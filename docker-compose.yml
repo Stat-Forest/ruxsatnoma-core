@@ -1,0 +1,74 @@
+# Local development environment.
+# Production deployment uses the same images on virtual machines (question O1: no Kubernetes).
+services:
+  db:
+    # The official postgis/postgis image has no arm64 build for PostgreSQL 18.
+    # imresamu/postgis is the multi-arch build of the same Dockerfile, maintained
+    # by one of the postgis/docker-postgis maintainers.
+    image: imresamu/postgis:18-3.6
+    environment:
+      POSTGRES_DB: ruxsatnoma_core
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      # Consumed by db/01-roles.sh
+      CORE_PASSWORD: ${CORE_PASSWORD}
+      OVERSIGHT_RO_PASSWORD: ${OVERSIGHT_RO_PASSWORD}
+      MIGRATOR_PASSWORD: ${MIGRATOR_PASSWORD}
+    ports: ["${DB_PORT:-5442}:5432"]
+    volumes:
+      # PostgreSQL 18 images store data in a major-version subdirectory, so the
+      # mount goes one level up from the pre-18 /var/lib/postgresql/data.
+      - pgdata:/var/lib/postgresql
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ruxsatnoma_core"]
+      interval: 5s
+      retries: 10
+
+  db_integration:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ruxsatnoma_integration
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports: ["${DB_INTEGRATION_PORT:-5443}:5432"]
+    volumes:
+      - pgdata_int:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ruxsatnoma_integration"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["${REDIS_PORT:-6389}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${MQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${MQ_PASSWORD}
+    ports: ["${MQ_PORT:-5682}:5672", "${MQ_UI_PORT:-15682}:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    ports: ["${MINIO_PORT:-9010}:9000", "${MINIO_UI_PORT:-9011}:9001"]
+    volumes:
+      - miniodata:/data
+
+volumes:
+  pgdata:
+  pgdata_int:
+  miniodata:
