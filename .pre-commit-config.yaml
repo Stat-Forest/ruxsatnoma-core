@@ -47,6 +47,10 @@ repos:
         language: system
         types: [python]
         pass_filenames: true
+        # pre-commit splits files into parallel batches; without this they
+        # race for .mypy_cache and the hook dies with an INTERNAL ERROR on a
+        # cold cache.
+        require_serial: true
 
       - id: import-linter
         name: module boundaries
