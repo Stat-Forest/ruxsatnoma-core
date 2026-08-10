@@ -31,6 +31,7 @@ english:            ## Verify sources contain no Cyrillic
 test:               ## Run tests. Exit code 5 means nothing was collected yet.
 	pytest || [ $$? -eq 5 ]
 
+# Needs a running database: `make up`, then a filled-in .env.
 constraints:        ## Critical constraints hold. Exit code 5 means nothing was collected yet.
 	pytest -m integration tests/integration || [ $$? -eq 5 ]
 
@@ -52,6 +53,7 @@ down:               ## Stop the local infrastructure
 logs:               ## Tail the infrastructure logs
 	docker compose logs -f
 
+# Needs a running database: `make up`, then a filled-in .env.
 migrate:            ## Apply database migrations
 	alembic upgrade head
 
