@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ruxsatnoma-core"
+version = "0.1.0"
+description = "Core service of the Ruxsatnoma electronic forest permit system"
+requires-python = ">=3.13"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sqlalchemy[asyncio]>=2.0,<2.1",
+    # 1.16 renamed version_path_separator to path_separator, see alembic.ini.
+    "alembic>=1.16",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7",
+    "asyncpg>=0.30",
+    "geoalchemy2>=0.16",
+    "redis>=5.2",
+    "aio-pika>=9.5",
+    "structlog>=25.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pytest-asyncio>=0.25",
+    # 4.15 moved the Postgres container to testcontainers.community.
+    "testcontainers[postgres]>=4.15",
+    "import-linter>=2.1",
+    "bandit>=1.8",
+    "pip-audit>=2.7",
+    "pre-commit>=4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["core"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "DTZ", "T20", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+# The alembic/ directory holds migrations, not a package of ours: the import
+# comes from the installed library and belongs in the third-party block.
+known-third-party = ["alembic"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+# The standards check reports its findings on stdout and stderr by design,
+# so the T20 ban on print does not apply to it.
+"scripts/*" = ["T20"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+# testcontainers ships no type information yet.
+module = ["testcontainers.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --cov=core --cov-report=term-missing"
+markers = [
+    "integration: requires a running database",
+    "e2e: requires the full environment",
+]
