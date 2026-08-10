@@ -1,0 +1,23 @@
+name: Auto Assign
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Auto-assign
+        uses: pozil/auto-assign-issue@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          # The backend developers. Hoka03 owns the frontend repository and is
+          # deliberately left out of the backend rotation.
+          assignees: Yuldashev222, MurodillaErgashev03, jahongiranorboyev
+          numOfAssignee: 2

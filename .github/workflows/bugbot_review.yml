@@ -1,0 +1,21 @@
+name: Bugbot Review
+
+on:
+  pull_request:
+    types: [opened]
+
+jobs:
+  request-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post @bugbot review comment
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.CURSOR_REVIEW_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: "@bugbot review",
+            });

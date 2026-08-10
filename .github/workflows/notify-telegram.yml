@@ -1,0 +1,264 @@
+name: Notify Telegram
+
+# Sends (almost) ALL repo activity to a single Telegram forum topic via the
+# Bot API (raw curl — no third-party action, so message_thread_id is honored).
+#
+# The trailing link is rendered as a single tappable inline button
+# (reply_markup) instead of a raw URL in the message body — keeps the text
+# compact and the body stays plain text (no parse_mode, no HTML escaping).
+#
+# Coverage note: GitHub Actions cannot capture 100% of repo events. Comment,
+# review, issue, create/delete, fork, star, label and discussion events only
+# fire from the workflow file on the DEFAULT branch — this must be merged into
+# `dev` to take effect. Events produced by GITHUB_TOKEN never re-trigger a
+# workflow (bot comments from external GitHub Apps, e.g. cursor[bot], DO).
+# System-level events (settings/collaborator/visibility changes, commit
+# comments) have no Actions trigger at all — only a real repo Webhook sees them.
+#
+# Required repo secrets:
+#   TG_BOT_TOKEN         — bot token from @BotFather
+#   TG_CHAT_ID           — supergroup id (negative, e.g. -1001234567890)
+#   TG_MESSAGE_THREAD_ID — id of the target forum topic (optional; omitted if unset)
+# To find the thread id: post into the topic, forward that message to
+# @RawDataBot (or read getUpdates) and copy `message_thread_id`.
+
+on:
+  push:
+    branches: ['**']   # every branch (tag pushes are covered by `create`)
+  pull_request:
+    types: [opened, closed, reopened, ready_for_review, converted_to_draft, edited]
+  issue_comment:                       # comments on PRs AND issues (conversation tab)
+    types: [created, edited, deleted]
+  pull_request_review:                 # approve / request changes / comment review
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:         # inline comments on the diff
+    types: [created, edited, deleted]
+  issues:
+    types: [opened, closed, reopened, edited, assigned, unassigned, labeled, unlabeled]
+  create:                              # branch or tag created
+  delete:                              # branch or tag deleted
+  release:
+    types: [published, released, prereleased, edited]
+  fork:
+  watch:                               # repo starred
+    types: [started]
+  gollum:                              # wiki page edits
+  label:
+    types: [created, edited, deleted]
+  discussion:                          # no-op if Discussions are disabled
+    types: [created, edited, deleted, answered, category_changed]
+  discussion_comment:
+    types: [created, edited, deleted]
+
+# This workflow never uses the GITHUB_TOKEN — drop all of its scopes.
+permissions: {}
+
+# One in-flight notify per ref — keep ordering, never drop (cancel-in-progress off).
+concurrency:
+  group: notify-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Send to Telegram
+    runs-on: ubuntu-latest
+    steps:
+      # Event payload is passed through env (never interpolated into the script
+      # body) to avoid shell-injection via titles / commit messages / comment text.
+      - name: Send
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_THREAD: ${{ secrets.TG_MESSAGE_THREAD_ID }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          REPO: ${{ github.repository }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+          ACTOR: ${{ github.actor }}
+          # pull_request
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          # issue_comment / pull_request_review_comment / discussion_comment
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          IS_PR: ${{ github.event.issue.pull_request.html_url }}
+          # pull_request_review
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+          # push
+          PUSH_REF: ${{ github.ref_name }}
+          PUSH_MSG: ${{ github.event.head_commit.message }}
+          PUSH_URL: ${{ github.event.compare }}
+          # release
+          REL_TAG: ${{ github.event.release.tag_name }}
+          REL_NAME: ${{ github.event.release.name }}
+          REL_URL: ${{ github.event.release.html_url }}
+          # issues
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          # create / delete
+          REF_TYPE: ${{ github.event.ref_type }}
+          REF_NAME: ${{ github.event.ref }}
+          # fork
+          FORK_NAME: ${{ github.event.forkee.full_name }}
+          FORK_URL: ${{ github.event.forkee.html_url }}
+          # label
+          LABEL_NAME: ${{ github.event.label.name }}
+          # discussion
+          DISCUSSION_TITLE: ${{ github.event.discussion.title }}
+          DISCUSSION_URL: ${{ github.event.discussion.html_url }}
+        run: |
+          set -euo pipefail
+
+          # The link is rendered as a single tappable inline button (built from
+          # LINK_URL / LINK_TEXT after the case below), so the raw URL no longer
+          # goes into the message body. Default to the repo page; each case
+          # overrides with the most specific URL, falling back to the repo page
+          # when that event has no own URL (keeps the button from ever being empty).
+          LINK_URL="$REPO_URL"
+          LINK_TEXT="🔗 Open on GitHub"
+
+          case "$EVENT" in
+            pull_request)
+              merged=""
+              [ "$PR_MERGED" = "true" ] && merged=" (merged)"
+              LINK_URL="${PR_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open PR #${PR_NUMBER}"
+              TEXT=$(printf '%s\n' \
+                "🔀 PR ${ACTION}${merged} — ${REPO}" \
+                "#${PR_NUMBER} ${PR_TITLE}" \
+                "${PR_HEAD} → ${PR_BASE}" \
+                "by ${ACTOR}")
+              ;;
+            issue_comment)
+              if [ -n "$IS_PR" ]; then kind="PR"; else kind="Issue"; fi
+              LINK_URL="${COMMENT_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open comment"
+              TEXT=$(printf '%s\n' \
+                "💬 Comment on ${kind} #${ISSUE_NUMBER} (${ACTION}) — ${REPO}" \
+                "${ISSUE_TITLE}" \
+                "by ${ACTOR}:" \
+                "${COMMENT_BODY}")
+              ;;
+            pull_request_review)
+              LINK_URL="${REVIEW_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open review"
+              TEXT=$(printf '%s\n' \
+                "🔎 Review ${REVIEW_STATE} (${ACTION}) — ${REPO}" \
+                "PR #${PR_NUMBER} ${PR_TITLE}" \
+                "by ${ACTOR}:" \
+                "${REVIEW_BODY}")
+              ;;
+            pull_request_review_comment)
+              LINK_URL="${COMMENT_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open comment"
+              TEXT=$(printf '%s\n' \
+                "📝 Inline comment (${ACTION}) — ${REPO}" \
+                "PR #${PR_NUMBER} ${PR_TITLE}" \
+                "${COMMENT_PATH}" \
+                "by ${ACTOR}:" \
+                "${COMMENT_BODY}")
+              ;;
+            push)
+              LINK_URL="${PUSH_URL:-$REPO_URL}"; LINK_TEXT="🔗 View diff"
+              TEXT=$(printf '%s\n' \
+                "⬆️ Push → ${PUSH_REF} — ${REPO}" \
+                "by ${ACTOR}" \
+                "${PUSH_MSG}")
+              ;;
+            release)
+              LINK_URL="${REL_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open release"
+              TEXT=$(printf '%s\n' \
+                "🏷️ Release ${ACTION} ${REL_TAG} — ${REPO}" \
+                "${REL_NAME}" \
+                "by ${ACTOR}")
+              ;;
+            issues)
+              LINK_URL="${ISSUE_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open issue #${ISSUE_NUMBER}"
+              TEXT=$(printf '%s\n' \
+                "📌 Issue ${ACTION} — ${REPO}" \
+                "#${ISSUE_NUMBER} ${ISSUE_TITLE}" \
+                "by ${ACTOR}")
+              ;;
+            create)
+              TEXT=$(printf '%s\n' \
+                "✨ ${REF_TYPE} created: ${REF_NAME} — ${REPO}" \
+                "by ${ACTOR}")
+              ;;
+            delete)
+              TEXT=$(printf '%s\n' \
+                "🗑️ ${REF_TYPE} deleted: ${REF_NAME} — ${REPO}" \
+                "by ${ACTOR}")
+              ;;
+            fork)
+              LINK_URL="${FORK_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open fork"
+              TEXT=$(printf '%s\n' \
+                "🍴 Forked — ${REPO}" \
+                "${FORK_NAME}" \
+                "by ${ACTOR}")
+              ;;
+            watch)
+              TEXT=$(printf '%s\n' \
+                "⭐ Starred — ${REPO}" \
+                "by ${ACTOR}")
+              ;;
+            gollum)
+              TEXT=$(printf '%s\n' \
+                "📖 Wiki updated — ${REPO}" \
+                "by ${ACTOR}")
+              ;;
+            label)
+              TEXT=$(printf '%s\n' \
+                "🏷️ Label ${ACTION}: ${LABEL_NAME} — ${REPO}" \
+                "by ${ACTOR}")
+              ;;
+            discussion)
+              LINK_URL="${DISCUSSION_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open discussion"
+              TEXT=$(printf '%s\n' \
+                "🗣️ Discussion ${ACTION} — ${REPO}" \
+                "${DISCUSSION_TITLE}" \
+                "by ${ACTOR}")
+              ;;
+            discussion_comment)
+              LINK_URL="${COMMENT_URL:-$REPO_URL}"; LINK_TEXT="🔗 Open comment"
+              TEXT=$(printf '%s\n' \
+                "🗣️💬 Discussion comment (${ACTION}) — ${REPO}" \
+                "${DISCUSSION_TITLE}" \
+                "by ${ACTOR}:" \
+                "${COMMENT_BODY}")
+              ;;
+            *)
+              # Catch-all: never drop an event that managed to trigger us.
+              TEXT=$(printf '%s\n' \
+                "📦 ${EVENT} ${ACTION} — ${REPO}" \
+                "by ${ACTOR}")
+              ;;
+          esac
+
+          # Telegram caps a message at 4096 chars — truncate with margin.
+          LIMIT=3500
+          if [ "${#TEXT}" -gt "$LIMIT" ]; then
+            TEXT=$(printf '%s\n%s' "${TEXT:0:$LIMIT}" "…(truncated)")
+          fi
+
+          args=( --data-urlencode "chat_id=${TG_CHAT_ID}" )
+          if [ -n "${TG_THREAD:-}" ]; then
+            args+=( --data-urlencode "message_thread_id=${TG_THREAD}" )
+          fi
+          args+=( --data-urlencode "disable_web_page_preview=true" )
+          args+=( --data-urlencode "text=${TEXT}" )
+
+          # Render the link as one tappable inline button instead of a raw URL
+          # in the body. jq builds valid JSON regardless of label/URL contents.
+          if [ -n "${LINK_URL:-}" ]; then
+            reply_markup=$(jq -cn --arg t "$LINK_TEXT" --arg u "$LINK_URL" \
+              '{inline_keyboard:[[{text:$t,url:$u}]]}')
+            args+=( --data-urlencode "reply_markup=${reply_markup}" )
+          fi
+
+          curl -sS --fail-with-body -X POST \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            "${args[@]}"
