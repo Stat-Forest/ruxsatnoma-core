@@ -72,7 +72,7 @@ jobs:
           TG_THREAD: ${{ secrets.TG_MESSAGE_THREAD_ID }}
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
-          REPO: ${{ github.repository }}
+          REPO: "🍎 ${{ github.repository }}"
           REPO_URL: ${{ github.event.repository.html_url }}
           ACTOR: ${{ github.actor }}
           # pull_request
