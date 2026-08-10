@@ -95,13 +95,15 @@ gh pr create --base main --title "<conventional commit title>" --body "<what and
 
 No AI attribution in the commit trailer or the PR body.
 
-## Step 6: Review loop
+## Step 6: Review
 
-Follow the bugbot review cadence from the tech lead's global instructions
-(`~/.claude/CLAUDE.md`): poll every five minutes, escalate with one
-`@bugbot review` only after thirty minutes of silence. **This command requires a
-streak of five consecutive clean rounds** — that number is set here, the cadence
-is set there. Any new finding resets the counter to zero.
+There is no automated reviewer on these repositories and no polling loop to run.
+Review is a local command the tech lead runs when they want one. Do not wait for
+a bot, do not poll the PR, and do not comment on the PR asking for a review.
+
+Your obligation ends at a PR whose gate is green and whose description says what
+changed and why. If review comments do arrive, address them and push — the PR
+updates itself as long as it is still open (Step 5).
 
 ## Step 7: Record what you learned
 
