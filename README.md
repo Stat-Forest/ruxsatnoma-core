@@ -57,17 +57,11 @@ pytest -m integration        # только те, что поднимают ба
 
 ## Проверки
 
-Те же девять шагов, что и в CI (`.github/workflows/ci.yml`). Ни один не пропускается.
-
 ```bash
-ruff check . && ruff format --check .
-mypy core alembic scripts tests
-lint-imports                                          # границы модулей
-git ls-files '*.py' | xargs python scripts/check_english_only.py
-pytest
-alembic upgrade head
-bandit -r core -ll && pip-audit
+make check
 ```
+
+Те же девять шагов, что и в CI (`.github/workflows/ci.yml`), в том же порядке. Ни один не пропускается. Полный список целей — `Makefile`.
 
 ## Куда класть код
 
