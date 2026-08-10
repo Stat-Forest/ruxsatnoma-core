@@ -57,17 +57,13 @@ pytest -m integration        # только те, что поднимают ба
 
 ## Проверки
 
-Те же девять шагов, что и в CI (`.github/workflows/ci.yml`). Ни один не пропускается.
+Шаги 6 и 7 ходят в базу: перед запуском нужны поднятая инфраструктура (`make up`) и заполненный `.env`.
 
 ```bash
-ruff check . && ruff format --check .
-mypy core alembic scripts tests
-lint-imports                                          # границы модулей
-git ls-files '*.py' | xargs python scripts/check_english_only.py
-pytest
-alembic upgrade head
-bandit -r core -ll && pip-audit
+make check
 ```
+
+Те же девять шагов, что и в CI (`.github/workflows/checks.yml`), в том же порядке. Ни один не пропускается. Полный список целей — `Makefile`.
 
 ## Куда класть код
 

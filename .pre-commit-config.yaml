@@ -1,19 +1,73 @@
+---
+# Fast hooks only. Tests stay in CI so that committing stays cheap: a slow
+# hook teaches the team to use --no-verify, and that switches off every other
+# hook along with the tests.
+#
+# Keep `rev` in sync with the floors in pyproject.toml [project.optional-
+# dependencies].dev — a hook pinned below the installed tool checks different
+# code than CI does.
+fail_fast: false
+default_language_version:
+  python: python3.13
+
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-case-conflict
+      - id: no-commit-to-branch
+        args: ["--branch", "main"]
+
+  # Ruff is the sole formatter, linter and import sorter.
+  # `ruff-check` is the current id; bare `ruff` is a legacy alias.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.6
-    hooks: [{id: ruff, args: [--fix]}, {id: ruff-format}]
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.15.0
-    hooks: [{id: mypy, additional_dependencies: [pydantic, sqlalchemy]}]
+    rev: v0.16.2
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # These run against the project environment on purpose. mypy inside an
+  # isolated pre-commit venv sees only what additional_dependencies lists —
+  # not geoalchemy2, structlog, fastapi, aio-pika or redis — so it would pass
+  # code that CI rejects.
   - repo: local
     hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: system
+        types: [python]
+        pass_filenames: true
+        # pre-commit splits files into parallel batches; without this they
+        # race for .mypy_cache and the hook dies with an INTERNAL ERROR on a
+        # cold cache.
+        require_serial: true
+
       - id: import-linter
         name: module boundaries
         entry: lint-imports
         language: system
         pass_filenames: false
+        types: [python]
+
       - id: english-only
         name: source code must be English only
         entry: scripts/check_english_only.py
         language: python
         types: [python]
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: ["-ll", "--skip", "B101"]
+        exclude: ^tests/

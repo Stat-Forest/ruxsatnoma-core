@@ -1,0 +1,86 @@
+name: Checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Steps that touch the database use the throwaway CI instance below.
+  DATABASE_URL: postgresql+asyncpg://ci:ci@localhost:5432/ruxsatnoma_core
+
+# Reusable gate — the nine checks from the engineering standards, section 6.
+# Mirrors `make check`. Called by CI on every pull request and, later, by
+# Deploy before it ships, so the merge gate and the deploy gate cannot drift.
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # The official postgis/postgis image has no arm64 build for
+        # PostgreSQL 18. imresamu/postgis is the multi-arch build of the same
+        # Dockerfile, and docker-compose.yml uses it too.
+        image: imresamu/postgis:18-3.6
+        env:
+          POSTGRES_DB: ruxsatnoma_core
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+        options: >-
+          --health-cmd "pg_isready -U ci" --health-interval 5s --health-retries 10
+        ports: ["5432:5432"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Nine checks from the engineering standards, section 6. None of them
+      # is ever skipped: a red CI means the code does not get merged.
+
+      - name: 1. Lint and format
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: 2. Types
+        run: mypy core alembic scripts tests
+
+      - name: 3. Module boundaries
+        run: lint-imports
+
+      - name: 4. Source code is English only
+        run: git ls-files '*.py' | xargs python scripts/check_english_only.py
+
+      - name: 5. Unit and integration tests
+        # Exit code 5 means pytest collected nothing, which is the expected
+        # state until the first test is written.
+        run: pytest || [ $? -eq 5 ]
+
+      - name: 6. Database schema applies to a clean database
+        run: alembic upgrade head
+
+      - name: 7. Critical constraints hold
+        # The constraint invariants live in tests/integration and run against
+        # a container started by testcontainers.
+        run: pytest -m integration tests/integration || [ $? -eq 5 ]
+
+      - name: 8. Known vulnerabilities
+        run: |
+          bandit -r core -ll
+          pip-audit
+
+      - name: 9. Images build
+        # The service Dockerfile does not exist yet, so for now the step
+        # validates the environment definition the images are run from.
+        run: docker compose config --quiet

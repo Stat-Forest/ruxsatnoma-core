@@ -1,0 +1,190 @@
+name: Feature Request
+description: Internal feature request for product owners and managers
+title: "[FEATURE]"
+labels: ["enhancement"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Please write all information in English.**
+
+        This template is for product owners and managers to request new features for Ruxsatnoma.
+
+  - type: input
+    id: feature-title
+    attributes:
+      label: Feature Title
+      description: Brief, descriptive title for the feature
+      placeholder: "e.g., Bulk export of issued permits to XLSX for the inspector report"
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: Feature Description
+      description: What feature do you want to add? Describe it in detail.
+      placeholder: |
+        Example: "I want applicants to be able to track their application status
+        by SMS so that they do not need to log into the portal to check
+        progress."
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose & Business Value
+      description: Why do we need this feature? What problem does it solve? What value does it bring to clients?
+      placeholder: |
+        - Client pain point: ...
+        - Business impact: ...
+        - Expected outcome: ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client-importance
+    attributes:
+      label: Client Importance
+      description: How important is this feature for the client?
+      options:
+        - Critical - Blocking client operations or major contract requirement
+        - High - Significant client request, affects multiple users
+        - Medium - Nice to have, improves workflow
+        - Low - Future consideration, not urgent
+    validations:
+      required: true
+
+  - type: textarea
+    id: client-discussions
+    attributes:
+      label: Client Discussions & Meeting Notes
+      description: Any client conversations, meeting notes, or requirements related to this feature?
+      placeholder: |
+        - Client name/org: ...
+        - Meeting date: ...
+        - Key requirements discussed: ...
+        - Client expectations: ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: how-should-it-work
+    attributes:
+      label: How Should It Work?
+      description: Describe how you envision this feature working from a user perspective. What should users be able to do? What should the workflow look like?
+      placeholder: |
+        Example: "Users should be able to:
+        - Submit the request from the applicant portal
+        - See the status update in real time
+        - Receive a notification when a decision is made"
+    validations:
+      required: true
+
+  - type: textarea
+    id: third-party-services
+    attributes:
+      label: Third-Party Services / Integrations
+      description: What external services or platforms should this feature integrate with?
+      placeholder: |
+        Examples:
+        - Cadastre
+        - Payme, Click, Uzum, Paynet
+        - my.gov.uz
+        - Any API documentation links: https://...
+    validations:
+      required: false
+
+  - type: textarea
+    id: affected-areas
+    attributes:
+      label: Which Parts of Ruxsatnoma Will This Affect?
+      description: Describe which areas or features of Ruxsatnoma this will impact (e.g., a specific module, the API, the frontend, etc.)
+      placeholder: |
+        Examples:
+        - "Applicant portal"
+        - "core: a specific module"
+        - "integration: a specific adapter"
+        - "Other (specify in additional context)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: integration-points
+    attributes:
+      label: Integration Points
+      description: How should this integrate with existing Ruxsatnoma features? Which roles should have access?
+      placeholder: |
+        Examples:
+        - "Should run automatically as part of the application workflow"
+        - "Available to applicants and inspectors only"
+        - "Should work automatically in the background"
+    validations:
+      required: false
+
+  - type: textarea
+    id: similar-features
+    attributes:
+      label: Similar Features / Examples
+      description: Any similar features in Ruxsatnoma or other products that we should reference? Any examples or inspiration?
+      placeholder: |
+        Examples:
+        - "Similar to how the portal already notifies applicants by email"
+        - "Reference similar feature in [other product/service]"
+        - "Link to example: https://..."
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How urgent is this feature?
+      options:
+        - Urgent - Needs to be shipped ASAP (blocking client)
+        - High - Important for upcoming release
+        - Medium - Plan for next sprint/quarter
+        - Low - Backlog item, no rush
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements-considerations
+    attributes:
+      label: Requirements & Considerations
+      description: Any specific requirements, constraints, or important considerations? (e.g., security, privacy, data handling, user permissions, etc.)
+      placeholder: |
+        - Security/privacy requirements: ...
+        - Data handling considerations: ...
+        - User permissions needed: ...
+        - Any limitations or constraints: ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: How will we know this feature is complete? What are the success criteria?
+      placeholder: |
+        - [ ] Feature works for all affected roles
+        - [ ] Covered by tests
+        - [ ] Documentation updated
+        - [ ] Client can use the feature end to end
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Any other context, links, mockups, or information that would help implement this feature.
+      placeholder: |
+        - Related issues: #...
+        - Client documentation: ...
+        - API documentation: ...
+        - Mockups/screenshots: ...
+    validations:
+      required: false
