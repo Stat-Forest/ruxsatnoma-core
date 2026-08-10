@@ -1,5 +1,12 @@
 name: Bugbot Review
 
+# Asks Cursor's bugbot to review every new pull request.
+#
+# Required repo secret:
+#   CURSOR_REVIEW_TOKEN — the token the comment is posted as. Without it the
+#   step fails with a 401 on every opened PR: GITHUB_TOKEN cannot be used
+#   here, because a comment it posts never re-triggers another workflow.
+
 on:
   pull_request:
     types: [opened]

@@ -99,8 +99,9 @@ No AI attribution in the commit trailer or the PR body.
 
 Follow the bugbot review cadence from the tech lead's global instructions
 (`~/.claude/CLAUDE.md`): poll every five minutes, escalate with one
-`@bugbot review` only after thirty minutes of silence, finish on the required
-streak of clean rounds. Do not duplicate that policy here — read it there.
+`@bugbot review` only after thirty minutes of silence. **This command requires a
+streak of five consecutive clean rounds** — that number is set here, the cadence
+is set there. Any new finding resets the counter to zero.
 
 ## Step 7: Record what you learned
 

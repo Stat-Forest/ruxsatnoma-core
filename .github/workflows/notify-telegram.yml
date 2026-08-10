@@ -10,7 +10,7 @@ name: Notify Telegram
 # Coverage note: GitHub Actions cannot capture 100% of repo events. Comment,
 # review, issue, create/delete, fork, star, label and discussion events only
 # fire from the workflow file on the DEFAULT branch — this must be merged into
-# `dev` to take effect. Events produced by GITHUB_TOKEN never re-trigger a
+# `main` to take effect. Events produced by GITHUB_TOKEN never re-trigger a
 # workflow (bot comments from external GitHub Apps, e.g. cursor[bot], DO).
 # System-level events (settings/collaborator/visibility changes, commit
 # comments) have no Actions trigger at all — only a real repo Webhook sees them.
