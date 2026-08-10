@@ -117,6 +117,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          # GitHub does NOT expose repository secrets to runs it starts on
+          # behalf of dependabot (those get a separate Dependabot secrets
+          # store) or to pull requests from forks. TG_BOT_TOKEN then expands
+          # to an empty string, the URL becomes .../bot/sendMessage and
+          # Telegram answers 404. Skip quietly instead of failing the run:
+          # a red check on every dependabot PR trains people to ignore checks.
+          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+            echo "Telegram secrets are not available to this event (dependabot or fork). Skipping."
+            exit 0
+          fi
+
           # The link is rendered as a single tappable inline button (built from
           # LINK_URL / LINK_TEXT after the case below), so the raw URL no longer
           # goes into the message body. Default to the repo page; each case

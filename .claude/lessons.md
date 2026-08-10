@@ -21,3 +21,9 @@ The file starts empty on purpose: a lesson earns its place by costing us
 something first.
 
 ---
+
+## Repository secrets are absent from dependabot and fork runs
+
+- **Rule:** A workflow step that needs `secrets.*` must tolerate them being empty. GitHub does not expose repository secrets to runs it starts on behalf of dependabot — those read a separate Dependabot secrets store — nor to pull requests from forks. Check the secret and skip with exit 0 rather than letting the step fail.
+- **Why:** 2026-08-10, the day `notify-telegram.yml` landed. Every dependabot pull request turned the check red with `curl: (22) 404` — `TG_BOT_TOKEN` expanded to an empty string and the URL became `api.telegram.org/bot/sendMessage`. The secrets were set correctly; the same workflow passed on human events minutes earlier. A permanently red check on bot PRs teaches the team to stop reading checks, which costs more than a missed notification.
+- **How to apply:** Any new workflow reading a secret gets the same guard at the top of its script: `if [ -z "${SECRET:-}" ]; then echo "..."; exit 0; fi`. If a bot-triggered run genuinely needs the value, put it in Dependabot secrets deliberately — do not assume the repository secret carries over.
