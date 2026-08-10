@@ -25,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.9",
+    "ruff>=0.16",
     "mypy>=1.14",
     "pytest>=8.3",
     "pytest-cov>=6.0",
@@ -33,7 +33,7 @@ dev = [
     # 4.15 moved the Postgres container to testcontainers.community.
     "testcontainers[postgres]>=4.15",
     "import-linter>=2.1",
-    "bandit>=1.8",
+    "bandit>=1.9",
     "pip-audit>=2.7",
     "pre-commit>=4.0",
 ]
