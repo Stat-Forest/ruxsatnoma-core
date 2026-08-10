@@ -1,0 +1,19 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks: [{id: ruff, args: [--fix]}, {id: ruff-format}]
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks: [{id: mypy, additional_dependencies: [pydantic, sqlalchemy]}]
+  - repo: local
+    hooks:
+      - id: import-linter
+        name: module boundaries
+        entry: lint-imports
+        language: system
+        pass_filenames: false
+      - id: english-only
+        name: source code must be English only
+        entry: scripts/check_english_only.py
+        language: python
+        types: [python]
