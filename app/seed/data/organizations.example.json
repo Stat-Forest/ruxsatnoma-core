@@ -1,0 +1,24 @@
+[
+  {
+    "code": "agency",
+    "kind": "agency",
+    "name": {"uz_cyrl": "Ўрмон хўжалиги агентлиги", "en": "Forestry Agency"}
+  },
+  {
+    "code": "leshoz-nukus",
+    "kind": "leshoz",
+    "parent_code": "agency",
+    "region_code": "karakalpakstan",
+    "name": {"uz_cyrl": "Нукус ДЎХ", "en": "Nukus forestry"},
+    "stir": "200388105",
+    "requisites": {"account": "40012186035209704220", "bank": "МБ ББ ХККМ", "mfo": "00014"}
+  },
+  {
+    "code": "leshoz-beruniy",
+    "kind": "leshoz",
+    "parent_code": "agency",
+    "region_code": "karakalpakstan",
+    "name": {"uz_cyrl": "Беруний ДЎХ", "en": "Beruniy forestry"},
+    "stir": "201604293"
+  }
+]
