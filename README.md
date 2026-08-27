@@ -49,3 +49,9 @@ docker compose up -d
 `app/core` — обвязка (конфиг, БД, ошибки ERR-*, логи, healthcheck), без бизнес-логики.
 `app/modules/<имя>` — доменные модули (этап 3), слои router → service → repo → models.
 Полная карта — `../docs/design/01-struktura-monolita.md`.
+
+## Deployment notes
+
+- Run uvicorn behind the reverse proxy with `--proxy-headers` so the client IP reaches the audit trail instead of the proxy's address.
+- The adminka is served from its own origin (decision: stage 3.3a ruling 3). Set `CORS_ORIGINS` to the exact frontend origins (JSON list) — with cookie credentials a wildcard is not allowed. In `prod` this also switches the session and CSRF cookies to `SameSite=None; Secure`, so the API must be served over https.
+- Reference data: `uv run python -m app.seed districts <file.json>` and `... organizations <file.json>` (idempotent upsert by `code`).

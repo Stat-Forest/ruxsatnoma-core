@@ -7,6 +7,7 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -55,6 +56,20 @@ def _error_body(request: Request, code: str, message: str, details: dict | None)
 def create_app() -> FastAPI:
     configure_logging(get_settings().log_format)
     app = FastAPI(title="Ruxsatnoma-urmon API", lifespan=lifespan)
+
+    settings = get_settings()
+    if settings.cors_origins:
+        # Cross-origin adminka (ruling 3): credentials are cookies, so the origin list
+        # must be explicit — "*" is invalid with allow_credentials.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["Content-Type", "X-CSRF-Token", "X-Request-Id", "Idempotency-Key"],
+            expose_headers=["X-Request-Id"],
+            max_age=600,
+        )
 
     @app.middleware("http")
     async def correlation_middleware(request: Request, call_next):

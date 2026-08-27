@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core import settings_store
 from app.core.deps import get_db
 from app.core.errors import err
@@ -19,6 +20,17 @@ from app.modules.auth.permissions import PERMISSIONS
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 # Paths a must-change-password user may still call (ruling 8)
 _MUST_CHANGE_ALLOWED = {"/api/v1/auth/me", "/api/v1/auth/logout", "/api/v1/auth/password/change"}
+# Role that passes every permission gate (stage 3.3a ruling 2)
+SUPERUSER_ROLE = "sys_admin"
+
+
+def _origin_allowed(request: Request, origin: str) -> bool:
+    """Same-origin requests and configured adminka origins only (ruling 3).
+    Requests without an Origin header (curl, server-to-server) are left to the CSRF
+    token, which they cannot guess."""
+    if origin in get_settings().cors_origins:
+        return True
+    return origin == str(request.base_url).rstrip("/")
 
 
 async def get_current_session(
@@ -37,6 +49,13 @@ async def get_current_session(
         await db.commit()  # the revocation must survive the 401 below (ruling 2 pattern)
         raise err("ERR-AUTH-002")
     if request.method in _MUTATING:
+        origin = request.headers.get("Origin")
+        if origin is not None and not _origin_allowed(request, origin):
+            await audit.log(
+                db, action="access.denied", user_id=row.user_id, result="denied", basis="origin"
+            )
+            await db.commit()
+            raise err("ERR-AUTH-006")
         header = request.headers.get("X-CSRF-Token")
         if not header or not secrets.compare_digest(header, row.csrf_token):
             await audit.log(
@@ -81,6 +100,11 @@ def require_permission(code: str):
         user: Annotated[User, Depends(get_current_user)],
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
+        # Stage 3.3a ruling 2: sys_admin passes every permission gate. The action
+        # itself is still audited by the service that performs it, and the DB-level
+        # append-only triggers on audit_log are unaffected by this bypass.
+        if await repo.role_code(db, user) == SUPERUSER_ROLE:
+            return user
         if code not in await repo.permission_codes(db, user):
             await audit.log(
                 db, action="access.denied", user_id=user.id, result="denied", basis=code

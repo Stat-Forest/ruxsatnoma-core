@@ -147,3 +147,31 @@ async def test_must_change_password_gate(db):
         client.cookies.set("session", token)
         me = await client.get(f"{API}/auth/me")  # allowed
         assert me.status_code == 200
+
+
+async def test_mutation_from_foreign_origin_is_rejected(db):
+    user = await make_user(db)
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.post(
+            f"{API}/auth/logout",
+            headers={"X-CSRF-Token": csrf, "Origin": "https://evil.example"},
+        )
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "ERR-AUTH-006"
+
+
+async def test_mutation_from_own_origin_is_accepted(db):
+    user = await make_user(db)
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.post(
+            f"{API}/auth/logout", headers={"X-CSRF-Token": csrf, "Origin": "http://t"}
+        )
+    assert r.status_code == 204
