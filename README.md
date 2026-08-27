@@ -26,6 +26,23 @@ uv run ruff check . && uv run ruff format --check .
 uv run pre-commit install   # один раз, хуки на коммит
 ```
 
+## Миграции
+
+```bash
+uv run alembic revision --autogenerate -m "…"
+uv run alembic upgrade head
+```
+
+⚠️ `docker/initdb/01-test-db.sql` (создание тестовой БД `ruxsatnoma_test`) отрабатывает
+только при первой инициализации пустого `pg-data` — Postgres запускает `initdb.d`-скрипты
+один раз, при создании тома. Если `pg-data` существовал ещё до появления этого скрипта,
+тестовая БД сама не появится — пересоздайте том:
+
+```bash
+docker compose down -v && rm -rf pg-data
+docker compose up -d
+```
+
 ## Структура
 
 `app/core` — обвязка (конфиг, БД, ошибки ERR-*, логи, healthcheck), без бизнес-логики.
