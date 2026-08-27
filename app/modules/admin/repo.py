@@ -146,14 +146,19 @@ async def list_classifier_items(
     """Items valid on `on_date` (default: today). Archived rows are included only when
     asked for — an admin editing history needs them, a form does not.
 
-    `on_date` in the past is a historical lookup (what WAS in force then): the date
-    range alone decides it, status is irrelevant, because `supersede` (ruling 7)
-    leaves the superseded row `archived` forever even though it was correctly live
-    during its own `[valid_from, valid_to]` window. `on_date` omitted (today, the
-    default — "what a form should offer right now") additionally requires
-    `status == 'active'`, matching the sibling `list_activity_types` /
-    `list_livestock_types` pattern: date range alone cannot tell "pulled early via
-    `/archive`, date window not yet expired" apart from "still genuinely current."
+    A past `on_date` is a historical lookup (what WAS in force then): the date range
+    alone decides it, status is irrelevant, because `supersede` (ruling 7) leaves the
+    superseded row `archived` forever even though it was correctly live during its
+    own `[valid_from, valid_to]` window.
+
+    An omitted, current, or future `on_date` is instead a "what is usable now"
+    lookup, and additionally requires `status == 'active'` — matching the sibling
+    `list_activity_types` / `list_livestock_types` pattern, since the date range
+    alone cannot tell "pulled early via `/archive`, date window not yet expired"
+    apart from "still genuinely current." The future case folds in deliberately:
+    `on_date` is a client-supplied parameter on a public endpoint, and a caller that
+    always sends the selected date (defaulting to today) must not reproduce the bug
+    this guards against.
     """
     stmt = select(ClassifierItem).where(ClassifierItem.classifier_id == classifier_id)
     if not include_archived:
@@ -162,7 +167,7 @@ async def list_classifier_items(
             ClassifierItem.valid_from <= day,
             (ClassifierItem.valid_to.is_(None)) | (ClassifierItem.valid_to >= day),
         )
-        if on_date is None:
+        if on_date is None or on_date >= date.today():
             stmt = stmt.where(ClassifierItem.status == "active")
     stmt = stmt.order_by(ClassifierItem.sort_order, ClassifierItem.code)
     return list((await db.execute(stmt)).scalars())

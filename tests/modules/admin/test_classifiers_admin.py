@@ -193,6 +193,41 @@ async def test_archived_item_with_future_valid_to_disappears_from_refs(db):
     assert listed.json() == []
 
 
+async def test_explicit_on_date_today_matches_omitted_for_future_valid_to(db):
+    """Round-2 finding: `on_date` is a client-supplied parameter on a public
+    endpoint, and "always send the selected date, defaulted to today" is an
+    ordinary frontend pattern — a caller doing that must not reproduce Finding 1's
+    bug. An explicit `on_date=<today>` has to agree with omitting the parameter."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"todayparam-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    item = ClassifierItem(
+        classifier_id=classifier.id,
+        code="T-01",
+        name={"uz_cyrl": "Х"},
+        valid_from=date(2026, 1, 1),
+        valid_to=date(2030, 1, 1),  # far future: date range alone would keep it visible
+    )
+    db.add(item)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        archived = await client.post(f"{API}/admin/classifier-items/{item.id}/archive")
+        omitted = await client.get(f"{API}/refs/classifiers/todayparam-{suffix}/items")
+        explicit_today = await client.get(
+            f"{API}/refs/classifiers/todayparam-{suffix}/items",
+            params={"on_date": date.today().isoformat()},
+        )
+    assert archived.status_code == 200, archived.text
+    assert omitted.json() == []
+    assert explicit_today.json() == []
+
+
 async def test_archive_same_day_valid_from_does_not_500(db):
     """Finding 2: `valid_from` today (or later) plus no explicit `valid_to` must not
     make the default-end-date fallback compute something earlier than `valid_from`
