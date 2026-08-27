@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.core.errors import DomainError
+from app.core.health import router as health_router
 from app.core.logging import configure_logging
 from app.db import make_engine, make_session_factory
 
@@ -69,5 +70,7 @@ def create_app() -> FastAPI:
             content=_error_body(request, "ERR-SYS-001", "Внутренняя ошибка сервера", None),
             headers={"X-Request-Id": rid} if rid else None,
         )
+
+    app.include_router(health_router)
 
     return app

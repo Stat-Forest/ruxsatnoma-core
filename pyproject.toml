@@ -36,3 +36,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Depends(...) в значении по умолчанию — идиоматичный DI-паттерн FastAPI, не баг (B008)
+extend-immutable-calls = ["fastapi.Depends"]
