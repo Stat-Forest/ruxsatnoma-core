@@ -5,5 +5,7 @@ here is caught by test_autogenerate_diff_empty: its table exists in the DB
 but not in metadata, producing a drop diff.
 """
 
+import app.core.models  # noqa: F401
+import app.modules.admin.models  # noqa: F401
 import app.modules.audit.models  # noqa: F401
 import app.modules.auth.models  # noqa: F401
