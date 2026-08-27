@@ -1,9 +1,9 @@
-import httpx
 import pytest
 from fastapi import APIRouter
 
 from app.core.errors import err
 from app.main import create_app
+from tests.conftest import make_client
 
 
 @pytest.fixture
@@ -19,11 +19,12 @@ async def client():
     async def crash():
         raise RuntimeError("внутреннее")
 
+    @r.get("/typed")
+    async def typed(n: int):
+        return {"n": n}
+
     app.include_router(r)
-    # raise_app_exceptions=False: Starlette ре-рейзит необработанные исключения
-    # после отправки 500 — иначе тест /crash увидит исключение, а не ответ
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+    async with make_client(app) as c:
         yield c
 
 
@@ -41,3 +42,26 @@ async def test_unhandled_becomes_err_sys_001(client):
     resp = await client.get("/crash")
     assert resp.status_code == 500
     assert resp.json()["error"]["code"] == "ERR-SYS-001"
+    assert "внутреннее" not in resp.text  # текст исключения наружу не течёт
+
+
+async def test_not_found_returns_err_sys_003(client):
+    resp = await client.get("/does-not-exist")
+    assert resp.status_code == 404
+    body = resp.json()["error"]
+    assert body["code"] == "ERR-SYS-003"
+    assert body["correlation_id"]
+
+
+async def test_method_not_allowed_returns_err_sys_004(client):
+    resp = await client.post("/boom")
+    assert resp.status_code == 405
+    assert resp.json()["error"]["code"] == "ERR-SYS-004"
+
+
+async def test_validation_error_returns_err_val_001(client):
+    resp = await client.get("/typed", params={"n": "not-an-int"})
+    assert resp.status_code == 422
+    body = resp.json()["error"]
+    assert body["code"] == "ERR-VAL-001"
+    assert body["details"]["errors"]

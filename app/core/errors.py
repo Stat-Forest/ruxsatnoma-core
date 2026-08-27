@@ -27,6 +27,9 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-INT-002": (502, "Внешний сервис вернул ошибку"),
     "ERR-SYS-001": (500, "Внутренняя ошибка сервера"),
     "ERR-SYS-002": (503, "Сервис временно недоступен"),
+    "ERR-SYS-003": (404, "Ресурс не найден"),
+    "ERR-SYS-004": (405, "Метод не поддерживается"),
+    "ERR-VAL-001": (422, "Ошибка валидации входных данных"),
 }
 
 
@@ -40,5 +43,7 @@ class DomainError(Exception):
 
 
 def err(code: str, details: dict | None = None, message: str | None = None) -> DomainError:
+    if code not in ERRORS:
+        raise KeyError(f"Неизвестный код ошибки: {code}")
     http_status, default_message = ERRORS[code]
     return DomainError(code, http_status, message or default_message, details)
