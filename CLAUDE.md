@@ -22,9 +22,8 @@ uv run ruff check . && uv run ruff format --check .
 - **Errors**: raise only via `err("ERR-…")` from `app/core/errors.py`; the catalog mirrors `../docs/tz/10-klassifikatory.md`. Single response format with `correlation_id` — do not invent ad-hoc error bodies.
 - **Time**: store UTC (`timestamptz`), display Asia/Tashkent. Money/norms — `numeric`, never float.
 - **Migrations**: Alembic autogenerate is wired with GeoAlchemy2 `alembic_helpers` (protects PostGIS tables) — do not remove; keep `sqlalchemy.url` in `alembic.ini` empty (URL comes from settings/attributes); naming convention lives on `Base.metadata`. A guard test asserts an empty autogenerate diff.
-- **Audit invariant** (from stage 3.1 on): every action writes `audit_log` in the same transaction.
+- **Audit invariant**: every state-changing action calls `audit.service.log(db, action=…)` in the same transaction (no commit inside — `get_db` commits both together). Action codes: `"<object>.<verb>"` in English, constants live in the acting module.
 
 ## Next-work checklist (stage 3 start)
 
-1. Bump Python 3.12 → 3.14 (`.python-version`, `requires-python`, ruff target) and rerun tests (№33).
-2. Consider type checker (mypy/pyright) + CI before scaling to 20 modules (final-review recommendation).
+1. Consider type checker (mypy/pyright) + CI before scaling to 20 modules (final-review recommendation).
