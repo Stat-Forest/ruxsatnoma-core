@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ruxsatnoma
+      POSTGRES_PASSWORD: ruxsatnoma
+      POSTGRES_DB: ruxsatnoma
+    ports: ["5432:5432"]
+    volumes:
+      - ./pg-data:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ruxsatnoma"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ruxsatnoma
+      MINIO_ROOT_PASSWORD: ruxsatnoma-secret
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["./minio-data:/data"]
