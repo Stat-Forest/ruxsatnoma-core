@@ -25,6 +25,11 @@ class DistrictOut(BaseModel):
 
 
 class OrganizationOut(BaseModel):
+    """The public /refs shape (ruling 10: no permission code, no zone filtering) —
+    `requisites` (bank details) is deliberately excluded; the admin write surface
+    (Task 5's `OrganizationAdminOut`, gated behind `admin.organizations.manage`)
+    is where that belongs."""
+
     id: uuid.UUID
     parent_id: uuid.UUID | None
     kind: str
@@ -33,7 +38,6 @@ class OrganizationOut(BaseModel):
     stir: str | None
     region_id: uuid.UUID | None
     district_id: uuid.UUID | None
-    requisites: dict[str, Any]
     status: str
 
 

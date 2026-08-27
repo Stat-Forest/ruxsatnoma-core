@@ -66,14 +66,17 @@ async def test_ten_livestock_types(db):
 
 
 async def test_classifier_catalog(db):
+    """Containment, not equality: API tests (e.g. test_refs_api.py) legitimately
+    commit their own ad-hoc classifiers, so the table is not closed to these five —
+    only migration 0005's seeded codes are guaranteed to be present."""
     codes = set((await db.execute(select(Classifier.code))).scalars())
-    assert codes == {
+    assert {
         "rejection_reasons",
         "doc_types",
         "benefit_categories",
         "violation_types",
         "appeal_subjects",
-    }
+    } <= codes
 
 
 async def test_rejection_reasons_seeded(db):
