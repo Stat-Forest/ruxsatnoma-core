@@ -1,4 +1,5 @@
 """Структурированные логи: structlog; console в dev, JSON в prod."""
+
 import logging
 
 import structlog

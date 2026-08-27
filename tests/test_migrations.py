@@ -1,4 +1,5 @@
 """Прогон миграций на тестовой БД: upgrade head проходит, расширения на месте."""
+
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
@@ -20,7 +21,9 @@ async def test_upgrade_head_installs_extensions(engine):
     await asyncio.to_thread(command.upgrade, _alembic_config(url), "head")
     async with engine.connect() as conn:
         rows = await conn.execute(
-            text("SELECT extname FROM pg_extension WHERE extname IN "
-                 "('postgis','btree_gist','pg_trgm','citext','unaccent')")
+            text(
+                "SELECT extname FROM pg_extension WHERE extname IN "
+                "('postgis','btree_gist','pg_trgm','citext','unaccent')"
+            )
         )
         assert {r[0] for r in rows} == {"postgis", "btree_gist", "pg_trgm", "citext", "unaccent"}

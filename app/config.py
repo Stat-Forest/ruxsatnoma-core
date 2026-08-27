@@ -1,4 +1,5 @@
 """Настройки приложения: всё из окружения/.env, никаких хардкодов по коду."""
+
 from functools import lru_cache
 from typing import Literal
 

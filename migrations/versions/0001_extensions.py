@@ -1,4 +1,5 @@
 """Расширения PostgreSQL (design/02, принцип 8)."""
+
 from alembic import op
 
 revision = "0001"

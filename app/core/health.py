@@ -1,4 +1,5 @@
 """Healthcheck: liveness без зависимостей, readiness с проверкой БД/PostGIS."""
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession

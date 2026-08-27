@@ -1,4 +1,5 @@
 """Сборка приложения: lifespan (БД), обработчики ошибок; роутеры модулей — этап 3."""
+
 from contextlib import asynccontextmanager
 
 import structlog

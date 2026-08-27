@@ -1,4 +1,5 @@
 """Подключение к PostgreSQL: async engine, фабрика сессий, Base с naming convention."""
+
 from sqlalchemy import MetaData
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase

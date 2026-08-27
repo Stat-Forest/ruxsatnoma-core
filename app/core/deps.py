@@ -1,4 +1,5 @@
 """Общие FastAPI-зависимости: сессия БД на запрос."""
+
 from collections.abc import AsyncIterator
 
 from fastapi import Request
