@@ -13,6 +13,9 @@ dependencies = [
     "pydantic-settings>=2.4",
     "structlog>=24.1",
     "uuid-utils>=0.9",
+    "argon2-cffi>=23.1",
+    "pyotp>=2.9",
+    "cryptography>=43",
 ]
 
 [dependency-groups]

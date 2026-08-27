@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     s3_access_key: str = "ruxsatnoma"
     s3_secret_key: str = "ruxsatnoma-secret"
     s3_bucket: str = "ruxsatnoma"
+    session_absolute_hours: int = 12
+    session_idle_minutes: int = 30
+    login_max_attempts: int = 5
+    login_lockout_minutes: int = 15
+    mfa_token_ttl_minutes: int = 5
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:
