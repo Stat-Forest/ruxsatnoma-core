@@ -1,8 +1,8 @@
-import httpx
 import pytest
 
 from app.core.errors import err
 from app.main import create_app
+from tests.conftest import make_client
 
 
 @pytest.fixture
@@ -17,10 +17,7 @@ async def client():
     async def crash():
         raise RuntimeError("внутреннее")
 
-    # raise_app_exceptions=False: как в tests/test_errors.py — иначе исключения
-    # из обработчиков могут прорваться наружу вместо HTTP-ответа
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+    async with make_client(app) as c:
         yield c
 
 
