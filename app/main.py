@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.config import get_settings
 from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
-from app.core.logging import configure_logging
+from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -57,11 +57,11 @@ def create_app() -> FastAPI:
     async def correlation_middleware(request: Request, call_next):
         rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
         request.state.correlation_id = rid
-        structlog.contextvars.bind_contextvars(correlation_id=rid)
+        structlog.contextvars.bind_contextvars(**{CORRELATION_ID_KEY: rid})
         try:
             response = await call_next(request)
         finally:
-            structlog.contextvars.unbind_contextvars("correlation_id")
+            structlog.contextvars.unbind_contextvars(CORRELATION_ID_KEY)
         response.headers["X-Request-Id"] = rid
         return response
 

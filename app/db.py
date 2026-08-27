@@ -4,7 +4,8 @@ import uuid
 from datetime import datetime
 
 import uuid_utils
-from sqlalchemy import DateTime, MetaData, Text
+from sqlalchemy import DateTime, MetaData, Text, TypeDecorator
+from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -40,6 +41,24 @@ def uuid7() -> uuid.UUID:
     so we re-wrap the bytes.
     """
     return uuid.UUID(bytes=uuid_utils.uuid7().bytes)
+
+
+class IPAddressString(TypeDecorator):
+    """PostgreSQL inet as plain str in Python.
+
+    asyncpg decodes inet to ipaddress objects and SQLAlchemy's INET does not
+    convert them back; the domain only ever displays addresses, so we
+    normalize to str on read and pass str through on write.
+    """
+
+    impl = INET
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return None if value is None else str(value)
+
+    def process_result_value(self, value, dialect):
+        return None if value is None else str(value)
 
 
 def make_engine(url: str) -> AsyncEngine:

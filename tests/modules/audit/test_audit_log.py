@@ -20,7 +20,9 @@ async def _insert_row(db) -> AuditLog:
 
 async def test_insert_and_read_back(db):
     entry = await _insert_row(db)
-    row = await db.get(AuditLog, entry.id)
+    entry_id = entry.id
+    db.expunge_all()
+    row = await db.get(AuditLog, entry_id)
     assert row is not None
     assert row.action == "test.write"
     assert row.result == "success"

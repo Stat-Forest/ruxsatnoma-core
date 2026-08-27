@@ -5,10 +5,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import CheckConstraint, Index, func
-from sqlalchemy.dialects.postgresql import INET, JSONB
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db import Base, uuid7
+from app.db import Base, IPAddressString, uuid7
 
 
 class AuditLog(Base):
@@ -17,6 +17,18 @@ class AuditLog(Base):
 
     Retention >= 3 years; partitioning deferred until real volumes
     (design/02). `user_id` gains its FK to users in stage 3.2.
+
+    - `occurred_at` is transaction-start time (`now()`): rows written in the
+      same transaction share one value, so it does not by itself total-order
+      events across rows — order by `(occurred_at, id)`, since `id` is a
+      monotonic UUIDv7.
+    - The future FK `user_id -> users` (stage 3.2) must be NO ACTION/RESTRICT
+      and added NOT VALID + VALIDATE CONSTRAINT: ON DELETE SET NULL/CASCADE
+      would fire the append-only triggers above, so users are never
+      physically deleted (block/soft-delete only). Exact parameters to be
+      confirmed in the 3.2 plan.
+    - Retention >= 3 years; rows can never be deleted here. Future purging
+      happens via partition DETACH+DROP, never TRUNCATE (triggers forbid it).
     """
 
     __tablename__ = "audit_log"
@@ -32,7 +44,7 @@ class AuditLog(Base):
     old_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     new_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     basis: Mapped[str | None]
-    ip: Mapped[str | None] = mapped_column(INET)
+    ip: Mapped[str | None] = mapped_column(IPAddressString)
     user_agent: Mapped[str | None]
     # text, not uuid: client-supplied X-Request-Id passes through as-is
     correlation_id: Mapped[str | None]

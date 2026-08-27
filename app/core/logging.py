@@ -5,6 +5,9 @@ from typing import Literal
 
 import structlog
 
+# structlog contextvars key: the correlation middleware binds it, audit.service reads it.
+CORRELATION_ID_KEY = "correlation_id"
+
 
 def configure_logging(log_format: Literal["console", "json"]) -> None:
     processors = [

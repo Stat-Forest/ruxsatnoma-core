@@ -7,11 +7,12 @@ and its trail durable atomically, or rolls back both.
 """
 
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import CORRELATION_ID_KEY
 from app.modules.audit import repo
 from app.modules.audit.models import AuditLog
 
@@ -26,7 +27,7 @@ async def log(
     old_value: dict[str, Any] | None = None,
     new_value: dict[str, Any] | None = None,
     basis: str | None = None,
-    result: str = "success",
+    result: Literal["success", "denied", "error"] = "success",
     ip: str | None = None,
     user_agent: str | None = None,
     correlation_id: str | None = None,
@@ -40,9 +41,14 @@ async def log(
     for system/worker actions. When `correlation_id` is not given, the
     request id bound by the correlation middleware is picked up from
     structlog contextvars (workers pass their own explicitly).
+
+    A raised exception rolls back the caller's transaction INCLUDING this
+    trail — so `result="denied"`/`"error"` entries survive only on
+    non-raising paths or via a separate transaction; the denied/error audit
+    path is designed in stage 3.2.
     """
     if correlation_id is None:
-        correlation_id = structlog.contextvars.get_contextvars().get("correlation_id")
+        correlation_id = structlog.contextvars.get_contextvars().get(CORRELATION_ID_KEY)
     entry = AuditLog(
         action=action,
         user_id=user_id,

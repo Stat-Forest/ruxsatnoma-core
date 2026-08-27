@@ -2,7 +2,9 @@
 
 import uuid
 
+import pytest
 import structlog
+from sqlalchemy.exc import IntegrityError
 
 from app.db import make_session_factory
 from app.modules.audit import service
@@ -26,7 +28,9 @@ async def test_log_writes_all_fields(db):
         correlation_id="req-42",
         extra={"note": "integration test"},
     )
-    row = await db.get(AuditLog, entry.id)
+    entry_id = entry.id
+    db.expunge_all()
+    row = await db.get(AuditLog, entry_id)
     assert row.action == "application.submit"
     assert row.user_id == user_id
     assert row.object_type == "application"
@@ -35,7 +39,7 @@ async def test_log_writes_all_fields(db):
     assert row.new_value == {"status": "SUBMITTED"}
     assert row.basis == "scenario C3"
     assert row.result == "success"
-    assert str(row.ip) == "10.0.0.1"
+    assert row.ip == "10.0.0.1"
     assert row.user_agent == "pytest"
     assert row.correlation_id == "req-42"
     assert row.extra == {"note": "integration test"}
@@ -68,3 +72,8 @@ async def test_log_does_not_commit(engine, db):
     factory = make_session_factory(engine)
     async with factory() as other:
         assert await other.get(AuditLog, entry_id) is None
+
+
+async def test_log_invalid_result_raises_at_call_site(db):
+    with pytest.raises(IntegrityError):
+        await service.log(db, action="test.invalid", result="hacked")  # type: ignore[arg-type]
