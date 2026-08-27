@@ -7,6 +7,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+import app.models_registry  # noqa: F401  # populate Base.metadata
 from app.config import get_settings
 from app.db import Base
 

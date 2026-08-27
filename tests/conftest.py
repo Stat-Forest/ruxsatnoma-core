@@ -1,12 +1,30 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.models_registry  # noqa: F401  # populate Base.metadata for migration tests
 from app.config import get_settings
 from app.db import make_engine, make_session_factory
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def _migrated_test_db() -> None:
+    """Bring the test DB to head before any test runs.
+
+    Test collection is alphabetical, so tests/modules/... collects before
+    tests/test_migrations.py — without this, a test touching a migrated
+    table can run before that table exists. Mirrors the upgrade-to-head
+    call test_migrations.py makes itself (idempotent, so no conflict).
+    """
+    cfg = Config("alembic.ini")
+    cfg.attributes["sqlalchemy_url"] = get_settings().database_url_test
+    await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
 @pytest.fixture(scope="session")
