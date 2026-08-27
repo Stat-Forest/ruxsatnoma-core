@@ -4,15 +4,21 @@ import uuid
 
 import pytest
 import structlog
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.db import make_session_factory
 from app.modules.audit import service
 from app.modules.audit.models import AuditLog
+from app.modules.auth.models import Role, User
 
 
 async def test_log_writes_all_fields(db):
-    user_id, object_id = uuid.uuid4(), uuid.uuid4()
+    role_id = (await db.execute(select(Role.id).where(Role.code == "sys_admin"))).scalar_one()
+    user = User(full_name="Audit Test User", role_id=role_id)
+    db.add(user)
+    await db.flush()
+    user_id, object_id = user.id, uuid.uuid4()
     entry = await service.log(
         db,
         action="application.submit",

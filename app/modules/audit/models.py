@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, Index, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,17 +16,16 @@ class AuditLog(Base):
     rejected by DB triggers (migration 0002); an attempt is incident RI-06.
 
     Retention >= 3 years; partitioning deferred until real volumes
-    (design/02). `user_id` gains its FK to users in stage 3.2.
+    (design/02). `user_id` FK to users added in migration 0003 (stage 3.2).
 
     - `occurred_at` is transaction-start time (`now()`): rows written in the
       same transaction share one value, so it does not by itself total-order
       events across rows — order by `(occurred_at, id)`, since `id` is a
       monotonic UUIDv7.
-    - The future FK `user_id -> users` (stage 3.2) must be NO ACTION/RESTRICT
-      and added NOT VALID + VALIDATE CONSTRAINT: ON DELETE SET NULL/CASCADE
+    - The FK `user_id -> users` (migration 0003) is NO ACTION (ruling 3) and
+      was added NOT VALID + VALIDATE CONSTRAINT: ON DELETE SET NULL/CASCADE
       would fire the append-only triggers above, so users are never
-      physically deleted (block/soft-delete only). Exact parameters to be
-      confirmed in the 3.2 plan.
+      physically deleted (block/soft-delete only).
     - Retention >= 3 years; rows can never be deleted here. Future purging
       happens via partition DETACH+DROP, never TRUNCATE (triggers forbid it).
     """
@@ -37,7 +36,9 @@ class AuditLog(Base):
     # Transaction-start time: the trail carries the exact time of the action
     # it is written together with (same transaction).
     occurred_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    user_id: Mapped[uuid.UUID | None]  # null = system/worker; FK added in 3.2
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id")
+    )  # null = system/worker
     action: Mapped[str]  # "<object>.<verb>", e.g. "application.submit"
     object_type: Mapped[str | None]
     object_id: Mapped[uuid.UUID | None]
