@@ -1,0 +1,37 @@
+[project]
+name = "ruxsatnoma-backend"
+version = "0.1.0"
+description = "Ruxsatnoma-urmon — электронные разрешения на пользование лесным фондом"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "geoalchemy2>=0.15",
+    "alembic>=1.13",
+    "pydantic-settings>=2.4",
+    "structlog>=24.1",
+    "uuid-utils>=0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "pre-commit>=3.7",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
