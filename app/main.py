@@ -16,6 +16,7 @@ from app.core.health import router as health_router
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
 from app.modules.admin.refs_router import router as refs_router
+from app.modules.admin.router import router as admin_router
 from app.modules.auth.router import router as auth_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -119,5 +120,6 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(refs_router, prefix="/api/v1")
+    app.include_router(admin_router, prefix="/api/v1")
 
     return app

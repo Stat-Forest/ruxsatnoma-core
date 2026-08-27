@@ -84,6 +84,12 @@ async def get_organization_by_code(db: AsyncSession, code: str) -> Organization 
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
+async def get_agency(db: AsyncSession) -> Organization | None:
+    """The single root organization, if it has been created yet (ruling 6)."""
+    stmt = select(Organization).where(Organization.kind == "agency")
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def is_descendant(
     db: AsyncSession, *, ancestor_id: uuid.UUID, candidate_id: uuid.UUID
 ) -> bool:

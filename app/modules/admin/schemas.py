@@ -41,6 +41,22 @@ class OrganizationOut(BaseModel):
     status: str
 
 
+class OrganizationAdminOut(BaseModel):
+    """The admin write-surface shape (Task 5): `OrganizationOut` plus `requisites` —
+    used only by routes gated behind `admin.organizations.manage`, never by /refs."""
+
+    id: uuid.UUID
+    parent_id: uuid.UUID | None
+    kind: str
+    code: str
+    name: dict[str, Any]
+    stir: str | None
+    region_id: uuid.UUID | None
+    district_id: uuid.UUID | None
+    requisites: dict[str, Any]
+    status: str
+
+
 class ActivityTypeOut(BaseModel):
     id: uuid.UUID
     code: str
