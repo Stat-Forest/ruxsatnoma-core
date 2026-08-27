@@ -11,6 +11,9 @@ services:
       # монтируем ОДИН файл, не каталог: bind-mount каталога затёр бы
       # собственные init-скрипты образа postgis (они ставят расширение в основную БД)
       - ./docker/initdb/01-test-db.sql:/docker-entrypoint-initdb.d/99-test-db.sql:ro
+      # 98- runs after the image's 10_postgis.sh: drop its unused tiger/topology
+      # extras so dev-DB autogenerate stays clean (see the SQL file's comment)
+      - ./docker/initdb/02-drop-image-extras.sql:/docker-entrypoint-initdb.d/98-drop-image-extras.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ruxsatnoma"]
       interval: 5s
