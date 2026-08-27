@@ -8,3 +8,7 @@ htmlcov/
 .coverage
 minio-data/
 pg-data/
+.DS_Store
+.idea/
+.vscode/
+.superpowers/
