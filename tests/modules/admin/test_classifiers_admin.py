@@ -164,6 +164,63 @@ async def test_archive_item_removes_it_from_refs(db):
     assert listed.json() == []
 
 
+async def test_archived_item_with_future_valid_to_disappears_from_refs(db):
+    """Finding 1: the date range alone cannot tell "pulled early" apart from "still
+    current" when `valid_to` was set to a date that hasn't arrived yet — `/refs`
+    must also check `status` for a "what's current" (no `on_date`) query."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"future-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    item = ClassifierItem(
+        classifier_id=classifier.id,
+        code="F-01",
+        name={"uz_cyrl": "Х"},
+        valid_from=date(2026, 1, 1),
+        valid_to=date(2030, 1, 1),  # far future: date range alone would keep it visible
+    )
+    db.add(item)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        archived = await client.post(f"{API}/admin/classifier-items/{item.id}/archive")
+        listed = await client.get(f"{API}/refs/classifiers/future-{suffix}/items")
+    assert archived.status_code == 200, archived.text
+    assert listed.json() == []
+
+
+async def test_archive_same_day_valid_from_does_not_500(db):
+    """Finding 2: `valid_from` today (or later) plus no explicit `valid_to` must not
+    make the default-end-date fallback compute something earlier than `valid_from`
+    — that would fail the `valid_period` CHECK and surface as a 500, not a clean
+    archive."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"sameday-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    item = ClassifierItem(
+        classifier_id=classifier.id,
+        code="S-01",
+        name={"uz_cyrl": "Х"},
+        valid_from=date.today(),
+    )
+    db.add(item)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        archived = await client.post(f"{API}/admin/classifier-items/{item.id}/archive")
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["status"] == "archived"
+
+
 async def test_patch_item_audits_old_and_new(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)

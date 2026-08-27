@@ -144,7 +144,17 @@ async def list_classifier_items(
     include_archived: bool = False,
 ) -> list[ClassifierItem]:
     """Items valid on `on_date` (default: today). Archived rows are included only when
-    asked for — an admin editing history needs them, a form does not."""
+    asked for — an admin editing history needs them, a form does not.
+
+    `on_date` in the past is a historical lookup (what WAS in force then): the date
+    range alone decides it, status is irrelevant, because `supersede` (ruling 7)
+    leaves the superseded row `archived` forever even though it was correctly live
+    during its own `[valid_from, valid_to]` window. `on_date` omitted (today, the
+    default — "what a form should offer right now") additionally requires
+    `status == 'active'`, matching the sibling `list_activity_types` /
+    `list_livestock_types` pattern: date range alone cannot tell "pulled early via
+    `/archive`, date window not yet expired" apart from "still genuinely current."
+    """
     stmt = select(ClassifierItem).where(ClassifierItem.classifier_id == classifier_id)
     if not include_archived:
         day = on_date or date.today()
@@ -152,5 +162,7 @@ async def list_classifier_items(
             ClassifierItem.valid_from <= day,
             (ClassifierItem.valid_to.is_(None)) | (ClassifierItem.valid_to >= day),
         )
+        if on_date is None:
+            stmt = stmt.where(ClassifierItem.status == "active")
     stmt = stmt.order_by(ClassifierItem.sort_order, ClassifierItem.code)
     return list((await db.execute(stmt)).scalars())

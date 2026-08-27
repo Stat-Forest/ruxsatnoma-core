@@ -299,11 +299,15 @@ async def archive_classifier_item(
         return item
     before = _item_snapshot(item)
     item.status = "archived"
-    # /refs filters by `valid_to >= day` (inclusive), so an item archived with no
-    # explicit end date must close as of yesterday, not today — otherwise it would
-    # still appear in today's listing until midnight (same "close the day before"
-    # convention supersede uses for its archived predecessor).
-    item.valid_to = valid_to or item.valid_to or (date.today() - timedelta(days=1))
+    # The default end date is "yesterday" — the same "close the day before" the
+    # next thing starts convention `supersede` uses for its archived predecessor
+    # (here, the thing that "starts" is the archival itself, today). Clamped to
+    # never precede `valid_from`: an item whose `valid_from` is today or later
+    # would otherwise compute a `valid_to` before `valid_from` and fail the
+    # `valid_period` CHECK at flush (ERR-SYS-001, 500) instead of archiving cleanly.
+    item.valid_to = (
+        valid_to or item.valid_to or max(item.valid_from, date.today() - timedelta(days=1))
+    )
     await db.flush()
     await audit.log(
         db,
