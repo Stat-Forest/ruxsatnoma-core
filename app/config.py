@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +21,15 @@ class Settings(BaseSettings):
     s3_access_key: str = "ruxsatnoma"
     s3_secret_key: str = "ruxsatnoma-secret"
     s3_bucket: str = "ruxsatnoma"
+
+    @model_validator(mode="after")
+    def _forbid_default_secret_in_prod(self) -> "Settings":
+        # Защита от молчаливого старта в проде с дефолтным секретом.
+        if self.app_env == "prod" and self.secret_key == "change-me":
+            raise ValueError(
+                "secret_key нельзя оставлять значением по умолчанию (change-me) в app_env=prod"
+            )
+        return self
 
 
 @lru_cache
