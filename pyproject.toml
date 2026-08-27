@@ -22,7 +22,16 @@ dev = [
     "httpx>=0.27",
     "ruff>=0.6",
     "pre-commit>=3.7",
+    "pyright>=1.1.411",
 ]
+
+[tool.pyright]
+# Standard mode to start (decision #39); tighten per-module as the code grows.
+typeCheckingMode = "standard"
+pythonVersion = "3.14"
+venvPath = "."
+venv = ".venv"
+include = ["app", "tests", "migrations"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

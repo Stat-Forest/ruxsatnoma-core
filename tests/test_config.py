@@ -16,7 +16,7 @@ def _clear_settings_cache():
 def test_settings_read_from_env(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h:5432/db")
     monkeypatch.setenv("APP_ENV", "test")
-    s = Settings(_env_file=None)  # только окружение, без .env
+    s = Settings(_env_file=None)  # pyright: ignore[reportCallIssue]  # env only, no .env file
     assert s.database_url == "postgresql+asyncpg://u:p@h:5432/db"
     assert s.app_env == "test"
 
@@ -27,9 +27,9 @@ def test_get_settings_cached():
 
 def test_prod_rejects_default_secret_key():
     with pytest.raises(ValidationError):
-        Settings(app_env="prod", secret_key="change-me", _env_file=None)
+        Settings(app_env="prod", secret_key="change-me", _env_file=None)  # pyright: ignore[reportCallIssue]
 
 
 def test_prod_accepts_custom_secret_key():
-    s = Settings(app_env="prod", secret_key="a-real-secret-value", _env_file=None)
+    s = Settings(app_env="prod", secret_key="a-real-secret-value", _env_file=None)  # pyright: ignore[reportCallIssue]
     assert s.secret_key == "a-real-secret-value"

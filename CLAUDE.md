@@ -11,6 +11,7 @@ uv run alembic upgrade head
 uv run uvicorn app.main:create_app --factory --reload
 uv run pytest -v              # integration tests need docker up
 uv run ruff check . && uv run ruff format --check .
+uv run pyright                # type check (standard mode, decision #39)
 ```
 
 ## Hard rules
@@ -26,4 +27,4 @@ uv run ruff check . && uv run ruff format --check .
 
 ## Next-work checklist (stage 3 start)
 
-1. Consider type checker (mypy/pyright) + CI before scaling to 20 modules (final-review recommendation).
+1. CI pipeline — deferred until the repos get a remote (pyright is done: decision #39, wired into pre-commit and the commands above).
