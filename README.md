@@ -5,7 +5,7 @@ FastAPI-монолит системы электронных разрешени�
 
 ## Запуск с нуля
 
-Требуется: Docker, [uv](https://docs.astral.sh/uv/), Python 3.12 (поставит uv).
+Требуется: Docker, [uv](https://docs.astral.sh/uv/), Python 3.14 (поставит uv).
 
 ```bash
 uv sync                        # зависимости

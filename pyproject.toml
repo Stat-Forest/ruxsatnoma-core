@@ -1,8 +1,8 @@
 [project]
 name = "ruxsatnoma-backend"
 version = "0.1.0"
-description = "Ruxsatnoma-urmon — электронные разрешения на пользование лесным фондом"
-requires-python = ">=3.12"
+description = "Ruxsatnoma-urmon — electronic permits for the use of forest fund lands"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -32,11 +32,11 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
 [tool.ruff.lint.flake8-bugbear]
-# Depends(...) в значении по умолчанию — идиоматичный DI-паттерн FastAPI, не баг (B008)
+# Depends(...) as a default value is FastAPI's idiomatic DI pattern, not a bug (B008)
 extend-immutable-calls = ["fastapi.Depends"]

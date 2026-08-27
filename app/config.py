@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     s3_bucket: str = "ruxsatnoma"
 
     @model_validator(mode="after")
-    def _forbid_default_secret_in_prod(self) -> "Settings":
+    def _forbid_default_secret_in_prod(self) -> Settings:
         # Защита от молчаливого старта в проде с дефолтным секретом.
         if self.app_env == "prod" and self.secret_key == "change-me":
             raise ValueError(
