@@ -1,6 +1,10 @@
-"""Подключение к PostgreSQL: async engine, фабрика сессий, Base с naming convention."""
+"""PostgreSQL wiring: async engine, session factory, Base, shared column helpers."""
 
-from sqlalchemy import MetaData
+import uuid
+from datetime import datetime
+
+import uuid_utils
+from sqlalchemy import DateTime, MetaData, Text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -9,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
-# Единые имена констрейнтов — чтобы Alembic-миграции были детерминированными
+# Deterministic constraint names for Alembic migrations
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
     "uq": "uq_%(table_name)s_%(column_0_N_name)s",
@@ -21,6 +25,21 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+    # Project-wide column defaults (decision #27): time is timestamptz (UTC),
+    # strings are TEXT (statuses constrained by CHECK, not varchar length).
+    type_annotation_map = {
+        datetime: DateTime(timezone=True),
+        str: Text(),
+    }
+
+
+def uuid7() -> uuid.UUID:
+    """UUIDv7 (time-ordered) as a stdlib UUID — the PK default for all tables (decision #27).
+
+    uuid-utils returns its own UUID class; asyncpg/SQLAlchemy expect stdlib uuid.UUID,
+    so we re-wrap the bytes.
+    """
+    return uuid.UUID(bytes=uuid_utils.uuid7().bytes)
 
 
 def make_engine(url: str) -> AsyncEngine:
