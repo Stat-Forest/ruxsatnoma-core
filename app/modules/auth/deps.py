@@ -55,3 +55,17 @@ async def get_current_user(
     if user.must_change_password and request.url.path not in _MUST_CHANGE_ALLOWED:
         raise err("ERR-AUTH-007")
     return user
+
+
+def require_permission(code: str):
+    """Dependency factory: current user must hold `code` (role ∪ personal grants)."""
+
+    async def _check(
+        user: Annotated[User, Depends(get_current_user)],
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        if code not in await repo.permission_codes(db, user):
+            raise err("ERR-ACL-001", details={"permission": code})
+        return user
+
+    return _check
