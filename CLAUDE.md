@@ -24,6 +24,7 @@ uv run pyright                # type check (standard mode, decision #39)
 - **Time**: store UTC (`timestamptz`), display Asia/Tashkent. Money/norms — `numeric`, never float.
 - **Migrations**: Alembic autogenerate is wired with GeoAlchemy2 `alembic_helpers` (protects PostGIS tables) — do not remove; keep `sqlalchemy.url` in `alembic.ini` empty (URL comes from settings/attributes); naming convention lives on `Base.metadata`. A guard test asserts an empty autogenerate diff.
 - **Audit invariant**: every state-changing action calls `audit.service.log(db, action=…)` in the same transaction (no commit inside — `get_db` commits both together). Action codes: `"<object>.<verb>"` in English, constants live in the acting module.
+- **Auth**: protect routes with `Depends(get_current_user)` / `require_permission("code")` from `app/modules/auth/deps.py`; permission codes are registered in the owning module via `auth.permissions.register`. Zone scoping — `app/core/abac.py` `zone_filter`. Denied/error audit entries follow the early-commit pattern: write counters + `audit.service.log(..., result="denied")`, `await db.commit()`, then `raise err(...)`.
 
 ## Next-work checklist (stage 3 start)
 
