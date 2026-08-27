@@ -68,7 +68,11 @@ def coerce(spec: SettingSpec, raw: Any) -> Any:
             raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected integer"})
         try:
             value = int(raw)
-        except TypeError, ValueError:
+        # Deliberately parenthesized, not the PEP 758 bare form: for years
+        # `except Foo, bar:` meant Python 2's except-as binding, so the bare
+        # shape reads like that trap. ruff format's py314 target rewrites it
+        # away otherwise, hence the fmt:skip.
+        except (TypeError, ValueError):  # fmt: skip
             raise err(
                 "ERR-VAL-001", details={"setting": spec.key, "reason": "expected integer"}
             ) from None
