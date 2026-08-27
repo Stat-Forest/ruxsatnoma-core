@@ -33,3 +33,16 @@ def test_prod_rejects_default_secret_key():
 def test_prod_accepts_custom_secret_key():
     s = Settings(app_env="prod", secret_key="a-real-secret-value", _env_file=None)  # pyright: ignore[reportCallIssue]
     assert s.secret_key == "a-real-secret-value"
+
+
+def test_policy_settings_are_not_deployment_config():
+    """session/lockout policy lives in system_settings, not in env (stage 3.3a ruling 9)."""
+    for field in (
+        "session_absolute_hours",
+        "session_idle_minutes",
+        "login_max_attempts",
+        "login_lockout_minutes",
+        "mfa_token_ttl_minutes",
+        "mfa_max_attempts",
+    ):
+        assert field not in Settings.model_fields

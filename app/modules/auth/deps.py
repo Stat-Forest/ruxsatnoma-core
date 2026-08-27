@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.core import settings_store
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.security import hash_token
@@ -31,7 +31,7 @@ async def get_current_session(
     now = datetime.now(UTC)
     if row is None or row.revoked_at is not None or row.expires_at <= now:
         raise err("ERR-AUTH-002")
-    idle_limit = timedelta(minutes=get_settings().session_idle_minutes)
+    idle_limit = timedelta(minutes=await settings_store.get_int(db, "session_idle_minutes"))
     if row.last_seen_at + idle_limit <= now:
         await service.revoke_session(db, row, reason="idle timeout")
         await db.commit()  # the revocation must survive the 401 below (ruling 2 pattern)
