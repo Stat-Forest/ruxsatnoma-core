@@ -3,8 +3,10 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import func, select
 
+from app.config import get_settings
 from app.core.security import hash_token, new_token
 from app.main import create_app
 from app.modules.audit.models import AuditLog
@@ -12,6 +14,7 @@ from app.modules.auth.models import Role, Session, User
 from tests.conftest import make_client
 
 API = "/api/v1"
+ADMIN_ORIGIN = "https://admin.ruxsatnoma.uz"
 
 
 async def make_user(db, *, role_code="executor_staff", **overrides) -> User:
@@ -173,5 +176,48 @@ async def test_mutation_from_own_origin_is_accepted(db):
         client.cookies.set("session", token)
         r = await client.post(
             f"{API}/auth/logout", headers={"X-CSRF-Token": csrf, "Origin": "http://t"}
+        )
+    assert r.status_code == 204
+
+
+@pytest.fixture
+def _cors_allowlist(monkeypatch):
+    """Configures the adminka's origin as the sole allowlisted one (ruling 3)."""
+    monkeypatch.setenv("CORS_ORIGINS", f'["{ADMIN_ORIGIN}"]')
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def test_mutation_from_allowlisted_origin_is_accepted(db, _cors_allowlist):
+    """The allowlist branch of _origin_allowed, exercised on a real mutating
+    request — not just the same-origin fallback the other Origin tests cover."""
+    user = await make_user(db)
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.post(
+            f"{API}/auth/logout", headers={"X-CSRF-Token": csrf, "Origin": ADMIN_ORIGIN}
+        )
+    assert r.status_code == 204
+
+
+async def test_mutation_with_body_sourced_csrf_from_allowlisted_origin(db, _cors_allowlist):
+    """End-to-end proof of ruling 3's actual point: a cross-origin adminka cannot
+    read the csrf_token cookie via JS (host-only, and Set-Cookie is never exposed to
+    JS regardless of CORS config), so it must read it from the JSON body instead —
+    exactly what a page reload recovery or a fresh mfa/verify response provides."""
+    user = await make_user(db)
+    _, token, _ = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        me = await client.get(f"{API}/auth/me", headers={"Origin": ADMIN_ORIGIN})
+        csrf = me.json()["csrf_token"]
+        r = await client.post(
+            f"{API}/auth/logout", headers={"X-CSRF-Token": csrf, "Origin": ADMIN_ORIGIN}
         )
     assert r.status_code == 204

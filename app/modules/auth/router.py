@@ -27,8 +27,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 @router.get("/me", response_model=MeOut)
 async def me(
     user: Annotated[User, Depends(get_current_user)],
+    session_row: Annotated[Session, Depends(get_current_session)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> MeOut:
+    # session_row depends on get_current_session, which get_current_user already
+    # depends on — FastAPI caches it per-request, so this doesn't re-run the chain.
+    # Carrying csrf_token here (ruling 3) lets a page reload recover it without a
+    # fresh login.
     role = await repo.get_role(db, user.role_id)
     assert role is not None  # FK guarantees it
     return MeOut(
@@ -40,6 +45,7 @@ async def me(
             district_id=user.district_id,
             organization_id=user.organization_id,
         ),
+        csrf_token=session_row.csrf_token,
     )
 
 
@@ -100,6 +106,7 @@ async def mfa_verify(
             district_id=user.district_id,
             organization_id=user.organization_id,
         ),
+        csrf_token=csrf,
     )
 
 
