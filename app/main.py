@@ -39,8 +39,6 @@ def create_app() -> FastAPI:
     async def correlation_middleware(request: Request, call_next):
         import uuid
 
-        import structlog
-
         rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
         request.state.correlation_id = rid
         structlog.contextvars.bind_contextvars(correlation_id=rid)
@@ -60,11 +58,16 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_handler(request: Request, exc: Exception):
-        # Текст исключения наружу не отдаём — только код; детали в логах
-        structlog.get_logger().exception("unhandled_error")
+        # Текст исключения наружу не отдаём — только код; детали в логах.
+        # ServerErrorMiddleware вызывает этот хендлер в обход correlation_middleware
+        # (contextvar correlation_id к этому моменту уже отвязан) — id и заголовок
+        # проставляем здесь явно из request.state.
+        rid = getattr(request.state, "correlation_id", None)
+        structlog.get_logger().exception("unhandled_error", correlation_id=rid)
         return JSONResponse(
             status_code=500,
             content=_error_body(request, "ERR-SYS-001", "Внутренняя ошибка сервера", None),
+            headers={"X-Request-Id": rid} if rid else None,
         )
 
     return app
