@@ -2,6 +2,7 @@
 
 Usage: uv run python -m app.bootstrap --login admin --full-name "Admin" [--password ...]
 Prints the one-time password (if generated) and the otpauth:// URI once; store them now.
+--password is for automation; prefer the generated one-time password.
 """
 
 import argparse
@@ -14,7 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.crypto import encrypt_str
-from app.core.security import hash_password, new_totp_secret, totp_provisioning_uri
+from app.core.security import (
+    hash_password,
+    new_totp_secret,
+    totp_provisioning_uri,
+    validate_password_policy,
+)
 from app.db import make_engine, make_session_factory
 from app.modules.audit import service as audit
 from app.modules.auth.models import Role, User
@@ -34,6 +40,8 @@ async def bootstrap_admin(
     if existing is not None:
         return None
     role_id = (await db.execute(select(Role.id).where(Role.code == "sys_admin"))).scalar_one()
+    if password is not None:
+        validate_password_policy(password)
     one_time = password or ("Aa1!" + secrets.token_urlsafe(12))
     secret = new_totp_secret()
     user = User(

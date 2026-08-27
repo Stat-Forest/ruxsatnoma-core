@@ -121,6 +121,8 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        # TypeDecorator renders as app.db.IPAddressString in autogenerate; INET is
+        # the real DDL type.
         sa.Column("ip", postgresql.INET(), nullable=True),
         sa.Column("user_agent", sa.Text(), nullable=True),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
@@ -203,6 +205,7 @@ def upgrade() -> None:
         op.execute(
             sa.text(
                 "INSERT INTO roles (id, code, name, is_system) "
+                # asyncpg needs an explicit uuid cast for text binds.
                 "VALUES (CAST(:id AS uuid), :code, "
                 "jsonb_build_object('uz_cyrl', :cyr, 'en', :en), true)"
             ).bindparams(id=role_id, code=code, cyr=name_cyr, en=name_en)

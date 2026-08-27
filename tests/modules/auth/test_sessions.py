@@ -3,10 +3,11 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.security import hash_token, new_token
 from app.main import create_app
+from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Role, Session, User
 from tests.conftest import make_client
 
@@ -123,6 +124,18 @@ async def test_logout_with_csrf_revokes(db, engine):
     async with make_session_factory(engine)() as fresh:
         row2 = await fresh.get(Session, row.id)
         assert row2 is not None and row2.revoked_at is not None
+        revoke_count = (
+            await fresh.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.user_id == user.id,
+                    AuditLog.action == "session.revoke",
+                    AuditLog.basis == "logout",
+                )
+            )
+        ).scalar()
+        assert revoke_count == 1
 
 
 async def test_must_change_password_gate(db):

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     login_max_attempts: int = 5
     login_lockout_minutes: int = 15
     mfa_token_ttl_minutes: int = 5
+    mfa_max_attempts: int = 5
+    cookie_secure: bool | None = None
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:
@@ -35,6 +37,11 @@ class Settings(BaseSettings):
                 "secret_key нельзя оставлять значением по умолчанию (change-me) в app_env=prod"
             )
         return self
+
+    def resolve_cookie_secure(self) -> bool:
+        """cookie_secure=None (default) follows app_env; an explicit value overrides it
+        (e.g. https on a non-prod staging deploy)."""
+        return self.cookie_secure if self.cookie_secure is not None else self.app_env == "prod"
 
 
 @lru_cache

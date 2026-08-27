@@ -3,9 +3,10 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import Base
 from app.modules.auth.models import OtpCode, Role, RolePermission, Session, User, UserPermission
 
 
@@ -27,9 +28,28 @@ async def get_session_by_token_hash(db: AsyncSession, token_hash: str) -> Sessio
     ).scalar_one_or_none()
 
 
-async def add(db: AsyncSession, obj) -> None:
+async def add(db: AsyncSession, obj: Base) -> None:
     db.add(obj)
     await db.flush()
+
+
+async def increment_failed_logins(db: AsyncSession, user_id: uuid.UUID) -> int:
+    """Atomic SQL increment (returning the new value) instead of a Python
+    read-modify-write, which would lose updates under concurrent attempts."""
+    result = await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(failed_login_count=User.failed_login_count + 1)
+        .returning(User.failed_login_count)
+    )
+    return result.scalar_one()
+
+
+async def lock_user(db: AsyncSession, user_id: uuid.UUID, *, until: datetime) -> None:
+    """Sets locked_until and resets the failed-attempt counter in one statement."""
+    await db.execute(
+        update(User).where(User.id == user_id).values(locked_until=until, failed_login_count=0)
+    )
 
 
 async def permission_codes(db: AsyncSession, user: User) -> set[str]:
@@ -47,6 +67,9 @@ async def permission_codes(db: AsyncSession, user: User) -> set[str]:
 
 
 async def get_valid_otp(db: AsyncSession, code_hash: str, purpose: str) -> OtpCode | None:
+    """Looks up by code_hash alone — sufficient for 256-bit tokens; NEVER reuse for
+    short numeric codes (phone/email OTP in 3.2b) without adding a target/user filter.
+    """
     now = datetime.now(UTC)
     return (
         await db.execute(
@@ -60,14 +83,17 @@ async def get_valid_otp(db: AsyncSession, code_hash: str, purpose: str) -> OtpCo
     ).scalar_one_or_none()
 
 
-async def revoke_other_sessions(db: AsyncSession, user_id: uuid.UUID, *, keep: uuid.UUID) -> None:
+async def other_active_sessions(
+    db: AsyncSession, user_id: uuid.UUID, *, exclude: uuid.UUID
+) -> list[Session]:
+    """Non-revoked sessions of `user_id` other than `exclude` (pure SELECT — the
+    caller decides how to revoke them, e.g. via service.revoke_session for the audit
+    trail each revocation needs)."""
     rows = (
         await db.execute(
             select(Session).where(
-                Session.user_id == user_id, Session.revoked_at.is_(None), Session.id != keep
+                Session.user_id == user_id, Session.revoked_at.is_(None), Session.id != exclude
             )
         )
     ).scalars()
-    now = datetime.now(UTC)
-    for row in rows:
-        row.revoked_at = now
+    return list(rows)

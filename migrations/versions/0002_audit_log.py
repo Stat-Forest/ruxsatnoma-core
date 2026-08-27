@@ -38,6 +38,8 @@ def upgrade() -> None:
         sa.Column("old_value", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("new_value", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("basis", sa.Text(), nullable=True),
+        # TypeDecorator renders as app.db.IPAddressString in autogenerate; INET is
+        # the real DDL type.
         sa.Column("ip", postgresql.INET(), nullable=True),
         sa.Column("user_agent", sa.Text(), nullable=True),
         sa.Column("correlation_id", sa.Text(), nullable=True),

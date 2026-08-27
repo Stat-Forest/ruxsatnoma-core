@@ -14,4 +14,6 @@ PERMISSIONS: dict[str, str] = {
 def register(codes: dict[str, str]) -> None:
     """Called by other modules to add their permission codes."""
     for code, description in codes.items():
+        if code in PERMISSIONS:
+            raise ValueError(f"permission code already registered: {code}")
         PERMISSIONS[code] = description

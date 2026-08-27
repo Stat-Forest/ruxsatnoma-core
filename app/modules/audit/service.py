@@ -44,8 +44,9 @@ async def log(
 
     A raised exception rolls back the caller's transaction INCLUDING this
     trail — so `result="denied"`/`"error"` entries survive only on
-    non-raising paths or via a separate transaction; the denied/error audit
-    path is designed in stage 3.2.
+    non-raising paths or via a separate transaction; denied/error entries use
+    the early-commit pattern (decision #40 ruling 2): write the trail, commit
+    explicitly, then raise.
     """
     if correlation_id is None:
         correlation_id = structlog.contextvars.get_contextvars().get(CORRELATION_ID_KEY)

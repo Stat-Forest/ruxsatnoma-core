@@ -12,6 +12,7 @@ uv sync                        # зависимости
 cp .env.example .env           # конфиг (дефолты рабочие для локалки)
 docker compose up -d           # PostgreSQL 16 + PostGIS, MinIO
 uv run alembic upgrade head    # миграции
+uv run python -m app.bootstrap --login admin --full-name "Admin"   # первый sys_admin (печатает одноразовый пароль и TOTP URI)
 uv run uvicorn app.main:create_app --factory --reload   # API на :8000
 ```
 

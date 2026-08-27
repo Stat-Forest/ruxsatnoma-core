@@ -82,7 +82,7 @@ async def mfa_verify(
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("User-Agent"),
     )
-    secure = get_settings().app_env == "prod"
+    secure = get_settings().resolve_cookie_secure()
     response.set_cookie("session", token, httponly=True, samesite="lax", secure=secure, path="/")
     response.set_cookie("csrf_token", csrf, httponly=False, samesite="lax", secure=secure, path="/")
     role = await repo.get_role(db, user.role_id)

@@ -1,11 +1,22 @@
 """/auth/me carries permissions; require_permission gates a route; must-change blocks non-exempt."""
 
+import pytest
+
 from app.main import create_app
+from app.modules.auth import permissions
 from app.modules.auth.models import RolePermission, UserPermission
 from tests.conftest import make_client
 from tests.modules.auth.test_sessions import make_session, make_user
 
 API = "/api/v1"
+
+# Registered once per process at import time: module-level PERMISSIONS persists
+# across tests within one pytest run, and require_permission() now rejects an
+# unregistered code (F10) — re-registering here on a later import would itself
+# raise ValueError, so this must run exactly once, at module import.
+permissions.register(
+    {"test.secret": "throwaway (test_me_rbac)", "test.secret2": "throwaway (test_me_rbac)"}
+)
 
 
 async def test_me_lists_role_and_user_permissions(db):
@@ -35,7 +46,7 @@ async def test_me_lists_role_and_user_permissions(db):
     await db.commit()
 
 
-async def test_require_permission_403_without_grant(db):
+async def test_require_permission_403_without_grant(db, engine):
     # a throwaway app route protected by require_permission, mounted only in this test
     from typing import Annotated
 
@@ -59,6 +70,25 @@ async def test_require_permission_403_without_grant(db):
         client.cookies.set("session", token)
         r = await client.get(f"{API}/test-protected")
     assert r.status_code == 403 and r.json()["error"]["code"] == "ERR-ACL-001"
+
+    from sqlalchemy import func, select
+
+    from app.db import make_session_factory
+    from app.modules.audit.models import AuditLog
+
+    async with make_session_factory(engine)() as fresh:
+        denied = (
+            await fresh.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.user_id == user.id,
+                    AuditLog.action == "access.denied",
+                    AuditLog.basis == "test.secret",
+                )
+            )
+        ).scalar()
+        assert denied == 1
 
 
 async def test_require_permission_ok_with_grant(db):
@@ -112,3 +142,8 @@ async def test_must_change_password_blocks_non_exempt_route(db):
         client.cookies.set("session", token)
         r = await client.get(f"{API}/test-normal")
     assert r.status_code == 403 and r.json()["error"]["code"] == "ERR-AUTH-007"
+
+
+def test_register_duplicate_code_raises():
+    with pytest.raises(ValueError):
+        permissions.register({"test.secret": "duplicate registration"})

@@ -6,7 +6,7 @@ import secrets
 
 import pyotp
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 from app.core.errors import err
 
@@ -28,7 +28,7 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     try:
         return _hasher.verify(password_hash, password)
-    except VerifyMismatchError:
+    except VerifyMismatchError, VerificationError, InvalidHashError:
         return False
 
 

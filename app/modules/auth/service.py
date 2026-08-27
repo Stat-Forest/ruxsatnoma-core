@@ -4,6 +4,8 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import structlog
+from cryptography.fernet import InvalidToken
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -20,6 +22,11 @@ from app.core.security import (
 from app.modules.audit import service as audit
 from app.modules.auth import repo
 from app.modules.auth.models import OtpCode, Session, User
+
+# Timing-uniform response (user enumeration): computed once at import so the
+# unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
+# as a real verification instead of returning early and leaking timing.
+_DUMMY_HASH = hash_password("dummy-timing-equalizer")
 
 
 async def issue_session(
@@ -73,6 +80,7 @@ async def login_password(
     user = await repo.get_user_by_login(db, login)
     now = datetime.now(UTC)
     if user is None or user.status != "active" or user.password_hash is None:
+        await asyncio.to_thread(verify_password, password, _DUMMY_HASH)
         raise err("ERR-AUTH-001")  # no user to audit against; uniform response
     if user.locked_until is not None and user.locked_until > now:
         await audit.log(
@@ -87,11 +95,12 @@ async def login_password(
         await db.commit()
         raise err("ERR-AUTH-003")
     if not await asyncio.to_thread(verify_password, password, user.password_hash):
-        user.failed_login_count += 1
-        locked = user.failed_login_count >= settings.login_max_attempts
+        new_count = await repo.increment_failed_logins(db, user.id)
+        locked = new_count >= settings.login_max_attempts
         if locked:
-            user.locked_until = now + timedelta(minutes=settings.login_lockout_minutes)
-            user.failed_login_count = 0
+            await repo.lock_user(
+                db, user.id, until=now + timedelta(minutes=settings.login_lockout_minutes)
+            )
         await audit.log(
             db,
             action="user.login",
@@ -119,30 +128,71 @@ async def login_password(
 async def verify_mfa(
     db: AsyncSession, *, mfa_token: str, code: str, ip: str | None, user_agent: str | None
 ) -> tuple[User, Session, str, str]:
-    """TOTP step: consumes the mfa_token, opens the session."""
+    """TOTP step: consumes the mfa_token, opens the session.
+
+    Denied outcomes follow the same early-commit pattern as login_password
+    (ruling 2). A wrong TOTP code counts against `otp.attempts`; once that hits
+    `settings.mfa_max_attempts` the interim token is burned (single MFA handoff
+    exhausted) AND the attempt counts against the account's own
+    failed_login_count/locked_until — otherwise MFA brute force would have no
+    cap at all (the mfa_token itself never expires faster than 5 minutes).
+    """
+    settings = get_settings()
     otp = await repo.get_valid_otp(db, hash_token(mfa_token), purpose="mfa")
     if otp is None or otp.user_id is None:
         raise err("ERR-AUTH-001")
     user = await repo.get_user(db, otp.user_id)
     if user is None or user.status != "active" or user.mfa_secret is None:
         raise err("ERR-AUTH-001")
-    otp.attempts += 1
-    if not verify_totp(decrypt_str(user.mfa_secret), code):
+    now = datetime.now(UTC)
+    if user.locked_until is not None and user.locked_until > now:
+        # A lock acquired between the password step and this one (e.g. another
+        # concurrent attempt) must be honoured even with a correct code.
         await audit.log(
             db,
             action="user.login",
             user_id=user.id,
             result="denied",
-            basis="bad totp",
+            basis="locked",
             ip=ip,
             user_agent=user_agent,
         )
         await db.commit()
-        raise err("ERR-AUTH-001")
-    otp.used_at = datetime.now(UTC)
+        raise err("ERR-AUTH-003")
+    otp.attempts += 1
+    try:
+        secret = decrypt_str(user.mfa_secret)
+    except InvalidToken:
+        structlog.get_logger().error("mfa_secret_undecryptable", user_id=str(user.id))
+        raise err("ERR-AUTH-001") from None
+    if not verify_totp(secret, code):
+        locked = False
+        if otp.attempts >= settings.mfa_max_attempts:
+            otp.used_at = now  # burn: this handoff token is spent, MFA must restart
+            new_count = await repo.increment_failed_logins(db, user.id)
+            locked = new_count >= settings.login_max_attempts
+            if locked:
+                await repo.lock_user(
+                    db, user.id, until=now + timedelta(minutes=settings.login_lockout_minutes)
+                )
+            basis = "bad totp, token burned" + (", locked" if locked else "")
+        else:
+            basis = "bad totp"
+        await audit.log(
+            db,
+            action="user.login",
+            user_id=user.id,
+            result="denied",
+            basis=basis,
+            ip=ip,
+            user_agent=user_agent,
+        )
+        await db.commit()
+        raise err("ERR-AUTH-003" if locked else "ERR-AUTH-001")
+    otp.used_at = now
     user.failed_login_count = 0
     user.locked_until = None
-    user.last_login_at = datetime.now(UTC)
+    user.last_login_at = now
     row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
     await audit.log(
         db,
@@ -166,5 +216,6 @@ async def change_password(
     validate_password_policy(new)
     user.password_hash = await asyncio.to_thread(hash_password, new)
     user.must_change_password = False
-    await repo.revoke_other_sessions(db, user.id, keep=current_session_id)
+    for other in await repo.other_active_sessions(db, user.id, exclude=current_session_id):
+        await revoke_session(db, other, reason="password change")
     await audit.log(db, action="user.password_change", user_id=user.id)
