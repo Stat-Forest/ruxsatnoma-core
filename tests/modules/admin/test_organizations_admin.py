@@ -229,7 +229,7 @@ async def test_patch_updates_and_audits_old_value(db, agency):
         await db.execute(
             select(AuditLog)
             .where(AuditLog.action == "organization.update", AuditLog.object_id == org.id)
-            .order_by(AuditLog.occurred_at.desc())
+            .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
             .limit(1)
         )
     ).scalar_one()

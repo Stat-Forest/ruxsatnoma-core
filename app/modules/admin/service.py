@@ -5,16 +5,25 @@ and 6 carry the hierarchy rules, archival semantics and the audit trail.
 """
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.errors import err
+from app.core.models import SystemSetting
 from app.modules.admin import repo
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
-from app.modules.admin.schemas import OrganizationIn, OrganizationPatch
+from app.modules.admin.schemas import (
+    ClassifierIn,
+    ClassifierItemIn,
+    ClassifierItemPatch,
+    OrganizationIn,
+    OrganizationPatch,
+    SettingOut,
+)
 from app.modules.audit import service as audit
 from app.modules.auth.models import User
 
@@ -192,3 +201,189 @@ async def archive_organization(db: AsyncSession, *, org_id: uuid.UUID, actor: Us
         new_value=_snapshot(org),
     )
     return org
+
+
+_ITEM_AUDITED_FIELDS = ("code", "name", "props", "valid_from", "valid_to", "sort_order", "status")
+
+
+def _item_snapshot(item: ClassifierItem) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    for field in _ITEM_AUDITED_FIELDS:
+        value = getattr(item, field)
+        data[field] = value.isoformat() if isinstance(value, date) else value
+    return data
+
+
+async def create_classifier(db: AsyncSession, *, data: ClassifierIn, actor: User) -> Classifier:
+    if await repo.get_classifier_by_code(db, data.code) is not None:
+        raise err("ERR-VAL-001", details={"code": data.code, "reason": "already exists"})
+    classifier = Classifier(code=data.code, name=data.name.root)
+    await repo.add(db, classifier)
+    await audit.log(
+        db,
+        action="classifier.create",
+        user_id=actor.id,
+        object_type="classifier",
+        object_id=classifier.id,
+        new_value={"code": classifier.code, "name": classifier.name},
+    )
+    return classifier
+
+
+async def add_classifier_item(
+    db: AsyncSession, *, classifier_code: str, data: ClassifierItemIn, actor: User
+) -> ClassifierItem:
+    classifier = await _classifier_or_404(db, classifier_code)
+    active = await repo.list_classifier_items(db, classifier.id, include_archived=True)
+    if any(row.code == data.code and row.status == "active" for row in active):
+        raise err("ERR-VAL-001", details={"code": data.code, "reason": "already active"})
+    item = ClassifierItem(
+        classifier_id=classifier.id,
+        code=data.code,
+        name=data.name.root,
+        props=data.props,
+        valid_from=data.valid_from,
+        valid_to=data.valid_to,
+        sort_order=data.sort_order,
+    )
+    await repo.add(db, item)
+    await audit.log(
+        db,
+        action="classifier_item.create",
+        user_id=actor.id,
+        object_type="classifier_item",
+        object_id=item.id,
+        new_value=_item_snapshot(item),
+    )
+    return item
+
+
+async def _item_or_404(db: AsyncSession, item_id: uuid.UUID) -> ClassifierItem:
+    item = await repo.get_classifier_item(db, item_id)
+    if item is None:
+        raise err("ERR-SYS-003", details={"classifier_item": str(item_id)})
+    return item
+
+
+async def update_classifier_item(
+    db: AsyncSession, *, item_id: uuid.UUID, patch: ClassifierItemPatch, actor: User
+) -> ClassifierItem:
+    """Edits presentation only. `code` and `valid_from` are identity/history — changing
+    the meaning of a code is a supersede, not an update (ruling 7)."""
+    item = await _item_or_404(db, item_id)
+    before = _item_snapshot(item)
+    fields = patch.model_dump(exclude_unset=True)
+    if "name" in fields and patch.name is not None:
+        item.name = patch.name.root
+    for field in ("props", "valid_to", "sort_order"):
+        if field in fields:
+            setattr(item, field, fields[field])
+    await db.flush()
+    await audit.log(
+        db,
+        action="classifier_item.update",
+        user_id=actor.id,
+        object_type="classifier_item",
+        object_id=item.id,
+        old_value=before,
+        new_value=_item_snapshot(item),
+    )
+    return item
+
+
+async def archive_classifier_item(
+    db: AsyncSession, *, item_id: uuid.UUID, actor: User, valid_to: date | None = None
+) -> ClassifierItem:
+    item = await _item_or_404(db, item_id)
+    if item.status == "archived":
+        return item
+    before = _item_snapshot(item)
+    item.status = "archived"
+    # /refs filters by `valid_to >= day` (inclusive), so an item archived with no
+    # explicit end date must close as of yesterday, not today — otherwise it would
+    # still appear in today's listing until midnight (same "close the day before"
+    # convention supersede uses for its archived predecessor).
+    item.valid_to = valid_to or item.valid_to or (date.today() - timedelta(days=1))
+    await db.flush()
+    await audit.log(
+        db,
+        action="classifier_item.archive",
+        user_id=actor.id,
+        object_type="classifier_item",
+        object_id=item.id,
+        old_value=before,
+        new_value=_item_snapshot(item),
+    )
+    return item
+
+
+async def supersede_classifier_item(
+    db: AsyncSession, *, item_id: uuid.UUID, data: ClassifierItemIn, actor: User
+) -> ClassifierItem:
+    """New version of the same code (ruling 7): the old row is closed the day before the
+    new one starts and archived, then the new row is inserted — one transaction, so the
+    partial unique index never sees two active rows for the same code."""
+    old = await _item_or_404(db, item_id)
+    if data.code != old.code:
+        raise err("ERR-VAL-001", details={"reason": "code must match", "code": old.code})
+    if data.valid_from <= old.valid_from:
+        raise err("ERR-VAL-001", details={"reason": "valid_from must be later"})
+    await archive_classifier_item(
+        db, item_id=old.id, actor=actor, valid_to=data.valid_from - timedelta(days=1)
+    )
+    classifier = await db.get(Classifier, old.classifier_id)
+    assert classifier is not None  # FK guarantees it
+    return await add_classifier_item(db, classifier_code=classifier.code, data=data, actor=actor)
+
+
+async def list_settings(db: AsyncSession) -> list[SettingOut]:
+    rows = {
+        row.key: row
+        for row in (await db.execute(select(SystemSetting))).scalars()
+        if row.key in settings_store.SETTING_SPECS
+    }
+    out: list[SettingOut] = []
+    for key, spec in settings_store.SETTING_SPECS.items():
+        out.append(
+            SettingOut(
+                key=key,
+                value=await settings_store.get_setting(db, key),
+                default=spec.default,
+                description=spec.description,
+                overridden=key in rows,
+            )
+        )
+    return out
+
+
+async def update_setting(db: AsyncSession, *, key: str, raw_value: Any, actor: User) -> SettingOut:
+    spec = settings_store.SETTING_SPECS.get(key)
+    if spec is None:
+        raise err("ERR-SYS-003", details={"setting": key})
+    value = settings_store.coerce(spec, raw_value)  # raises ERR-VAL-001 on bad input
+    previous = await settings_store.get_setting(db, key)
+    row = await db.get(SystemSetting, key)
+    if row is None:
+        row = SystemSetting(key=key, value=value, description=spec.description)
+        db.add(row)
+    else:
+        row.value = value
+    row.updated_by = actor.id
+    await db.flush()
+    settings_store.invalidate(key)
+    await audit.log(
+        db,
+        action="setting.update",
+        user_id=actor.id,
+        object_type="system_setting",
+        old_value={"value": previous},
+        new_value={"value": value},
+        basis=key,
+    )
+    return SettingOut(
+        key=key,
+        value=value,
+        default=spec.default,
+        description=spec.description,
+        overridden=True,
+    )
