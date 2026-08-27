@@ -58,3 +58,16 @@ async def get_valid_otp(db: AsyncSession, code_hash: str, purpose: str) -> OtpCo
             )
         )
     ).scalar_one_or_none()
+
+
+async def revoke_other_sessions(db: AsyncSession, user_id: uuid.UUID, *, keep: uuid.UUID) -> None:
+    rows = (
+        await db.execute(
+            select(Session).where(
+                Session.user_id == user_id, Session.revoked_at.is_(None), Session.id != keep
+            )
+        )
+    ).scalars()
+    now = datetime.now(UTC)
+    for row in rows:
+        row.revoked_at = now

@@ -31,3 +31,23 @@ class MeOut(BaseModel):
     role: RoleOut
     permissions: list[str]
     zone: ZoneOut
+
+
+class LoginIn(BaseModel):
+    login: str
+    password: str
+
+
+class LoginOut(BaseModel):
+    mfa_required: bool
+    mfa_token: str
+
+
+class MfaIn(BaseModel):
+    mfa_token: str
+    code: str
+
+
+class PasswordChangeIn(BaseModel):
+    old_password: str
+    new_password: str
