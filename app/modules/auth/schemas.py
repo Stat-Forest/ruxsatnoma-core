@@ -2,10 +2,11 @@
 
 import re
 import uuid
+from datetime import date, datetime
 from typing import Any, Literal
 
 from email_validator import validate_email
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class UserOut(BaseModel):
@@ -28,6 +29,44 @@ class ZoneOut(BaseModel):
     organization_id: uuid.UUID | None
 
 
+class ConsentsIn(BaseModel):
+    privacy_policy: str
+    offer: str
+
+
+class CompleteRegistrationIn(BaseModel):
+    consents: ConsentsIn
+    phone: str = Field(pattern=r"^\+998[0-9]{9}$")
+    otp_token: str
+    email: EmailStr | None = None
+    region_id: uuid.UUID | None = None
+    district_id: uuid.UUID | None = None
+    address: str | None = None
+
+
+class ApplicantOut(BaseModel):
+    id: uuid.UUID
+    kind: str
+    pinfl: str | None
+    stir: str | None
+    name: str
+    phone: str | None
+    email: str | None
+    region_id: uuid.UUID | None
+    district_id: uuid.UUID | None
+    address: str | None
+    verified_at: datetime | None
+
+
+class RepresentationOut(BaseModel):
+    id: uuid.UUID
+    applicant: ApplicantOut
+    basis: str
+    valid_from: date
+    valid_until: date | None
+    status: str
+
+
 class MeOut(BaseModel):
     user: UserOut
     role: RoleOut
@@ -45,6 +84,11 @@ class MeOut(BaseModel):
     # this flag to tell "holds every code today" apart from "is the superuser, and
     # would still pass a gate for a code added tomorrow".
     is_superuser: bool
+    # Applicant-role only (ruling 16); every other role keeps the defaults below so
+    # existing staff suites stay green without touching their assertions.
+    applicant: ApplicantOut | None = None
+    representations: list[RepresentationOut] = []
+    registration_complete: bool = True
 
 
 class OneIdAuthorizeOut(BaseModel):

@@ -10,12 +10,15 @@ from app.config import get_settings
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.security import new_token
+from app.core.time import business_today
 from app.modules.auth import repo, service
 from app.modules.auth.adapters.oneid import get_oneid_adapter
 from app.modules.auth.deps import SUPERUSER_ROLE, get_current_session, get_current_user
 from app.modules.auth.models import Role, Session, User
 from app.modules.auth.permissions import PERMISSIONS
 from app.modules.auth.schemas import (
+    ApplicantOut,
+    CompleteRegistrationIn,
     EimzoChallengeOut,
     EimzoLoginIn,
     LoginIn,
@@ -27,6 +30,7 @@ from app.modules.auth.schemas import (
     OtpVerifyIn,
     OtpVerifyOut,
     PasswordChangeIn,
+    RepresentationOut,
     RoleOut,
     UserOut,
     ZoneOut,
@@ -55,6 +59,24 @@ async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> 
     """
     is_superuser = role.code == SUPERUSER_ROLE
     codes = sorted(PERMISSIONS) if is_superuser else sorted(await repo.permission_codes(db, user))
+    applicant_out: ApplicantOut | None = None
+    representations: list[RepresentationOut] = []
+    registration_complete = True
+    if role.code == "applicant":
+        own = await repo.get_own_applicant(db, user.id)
+        applicant_out = ApplicantOut.model_validate(own, from_attributes=True) if own else None
+        registration_complete = own is not None
+        representations = [
+            RepresentationOut(
+                id=rep.id,
+                applicant=ApplicantOut.model_validate(legal, from_attributes=True),
+                basis=rep.basis,
+                valid_from=rep.valid_from,
+                valid_until=rep.valid_until,
+                status=rep.status,
+            )
+            for rep, legal in await repo.effective_representations(db, user.id, business_today())
+        ]
     return MeOut(
         user=UserOut.model_validate(user, from_attributes=True),
         role=RoleOut.model_validate(role, from_attributes=True),
@@ -66,6 +88,9 @@ async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> 
         ),
         csrf_token=csrf_token,
         is_superuser=is_superuser,
+        applicant=applicant_out,
+        representations=representations,
+        registration_complete=registration_complete,
     )
 
 
@@ -231,3 +256,29 @@ async def otp_verify(
         ip=request.client.host if request.client else None,
     )
     return OtpVerifyOut(otp_token=token)
+
+
+@router.post("/complete-registration", response_model=MeOut)
+async def complete_registration(
+    body: CompleteRegistrationIn,
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    session_row: Annotated[Session, Depends(get_current_session)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MeOut:
+    await service.complete_registration(
+        db,
+        user,
+        privacy_policy_version=body.consents.privacy_policy,
+        offer_version=body.consents.offer,
+        phone=body.phone,
+        otp_token=body.otp_token,
+        email=str(body.email) if body.email else None,
+        region_id=body.region_id,
+        district_id=body.district_id,
+        address=body.address,
+        ip=request.client.host if request.client else None,
+    )
+    role = await repo.get_role(db, user.role_id)
+    assert role is not None
+    return await _me_out(db, user, role, session_row.csrf_token)

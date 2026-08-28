@@ -26,7 +26,7 @@ from app.modules.auth import repo
 from app.modules.auth.adapters.eimzo import EimzoError, get_eimzo_adapter
 from app.modules.auth.adapters.oneid import OneIdError, get_oneid_adapter
 from app.modules.auth.adapters.otp_sender import get_otp_sender
-from app.modules.auth.models import OtpCode, Session, User
+from app.modules.auth.models import Applicant, OtpCode, Session, User, UserConsent
 
 # Timing-uniform response (user enumeration): computed once at import so the
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
@@ -479,3 +479,69 @@ async def consume_otp_token(db: AsyncSession, *, token: str, purpose: str, targe
     if row is None or row.target != target:
         raise err("ERR-AUTH-010")
     row.used_at = datetime.now(UTC)
+
+
+async def complete_registration(
+    db: AsyncSession,
+    user: User,
+    *,
+    privacy_policy_version: str,
+    offer_version: str,
+    phone: str,
+    otp_token: str,
+    email: str | None,
+    region_id: uuid.UUID | None,
+    district_id: uuid.UUID | None,
+    address: str | None,
+    ip: str | None,
+) -> Applicant:
+    if await repo.role_code(db, user) != "applicant":
+        raise err("ERR-ACL-001", details={"reason": "not an applicant account"})
+    if await repo.get_own_applicant(db, user.id) is not None:
+        raise err("ERR-AUTH-012")
+    assert user.pinfl is not None  # oneid/eimzo entry always sets it
+    current_privacy = await settings_store.get_str(db, "privacy_policy_version")
+    current_offer = await settings_store.get_str(db, "offer_version")
+    stale = {}
+    if privacy_policy_version != current_privacy:
+        stale["privacy_policy"] = current_privacy
+    if offer_version != current_offer:
+        stale["offer"] = current_offer
+    if stale:
+        raise err("ERR-VAL-001", details={"consents_current": stale})
+    await consume_otp_token(db, token=otp_token, purpose="phone_verify", target=phone)
+    now = datetime.now(UTC)
+    applicant = Applicant(
+        kind="individual",
+        pinfl=user.pinfl,
+        name=user.full_name,
+        phone=phone,
+        email=email,
+        region_id=region_id,
+        district_id=district_id,
+        address=address,
+        owner_user_id=user.id,
+        verified_at=now if user.oneid_profile is not None else None,
+        verify_source="oneid" if user.oneid_profile is not None else None,
+    )
+    await repo.add(db, applicant)
+    for doc_type, doc_version in (
+        ("privacy_policy", privacy_policy_version),
+        ("offer", offer_version),
+    ):
+        await repo.add(
+            db, UserConsent(user_id=user.id, doc_type=doc_type, doc_version=doc_version, ip=ip)
+        )
+    user.phone = phone
+    user.phone_verified_at = now
+    if email is not None:
+        user.email = email  # verified later via PATCH /auth/me (ruling 11)
+    await audit.log(
+        db,
+        action="applicant.register",
+        user_id=user.id,
+        object_type="applicant",
+        object_id=applicant.id,
+        ip=ip,
+    )
+    return applicant

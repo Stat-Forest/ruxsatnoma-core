@@ -1,13 +1,22 @@
 """Auth repository: DB access for users, sessions, permissions, otp codes."""
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
-from app.modules.auth.models import OtpCode, Role, RolePermission, Session, User, UserPermission
+from app.modules.auth.models import (
+    Applicant,
+    OtpCode,
+    Representation,
+    Role,
+    RolePermission,
+    Session,
+    User,
+    UserPermission,
+)
 
 
 async def get_user_by_login(db: AsyncSession, login: str) -> User | None:
@@ -137,3 +146,25 @@ async def other_active_sessions(
         )
     ).scalars()
     return list(rows)
+
+
+async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
+    return (
+        await db.execute(select(Applicant).where(Applicant.owner_user_id == user_id))
+    ).scalar_one_or_none()
+
+
+async def effective_representations(
+    db: AsyncSession, user_id: uuid.UUID, today: date
+) -> list[tuple[Representation, Applicant]]:
+    rows = await db.execute(
+        select(Representation, Applicant)
+        .join(Applicant, Representation.applicant_id == Applicant.id)
+        .where(
+            Representation.user_id == user_id,
+            Representation.status == "active",
+            (Representation.valid_until.is_(None)) | (Representation.valid_until >= today),
+        )
+        .order_by(Representation.created_at)
+    )
+    return [(rep, app) for rep, app in rows.all()]

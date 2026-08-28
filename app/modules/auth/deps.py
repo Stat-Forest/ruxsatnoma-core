@@ -21,6 +21,13 @@ from app.modules.auth.permissions import PERMISSIONS
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 # Paths a must-change-password user may still call (ruling 8)
 _MUST_CHANGE_ALLOWED = {"/api/v1/auth/me", "/api/v1/auth/logout", "/api/v1/auth/password/change"}
+# Paths an applicant may call before completing C2 registration (ruling 9);
+# /api/v1/refs/* is allowed as a prefix — the registration form needs catalogs.
+_REGISTRATION_EXEMPT = {
+    "/api/v1/auth/me",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/complete-registration",
+}
 # Role that passes every permission gate (stage 3.3a ruling 2)
 SUPERUSER_ROLE = "sys_admin"
 
@@ -87,6 +94,11 @@ async def get_current_user(
         raise err("ERR-AUTH-002")
     if user.must_change_password and request.url.path not in _MUST_CHANGE_ALLOWED:
         raise err("ERR-AUTH-007")
+    if await repo.role_code(db, user) == "applicant":
+        path = request.url.path
+        if path not in _REGISTRATION_EXEMPT and not path.startswith("/api/v1/refs/"):
+            if await repo.get_own_applicant(db, user.id) is None:
+                raise err("ERR-AUTH-008")
     return user
 
 
