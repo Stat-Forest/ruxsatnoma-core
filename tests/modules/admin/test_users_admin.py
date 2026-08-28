@@ -139,6 +139,59 @@ async def test_get_unknown_user_is_404(db):
     assert r.json()["error"]["code"] == "ERR-SYS-003"
 
 
+async def test_get_user_card_is_zone_scoped_for_view_only(db, agency):
+    """Controller ruling on Task 5 review: ruling 7's zone rule applies to reading
+    users generally, not only `GET /admin/users` — a view-only holder must not be
+    able to read a card outside their own zone by id."""
+    suffix = uuid.uuid4().hex[:6]
+    org_a = Organization(
+        kind="leshoz", code=f"gva-{suffix}", name={"uz_cyrl": "А"}, parent_id=agency.id
+    )
+    org_b = Organization(
+        kind="leshoz", code=f"gvb-{suffix}", name={"uz_cyrl": "Б"}, parent_id=agency.id
+    )
+    db.add_all([org_a, org_b])
+    await db.flush()
+
+    viewer, token, csrf = await signed_in_with(db, USERS_VIEW)
+    viewer.organization_id = org_a.id
+    in_zone = await make_user(db, organization_id=org_a.id)
+    out_of_zone = await make_user(db, organization_id=org_b.id)
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        ok = await client.get(f"{API}/admin/users/{in_zone.id}")
+        blocked = await client.get(f"{API}/admin/users/{out_of_zone.id}")
+    assert ok.status_code == 200, ok.text
+    assert blocked.status_code == 403, blocked.text
+    assert blocked.json()["error"]["code"] == "ERR-ACL-002"
+
+
+async def test_get_user_card_manage_holder_sees_out_of_zone(db, agency):
+    suffix = uuid.uuid4().hex[:6]
+    org_a = Organization(
+        kind="leshoz", code=f"gma-{suffix}", name={"uz_cyrl": "А"}, parent_id=agency.id
+    )
+    org_b = Organization(
+        kind="leshoz", code=f"gmb-{suffix}", name={"uz_cyrl": "Б"}, parent_id=agency.id
+    )
+    db.add_all([org_a, org_b])
+    await db.flush()
+
+    manager, token, csrf = await signed_in_with(db, USERS_MANAGE)
+    manager.organization_id = org_a.id
+    out_of_zone = await make_user(db, organization_id=org_b.id)
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.get(f"{API}/admin/users/{out_of_zone.id}")
+    assert r.status_code == 200, r.text
+
+
 async def test_create_requires_manage_not_just_view(db):
     """Write routes are gated behind USERS_MANAGE alone — a view-only grant, which
     is enough for the list/get routes, must not be enough here."""

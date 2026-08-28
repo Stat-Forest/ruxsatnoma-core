@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.abac import zone_filter, zone_of
+from app.core.abac import Zone, zone_filter, zone_of
 from app.core.crypto import encrypt_str
 from app.core.errors import err
 from app.core.schemas import Page, PageParams
@@ -147,6 +147,22 @@ async def _may_manage(db: AsyncSession, actor: User) -> bool:
     return USERS_MANAGE in await auth_repo.permission_codes(db, actor)
 
 
+def _within_zone(zone: Zone, user: User) -> bool:
+    """Per-row equivalent of `zone_filter`'s SQL (design/01 'own zone' mechanics),
+    for a single already-fetched row rather than a query — same semantics kept in
+    sync deliberately, not a second SQL round-trip: an axis whose `zone` field is
+    None is unrestricted; a set axis requires an exact match on `user`'s column.
+    An all-None `zone` (republic-wide) therefore matches every user, same as
+    `zone_filter`'s `true()` fallback."""
+    if zone.region_id is not None and zone.region_id != user.region_id:
+        return False
+    if zone.district_id is not None and zone.district_id != user.district_id:
+        return False
+    if zone.organization_id is not None and zone.organization_id != user.organization_id:
+        return False
+    return True
+
+
 async def _staff_role_or_422(db: AsyncSession, role_code: str) -> Role:
     """A role usable for `POST /admin/users` / role reassignment via PATCH: must
     exist, be active, and not be `applicant` (applicants are born via OneID/E-IMZO,
@@ -223,7 +239,14 @@ async def list_users(
 
 
 async def get_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> UserAdminOut:
+    """Ruling 7 applies here too, not just to `list_users`: a viewer without
+    `auth.users.manage` (and not sys_admin) may only read cards inside their own
+    zone — a target outside it is `ERR-ACL-002`, not a 404 (the row exists, the
+    actor just may not see it), matching the code the catalog already carries for
+    zone violations."""
     user = await _user_or_404(db, user_id)
+    if not await _may_manage(db, actor) and not _within_zone(zone_of(actor), user):
+        raise err("ERR-ACL-002")
     role_code = await auth_repo.role_code(db, user)
     assert role_code is not None
     return _to_admin_out(user, role_code)
