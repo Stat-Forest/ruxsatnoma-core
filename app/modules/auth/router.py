@@ -16,6 +16,9 @@ from app.modules.auth.schemas import (
     LoginOut,
     MeOut,
     MfaIn,
+    OtpRequestIn,
+    OtpVerifyIn,
+    OtpVerifyOut,
     PasswordChangeIn,
     RoleOut,
     UserOut,
@@ -125,3 +128,30 @@ async def password_change(
     await service.change_password(
         db, user, old=body.old_password, new=body.new_password, current_session_id=session_row.id
     )
+
+
+@router.post("/otp/request", status_code=204)
+async def otp_request(
+    body: OtpRequestIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+) -> None:
+    await service.request_otp(
+        db,
+        target_type=body.target_type,
+        target=body.target,
+        purpose=body.purpose,
+        ip=request.client.host if request.client else None,
+    )
+
+
+@router.post("/otp/verify", response_model=OtpVerifyOut)
+async def otp_verify(
+    body: OtpVerifyIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+) -> OtpVerifyOut:
+    token = await service.verify_otp(
+        db,
+        target=body.target,
+        code=body.code,
+        purpose=body.purpose,
+        ip=request.client.host if request.client else None,
+    )
+    return OtpVerifyOut(otp_token=token)

@@ -1,9 +1,11 @@
 """Pydantic schemas for auth API."""
 
+import re
 import uuid
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from email_validator import validate_email
+from pydantic import BaseModel, model_validator
 
 
 class UserOut(BaseModel):
@@ -63,3 +65,32 @@ class MfaIn(BaseModel):
 class PasswordChangeIn(BaseModel):
     old_password: str
     new_password: str
+
+
+class OtpRequestIn(BaseModel):
+    target_type: Literal["phone", "email"]
+    target: str
+    purpose: Literal["phone_verify", "email_verify"]
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> OtpRequestIn:
+        pairs = {"phone": "phone_verify", "email": "email_verify"}
+        if pairs[self.target_type] != self.purpose:
+            raise ValueError("purpose does not match target_type")
+        if self.target_type == "phone":
+            if not re.fullmatch(r"\+998[0-9]{9}", self.target):
+                raise ValueError("phone must be +998XXXXXXXXX")
+        else:
+            # No DNS lookups in request validation (tests run offline).
+            validate_email(self.target, check_deliverability=False)
+        return self
+
+
+class OtpVerifyIn(BaseModel):
+    target: str
+    code: str
+    purpose: Literal["phone_verify", "email_verify"]
+
+
+class OtpVerifyOut(BaseModel):
+    otp_token: str

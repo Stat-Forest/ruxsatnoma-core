@@ -1,6 +1,7 @@
 """Auth service: sessions, login+MFA, passwords. The only door for other modules."""
 
 import asyncio
+import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -21,6 +22,7 @@ from app.core.security import (
 )
 from app.modules.audit import service as audit
 from app.modules.auth import repo
+from app.modules.auth.adapters.otp_sender import get_otp_sender
 from app.modules.auth.models import OtpCode, Session, User
 
 # Timing-uniform response (user enumeration): computed once at import so the
@@ -217,3 +219,116 @@ async def change_password(
     for other in await repo.other_active_sessions(db, user.id, exclude=current_session_id):
         await revoke_session(db, other, reason="password change")
     await audit.log(db, action="user.password_change", user_id=user.id)
+
+
+OTP_TOKEN_TTL_MINUTES = 30  # verified-target token consumed by registration/contact change
+
+
+def _mask_target(target: str) -> str:
+    """Audit-safe form: +99890***4567 / a***@host."""
+    if "@" in target:
+        local, _, host = target.partition("@")
+        return f"{local[:1]}***@{host}"
+    return f"{target[:6]}***{target[-4:]}"
+
+
+def _generate_otp_code() -> str:
+    return f"{secrets.randbelow(10**6):06d}"
+
+
+async def request_otp(
+    db: AsyncSession, *, target_type: str, target: str, purpose: str, ip: str | None
+) -> None:
+    now = datetime.now(UTC)
+    limit = await settings_store.get_int(db, "otp_hourly_limit")
+    recent = await repo.count_recent_otps(
+        db, target=target, purpose=purpose, since=now - timedelta(hours=1)
+    )
+    if recent >= limit:
+        await audit.log(
+            db,
+            action="otp.request",
+            result="denied",
+            basis="rate limit",
+            ip=ip,
+            extra={"target": _mask_target(target), "purpose": purpose},
+        )
+        await db.commit()
+        raise err("ERR-AUTH-009")
+    code = _generate_otp_code()
+    ttl = await settings_store.get_int(db, "otp_ttl_minutes")
+    await repo.add(
+        db,
+        OtpCode(
+            target_type=target_type,
+            target=target,
+            code_hash=hash_token(code),
+            purpose=purpose,
+            expires_at=now + timedelta(minutes=ttl),
+        ),
+    )
+    await audit.log(
+        db,
+        action="otp.request",
+        ip=ip,
+        extra={"target": _mask_target(target), "purpose": purpose},
+    )
+    await get_otp_sender().send(target_type=target_type, target=target, code=code)
+
+
+async def verify_otp(
+    db: AsyncSession, *, target: str, code: str, purpose: str, ip: str | None
+) -> str:
+    row = await repo.latest_pending_otp(db, target=target, purpose=purpose)
+    max_attempts = await settings_store.get_int(db, "otp_max_attempts")
+    if row is None or row.attempts >= max_attempts:
+        await audit.log(
+            db,
+            action="otp.verify",
+            result="denied",
+            basis="no valid code",
+            ip=ip,
+            extra={"target": _mask_target(target), "purpose": purpose},
+        )
+        await db.commit()
+        raise err("ERR-AUTH-010")
+    if not secrets.compare_digest(hash_token(code), row.code_hash):
+        row.attempts += 1
+        await audit.log(
+            db,
+            action="otp.verify",
+            result="denied",
+            basis="wrong code",
+            ip=ip,
+            extra={"target": _mask_target(target), "purpose": purpose},
+        )
+        await db.commit()  # the attempt counter must survive the raise (ruling 2)
+        raise err("ERR-AUTH-010")
+    now = datetime.now(UTC)
+    row.used_at = now
+    token = new_token()
+    await repo.add(
+        db,
+        OtpCode(
+            target_type=row.target_type,
+            target=target,
+            code_hash=hash_token(token),
+            purpose=f"{purpose}_token",
+            expires_at=now + timedelta(minutes=OTP_TOKEN_TTL_MINUTES),
+        ),
+    )
+    await audit.log(
+        db,
+        action="otp.verify",
+        ip=ip,
+        extra={"target": _mask_target(target), "purpose": purpose},
+    )
+    return token
+
+
+async def consume_otp_token(db: AsyncSession, *, token: str, purpose: str, target: str) -> None:
+    """Burn a `{purpose}_token` issued by verify_otp; the token must belong to `target`."""
+    row = await repo.get_valid_otp(db, hash_token(token), purpose=f"{purpose}_token")
+    if row is None or row.target != target:
+        raise err("ERR-AUTH-010")
+    row.used_at = datetime.now(UTC)

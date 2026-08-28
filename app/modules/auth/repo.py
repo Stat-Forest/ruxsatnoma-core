@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
@@ -85,6 +85,32 @@ async def get_valid_otp(db: AsyncSession, code_hash: str, purpose: str) -> OtpCo
                 OtpCode.used_at.is_(None),
                 OtpCode.expires_at > now,
             )
+        )
+    ).scalar_one_or_none()
+
+
+async def count_recent_otps(db: AsyncSession, *, target: str, purpose: str, since: datetime) -> int:
+    result = await db.execute(
+        select(func.count())
+        .select_from(OtpCode)
+        .where(OtpCode.target == target, OtpCode.purpose == purpose, OtpCode.created_at >= since)
+    )
+    return result.scalar_one()
+
+
+async def latest_pending_otp(db: AsyncSession, *, target: str, purpose: str) -> OtpCode | None:
+    now = datetime.now(UTC)
+    return (
+        await db.execute(
+            select(OtpCode)
+            .where(
+                OtpCode.target == target,
+                OtpCode.purpose == purpose,
+                OtpCode.used_at.is_(None),
+                OtpCode.expires_at > now,
+            )
+            .order_by(OtpCode.created_at.desc())
+            .limit(1)
         )
     ).scalar_one_or_none()
 
