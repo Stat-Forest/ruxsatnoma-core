@@ -12,6 +12,7 @@ from app.core import settings_store
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.security import hash_token
+from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo, service
 from app.modules.auth.models import Session, User
@@ -76,10 +77,13 @@ async def get_current_user(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
     user = await repo.get_user(db, session_row.user_id)
-    now = datetime.now(UTC)
     if user is None or user.status != "active":
         raise err("ERR-AUTH-002")
-    if user.valid_until is not None and user.valid_until < now.date():
+    # business_today(), not a UTC date.today()/now.date() (same Asia/Tashkent rule as
+    # admin.repo/admin.service, finding 11): valid_until is a calendar day, and a
+    # server-local/UTC day would keep an expired fixed-term account (e.g. the
+    # prosecutor's) authenticating for up to 5 hours after midnight Tashkent time.
+    if user.valid_until is not None and user.valid_until < business_today():
         raise err("ERR-AUTH-002")
     if user.must_change_password and request.url.path not in _MUST_CHANGE_ALLOWED:
         raise err("ERR-AUTH-007")

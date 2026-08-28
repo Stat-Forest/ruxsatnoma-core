@@ -26,7 +26,9 @@ ENTITIES = ("districts", "organizations")
 
 # Matches the `stir_format` DB CHECK (admin.schemas.Stir) — validated here too so a
 # bad file 422-equivalents (ERR-VAL-001) instead of an IntegrityError traceback.
-_STIR_RE = re.compile(r"^\d{9}$")
+# [0-9], not \d: \d is Unicode-aware in Python's re, so it would accept e.g. nine
+# Arabic-Indic digits that the ASCII-only Postgres CHECK rejects.
+_STIR_RE = re.compile(r"^[0-9]{9}$")
 
 
 def _validated_name(code: str, raw: Any) -> dict[str, Any]:
@@ -142,7 +144,7 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
     the write API (`ALLOWED_PARENT_KINDS`, `admin.repo.is_descendant`, and a
     `status != "active"` parent), so a bad file cannot build a hierarchy the API
     would refuse. `name`/`stir`/`requisites` are validated the same way the write API
-    validates them (`LocalizedName`, the `^\\d{9}$` STIR shape, requisites must be an
+    validates them (`LocalizedName`, the `^[0-9]{9}$` STIR shape, requisites must be an
     object) — a bad file must not be able to store something `/refs` later fails to
     read, or a CHECK constraint catches as an unhandled `IntegrityError`.
 

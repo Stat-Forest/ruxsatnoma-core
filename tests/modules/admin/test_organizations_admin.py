@@ -359,6 +359,32 @@ async def test_patch_rejects_malformed_stir_with_422_not_500(db, agency):
     assert r.json()["error"]["code"] == "ERR-VAL-001"
 
 
+async def test_create_rejects_non_ascii_digit_stir_with_422_not_500(db, agency):
+    """Re-review finding: `\\d` is Unicode-aware in both Pydantic and Python `re`, so
+    a string of 9 Arabic-Indic digits satisfies `^\\d{9}$` even though it is not
+    `^[0-9]{9}$` — and the Postgres CHECK (`stir ~ '^\\d{9}$'` is itself PCRE-ish but
+    Postgres's `\\d` is ASCII-only) rejects it, reopening the exact 500 path finding 4
+    closed. The pattern must use `[0-9]` explicitly."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.post(
+            f"{API}/admin/organizations",
+            json={
+                "kind": "leshoz",
+                "parent_id": str(agency.id),
+                "code": f"arabicstir-{suffix}",
+                "name": {"uz_cyrl": "Х"},
+                "stir": "١٢٣٤٥٦٧٨٩",  # nine Arabic-Indic digits, not ASCII 0-9
+            },
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "ERR-VAL-001"
+
+
 async def test_unknown_organization_is_404(db):
     _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
     await db.commit()

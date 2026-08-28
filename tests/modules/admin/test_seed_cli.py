@@ -322,6 +322,25 @@ async def test_organizations_reject_a_malformed_stir(db, agency):
     assert excinfo.value.details["reason"] == "invalid stir"
 
 
+async def test_organizations_reject_a_non_ascii_digit_stir(db, agency):
+    """`\\d` is Unicode-aware in Python `re`, unlike the ASCII-only Postgres CHECK —
+    nine Arabic-Indic digits must not slip past `_STIR_RE` and reach the DB."""
+    suffix = uuid.uuid4().hex[:6]
+    rows = [
+        {
+            "code": f"arabicstir-{suffix}",
+            "kind": "leshoz",
+            "parent_code": agency.code,
+            "name": {"uz_cyrl": "Х"},
+            "stir": "١٢٣٤٥٦٧٨٩",
+        }
+    ]
+    with pytest.raises(DomainError) as excinfo:
+        await seed_organizations(db, rows)
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["reason"] == "invalid stir"
+
+
 async def test_districts_reject_an_unvalidated_name_shape(db):
     rows = district_rows(uuid.uuid4().hex[:6])
     rows[0]["name"] = "Беруний тумани"  # not an object

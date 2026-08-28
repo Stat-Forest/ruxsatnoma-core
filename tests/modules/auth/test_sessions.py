@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.core.security import hash_token, new_token
+from app.core.time import business_today
 from app.main import create_app
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Role, Session, User
@@ -99,6 +100,22 @@ async def test_blocked_user_is_401(db):
         client.cookies.set("session", token)
         r = await client.get(f"{API}/auth/me")
     assert r.status_code == 401
+
+
+async def test_user_with_valid_until_yesterday_is_401(db):
+    """Same Asia/Tashkent bug as finding 11, one file over: comparing `valid_until`
+    (a calendar date) against a UTC `now.date()` kept a fixed-term account (e.g. the
+    prosecutor's) alive for up to 5 hours after midnight Tashkent time. "Yesterday"
+    is built from business_today() so the test cannot drift from the code it checks."""
+    user = await make_user(db, valid_until=business_today() - timedelta(days=1))
+    _, token, _ = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.get(f"{API}/auth/me")
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "ERR-AUTH-002"
 
 
 async def test_mutation_without_csrf_is_403(db):

@@ -10,7 +10,9 @@ from app.core.schemas import LocalizedName
 
 # Matches the `stir_format` DB CHECK (ruling 12): catching the shape here means a bad
 # value 422s at the schema boundary instead of surfacing as an IntegrityError (500).
-Stir = Annotated[str, Field(pattern=r"^\d{9}$")]
+# [0-9], not \d: \d is Unicode-aware in Pydantic's pattern matching, so it would
+# accept e.g. nine Arabic-Indic digits that the ASCII-only Postgres CHECK rejects.
+Stir = Annotated[str, Field(pattern=r"^[0-9]{9}$")]
 
 
 class RegionOut(BaseModel):
