@@ -183,10 +183,13 @@ def _within_zone(zone: Zone, user: User) -> bool:
     return True
 
 
-async def _staff_role_or_422(db: AsyncSession, role_code: str) -> Role:
+async def _staff_role_or_422(db: AsyncSession, role_code: str, *, actor: User) -> Role:
     """A role usable for `POST /admin/users` / role reassignment via PATCH: must
     exist, be active, and not be `applicant` (applicants are born via OneID/E-IMZO,
-    never created or reassigned by hand here — ruling 8/9)."""
+    never created or reassigned by hand here — ruling 8/9). R5a (final review):
+    assigning the `sys_admin` role is itself a privilege-escalation vector — a
+    manage-holder could otherwise mint themselves (or an ally) a superuser — so it
+    is restricted to actors who are already `sys_admin`."""
     role = await auth_repo.get_role_by_code(db, role_code)
     if role is None:
         raise err("ERR-SYS-003", details={"role_code": role_code})
@@ -194,6 +197,8 @@ async def _staff_role_or_422(db: AsyncSession, role_code: str) -> Role:
         raise err("ERR-VAL-001", details={"role_code": role_code, "reason": "role_archived"})
     if role.code == "applicant":
         raise err("ERR-VAL-001", details={"reason": "staff_roles_only"})
+    if role.code == SUPERUSER_ROLE and await auth_repo.role_code(db, actor) != SUPERUSER_ROLE:
+        raise err("ERR-VAL-001", details={"reason": "superuser_role_restricted"})
     return role
 
 
@@ -273,7 +278,7 @@ async def get_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> User
 
 
 async def create_user(db: AsyncSession, *, data: UserCreateIn, actor: User) -> UserCreatedOut:
-    role = await _staff_role_or_422(db, data.role_code)
+    role = await _staff_role_or_422(db, data.role_code, actor=actor)
     await _check_pinfl_available(db, data.pinfl)
     await _check_login_available(db, data.login)
 
@@ -343,7 +348,7 @@ async def patch_user(
 
     new_role_code = role_code_before
     if "role_code" in fields:
-        role = await _staff_role_or_422(db, fields["role_code"])
+        role = await _staff_role_or_422(db, fields["role_code"], actor=actor)
         new_role_code = role.code
         user.role_id = role.id
 
@@ -378,6 +383,10 @@ async def block_user(
 ) -> UserAdminOut:
     _guard_not_self(user_id, actor)
     user = await _user_or_404(db, user_id)
+    # I4 (final review): block only from `active` — otherwise a `blocked -> blocked`
+    # no-op audit-spams, and `deleted -> blocked` would resurrect a terminal account.
+    if user.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "wrong_status"})
     before_status = user.status
     user.status = "blocked"
     await auth_repo.revoke_user_sessions(db, user.id)
@@ -398,6 +407,11 @@ async def block_user(
 
 async def unblock_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> UserAdminOut:
     user = await _user_or_404(db, user_id)
+    # I4 (final review): unblock only from `blocked` — "deletion is terminal" (С23)
+    # means `deleted -> active` must not happen via this route, and an `active`
+    # account is not something "unblock" has any meaning for.
+    if user.status != "blocked":
+        raise err("ERR-VAL-001", details={"reason": "wrong_status"})
     before_status = user.status
     user.status = "active"
     user.failed_login_count = 0
@@ -614,6 +628,11 @@ async def set_role_permissions(
     db: AsyncSession, *, role_id: uuid.UUID, data: PermissionCodesIn, actor: User
 ) -> RoleAdminOut:
     role = await _role_or_404(db, role_id)
+    # R5b (final review): staff permission codes must never be grantable to the
+    # public applicant role — `applicant` never goes through `_staff_role_or_422`,
+    # so this is the only gate protecting it.
+    if role.code == "applicant":
+        raise err("ERR-VAL-001", details={"reason": "applicant_role_restricted"})
     codes = sorted(set(data.codes))
     _validate_permission_codes(codes)
     before = await auth_repo.role_permission_codes(db, role.id)
@@ -666,7 +685,12 @@ async def list_permissions(db: AsyncSession) -> list[PermissionOut]:
 async def get_user_permissions(
     db: AsyncSession, *, user_id: uuid.UUID, actor: User
 ) -> PermissionCodesOut:
-    await _user_or_404(db, user_id)
+    """I3 (final review): mirrors `get_user`'s zone guard — a view-only holder must
+    not be able to read another user's personal grants outside their own zone by
+    id, same as they cannot read that user's card."""
+    user = await _user_or_404(db, user_id)
+    if not await _may_manage(db, actor) and not _within_zone(zone_of(actor), user):
+        raise err("ERR-ACL-002")
     codes = await auth_repo.user_permission_codes(db, user_id)
     return PermissionCodesOut(codes=sorted(codes))
 

@@ -239,6 +239,26 @@ async def test_set_role_permissions_rejects_unknown_code(db):
     assert r.json()["error"]["details"]["reason"] == "unknown_permission"
 
 
+async def test_set_role_permissions_rejects_applicant_role(db):
+    """R5b (final review): staff permission codes must never be grantable to the
+    public applicant role — `applicant` never goes through `_staff_role_or_422`
+    (it is created via OneID/E-IMZO, not this API), so this is the only gate."""
+    _, token, csrf = await signed_in_with(db, USERS_MANAGE)
+    applicant_role_id = (
+        await db.execute(select(Role.id).where(Role.code == "applicant"))
+    ).scalar_one()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.put(
+            f"{API}/admin/roles/{applicant_role_id}/permissions", json={"codes": [USERS_VIEW]}
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["details"]["reason"] == "applicant_role_restricted"
+
+
 async def test_set_role_permissions_audits_old_and_new(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)

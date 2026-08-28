@@ -3,9 +3,14 @@ size cap, access rules, audit."""
 
 import io
 import uuid
+from urllib.parse import quote
 
+import pytest
+from fastapi import UploadFile
 from sqlalchemy import select
 
+from app import files_router
+from app.core.errors import DomainError
 from app.main import create_app
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Applicant, User
@@ -168,3 +173,89 @@ async def test_unknown_file_is_404(db):
         auth_client(client, token, csrf)
         r = await client.get(f"{API}/files/{uuid.uuid4()}")
     assert r.status_code == 404
+
+
+# --- C1 (final review): non-latin-1 filenames must not 500 the download ------------
+
+
+async def test_download_cyrillic_filename_roundtrip(db):
+    """C1 (final review): Starlette encodes header values latin-1, so a raw
+    Cyrillic byte in `Content-Disposition` used to raise UnicodeEncodeError -> 500
+    on every download of a file uploaded with a name like «доверенность.pdf».
+    Fixed per RFC 6266/5987: an ASCII fallback `filename=` plus the exact original
+    name in `filename*=UTF-8''...`."""
+    _, token, csrf = await signed_in_with(db)
+    await db.commit()
+    app = create_app()
+    filename = "доверенность.pdf"
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await upload(client, PDF, filename=filename)
+        assert r.status_code == 201, r.text
+        file_id = r.json()["id"]
+        r2 = await client.get(f"{API}/files/{file_id}")
+    assert r2.status_code == 200, r2.text
+    assert r2.content == PDF
+    disposition = r2.headers["content-disposition"]
+    assert disposition.startswith("attachment")
+    # The base name is pure Cyrillic (no ASCII survives) — the ASCII fallback
+    # collapses to "file", keeping the ASCII extension.
+    assert 'filename="file.pdf"' in disposition
+    assert f"filename*=UTF-8''{quote(filename, safe='')}" in disposition
+
+
+def test_ascii_fallback_filename_pure_non_ascii_collapses_to_file():
+    """Unit-ish case for the pure-non-ASCII fallback: no extension at all survives
+    either, so there is nothing to append to "file"."""
+    assert files_router._ascii_fallback_filename("доверенность") == "file"
+
+
+def test_ascii_fallback_filename_keeps_a_surviving_extension():
+    assert files_router._ascii_fallback_filename("доверенность.pdf") == "file.pdf"
+
+
+def test_ascii_fallback_filename_untouched_for_plain_ascii():
+    assert files_router._ascii_fallback_filename("report.pdf") == "report.pdf"
+
+
+def test_sanitize_filename_strips_bare_carriage_return():
+    """T3 (deferred minor, absorbed here): `_sanitize_filename`'s docstring already
+    promised newline safety, but a bare `\\r` with no accompanying `\\n` survived
+    untouched — still a header-injection seam on clients that treat lone CR as a
+    line terminator."""
+    assert files_router._sanitize_filename("evil\rInjected: header") == "evilInjected: header"
+
+
+# --- I2 (final review): the size cap must be enforced before the body sits in RAM --
+
+
+async def test_read_capped_content_length_fast_path_skips_reading():
+    """A Content-Length already over the cap must reject before a single byte is
+    read off the upload — proven with a stream that raises if `.read()` is ever
+    invoked, so this fails loudly if the fast path regresses into always reading."""
+
+    class _ExplodingStream(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            raise AssertionError("must not read once Content-Length already exceeds cap")
+
+    file = UploadFile(_ExplodingStream(b""), filename="big.pdf")
+    with pytest.raises(DomainError) as exc_info:
+        await files_router._read_capped(file, cap_bytes=10, content_length=999)
+    assert exc_info.value.code == "ERR-VAL-001"
+    assert exc_info.value.details == {"reason": "too_large"}
+
+
+async def test_read_capped_chunked_path_aborts_once_over_cap():
+    """No Content-Length/`.size` known upfront: the body streams in chunks and
+    aborts the instant the running total exceeds the cap. Tiny sizes only — this
+    must never allocate anything close to a real oversized upload."""
+    file = UploadFile(io.BytesIO(b"x" * 25), filename="small.pdf")
+    with pytest.raises(DomainError) as exc_info:
+        await files_router._read_capped(file, cap_bytes=20, content_length=None)
+    assert exc_info.value.details == {"reason": "too_large"}
+
+
+async def test_read_capped_returns_full_bytes_under_cap():
+    file = UploadFile(io.BytesIO(PDF), filename="doc.pdf")
+    data = await files_router._read_capped(file, cap_bytes=1024, content_length=len(PDF))
+    assert data == PDF
