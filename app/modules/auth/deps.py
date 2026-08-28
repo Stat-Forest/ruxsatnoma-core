@@ -19,8 +19,22 @@ from app.modules.auth.models import Session, User
 from app.modules.auth.permissions import PERMISSIONS
 
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
-# Paths a must-change-password user may still call (ruling 8)
-_MUST_CHANGE_ALLOWED = {"/api/v1/auth/me", "/api/v1/auth/logout", "/api/v1/auth/password/change"}
+# (method, path) pairs a must-change-password user may still call (ruling 8).
+# Method-aware so a route that shares a path with an exempt one but a different
+# verb (e.g. PATCH /auth/me alongside GET /auth/me) is NOT exempted for free.
+_MUST_CHANGE_ALLOWED = {
+    ("GET", "/api/v1/auth/me"),
+    ("POST", "/api/v1/auth/logout"),
+    ("POST", "/api/v1/auth/password/change"),
+}
+# (method, path) pairs an applicant may call before completing C2 registration
+# (ruling 9); /api/v1/refs/* is allowed as a prefix regardless of method — the
+# registration form needs catalogs and refs is read-only (GET) in practice.
+_REGISTRATION_EXEMPT = {
+    ("GET", "/api/v1/auth/me"),
+    ("POST", "/api/v1/auth/logout"),
+    ("POST", "/api/v1/auth/complete-registration"),
+}
 # Role that passes every permission gate (stage 3.3a ruling 2)
 SUPERUSER_ROLE = "sys_admin"
 
@@ -85,8 +99,14 @@ async def get_current_user(
     # prosecutor's) authenticating for up to 5 hours after midnight Tashkent time.
     if user.valid_until is not None and user.valid_until < business_today():
         raise err("ERR-AUTH-002")
-    if user.must_change_password and request.url.path not in _MUST_CHANGE_ALLOWED:
+    if user.must_change_password and (request.method, request.url.path) not in _MUST_CHANGE_ALLOWED:
         raise err("ERR-AUTH-007")
+    if await repo.role_code(db, user) == "applicant":
+        path = request.url.path
+        exempt = (request.method, path) in _REGISTRATION_EXEMPT or path.startswith("/api/v1/refs/")
+        if not exempt:
+            if await repo.get_own_applicant(db, user.id) is None:
+                raise err("ERR-AUTH-008")
     return user
 
 

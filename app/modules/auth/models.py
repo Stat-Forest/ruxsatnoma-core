@@ -10,7 +10,15 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, func
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Numeric,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -52,6 +60,7 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(CITEXT)
     email_verified_at: Mapped[datetime | None]
     mfa_secret: Mapped[str | None]  # Fernet-encrypted TOTP secret (ruling 5)
+    oneid_profile: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # 3.2b ruling 4
     status: Mapped[str] = mapped_column(default="active")
     must_change_password: Mapped[bool] = mapped_column(default=False)  # ruling 8
     valid_until: Mapped[date | None]
@@ -104,7 +113,8 @@ class Session(Base):
 
 
 class OtpCode(Base):
-    """One-time codes: MFA handoff tokens now (ruling 6); phone/email verify in 3.2b."""
+    """One-time codes: MFA handoff tokens (ruling 6); phone/email verify, their
+    verified-tokens, and E-IMZO challenges live here too (3.2b)."""
 
     __tablename__ = "otp_codes"
 
@@ -117,11 +127,106 @@ class OtpCode(Base):
     expires_at: Mapped[datetime]
     attempts: Mapped[int] = mapped_column(default=0)
     used_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     __table_args__ = (
         CheckConstraint(
-            "purpose IN ('phone_verify', 'email_verify', 'mfa', 'password_reset')",
+            "purpose IN ('phone_verify', 'email_verify', 'mfa', 'password_reset',"
+            " 'phone_verify_token', 'email_verify_token', 'eimzo_challenge')",
             name="purpose_valid",
         ),
         Index("ix_otp_codes_code_hash", "code_hash"),
+    )
+
+
+class Applicant(Base):
+    """The person/org applications are filed for (design/02 § applicants).
+
+    individual ⇔ pinfl, legal ⇔ stir (identity_by_kind); the full unique on each
+    column subsumes design/02's partial unique — the CHECK already restricts the
+    column to one kind. owner_user_id: individual's 1:1 account; legal has none
+    (representatives act, decision #9)."""
+
+    __tablename__ = "applicants"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    kind: Mapped[str]
+    pinfl: Mapped[str | None] = mapped_column(unique=True)
+    stir: Mapped[str | None] = mapped_column(unique=True)
+    name: Mapped[str]
+    region_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("regions.id"))
+    district_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("districts.id"))
+    address: Mapped[str | None]
+    phone: Mapped[str | None]
+    email: Mapped[str | None] = mapped_column(CITEXT)
+    requisites: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), unique=True)
+    verified_at: Mapped[datetime | None]
+    verify_source: Mapped[str | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('individual', 'legal')", name="kind_valid"),
+        CheckConstraint(
+            "(kind = 'individual' AND pinfl IS NOT NULL AND stir IS NULL)"
+            " OR (kind = 'legal' AND stir IS NOT NULL AND pinfl IS NULL)",
+            name="identity_by_kind",
+        ),
+        CheckConstraint("pinfl IS NULL OR pinfl ~ '^[0-9]{14}$'", name="pinfl_format"),
+        CheckConstraint("stir IS NULL OR stir ~ '^[0-9]{9}$'", name="stir_format"),
+    )
+
+
+class Representation(Base):
+    """Who may act for a legal applicant and on what basis (decision #9).
+
+    poa_file_id is a plain uuid until media_files lands in 3.3b (deferred-FK
+    pattern). Effectiveness is checked on read: status='active' AND not past
+    valid_until (ruling 14); the expiry job is 3.4+."""
+
+    __tablename__ = "representations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    applicant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applicants.id"))
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    basis: Mapped[str]
+    poa_file_id: Mapped[uuid.UUID | None]  # FK -> media_files in 3.3b
+    valid_from: Mapped[date]
+    valid_until: Mapped[date | None]
+    status: Mapped[str] = mapped_column(default="active")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("basis IN ('director_registry', 'poa', 'org_eri')", name="basis_valid"),
+        CheckConstraint("status IN ('active', 'expired', 'revoked')", name="status_valid"),
+        CheckConstraint(
+            "basis <> 'poa' OR (poa_file_id IS NOT NULL AND valid_until IS NOT NULL)",
+            name="poa_requires_file_and_term",
+        ),
+        Index(
+            "uq_representations_active",
+            "applicant_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index("ix_representations_user", "user_id"),
+    )
+
+
+class UserConsent(Base):
+    """С2 consents; without them registration does not proceed (design/02)."""
+
+    __tablename__ = "user_consents"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    doc_type: Mapped[str]
+    doc_version: Mapped[str]
+    accepted_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    ip: Mapped[str | None] = mapped_column(IPAddressString)
+
+    __table_args__ = (
+        CheckConstraint("doc_type IN ('privacy_policy', 'offer')", name="doc_type_valid"),
+        UniqueConstraint("user_id", "doc_type", "doc_version", name="uq_user_consents_doc"),
     )

@@ -18,6 +18,10 @@ uv run uvicorn app.main:create_app --factory --reload   # API на :8000
 
 Проверка: `curl localhost:8000/health/ready` → `{"status":"ok","postgis":"3.4..."}`.
 
+## Applicant login (dev)
+
+Mock adapters are the default (`ONEID_MODE`/`EIMZO_MODE`/`SMS_MODE=mock`). OneID's `code` and E-IMZO's `signed_challenge` are just base64url-JSON payloads — build one with `encode_mock_code`/`encode_mock_signed_challenge` from `app/modules/auth/adapters/{oneid,eimzo}.py` and pass it to `GET /auth/oneid/callback?code=` / `POST /auth/eimzo/login`. `POST /auth/otp/request` doesn't send anything either — the mock sender logs the code (`otp.mock_send`), so check the app log/console for it during local testing.
+
 ## Тесты и качество
 
 ```bash

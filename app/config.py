@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     s3_bucket: str = "ruxsatnoma"
     cookie_secure: bool | None = None
     cors_origins: list[str] = []
+    oneid_mode: Literal["mock", "real"] = "mock"
+    eimzo_mode: Literal["mock", "real"] = "mock"
+    sms_mode: Literal["mock", "real"] = "mock"
+    oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:
@@ -31,6 +35,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "secret_key нельзя оставлять значением по умолчанию (change-me) в app_env=prod"
             )
+        if self.app_env == "prod":
+            mocked = [
+                name
+                for name in ("oneid_mode", "eimzo_mode", "sms_mode")
+                if getattr(self, name) == "mock"
+            ]
+            if mocked:
+                raise ValueError(
+                    f"mock adapters are not allowed in app_env=prod: {', '.join(mocked)}"
+                )
         return self
 
     def resolve_cookie_secure(self) -> bool:

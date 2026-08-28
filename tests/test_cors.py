@@ -51,6 +51,9 @@ def test_samesite_follows_the_cross_origin_setup():
         app_env="prod",
         secret_key="a-real-secret-value",
         cors_origins=[ADMIN_ORIGIN],
+        oneid_mode="real",
+        eimzo_mode="real",
+        sms_mode="real",
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert cross_origin_prod.resolve_cookie_samesite() == "none"

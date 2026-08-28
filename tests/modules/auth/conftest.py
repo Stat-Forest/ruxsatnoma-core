@@ -11,3 +11,13 @@ def _app_on_test_db(monkeypatch):
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()  # do not leak the test URL into non-auth tests
+
+
+@pytest.fixture(autouse=True)
+def _clear_sent_codes():
+    from app.modules.auth.adapters.otp_sender import MockOtpSender, get_otp_sender
+
+    sender = get_otp_sender()
+    if isinstance(sender, MockOtpSender):
+        sender.sent.clear()
+    yield

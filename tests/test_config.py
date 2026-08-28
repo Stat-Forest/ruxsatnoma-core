@@ -31,7 +31,14 @@ def test_prod_rejects_default_secret_key():
 
 
 def test_prod_accepts_custom_secret_key():
-    s = Settings(app_env="prod", secret_key="a-real-secret-value", _env_file=None)  # pyright: ignore[reportCallIssue]
+    s = Settings(
+        app_env="prod",
+        secret_key="a-real-secret-value",
+        oneid_mode="real",
+        eimzo_mode="real",
+        sms_mode="real",
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+    )
     assert s.secret_key == "a-real-secret-value"
 
 
@@ -46,3 +53,19 @@ def test_policy_settings_are_not_deployment_config():
         "mfa_max_attempts",
     ):
         assert field not in Settings.model_fields
+
+
+def test_prod_rejects_mock_adapters(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("SECRET_KEY", "real-secret-for-prod-guard-test")
+    with pytest.raises(ValidationError, match="mock adapters"):
+        Settings()
+
+
+def test_prod_accepts_real_adapters(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("SECRET_KEY", "real-secret-for-prod-guard-test")
+    for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE"):
+        monkeypatch.setenv(name, "real")
+    settings = Settings()
+    assert settings.oneid_mode == "real"
