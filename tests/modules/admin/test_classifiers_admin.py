@@ -5,6 +5,7 @@ from datetime import date
 
 from sqlalchemy import select
 
+from app.core.time import business_today
 from app.main import create_app
 from app.modules.admin.models import Classifier, ClassifierItem
 from app.modules.admin.permissions import CLASSIFIERS_MANAGE
@@ -40,6 +41,56 @@ async def test_create_classifier_and_item(db):
         listed = await client.get(f"{API}/refs/classifiers/cargo-{suffix}/items")
     assert [row["code"] for row in listed.json()] == ["C-01"]
     assert listed.json()[0]["props"] == {"required": True}
+
+
+async def test_add_item_with_valid_to_before_valid_from_is_422_not_500(db):
+    """No `IntegrityError` from the `valid_period` CHECK must ever reach the client —
+    the service must catch this as a domain error (finding 4)."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"badperiod-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.post(
+            f"{API}/admin/classifiers/badperiod-{suffix}/items",
+            json={
+                "code": "B-01",
+                "name": {"uz_cyrl": "Х"},
+                "valid_from": "2026-06-01",
+                "valid_to": "2026-01-01",
+            },
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_patch_item_with_valid_to_before_valid_from_is_422_not_500(db):
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"badpatch-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    item = ClassifierItem(
+        classifier_id=classifier.id,
+        code="B-02",
+        name={"uz_cyrl": "Х"},
+        valid_from=date(2026, 6, 1),
+    )
+    db.add(item)
+    await db.flush()
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.patch(
+            f"{API}/admin/classifier-items/{item.id}", json={"valid_to": "2026-01-01"}
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_duplicate_active_item_code_rejected(db):
@@ -138,6 +189,88 @@ async def test_supersede_requires_a_later_start(db):
     assert r.json()["error"]["details"]["reason"] == "valid_from must be later"
 
 
+async def test_supersede_rejects_an_already_archived_item(db):
+    """Finding 1 (whole-branch review): `archive` then `supersede` must not silently
+    leave the old row's `valid_to` untouched while inserting an overlapping new row —
+    superseding a closed value is meaningless; adding a new item is the right move."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"reopen-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    old = ClassifierItem(
+        classifier_id=classifier.id,
+        code="R-01",
+        name={"uz_cyrl": "Эски"},
+        valid_from=date(2026, 1, 1),
+    )
+    db.add(old)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        archived = await client.post(f"{API}/admin/classifier-items/{old.id}/archive")
+        assert archived.status_code == 200, archived.text
+        old_valid_to_after_archive = archived.json()["valid_to"]
+
+        r = await client.post(
+            f"{API}/admin/classifier-items/{old.id}/supersede",
+            json={"code": "R-01", "name": {"uz_cyrl": "Янги"}, "valid_from": "2026-07-01"},
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["details"]["reason"] == "already archived"
+
+    # No overlapping second row was inserted, and the archived row's valid_to was not
+    # disturbed by the rejected supersede attempt.
+    rows = (
+        (
+            await db.execute(
+                select(ClassifierItem).where(
+                    ClassifierItem.classifier_id == classifier.id, ClassifierItem.code == "R-01"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].valid_to == date.fromisoformat(old_valid_to_after_archive)
+
+
+async def test_supersede_requires_a_start_later_than_the_old_valid_to(db):
+    """Tightened ordering check: when the old item already carries an explicit
+    `valid_to`, the new version must start after THAT date, not merely after the old
+    item's `valid_from` — otherwise the two periods would overlap."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
+    classifier = Classifier(code=f"overlap-{suffix}", name={"uz_cyrl": "Х"})
+    db.add(classifier)
+    await db.flush()
+    old = ClassifierItem(
+        classifier_id=classifier.id,
+        code="O-01",
+        name={"uz_cyrl": "Эски"},
+        valid_from=date(2026, 1, 1),
+        valid_to=date(2026, 8, 1),
+    )
+    db.add(old)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        # Later than old.valid_from but NOT later than old.valid_to — must be rejected.
+        r = await client.post(
+            f"{API}/admin/classifier-items/{old.id}/supersede",
+            json={"code": "O-01", "name": {"uz_cyrl": "Янги"}, "valid_from": "2026-05-01"},
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["details"]["reason"] == "valid_from must be later"
+
+
 async def test_archive_item_removes_it_from_refs(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
@@ -221,7 +354,7 @@ async def test_explicit_on_date_today_matches_omitted_for_future_valid_to(db):
         omitted = await client.get(f"{API}/refs/classifiers/todayparam-{suffix}/items")
         explicit_today = await client.get(
             f"{API}/refs/classifiers/todayparam-{suffix}/items",
-            params={"on_date": date.today().isoformat()},
+            params={"on_date": business_today().isoformat()},
         )
     assert archived.status_code == 200, archived.text
     assert omitted.json() == []
@@ -242,7 +375,7 @@ async def test_archive_same_day_valid_from_does_not_500(db):
         classifier_id=classifier.id,
         code="S-01",
         name={"uz_cyrl": "Х"},
-        valid_from=date.today(),
+        valid_from=business_today(),
     )
     db.add(item)
     await db.flush()

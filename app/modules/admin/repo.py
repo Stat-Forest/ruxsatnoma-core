@@ -6,6 +6,7 @@ from datetime import date
 from sqlalchemy import Select, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.time import business_today
 from app.db import Base
 from app.modules.admin.models import (
     ActivityType,
@@ -162,12 +163,13 @@ async def list_classifier_items(
     """
     stmt = select(ClassifierItem).where(ClassifierItem.classifier_id == classifier_id)
     if not include_archived:
-        day = on_date or date.today()
+        today = business_today()
+        day = on_date or today
         stmt = stmt.where(
             ClassifierItem.valid_from <= day,
             (ClassifierItem.valid_to.is_(None)) | (ClassifierItem.valid_to >= day),
         )
-        if on_date is None or on_date >= date.today():
+        if on_date is None or on_date >= today:
             stmt = stmt.where(ClassifierItem.status == "active")
     stmt = stmt.order_by(ClassifierItem.sort_order, ClassifierItem.code)
     return list((await db.execute(stmt)).scalars())

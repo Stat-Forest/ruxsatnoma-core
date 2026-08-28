@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import settings_store
 from app.core.errors import err
 from app.core.models import SystemSetting
+from app.core.time import business_today
 from app.modules.admin import repo
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
 from app.modules.admin.schemas import (
@@ -237,6 +238,10 @@ async def add_classifier_item(
     active = await repo.list_classifier_items(db, classifier.id, include_archived=True)
     if any(row.code == data.code and row.status == "active" for row in active):
         raise err("ERR-VAL-001", details={"code": data.code, "reason": "already active"})
+    if data.valid_to is not None and data.valid_to < data.valid_from:
+        # Must be caught here, not by the `valid_period` DB CHECK (finding 4): an
+        # IntegrityError has no handler in main.py and would surface as ERR-SYS-001.
+        raise err("ERR-VAL-001", details={"reason": "valid_to before valid_from"})
     item = ClassifierItem(
         classifier_id=classifier.id,
         code=data.code,
@@ -275,6 +280,13 @@ async def update_classifier_item(
     fields = patch.model_dump(exclude_unset=True)
     if "name" in fields and patch.name is not None:
         item.name = patch.name.root
+    if (
+        "valid_to" in fields
+        and fields["valid_to"] is not None
+        and fields["valid_to"] < item.valid_from
+    ):
+        # Same reasoning as add_classifier_item: reject before the DB CHECK can (500).
+        raise err("ERR-VAL-001", details={"reason": "valid_to before valid_from"})
     for field in ("props", "valid_to", "sort_order"):
         if field in fields:
             setattr(item, field, fields[field])
@@ -306,7 +318,7 @@ async def archive_classifier_item(
     # would otherwise compute a `valid_to` before `valid_from` and fail the
     # `valid_period` CHECK at flush (ERR-SYS-001, 500) instead of archiving cleanly.
     item.valid_to = (
-        valid_to or item.valid_to or max(item.valid_from, date.today() - timedelta(days=1))
+        valid_to or item.valid_to or max(item.valid_from, business_today() - timedelta(days=1))
     )
     await db.flush()
     await audit.log(
@@ -328,9 +340,15 @@ async def supersede_classifier_item(
     new one starts and archived, then the new row is inserted — one transaction, so the
     partial unique index never sees two active rows for the same code."""
     old = await _item_or_404(db, item_id)
+    if old.status == "archived":
+        # The early-return in archive_classifier_item below would silently skip
+        # re-closing an already-archived row, leaving its old valid_to in place
+        # while this call still inserted an overlapping new one (finding 1,
+        # whole-branch review). Adding a new item is the right operation here.
+        raise err("ERR-VAL-001", details={"reason": "already archived"})
     if data.code != old.code:
         raise err("ERR-VAL-001", details={"reason": "code must match", "code": old.code})
-    if data.valid_from <= old.valid_from:
+    if data.valid_from <= (old.valid_to or old.valid_from):
         raise err("ERR-VAL-001", details={"reason": "valid_from must be later"})
     await archive_classifier_item(
         db, item_id=old.id, actor=actor, valid_to=data.valid_from - timedelta(days=1)
