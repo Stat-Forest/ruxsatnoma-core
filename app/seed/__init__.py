@@ -6,20 +6,46 @@ matched by `code`: present → updated, absent → created. Nothing is ever dele
 """
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
+from app.core.schemas import LocalizedName
 from app.modules.admin import repo
 from app.modules.admin.models import District, Organization, Region
 from app.modules.admin.service import ALLOWED_PARENT_KINDS
 from app.modules.audit import service as audit
 
 ENTITIES = ("districts", "organizations")
+
+# Matches the `stir_format` DB CHECK (admin.schemas.Stir) — validated here too so a
+# bad file 422-equivalents (ERR-VAL-001) instead of an IntegrityError traceback.
+_STIR_RE = re.compile(r"^\d{9}$")
+
+
+def _validated_name(code: str, raw: Any) -> dict[str, Any]:
+    """The write API enforces `LocalizedName` (ruling 13: `uz_cyrl` required, only
+    known locales) via Pydantic; the seed CLI bypassed that and stored `name` as
+    free-form JSONB — a file with `"name": "Нукус"` or a stray locale key would be
+    written and then break `/refs` on read."""
+    try:
+        return LocalizedName.model_validate(raw).root
+    except ValidationError as exc:
+        raise err(
+            "ERR-VAL-001", details={"code": code, "reason": "invalid name", "errors": str(exc)}
+        ) from exc
+
+
+def _validated_stir(code: str, stir: str | None) -> str | None:
+    if stir is not None and not _STIR_RE.fullmatch(stir):
+        raise err("ERR-VAL-001", details={"code": code, "reason": "invalid stir"})
+    return stir
 
 
 def load_rows(path: Path) -> list[dict[str, Any]]:
@@ -77,6 +103,7 @@ async def seed_districts(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[
     created = updated = 0
     for row in rows:
         region_id = await _required_region_id(db, row.get("region_code"))
+        name = _validated_name(row["code"], row["name"])
         existing = (
             await db.execute(select(District).where(District.code == row["code"]))
         ).scalar_one_or_none()
@@ -85,7 +112,7 @@ async def seed_districts(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[
                 District(
                     code=row["code"],
                     soato_code=row.get("soato_code"),
-                    name=row["name"],
+                    name=name,
                     region_id=region_id,
                     sort_order=row.get("sort_order", 0),
                 )
@@ -93,7 +120,7 @@ async def seed_districts(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[
             created += 1
         else:
             existing.soato_code = row.get("soato_code", existing.soato_code)
-            existing.name = row["name"]
+            existing.name = name
             existing.region_id = region_id
             existing.sort_order = row.get("sort_order", existing.sort_order)
             updated += 1
@@ -110,23 +137,39 @@ async def seed_districts(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[
 
 async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[int, int]:
     """Rows are applied in file order: a parent must appear before its children (or
-    already exist in the DB). Kind pairing and the archived-parent rule are validated
-    against the same source of truth `admin.service` enforces for the write API
-    (`ALLOWED_PARENT_KINDS`, and a `status != "active"` parent), so a bad file cannot
-    build a hierarchy the API would refuse.
+    already exist in the DB). Kind pairing, re-parent cycles and the archived-parent
+    rule are validated against the same source of truth `admin.service` enforces for
+    the write API (`ALLOWED_PARENT_KINDS`, `admin.repo.is_descendant`, and a
+    `status != "active"` parent), so a bad file cannot build a hierarchy the API
+    would refuse. `name`/`stir`/`requisites` are validated the same way the write API
+    validates them (`LocalizedName`, the `^\\d{9}$` STIR shape, requisites must be an
+    object) — a bad file must not be able to store something `/refs` later fails to
+    read, or a CHECK constraint catches as an unhandled `IntegrityError`.
 
     On update, `stir`/`region_code`/`district_code`/`requisites` are
     preserve-on-absence (ruling 5: reorganizations are partial re-edits of the file,
     not full re-descriptions): a key missing from the row leaves the stored value
-    untouched; a key present with JSON `null` clears it; a key present with a value
-    sets it. `name` and `kind` are always required and always overwrite.
+    untouched; a key present with JSON `null` clears it (`requisites` excepted: it
+    must be an object whenever the key is present, so `null` is rejected like any
+    other non-object value). `name` is always required and always overwrites.
+    `kind` is always required, but a row that CHANGES an existing code's kind is
+    rejected outright — moving an organization between hierarchy levels is too
+    consequential for a bulk importer to do silently.
     """
     created = updated = 0
     for row in rows:
+        code = row["code"]
         kind = row["kind"]
         allowed = ALLOWED_PARENT_KINDS.get(kind)
         if allowed is None:
             raise err("ERR-VAL-001", details={"kind": kind, "reason": "unknown kind"})
+
+        existing = await repo.get_organization_by_code(db, code)
+        if existing is not None and existing.kind != kind:
+            raise err(
+                "ERR-VAL-001", details={"code": code, "reason": "kind change is not supported"}
+            )
+
         parent_code = row.get("parent_code")
         parent: Organization | None = None
         if parent_code is not None:
@@ -136,11 +179,22 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
                     "ERR-VAL-001",
                     details={"parent_code": parent_code, "reason": "unknown parent"},
                 )
+
+        if existing is not None and parent is not None:
+            # Mirrors admin.service.update_organization (ruling 6), including running
+            # BEFORE the kind/parent-pairing check below: a cycle is a cycle
+            # regardless of whether the candidate parent's kind would otherwise be
+            # an allowed one. A plain FK has no notion of a cycle to catch this.
+            if parent.id == existing.id or await repo.is_descendant(
+                db, ancestor_id=existing.id, candidate_id=parent.id
+            ):
+                raise err("ERR-VAL-001", details={"reason": "cycle"})
+
         if not allowed:
             if parent is not None:
                 raise err("ERR-VAL-001", details={"kind": kind, "reason": "must be root"})
             existing_root = await repo.get_agency(db)
-            if existing_root is not None and existing_root.code != row["code"]:
+            if existing_root is not None and existing_root.code != code:
                 raise err(
                     "ERR-VAL-001",
                     details={"kind": kind, "reason": "root already exists"},
@@ -155,17 +209,24 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
         elif parent.status != "active":
             raise err("ERR-VAL-001", details={"reason": "parent archived"})
 
-        existing = await repo.get_organization_by_code(db, row["code"])
+        name = _validated_name(code, row["name"])
+        if "requisites" in row and not isinstance(row["requisites"], dict):
+            raise err(
+                "ERR-VAL-001", details={"code": code, "reason": "requisites must be an object"}
+            )
+        default_stir = None if existing is None else existing.stir
+        stir = _validated_stir(code, row.get("stir", default_stir))
+
         if existing is None:
             region_id = await _region_id(db, row.get("region_code"))
             district_id = await _district_id(db, row.get("district_code"))
             db.add(
                 Organization(
-                    code=row["code"],
+                    code=code,
                     kind=kind,
                     parent_id=parent.id if parent is not None else None,
-                    name=row["name"],
-                    stir=row.get("stir"),
+                    name=name,
+                    stir=stir,
                     region_id=region_id,
                     district_id=district_id,
                     requisites=row.get("requisites", {}),
@@ -174,8 +235,8 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
             created += 1
         else:
             existing.parent_id = parent.id if parent is not None else None
-            existing.name = row["name"]
-            existing.stir = row.get("stir", existing.stir)
+            existing.name = name
+            existing.stir = stir
             if "region_code" in row:
                 existing.region_id = await _region_id(db, row["region_code"])
             if "district_code" in row:
