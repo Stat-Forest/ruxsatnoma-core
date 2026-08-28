@@ -20,6 +20,8 @@ from app.modules.admin.users_schemas import (
     RoleAdminOut,
     RoleCreateIn,
     RolePatchIn,
+    SessionAdminOut,
+    SessionsRevokedOut,
     TotpUriOut,
     UserAdminOut,
     UserBlockIn,
@@ -27,10 +29,11 @@ from app.modules.admin.users_schemas import (
     UserCreateIn,
     UserFilters,
     UserPatchIn,
+    UserStatsOut,
 )
 from app.modules.auth.deps import require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.auth.permissions import USERS_MANAGE, USERS_VIEW
+from app.modules.auth.permissions import SESSIONS_REVOKE_ANY, USERS_MANAGE, USERS_VIEW
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -43,6 +46,17 @@ async def list_users(
     actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
 ) -> Page[UserAdminOut]:
     return await service.list_users(db, params=params, filters=filters, actor=actor)
+
+
+@router.get("/users/stats", response_model=UserStatsOut)
+async def user_stats(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+) -> UserStatsOut:
+    # Must stay registered before GET /users/{user_id} below — otherwise FastAPI
+    # matches this path there first and tries (and fails) to parse "stats" as a
+    # UUID path param.
+    return await service.user_stats(db)
 
 
 @router.get("/users/{user_id}", response_model=UserAdminOut)
@@ -192,3 +206,31 @@ async def set_user_permissions(
     actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
 ) -> PermissionCodesOut:
     return await service.set_user_permissions(db, user_id=user_id, data=body, actor=actor)
+
+
+@router.get("/users/{user_id}/sessions", response_model=list[SessionAdminOut])
+async def list_user_sessions(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SESSIONS_REVOKE_ANY))],
+) -> list[SessionAdminOut]:
+    return await service.list_user_sessions(db, user_id=user_id, actor=actor)
+
+
+@router.post("/sessions/{session_id}/revoke", status_code=204)
+async def revoke_session(
+    session_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SESSIONS_REVOKE_ANY))],
+) -> None:
+    await service.revoke_session(db, session_id=session_id, actor=actor)
+
+
+@router.post("/users/{user_id}/sessions/revoke-all", response_model=SessionsRevokedOut)
+async def revoke_all_sessions(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SESSIONS_REVOKE_ANY))],
+) -> SessionsRevokedOut:
+    revoked = await service.revoke_all_sessions(db, user_id=user_id, actor=actor)
+    return SessionsRevokedOut(revoked=revoked)

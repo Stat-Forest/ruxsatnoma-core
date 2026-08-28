@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
+from typing import Any
 
 from sqlalchemy import ColumnElement, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +45,12 @@ async def get_session_by_token_hash(db: AsyncSession, token_hash: str) -> Sessio
     return (
         await db.execute(select(Session).where(Session.token_hash == token_hash))
     ).scalar_one_or_none()
+
+
+async def get_session(db: AsyncSession, session_id: uuid.UUID) -> Session | None:
+    """By primary key — the admin single-session revoke/lookup path (С23, Task 7),
+    as opposed to `get_session_by_token_hash`'s cookie-validation lookup."""
+    return await db.get(Session, session_id)
 
 
 async def add(db: AsyncSession, obj: Base) -> None:
@@ -248,6 +255,61 @@ async def revoke_user_sessions(db: AsyncSession, user_id: uuid.UUID) -> int:
         .returning(Session.id)
     )
     return len(result.all())
+
+
+async def list_active_sessions(db: AsyncSession, user_id: uuid.UUID) -> list[Session]:
+    """Live sessions of `user_id` — not revoked AND not expired (admin session
+    list, С23/Task 7). Unlike `other_active_sessions` (revoked_at IS NULL only,
+    used to sweep sessions on a password change), this also excludes rows that
+    simply lapsed: an admin looking at "active sessions" should not see one a
+    user let expire minutes ago."""
+    now = datetime.now(UTC)
+    rows = (
+        await db.execute(
+            select(Session)
+            .where(
+                Session.user_id == user_id,
+                Session.revoked_at.is_(None),
+                Session.expires_at > now,
+            )
+            .order_by(Session.created_at.desc())
+        )
+    ).scalars()
+    return list(rows)
+
+
+async def user_stats(db: AsyncSession) -> dict[str, Any]:
+    """Admin dashboard counters (С23/Task 7): total users, breakdowns by status and
+    by role code, and the count of currently-active sessions — three GROUP BYs plus
+    one more COUNT, all in one round-trip each. Returns a plain dict; shaping into
+    `UserStatsOut` is `admin.users_service.user_stats`'s job (the schema belongs to
+    the admin module, not auth)."""
+    total = (await db.execute(select(func.count()).select_from(User))).scalar_one()
+    status_rows = (await db.execute(select(User.status, func.count()).group_by(User.status))).all()
+    by_status = {status: count for status, count in status_rows}
+    role_rows = (
+        await db.execute(
+            select(Role.code, func.count())
+            .select_from(User)
+            .join(Role, Role.id == User.role_id)
+            .group_by(Role.code)
+        )
+    ).all()
+    by_role = {role_code: count for role_code, count in role_rows}
+    now = datetime.now(UTC)
+    active_sessions = (
+        await db.execute(
+            select(func.count())
+            .select_from(Session)
+            .where(Session.revoked_at.is_(None), Session.expires_at > now)
+        )
+    ).scalar_one()
+    return {
+        "total": total,
+        "by_status": by_status,
+        "by_role": by_role,
+        "active_sessions": active_sessions,
+    }
 
 
 async def get_valid_otp(db: AsyncSession, code_hash: str, purpose: str) -> OtpCode | None:

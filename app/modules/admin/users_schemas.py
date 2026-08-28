@@ -165,3 +165,36 @@ class PermissionOut(BaseModel):
     code: str
     description: str
     roles: list[str]
+
+
+# --- Sessions administration + user counters (С23, Task 7) -------------------------
+
+
+class SessionAdminOut(BaseModel):
+    """One row of `GET /admin/users/{id}/sessions` — active sessions only (not
+    revoked, not expired). No token/csrf material: this is an admin read view, not
+    the owning user's own session."""
+
+    id: uuid.UUID
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    ip: str | None
+    user_agent: str | None
+
+
+class SessionsRevokedOut(BaseModel):
+    """`POST /admin/users/{id}/sessions/revoke-all` response — the count, not the
+    rows (ruling: one audit entry for the whole action, not N)."""
+
+    revoked: int
+
+
+class UserStatsOut(BaseModel):
+    """`GET /admin/users/stats`: total headcount plus breakdowns by status and by
+    role code, and the count of currently-active sessions across all users."""
+
+    total: int
+    by_status: dict[str, int]
+    by_role: dict[str, int]
+    active_sessions: int

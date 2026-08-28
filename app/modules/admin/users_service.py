@@ -8,7 +8,7 @@ import random
 import secrets
 import string
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -31,16 +31,18 @@ from app.modules.admin.users_schemas import (
     RoleAdminOut,
     RoleCreateIn,
     RolePatchIn,
+    SessionAdminOut,
     UserAdminOut,
     UserCreatedOut,
     UserCreateIn,
     UserFilters,
     UserPatchIn,
+    UserStatsOut,
 )
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.deps import SUPERUSER_ROLE
-from app.modules.auth.models import Role, User
+from app.modules.auth.models import Role, Session, User
 from app.modules.auth.permissions import PERMISSIONS, USERS_MANAGE
 
 # One-time password generator: 12 chars from a de-ambiguated alphabet (no l/I/O/0/1
@@ -144,6 +146,13 @@ async def _user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:
     if user is None:
         raise err("ERR-SYS-003", details={"user": str(user_id)})
     return user
+
+
+async def _session_or_404(db: AsyncSession, session_id: uuid.UUID) -> Session:
+    session = await auth_repo.get_session(db, session_id)
+    if session is None:
+        raise err("ERR-SYS-003", details={"session": str(session_id)})
+    return session
 
 
 def _guard_not_self(user_id: uuid.UUID, actor: User) -> None:
@@ -680,3 +689,79 @@ async def set_user_permissions(
         new_value={"codes": codes},
     )
     return PermissionCodesOut(codes=codes)
+
+
+# --- Sessions administration + user counters (С23, Task 7) -------------------------
+
+
+async def list_user_sessions(
+    db: AsyncSession, *, user_id: uuid.UUID, actor: User
+) -> list[SessionAdminOut]:
+    """Active sessions only (not revoked, not expired). `auth.sessions.revoke_any`
+    is unrestricted by zone — the permission name says "any" — unlike the users
+    list/card routes, so there is no `_within_zone` check here."""
+    await _user_or_404(db, user_id)
+    rows = await auth_repo.list_active_sessions(db, user_id)
+    return [
+        SessionAdminOut(
+            id=row.id,
+            created_at=row.created_at,
+            last_seen_at=row.last_seen_at,
+            expires_at=row.expires_at,
+            ip=row.ip,
+            user_agent=row.user_agent,
+        )
+        for row in rows
+    ]
+
+
+async def revoke_session(db: AsyncSession, *, session_id: uuid.UUID, actor: User) -> None:
+    """Admin-initiated single-session revoke. Unlike self-service logout/idle-
+    timeout (`auth.service.revoke_session`, which audits `user_id=session_row.
+    user_id` — the session's own owner), the audited actor here is the ADMIN who
+    acted, same `user_id=actor.id` convention as `block_user`/`delete_user`; the
+    affected account is carried in `extra` since `object_type` names the session,
+    not the user."""
+    session = await _session_or_404(db, session_id)
+    session.revoked_at = datetime.now(UTC)
+    await db.flush()
+    await audit.log(
+        db,
+        action="session.revoke",
+        user_id=actor.id,
+        object_type="session",
+        object_id=session.id,
+        basis="admin",
+        # Same key convention as `add_representation`'s extra={"for_user": ...}
+        # (auth/service.py) for an actor-acts-on-someone-else audit row: a bare
+        # "user_id" here would read as a duplicate of the top-level actor column.
+        extra={"for_user": str(session.user_id)},
+    )
+
+
+async def revoke_all_sessions(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> int:
+    """Bulk revoke via `auth_repo.revoke_user_sessions` (Task 5's plain UPDATE, no
+    per-row audit) — this call writes the ONE audit entry for the whole action,
+    carrying the count; `block_user`/`delete_user`/`reset_password` also call
+    `revoke_user_sessions` but never audit it separately, because their own
+    action's entry already covers it in the same transaction. Here session revocation
+    IS the action, so it gets its own `session.revoke` entry, object_type="user"."""
+    await _user_or_404(db, user_id)
+    count = await auth_repo.revoke_user_sessions(db, user_id)
+    await audit.log(
+        db,
+        action="session.revoke",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user_id,
+        new_value={"revoked": count},
+    )
+    return count
+
+
+async def user_stats(db: AsyncSession) -> UserStatsOut:
+    """Shapes `auth_repo.user_stats`'s raw dict into the response schema. No zone
+    logic beyond the route's `require_any_permission` gate — a view-only holder
+    sees the same whole-system counters as a manage-holder, same as `list_roles`."""
+    stats = await auth_repo.user_stats(db)
+    return UserStatsOut(**stats)
