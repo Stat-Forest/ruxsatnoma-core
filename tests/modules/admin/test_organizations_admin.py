@@ -32,6 +32,55 @@ def auth_client(client, token: str, csrf: str):
     return client
 
 
+async def test_get_organization_requires_permission(db, agency):
+    _, token, csrf = await signed_in_with(db)  # no grants
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.get(f"{API}/admin/organizations/{agency.id}")
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_get_organization_returns_the_admin_shape_with_requisites(db, agency):
+    """Finding 6 (whole-branch review): the ruling that dropped `requisites` from the
+    public /refs schema assumed an admin read route existed — it didn't. Without this,
+    `requisites` could only ever be seen in the response to a write."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    org = Organization(
+        kind="leshoz",
+        code=f"getone-{suffix}",
+        name={"uz_cyrl": "Х"},
+        parent_id=agency.id,
+        stir="200388105",
+        requisites={"account": "40012186035209704220"},
+    )
+    db.add(org)
+    await db.flush()
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.get(f"{API}/admin/organizations/{org.id}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["code"] == f"getone-{suffix}"
+    assert body["requisites"] == {"account": "40012186035209704220"}
+
+
+async def test_get_unknown_organization_is_404(db):
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.get(f"{API}/admin/organizations/{uuid.uuid4()}")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "ERR-SYS-003"
+
+
 async def test_create_requires_permission(db):
     _, token, csrf = await signed_in_with(db)  # no grants
     await db.commit()
@@ -266,6 +315,48 @@ async def test_archive_blocked_while_active_children_exist(db, agency):
         allowed = await client.post(f"{API}/admin/organizations/{territorial.id}/archive")
     assert allowed.status_code == 200
     assert allowed.json()["status"] == "archived"
+
+
+async def test_create_rejects_malformed_stir_with_422_not_500(db, agency):
+    """The DB CHECK `stir_format` must never be the thing that catches this — a bad
+    value should 422 at the schema boundary, not surface as ERR-SYS-001 (finding 4)."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.post(
+            f"{API}/admin/organizations",
+            json={
+                "kind": "leshoz",
+                "parent_id": str(agency.id),
+                "code": f"badstir-{suffix}",
+                "name": {"uz_cyrl": "Х"},
+                "stir": "12345",
+            },
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_patch_rejects_malformed_stir_with_422_not_500(db, agency):
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    org = Organization(
+        kind="leshoz", code=f"patchstir-{suffix}", name={"uz_cyrl": "Х"}, parent_id=agency.id
+    )
+    db.add(org)
+    await db.flush()
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.patch(
+            f"{API}/admin/organizations/{org.id}", json={"stir": "not-nine-digits"}
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_unknown_organization_is_404(db):

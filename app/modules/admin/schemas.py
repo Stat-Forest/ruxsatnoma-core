@@ -2,11 +2,15 @@
 
 import uuid
 from datetime import date
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.schemas import LocalizedName
+
+# Matches the `stir_format` DB CHECK (ruling 12): catching the shape here means a bad
+# value 422s at the schema boundary instead of surfacing as an IntegrityError (500).
+Stir = Annotated[str, Field(pattern=r"^\d{9}$")]
 
 
 class RegionOut(BaseModel):
@@ -89,7 +93,7 @@ class OrganizationIn(BaseModel):
     kind: str
     code: str
     name: LocalizedName
-    stir: str | None = None
+    stir: Stir | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
     requisites: dict[str, Any] = {}
@@ -98,7 +102,7 @@ class OrganizationIn(BaseModel):
 class OrganizationPatch(BaseModel):
     parent_id: uuid.UUID | None = None
     name: LocalizedName | None = None
-    stir: str | None = None
+    stir: Stir | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
     requisites: dict[str, Any] | None = None

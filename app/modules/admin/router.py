@@ -37,6 +37,18 @@ async def create_organization(
     return OrganizationAdminOut.model_validate(org, from_attributes=True)
 
 
+@router.get("/organizations/{org_id}", response_model=OrganizationAdminOut)
+async def get_organization(
+    org_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(ORGANIZATIONS_MANAGE))],
+) -> OrganizationAdminOut:
+    """The only way to read `requisites` back outside a write response — `/refs`
+    deliberately omits it (finding 6, whole-branch review)."""
+    org = await service.organization_or_404(db, org_id)
+    return OrganizationAdminOut.model_validate(org, from_attributes=True)
+
+
 @router.patch("/organizations/{org_id}", response_model=OrganizationAdminOut)
 async def update_organization(
     org_id: uuid.UUID,
