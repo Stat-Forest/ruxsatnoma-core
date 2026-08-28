@@ -9,6 +9,7 @@ import secrets
 import string
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,12 @@ from app.core.security import (
     validate_password_policy,
 )
 from app.modules.admin.users_schemas import (
+    PermissionCodesIn,
+    PermissionCodesOut,
+    PermissionOut,
+    RoleAdminOut,
+    RoleCreateIn,
+    RolePatchIn,
     UserAdminOut,
     UserCreatedOut,
     UserCreateIn,
@@ -34,7 +41,7 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import Role, User
-from app.modules.auth.permissions import USERS_MANAGE
+from app.modules.auth.permissions import PERMISSIONS, USERS_MANAGE
 
 # One-time password generator: 12 chars from a de-ambiguated alphabet (no l/I/O/0/1
 # — a person reads these off a screen to type them once). A pure alnum draw could
@@ -68,6 +75,10 @@ def _json_safe(value: Any) -> Any:
         return str(value)
     if isinstance(value, date):
         return value.isoformat()
+    if isinstance(value, Decimal):
+        # str, not float: audit snapshots go through JSONB's plain json.dumps (no
+        # Decimal support), and money/norms are never float (backend/CLAUDE.md).
+        return str(value)
     return value
 
 
@@ -442,3 +453,230 @@ async def reset_mfa(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> str
         db, action="user.reset_mfa", user_id=actor.id, object_type="user", object_id=user.id
     )
     return totp_provisioning_uri(secret, user.login or str(user.id))
+
+
+# --- Roles CRUD + permission coverage + personal grants (С23, Task 6) -------------
+
+_ROLE_AUDITED_FIELDS = (
+    "code",
+    "name",
+    "description",
+    "max_approve_amount",
+    "max_approve_area",
+    "status",
+)
+
+
+def _role_field_snapshot(role: Role, fields: set[str]) -> dict[str, Any]:
+    """JSON-safe values for exactly `fields` — same scoped-to-touched-fields
+    convention as `_user_field_snapshot`, used for `role.update`'s audit entry."""
+    data: dict[str, Any] = {}
+    for field in fields:
+        data[field] = _json_safe(getattr(role, field))
+    return data
+
+
+def _role_snapshot(role: Role, permission_codes: list[str]) -> dict[str, Any]:
+    """Full snapshot for `role.create`'s audit `new_value` — includes the initial
+    `permission_codes` (populated when `copy_from` was given)."""
+    data = {field: _json_safe(getattr(role, field)) for field in _ROLE_AUDITED_FIELDS}
+    data["permission_codes"] = permission_codes
+    return data
+
+
+def _to_role_admin_out(role: Role, *, holders: int, permission_codes: list[str]) -> RoleAdminOut:
+    return RoleAdminOut(
+        id=role.id,
+        code=role.code,
+        name=role.name,
+        description=role.description,
+        is_system=role.is_system,
+        status=role.status,
+        max_approve_amount=role.max_approve_amount,
+        max_approve_area=role.max_approve_area,
+        permission_codes=permission_codes,
+        holders=holders,
+    )
+
+
+async def _role_stats_out(db: AsyncSession, role: Role) -> RoleAdminOut:
+    """Builds `RoleAdminOut` for a single already-mutated role via two small
+    lookups — `roles_with_stats`' one-query LEFT JOIN is for the list endpoint,
+    where it saves an N+1; a single write response doesn't have that problem."""
+    codes = await auth_repo.role_permission_codes(db, role.id)
+    holders = await auth_repo.count_role_holders(db, role.id)
+    return _to_role_admin_out(role, holders=holders, permission_codes=codes)
+
+
+async def _role_or_404(db: AsyncSession, role_id: uuid.UUID) -> Role:
+    role = await auth_repo.get_role(db, role_id)
+    if role is None:
+        raise err("ERR-SYS-003", details={"role": str(role_id)})
+    return role
+
+
+def _validate_permission_codes(codes: list[str]) -> None:
+    """Every code must already be registered in `PERMISSIONS` — a typo or a code
+    from a not-yet-landed module is rejected here, not left to violate nothing (the
+    registry is in-memory, not FK-enforced) and surface as a silent no-op grant."""
+    unknown = [code for code in codes if code not in PERMISSIONS]
+    if unknown:
+        raise err("ERR-VAL-001", details={"reason": "unknown_permission", "codes": unknown})
+
+
+async def list_roles(db: AsyncSession) -> list[RoleAdminOut]:
+    rows = await auth_repo.roles_with_stats(db)
+    return [
+        _to_role_admin_out(role, holders=holders, permission_codes=codes)
+        for role, holders, codes in rows
+    ]
+
+
+async def create_role(db: AsyncSession, *, data: RoleCreateIn, actor: User) -> RoleAdminOut:
+    if await auth_repo.get_role_by_code(db, data.code) is not None:
+        raise err("ERR-VAL-001", details={"code": data.code, "reason": "duplicate_code"})
+
+    fields = data.model_dump(exclude_unset=True)
+    max_approve_amount = data.max_approve_amount
+    max_approve_area = data.max_approve_area
+    copied_codes: list[str] = []
+    if data.copy_from is not None:
+        source = await auth_repo.get_role_by_code(db, data.copy_from)
+        if source is None:
+            raise err("ERR-SYS-003", details={"role_code": data.copy_from})
+        if "max_approve_amount" not in fields:
+            max_approve_amount = source.max_approve_amount
+        if "max_approve_area" not in fields:
+            max_approve_area = source.max_approve_area
+        copied_codes = await auth_repo.role_permission_codes(db, source.id)
+
+    role = Role(
+        code=data.code,
+        name=data.name.root,
+        description=data.description.root if data.description is not None else None,
+        max_approve_amount=max_approve_amount,
+        max_approve_area=max_approve_area,
+    )
+    db.add(role)
+    await db.flush()
+    if copied_codes:
+        await auth_repo.set_role_permissions(db, role.id, copied_codes)
+    await audit.log(
+        db,
+        action="role.create",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        new_value=_role_snapshot(role, copied_codes),
+    )
+    return _to_role_admin_out(role, holders=0, permission_codes=copied_codes)
+
+
+async def patch_role(
+    db: AsyncSession, *, role_id: uuid.UUID, data: RolePatchIn, actor: User
+) -> RoleAdminOut:
+    role = await _role_or_404(db, role_id)
+    fields = data.model_dump(exclude_unset=True)
+    before = _role_field_snapshot(role, set(fields))
+
+    if "name" in fields and data.name is not None:
+        role.name = data.name.root
+    if "description" in fields:
+        role.description = data.description.root if data.description is not None else None
+    for field in ("max_approve_amount", "max_approve_area"):
+        if field in fields:
+            setattr(role, field, fields[field])
+
+    await db.flush()
+    after = _role_field_snapshot(role, set(fields))
+    await audit.log(
+        db,
+        action="role.update",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        old_value=before,
+        new_value=after,
+    )
+    return await _role_stats_out(db, role)
+
+
+async def set_role_permissions(
+    db: AsyncSession, *, role_id: uuid.UUID, data: PermissionCodesIn, actor: User
+) -> RoleAdminOut:
+    role = await _role_or_404(db, role_id)
+    codes = sorted(set(data.codes))
+    _validate_permission_codes(codes)
+    before = await auth_repo.role_permission_codes(db, role.id)
+    await auth_repo.set_role_permissions(db, role.id, codes)
+    await audit.log(
+        db,
+        action="role.permissions_set",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        old_value={"codes": before},
+        new_value={"codes": codes},
+    )
+    return await _role_stats_out(db, role)
+
+
+async def archive_role(db: AsyncSession, *, role_id: uuid.UUID, actor: User) -> RoleAdminOut:
+    role = await _role_or_404(db, role_id)
+    if role.status == "archived":
+        return await _role_stats_out(db, role)
+    if role.is_system:
+        raise err("ERR-VAL-001", details={"reason": "system_role"})
+    holders = await auth_repo.count_role_holders(db, role.id)
+    if holders > 0:
+        raise err("ERR-VAL-001", details={"reason": "role_in_use", "holders": holders})
+
+    before_status = role.status
+    role.status = "archived"
+    await db.flush()
+    await audit.log(
+        db,
+        action="role.archive",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        old_value={"status": before_status},
+        new_value={"status": "archived"},
+    )
+    return await _role_stats_out(db, role)
+
+
+async def list_permissions(db: AsyncSession) -> list[PermissionOut]:
+    role_codes = await auth_repo.role_codes_by_permission(db)
+    return [
+        PermissionOut(code=code, description=description, roles=role_codes.get(code, []))
+        for code, description in sorted(PERMISSIONS.items())
+    ]
+
+
+async def get_user_permissions(
+    db: AsyncSession, *, user_id: uuid.UUID, actor: User
+) -> PermissionCodesOut:
+    await _user_or_404(db, user_id)
+    codes = await auth_repo.user_permission_codes(db, user_id)
+    return PermissionCodesOut(codes=sorted(codes))
+
+
+async def set_user_permissions(
+    db: AsyncSession, *, user_id: uuid.UUID, data: PermissionCodesIn, actor: User
+) -> PermissionCodesOut:
+    user = await _user_or_404(db, user_id)
+    codes = sorted(set(data.codes))
+    _validate_permission_codes(codes)
+    before = await auth_repo.user_permission_codes(db, user.id)
+    await auth_repo.set_user_permissions(db, user.id, codes, granted_by=actor.id)
+    await audit.log(
+        db,
+        action="user.permissions_set",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        old_value={"codes": sorted(before)},
+        new_value={"codes": codes},
+    )
+    return PermissionCodesOut(codes=codes)

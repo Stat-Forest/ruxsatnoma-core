@@ -5,9 +5,12 @@ once the module would otherwise grow past ~400 lines.
 
 import uuid
 from datetime import date, datetime
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
+
+from app.core.schemas import LocalizedName
 
 # Matches the DB's `pinfl_format` CHECK (ASCII-only digits, migration 0007):
 # catching the shape here means a bad value 422s at the schema boundary instead of
@@ -100,3 +103,65 @@ class OneTimePasswordOut(BaseModel):
 
 class TotpUriOut(BaseModel):
     totp_uri: str
+
+
+class RoleAdminOut(BaseModel):
+    """`GET /admin/roles` row and the write-endpoints' response shape (Task 6, С23):
+    `permission_codes`/`holders` are computed (LEFT JOIN + array_agg in
+    `auth.repo.roles_with_stats`, or the two single-role lookups for a write
+    response), not native `Role` columns."""
+
+    id: uuid.UUID
+    code: str
+    name: dict[str, Any]
+    description: dict[str, Any] | None
+    is_system: bool
+    status: str
+    max_approve_amount: Decimal | None
+    max_approve_area: Decimal | None
+    permission_codes: list[str]
+    holders: int
+
+
+class RoleCreateIn(BaseModel):
+    """`copy_from` (an existing role's code) seeds the new role's permission codes
+    and, for any limit NOT explicitly given here, its `max_approve_amount`/
+    `max_approve_area` too — an explicit value in this payload always wins."""
+
+    code: str
+    name: LocalizedName
+    description: LocalizedName | None = None
+    max_approve_amount: Decimal | None = None
+    max_approve_area: Decimal | None = None
+    copy_from: str | None = None
+
+
+class RolePatchIn(BaseModel):
+    """Name/description/limits only — `code` is identity, `is_system` is never
+    settable via the API, and `status` changes only via `POST .../archive`."""
+
+    name: LocalizedName | None = None
+    description: LocalizedName | None = None
+    max_approve_amount: Decimal | None = None
+    max_approve_area: Decimal | None = None
+
+
+class PermissionCodesIn(BaseModel):
+    """Replace-set request body, shared by `PUT /admin/roles/{id}/permissions` and
+    `PUT /admin/users/{id}/permissions` (personal grants) — same `{codes: [...]}`
+    shape for both."""
+
+    codes: list[str]
+
+
+class PermissionCodesOut(BaseModel):
+    codes: list[str]
+
+
+class PermissionOut(BaseModel):
+    """One row of `GET /admin/permissions`: every code in the `PERMISSIONS`
+    registry, with which role codes currently grant it (`[]` if none do)."""
+
+    code: str
+    description: str
+    roles: list[str]

@@ -1,9 +1,10 @@
 """Auth repository: DB access for users, sessions, permissions, otp codes."""
 
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, date, datetime
 
-from sqlalchemy import ColumnElement, func, or_, select, update
+from sqlalchemy import ColumnElement, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
@@ -87,6 +88,106 @@ async def permission_codes(db: AsyncSession, user: User) -> set[str]:
         )
     ).scalars()
     return set(role_codes) | set(user_codes)
+
+
+async def role_permission_codes(db: AsyncSession, role_id: uuid.UUID) -> list[str]:
+    result = await db.execute(
+        select(RolePermission.permission_code)
+        .where(RolePermission.role_id == role_id)
+        .order_by(RolePermission.permission_code)
+    )
+    return list(result.scalars())
+
+
+async def user_permission_codes(db: AsyncSession, user_id: uuid.UUID) -> set[str]:
+    """Personal grants only (`user_permissions`) — unlike `permission_codes` above,
+    which merges in the role's grants too, the С23 personal-grants admin API
+    (GET/PUT /admin/users/{id}/permissions) needs the un-merged set."""
+    result = await db.execute(
+        select(UserPermission.permission_code).where(UserPermission.user_id == user_id)
+    )
+    return set(result.scalars())
+
+
+async def role_codes_by_permission(db: AsyncSession) -> dict[str, list[str]]:
+    """Which role codes grant each permission code (`GET /admin/permissions`
+    coverage view, С23) — a code held by no role is simply absent from the dict;
+    callers default to `[]`."""
+    rows = (
+        await db.execute(
+            select(RolePermission.permission_code, Role.code)
+            .join(Role, Role.id == RolePermission.role_id)
+            .order_by(RolePermission.permission_code, Role.code)
+        )
+    ).all()
+    result: dict[str, list[str]] = {}
+    for permission_code, role_code in rows:
+        result.setdefault(permission_code, []).append(role_code)
+    return result
+
+
+async def count_role_holders(db: AsyncSession, role_id: uuid.UUID) -> int:
+    """Non-deleted users currently assigned `role_id` — same "non-deleted" rule
+    `roles_with_stats` counts by, reused as the archive-guard check for one role."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(User)
+        .where(User.role_id == role_id, User.status != "deleted")
+    )
+    return result.scalar_one()
+
+
+async def roles_with_stats(db: AsyncSession) -> list[tuple[Role, int, list[str]]]:
+    """Every role with its holder count (non-deleted users) and permission codes, in
+    one query (LEFT JOIN + array_agg) — avoids an N+1 across the admin roles list
+    (С23)."""
+    holders = (
+        select(User.role_id, func.count().label("holders"))
+        .where(User.status != "deleted")
+        .group_by(User.role_id)
+        .subquery()
+    )
+    perms = (
+        select(
+            RolePermission.role_id,
+            func.array_agg(RolePermission.permission_code).label("codes"),
+        )
+        .group_by(RolePermission.role_id)
+        .subquery()
+    )
+    stmt = (
+        select(Role, func.coalesce(holders.c.holders, 0), perms.c.codes)
+        .outerjoin(holders, holders.c.role_id == Role.id)
+        .outerjoin(perms, perms.c.role_id == Role.id)
+        .order_by(Role.code)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        (role, holder_count, sorted(codes) if codes else []) for role, holder_count, codes in rows
+    ]
+
+
+async def set_role_permissions(db: AsyncSession, role_id: uuid.UUID, codes: Iterable[str]) -> None:
+    """Replace-set: DELETE then INSERT in the caller's transaction — role_permissions
+    has no updated_at to key a diff-patch on, same reasoning as `set_user_permissions`."""
+    await db.execute(delete(RolePermission).where(RolePermission.role_id == role_id))
+    db.add_all([RolePermission(role_id=role_id, permission_code=code) for code in codes])
+    await db.flush()
+
+
+async def set_user_permissions(
+    db: AsyncSession, user_id: uuid.UUID, codes: Iterable[str], *, granted_by: uuid.UUID
+) -> None:
+    """Replace-set for personal grants (С23) — same DELETE+INSERT reasoning as
+    `set_role_permissions`."""
+    await db.execute(delete(UserPermission).where(UserPermission.user_id == user_id))
+    db.add_all(
+        [
+            UserPermission(user_id=user_id, permission_code=code, granted_by=granted_by)
+            for code in codes
+        ]
+    )
+    await db.flush()
 
 
 async def list_users(

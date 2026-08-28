@@ -11,8 +11,13 @@ from app.modules.auth.models import Role, User
 
 
 async def test_role_seeds_present(db):
+    """Subset, not exact-equality (Task 6, С23): `POST /admin/roles` gives other
+    tests a legitimate way to add rows to this shared/persistent table, so the seed
+    codes can only be asserted present, not exhaustive. `is_system` stays an exact
+    count — the admin API never sets it, so only the 11 migration-seeded rows carry
+    it true."""
     codes = set((await db.execute(select(Role.code))).scalars())
-    assert codes == {
+    assert {
         "sys_admin",
         "central_admin",
         "leadership",
@@ -24,7 +29,7 @@ async def test_role_seeds_present(db):
         "accountant",
         "applicant",
         "prosecutor",
-    }
+    } <= codes
     assert (
         await db.execute(select(func.count()).select_from(Role).where(Role.is_system))
     ).scalar() == 11

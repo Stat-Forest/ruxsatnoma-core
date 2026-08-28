@@ -14,6 +14,12 @@ from app.core.schemas import Page, PageParams
 from app.modules.admin import users_service as service
 from app.modules.admin.users_schemas import (
     OneTimePasswordOut,
+    PermissionCodesIn,
+    PermissionCodesOut,
+    PermissionOut,
+    RoleAdminOut,
+    RoleCreateIn,
+    RolePatchIn,
     TotpUriOut,
     UserAdminOut,
     UserBlockIn,
@@ -113,3 +119,76 @@ async def reset_mfa(
 ) -> TotpUriOut:
     totp_uri = await service.reset_mfa(db, user_id=user_id, actor=actor)
     return TotpUriOut(totp_uri=totp_uri)
+
+
+@router.get("/roles", response_model=list[RoleAdminOut])
+async def list_roles(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+) -> list[RoleAdminOut]:
+    return await service.list_roles(db)
+
+
+@router.post("/roles", response_model=RoleAdminOut, status_code=201)
+async def create_role(
+    body: RoleCreateIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> RoleAdminOut:
+    return await service.create_role(db, data=body, actor=actor)
+
+
+@router.patch("/roles/{role_id}", response_model=RoleAdminOut)
+async def patch_role(
+    role_id: uuid.UUID,
+    body: RolePatchIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> RoleAdminOut:
+    return await service.patch_role(db, role_id=role_id, data=body, actor=actor)
+
+
+@router.put("/roles/{role_id}/permissions", response_model=RoleAdminOut)
+async def set_role_permissions(
+    role_id: uuid.UUID,
+    body: PermissionCodesIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> RoleAdminOut:
+    return await service.set_role_permissions(db, role_id=role_id, data=body, actor=actor)
+
+
+@router.post("/roles/{role_id}/archive", response_model=RoleAdminOut)
+async def archive_role(
+    role_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> RoleAdminOut:
+    return await service.archive_role(db, role_id=role_id, actor=actor)
+
+
+@router.get("/permissions", response_model=list[PermissionOut])
+async def list_permissions(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+) -> list[PermissionOut]:
+    return await service.list_permissions(db)
+
+
+@router.get("/users/{user_id}/permissions", response_model=PermissionCodesOut)
+async def get_user_permissions(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+) -> PermissionCodesOut:
+    return await service.get_user_permissions(db, user_id=user_id, actor=actor)
+
+
+@router.put("/users/{user_id}/permissions", response_model=PermissionCodesOut)
+async def set_user_permissions(
+    user_id: uuid.UUID,
+    body: PermissionCodesIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> PermissionCodesOut:
+    return await service.set_user_permissions(db, user_id=user_id, data=body, actor=actor)

@@ -129,6 +129,10 @@ async def test_poa_file_fk_enforced(db):
 
 
 async def test_users_view_seeded_to_three_roles(db):
+    """Subset, not exact-equality (Task 6, С23): `PUT /admin/roles/{id}/permissions`
+    gives other tests a legitimate way to grant auth.users.view to further roles in
+    this shared/persistent table — migration 0007's own three seeded grants must
+    still be present, but they need not be the only ones anymore."""
     rows = (
         await db.execute(
             select(Role.code)
@@ -136,7 +140,7 @@ async def test_users_view_seeded_to_three_roles(db):
             .where(RolePermission.permission_code == "auth.users.view")
         )
     ).scalars()
-    assert set(rows) == {"central_admin", "leadership", "executor_head"}
+    assert {"central_admin", "leadership", "executor_head"} <= set(rows)
 
 
 async def test_permission_codes_registered():
