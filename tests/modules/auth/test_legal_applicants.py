@@ -3,10 +3,13 @@
 import uuid
 from datetime import date, timedelta
 
+from sqlalchemy import select
+
 from app.core.models import MediaFile
 from app.main import create_app
 from app.modules.auth.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
 from app.modules.auth.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
+from app.modules.auth.models import User
 from tests.conftest import make_client
 from tests.modules.auth.test_otp import last_code, unique_email, unique_phone
 
@@ -25,19 +28,28 @@ def csrf_headers(client) -> dict[str, str]:
     return {"X-CSRF-Token": client.cookies.get("csrf_token")}
 
 
-async def make_media_file(db) -> MediaFile:
-    """A stand-in poa attachment: representations.poa_file_id FK closed in 3.3b,
-    so tests can no longer point it at an arbitrary uuid."""
+async def make_media_file(db, uploaded_by: uuid.UUID) -> MediaFile:
+    """A stand-in poa attachment: representations.poa_file_id FK closed in 3.3b
+    (Task 1), and the poa closure (Task 4) also requires the file to be owned by
+    the actor referencing it — callers pass that actor's user id."""
     f = MediaFile(
         storage_key=f"t/{uuid.uuid4().hex}",
         filename="poa.pdf",
         content_type="application/pdf",
         size_bytes=100,
         sha256="0" * 64,
+        uploaded_by=uploaded_by,
     )
     db.add(f)
     await db.flush()
     return f
+
+
+async def user_id_by_pinfl(db, pinfl: str) -> uuid.UUID:
+    """register_individual only drives the HTTP flow and hands back nothing, so
+    poa tests that need the resulting user's id (to own a stand-in MediaFile)
+    look it up here."""
+    return (await db.execute(select(User.id).where(User.pinfl == pinfl))).scalar_one()
 
 
 async def register_individual(client, pinfl: str, *, legal_info=()) -> None:
@@ -177,7 +189,7 @@ async def test_attach_via_poa_requires_fields(db):
             headers=csrf_headers(client),
         )
         assert incomplete.status_code == 422
-        poa_file = await make_media_file(db)
+        poa_file = await make_media_file(db, await user_id_by_pinfl(db, pinfl))
         await db.commit()
         r = await client.post(
             f"{API}/auth/applicants",
@@ -203,7 +215,7 @@ async def test_verified_basis_heals_poa_squatted_applicant(db):
     app = create_app()
     async with make_client(app, lifespan=True) as squatter_client:
         await register_individual(squatter_client, squatter)
-        poa_file = await make_media_file(db)
+        poa_file = await make_media_file(db, await user_id_by_pinfl(db, squatter))
         await db.commit()
         squat = await squatter_client.post(
             f"{API}/auth/applicants",
@@ -312,7 +324,7 @@ async def test_poa_holder_cannot_add_people(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         await register_individual(client, holder)
-        poa_file = await make_media_file(db)
+        poa_file = await make_media_file(db, await user_id_by_pinfl(db, holder))
         await db.commit()
         r = await client.post(
             f"{API}/auth/applicants",
