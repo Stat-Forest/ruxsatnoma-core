@@ -3,13 +3,16 @@
 import uuid
 from datetime import date
 
-from sqlalchemy import Select, func, select, text
+from sqlalchemy import Select, and_, delete, exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.models import MediaFile
 from app.core.time import business_today
 from app.db import Base
 from app.modules.admin.models import (
     ActivityType,
+    Announcement,
+    AnnouncementFile,
     Classifier,
     ClassifierItem,
     District,
@@ -172,4 +175,124 @@ async def list_classifier_items(
         if on_date is None or on_date >= today:
             stmt = stmt.where(ClassifierItem.status == "active")
     stmt = stmt.order_by(ClassifierItem.sort_order, ClassifierItem.code)
+    return list((await db.execute(stmt)).scalars())
+
+
+# --- Announcements (Task 8): admin CRUD queries + the audience-visibility clause ----
+
+
+async def get_announcement(db: AsyncSession, announcement_id: uuid.UUID) -> Announcement | None:
+    return await db.get(Announcement, announcement_id)
+
+
+async def list_admin_announcements(
+    db: AsyncSession, *, status: str | None, offset: int, limit: int
+) -> tuple[list[Announcement], int]:
+    stmt = select(Announcement)
+    if status is not None:
+        stmt = stmt.where(Announcement.status == status)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(stmt.order_by(Announcement.created_at.desc()).offset(offset).limit(limit))
+    ).scalars()
+    return list(rows), total
+
+
+def announcement_visibility_clause(role_code: str, region_id: uuid.UUID | None):
+    """A row is visible when published, currently inside its publish window, and its
+    audience (if any) matches the reader's role/region — a missing key or null
+    `audience` column means no restriction on that axis (models.py's Announcement
+    docstring, ruling 12). Shared by the reader queries below and by
+    `file_visible_via_announcement` (the files-access grant, Task 8 ruling 5)."""
+    aud = Announcement.audience
+    now = func.now()
+    # jsonb `?` on an array = element membership; SQLAlchemy spells it .has_key()
+    role_ok = or_(aud.is_(None), aud["role_codes"].is_(None), aud["role_codes"].has_key(role_code))
+    region_parts = [aud.is_(None), aud["region_ids"].is_(None)]
+    if region_id is not None:
+        region_parts.append(aud["region_ids"].has_key(str(region_id)))
+    return and_(
+        Announcement.status == "published",
+        Announcement.publish_from <= now,
+        or_(Announcement.publish_to.is_(None), Announcement.publish_to >= now),
+        role_ok,
+        or_(*region_parts),
+    )
+
+
+async def list_visible_announcements(
+    db: AsyncSession, *, role_code: str, region_id: uuid.UUID | None, offset: int, limit: int
+) -> tuple[list[Announcement], int]:
+    clause = announcement_visibility_clause(role_code, region_id)
+    stmt = select(Announcement).where(clause)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Announcement.publish_from.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def get_visible_announcement(
+    db: AsyncSession, announcement_id: uuid.UUID, *, role_code: str, region_id: uuid.UUID | None
+) -> Announcement | None:
+    clause = announcement_visibility_clause(role_code, region_id)
+    stmt = select(Announcement).where(Announcement.id == announcement_id, clause)
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def file_visible_via_announcement(
+    db: AsyncSession, file_id: uuid.UUID, *, role_code: str, region_id: uuid.UUID | None
+) -> bool:
+    """Backs `announcements_service.announcement_grants_access` (the
+    `files.ACCESS_CHECKS` entry, ruling 5): true when `file_id` is attached to an
+    announcement currently visible to a reader with this role/region."""
+    clause = announcement_visibility_clause(role_code, region_id)
+    stmt = select(
+        exists(
+            select(1)
+            .select_from(AnnouncementFile)
+            .join(Announcement, Announcement.id == AnnouncementFile.announcement_id)
+            .where(AnnouncementFile.file_id == file_id, clause)
+        )
+    )
+    return bool((await db.execute(stmt)).scalar_one())
+
+
+async def count_active_media_files(db: AsyncSession, file_ids: list[uuid.UUID]) -> int:
+    """One-SELECT existence+status check backing `file_ids` validation on
+    create/patch — an archived file can't be (re)attached."""
+    if not file_ids:
+        return 0
+    stmt = (
+        select(func.count())
+        .select_from(MediaFile)
+        .where(MediaFile.id.in_(file_ids), MediaFile.status == "active")
+    )
+    return (await db.execute(stmt)).scalar_one()
+
+
+async def set_announcement_files(
+    db: AsyncSession, announcement_id: uuid.UUID, file_ids: list[uuid.UUID]
+) -> None:
+    """Replace-set: drop the previous links, insert the given ones in order
+    (`position` = list index)."""
+    await db.execute(
+        delete(AnnouncementFile).where(AnnouncementFile.announcement_id == announcement_id)
+    )
+    for position, file_id in enumerate(file_ids):
+        db.add(
+            AnnouncementFile(announcement_id=announcement_id, file_id=file_id, position=position)
+        )
+    await db.flush()
+
+
+async def list_announcement_files(db: AsyncSession, announcement_id: uuid.UUID) -> list[MediaFile]:
+    stmt = (
+        select(MediaFile)
+        .join(AnnouncementFile, AnnouncementFile.file_id == MediaFile.id)
+        .where(AnnouncementFile.announcement_id == announcement_id)
+        .order_by(AnnouncementFile.position)
+    )
     return list((await db.execute(stmt)).scalars())
