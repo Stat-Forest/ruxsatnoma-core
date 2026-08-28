@@ -4,6 +4,7 @@ import asyncio
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from cryptography.fernet import InvalidToken
@@ -22,6 +23,7 @@ from app.core.security import (
 )
 from app.modules.audit import service as audit
 from app.modules.auth import repo
+from app.modules.auth.adapters.oneid import OneIdError, get_oneid_adapter
 from app.modules.auth.adapters.otp_sender import get_otp_sender
 from app.modules.auth.models import OtpCode, Session, User
 
@@ -56,6 +58,89 @@ async def issue_session(
         user_agent=user_agent,
     )
     return row, token, csrf
+
+
+async def login_or_create_by_pinfl(
+    db: AsyncSession,
+    *,
+    pinfl: str,
+    full_name: str,
+    method: str,
+    snapshot: dict[str, Any] | None,
+    phone: str | None,
+    ip: str | None,
+    user_agent: str | None,
+) -> tuple[User, Session, str, str]:
+    """Shared core of OneID/E-IMZO logins (ruling 5): any-role entry by pinfl,
+    auto-creating an applicant account on first contact."""
+    user = await repo.get_user_by_pinfl(db, pinfl)
+    now = datetime.now(UTC)
+    if user is not None and user.status != "active":
+        await audit.log(
+            db,
+            action="user.login",
+            user_id=user.id,
+            result="denied",
+            basis=f"{method}: user not active",
+            ip=ip,
+            user_agent=user_agent,
+        )
+        await db.commit()
+        raise err("ERR-AUTH-001")
+    if user is None:
+        role = await repo.get_role_by_code(db, "applicant")
+        assert role is not None  # seeded by migration 0003
+        user = User(
+            full_name=full_name,
+            role_id=role.id,
+            pinfl=pinfl,
+            phone=phone,  # draft from the provider; verified only via OTP (С2)
+        )
+        await repo.add(db, user)
+        await audit.log(
+            db,
+            action="user.create",
+            user_id=user.id,
+            object_type="user",
+            object_id=user.id,
+            basis="self-registration",
+            extra={"method": method},
+            ip=ip,
+            user_agent=user_agent,
+        )
+    if snapshot is not None:
+        user.oneid_profile = snapshot
+    user.last_login_at = now
+    row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
+    await audit.log(
+        db,
+        action="user.login",
+        user_id=user.id,
+        extra={"method": method},
+        ip=ip,
+        user_agent=user_agent,
+    )
+    return user, row, token, csrf
+
+
+async def login_via_oneid(
+    db: AsyncSession, *, code: str, ip: str | None, user_agent: str | None
+) -> tuple[User, Session, str, str]:
+    adapter = get_oneid_adapter()
+    try:
+        profile = await adapter.exchange_code(code)
+    except OneIdError as exc:
+        raise err(exc.err_code) from exc
+    return await login_or_create_by_pinfl(
+        db,
+        pinfl=profile.pinfl,
+        full_name=profile.full_name,
+        method="oneid",
+        snapshot=profile.to_snapshot(),
+        phone=profile.phone,
+        ip=ip,
+        user_agent=user_agent,
+    )
 
 
 async def revoke_session(db: AsyncSession, session_row: Session, *, reason: str) -> None:

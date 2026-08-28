@@ -47,6 +47,10 @@ class MeOut(BaseModel):
     is_superuser: bool
 
 
+class OneIdAuthorizeOut(BaseModel):
+    redirect_url: str
+
+
 class LoginIn(BaseModel):
     login: str
     password: str

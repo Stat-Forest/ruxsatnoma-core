@@ -22,6 +22,14 @@ async def get_role(db: AsyncSession, role_id: uuid.UUID) -> Role | None:
     return await db.get(Role, role_id)
 
 
+async def get_user_by_pinfl(db: AsyncSession, pinfl: str) -> User | None:
+    return (await db.execute(select(User).where(User.pinfl == pinfl))).scalar_one_or_none()
+
+
+async def get_role_by_code(db: AsyncSession, code: str) -> Role | None:
+    return (await db.execute(select(Role).where(Role.code == code))).scalar_one_or_none()
+
+
 async def get_session_by_token_hash(db: AsyncSession, token_hash: str) -> Session | None:
     return (
         await db.execute(select(Session).where(Session.token_hash == token_hash))

@@ -1,5 +1,6 @@
 """Auth HTTP routes (design/03 § auth)."""
 
+import secrets
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -7,7 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.deps import get_db
+from app.core.errors import err
+from app.core.security import new_token
 from app.modules.auth import repo, service
+from app.modules.auth.adapters.oneid import get_oneid_adapter
 from app.modules.auth.deps import SUPERUSER_ROLE, get_current_session, get_current_user
 from app.modules.auth.models import Role, Session, User
 from app.modules.auth.permissions import PERMISSIONS
@@ -16,6 +20,7 @@ from app.modules.auth.schemas import (
     LoginOut,
     MeOut,
     MfaIn,
+    OneIdAuthorizeOut,
     OtpRequestIn,
     OtpVerifyIn,
     OtpVerifyOut,
@@ -26,6 +31,16 @@ from app.modules.auth.schemas import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _set_session_cookies(response: Response, token: str, csrf: str) -> None:
+    settings = get_settings()
+    secure = settings.resolve_cookie_secure()
+    samesite = settings.resolve_cookie_samesite()
+    response.set_cookie("session", token, httponly=True, samesite=samesite, secure=secure, path="/")
+    response.set_cookie(
+        "csrf_token", csrf, httponly=False, samesite=samesite, secure=secure, path="/"
+    )
 
 
 async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> MeOut:
@@ -106,13 +121,48 @@ async def mfa_verify(
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("User-Agent"),
     )
+    _set_session_cookies(response, token, csrf)
+    role = await repo.get_role(db, user.role_id)
+    assert role is not None
+    return await _me_out(db, user, role, csrf)
+
+
+@router.get("/oneid/authorize", response_model=OneIdAuthorizeOut)
+async def oneid_authorize(response: Response) -> OneIdAuthorizeOut:
     settings = get_settings()
-    secure = settings.resolve_cookie_secure()
-    samesite = settings.resolve_cookie_samesite()
-    response.set_cookie("session", token, httponly=True, samesite=samesite, secure=secure, path="/")
+    state = new_token()
+    url = get_oneid_adapter().authorize_url(state=state, redirect_uri=settings.oneid_redirect_uri)
     response.set_cookie(
-        "csrf_token", csrf, httponly=False, samesite=samesite, secure=secure, path="/"
+        "oneid_state",
+        state,
+        httponly=True,
+        max_age=600,
+        samesite=settings.resolve_cookie_samesite(),
+        secure=settings.resolve_cookie_secure(),
+        path="/",
     )
+    return OneIdAuthorizeOut(redirect_url=url)
+
+
+@router.get("/oneid/callback", response_model=MeOut)
+async def oneid_callback(
+    code: str,
+    state: str,
+    request: Request,
+    response: Response,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MeOut:
+    expected = request.cookies.get("oneid_state")
+    if not expected or not secrets.compare_digest(state, expected):
+        raise err("ERR-AUTH-006")
+    user, _row, token, csrf = await service.login_via_oneid(
+        db,
+        code=code,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+    )
+    response.delete_cookie("oneid_state")
+    _set_session_cookies(response, token, csrf)
     role = await repo.get_role(db, user.role_id)
     assert role is not None
     return await _me_out(db, user, role, csrf)
