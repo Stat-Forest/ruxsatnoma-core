@@ -153,6 +153,25 @@ async def test_double_registration_409(db):
     assert r.json()["error"]["code"] == "ERR-AUTH-012"
 
 
+async def test_patch_me_blocked_for_unregistered_applicant(db):
+    """Finding 1 (final review): the registration-gate exemption is method-aware —
+    PATCH /auth/me must not ride the GET-only /auth/me exemption. An unregistered
+    applicant PATCHing /auth/me is gated to ERR-AUTH-008 before the request ever
+    reaches OTP validation (otp_token below is a deliberately bogus value)."""
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        await oneid_login(client, unique_pinfl())
+        r = await client.patch(
+            f"{API}/auth/me",
+            json={"phone": unique_phone(), "otp_token": "bogus"},
+            headers=csrf_headers(client),
+        )
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "ERR-AUTH-008"
+        # the GET exemption itself must still work for the same user
+        assert (await client.get(f"{API}/auth/me")).status_code == 200
+
+
 async def test_staff_cannot_register_as_applicant(db):
     """A staff role calling complete-registration gets 403, and staff are never gated."""
     from tests.modules.auth.test_sessions import make_session, make_user

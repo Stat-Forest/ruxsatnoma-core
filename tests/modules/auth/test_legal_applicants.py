@@ -54,14 +54,14 @@ async def register_individual(client, pinfl: str, *, legal_info=()) -> None:
     assert r.status_code == 200
 
 
-async def org_eri_challenge(client, *, pinfl: str, stir: str) -> str:
+async def org_eri_challenge(client, *, pinfl: str, stir: str, legal_name: str = "OOO ORG") -> str:
     r = await client.post(f"{API}/auth/eimzo/challenge")
     identity = EimzoIdentity(
         challenge=r.json()["challenge"],
         pinfl=pinfl,
         full_name="DIRECTOR",
         tin=stir,
-        legal_name="OOO ORG",
+        legal_name=legal_name,
     )
     return encode_mock_signed_challenge(identity)
 
@@ -94,6 +94,25 @@ async def test_org_eri_tin_mismatch_403(db):
         r = await client.post(
             f"{API}/auth/applicants",
             json={"stir": unique_stir(), "basis": "org_eri", "signed_challenge": signed},
+            headers=csrf_headers(client),
+        )
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_org_eri_stolen_cert_pinfl_mismatch_403(db):
+    """Finding 5 (final review): a cert whose embedded pinfl differs from the
+    calling user's own pinfl must be rejected even when the tin matches — isolates
+    the identity.pinfl != signer_pinfl check in _verify_org_challenge from the tin
+    check (test_org_eri_tin_mismatch_403 above already covers that one)."""
+    pinfl, stir = unique_pinfl(), unique_stir()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        await register_individual(client, pinfl)
+        stolen = await org_eri_challenge(client, pinfl=unique_pinfl(), stir=stir)
+        r = await client.post(
+            f"{API}/auth/applicants",
+            json={"stir": stir, "basis": "org_eri", "signed_challenge": stolen},
             headers=csrf_headers(client),
         )
     assert r.status_code == 403
@@ -155,6 +174,42 @@ async def test_attach_via_poa_requires_fields(db):
         )
         assert r.status_code == 201
         assert r.json()["representation"]["basis"] == "poa"
+
+
+async def test_verified_basis_heals_poa_squatted_applicant(db):
+    """Finding 2 (final review): basis=poa never verifies the stir against anything,
+    so anyone can pre-create a legal applicant row for any stir under an arbitrary
+    name. The stir's real director's later org_eri attach must heal that row's
+    name/verified_at/verify_source rather than silently inheriting the squat."""
+    squatter, director, stir = unique_pinfl(), unique_pinfl(), unique_stir()
+    app = create_app()
+    async with make_client(app, lifespan=True) as squatter_client:
+        await register_individual(squatter_client, squatter)
+        squat = await squatter_client.post(
+            f"{API}/auth/applicants",
+            json={
+                "stir": stir,
+                "basis": "poa",
+                "poa_file_id": str(uuid.uuid4()),
+                "valid_until": str(date.today() + timedelta(days=30)),
+                "name": "OOO SQUAT",
+            },
+            headers=csrf_headers(squatter_client),
+        )
+        assert squat.status_code == 201
+        assert squat.json()["applicant"]["verified_at"] is None
+    async with make_client(app, lifespan=True) as client:
+        await register_individual(client, director)
+        signed = await org_eri_challenge(client, pinfl=director, stir=stir, legal_name="OOO REAL")
+        r = await client.post(
+            f"{API}/auth/applicants",
+            json={"stir": stir, "basis": "org_eri", "signed_challenge": signed},
+            headers=csrf_headers(client),
+        )
+        assert r.status_code == 201
+        body = r.json()
+        assert body["applicant"]["name"] == "OOO REAL"
+        assert body["applicant"]["verified_at"] is not None
 
 
 async def test_duplicate_active_representation_409(db):

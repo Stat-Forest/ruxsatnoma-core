@@ -73,8 +73,18 @@ async def test_expired_cert_rejected(db):
             f"{API}/auth/eimzo/login",
             json={"signed_challenge": encode_mock_signed_challenge(identity)},
         )
-    assert r.status_code == 401
-    assert r.json()["error"]["code"] == "ERR-AUTH-004"
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "ERR-AUTH-004"
+        # Finding 4 (final review): the challenge row is burned (used_at set) BEFORE
+        # the expiry check runs, so a retry on the SAME challenge — even with a
+        # valid, non-expired identity — must also fail. Pins that ordering.
+        retry_identity = EimzoIdentity(challenge=challenge, pinfl=unique_pinfl(), full_name="U2")
+        retry = await client.post(
+            f"{API}/auth/eimzo/login",
+            json={"signed_challenge": encode_mock_signed_challenge(retry_identity)},
+        )
+    assert retry.status_code == 401
+    assert retry.json()["error"]["code"] == "ERR-AUTH-004"
 
 
 async def test_garbage_signature_rejected(db):

@@ -55,7 +55,9 @@ def _set_session_cookies(response: Response, token: str, csrf: str) -> None:
 
 
 async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> MeOut:
-    """Shared by /auth/me and /auth/mfa/verify (both return the same shape).
+    """Shared by every session-returning/profile-returning route: GET /auth/me,
+    /auth/mfa/verify, /auth/oneid/callback, /auth/eimzo/login,
+    /auth/complete-registration, and PATCH /auth/me — all return the same shape.
 
     sys_admin passes require_permission without consulting codes (ruling 2), so its
     `permissions` here is the whole registry rather than its (usually empty) personal

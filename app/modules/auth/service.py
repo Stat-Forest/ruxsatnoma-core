@@ -627,6 +627,21 @@ async def attach_legal(
     )
     if existing is not None:
         raise err("ERR-AUTH-011")
+    # A poa attach can pre-create an applicant row for any stir under an arbitrary
+    # name (basis=poa never verifies the stir against anything) — the first
+    # cryptographically/registry-verified attach for that stir heals the row instead
+    # of silently inheriting the squatted name. Only on the success path (a raise
+    # above would roll the heal back too, which is fine — nothing urgent to fix on a
+    # duplicate/denied attach).
+    healed = (
+        not created and basis in ("org_eri", "director_registry") and applicant.verified_at is None
+    )
+    if healed:
+        applicant.name = legal_name
+        applicant.verified_at = datetime.now(UTC)
+        applicant.verify_source = basis
+        if basis == "org_eri":
+            applicant.requisites = requisites
     representation = Representation(
         applicant_id=applicant.id,
         user_id=user.id,
@@ -644,6 +659,16 @@ async def attach_legal(
             object_type="applicant",
             object_id=applicant.id,
             extra={"stir": stir},
+            ip=ip,
+        )
+    if healed:
+        await audit.log(
+            db,
+            action="applicant.verify",
+            user_id=user.id,
+            object_type="applicant",
+            object_id=applicant.id,
+            extra={"stir": stir, "source": basis},
             ip=ip,
         )
     await audit.log(
