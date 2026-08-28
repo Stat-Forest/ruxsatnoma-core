@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import settings_store
 from app.core.crypto import decrypt_str
 from app.core.errors import err
+from app.core.models import MediaFile
 from app.core.security import (
     hash_password,
     hash_token,
@@ -575,6 +576,17 @@ def _director_listed(user: User, stir: str) -> tuple[bool, str | None]:
     return False, None
 
 
+async def _check_poa_file(db: AsyncSession, *, file_id: uuid.UUID, actor: User) -> None:
+    """ruling 6 (3.3b): poa file must exist, be active, own, and be a PDF."""
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "poa_file_not_found"})
+    if file.uploaded_by != actor.id:
+        raise err("ERR-VAL-001", details={"reason": "poa_file_not_owned"})
+    if file.content_type != "application/pdf":
+        raise err("ERR-VAL-001", details={"reason": "poa_file_not_pdf"})
+
+
 async def attach_legal(
     db: AsyncSession,
     user: User,
@@ -607,8 +619,10 @@ async def attach_legal(
                 details={"basis": "director_registry", "reason": "stir not in oneid profile"},
             )
         legal_name = le_name or legal_name or f"STIR {stir}"
-    else:  # poa — schema guarantees file/term/name; the file itself is checked in 3.3b
+    else:  # poa — schema guarantees file/term/name
         assert legal_name is not None
+        assert poa_file_id is not None
+        await _check_poa_file(db, file_id=poa_file_id, actor=user)
     applicant = await repo.get_applicant_by_stir(db, stir)
     created = False
     if applicant is None:
@@ -722,6 +736,9 @@ async def add_representation(
                 "ERR-ACL-001",
                 details={"basis": "director_registry", "reason": "candidate not listed"},
             )
+    elif basis == "poa":
+        assert poa_file_id is not None  # schema guarantees
+        await _check_poa_file(db, file_id=poa_file_id, actor=user)
     existing = await repo.get_effective_representation(
         db, applicant_id=applicant_id, user_id=candidate.id, today=today
     )

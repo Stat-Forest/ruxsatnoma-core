@@ -1,0 +1,791 @@
+"""Service layer for user administration (С23): CRUD, credentials handout,
+block/unblock/delete. Reaches users/sessions/roles through `auth.repo`; password
+and TOTP primitives stay in `app.core.security` — this module only orchestrates
+them (design/01: `admin` may import `auth`, never the reverse).
+"""
+
+import random
+import secrets
+import string
+import uuid
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.abac import Zone, zone_filter, zone_of
+from app.core.crypto import encrypt_str
+from app.core.errors import err
+from app.core.schemas import Page, PageParams
+from app.core.security import (
+    hash_password,
+    new_totp_secret,
+    totp_provisioning_uri,
+    validate_password_policy,
+)
+from app.modules.admin.users_schemas import (
+    PermissionCodesIn,
+    PermissionCodesOut,
+    PermissionOut,
+    RoleAdminOut,
+    RoleCreateIn,
+    RolePatchIn,
+    SessionAdminOut,
+    UserAdminOut,
+    UserCreatedOut,
+    UserCreateIn,
+    UserFilters,
+    UserPatchIn,
+    UserStatsOut,
+)
+from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
+from app.modules.auth.deps import SUPERUSER_ROLE
+from app.modules.auth.models import Role, Session, User
+from app.modules.auth.permissions import PERMISSIONS, USERS_MANAGE
+
+# One-time password generator: 12 chars from a de-ambiguated alphabet (no l/I/O/0/1
+# — a person reads these off a screen to type them once). A pure alnum draw could
+# never satisfy `validate_password_policy` (it requires a special character, and
+# none of the alphabet below is one), so one char from each required class is
+# guaranteed by construction, then the rest is filled and the whole thing shuffled.
+_AMBIGUOUS = "lIO01"
+_OTP_UPPER = "".join(c for c in string.ascii_uppercase if c not in _AMBIGUOUS)
+_OTP_LOWER = "".join(c for c in string.ascii_lowercase if c not in _AMBIGUOUS)
+_OTP_DIGITS = "".join(c for c in string.digits if c not in _AMBIGUOUS)
+_OTP_SPECIAL = "!@#$%*-_="
+_OTP_ALPHABET = _OTP_UPPER + _OTP_LOWER + _OTP_DIGITS
+_OTP_LENGTH = 12
+
+
+def _generate_one_time_password() -> str:
+    required = [
+        secrets.choice(_OTP_UPPER),
+        secrets.choice(_OTP_LOWER),
+        secrets.choice(_OTP_DIGITS),
+        secrets.choice(_OTP_SPECIAL),
+    ]
+    rest = [secrets.choice(_OTP_ALPHABET) for _ in range(_OTP_LENGTH - len(required))]
+    chars = required + rest
+    random.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        # str, not float: audit snapshots go through JSONB's plain json.dumps (no
+        # Decimal support), and money/norms are never float (backend/CLAUDE.md).
+        return str(value)
+    return value
+
+
+_CREATE_SNAPSHOT_FIELDS = (
+    "login",
+    "full_name",
+    "pinfl",
+    "position",
+    "organization_id",
+    "region_id",
+    "district_id",
+    "phone",
+    "email",
+    "status",
+    "must_change_password",
+    "valid_until",
+)
+
+
+def _user_snapshot(user: User, role_code: str) -> dict[str, Any]:
+    """Full JSON-safe snapshot for `user.create`'s audit `new_value` — never
+    includes `password_hash`/`mfa_secret` (they are not in the field list)."""
+    data = {field: _json_safe(getattr(user, field)) for field in _CREATE_SNAPSHOT_FIELDS}
+    data["role_id"] = str(user.role_id)
+    data["role_code"] = role_code
+    return data
+
+
+def _user_field_snapshot(user: User, role_code: str, fields: set[str]) -> dict[str, Any]:
+    """JSON-safe values for exactly `fields` (the keys present in an incoming
+    patch) — `user.update` audits are scoped to what the caller touched, unlike
+    `user.create`'s full snapshot."""
+    data: dict[str, Any] = {}
+    for field in fields:
+        data[field] = role_code if field == "role_code" else _json_safe(getattr(user, field))
+    return data
+
+
+def _to_admin_out(user: User, role_code: str) -> UserAdminOut:
+    return UserAdminOut(
+        id=user.id,
+        login=user.login,
+        full_name=user.full_name,
+        pinfl=user.pinfl,
+        position=user.position,
+        role_id=user.role_id,
+        role_code=role_code,
+        organization_id=user.organization_id,
+        region_id=user.region_id,
+        district_id=user.district_id,
+        phone=user.phone,
+        email=user.email,
+        status=user.status,
+        must_change_password=user.must_change_password,
+        valid_until=user.valid_until,
+        last_login_at=user.last_login_at,
+        created_at=user.created_at,
+    )
+
+
+async def _user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:
+    user = await auth_repo.get_user(db, user_id)
+    if user is None:
+        raise err("ERR-SYS-003", details={"user": str(user_id)})
+    return user
+
+
+async def _session_or_404(db: AsyncSession, session_id: uuid.UUID) -> Session:
+    session = await auth_repo.get_session(db, session_id)
+    if session is None:
+        raise err("ERR-SYS-003", details={"session": str(session_id)})
+    return session
+
+
+def _guard_not_self(user_id: uuid.UUID, actor: User) -> None:
+    """Ruling 10: an admin cannot block or delete their own account."""
+    if user_id == actor.id:
+        raise err("ERR-VAL-001", details={"reason": "own_account"})
+
+
+async def _may_manage(db: AsyncSession, actor: User) -> bool:
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return USERS_MANAGE in await auth_repo.permission_codes(db, actor)
+
+
+def _within_zone(zone: Zone, user: User) -> bool:
+    """Per-row equivalent of `zone_filter`'s SQL (design/01 'own zone' mechanics),
+    for a single already-fetched row rather than a query — same semantics kept in
+    sync deliberately, not a second SQL round-trip: an axis whose `zone` field is
+    None is unrestricted; a set axis requires an exact match on `user`'s column.
+    An all-None `zone` (republic-wide) therefore matches every user, same as
+    `zone_filter`'s `true()` fallback."""
+    if zone.region_id is not None and zone.region_id != user.region_id:
+        return False
+    if zone.district_id is not None and zone.district_id != user.district_id:
+        return False
+    if zone.organization_id is not None and zone.organization_id != user.organization_id:
+        return False
+    return True
+
+
+async def _staff_role_or_422(db: AsyncSession, role_code: str, *, actor: User) -> Role:
+    """A role usable for `POST /admin/users` / role reassignment via PATCH: must
+    exist, be active, and not be `applicant` (applicants are born via OneID/E-IMZO,
+    never created or reassigned by hand here — ruling 8/9). R5a (final review):
+    assigning the `sys_admin` role is itself a privilege-escalation vector — a
+    manage-holder could otherwise mint themselves (or an ally) a superuser — so it
+    is restricted to actors who are already `sys_admin`."""
+    role = await auth_repo.get_role_by_code(db, role_code)
+    if role is None:
+        raise err("ERR-SYS-003", details={"role_code": role_code})
+    if role.status != "active":
+        raise err("ERR-VAL-001", details={"role_code": role_code, "reason": "role_archived"})
+    if role.code == "applicant":
+        raise err("ERR-VAL-001", details={"reason": "staff_roles_only"})
+    if role.code == SUPERUSER_ROLE and await auth_repo.role_code(db, actor) != SUPERUSER_ROLE:
+        raise err("ERR-VAL-001", details={"reason": "superuser_role_restricted"})
+    return role
+
+
+async def _check_pinfl_available(
+    db: AsyncSession, pinfl: str | None, *, exclude_user_id: uuid.UUID | None = None
+) -> None:
+    if pinfl is None:
+        return
+    existing = await auth_repo.get_user_by_pinfl(db, pinfl)
+    if existing is not None and existing.id != exclude_user_id:
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "duplicate_pinfl", "existing_user_id": str(existing.id)},
+        )
+
+
+async def _check_login_available(
+    db: AsyncSession, login: str | None, *, exclude_user_id: uuid.UUID | None = None
+) -> None:
+    if login is None:
+        return
+    existing = await auth_repo.get_user_by_login(db, login)
+    if existing is not None and existing.id != exclude_user_id:
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "duplicate_login", "existing_user_id": str(existing.id)},
+        )
+
+
+async def list_users(
+    db: AsyncSession, *, params: PageParams, filters: UserFilters, actor: User
+) -> Page[UserAdminOut]:
+    """Ruling 7: a viewer without `auth.users.manage` (and not sys_admin) sees only
+    their own zone (`zone_of(actor)` over `region_id`/`district_id`/`organization_id`);
+    a manage-holder sees everything, filters notwithstanding."""
+    zone_condition = None
+    if not await _may_manage(db, actor):
+        zone_condition = zone_filter(
+            zone_of(actor),
+            region_col=User.region_id,
+            district_col=User.district_id,
+            organization_col=User.organization_id,
+        )
+    rows, total = await auth_repo.list_users(
+        db,
+        role_code=filters.role_code,
+        status=filters.status,
+        organization_id=filters.organization_id,
+        region_id=filters.region_id,
+        q=filters.q,
+        zone=zone_condition,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+    items: list[UserAdminOut] = []
+    for row in rows:
+        role_code = await auth_repo.role_code(db, row)
+        assert role_code is not None  # FK guarantees a role row
+        items.append(_to_admin_out(row, role_code))
+    return Page[UserAdminOut](
+        items=items, total=total, page=params.page, page_size=params.page_size
+    )
+
+
+async def get_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> UserAdminOut:
+    """Ruling 7 applies here too, not just to `list_users`: a viewer without
+    `auth.users.manage` (and not sys_admin) may only read cards inside their own
+    zone — a target outside it is `ERR-ACL-002`, not a 404 (the row exists, the
+    actor just may not see it), matching the code the catalog already carries for
+    zone violations."""
+    user = await _user_or_404(db, user_id)
+    if not await _may_manage(db, actor) and not _within_zone(zone_of(actor), user):
+        raise err("ERR-ACL-002")
+    role_code = await auth_repo.role_code(db, user)
+    assert role_code is not None
+    return _to_admin_out(user, role_code)
+
+
+async def create_user(db: AsyncSession, *, data: UserCreateIn, actor: User) -> UserCreatedOut:
+    role = await _staff_role_or_422(db, data.role_code, actor=actor)
+    await _check_pinfl_available(db, data.pinfl)
+    await _check_login_available(db, data.login)
+
+    one_time_password = _generate_one_time_password()
+    validate_password_policy(one_time_password)  # guaranteed by construction; safety net
+    secret = new_totp_secret()
+    user = User(
+        login=data.login,
+        full_name=data.full_name,
+        role_id=role.id,
+        pinfl=data.pinfl,
+        position=data.position,
+        organization_id=data.organization_id,
+        region_id=data.region_id,
+        district_id=data.district_id,
+        phone=data.phone,
+        email=data.email,
+        valid_until=data.valid_until,
+        # Same handout pattern as app/bootstrap.py's first sys_admin: hashed
+        # one-time password, Fernet-encrypted TOTP secret, forced change on login.
+        password_hash=hash_password(one_time_password),
+        mfa_secret=encrypt_str(secret),
+        must_change_password=True,
+    )
+    db.add(user)
+    await db.flush()
+    await audit.log(
+        db,
+        action="user.create",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        new_value=_user_snapshot(user, role.code),
+    )
+    return UserCreatedOut(
+        user=_to_admin_out(user, role.code),
+        one_time_password=one_time_password,
+        totp_uri=totp_provisioning_uri(secret, data.login),
+    )
+
+
+_PATCHABLE_SIMPLE_FIELDS = (
+    "full_name",
+    "position",
+    "pinfl",
+    "phone",
+    "email",
+    "organization_id",
+    "region_id",
+    "district_id",
+    "valid_until",
+)
+
+
+async def patch_user(
+    db: AsyncSession, *, user_id: uuid.UUID, data: UserPatchIn, actor: User
+) -> UserAdminOut:
+    user = await _user_or_404(db, user_id)
+    fields = data.model_dump(exclude_unset=True)
+    role_code_before = await auth_repo.role_code(db, user)
+    assert role_code_before is not None  # FK guarantees a role row
+
+    before = _user_field_snapshot(user, role_code_before, set(fields))
+
+    await _check_pinfl_available(db, fields.get("pinfl"), exclude_user_id=user.id)
+    await _check_login_available(db, fields.get("login"), exclude_user_id=user.id)
+
+    new_role_code = role_code_before
+    if "role_code" in fields:
+        role = await _staff_role_or_422(db, fields["role_code"], actor=actor)
+        new_role_code = role.code
+        user.role_id = role.id
+
+    # Ruling 9: assigning a staff role requires a login — either already stored,
+    # or supplied in this same patch (staffifying an auto-created applicant).
+    effective_login = fields["login"] if "login" in fields else user.login
+    if new_role_code != "applicant" and not effective_login:
+        raise err("ERR-VAL-001", details={"reason": "login_required"})
+
+    for field in _PATCHABLE_SIMPLE_FIELDS:
+        if field in fields:
+            setattr(user, field, fields[field])
+    if "login" in fields:
+        user.login = fields["login"]
+
+    await db.flush()
+    after = _user_field_snapshot(user, new_role_code, set(fields))
+    await audit.log(
+        db,
+        action="user.update",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        old_value=before,
+        new_value=after,
+    )
+    return _to_admin_out(user, new_role_code)
+
+
+async def block_user(
+    db: AsyncSession, *, user_id: uuid.UUID, reason: str, actor: User
+) -> UserAdminOut:
+    _guard_not_self(user_id, actor)
+    user = await _user_or_404(db, user_id)
+    # I4 (final review): block only from `active` — otherwise a `blocked -> blocked`
+    # no-op audit-spams, and `deleted -> blocked` would resurrect a terminal account.
+    if user.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "wrong_status"})
+    before_status = user.status
+    user.status = "blocked"
+    await auth_repo.revoke_user_sessions(db, user.id)
+    await db.flush()
+    role_code = await auth_repo.role_code(db, user)
+    assert role_code is not None
+    await audit.log(
+        db,
+        action="user.block",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        old_value={"status": before_status},
+        new_value={"status": "blocked", "reason": reason},
+    )
+    return _to_admin_out(user, role_code)
+
+
+async def unblock_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> UserAdminOut:
+    user = await _user_or_404(db, user_id)
+    # I4 (final review): unblock only from `blocked` — "deletion is terminal" (С23)
+    # means `deleted -> active` must not happen via this route, and an `active`
+    # account is not something "unblock" has any meaning for.
+    if user.status != "blocked":
+        raise err("ERR-VAL-001", details={"reason": "wrong_status"})
+    before_status = user.status
+    user.status = "active"
+    user.failed_login_count = 0
+    user.locked_until = None
+    await db.flush()
+    role_code = await auth_repo.role_code(db, user)
+    assert role_code is not None
+    await audit.log(
+        db,
+        action="user.unblock",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        old_value={"status": before_status},
+        new_value={"status": "active"},
+    )
+    return _to_admin_out(user, role_code)
+
+
+async def delete_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> UserAdminOut:
+    _guard_not_self(user_id, actor)
+    user = await _user_or_404(db, user_id)
+    before_status = user.status
+    user.status = "deleted"
+    await auth_repo.revoke_user_sessions(db, user.id)
+    await db.flush()
+    role_code = await auth_repo.role_code(db, user)
+    assert role_code is not None
+    await audit.log(
+        db,
+        action="user.delete",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        old_value={"status": before_status},
+        new_value={"status": "deleted"},
+    )
+    return _to_admin_out(user, role_code)
+
+
+async def reset_password(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> str:
+    user = await _user_or_404(db, user_id)
+    one_time_password = _generate_one_time_password()
+    validate_password_policy(one_time_password)
+    user.password_hash = hash_password(one_time_password)
+    user.must_change_password = True
+    await auth_repo.revoke_user_sessions(db, user.id)
+    await db.flush()
+    await audit.log(
+        db, action="user.reset_password", user_id=actor.id, object_type="user", object_id=user.id
+    )
+    return one_time_password
+
+
+async def reset_mfa(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> str:
+    user = await _user_or_404(db, user_id)
+    secret = new_totp_secret()
+    user.mfa_secret = encrypt_str(secret)
+    await auth_repo.revoke_user_sessions(db, user.id)
+    await db.flush()
+    await audit.log(
+        db, action="user.reset_mfa", user_id=actor.id, object_type="user", object_id=user.id
+    )
+    return totp_provisioning_uri(secret, user.login or str(user.id))
+
+
+# --- Roles CRUD + permission coverage + personal grants (С23, Task 6) -------------
+
+_ROLE_AUDITED_FIELDS = (
+    "code",
+    "name",
+    "description",
+    "max_approve_amount",
+    "max_approve_area",
+    "status",
+)
+
+
+def _role_field_snapshot(role: Role, fields: set[str]) -> dict[str, Any]:
+    """JSON-safe values for exactly `fields` — same scoped-to-touched-fields
+    convention as `_user_field_snapshot`, used for `role.update`'s audit entry."""
+    data: dict[str, Any] = {}
+    for field in fields:
+        data[field] = _json_safe(getattr(role, field))
+    return data
+
+
+def _role_snapshot(role: Role, permission_codes: list[str]) -> dict[str, Any]:
+    """Full snapshot for `role.create`'s audit `new_value` — includes the initial
+    `permission_codes` (populated when `copy_from` was given)."""
+    data = {field: _json_safe(getattr(role, field)) for field in _ROLE_AUDITED_FIELDS}
+    data["permission_codes"] = permission_codes
+    return data
+
+
+def _to_role_admin_out(role: Role, *, holders: int, permission_codes: list[str]) -> RoleAdminOut:
+    return RoleAdminOut(
+        id=role.id,
+        code=role.code,
+        name=role.name,
+        description=role.description,
+        is_system=role.is_system,
+        status=role.status,
+        max_approve_amount=role.max_approve_amount,
+        max_approve_area=role.max_approve_area,
+        permission_codes=permission_codes,
+        holders=holders,
+    )
+
+
+async def _role_stats_out(db: AsyncSession, role: Role) -> RoleAdminOut:
+    """Builds `RoleAdminOut` for a single already-mutated role via two small
+    lookups — `roles_with_stats`' one-query LEFT JOIN is for the list endpoint,
+    where it saves an N+1; a single write response doesn't have that problem."""
+    codes = await auth_repo.role_permission_codes(db, role.id)
+    holders = await auth_repo.count_role_holders(db, role.id)
+    return _to_role_admin_out(role, holders=holders, permission_codes=codes)
+
+
+async def _role_or_404(db: AsyncSession, role_id: uuid.UUID) -> Role:
+    role = await auth_repo.get_role(db, role_id)
+    if role is None:
+        raise err("ERR-SYS-003", details={"role": str(role_id)})
+    return role
+
+
+def _validate_permission_codes(codes: list[str]) -> None:
+    """Every code must already be registered in `PERMISSIONS` — a typo or a code
+    from a not-yet-landed module is rejected here, not left to violate nothing (the
+    registry is in-memory, not FK-enforced) and surface as a silent no-op grant."""
+    unknown = [code for code in codes if code not in PERMISSIONS]
+    if unknown:
+        raise err("ERR-VAL-001", details={"reason": "unknown_permission", "codes": unknown})
+
+
+async def list_roles(db: AsyncSession) -> list[RoleAdminOut]:
+    rows = await auth_repo.roles_with_stats(db)
+    return [
+        _to_role_admin_out(role, holders=holders, permission_codes=codes)
+        for role, holders, codes in rows
+    ]
+
+
+async def create_role(db: AsyncSession, *, data: RoleCreateIn, actor: User) -> RoleAdminOut:
+    if await auth_repo.get_role_by_code(db, data.code) is not None:
+        raise err("ERR-VAL-001", details={"code": data.code, "reason": "duplicate_code"})
+
+    fields = data.model_dump(exclude_unset=True)
+    max_approve_amount = data.max_approve_amount
+    max_approve_area = data.max_approve_area
+    copied_codes: list[str] = []
+    if data.copy_from is not None:
+        source = await auth_repo.get_role_by_code(db, data.copy_from)
+        if source is None:
+            raise err("ERR-SYS-003", details={"role_code": data.copy_from})
+        if "max_approve_amount" not in fields:
+            max_approve_amount = source.max_approve_amount
+        if "max_approve_area" not in fields:
+            max_approve_area = source.max_approve_area
+        copied_codes = await auth_repo.role_permission_codes(db, source.id)
+
+    role = Role(
+        code=data.code,
+        name=data.name.root,
+        description=data.description.root if data.description is not None else None,
+        max_approve_amount=max_approve_amount,
+        max_approve_area=max_approve_area,
+    )
+    db.add(role)
+    await db.flush()
+    if copied_codes:
+        await auth_repo.set_role_permissions(db, role.id, copied_codes)
+    await audit.log(
+        db,
+        action="role.create",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        new_value=_role_snapshot(role, copied_codes),
+    )
+    return _to_role_admin_out(role, holders=0, permission_codes=copied_codes)
+
+
+async def patch_role(
+    db: AsyncSession, *, role_id: uuid.UUID, data: RolePatchIn, actor: User
+) -> RoleAdminOut:
+    role = await _role_or_404(db, role_id)
+    fields = data.model_dump(exclude_unset=True)
+    before = _role_field_snapshot(role, set(fields))
+
+    if "name" in fields and data.name is not None:
+        role.name = data.name.root
+    if "description" in fields:
+        role.description = data.description.root if data.description is not None else None
+    for field in ("max_approve_amount", "max_approve_area"):
+        if field in fields:
+            setattr(role, field, fields[field])
+
+    await db.flush()
+    after = _role_field_snapshot(role, set(fields))
+    await audit.log(
+        db,
+        action="role.update",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        old_value=before,
+        new_value=after,
+    )
+    return await _role_stats_out(db, role)
+
+
+async def set_role_permissions(
+    db: AsyncSession, *, role_id: uuid.UUID, data: PermissionCodesIn, actor: User
+) -> RoleAdminOut:
+    role = await _role_or_404(db, role_id)
+    # R5b (final review): staff permission codes must never be grantable to the
+    # public applicant role — `applicant` never goes through `_staff_role_or_422`,
+    # so this is the only gate protecting it.
+    if role.code == "applicant":
+        raise err("ERR-VAL-001", details={"reason": "applicant_role_restricted"})
+    codes = sorted(set(data.codes))
+    _validate_permission_codes(codes)
+    before = await auth_repo.role_permission_codes(db, role.id)
+    await auth_repo.set_role_permissions(db, role.id, codes)
+    await audit.log(
+        db,
+        action="role.permissions_set",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        old_value={"codes": before},
+        new_value={"codes": codes},
+    )
+    return await _role_stats_out(db, role)
+
+
+async def archive_role(db: AsyncSession, *, role_id: uuid.UUID, actor: User) -> RoleAdminOut:
+    role = await _role_or_404(db, role_id)
+    if role.status == "archived":
+        return await _role_stats_out(db, role)
+    if role.is_system:
+        raise err("ERR-VAL-001", details={"reason": "system_role"})
+    holders = await auth_repo.count_role_holders(db, role.id)
+    if holders > 0:
+        raise err("ERR-VAL-001", details={"reason": "role_in_use", "holders": holders})
+
+    before_status = role.status
+    role.status = "archived"
+    await db.flush()
+    await audit.log(
+        db,
+        action="role.archive",
+        user_id=actor.id,
+        object_type="role",
+        object_id=role.id,
+        old_value={"status": before_status},
+        new_value={"status": "archived"},
+    )
+    return await _role_stats_out(db, role)
+
+
+async def list_permissions(db: AsyncSession) -> list[PermissionOut]:
+    role_codes = await auth_repo.role_codes_by_permission(db)
+    return [
+        PermissionOut(code=code, description=description, roles=role_codes.get(code, []))
+        for code, description in sorted(PERMISSIONS.items())
+    ]
+
+
+async def get_user_permissions(
+    db: AsyncSession, *, user_id: uuid.UUID, actor: User
+) -> PermissionCodesOut:
+    """I3 (final review): mirrors `get_user`'s zone guard — a view-only holder must
+    not be able to read another user's personal grants outside their own zone by
+    id, same as they cannot read that user's card."""
+    user = await _user_or_404(db, user_id)
+    if not await _may_manage(db, actor) and not _within_zone(zone_of(actor), user):
+        raise err("ERR-ACL-002")
+    codes = await auth_repo.user_permission_codes(db, user_id)
+    return PermissionCodesOut(codes=sorted(codes))
+
+
+async def set_user_permissions(
+    db: AsyncSession, *, user_id: uuid.UUID, data: PermissionCodesIn, actor: User
+) -> PermissionCodesOut:
+    user = await _user_or_404(db, user_id)
+    codes = sorted(set(data.codes))
+    _validate_permission_codes(codes)
+    before = await auth_repo.user_permission_codes(db, user.id)
+    await auth_repo.set_user_permissions(db, user.id, codes, granted_by=actor.id)
+    await audit.log(
+        db,
+        action="user.permissions_set",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user.id,
+        old_value={"codes": sorted(before)},
+        new_value={"codes": codes},
+    )
+    return PermissionCodesOut(codes=codes)
+
+
+# --- Sessions administration + user counters (С23, Task 7) -------------------------
+
+
+async def list_user_sessions(
+    db: AsyncSession, *, user_id: uuid.UUID, actor: User
+) -> list[SessionAdminOut]:
+    """Active sessions only (not revoked, not expired). `auth.sessions.revoke_any`
+    is unrestricted by zone — the permission name says "any" — unlike the users
+    list/card routes, so there is no `_within_zone` check here."""
+    await _user_or_404(db, user_id)
+    rows = await auth_repo.list_active_sessions(db, user_id)
+    return [
+        SessionAdminOut(
+            id=row.id,
+            created_at=row.created_at,
+            last_seen_at=row.last_seen_at,
+            expires_at=row.expires_at,
+            ip=row.ip,
+            user_agent=row.user_agent,
+        )
+        for row in rows
+    ]
+
+
+async def revoke_session(db: AsyncSession, *, session_id: uuid.UUID, actor: User) -> None:
+    """Admin-initiated single-session revoke. Unlike self-service logout/idle-
+    timeout (`auth.service.revoke_session`, which audits `user_id=session_row.
+    user_id` — the session's own owner), the audited actor here is the ADMIN who
+    acted, same `user_id=actor.id` convention as `block_user`/`delete_user`; the
+    affected account is carried in `extra` since `object_type` names the session,
+    not the user."""
+    session = await _session_or_404(db, session_id)
+    session.revoked_at = datetime.now(UTC)
+    await db.flush()
+    await audit.log(
+        db,
+        action="session.revoke",
+        user_id=actor.id,
+        object_type="session",
+        object_id=session.id,
+        basis="admin",
+        # Same key convention as `add_representation`'s extra={"for_user": ...}
+        # (auth/service.py) for an actor-acts-on-someone-else audit row: a bare
+        # "user_id" here would read as a duplicate of the top-level actor column.
+        extra={"for_user": str(session.user_id)},
+    )
+
+
+async def revoke_all_sessions(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> int:
+    """Bulk revoke via `auth_repo.revoke_user_sessions` (Task 5's plain UPDATE, no
+    per-row audit) — this call writes the ONE audit entry for the whole action,
+    carrying the count; `block_user`/`delete_user`/`reset_password` also call
+    `revoke_user_sessions` but never audit it separately, because their own
+    action's entry already covers it in the same transaction. Here session revocation
+    IS the action, so it gets its own `session.revoke` entry, object_type="user"."""
+    await _user_or_404(db, user_id)
+    count = await auth_repo.revoke_user_sessions(db, user_id)
+    await audit.log(
+        db,
+        action="session.revoke",
+        user_id=actor.id,
+        object_type="user",
+        object_id=user_id,
+        new_value={"revoked": count},
+    )
+    return count
+
+
+async def user_stats(db: AsyncSession) -> UserStatsOut:
+    """Shapes `auth_repo.user_stats`'s raw dict into the response schema. No zone
+    logic beyond the route's `require_any_permission` gate — a view-only holder
+    sees the same whole-system counters as a manage-holder, same as `list_roles`."""
+    stats = await auth_repo.user_stats(db)
+    return UserStatsOut(**stats)

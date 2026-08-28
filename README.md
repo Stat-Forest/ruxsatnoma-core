@@ -22,6 +22,18 @@ uv run uvicorn app.main:create_app --factory --reload   # API на :8000
 
 Mock adapters are the default (`ONEID_MODE`/`EIMZO_MODE`/`SMS_MODE=mock`). OneID's `code` and E-IMZO's `signed_challenge` are just base64url-JSON payloads — build one with `encode_mock_code`/`encode_mock_signed_challenge` from `app/modules/auth/adapters/{oneid,eimzo}.py` and pass it to `GET /auth/oneid/callback?code=` / `POST /auth/eimzo/login`. `POST /auth/otp/request` doesn't send anything either — the mock sender logs the code (`otp.mock_send`), so check the app log/console for it during local testing.
 
+## Files API (dev)
+
+MinIO's bucket is created automatically at startup (`ensure_bucket()` in the app lifespan) — nothing to set up by hand, even on a fresh `docker compose up -d` volume.
+
+Smoke test `POST /api/v1/files` (multipart) against a session cookie jar `cj` (obtained via one of the login flows above):
+
+```bash
+curl -c cj -b cj -F "file=@/path/to/doc.pdf;type=application/pdf" localhost:8000/api/v1/files
+```
+
+`GET /api/v1/files/{id}` (same cookie jar) returns the bytes. Allowed types: PDF, PNG, JPEG, WEBP — the declared content type must match the file's magic bytes; size is capped by the `max_upload_mb` setting (default 20 MB).
+
 ## Тесты и качество
 
 ```bash

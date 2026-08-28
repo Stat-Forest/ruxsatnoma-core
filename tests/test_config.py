@@ -34,12 +34,25 @@ def test_prod_accepts_custom_secret_key():
     s = Settings(
         app_env="prod",
         secret_key="a-real-secret-value",
+        s3_secret_key="a-real-s3-secret-value",
         oneid_mode="real",
         eimzo_mode="real",
         sms_mode="real",
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert s.secret_key == "a-real-secret-value"
+
+
+def test_prod_rejects_default_s3_secret_key():
+    with pytest.raises(ValidationError, match="s3_secret_key"):
+        Settings(
+            app_env="prod",
+            secret_key="a-real-secret-value",
+            oneid_mode="real",
+            eimzo_mode="real",
+            sms_mode="real",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
 
 
 def test_policy_settings_are_not_deployment_config():
@@ -58,6 +71,7 @@ def test_policy_settings_are_not_deployment_config():
 def test_prod_rejects_mock_adapters(monkeypatch):
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("SECRET_KEY", "real-secret-for-prod-guard-test")
+    monkeypatch.setenv("S3_SECRET_KEY", "real-s3-secret-for-prod-guard-test")
     with pytest.raises(ValidationError, match="mock adapters"):
         Settings()
 
@@ -65,6 +79,7 @@ def test_prod_rejects_mock_adapters(monkeypatch):
 def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("SECRET_KEY", "real-secret-for-prod-guard-test")
+    monkeypatch.setenv("S3_SECRET_KEY", "real-s3-secret-for-prod-guard-test")
     for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE"):
         monkeypatch.setenv(name, "real")
     settings = Settings()

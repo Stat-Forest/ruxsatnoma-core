@@ -50,6 +50,7 @@ def test_samesite_follows_the_cross_origin_setup():
     cross_origin_prod = Settings(
         app_env="prod",
         secret_key="a-real-secret-value",
+        s3_secret_key="a-real-s3-secret-value",
         cors_origins=[ADMIN_ORIGIN],
         oneid_mode="real",
         eimzo_mode="real",

@@ -66,6 +66,8 @@ async def test_me_superuser_sees_the_full_permission_registry(db):
 
 
 async def test_me_non_superuser_sees_only_its_own_codes(db):
+    from sqlalchemy import select
+
     user = await make_user(db, role_code="executor_staff")
     db.add(UserPermission(user_id=user.id, permission_code="test.user_perm"))
     await db.flush()
@@ -78,7 +80,18 @@ async def test_me_non_superuser_sees_only_its_own_codes(db):
     assert r.status_code == 200
     body = r.json()
     assert body["is_superuser"] is False
-    assert body["permissions"] == ["test.user_perm"]
+    # Derived from the DB rather than a hardcoded list (ruling 15): the role
+    # itself may gain seeded grants (e.g. auth.users.view) independently of
+    # this test, so the expectation is role grants (whatever they are) union
+    # the personal grant this test created.
+    role_grants = (
+        await db.execute(
+            select(RolePermission.permission_code).where(RolePermission.role_id == user.role_id)
+        )
+    ).scalars()
+    personal_codes = {"test.user_perm"}
+    expected = set(role_grants) | personal_codes
+    assert set(body["permissions"]) == expected
 
     from sqlalchemy import delete
 

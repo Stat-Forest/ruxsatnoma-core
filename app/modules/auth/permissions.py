@@ -6,9 +6,18 @@ matrix (tz/03 4-ilova) fills as modules land in 3.3+.
 """
 
 PERMISSIONS: dict[str, str] = {
-    "auth.users.manage": "Create/edit users, reset passwords (admin, stage 3.3)",
-    "auth.sessions.revoke_any": "Revoke any user's sessions (admin, stage 3.3)",
+    "auth.users.view": "List and read users (С23; zone-scoped without auth.users.manage)",
+    "auth.users.manage": "Create/edit users, reset passwords, manage roles and grants (С23)",
+    "auth.sessions.revoke_any": "List and revoke any user's sessions (С23)",
 }
+
+# Module constants for the codes above — auth owns them, so they are seeded
+# directly into the dict literal instead of going through `register()` (which
+# would reject them as already-registered). Call sites import these instead of
+# typing the strings, so a typo fails at import time, not at request time.
+USERS_VIEW = "auth.users.view"
+USERS_MANAGE = "auth.users.manage"
+SESSIONS_REVOKE_ANY = "auth.sessions.revoke_any"
 
 
 def register(codes: dict[str, str]) -> None:

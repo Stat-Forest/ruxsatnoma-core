@@ -47,6 +47,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec("otp_hourly_limit", int, 5, "OTP requests per target per hour"),
         SettingSpec("privacy_policy_version", str, "1.0", "Current privacy policy version"),
         SettingSpec("offer_version", str, "1.0", "Current public offer version"),
+        SettingSpec("max_upload_mb", int, 20, "Maximum accepted upload size, MB"),
     )
 }
 

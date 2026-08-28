@@ -12,12 +12,17 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
+from app.core import storage
 from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
+from app.files_router import router as files_router
+from app.modules.admin.announcements_router import admin_router as announcements_admin_router
+from app.modules.admin.announcements_router import router as announcements_router
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
+from app.modules.admin.users_router import router as users_router
 from app.modules.auth.router import router as auth_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -38,6 +43,8 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.engine = make_engine(settings.database_url)
     app.state.session_factory = make_session_factory(app.state.engine)
+    # Fresh dev/test MinIO volumes have no bucket yet; in prod this is an idempotent HEAD.
+    await storage.ensure_bucket()
     yield
     await app.state.engine.dispose()
 
@@ -54,10 +61,19 @@ def _error_body(request: Request, code: str, message: str, details: dict | None)
 
 
 def create_app() -> FastAPI:
-    configure_logging(get_settings().log_format)
-    app = FastAPI(title="Ruxsatnoma-urmon API", lifespan=lifespan)
-
     settings = get_settings()
+    configure_logging(settings.log_format)
+    # API docs/schema are a dev convenience, not something to expose in test/prod
+    # (stage 3.3b): app_env=dev is the only state that turns them on.
+    docs_enabled = settings.app_env == "dev"
+    app = FastAPI(
+        title="Ruxsatnoma-urmon API",
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
+
     if settings.cors_origins:
         # Cross-origin adminka (ruling 3): credentials are cookies, so the origin list
         # must be explicit — "*" is invalid with allow_credentials.
@@ -148,5 +164,9 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(refs_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")
+    app.include_router(users_router, prefix="/api/v1")
+    app.include_router(announcements_router, prefix="/api/v1")
+    app.include_router(announcements_admin_router, prefix="/api/v1")
+    app.include_router(files_router, prefix="/api/v1")
 
     return app

@@ -3,7 +3,7 @@
 import uuid
 from typing import NamedTuple
 
-from sqlalchemy import ColumnElement, and_, true
+from sqlalchemy import ColumnElement, ColumnExpressionArgument, and_, true
 
 
 class Zone(NamedTuple):
@@ -21,9 +21,9 @@ def zone_of(user) -> Zone:
 def zone_filter(
     zone: Zone,
     *,
-    region_col: ColumnElement | None = None,
-    district_col: ColumnElement | None = None,
-    organization_col: ColumnElement | None = None,
+    region_col: ColumnExpressionArgument | None = None,
+    district_col: ColumnExpressionArgument | None = None,
+    organization_col: ColumnExpressionArgument | None = None,
 ) -> ColumnElement[bool]:
     """Boolean SQL expression limiting a query to the user's zone.
 
@@ -34,6 +34,11 @@ def zone_filter(
     Fails closed: a zone field that IS set but whose column was not supplied is a
     caller bug (the table has no such column, so the restriction would silently
     not apply and leak rows outside the zone) — raise rather than let that pass.
+
+    `ColumnExpressionArgument` (not the narrower `ColumnElement`) so a caller can
+    pass a mapped attribute directly (e.g. `User.region_id`) — that is
+    `InstrumentedAttribute`, not `ColumnElement`, but `col == value` below works on
+    either identically; this is the same alias SQLAlchemy's own `.where()` uses.
     """
     conditions = []
     for value, col, field in (
