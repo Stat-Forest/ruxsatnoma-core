@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
+from app.modules.admin import repo
 from app.modules.admin.models import District, Organization, Region
 from app.modules.admin.service import ALLOWED_PARENT_KINDS
 from app.modules.audit import service as audit
@@ -30,8 +31,25 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
 
 
 async def _region_id(db: AsyncSession, code: str | None) -> uuid.UUID | None:
+    """Resolve an optional region code (organizations: the field may be absent
+    entirely). A present-but-unknown code is still a domain error."""
     if code is None:
         return None
+    region_id = (
+        await db.execute(select(Region.id).where(Region.code == code))
+    ).scalar_one_or_none()
+    if region_id is None:
+        raise err("ERR-VAL-001", details={"region_code": code, "reason": "unknown region"})
+    return region_id
+
+
+async def _required_region_id(db: AsyncSession, code: str | None) -> uuid.UUID:
+    """Resolve a mandatory region code (districts: `District.region_id` is
+    non-nullable). A missing or null code is a domain error in its own right,
+    distinct from a code that is present but does not resolve — and unlike an
+    `assert`, this check runs even under `python -O` and always raises via `err`."""
+    if code is None:
+        raise err("ERR-VAL-001", details={"reason": "region_code is required"})
     region_id = (
         await db.execute(select(Region.id).where(Region.code == code))
     ).scalar_one_or_none()
@@ -52,12 +70,13 @@ async def _district_id(db: AsyncSession, code: str | None) -> uuid.UUID | None:
 
 
 async def seed_districts(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """`region_code` is required on every row (`District.region_id` is non-nullable).
+    `soato_code`/`sort_order` preserve the existing value when their key is absent
+    from a row being updated (the general preserve-on-absence rule is documented on
+    `seed_organizations`, which has more fields it applies to)."""
     created = updated = 0
     for row in rows:
-        region_id = await _region_id(db, row["region_code"])
-        # `District.region_id` is non-nullable; `_region_id` only returns None for a
-        # None input code, and `region_code` is a required field for districts.
-        assert region_id is not None
+        region_id = await _required_region_id(db, row.get("region_code"))
         existing = (
             await db.execute(select(District).where(District.code == row["code"]))
         ).scalar_one_or_none()
@@ -91,8 +110,17 @@ async def seed_districts(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[
 
 async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tuple[int, int]:
     """Rows are applied in file order: a parent must appear before its children (or
-    already exist in the DB). Kind pairing is validated with the same table the API
-    uses (ruling 6), so a bad file cannot build a hierarchy the API would refuse."""
+    already exist in the DB). Kind pairing and the archived-parent rule are validated
+    against the same source of truth `admin.service` enforces for the write API
+    (`ALLOWED_PARENT_KINDS`, and a `status != "active"` parent), so a bad file cannot
+    build a hierarchy the API would refuse.
+
+    On update, `stir`/`region_code`/`district_code`/`requisites` are
+    preserve-on-absence (ruling 5: reorganizations are partial re-edits of the file,
+    not full re-descriptions): a key missing from the row leaves the stored value
+    untouched; a key present with JSON `null` clears it; a key present with a value
+    sets it. `name` and `kind` are always required and always overwrite.
+    """
     created = updated = 0
     for row in rows:
         kind = row["kind"]
@@ -102,9 +130,7 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
         parent_code = row.get("parent_code")
         parent: Organization | None = None
         if parent_code is not None:
-            parent = (
-                await db.execute(select(Organization).where(Organization.code == parent_code))
-            ).scalar_one_or_none()
+            parent = await repo.get_organization_by_code(db, parent_code)
             if parent is None:
                 raise err(
                     "ERR-VAL-001",
@@ -113,9 +139,7 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
         if not allowed:
             if parent is not None:
                 raise err("ERR-VAL-001", details={"kind": kind, "reason": "must be root"})
-            existing_root = (
-                await db.execute(select(Organization).where(Organization.kind == "agency"))
-            ).scalar_one_or_none()
+            existing_root = await repo.get_agency(db)
             if existing_root is not None and existing_root.code != row["code"]:
                 raise err(
                     "ERR-VAL-001",
@@ -128,13 +152,13 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
                 "ERR-VAL-001",
                 details={"kind": kind, "parent_kind": parent.kind, "allowed": list(allowed)},
             )
+        elif parent.status != "active":
+            raise err("ERR-VAL-001", details={"reason": "parent archived"})
 
-        region_id = await _region_id(db, row.get("region_code"))
-        district_id = await _district_id(db, row.get("district_code"))
-        existing = (
-            await db.execute(select(Organization).where(Organization.code == row["code"]))
-        ).scalar_one_or_none()
+        existing = await repo.get_organization_by_code(db, row["code"])
         if existing is None:
+            region_id = await _region_id(db, row.get("region_code"))
+            district_id = await _district_id(db, row.get("district_code"))
             db.add(
                 Organization(
                     code=row["code"],
@@ -152,8 +176,10 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
             existing.parent_id = parent.id if parent is not None else None
             existing.name = row["name"]
             existing.stir = row.get("stir", existing.stir)
-            existing.region_id = region_id
-            existing.district_id = district_id
+            if "region_code" in row:
+                existing.region_id = await _region_id(db, row["region_code"])
+            if "district_code" in row:
+                existing.district_id = await _district_id(db, row["district_code"])
             existing.requisites = row.get("requisites", existing.requisites)
             updated += 1
         await db.flush()

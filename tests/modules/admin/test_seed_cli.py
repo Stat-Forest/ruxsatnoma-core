@@ -75,6 +75,18 @@ async def test_unknown_region_code_is_a_clear_error(db):
     assert excinfo.value.details["region_code"] == "atlantis"
 
 
+async def test_null_region_code_is_a_clear_error(db):
+    """A `region_code: null` row must raise the same `err(...)` a missing key would —
+    not fall through to a bare `AssertionError` (or, under `python -O`, a raw
+    NOT NULL `IntegrityError` from Postgres)."""
+    rows = district_rows(uuid.uuid4().hex[:6])
+    rows[0]["region_code"] = None
+    with pytest.raises(DomainError) as excinfo:
+        await seed_districts(db, rows)
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["reason"] == "region_code is required"
+
+
 async def test_organizations_build_the_hierarchy(db, agency):
     suffix = uuid.uuid4().hex[:6]
     created, updated = await seed_organizations(db, organization_rows(suffix, agency.code))
@@ -92,12 +104,59 @@ async def test_organizations_build_the_hierarchy(db, agency):
     assert leshoz.region_id is not None
 
 
+async def test_organizations_preserve_region_on_absent_key(db, agency):
+    """Re-seeding with `region_code` absent (not null) must not wipe a previously set
+    `region_id` — ruling: preserve-on-absence, since a reorganization file describes
+    only what changed (finding 2)."""
+    suffix = uuid.uuid4().hex[:6]
+    rows = organization_rows(suffix, agency.code)
+    await seed_organizations(db, rows)
+
+    leshoz_row = dict(rows[1])
+    del leshoz_row["region_code"]
+    created, updated = await seed_organizations(db, [rows[0], leshoz_row])
+    assert (created, updated) == (0, 2)
+
+    leshoz = (
+        await db.execute(select(Organization).where(Organization.code == f"leshoz-{suffix}"))
+    ).scalar_one()
+    assert leshoz.region_id is not None
+
+
 async def test_organizations_reject_a_wrong_parent_kind(db, agency):
     suffix = uuid.uuid4().hex[:6]
     rows = organization_rows(suffix, agency.code)
     rows[1]["kind"] = "bolak"  # bolak may only hang off aylanma
     with pytest.raises(DomainError):
         await seed_organizations(db, rows)
+
+
+async def test_organizations_reject_an_archived_parent(db, agency):
+    """A parent the write API would refuse (archived) must be refused here too —
+    the importer must not build a hierarchy the API would reject (finding 3)."""
+    suffix = uuid.uuid4().hex[:6]
+    archived = Organization(
+        code=f"archived-{suffix}",
+        kind="territorial",
+        parent_id=agency.id,
+        name={"uz_cyrl": "Архив"},
+        status="archived",
+    )
+    db.add(archived)
+    await db.flush()
+
+    rows = [
+        {
+            "code": f"leshoz-{suffix}",
+            "kind": "leshoz",
+            "parent_code": archived.code,
+            "name": {"uz_cyrl": "Тест"},
+        }
+    ]
+    with pytest.raises(DomainError) as excinfo:
+        await seed_organizations(db, rows)
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["reason"] == "parent archived"
 
 
 async def test_organizations_reject_a_second_root(db, agency):
