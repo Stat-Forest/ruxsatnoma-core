@@ -51,6 +51,14 @@ class OneIdAuthorizeOut(BaseModel):
     redirect_url: str
 
 
+class EimzoChallengeOut(BaseModel):
+    challenge: str
+
+
+class EimzoLoginIn(BaseModel):
+    signed_challenge: str
+
+
 class LoginIn(BaseModel):
     login: str
     password: str

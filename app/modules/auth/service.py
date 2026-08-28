@@ -23,6 +23,7 @@ from app.core.security import (
 )
 from app.modules.audit import service as audit
 from app.modules.auth import repo
+from app.modules.auth.adapters.eimzo import EimzoError, get_eimzo_adapter
 from app.modules.auth.adapters.oneid import OneIdError, get_oneid_adapter
 from app.modules.auth.adapters.otp_sender import get_otp_sender
 from app.modules.auth.models import OtpCode, Session, User
@@ -138,6 +139,57 @@ async def login_via_oneid(
         method="oneid",
         snapshot=profile.to_snapshot(),
         phone=profile.phone,
+        ip=ip,
+        user_agent=user_agent,
+    )
+
+
+EIMZO_CHALLENGE_TTL_MINUTES = 5
+
+
+async def issue_eimzo_challenge(db: AsyncSession) -> str:
+    challenge = new_token()
+    await repo.add(
+        db,
+        OtpCode(
+            code_hash=hash_token(challenge),
+            purpose="eimzo_challenge",
+            expires_at=datetime.now(UTC) + timedelta(minutes=EIMZO_CHALLENGE_TTL_MINUTES),
+        ),
+    )
+    return challenge
+
+
+async def login_via_eimzo(
+    db: AsyncSession, *, signed_challenge: str, ip: str | None, user_agent: str | None
+) -> tuple[User, Session, str, str]:
+    adapter = get_eimzo_adapter()
+    try:
+        identity = await adapter.verify_signed_challenge(signed_challenge)
+    except EimzoError as exc:
+        raise err(exc.err_code) from exc
+    row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
+    if row is None:
+        raise err("ERR-AUTH-004")  # unknown, expired or replayed challenge
+    row.used_at = datetime.now(UTC)
+    if identity.cert_expires_at is not None and identity.cert_expires_at <= datetime.now(UTC):
+        await audit.log(
+            db,
+            action="user.login",
+            result="denied",
+            basis="eimzo: certificate expired",
+            ip=ip,
+            user_agent=user_agent,
+        )
+        await db.commit()
+        raise err("ERR-AUTH-004")
+    return await login_or_create_by_pinfl(
+        db,
+        pinfl=identity.pinfl,
+        full_name=identity.full_name,
+        method="eimzo",
+        snapshot=None,
+        phone=None,
         ip=ip,
         user_agent=user_agent,
     )

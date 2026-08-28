@@ -16,6 +16,8 @@ from app.modules.auth.deps import SUPERUSER_ROLE, get_current_session, get_curre
 from app.modules.auth.models import Role, Session, User
 from app.modules.auth.permissions import PERMISSIONS
 from app.modules.auth.schemas import (
+    EimzoChallengeOut,
+    EimzoLoginIn,
     LoginIn,
     LoginOut,
     MeOut,
@@ -162,6 +164,30 @@ async def oneid_callback(
         user_agent=request.headers.get("User-Agent"),
     )
     response.delete_cookie("oneid_state")
+    _set_session_cookies(response, token, csrf)
+    role = await repo.get_role(db, user.role_id)
+    assert role is not None
+    return await _me_out(db, user, role, csrf)
+
+
+@router.post("/eimzo/challenge", response_model=EimzoChallengeOut)
+async def eimzo_challenge(db: Annotated[AsyncSession, Depends(get_db)]) -> EimzoChallengeOut:
+    return EimzoChallengeOut(challenge=await service.issue_eimzo_challenge(db))
+
+
+@router.post("/eimzo/login", response_model=MeOut)
+async def eimzo_login(
+    body: EimzoLoginIn,
+    request: Request,
+    response: Response,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MeOut:
+    user, _row, token, csrf = await service.login_via_eimzo(
+        db,
+        signed_challenge=body.signed_challenge,
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+    )
     _set_session_cookies(response, token, csrf)
     role = await repo.get_role(db, user.role_id)
     assert role is not None
