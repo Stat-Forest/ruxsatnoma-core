@@ -52,6 +52,6 @@ docker compose up -d
 
 ## Deployment notes
 
-- Run uvicorn behind the reverse proxy with `--proxy-headers` so the client IP reaches the audit trail instead of the proxy's address.
+- Run uvicorn behind the reverse proxy with `--proxy-headers` so the client IP reaches the audit trail instead of the proxy's address. Without it behind a TLS-terminating proxy, uvicorn sees the proxy's own plain-HTTP connection, so `request.base_url` renders `http://…` while the browser's `Origin` header says `https://…` — the mismatch makes `_origin_allowed`'s same-origin fallback reject every same-origin mutation (`ERR-AUTH-006` on every `POST`/`PATCH`/`PUT`/`DELETE`), not just the audit IP.
 - The adminka is served from its own origin (decision: stage 3.3a ruling 3). Set `CORS_ORIGINS` to the exact frontend origins (JSON list) — with cookie credentials a wildcard is not allowed. In `prod` this also switches the session and CSRF cookies to `SameSite=None; Secure`, so the API must be served over https.
 - Reference data: `uv run python -m app.seed districts <file.json>` and `... organizations <file.json>` (idempotent upsert by `code`).
