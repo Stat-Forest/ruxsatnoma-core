@@ -1,6 +1,7 @@
 """Auth HTTP routes (design/03 § auth)."""
 
 import secrets
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -14,11 +15,15 @@ from app.core.time import business_today
 from app.modules.auth import repo, service
 from app.modules.auth.adapters.oneid import get_oneid_adapter
 from app.modules.auth.deps import SUPERUSER_ROLE, get_current_session, get_current_user
-from app.modules.auth.models import Role, Session, User
+from app.modules.auth.models import Applicant, Representation, Role, Session, User
 from app.modules.auth.permissions import PERMISSIONS
 from app.modules.auth.schemas import (
+    AddRepresentationIn,
     ApplicantOut,
+    AttachLegalIn,
+    AttachLegalOut,
     CompleteRegistrationIn,
+    ContactUpdateIn,
     EimzoChallengeOut,
     EimzoLoginIn,
     LoginIn,
@@ -277,6 +282,86 @@ async def complete_registration(
         region_id=body.region_id,
         district_id=body.district_id,
         address=body.address,
+        ip=request.client.host if request.client else None,
+    )
+    role = await repo.get_role(db, user.role_id)
+    assert role is not None
+    return await _me_out(db, user, role, session_row.csrf_token)
+
+
+def _representation_out(rep: Representation, applicant: Applicant) -> RepresentationOut:
+    return RepresentationOut(
+        id=rep.id,
+        applicant=ApplicantOut.model_validate(applicant, from_attributes=True),
+        basis=rep.basis,
+        valid_from=rep.valid_from,
+        valid_until=rep.valid_until,
+        status=rep.status,
+    )
+
+
+@router.post("/applicants", status_code=201, response_model=AttachLegalOut)
+async def attach_legal(
+    body: AttachLegalIn,
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AttachLegalOut:
+    applicant, representation = await service.attach_legal(
+        db,
+        user,
+        stir=body.stir,
+        basis=body.basis,
+        signed_challenge=body.signed_challenge,
+        poa_file_id=body.poa_file_id,
+        valid_until=body.valid_until,
+        name=body.name,
+        ip=request.client.host if request.client else None,
+    )
+    return AttachLegalOut(
+        applicant=ApplicantOut.model_validate(applicant, from_attributes=True),
+        representation=_representation_out(representation, applicant),
+    )
+
+
+@router.post(
+    "/applicants/{applicant_id}/representations", status_code=201, response_model=RepresentationOut
+)
+async def add_representation(
+    applicant_id: uuid.UUID,
+    body: AddRepresentationIn,
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RepresentationOut:
+    representation, applicant = await service.add_representation(
+        db,
+        user,
+        applicant_id=applicant_id,
+        user_pinfl=body.user_pinfl,
+        basis=body.basis,
+        signed_challenge=body.signed_challenge,
+        poa_file_id=body.poa_file_id,
+        valid_until=body.valid_until,
+        ip=request.client.host if request.client else None,
+    )
+    return _representation_out(representation, applicant)
+
+
+@router.patch("/me", response_model=MeOut)
+async def patch_me(
+    body: ContactUpdateIn,
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    session_row: Annotated[Session, Depends(get_current_session)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MeOut:
+    await service.update_contact(
+        db,
+        user,
+        phone=body.phone,
+        email=str(body.email) if body.email else None,
+        otp_token=body.otp_token,
         ip=request.client.host if request.client else None,
     )
     role = await repo.get_role(db, user.role_id)

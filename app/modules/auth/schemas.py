@@ -165,3 +165,53 @@ class OtpVerifyIn(BaseModel):
 
 class OtpVerifyOut(BaseModel):
     otp_token: str
+
+
+class AttachLegalIn(BaseModel):
+    stir: str = Field(pattern=r"^[0-9]{9}$")
+    basis: Literal["org_eri", "director_registry", "poa"]
+    signed_challenge: str | None = None
+    poa_file_id: uuid.UUID | None = None
+    valid_until: date | None = None
+    name: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_basis_fields(self) -> AttachLegalIn:
+        if self.basis == "org_eri" and not self.signed_challenge:
+            raise ValueError("org_eri requires signed_challenge")
+        if self.basis == "poa" and not (self.poa_file_id and self.valid_until and self.name):
+            raise ValueError("poa requires poa_file_id, valid_until and name")
+        return self
+
+
+class AttachLegalOut(BaseModel):
+    applicant: ApplicantOut
+    representation: RepresentationOut
+
+
+class AddRepresentationIn(BaseModel):
+    user_pinfl: str = Field(pattern=r"^[0-9]{14}$")
+    basis: Literal["org_eri", "director_registry", "poa"]
+    signed_challenge: str | None = None
+    poa_file_id: uuid.UUID | None = None
+    valid_until: date | None = None
+
+    @model_validator(mode="after")
+    def _validate_basis_fields(self) -> AddRepresentationIn:
+        if self.basis == "org_eri" and not self.signed_challenge:
+            raise ValueError("org_eri requires signed_challenge")
+        if self.basis == "poa" and not (self.poa_file_id and self.valid_until):
+            raise ValueError("poa requires poa_file_id and valid_until")
+        return self
+
+
+class ContactUpdateIn(BaseModel):
+    phone: str | None = Field(default=None, pattern=r"^\+998[0-9]{9}$")
+    email: EmailStr | None = None
+    otp_token: str
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> ContactUpdateIn:
+        if (self.phone is None) == (self.email is None):
+            raise ValueError("exactly one of phone/email must be set")
+        return self

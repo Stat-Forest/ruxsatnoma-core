@@ -3,7 +3,7 @@
 import asyncio
 import secrets
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -21,12 +21,13 @@ from app.core.security import (
     verify_password,
     verify_totp,
 )
+from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo
-from app.modules.auth.adapters.eimzo import EimzoError, get_eimzo_adapter
+from app.modules.auth.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
 from app.modules.auth.adapters.oneid import OneIdError, get_oneid_adapter
 from app.modules.auth.adapters.otp_sender import get_otp_sender
-from app.modules.auth.models import Applicant, OtpCode, Session, User, UserConsent
+from app.modules.auth.models import Applicant, OtpCode, Representation, Session, User, UserConsent
 
 # Timing-uniform response (user enumeration): computed once at import so the
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
@@ -545,3 +546,212 @@ async def complete_registration(
         ip=ip,
     )
     return applicant
+
+
+async def _verify_org_challenge(
+    db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str
+) -> EimzoIdentity:
+    """org_eri basis: a fresh org-cert signature naming this stir and this signer."""
+    adapter = get_eimzo_adapter()
+    try:
+        identity = await adapter.verify_signed_challenge(signed_challenge)
+    except EimzoError as exc:
+        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
+    row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
+    if row is None:
+        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})
+    row.used_at = datetime.now(UTC)
+    if identity.tin != stir or identity.pinfl != signer_pinfl:
+        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "certificate mismatch"})
+    return identity
+
+
+def _director_listed(user: User, stir: str) -> tuple[bool, str | None]:
+    """director_registry basis: OneID's legal_info is the directors' registry (ruling 12)."""
+    profile = user.oneid_profile or {}
+    for entry in profile.get("legal_info", []):
+        if entry.get("le_tin") == stir:
+            return True, entry.get("le_name")
+    return False, None
+
+
+async def attach_legal(
+    db: AsyncSession,
+    user: User,
+    *,
+    stir: str,
+    basis: str,
+    signed_challenge: str | None,
+    poa_file_id: uuid.UUID | None,
+    valid_until: date | None,
+    name: str | None,
+    ip: str | None,
+) -> tuple[Applicant, Representation]:
+    if await repo.role_code(db, user) != "applicant":
+        raise err("ERR-ACL-001", details={"reason": "not an applicant account"})
+    assert user.pinfl is not None
+    legal_name = name
+    requisites: dict[str, Any] | None = None
+    if basis == "org_eri":
+        assert signed_challenge is not None  # schema guarantees
+        identity = await _verify_org_challenge(
+            db, signed_challenge=signed_challenge, stir=stir, signer_pinfl=user.pinfl
+        )
+        legal_name = identity.legal_name or legal_name or f"STIR {stir}"
+        requisites = {"cert_serial": identity.cert_serial}
+    elif basis == "director_registry":
+        listed, le_name = _director_listed(user, stir)
+        if not listed:
+            raise err(
+                "ERR-ACL-001",
+                details={"basis": "director_registry", "reason": "stir not in oneid profile"},
+            )
+        legal_name = le_name or legal_name or f"STIR {stir}"
+    else:  # poa — schema guarantees file/term/name; the file itself is checked in 3.3b
+        assert legal_name is not None
+    applicant = await repo.get_applicant_by_stir(db, stir)
+    created = False
+    if applicant is None:
+        applicant = Applicant(
+            kind="legal",
+            stir=stir,
+            name=legal_name,
+            requisites=requisites,
+            verified_at=datetime.now(UTC) if basis != "poa" else None,
+            verify_source=basis if basis != "poa" else None,
+        )
+        await repo.add(db, applicant)
+        created = True
+    existing = await repo.get_effective_representation(
+        db, applicant_id=applicant.id, user_id=user.id, today=business_today()
+    )
+    if existing is not None:
+        raise err("ERR-AUTH-011")
+    representation = Representation(
+        applicant_id=applicant.id,
+        user_id=user.id,
+        basis=basis,
+        poa_file_id=poa_file_id,
+        valid_from=business_today(),
+        valid_until=valid_until,
+    )
+    await repo.add(db, representation)
+    if created:
+        await audit.log(
+            db,
+            action="applicant.create_legal",
+            user_id=user.id,
+            object_type="applicant",
+            object_id=applicant.id,
+            extra={"stir": stir},
+            ip=ip,
+        )
+    await audit.log(
+        db,
+        action="representation.create",
+        user_id=user.id,
+        object_type="representation",
+        object_id=representation.id,
+        basis=basis,
+        ip=ip,
+    )
+    return applicant, representation
+
+
+async def add_representation(
+    db: AsyncSession,
+    user: User,
+    *,
+    applicant_id: uuid.UUID,
+    user_pinfl: str,
+    basis: str,
+    signed_challenge: str | None,
+    poa_file_id: uuid.UUID | None,
+    valid_until: date | None,
+    ip: str | None,
+) -> tuple[Representation, Applicant]:
+    applicant = await db.get(Applicant, applicant_id)
+    if applicant is None or applicant.kind != "legal":
+        raise err("ERR-SYS-003")
+    today = business_today()
+    own = await repo.get_effective_representation(
+        db, applicant_id=applicant_id, user_id=user.id, today=today
+    )
+    if own is None or own.basis not in ("org_eri", "director_registry"):
+        raise err("ERR-ACL-001", details={"reason": "org_eri or director basis required"})
+    candidate = await repo.get_user_by_pinfl(db, user_pinfl)
+    if candidate is None or await repo.get_own_applicant(db, candidate.id) is None:
+        raise err("ERR-SYS-003", details={"reason": "candidate must sign in and register first"})
+    if await repo.role_code(db, candidate) != "applicant":
+        raise err("ERR-ACL-001", details={"reason": "candidate is not an applicant account"})
+    assert applicant.stir is not None and user.pinfl is not None
+    if basis == "org_eri":
+        assert signed_challenge is not None
+        await _verify_org_challenge(
+            db, signed_challenge=signed_challenge, stir=applicant.stir, signer_pinfl=user.pinfl
+        )
+    elif basis == "director_registry":
+        listed, _ = _director_listed(candidate, applicant.stir)
+        if not listed:
+            raise err(
+                "ERR-ACL-001",
+                details={"basis": "director_registry", "reason": "candidate not listed"},
+            )
+    existing = await repo.get_effective_representation(
+        db, applicant_id=applicant_id, user_id=candidate.id, today=today
+    )
+    if existing is not None:
+        raise err("ERR-AUTH-011")
+    representation = Representation(
+        applicant_id=applicant_id,
+        user_id=candidate.id,
+        basis=basis,
+        poa_file_id=poa_file_id,
+        valid_from=today,
+        valid_until=valid_until,
+    )
+    await repo.add(db, representation)
+    await audit.log(
+        db,
+        action="representation.create",
+        user_id=user.id,
+        object_type="representation",
+        object_id=representation.id,
+        basis=basis,
+        extra={"for_user": str(candidate.id)},
+        ip=ip,
+    )
+    return representation, applicant
+
+
+async def update_contact(
+    db: AsyncSession,
+    user: User,
+    *,
+    phone: str | None,
+    email: str | None,
+    otp_token: str,
+    ip: str | None,
+) -> None:
+    now = datetime.now(UTC)
+    own = await repo.get_own_applicant(db, user.id)
+    if phone is not None:
+        await consume_otp_token(db, token=otp_token, purpose="phone_verify", target=phone)
+        user.phone = phone
+        user.phone_verified_at = now
+        if own is not None:
+            own.phone = phone
+    else:
+        assert email is not None  # schema guarantees exactly one
+        await consume_otp_token(db, token=otp_token, purpose="email_verify", target=email)
+        user.email = email
+        user.email_verified_at = now
+        if own is not None:
+            own.email = email
+    await audit.log(
+        db,
+        action="user.update_contact",
+        user_id=user.id,
+        extra={"field": "phone" if phone is not None else "email"},
+        ip=ip,
+    )

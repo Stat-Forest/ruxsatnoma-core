@@ -168,3 +168,22 @@ async def effective_representations(
         .order_by(Representation.created_at)
     )
     return [(rep, app) for rep, app in rows.all()]
+
+
+async def get_applicant_by_stir(db: AsyncSession, stir: str) -> Applicant | None:
+    return (await db.execute(select(Applicant).where(Applicant.stir == stir))).scalar_one_or_none()
+
+
+async def get_effective_representation(
+    db: AsyncSession, *, applicant_id: uuid.UUID, user_id: uuid.UUID, today: date
+) -> Representation | None:
+    return (
+        await db.execute(
+            select(Representation).where(
+                Representation.applicant_id == applicant_id,
+                Representation.user_id == user_id,
+                Representation.status == "active",
+                (Representation.valid_until.is_(None)) | (Representation.valid_until >= today),
+            )
+        )
+    ).scalar_one_or_none()
