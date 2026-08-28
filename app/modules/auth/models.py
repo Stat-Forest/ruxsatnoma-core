@@ -26,7 +26,9 @@ from app.db import Base, IPAddressString, uuid7
 
 
 class Role(Base):
-    """System role catalog; 11 seeded rows (migration 0003). Approval limits — decision #29."""
+    """System role catalog; 11 seeded rows (migration 0003). Approval limits — decision #29.
+
+    Roles are archived, never deleted — status column (ruling 11, 3.3b)."""
 
     __tablename__ = "roles"
 
@@ -37,6 +39,9 @@ class Role(Base):
     is_system: Mapped[bool] = mapped_column(default=False)
     max_approve_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     max_approve_area: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    status: Mapped[str] = mapped_column(default="active")
+
+    __table_args__ = (CheckConstraint("status IN ('active', 'archived')", name="status_valid"),)
 
 
 class User(Base):
@@ -71,7 +76,7 @@ class User(Base):
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'blocked', 'deleted')", name="status_valid"),
-        CheckConstraint(r"pinfl IS NULL OR pinfl ~ '^\d{14}$'", name="pinfl_format"),
+        CheckConstraint(r"pinfl IS NULL OR pinfl ~ '^[0-9]{14}$'", name="pinfl_format"),
     )
 
 
@@ -180,9 +185,9 @@ class Applicant(Base):
 class Representation(Base):
     """Who may act for a legal applicant and on what basis (decision #9).
 
-    poa_file_id is a plain uuid until media_files lands in 3.3b (deferred-FK
-    pattern). Effectiveness is checked on read: status='active' AND not past
-    valid_until (ruling 14); the expiry job is 3.4+."""
+    poa_file_id FK to media_files closed in 3.3b (the deferred-FK pattern from
+    3.2b is resolved). Effectiveness is checked on read: status='active' AND not
+    past valid_until (ruling 14); the expiry job is 3.4+."""
 
     __tablename__ = "representations"
 
@@ -190,7 +195,7 @@ class Representation(Base):
     applicant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applicants.id"))
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     basis: Mapped[str]
-    poa_file_id: Mapped[uuid.UUID | None]  # FK -> media_files in 3.3b
+    poa_file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
     valid_from: Mapped[date]
     valid_until: Mapped[date | None]
     status: Mapped[str] = mapped_column(default="active")

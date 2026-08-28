@@ -177,3 +177,39 @@ class LivestockType(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (CheckConstraint("status IN ('active', 'archived')", name="status_valid"),)
+
+
+class Announcement(Base):
+    """Multilingual targeted announcements (tz/02: admin module owns them).
+    audience: {"role_codes": [...], "region_ids": [...]} — a missing key or null
+    audience means no restriction on that axis (ruling 12)."""
+
+    __tablename__ = "announcements"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    title: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    body: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    audience: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    publish_from: Mapped[datetime | None]
+    publish_to: Mapped[datetime | None]
+    status: Mapped[str] = mapped_column(default="draft")
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'published', 'archived')", name="status_valid"),
+        Index("ix_announcements_status_window", "status", "publish_from"),
+    )
+
+
+class AnnouncementFile(Base):
+    """M2M announcements ↔ media_files (design/02)."""
+
+    __tablename__ = "announcement_files"
+
+    announcement_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("announcements.id"), primary_key=True
+    )
+    file_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("media_files.id"), primary_key=True)
+    position: Mapped[int] = mapped_column(default=0)

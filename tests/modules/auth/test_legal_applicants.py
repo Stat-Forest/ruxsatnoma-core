@@ -3,6 +3,7 @@
 import uuid
 from datetime import date, timedelta
 
+from app.core.models import MediaFile
 from app.main import create_app
 from app.modules.auth.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
 from app.modules.auth.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
@@ -22,6 +23,21 @@ def unique_stir() -> str:
 
 def csrf_headers(client) -> dict[str, str]:
     return {"X-CSRF-Token": client.cookies.get("csrf_token")}
+
+
+async def make_media_file(db) -> MediaFile:
+    """A stand-in poa attachment: representations.poa_file_id FK closed in 3.3b,
+    so tests can no longer point it at an arbitrary uuid."""
+    f = MediaFile(
+        storage_key=f"t/{uuid.uuid4().hex}",
+        filename="poa.pdf",
+        content_type="application/pdf",
+        size_bytes=100,
+        sha256="0" * 64,
+    )
+    db.add(f)
+    await db.flush()
+    return f
 
 
 async def register_individual(client, pinfl: str, *, legal_info=()) -> None:
@@ -161,12 +177,14 @@ async def test_attach_via_poa_requires_fields(db):
             headers=csrf_headers(client),
         )
         assert incomplete.status_code == 422
+        poa_file = await make_media_file(db)
+        await db.commit()
         r = await client.post(
             f"{API}/auth/applicants",
             json={
                 "stir": stir,
                 "basis": "poa",
-                "poa_file_id": str(uuid.uuid4()),
+                "poa_file_id": str(poa_file.id),
                 "valid_until": str(date.today() + timedelta(days=30)),
                 "name": "OOO POA",
             },
@@ -185,12 +203,14 @@ async def test_verified_basis_heals_poa_squatted_applicant(db):
     app = create_app()
     async with make_client(app, lifespan=True) as squatter_client:
         await register_individual(squatter_client, squatter)
+        poa_file = await make_media_file(db)
+        await db.commit()
         squat = await squatter_client.post(
             f"{API}/auth/applicants",
             json={
                 "stir": stir,
                 "basis": "poa",
-                "poa_file_id": str(uuid.uuid4()),
+                "poa_file_id": str(poa_file.id),
                 "valid_until": str(date.today() + timedelta(days=30)),
                 "name": "OOO SQUAT",
             },
@@ -292,12 +312,14 @@ async def test_poa_holder_cannot_add_people(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         await register_individual(client, holder)
+        poa_file = await make_media_file(db)
+        await db.commit()
         r = await client.post(
             f"{API}/auth/applicants",
             json={
                 "stir": stir,
                 "basis": "poa",
-                "poa_file_id": str(uuid.uuid4()),
+                "poa_file_id": str(poa_file.id),
                 "valid_until": str(date.today() + timedelta(days=30)),
                 "name": "OOO POA2",
             },
@@ -309,7 +331,7 @@ async def test_poa_holder_cannot_add_people(db):
             json={
                 "user_pinfl": holder,
                 "basis": "poa",
-                "poa_file_id": str(uuid.uuid4()),
+                "poa_file_id": str(poa_file.id),
                 "valid_until": str(date.today() + timedelta(days=30)),
             },
             headers=csrf_headers(client),

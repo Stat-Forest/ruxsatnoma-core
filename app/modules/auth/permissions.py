@@ -6,8 +6,9 @@ matrix (tz/03 4-ilova) fills as modules land in 3.3+.
 """
 
 PERMISSIONS: dict[str, str] = {
-    "auth.users.manage": "Create/edit users, reset passwords (admin, stage 3.3)",
-    "auth.sessions.revoke_any": "Revoke any user's sessions (admin, stage 3.3)",
+    "auth.users.view": "List and read users (С23; zone-scoped without auth.users.manage)",
+    "auth.users.manage": "Create/edit users, reset passwords, manage roles and grants (С23)",
+    "auth.sessions.revoke_any": "List and revoke any user's sessions (С23)",
 }
 
 
