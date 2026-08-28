@@ -42,6 +42,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec("login_lockout_minutes", int, 15, "How long a locked account stays locked"),
         SettingSpec("mfa_token_ttl_minutes", int, 5, "Lifetime of the interim MFA token"),
         SettingSpec("mfa_max_attempts", int, 5, "Wrong TOTP codes before the MFA token burns"),
+        SettingSpec("otp_ttl_minutes", int, 5, "Lifetime of a phone/email OTP code"),
+        SettingSpec("otp_max_attempts", int, 5, "Wrong OTP entries before the code burns"),
+        SettingSpec("otp_hourly_limit", int, 5, "OTP requests per target per hour"),
+        SettingSpec("privacy_policy_version", str, "1.0", "Current privacy policy version"),
+        SettingSpec("offer_version", str, "1.0", "Current public offer version"),
     )
 }
 
@@ -114,4 +119,10 @@ async def get_setting(db: AsyncSession, key: str) -> Any:
 async def get_int(db: AsyncSession, key: str) -> int:
     value = await get_setting(db, key)
     assert isinstance(value, int)  # SETTING_SPECS guarantees the type
+    return value
+
+
+async def get_str(db: AsyncSession, key: str) -> str:
+    value = await get_setting(db, key)
+    assert isinstance(value, str)  # SETTING_SPECS guarantees the type
     return value
