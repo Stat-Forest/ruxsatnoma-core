@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core.deps import get_db
 from app.modules.auth import repo, service
-from app.modules.auth.deps import get_current_session, get_current_user
-from app.modules.auth.models import Session, User
+from app.modules.auth.deps import SUPERUSER_ROLE, get_current_session, get_current_user
+from app.modules.auth.models import Role, Session, User
+from app.modules.auth.permissions import PERMISSIONS
 from app.modules.auth.schemas import (
     LoginIn,
     LoginOut,
@@ -24,6 +25,30 @@ from app.modules.auth.schemas import (
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> MeOut:
+    """Shared by /auth/me and /auth/mfa/verify (both return the same shape).
+
+    sys_admin passes require_permission without consulting codes (ruling 2), so its
+    `permissions` here is the whole registry rather than its (usually empty) personal
+    grants — otherwise the adminka would render "no rights" for the one user who
+    holds every one of them.
+    """
+    is_superuser = role.code == SUPERUSER_ROLE
+    codes = sorted(PERMISSIONS) if is_superuser else sorted(await repo.permission_codes(db, user))
+    return MeOut(
+        user=UserOut.model_validate(user, from_attributes=True),
+        role=RoleOut.model_validate(role, from_attributes=True),
+        permissions=codes,
+        zone=ZoneOut(
+            region_id=user.region_id,
+            district_id=user.district_id,
+            organization_id=user.organization_id,
+        ),
+        csrf_token=csrf_token,
+        is_superuser=is_superuser,
+    )
+
+
 @router.get("/me", response_model=MeOut)
 async def me(
     user: Annotated[User, Depends(get_current_user)],
@@ -36,17 +61,7 @@ async def me(
     # fresh login.
     role = await repo.get_role(db, user.role_id)
     assert role is not None  # FK guarantees it
-    return MeOut(
-        user=UserOut.model_validate(user, from_attributes=True),
-        role=RoleOut.model_validate(role, from_attributes=True),
-        permissions=sorted(await repo.permission_codes(db, user)),
-        zone=ZoneOut(
-            region_id=user.region_id,
-            district_id=user.district_id,
-            organization_id=user.organization_id,
-        ),
-        csrf_token=session_row.csrf_token,
-    )
+    return await _me_out(db, user, role, session_row.csrf_token)
 
 
 @router.post("/logout", status_code=204)
@@ -97,17 +112,7 @@ async def mfa_verify(
     )
     role = await repo.get_role(db, user.role_id)
     assert role is not None
-    return MeOut(
-        user=UserOut.model_validate(user, from_attributes=True),
-        role=RoleOut.model_validate(role, from_attributes=True),
-        permissions=sorted(await repo.permission_codes(db, user)),
-        zone=ZoneOut(
-            region_id=user.region_id,
-            district_id=user.district_id,
-            organization_id=user.organization_id,
-        ),
-        csrf_token=csrf,
-    )
+    return await _me_out(db, user, role, csrf)
 
 
 @router.post("/password/change", status_code=204)

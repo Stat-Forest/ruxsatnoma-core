@@ -37,6 +37,12 @@ class MeOut(BaseModel):
     # replays it as X-CSRF-Token. Safe from a GET: a cross-origin attacker can't
     # read this response because their origin isn't in the CORS allowlist.
     csrf_token: str
+    # True for the sys_admin superuser role (ruling 2): require_permission lets it
+    # through without consulting codes, so `permissions` below is the whole registry
+    # for this user, not its (possibly empty) personal grants — the frontend needs
+    # this flag to tell "holds every code today" apart from "is the superuser, and
+    # would still pass a gate for a code added tomorrow".
+    is_superuser: bool
 
 
 class LoginIn(BaseModel):
