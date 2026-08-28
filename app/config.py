@@ -21,13 +21,8 @@ class Settings(BaseSettings):
     s3_access_key: str = "ruxsatnoma"
     s3_secret_key: str = "ruxsatnoma-secret"
     s3_bucket: str = "ruxsatnoma"
-    session_absolute_hours: int = 12
-    session_idle_minutes: int = 30
-    login_max_attempts: int = 5
-    login_lockout_minutes: int = 15
-    mfa_token_ttl_minutes: int = 5
-    mfa_max_attempts: int = 5
     cookie_secure: bool | None = None
+    cors_origins: list[str] = []
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:
@@ -42,6 +37,13 @@ class Settings(BaseSettings):
         """cookie_secure=None (default) follows app_env; an explicit value overrides it
         (e.g. https on a non-prod staging deploy)."""
         return self.cookie_secure if self.cookie_secure is not None else self.app_env == "prod"
+
+    def resolve_cookie_samesite(self) -> Literal["lax", "none"]:
+        """Cross-origin adminka (ruling 3) needs SameSite=None, which browsers accept
+        only together with Secure — so a non-secure deployment stays on Lax."""
+        if self.cors_origins and self.resolve_cookie_secure():
+            return "none"
+        return "lax"
 
 
 @lru_cache

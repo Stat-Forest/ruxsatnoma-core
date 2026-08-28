@@ -19,9 +19,9 @@ API = "/api/v1"
 PASSWORD = "Str0ng!pass"
 
 
-async def make_staff(db, **overrides) -> tuple[User, str]:
+async def make_staff(db, *, role_code="executor_staff", **overrides) -> tuple[User, str]:
     secret = pyotp.random_base32()
-    role_id = (await db.execute(select(Role.id).where(Role.code == "executor_staff"))).scalar_one()
+    role_id = (await db.execute(select(Role.id).where(Role.code == role_code))).scalar_one()
     user = User(
         full_name="Staff",
         role_id=role_id,
@@ -286,6 +286,25 @@ async def test_password_change_revokes_other_sessions(db, engine):
             )
         ).scalar()
         assert revoke_count == 1
+
+
+async def test_mfa_verify_response_flags_a_superuser(db):
+    """The is_superuser/full-registry fix (finding 2) must land in the mfa/verify
+    response body too — it builds MeOut independently of /auth/me."""
+    user, secret = await make_staff(db, role_code="sys_admin")
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r1 = await client.post(
+            f"{API}/auth/login", json={"login": user.login, "password": PASSWORD}
+        )
+        code = pyotp.TOTP(secret).now()
+        r2 = await client.post(
+            f"{API}/auth/mfa/verify", json={"mfa_token": r1.json()["mfa_token"], "code": code}
+        )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["is_superuser"] is True
+    assert r2.json()["permissions"]  # non-empty: the full registry, not personal grants
 
 
 async def test_weak_new_password_rejected(db):

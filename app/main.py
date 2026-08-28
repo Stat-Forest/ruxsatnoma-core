@@ -7,6 +7,7 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -15,6 +16,8 @@ from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
+from app.modules.admin.refs_router import router as refs_router
+from app.modules.admin.router import router as admin_router
 from app.modules.auth.router import router as auth_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -54,6 +57,20 @@ def create_app() -> FastAPI:
     configure_logging(get_settings().log_format)
     app = FastAPI(title="Ruxsatnoma-urmon API", lifespan=lifespan)
 
+    settings = get_settings()
+    if settings.cors_origins:
+        # Cross-origin adminka (ruling 3): credentials are cookies, so the origin list
+        # must be explicit — "*" is invalid with allow_credentials.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["Content-Type", "X-CSRF-Token", "X-Request-Id", "Idempotency-Key"],
+            expose_headers=["X-Request-Id"],
+            max_age=600,
+        )
+
     @app.middleware("http")
     async def correlation_middleware(request: Request, call_next):
         rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
@@ -64,6 +81,18 @@ def create_app() -> FastAPI:
         finally:
             structlog.contextvars.unbind_contextvars(CORRELATION_ID_KEY)
         response.headers["X-Request-Id"] = rid
+        return response
+
+    @app.middleware("http")
+    async def cache_control_middleware(request: Request, call_next):
+        # A 200 with no freshness information may be heuristically cached by a shared
+        # cache/CDN in front of the API (RFC 9111 §4.2.2). /api/v1/* responses carry
+        # session-scoped data (e.g. /auth/me's csrf_token), so every one of them must
+        # opt out explicitly; /health is a cacheable, unauthenticated probe and stays
+        # untouched.
+        response = await call_next(request)
+        if request.url.path.startswith("/api/v1/"):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.exception_handler(DomainError)
@@ -117,5 +146,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(refs_router, prefix="/api/v1")
+    app.include_router(admin_router, prefix="/api/v1")
 
     return app

@@ -46,6 +46,48 @@ async def test_me_lists_role_and_user_permissions(db):
     await db.commit()
 
 
+async def test_me_superuser_sees_the_full_permission_registry(db):
+    """Finding 2 (whole-branch review): require_permission lets sys_admin through
+    without consulting permission codes, but /auth/me used to echo back only its
+    (empty) personal grants — the adminka would render "no rights" for the one user
+    who actually has all of them."""
+    user = await make_user(db, role_code="sys_admin")
+    _, token, _ = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.get(f"{API}/auth/me")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_superuser"] is True
+    assert body["permissions"] == sorted(permissions.PERMISSIONS)
+    assert body["permissions"]  # non-empty: the point of the fix
+
+
+async def test_me_non_superuser_sees_only_its_own_codes(db):
+    user = await make_user(db, role_code="executor_staff")
+    db.add(UserPermission(user_id=user.id, permission_code="test.user_perm"))
+    await db.flush()
+    _, token, _ = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.get(f"{API}/auth/me")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_superuser"] is False
+    assert body["permissions"] == ["test.user_perm"]
+
+    from sqlalchemy import delete
+
+    await db.execute(
+        delete(UserPermission).where(UserPermission.permission_code == "test.user_perm")
+    )
+    await db.commit()
+
+
 async def test_require_permission_403_without_grant(db, engine):
     # a throwaway app route protected by require_permission, mounted only in this test
     from typing import Annotated

@@ -52,6 +52,12 @@ async def lock_user(db: AsyncSession, user_id: uuid.UUID, *, until: datetime) ->
     )
 
 
+async def role_code(db: AsyncSession, user: User) -> str | None:
+    """The user's role code, or None if the role row vanished (should not happen: FK)."""
+    stmt = select(Role.code).where(Role.id == user.role_id)
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def permission_codes(db: AsyncSession, user: User) -> set[str]:
     role_codes = (
         await db.execute(

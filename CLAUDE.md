@@ -12,6 +12,7 @@ uv run uvicorn app.main:create_app --factory --reload
 uv run pytest -v              # integration tests need docker up
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                # type check (standard mode, decision #39)
+uv run python -m app.seed organizations app/seed/data/organizations.example.json   # reference data
 ```
 
 ## Hard rules
@@ -24,7 +25,8 @@ uv run pyright                # type check (standard mode, decision #39)
 - **Time**: store UTC (`timestamptz`), display Asia/Tashkent. Money/norms — `numeric`, never float.
 - **Migrations**: Alembic autogenerate is wired with GeoAlchemy2 `alembic_helpers` (protects PostGIS tables) — do not remove; keep `sqlalchemy.url` in `alembic.ini` empty (URL comes from settings/attributes); naming convention lives on `Base.metadata`. A guard test asserts an empty autogenerate diff.
 - **Audit invariant**: every state-changing action calls `audit.service.log(db, action=…)` in the same transaction (no commit inside — `get_db` commits both together). Action codes: `"<object>.<verb>"` in English, constants live in the acting module.
-- **Auth**: protect routes with `Depends(get_current_user)` / `require_permission("code")` from `app/modules/auth/deps.py`; permission codes are registered in the owning module via `auth.permissions.register`. Zone scoping — `app/core/abac.py` `zone_filter`. Denied/error audit entries follow the early-commit pattern: write counters + `audit.service.log(..., result="denied")`, `await db.commit()`, then `raise err(...)`.
+- **Auth**: protect routes with `Depends(get_current_user)` / `require_permission("code")` from `app/modules/auth/deps.py`; permission codes are registered in the owning module via `auth.permissions.register`. `sys_admin` is a superuser: `require_permission` lets it through before checking codes (decision #41 ruling 2; the action is still audited, and the DB-level append-only triggers on `audit_log` are unaffected). Zone scoping — `app/core/abac.py` `zone_filter`. Denied/error audit entries follow the early-commit pattern: write counters + `audit.service.log(..., result="denied")`, `await db.commit()`, then `raise err(...)`.
+- **Reference data**: read catalogs through `admin.repo`/`admin.service` (or the `/api/v1/refs/*` routes); never re-query `regions`/`organizations`/`classifier_items` from another module's repo. `GET /refs/*` reads with no rule to apply (regions, districts, organizations, activity/livestock types) call `admin.repo` directly from the router — the one router → repo exception to the layering above, made instead of adding an empty pass-through service method. Runtime policy values (session TTLs, lockout thresholds) come from `app/core/settings_store.py` — `get_int(db, "…")`, never from `Settings`. Nothing in reference data is deleted: `status='archived'`, and classifier values are superseded (archive + insert), never rewritten.
 
 ## Next-work checklist (stage 3 start)
 

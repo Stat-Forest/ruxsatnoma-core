@@ -8,7 +8,7 @@ import structlog
 from cryptography.fernet import InvalidToken
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.core import settings_store
 from app.core.crypto import decrypt_str
 from app.core.errors import err
 from app.core.security import (
@@ -33,13 +33,13 @@ async def issue_session(
     db: AsyncSession, user: User, *, ip: str | None, user_agent: str | None
 ) -> tuple[Session, str, str]:
     """Create a session row; returns (row, raw token for the cookie, csrf token)."""
-    settings = get_settings()
+    hours = await settings_store.get_int(db, "session_absolute_hours")
     token, csrf = new_token(), new_token()
     row = Session(
         token_hash=hash_token(token),
         user_id=user.id,
         csrf_token=csrf,
-        expires_at=datetime.now(UTC) + timedelta(hours=settings.session_absolute_hours),
+        expires_at=datetime.now(UTC) + timedelta(hours=hours),
         ip=ip,
         user_agent=user_agent,
     )
@@ -76,7 +76,6 @@ async def login_password(
     Denied outcomes follow ruling 2: counters + audit(result=denied) are
     committed explicitly BEFORE raising, so the trail survives the rollback.
     """
-    settings = get_settings()
     user = await repo.get_user_by_login(db, login)
     now = datetime.now(UTC)
     if user is None or user.status != "active" or user.password_hash is None:
@@ -96,11 +95,11 @@ async def login_password(
         raise err("ERR-AUTH-003")
     if not await asyncio.to_thread(verify_password, password, user.password_hash):
         new_count = await repo.increment_failed_logins(db, user.id)
-        locked = new_count >= settings.login_max_attempts
+        max_attempts = await settings_store.get_int(db, "login_max_attempts")
+        locked = new_count >= max_attempts
         if locked:
-            await repo.lock_user(
-                db, user.id, until=now + timedelta(minutes=settings.login_lockout_minutes)
-            )
+            lockout_minutes = await settings_store.get_int(db, "login_lockout_minutes")
+            await repo.lock_user(db, user.id, until=now + timedelta(minutes=lockout_minutes))
         await audit.log(
             db,
             action="user.login",
@@ -113,13 +112,14 @@ async def login_password(
         await db.commit()
         raise err("ERR-AUTH-003" if locked else "ERR-AUTH-001")
     token = new_token()
+    ttl = await settings_store.get_int(db, "mfa_token_ttl_minutes")
     await repo.add(
         db,
         OtpCode(
             code_hash=hash_token(token),
             purpose="mfa",
             user_id=user.id,
-            expires_at=now + timedelta(minutes=settings.mfa_token_ttl_minutes),
+            expires_at=now + timedelta(minutes=ttl),
         ),
     )
     return token
@@ -132,12 +132,11 @@ async def verify_mfa(
 
     Denied outcomes follow the same early-commit pattern as login_password
     (ruling 2). A wrong TOTP code counts against `otp.attempts`; once that hits
-    `settings.mfa_max_attempts` the interim token is burned (single MFA handoff
+    the mfa_max_attempts setting the interim token is burned (single MFA handoff
     exhausted) AND the attempt counts against the account's own
     failed_login_count/locked_until — otherwise MFA brute force would have no
     cap at all (the mfa_token itself never expires faster than 5 minutes).
     """
-    settings = get_settings()
     otp = await repo.get_valid_otp(db, hash_token(mfa_token), purpose="mfa")
     if otp is None or otp.user_id is None:
         raise err("ERR-AUTH-001")
@@ -167,14 +166,13 @@ async def verify_mfa(
         raise err("ERR-AUTH-001") from None
     if not verify_totp(secret, code):
         locked = False
-        if otp.attempts >= settings.mfa_max_attempts:
+        if otp.attempts >= await settings_store.get_int(db, "mfa_max_attempts"):
             otp.used_at = now  # burn: this handoff token is spent, MFA must restart
             new_count = await repo.increment_failed_logins(db, user.id)
-            locked = new_count >= settings.login_max_attempts
+            locked = new_count >= await settings_store.get_int(db, "login_max_attempts")
             if locked:
-                await repo.lock_user(
-                    db, user.id, until=now + timedelta(minutes=settings.login_lockout_minutes)
-                )
+                lockout_minutes = await settings_store.get_int(db, "login_lockout_minutes")
+                await repo.lock_user(db, user.id, until=now + timedelta(minutes=lockout_minutes))
             basis = "bad totp, token burned" + (", locked" if locked else "")
         else:
             basis = "bad totp"

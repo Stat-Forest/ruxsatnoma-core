@@ -1,9 +1,8 @@
 """Auth module models (design/02 § auth). Staff log in with password+MFA;
 applicants/prosecutors have no password (login/password_hash null, decision #32).
 
-Deferred FKs (ruling 4): organization_id/region_id/district_id become FKs in
-stage 3.3 admin. user_delegations deferred entirely (ruling 10); applicants,
-representations, user_consents are stage 3.2b.
+Territory FKs closed in stage 3.3a (migration 0004). user_delegations deferred
+entirely (ruling 10); applicants, representations, user_consents are stage 3.2b.
 """
 
 import uuid
@@ -44,10 +43,10 @@ class User(Base):
     pinfl: Mapped[str | None] = mapped_column(unique=True)
     full_name: Mapped[str]
     position: Mapped[str | None]
-    organization_id: Mapped[uuid.UUID | None]  # FK in 3.3 (ruling 4)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id"))
     role_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("roles.id"))
-    region_id: Mapped[uuid.UUID | None]  # FK in 3.3
-    district_id: Mapped[uuid.UUID | None]  # FK in 3.3
+    region_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("regions.id"))
+    district_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("districts.id"))
     phone: Mapped[str | None]
     phone_verified_at: Mapped[datetime | None]
     email: Mapped[str | None] = mapped_column(CITEXT)
