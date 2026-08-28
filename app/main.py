@@ -20,6 +20,7 @@ from app.db import make_engine, make_session_factory
 from app.files_router import router as files_router
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
+from app.modules.admin.users_router import router as users_router
 from app.modules.auth.router import router as auth_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -152,6 +153,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(refs_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")
+    app.include_router(users_router, prefix="/api/v1")
     app.include_router(files_router, prefix="/api/v1")
 
     return app

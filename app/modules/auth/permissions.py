@@ -11,6 +11,14 @@ PERMISSIONS: dict[str, str] = {
     "auth.sessions.revoke_any": "List and revoke any user's sessions (С23)",
 }
 
+# Module constants for the codes above — auth owns them, so they are seeded
+# directly into the dict literal instead of going through `register()` (which
+# would reject them as already-registered). Call sites import these instead of
+# typing the strings, so a typo fails at import time, not at request time.
+USERS_VIEW = "auth.users.view"
+USERS_MANAGE = "auth.users.manage"
+SESSIONS_REVOKE_ANY = "auth.sessions.revoke_any"
+
 
 def register(codes: dict[str, str]) -> None:
     """Called by other modules to add their permission codes."""

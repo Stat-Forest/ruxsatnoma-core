@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, date, datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import ColumnElement, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
@@ -87,6 +87,66 @@ async def permission_codes(db: AsyncSession, user: User) -> set[str]:
         )
     ).scalars()
     return set(role_codes) | set(user_codes)
+
+
+async def list_users(
+    db: AsyncSession,
+    *,
+    role_code: str | None,
+    status: str | None,
+    organization_id: uuid.UUID | None,
+    region_id: uuid.UUID | None,
+    q: str | None,
+    zone: ColumnElement[bool] | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[User], int]:
+    """Admin user listing (С23). Filters combine with AND; `q` is an ILIKE search
+    across login/full_name/pinfl. `zone` is an optional extra WHERE clause the
+    caller builds via `core.abac.zone_filter` — this repo stays agnostic of ABAC,
+    it just ANDs in whatever boolean expression it is handed (or none at all, for
+    a manage-holder who is not zone-restricted)."""
+    stmt = select(User)
+    if role_code is not None:
+        stmt = stmt.join(Role, Role.id == User.role_id).where(Role.code == role_code)
+    if status is not None:
+        stmt = stmt.where(User.status == status)
+    if organization_id is not None:
+        stmt = stmt.where(User.organization_id == organization_id)
+    if region_id is not None:
+        stmt = stmt.where(User.region_id == region_id)
+    if q is not None:
+        pattern = f"%{q}%"
+        stmt = stmt.where(
+            or_(
+                User.login.ilike(pattern),
+                User.full_name.ilike(pattern),
+                User.pinfl.ilike(pattern),
+            )
+        )
+    if zone is not None:
+        stmt = stmt.where(zone)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(User.created_at.desc(), User.id.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def revoke_user_sessions(db: AsyncSession, user_id: uuid.UUID) -> int:
+    """Bulk-revokes every still-active session of `user_id` (block/delete/reset-*,
+    С23): a plain UPDATE, not a per-row `service.revoke_session` call — no
+    per-session audit entry, the caller's own action (`user.block` etc.) already
+    covers it in the same transaction."""
+    result = await db.execute(
+        update(Session)
+        .where(Session.user_id == user_id, Session.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+        .returning(Session.id)
+    )
+    return len(result.all())
 
 
 async def get_valid_otp(db: AsyncSession, code_hash: str, purpose: str) -> OtpCode | None:

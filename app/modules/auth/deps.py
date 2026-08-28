@@ -110,6 +110,25 @@ async def get_current_user(
     return user
 
 
+async def _authorize(db: AsyncSession, user: User, wanted: set[str], *, basis: str) -> None:
+    """Shared body of `require_permission`/`require_any_permission`.
+
+    Stage 3.3a ruling 2: sys_admin passes every gate — the action itself is still
+    audited by the service that performs it, and the DB-level append-only triggers
+    on audit_log are unaffected by this bypass. Otherwise `user` must hold at least
+    one of `wanted` (role ∪ personal grants); on denial, the audit entry is written
+    and committed BEFORE raising (early-commit pattern) — the exception's own
+    rollback in `get_db` would otherwise discard the very entry meant to record it.
+    """
+    if await repo.role_code(db, user) == SUPERUSER_ROLE:
+        return
+    held = await repo.permission_codes(db, user)
+    if held.isdisjoint(wanted):
+        await audit.log(db, action="access.denied", user_id=user.id, result="denied", basis=basis)
+        await db.commit()
+        raise err("ERR-ACL-001", details={"permission": basis})
+
+
 def require_permission(code: str):
     """Dependency factory: current user must hold `code` (role ∪ personal grants).
 
@@ -124,17 +143,30 @@ def require_permission(code: str):
         user: Annotated[User, Depends(get_current_user)],
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
-        # Stage 3.3a ruling 2: sys_admin passes every permission gate. The action
-        # itself is still audited by the service that performs it, and the DB-level
-        # append-only triggers on audit_log are unaffected by this bypass.
-        if await repo.role_code(db, user) == SUPERUSER_ROLE:
-            return user
-        if code not in await repo.permission_codes(db, user):
-            await audit.log(
-                db, action="access.denied", user_id=user.id, result="denied", basis=code
-            )
-            await db.commit()
-            raise err("ERR-ACL-001", details={"permission": code})
+        await _authorize(db, user, {code}, basis=code)
+        return user
+
+    return _check
+
+
+def require_any_permission(*codes: str):
+    """Dependency factory: current user must hold at least ONE of `codes` (role ∪
+    personal grants) — for read routes that a view-level AND a manage-level grant
+    should both satisfy (e.g. `GET /admin/users`: `auth.users.view` OR
+    `auth.users.manage`). Same registration check and sys_admin bypass as
+    `require_permission`, whose internals it shares via `_authorize`.
+    """
+    if not codes:
+        raise ValueError("require_any_permission needs at least one code")
+    for code in codes:
+        if code not in PERMISSIONS:
+            raise ValueError(f"permission code not registered: {code!r}")
+
+    async def _check(
+        user: Annotated[User, Depends(get_current_user)],
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        await _authorize(db, user, set(codes), basis="|".join(codes))
         return user
 
     return _check

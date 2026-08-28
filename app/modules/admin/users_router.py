@@ -1,0 +1,115 @@
+"""Admin API for staff user administration (С23): CRUD, credentials handout,
+block/unblock/delete. Read routes accept either view or manage; every write route
+requires manage. Every route is audited inside the service it calls.
+"""
+
+import uuid
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.deps import get_db
+from app.core.schemas import Page, PageParams
+from app.modules.admin import users_service as service
+from app.modules.admin.users_schemas import (
+    OneTimePasswordOut,
+    TotpUriOut,
+    UserAdminOut,
+    UserBlockIn,
+    UserCreatedOut,
+    UserCreateIn,
+    UserFilters,
+    UserPatchIn,
+)
+from app.modules.auth.deps import require_any_permission, require_permission
+from app.modules.auth.models import User
+from app.modules.auth.permissions import USERS_MANAGE, USERS_VIEW
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@router.get("/users", response_model=Page[UserAdminOut])
+async def list_users(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    params: Annotated[PageParams, Depends()],
+    filters: Annotated[UserFilters, Depends()],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+) -> Page[UserAdminOut]:
+    return await service.list_users(db, params=params, filters=filters, actor=actor)
+
+
+@router.get("/users/{user_id}", response_model=UserAdminOut)
+async def get_user(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+) -> UserAdminOut:
+    return await service.get_user(db, user_id=user_id, actor=actor)
+
+
+@router.post("/users", response_model=UserCreatedOut, status_code=201)
+async def create_user(
+    body: UserCreateIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> UserCreatedOut:
+    return await service.create_user(db, data=body, actor=actor)
+
+
+@router.patch("/users/{user_id}", response_model=UserAdminOut)
+async def patch_user(
+    user_id: uuid.UUID,
+    body: UserPatchIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> UserAdminOut:
+    return await service.patch_user(db, user_id=user_id, data=body, actor=actor)
+
+
+@router.post("/users/{user_id}/block", response_model=UserAdminOut)
+async def block_user(
+    user_id: uuid.UUID,
+    body: UserBlockIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> UserAdminOut:
+    return await service.block_user(db, user_id=user_id, reason=body.reason, actor=actor)
+
+
+@router.post("/users/{user_id}/unblock", response_model=UserAdminOut)
+async def unblock_user(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> UserAdminOut:
+    return await service.unblock_user(db, user_id=user_id, actor=actor)
+
+
+@router.post("/users/{user_id}/delete", response_model=UserAdminOut)
+async def delete_user(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> UserAdminOut:
+    return await service.delete_user(db, user_id=user_id, actor=actor)
+
+
+@router.post("/users/{user_id}/reset-password", response_model=OneTimePasswordOut)
+async def reset_password(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> OneTimePasswordOut:
+    one_time_password = await service.reset_password(db, user_id=user_id, actor=actor)
+    return OneTimePasswordOut(one_time_password=one_time_password)
+
+
+@router.post("/users/{user_id}/reset-mfa", response_model=TotpUriOut)
+async def reset_mfa(
+    user_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(USERS_MANAGE))],
+) -> TotpUriOut:
+    totp_uri = await service.reset_mfa(db, user_id=user_id, actor=actor)
+    return TotpUriOut(totp_uri=totp_uri)
