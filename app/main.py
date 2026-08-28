@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
+from app.core import storage
 from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
@@ -38,6 +39,8 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.engine = make_engine(settings.database_url)
     app.state.session_factory = make_session_factory(app.state.engine)
+    # Fresh dev/test MinIO volumes have no bucket yet; in prod this is an idempotent HEAD.
+    await storage.ensure_bucket()
     yield
     await app.state.engine.dispose()
 

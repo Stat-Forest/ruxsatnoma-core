@@ -17,6 +17,7 @@ dependencies = [
     "pyotp>=2.9",
     "cryptography>=43",
     "email-validator>=2",
+    "aioboto3>=15.5.0",
 ]
 
 [dependency-groups]
@@ -27,6 +28,7 @@ dev = [
     "ruff>=0.6",
     "pre-commit>=3.7",
     "pyright>=1.1.411",
+    "types-aiobotocore-s3>=3.9.0",
 ]
 
 [tool.pyright]

@@ -35,6 +35,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "secret_key нельзя оставлять значением по умолчанию (change-me) в app_env=prod"
             )
+        if self.app_env == "prod" and self.s3_secret_key == "ruxsatnoma-secret":
+            raise ValueError("s3_secret_key must not keep the default value in app_env=prod")
         if self.app_env == "prod":
             mocked = [
                 name
