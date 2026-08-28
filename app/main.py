@@ -83,6 +83,18 @@ def create_app() -> FastAPI:
         response.headers["X-Request-Id"] = rid
         return response
 
+    @app.middleware("http")
+    async def cache_control_middleware(request: Request, call_next):
+        # A 200 with no freshness information may be heuristically cached by a shared
+        # cache/CDN in front of the API (RFC 9111 §4.2.2). /api/v1/* responses carry
+        # session-scoped data (e.g. /auth/me's csrf_token), so every one of them must
+        # opt out explicitly; /health is a cacheable, unauthenticated probe and stays
+        # untouched.
+        response = await call_next(request)
+        if request.url.path.startswith("/api/v1/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
         return JSONResponse(
