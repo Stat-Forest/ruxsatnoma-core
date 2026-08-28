@@ -225,10 +225,20 @@ OTP_TOKEN_TTL_MINUTES = 30  # verified-target token consumed by registration/con
 
 
 def _mask_target(target: str) -> str:
-    """Audit-safe form: +99890***4567 / a***@host."""
+    """Audit-safe form: +99890***4567 / a***@host.
+
+    Defense in depth: `OtpVerifyIn.target` carries schema-level format
+    validation (see `schemas._validate_target_format`), but this must still
+    degrade safely on its own for any short non-email string that reaches it
+    — it must never echo more of the original than it hides.
+    """
     if "@" in target:
         local, _, host = target.partition("@")
         return f"{local[:1]}***@{host}"
+    if len(target) <= 10:
+        if len(target) < 4:
+            return "***"
+        return f"***{target[-4:]}"
     return f"{target[:6]}***{target[-4:]}"
 
 

@@ -13,6 +13,7 @@ from sqlalchemy import update
 from app.main import create_app
 from app.modules.auth.adapters.otp_sender import MockOtpSender, get_otp_sender
 from app.modules.auth.models import OtpCode
+from app.modules.auth.service import _mask_target
 from tests.conftest import make_client
 
 API = "/api/v1"
@@ -160,3 +161,29 @@ async def test_mfa_purpose_rejected_by_schema(db):
             json={"target_type": "phone", "target": unique_phone(), "purpose": "mfa"},
         )
     assert r.status_code == 422
+
+
+async def test_verify_malformed_phone_target_rejected_by_schema(db):
+    """Regression: a short digit-only target must 422 before reaching the
+    service/audit layer, where an unmasked target could leak into the audit log."""
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r = await client.post(
+            f"{API}/auth/otp/verify",
+            json={"target": "901234567", "code": "000000", "purpose": "phone_verify"},
+        )
+    assert r.status_code == 422
+
+
+def test_mask_target_short_non_email_never_echoes_full_value():
+    masked = _mask_target("901234567")
+    assert "901234567" not in masked
+    assert masked == "***4567"
+
+
+def test_mask_target_full_phone():
+    assert _mask_target("+998901234567") == "+99890***4567"
+
+
+def test_mask_target_email():
+    assert _mask_target("user@example.com") == "u***@example.com"

@@ -67,6 +67,21 @@ class PasswordChangeIn(BaseModel):
     new_password: str
 
 
+def _validate_target_format(target: str, purpose: str) -> None:
+    """Raise ValueError unless `target` matches the format `purpose` implies.
+
+    Shared by OtpRequestIn and OtpVerifyIn so both anonymous OTP endpoints
+    reject malformed targets at the schema level, before they ever reach the
+    service/audit layer.
+    """
+    if purpose == "phone_verify":
+        if not re.fullmatch(r"\+998[0-9]{9}", target):
+            raise ValueError("phone must be +998XXXXXXXXX")
+    else:
+        # No DNS lookups in request validation (tests run offline).
+        validate_email(target, check_deliverability=False)
+
+
 class OtpRequestIn(BaseModel):
     target_type: Literal["phone", "email"]
     target: str
@@ -77,12 +92,7 @@ class OtpRequestIn(BaseModel):
         pairs = {"phone": "phone_verify", "email": "email_verify"}
         if pairs[self.target_type] != self.purpose:
             raise ValueError("purpose does not match target_type")
-        if self.target_type == "phone":
-            if not re.fullmatch(r"\+998[0-9]{9}", self.target):
-                raise ValueError("phone must be +998XXXXXXXXX")
-        else:
-            # No DNS lookups in request validation (tests run offline).
-            validate_email(self.target, check_deliverability=False)
+        _validate_target_format(self.target, self.purpose)
         return self
 
 
@@ -90,6 +100,11 @@ class OtpVerifyIn(BaseModel):
     target: str
     code: str
     purpose: Literal["phone_verify", "email_verify"]
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> OtpVerifyIn:
+        _validate_target_format(self.target, self.purpose)
+        return self
 
 
 class OtpVerifyOut(BaseModel):
