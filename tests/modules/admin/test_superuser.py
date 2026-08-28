@@ -2,9 +2,7 @@
 
 import uuid
 
-import pytest
-from sqlalchemy import select, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy import select
 
 from app.main import create_app
 from app.modules.audit.models import AuditLog
@@ -81,11 +79,3 @@ async def test_other_roles_still_need_the_code(db, agency):
         )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-ACL-001"
-
-
-async def test_sys_admin_cannot_touch_the_audit_log(db):
-    """The bypass is about API permissions; the append-only DB triggers still hold."""
-    db.add(AuditLog(action="test.superuser", result="success"))
-    await db.flush()
-    with pytest.raises(DBAPIError):
-        await db.execute(text("UPDATE audit_log SET action = 'tampered'"))

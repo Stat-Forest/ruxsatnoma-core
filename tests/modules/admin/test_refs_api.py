@@ -90,6 +90,39 @@ async def test_organizations_default_to_the_root(db, agency):
     assert org.parent_id == agency.id
 
 
+async def test_organizations_filtered_by_parent_id(db, agency):
+    """`parent_id=` is the one branch of `_organizations_query` nothing covered after
+    the flake rewrite (finding 9). A dedicated parent with exactly one child keeps
+    this deterministic regardless of what other tests accumulate in the table."""
+    suffix = uuid.uuid4().hex[:6]
+    territorial = Organization(
+        kind="territorial",
+        code=f"parentfilter-{suffix}",
+        name={"uz_cyrl": "Ҳудудий бошқарма"},
+        parent_id=agency.id,
+    )
+    db.add(territorial)
+    await db.flush()
+    child = Organization(
+        kind="leshoz",
+        code=f"parentfilter-child-{suffix}",
+        name={"uz_cyrl": "ДЎХ"},
+        parent_id=territorial.id,
+    )
+    db.add(child)
+    _, token, _ = await signed_in(db)
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.get(f"{API}/refs/organizations", params={"parent_id": str(territorial.id)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 1
+    assert [row["code"] for row in body["items"]] == [f"parentfilter-child-{suffix}"]
+
+
 async def test_organizations_pagination_caps_page_size(db):
     _, token, _ = await signed_in(db)
     await db.commit()
