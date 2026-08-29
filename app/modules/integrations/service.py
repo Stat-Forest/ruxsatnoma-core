@@ -80,6 +80,11 @@ async def deliver_one(db: AsyncSession) -> bool:
         except Exception as exc:  # noqa: BLE001 — any sender failure is a retry case
             row.attempts += 1
             row.last_error = repr(exc)[:1000]
+            # Every trip sits the destination out for outbox_breaker_cooldown_seconds
+            # on top of the backoff below, and while open it holds back ALL of that
+            # destination's pending rows, not just this one — so time-to-dead is no
+            # longer bounded purely by outbox_max_attempts x backoff; the breaker can
+            # only push it later, never earlier.
             breaker.record_failure(
                 row.destination,
                 threshold=await settings_store.get_int(db, "outbox_breaker_failures"),

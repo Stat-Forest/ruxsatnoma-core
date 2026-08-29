@@ -1,6 +1,7 @@
 """Per-destination circuit breaker (ruling 13): an outage on one provider must not
 burn the retry budget of every queued message, and must not stall other channels."""
 
+import pytest
 from sqlalchemy import delete
 
 from app.core import settings_store
@@ -35,16 +36,34 @@ async def test_pick_due_skips_an_open_destination(db):
     assert row.destination == "email"
 
 
-async def test_a_tripped_destination_is_skipped_while_another_keeps_flowing(db, monkeypatch):
-    breaker.reset()
-    # deliver_one() commits internally, so this override durably lands in the
-    # shared test DB — delete-before/delete-after (as tests/core/test_ratelimit.py
-    # does for its own SystemSetting overrides) keeps the test idempotent across
-    # repeated runs and leaves no override behind for later tests to trip over.
-    await db.execute(delete(SystemSetting).where(SystemSetting.key == "outbox_breaker_failures"))
-    db.add(SystemSetting(key="outbox_breaker_failures", value=1))
+@pytest.fixture
+async def _trip_after_one_failure(db):
+    """Push outbox_breaker_failures to 1 so a single failure trips the breaker.
+
+    deliver_one() commits internally, so this override durably lands in the
+    shared test DB. Cleanup runs in fixture teardown — after yield, not as
+    ordinary test-body code — the same idiom tests/core/test_ratelimit.py's
+    _low_login_limit/_low_challenge_limit fixtures use for their own
+    SystemSetting overrides: pytest runs a fixture's post-yield code even when
+    the test body raises, so a genuine assertion failure here still leaves the
+    shared dev DB clean instead of poisoning the next run with a leftover
+    override and the UniqueViolationError that override would cause.
+    """
+    key = "outbox_breaker_failures"
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == key))
+    db.add(SystemSetting(key=key, value=1))
     await db.flush()
-    settings_store.invalidate("outbox_breaker_failures")
+    settings_store.invalidate(key)
+    yield
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == key))
+    await db.commit()
+    settings_store.invalidate(key)
+
+
+async def test_a_tripped_destination_is_skipped_while_another_keeps_flowing(
+    db, monkeypatch, _trip_after_one_failure
+):
+    breaker.reset()
 
     async def _boom(session, payload):
         raise RuntimeError("provider down")
@@ -66,7 +85,4 @@ async def test_a_tripped_destination_is_skipped_while_another_keeps_flowing(db, 
 
     assert delivered == [{"n": 3}]  # the healthy channel drained
     assert "sms" in breaker.open_destinations()
-    await db.execute(delete(SystemSetting).where(SystemSetting.key == "outbox_breaker_failures"))
-    await db.commit()
-    settings_store.invalidate("outbox_breaker_failures")
     breaker.reset()

@@ -25,6 +25,10 @@ async def test_reports_dead_rows_once_and_fails_their_notifications(db, engine):
     await jobs.alert_dead_outbox(factory)
 
     admin = await make_user(db, role_code="central_admin")
+    # list_user_ids_by_role_codes() filters on status == "active"; this is its
+    # first caller anywhere in the codebase, so nothing else proves that filter
+    # actually holds — a blocked admin must come away with no alert.
+    blocked_admin = await make_user(db, role_code="central_admin", status="blocked")
     user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
     rows = await notifications.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
     sms = next(r for r in rows if r.channel == "sms")
@@ -56,6 +60,16 @@ async def test_reports_dead_rows_once_and_fails_their_notifications(db, engine):
     )
     assert len(alerts) == 1
     assert "sms" in alerts[0].rendered_text
+    blocked_alerts = (
+        (
+            await db.execute(
+                select(Notification).where(Notification.recipient_user_id == blocked_admin.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert blocked_alerts == []
     entry = (
         (await db.execute(select(AuditLog).where(AuditLog.action == "outbox.alert_dead")))
         .scalars()
