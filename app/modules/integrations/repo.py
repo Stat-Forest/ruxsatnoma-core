@@ -12,11 +12,22 @@ async def pick_due(db: AsyncSession) -> OutboxMessage | None:
     """Claim one due row; the row lock is held until the caller commits/rolls back.
 
     SKIP LOCKED lets any number of worker processes drain the queue without
-    stepping on each other (plan 03.4 ruling 5)."""
+    stepping on each other (plan 03.4 ruling 5).
+
+    Uses clock_timestamp(), not now(): Postgres freezes now() for a
+    transaction's whole lifetime, so a caller that reuses one session across
+    several calls (the outbox worker opens a fresh session per call and never
+    notices, but a drain loop sharing one session — e.g. tests — does) would
+    otherwise keep comparing against a timestamp stuck at whenever this
+    session's transaction first began, never seeing rows enqueued afterwards.
+    """
     return (
         await db.execute(
             select(OutboxMessage)
-            .where(OutboxMessage.status == "pending", OutboxMessage.next_attempt_at <= func.now())
+            .where(
+                OutboxMessage.status == "pending",
+                OutboxMessage.next_attempt_at <= func.clock_timestamp(),
+            )
             .order_by(OutboxMessage.next_attempt_at)
             .limit(1)
             .with_for_update(skip_locked=True)

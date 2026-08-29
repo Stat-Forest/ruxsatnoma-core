@@ -11,7 +11,8 @@ from app.modules.auth.models import User
 from app.modules.integrations.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
 from app.modules.integrations.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
 from tests.conftest import make_client
-from tests.modules.auth.test_otp import last_code, unique_email, unique_phone
+from tests.modules.auth.conftest import _delivered_code
+from tests.modules.auth.test_otp import unique_email, unique_phone
 
 API = "/api/v1"
 
@@ -52,7 +53,7 @@ async def user_id_by_pinfl(db, pinfl: str) -> uuid.UUID:
     return (await db.execute(select(User.id).where(User.pinfl == pinfl))).scalar_one()
 
 
-async def register_individual(client, pinfl: str, *, legal_info=()) -> None:
+async def register_individual(client, pinfl: str, *, db, legal_info=()) -> None:
     """OneID login + complete registration; unique phone derived from pinfl."""
     await client.get(f"{API}/auth/oneid/authorize")
     state = client.cookies.get("oneid_state")
@@ -68,7 +69,7 @@ async def register_individual(client, pinfl: str, *, legal_info=()) -> None:
     )
     v = await client.post(
         f"{API}/auth/otp/verify",
-        json={"target": phone, "code": last_code(), "purpose": "phone_verify"},
+        json={"target": phone, "code": await _delivered_code(db), "purpose": "phone_verify"},
     )
     r = await client.post(
         f"{API}/auth/complete-registration",
@@ -98,7 +99,7 @@ async def test_attach_via_org_eri(db):
     pinfl, stir = unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         signed = await org_eri_challenge(client, pinfl=pinfl, stir=stir)
         r = await client.post(
             f"{API}/auth/applicants",
@@ -117,7 +118,7 @@ async def test_org_eri_tin_mismatch_403(db):
     pinfl = unique_pinfl()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         signed = await org_eri_challenge(client, pinfl=pinfl, stir=unique_stir())
         r = await client.post(
             f"{API}/auth/applicants",
@@ -136,7 +137,7 @@ async def test_org_eri_stolen_cert_pinfl_mismatch_403(db):
     pinfl, stir = unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         stolen = await org_eri_challenge(client, pinfl=unique_pinfl(), stir=stir)
         r = await client.post(
             f"{API}/auth/applicants",
@@ -154,6 +155,7 @@ async def test_attach_via_director_registry(db):
         await register_individual(
             client,
             pinfl,
+            db=db,
             legal_info=[OneIdLegalInfo(le_tin=stir, le_name="OOO DIR", is_basic=True)],
         )
         r = await client.post(
@@ -169,7 +171,7 @@ async def test_director_registry_not_listed_403(db):
     pinfl = unique_pinfl()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         r = await client.post(
             f"{API}/auth/applicants",
             json={"stir": unique_stir(), "basis": "director_registry"},
@@ -182,7 +184,7 @@ async def test_attach_via_poa_requires_fields(db):
     pinfl, stir = unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         incomplete = await client.post(
             f"{API}/auth/applicants",
             json={"stir": stir, "basis": "poa"},
@@ -214,7 +216,7 @@ async def test_verified_basis_heals_poa_squatted_applicant(db):
     squatter, director, stir = unique_pinfl(), unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as squatter_client:
-        await register_individual(squatter_client, squatter)
+        await register_individual(squatter_client, squatter, db=db)
         poa_file = await make_media_file(db, await user_id_by_pinfl(db, squatter))
         await db.commit()
         squat = await squatter_client.post(
@@ -231,7 +233,7 @@ async def test_verified_basis_heals_poa_squatted_applicant(db):
         assert squat.status_code == 201
         assert squat.json()["applicant"]["verified_at"] is None
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, director)
+        await register_individual(client, director, db=db)
         signed = await org_eri_challenge(client, pinfl=director, stir=stir, legal_name="OOO REAL")
         r = await client.post(
             f"{API}/auth/applicants",
@@ -248,7 +250,7 @@ async def test_duplicate_active_representation_409(db):
     pinfl, stir = unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         signed = await org_eri_challenge(client, pinfl=pinfl, stir=stir)
         assert (
             await client.post(
@@ -271,9 +273,9 @@ async def test_add_second_representative(db):
     director, second, stir = unique_pinfl(), unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as second_client:
-        await register_individual(second_client, second)
+        await register_individual(second_client, second, db=db)
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, director)
+        await register_individual(client, director, db=db)
         signed = await org_eri_challenge(client, pinfl=director, stir=stir)
         attach = await client.post(
             f"{API}/auth/applicants",
@@ -302,7 +304,7 @@ async def test_add_representative_requires_signed_in_candidate(db):
     director, stir = unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, director)
+        await register_individual(client, director, db=db)
         signed = await org_eri_challenge(client, pinfl=director, stir=stir)
         attach = await client.post(
             f"{API}/auth/applicants",
@@ -323,7 +325,7 @@ async def test_poa_holder_cannot_add_people(db):
     holder, stir = unique_pinfl(), unique_stir()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, holder)
+        await register_individual(client, holder, db=db)
         poa_file = await make_media_file(db, await user_id_by_pinfl(db, holder))
         await db.commit()
         r = await client.post(
@@ -355,14 +357,18 @@ async def test_patch_me_phone(db):
     pinfl, new_phone = unique_pinfl(), unique_phone()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         await client.post(
             f"{API}/auth/otp/request",
             json={"target_type": "phone", "target": new_phone, "purpose": "phone_verify"},
         )
         v = await client.post(
             f"{API}/auth/otp/verify",
-            json={"target": new_phone, "code": last_code(), "purpose": "phone_verify"},
+            json={
+                "target": new_phone,
+                "code": await _delivered_code(db),
+                "purpose": "phone_verify",
+            },
         )
         r = await client.patch(
             f"{API}/auth/me",
@@ -378,7 +384,7 @@ async def test_patch_me_email_and_exclusivity(db):
     pinfl, email = unique_pinfl(), unique_email()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        await register_individual(client, pinfl)
+        await register_individual(client, pinfl, db=db)
         both = await client.patch(
             f"{API}/auth/me",
             json={"phone": unique_phone(), "email": email, "otp_token": "x"},
@@ -391,7 +397,7 @@ async def test_patch_me_email_and_exclusivity(db):
         )
         v = await client.post(
             f"{API}/auth/otp/verify",
-            json={"target": email, "code": last_code(), "purpose": "email_verify"},
+            json={"target": email, "code": await _delivered_code(db), "purpose": "email_verify"},
         )
         r = await client.patch(
             f"{API}/auth/me",

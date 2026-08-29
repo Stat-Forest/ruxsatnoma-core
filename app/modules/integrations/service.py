@@ -17,7 +17,7 @@ from app.db import uuid7
 from app.modules.audit import service as audit
 from app.modules.integrations import repo
 from app.modules.integrations.models import InboundDeadLetter, IntegrationLog, OutboxMessage
-from app.modules.integrations.senders import SENDERS
+from app.modules.integrations.senders import SENDERS, register_sender
 
 logger = structlog.get_logger(__name__)
 
@@ -198,3 +198,14 @@ async def discard_dead_letter(
         ip=ip,
     )
     return row
+
+
+async def _send_sms_otp(payload: dict[str, Any]) -> None:
+    from app.modules.integrations.adapters.otp_sender import get_otp_sender
+
+    await get_otp_sender().send(
+        target_type=payload["target_type"], target=payload["target"], code=payload["code"]
+    )
+
+
+register_sender("sms_otp", _send_sms_otp)

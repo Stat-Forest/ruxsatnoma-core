@@ -3,6 +3,8 @@
 import pytest
 
 from app.config import get_settings
+from app.modules.integrations import service as integrations_service
+from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
 
 
 @pytest.fixture(autouse=True)
@@ -15,9 +17,19 @@ def _app_on_test_db(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clear_sent_codes():
-    from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
-
     sender = get_otp_sender()
     if isinstance(sender, MockOtpSender):
         sender.sent.clear()
     yield
+
+
+async def _delivered_code(db) -> str:
+    """Drain the outbox, then return the code from the most recently delivered
+    OTP send. Since Task 4, `request_otp` only enqueues — nothing reaches the
+    mock sender until a worker (this drain loop, standing in for one) delivers
+    the outbox row."""
+    while await integrations_service.deliver_one(db):
+        pass
+    sender = get_otp_sender()
+    assert isinstance(sender, MockOtpSender)
+    return sender.sent[-1][2]

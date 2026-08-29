@@ -15,6 +15,7 @@ from app.core.crypto import decrypt_str
 from app.core.errors import err
 from app.core.models import MediaFile
 from app.core.security import (
+    hash_otp,
     hash_password,
     hash_token,
     new_token,
@@ -26,9 +27,9 @@ from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo
 from app.modules.auth.models import Applicant, OtpCode, Representation, Session, User, UserConsent
+from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
 from app.modules.integrations.adapters.oneid import OneIdError, get_oneid_adapter
-from app.modules.integrations.adapters.otp_sender import get_otp_sender
 
 # Timing-uniform response (user enumeration): computed once at import so the
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
@@ -411,7 +412,7 @@ async def request_otp(
         OtpCode(
             target_type=target_type,
             target=target,
-            code_hash=hash_token(code),
+            code_hash=hash_otp(code),
             purpose=purpose,
             expires_at=now + timedelta(minutes=ttl),
         ),
@@ -422,7 +423,11 @@ async def request_otp(
         ip=ip,
         extra={"target": _mask_target(target), "purpose": purpose},
     )
-    await get_otp_sender().send(target_type=target_type, target=target, code=code)
+    await integrations_service.enqueue(
+        db,
+        destination="sms_otp",
+        payload={"target_type": target_type, "target": target, "code": code},
+    )
 
 
 async def verify_otp(
@@ -441,7 +446,7 @@ async def verify_otp(
         )
         await db.commit()
         raise err("ERR-AUTH-010")
-    if not secrets.compare_digest(hash_token(code), row.code_hash):
+    if not secrets.compare_digest(hash_otp(code), row.code_hash):
         row.attempts += 1
         await audit.log(
             db,
