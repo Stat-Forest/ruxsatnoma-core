@@ -17,7 +17,7 @@ from app.core.models import MediaFile
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization
-from app.modules.auth.models import Applicant, User
+from app.modules.auth.models import Applicant, User, UserPermission
 from app.modules.gis.models import Contour, ContourVersion, GisLayer
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE, LAYERS_MANAGE
 from tests.conftest import make_client
@@ -63,6 +63,38 @@ async def leshoz(db: AsyncSession) -> Organization:
         id=uuid7(),
         code=f"T{uuid.uuid4().hex[:8]}",
         name={"uz_cyrl": "Тест ЎХ", "ru": "Тестовый лесхоз"},
+        kind="leshoz",
+        parent_id=agency.id,
+    )
+    db.add(org)
+    await db.flush()
+    return org
+
+
+@pytest.fixture
+async def other_leshoz(db: AsyncSession) -> Organization:
+    """A second organization, distinct from `leshoz` — the target of a
+    cross-organization create in the zone test (final review, finding 1).
+    `leshoz` is the actor's OWN zone there, so proving a mismatch is refused
+    needs a second, different organization to attempt the create against; not
+    a fixture `leshoz` itself can produce twice (pytest fixtures are cached per
+    test, so requesting the same one twice gives the same instance, not two)."""
+    agency = (
+        await db.execute(select(Organization).where(Organization.kind == "agency"))
+    ).scalar_one_or_none()
+    if agency is None:
+        agency = Organization(
+            id=uuid7(),
+            code=f"A{uuid.uuid4().hex[:8]}",
+            name={"uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"},
+            kind="agency",
+        )
+        db.add(agency)
+        await db.flush()
+    org = Organization(
+        id=uuid7(),
+        code=f"T{uuid.uuid4().hex[:8]}",
+        name={"uz_cyrl": "Тест ЎХ 2", "ru": "Тестовый лесхоз 2"},
         kind="leshoz",
         parent_id=agency.id,
     )
@@ -242,8 +274,23 @@ def _commit_pending_before_requests(client: httpx.AsyncClient, db: AsyncSession)
     client.event_hooks["request"] = [*client.event_hooks.get("request", []), _commit_pending]
 
 
-async def _client_for(db: AsyncSession, *permissions: str):
-    user, token, csrf = await signed_in_with(db, *permissions)
+async def _client_for(
+    db: AsyncSession, *permissions: str, organization_id: uuid.UUID | None = None
+):
+    """`organization_id`, when given, zones the actor to one organization
+    (`User.organization_id`) instead of the zone-free default `signed_in_with`
+    builds — `signed_in_with` itself has no parameter for this (it lives in
+    `tests/modules/admin/test_organizations_admin.py`, shared by other modules'
+    tests too), so the org-scoped path is built inline here rather than
+    widening that shared helper for one gis-only case."""
+    if organization_id is None:
+        user, token, csrf = await signed_in_with(db, *permissions)
+    else:
+        user = await make_user(db, role_code="executor_staff", organization_id=organization_id)
+        for code in permissions:
+            db.add(UserPermission(user_id=user.id, permission_code=code))
+        await db.flush()
+        _, token, csrf = await make_session(db, user)
     await db.commit()
     async with make_client(create_app(), lifespan=True) as client:
         auth_client(client, token, csrf)
@@ -255,6 +302,18 @@ async def _client_for(db: AsyncSession, *permissions: str):
 async def gis_client(db: AsyncSession):
     """The GIS specialist: draws, edits and imports, but never approves."""
     async for client in _client_for(db, CONTOURS_MANAGE, LAYERS_MANAGE):
+        yield client
+
+
+@pytest.fixture
+async def org_scoped_gis_client(db: AsyncSession, leshoz: Organization):
+    """A `CONTOURS_MANAGE` actor zoned to `leshoz` — migration 0010 grants
+    `gis.contours.manage` to `gis_specialist`, and a leshoz-level specialist has
+    their own `organization_id` set, so this is the shape the zone check
+    (final review, finding 1) actually has to defend against. `gis_client`
+    stays zone-free (`organization_id=None`, republic-wide) on purpose, so the
+    other 3.6a tests are unaffected by this addition."""
+    async for client in _client_for(db, CONTOURS_MANAGE, organization_id=leshoz.id):
         yield client
 
 

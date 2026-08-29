@@ -1,5 +1,7 @@
 """Contour identity + draft versions through the API, with the zone rule of ruling 18."""
 
+from app.modules.gis import repo
+
 
 async def test_gis_specialist_creates_a_contour_and_a_draft_version(
     gis_client, leshoz, contours_layer
@@ -151,3 +153,73 @@ async def test_a_contour_can_be_archived_via_patch(gis_client, leshoz, contours_
     resp = await gis_client.patch(f"/api/v1/gis/contours/{contour_id}", json={"status": "archived"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "archived"
+
+
+async def test_an_org_scoped_specialist_cannot_create_a_contour_for_another_org(
+    org_scoped_gis_client, other_leshoz, contours_layer
+):
+    """Final review, finding 1: migration 0010 grants gis.contours.manage to
+    gis_specialist broadly, but a leshoz-level specialist's own organization_id
+    zones them to their own leshoz — creating under a DIFFERENT organization
+    must be refused (ERR-ACL-001), the same zone check the three sibling
+    writes (update_contour, create_version, update_version) already apply to
+    an existing row, applied here to the request's own organization_id."""
+    resp = await org_scoped_gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(contours_layer.id),
+            "organization_id": str(other_leshoz.id),
+            "number": "cross-org-1",
+            "kind": "contour",
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_a_version_number_race_is_a_conflict_not_a_geometry_error(
+    gis_client, leshoz, contours_layer, monkeypatch
+):
+    """Final review, finding 3: IntegrityError IS a DBAPIError subclass, and
+    next_version_no is an unlocked SELECT MAX(version_no)+1 — two concurrent
+    version creates on one contour can both compute the same number and
+    collide on uq_contour_version_no. That must surface as a conflict, never
+    as "unreadable geometry" (ERR-GIS-001, the malformed-geometry code).
+    Simulated by forcing next_version_no to return an already-taken number,
+    standing in for the race without needing true concurrency."""
+    created = await gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(contours_layer.id),
+            "organization_id": str(leshoz.id),
+            "number": "race-1",
+            "kind": "contour",
+        },
+    )
+    assert created.status_code == 201
+    contour_id = created.json()["id"]
+
+    geom = {
+        "type": "Polygon",
+        "coordinates": [[[69.9, 41.5], [69.91, 41.5], [69.91, 41.51], [69.9, 41.51], [69.9, 41.5]]],
+    }
+    first = await gis_client.post(
+        f"/api/v1/gis/contours/{contour_id}/versions",
+        json={"geom": geom, "source": "survey"},
+    )
+    assert first.status_code == 201
+    assert first.json()["version_no"] == 1
+
+    async def _stale_next_version_no(db, contour_id):
+        return 1  # already taken by `first` — stands in for the race
+
+    monkeypatch.setattr(repo, "next_version_no", _stale_next_version_no)
+
+    second = await gis_client.post(
+        f"/api/v1/gis/contours/{contour_id}/versions",
+        json={"geom": geom, "source": "survey"},
+    )
+    assert second.status_code == 409
+    body = second.json()
+    assert body["error"]["code"] == "ERR-GIS-005"
+    assert body["error"]["details"]["reason"] == "version_conflict"

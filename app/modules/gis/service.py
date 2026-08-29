@@ -76,19 +76,23 @@ async def update_layer(
     return layer
 
 
-def _assert_in_zone(actor: User, contour: Contour) -> None:
-    """Per-row zone check on the one axis `contours` carries (`organization_id`)
-    — same 'own zone' semantics as `admin.users_service._within_zone`, kept
-    local since gis has no reason to import an admin-module internal. This is
-    separate from the `CONTOURS_MANAGE` permission check the router already
-    applies (lesson: "Zone scoping is not a permission check — a read path needs
-    both", and here every write path needs both too): it answers WHOSE contour,
-    not WHETHER the actor may manage contours at all. `Contour` has no
-    region_id/district_id of its own, so only the organization axis of the
-    actor's zone is enforced; a region/district-scoped zone is a shape this
-    stage does not assign to CONTOURS_MANAGE holders."""
+def _assert_in_zone(actor: User, organization_id: uuid.UUID) -> None:
+    """Per-request zone check on the one axis `contours` carries
+    (`organization_id`) — same 'own zone' semantics as
+    `admin.users_service._within_zone`, kept local since gis has no reason to
+    import an admin-module internal. This is separate from the
+    `CONTOURS_MANAGE` permission check the router already applies (lesson:
+    "Zone scoping is not a permission check — a read path needs both", and here
+    every write path needs both too): it answers WHOSE organization, not
+    WHETHER the actor may manage contours at all. Takes the organization id
+    directly rather than a `Contour` row — `create_contour` has no row yet when
+    it needs this check (final review, finding 1: it must run before the row is
+    constructed, since `organization_id` comes straight from the request body).
+    `Contour` has no region_id/district_id of its own, so only the organization
+    axis of the actor's zone is enforced; a region/district-scoped zone is a
+    shape this stage does not assign to CONTOURS_MANAGE holders."""
     zone = zone_of(actor)
-    if zone.organization_id is not None and zone.organization_id != contour.organization_id:
+    if zone.organization_id is not None and zone.organization_id != organization_id:
         raise err("ERR-ACL-001")
 
 
@@ -112,7 +116,16 @@ async def create_contour(
     unhandled 500. The number's uniqueness, by contrast, genuinely races against
     other concurrent creates: that one is caught from the flush, never
     pre-checked.
+
+    `organization_id` is zone-checked before anything else: migration 0010
+    grants `gis.contours.manage` to `gis_specialist`, and a leshoz-level
+    specialist has their own `organization_id` set, so without this an actor
+    scoped to one leshoz could create a contour under a different one — the
+    same check `update_contour`/`create_version`/`update_version` already apply
+    to an existing row, applied here to the request's own value before any row
+    exists (final review, finding 1).
     """
+    _assert_in_zone(actor, organization_id)
     if parent_id is not None and kind != "subcontour":
         raise err("ERR-VAL-001", details={"reason": "parent_needs_subcontour"})
     contour = Contour(
@@ -157,7 +170,7 @@ async def update_contour(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour)
+    _assert_in_zone(actor, contour.organization_id)
     before = {"status": contour.status}
     if status is not None:
         contour.status = status
@@ -182,19 +195,36 @@ async def create_version(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour)
+    _assert_in_zone(actor, contour.organization_id)
     version_no = await repo.next_version_no(db, contour_id)
     try:
         version = await repo.insert_version(
             db, contour_id=contour_id, version_no=version_no, created_by=actor.id, **fields
         )
-    except DBAPIError as exc:  # malformed GeoJSON reaches us as a PostGIS error
-        # ST_GeomFromGeoJSON's XX000 poisons the session the same way the
-        # IntegrityError above does — raise immediately and nothing else touches
-        # `db` on this path; get_db's except-and-rollback (app/core/deps.py) is
-        # what actually clears the aborted transaction before this becomes a
-        # response. Do not add an audit call here: it would run inside the still
-        # -aborted transaction and fail a second time.
+    except IntegrityError as exc:
+        # `IntegrityError` IS a `DBAPIError` subclass, so it must be caught (and
+        # distinguished) BEFORE the broader `except DBAPIError` below — Python
+        # tries `except` clauses in order, and this one only matches PostgreSQL
+        # error class 23 (integrity constraint violation). `next_version_no` is
+        # an unlocked `SELECT MAX(version_no)+1`: two concurrent creates on one
+        # contour can both compute the same number and collide on
+        # `uq_contour_version_no`. Without this clause that collision fell
+        # through to the branch below and was reported as "unreadable
+        # geometry" — a data-format error — for what is actually a concurrency
+        # conflict; Task 7's bulk import drives this same path, so the
+        # confusion would recur under real load (final review, finding 3).
+        raise err("ERR-GIS-005", details={"reason": "version_conflict"}) from exc
+    except DBAPIError as exc:
+        # Everything else reaching here is a genuine PostGIS parse failure
+        # (`ST_GeomFromGeoJSON`'s malformed-input raise is SQLSTATE class XX,
+        # `sqlalchemy.exc.InternalError` — verified NOT an `IntegrityError`, so
+        # it never matches the clause above). It poisons the session the same
+        # way an IntegrityError does — raise immediately and nothing else
+        # touches `db` on this path; get_db's except-and-rollback
+        # (app/core/deps.py) is what actually clears the aborted transaction
+        # before this becomes a response. Do not add an audit call here: it
+        # would run inside the still-aborted transaction and fail a second
+        # time.
         raise err("ERR-GIS-001", details={"reason": "unreadable_geometry"}) from exc
     await audit.log(
         db,
@@ -215,7 +245,7 @@ async def update_version(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour)
+    _assert_in_zone(actor, contour.organization_id)
     version = await db.get(ContourVersion, version_id)
     if version is None or version.contour_id != contour_id:
         raise err("ERR-SYS-003")

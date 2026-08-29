@@ -6,7 +6,8 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from app.modules.gis.models import LAYER_CODES, ContourVersion, GisLayer
+from app.db import uuid7
+from app.modules.gis.models import LAYER_CODES, Contour, ContourVersion, GisLayer
 from tests.modules.gis.conftest import box_wkt, make_contour
 
 
@@ -76,3 +77,25 @@ async def test_contour_number_is_unique_per_organization(db, contours_layer, les
     _contour = await make_contour(db, contours_layer, leshoz, number="14515q")
     with pytest.raises(IntegrityError):
         await make_contour(db, contours_layer, leshoz, number="14515q")
+
+
+async def test_parent_needs_subcontour_check_fires(db, contours_layer, leshoz):
+    """The parent_needs_subcontour CHECK itself, at the model/DB level.
+    gis.service.create_contour pre-validates this same rule in Python and never
+    reaches the constraint (see
+    test_contours_api.py::test_a_parent_id_requires_kind_subcontour for that
+    guard) — this proves the DB-level backstop holds on its own, independent of
+    that guard (final review, finding 2). `parent_id` does not need to
+    reference a real row: the CHECK fires on kind/parent_id alone, before any
+    FK lookup."""
+    contour = Contour(
+        layer_id=contours_layer.id,
+        organization_id=leshoz.id,
+        kind="contour",
+        parent_id=uuid7(),
+        number="parent-needs-subcontour-check",
+    )
+    db.add(contour)
+    with pytest.raises(IntegrityError) as excinfo:
+        await db.flush()
+    assert "parent_needs_subcontour" in str(excinfo.value)
