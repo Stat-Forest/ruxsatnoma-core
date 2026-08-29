@@ -2,7 +2,11 @@
 
 FastAPI modular monolith for the forest-permit system. Architecture, DB schema and API contracts live in the docs repo: `../docs/design/01-struktura-monolita.md`, `02-shema-bd.md`, `03-api-kontrakty.md`; decisions — `../docs/decisions.md` (source of truth).
 
+**Before any work read [`.claude/lessons.md`](.claude/lessons.md)** — the accumulated gotchas of this codebase (`Rule` / `Why` / `How to apply`). If a lesson covers the area you are touching, it overrides your instinct; the entries exist because each one already cost a review round or a production-shaped bug.
+
 ## Run / test
+
+`make help` lists every target; **`make check` is the local gate and mirrors CI exactly** (ruff check + format check + pyright + pytest) — run it before every commit, together with `uv run pre-commit run --all-files`. The raw commands behind it:
 
 ```bash
 uv sync
@@ -33,4 +37,21 @@ uv run python -m app.seed organizations app/seed/data/organizations.example.json
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`, stage 3.4): `lint` (ruff check + format check + pyright) and `test` (PostGIS service + MinIO, full pytest incl. the migration downgrade→upgrade round-trip) on every push/PR. Keep both green; the round-trip test runs last and wipes the shared test DB by design (collection order is pinned by a hook in `tests/conftest.py`).
+GitHub Actions (`.github/workflows/ci.yml`, stage 3.4): `lint` (single-Alembic-head check + ruff check + format check + pyright + bandit) and `test` (PostGIS service + MinIO, full pytest incl. the migration downgrade→upgrade round-trip) on every push/PR. Keep both green; the round-trip test runs last and wipes the shared test DB by design (collection order is pinned by a hook in `tests/conftest.py`). Git rules — branch/pull/push discipline for the parallel sessions — live in the root `../CLAUDE.md`. In short (decision #47): branch off `dev`, PR back into `dev`; `main` only ever receives `dev` through a release PR; direct commits on either are blocked by `no-commit-to-branch`.
+
+## Continuous learning
+
+After fixing any non-trivial bug or discovering a non-obvious gotcha, **append a
+terse entry to `.claude/lessons.md`** — short topic title + **Rule:** / **Why:** /
+**How to apply:**, one line each. Ruxsatnoma-specific only; general Python/FastAPI
+advice does not belong there. This is part of finishing a task, not optional
+polish: closing a stage includes the lessons its reviews produced.
+
+Where a finding belongs:
+
+| Kind of knowledge | Goes to |
+|---|---|
+| A trap in this code — regex dialects, a partial index, a silent migration | `.claude/lessons.md` |
+| An accepted product/design ruling | `../docs/decisions.md` (only after Oybek's explicit OK) |
+| What is done and what is next | `../docs/status.md` |
+| A question for the customer | `../docs/tz/12-otkrytye-voprosy.md` |
