@@ -15,7 +15,7 @@ from app.core import settings_store
 from app.core.errors import err
 from app.db import uuid7
 from app.modules.audit import service as audit
-from app.modules.integrations import repo
+from app.modules.integrations import breaker, repo
 from app.modules.integrations.models import InboundDeadLetter, IntegrationLog, OutboxMessage
 from app.modules.integrations.senders import SENDERS, register_sender
 
@@ -60,7 +60,7 @@ async def deliver_one(db: AsyncSession) -> bool:
 
     The claim is the open transaction itself: a crash rolls back to 'pending'
     and the row is retried — no reaper, no stuck 'delivering' rows (ruling 5)."""
-    row = await repo.pick_due(db)
+    row = await repo.pick_due(db, exclude_destinations=breaker.open_destinations())
     if row is None:
         # Belt-and-braces: closes the open read transaction that made clock_timestamp necessary.
         await db.rollback()
@@ -80,6 +80,13 @@ async def deliver_one(db: AsyncSession) -> bool:
         except Exception as exc:  # noqa: BLE001 — any sender failure is a retry case
             row.attempts += 1
             row.last_error = repr(exc)[:1000]
+            breaker.record_failure(
+                row.destination,
+                threshold=await settings_store.get_int(db, "outbox_breaker_failures"),
+                cooldown_seconds=await settings_store.get_int(
+                    db, "outbox_breaker_cooldown_seconds"
+                ),
+            )
             max_attempts = await settings_store.get_int(db, "outbox_max_attempts")
             if row.attempts >= max_attempts:
                 row.status = "dead"
@@ -97,6 +104,7 @@ async def deliver_one(db: AsyncSession) -> bool:
         else:
             row.status = "delivered"
             row.delivered_at = now
+            breaker.record_success(row.destination)
     await log_integration(
         db,
         direction="out",

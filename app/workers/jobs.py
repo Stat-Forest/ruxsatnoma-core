@@ -6,15 +6,18 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core import settings_store
 from app.core.models import IdempotencyKey
 from app.core.time import business_today
 from app.modules.audit import service as audit
+from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Representation, Session
 from app.modules.integrations.models import OutboxMessage
+from app.modules.notifications import service as notifications_service
+from app.modules.notifications.models import Notification
 
 logger = structlog.get_logger(__name__)
 
@@ -101,4 +104,68 @@ async def expire_representations(factory: async_sessionmaker[AsyncSession]) -> i
             )
         await db.commit()
     logger.info("job.expire_representations", expired=len(rows))
+    return len(rows)
+
+
+# The audience of system alerts. Kept as a code constant, not a setting: an
+# administrator who could edit it could also silence the alert about the queue
+# that stopped telling them anything.
+ADMIN_ROLE_CODES = ("sys_admin", "central_admin")
+
+
+async def alert_dead_outbox(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Report dead outbox rows to administrators in-app (plan 03.5 ruling 12).
+
+    `integrations` is level 0 and cannot call `notifications` (level 2), so the
+    alert cannot live inside `deliver_one`; this job is the seam. `alerted_at`
+    makes it exactly-once, and any notification whose transport died is failed
+    here — nothing will deliver it now."""
+    async with factory() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(OutboxMessage).where(
+                        OutboxMessage.status == "dead", OutboxMessage.alerted_at.is_(None)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return 0
+        now = datetime.now(UTC)
+        by_destination: dict[str, int] = {}
+        for row in rows:
+            by_destination[row.destination] = by_destination.get(row.destination, 0) + 1
+            row.alerted_at = now
+        await db.execute(
+            update(Notification)
+            .where(
+                Notification.outbox_message_id.in_([row.id for row in rows]),
+                Notification.status.in_(("queued", "sent")),
+            )
+            .values(status="failed", error="transport gave up (outbox dead)")
+        )
+        correlation = f"job:{uuid.uuid4()}"
+        admin_ids = await auth_service.list_user_ids_by_role_codes(db, ADMIN_ROLE_CODES)
+        for destination, count in sorted(by_destination.items()):
+            for user_id in admin_ids:
+                await notifications_service.notify(
+                    db,
+                    event_code="system.outbox_dead",
+                    recipient_user_id=user_id,
+                    params={"destination": destination, "count": count},
+                    channels=("inapp",),  # never send an SMS about SMS being broken
+                    correlation_id=correlation,
+                )
+        await audit.log(
+            db,
+            action="outbox.alert_dead",
+            user_id=None,
+            correlation_id=correlation,
+            extra=by_destination,
+        )
+        await db.commit()
+    logger.info("job.alert_dead_outbox", **by_destination)
     return len(rows)

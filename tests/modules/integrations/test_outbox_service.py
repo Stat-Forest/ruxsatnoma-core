@@ -8,7 +8,7 @@ from sqlalchemy import select, text
 
 from app.core.errors import DomainError
 from app.db import uuid7
-from app.modules.integrations import repo, senders, service
+from app.modules.integrations import breaker, repo, senders, service
 from app.modules.integrations.models import InboundDeadLetter, IntegrationLog, OutboxMessage
 from tests.modules.auth.test_sessions import make_user
 
@@ -94,6 +94,11 @@ async def test_failed_delivery_backs_off_then_dies(db):
             {"id": str(msg.id)},
         )
         await db.commit()
+        # This test is about the attempts/backoff/dead escalation, not the
+        # breaker (that has its own suite, test_breaker.py) — 8 straight
+        # failures on one destination is exactly what trips it, so keep it
+        # out of the way here.
+        breaker.reset()
         assert await service.deliver_one(db) is True
         await db.refresh(row)
         assert row.attempts == expected_attempts

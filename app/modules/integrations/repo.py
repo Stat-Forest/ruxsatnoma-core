@@ -1,6 +1,7 @@
 """DB queries of the integrations module."""
 
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.integrations.models import InboundDeadLetter, OutboxMessage
 
 
-async def pick_due(db: AsyncSession) -> OutboxMessage | None:
+async def pick_due(
+    db: AsyncSession, *, exclude_destinations: Sequence[str] = ()
+) -> OutboxMessage | None:
     """Claim one due row; the row lock is held until the caller commits/rolls back.
 
     SKIP LOCKED lets any number of worker processes drain the queue without
@@ -20,17 +23,19 @@ async def pick_due(db: AsyncSession) -> OutboxMessage | None:
     notices, but a drain loop sharing one session — e.g. tests — does) would
     otherwise keep comparing against a timestamp stuck at whenever this
     session's transaction first began, never seeing rows enqueued afterwards.
+
+    A destination whose breaker is open is excluded here rather than after the
+    claim — an outage must not consume the retry budget of every queued row.
     """
+    stmt = select(OutboxMessage).where(
+        OutboxMessage.status == "pending",
+        OutboxMessage.next_attempt_at <= func.clock_timestamp(),
+    )
+    if exclude_destinations:
+        stmt = stmt.where(OutboxMessage.destination.notin_(list(exclude_destinations)))
     return (
         await db.execute(
-            select(OutboxMessage)
-            .where(
-                OutboxMessage.status == "pending",
-                OutboxMessage.next_attempt_at <= func.clock_timestamp(),
-            )
-            .order_by(OutboxMessage.next_attempt_at)
-            .limit(1)
-            .with_for_update(skip_locked=True)
+            stmt.order_by(OutboxMessage.next_attempt_at).limit(1).with_for_update(skip_locked=True)
         )
     ).scalar_one_or_none()
 
