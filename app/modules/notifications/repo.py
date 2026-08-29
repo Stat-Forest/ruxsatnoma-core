@@ -83,6 +83,19 @@ async def get_notification(db: AsyncSession, notification_id: uuid.UUID) -> Noti
     return await db.get(Notification, notification_id)
 
 
+async def get_by_provider_message_id(
+    db: AsyncSession, provider_message_id: str
+) -> Notification | None:
+    return (
+        await db.execute(
+            select(Notification)
+            .where(Notification.provider_message_id == provider_message_id)
+            .order_by(Notification.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
 def _inbox_stmt(user_id: uuid.UUID, unread_only: bool):
     stmt = select(Notification).where(
         Notification.recipient_user_id == user_id, Notification.channel == "inapp"

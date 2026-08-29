@@ -29,6 +29,7 @@ from app.modules.admin.users_router import router as users_router
 from app.modules.auth.router import router as auth_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
+from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
 # (используются редко: собственный HTTPException модуля вне err()) — код ERR-SYS-001,
@@ -196,6 +197,7 @@ def create_app() -> FastAPI:
     app.include_router(integrations_admin_router, prefix="/api/v1")
     app.include_router(notification_templates_router, prefix="/api/v1")
     app.include_router(notifications_router, prefix="/api/v1")
+    app.include_router(notifications_webhooks_router, prefix="/api/v1")
     app.include_router(files_router, prefix="/api/v1")
 
     return app

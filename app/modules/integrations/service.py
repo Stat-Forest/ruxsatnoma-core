@@ -203,6 +203,18 @@ async def discard_dead_letter(
     return row
 
 
+async def record_dead_letter(
+    db: AsyncSession, *, source: str, payload: dict[str, Any], error: str
+) -> InboundDeadLetter:
+    """An inbound message we could not interpret (tz/09: schema mismatch → DLQ).
+    Written in the caller's transaction; triage happens through /admin/integrations."""
+    row = InboundDeadLetter(source=source, payload=payload, error=error[:1000])
+    db.add(row)
+    await db.flush()
+    logger.warning("dead_letter.recorded", source=source, error=error[:200])
+    return row
+
+
 async def _send_sms_otp(db: AsyncSession, payload: dict[str, Any]) -> None:
     from app.modules.integrations.adapters.otp_sender import get_otp_sender
 

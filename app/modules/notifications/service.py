@@ -309,3 +309,55 @@ async def _deliver(db: AsyncSession, payload: dict[str, Any]) -> None:
 
 register_sender("sms", _deliver)
 register_sender("email", _deliver)
+
+
+# Eskiz's report vocabulary (design/04 §4 plus the SMPP statuses it forwards).
+DELIVERED_STATUSES = frozenset({"DELIVRD", "DELIVERED"})
+FAILED_STATUSES = frozenset(
+    {"REJECTD", "REJECTED", "UNDELIV", "UNDELIVERABLE", "FAILED", "EXPIRED", "DELETED"}
+)
+TERMINAL = frozenset({"delivered", "failed"})
+
+
+async def apply_delivery_report(db: AsyncSession, data: Mapping[str, Any]) -> str:
+    """Apply one provider delivery report. Returns 'ok' | 'ignored' | 'dead_letter'.
+
+    Never raises for bad input: the provider retries a 4xx, and a body we cannot
+    interpret will not become interpretable on the third attempt (ruling 18).
+    """
+    reference = str(data.get("user_sms_id") or "").strip()
+    provider_id = str(data.get("message_id") or data.get("id") or "").strip()
+    status = str(data.get("status") or "").strip().upper()
+    row: Notification | None = None
+    if reference:
+        try:
+            row = await repo.get_notification(db, uuid.UUID(reference))
+        except ValueError:
+            row = None
+    if row is None and provider_id:
+        row = await repo.get_by_provider_message_id(db, provider_id)
+    result = "ok"
+    if row is None or not status:
+        await integrations_service.record_dead_letter(
+            db,
+            source="eskiz",
+            payload=dict(data),
+            error="unknown notification reference" if status else "missing status",
+        )
+        result = "dead_letter"
+    elif row.status in TERMINAL or status not in DELIVERED_STATUSES | FAILED_STATUSES:
+        result = "ignored"
+    elif status in DELIVERED_STATUSES:
+        row.status = "delivered"
+        row.delivered_at = datetime.now(UTC)
+    else:
+        row.status = "failed"
+        row.error = status
+    await integrations_service.log_integration(
+        db,
+        direction="in",
+        system="eskiz",
+        endpoint="delivery-report",
+        meta={"status": status, "result": result},
+    )
+    return result
