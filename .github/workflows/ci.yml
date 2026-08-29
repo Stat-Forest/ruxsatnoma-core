@@ -13,9 +13,13 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.14
       - run: uv sync --frozen
+      # Cheap and DB-free — fails fast when two branches each added a revision.
+      - run: make heads
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright
+      # bandit, MEDIUM+ only; same args as the Makefile and the pre-commit hook.
+      - run: make security
 
   test:
     runs-on: ubuntu-latest
