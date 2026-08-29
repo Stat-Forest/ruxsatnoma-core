@@ -68,6 +68,46 @@ async def test_create_then_supersede_bumps_the_version_and_archives_the_old_row(
     assert entry.user_id == actor.id
 
 
+async def test_supersede_unknown_template_is_404(db):
+    _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.post(
+            f"{API}/{uuid.uuid4()}", json=_payload(f"test.t{uuid.uuid4().hex[:8]}")
+        )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "ERR-SYS-003"
+
+
+async def test_supersede_an_already_archived_template_is_rejected(db):
+    _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
+    await db.commit()
+    code = f"test.t{uuid.uuid4().hex[:8]}"
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(API, json=_payload(code))
+        template_id = created.json()["id"]
+        archived = await client.post(f"{API}/{template_id}/archive")
+        assert archived.status_code == 200, archived.text
+        r = await client.post(f"{API}/{template_id}", json=_payload(code))
+    assert r.status_code == 422
+    assert r.json()["error"]["details"]["reason"] == "already archived"
+
+
+async def test_supersede_rejects_a_changed_event_code(db):
+    _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
+    await db.commit()
+    code = f"test.t{uuid.uuid4().hex[:8]}"
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(API, json=_payload(code))
+        other_code = f"test.t{uuid.uuid4().hex[:8]}"
+        r = await client.post(f"{API}/{created.json()['id']}", json=_payload(other_code))
+    assert r.status_code == 422
+    assert r.json()["error"]["details"]["reason"] == "event_code and channel must match"
+
+
 async def test_sms_writes_carry_the_moderation_warning(db):
     _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
     await db.commit()
@@ -100,6 +140,47 @@ async def test_archive_then_a_fresh_create_is_allowed(db):
         again = await client.post(API, json=_payload(code))
     assert again.status_code == 201
     assert again.json()["version"] == 2
+
+
+async def test_archive_unknown_template_is_404(db):
+    _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.post(f"{API}/{uuid.uuid4()}/archive")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "ERR-SYS-003"
+
+
+async def test_archive_an_already_archived_template_is_rejected(db):
+    _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
+    await db.commit()
+    code = f"test.t{uuid.uuid4().hex[:8]}"
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(API, json=_payload(code))
+        template_id = created.json()["id"]
+        first = await client.post(f"{API}/{template_id}/archive")
+        assert first.status_code == 200, first.text
+        r = await client.post(f"{API}/{template_id}/archive")
+    assert r.status_code == 422
+    assert r.json()["error"]["details"]["reason"] == "already archived"
+
+
+async def test_get_template_returns_it_and_404s_for_an_unknown_id(db):
+    _, token, csrf = await signed_in_with(db, TEMPLATES_MANAGE)
+    await db.commit()
+    code = f"test.t{uuid.uuid4().hex[:8]}"
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(API, json=_payload(code))
+        found = await client.get(f"{API}/{created.json()['id']}")
+        missing = await client.get(f"{API}/{uuid.uuid4()}")
+    assert found.status_code == 200, found.text
+    assert found.json()["id"] == created.json()["id"]
+    assert found.json()["event_code"] == code
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "ERR-SYS-003"
 
 
 async def test_seeded_templates_are_listed(db):
