@@ -130,7 +130,7 @@ async def create_contour(
         # The session is poisoned after this (same reasoning as create_version's
         # DBAPIError below) — raise immediately, touch `db` no further on this
         # path; get_db's rollback-on-exception clears the aborted transaction.
-        raise err("ERR-SYS-005", details={"reason": "number_taken"}) from exc
+        raise err("ERR-GIS-005", details={"reason": "number_taken"}) from exc
     await audit.log(
         db,
         action="contour.create",
@@ -220,7 +220,7 @@ async def update_version(
     if version is None or version.contour_id != contour_id:
         raise err("ERR-SYS-003")
     if version.status != "draft":
-        raise err("ERR-SYS-005", details={"reason": "not_draft"})
+        raise err("ERR-GIS-005", details={"reason": "not_draft"})
     before = {key: _json_safe(getattr(version, key)) for key in fields}
     for key, value in fields.items():
         setattr(version, key, value)
