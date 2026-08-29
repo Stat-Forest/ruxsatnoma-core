@@ -22,6 +22,7 @@ from app.db import make_engine, make_session_factory
 from app.files_router import router as files_router
 from app.modules.admin.announcements_router import admin_router as announcements_admin_router
 from app.modules.admin.announcements_router import router as announcements_router
+from app.modules.admin.integrations_router import router as integrations_admin_router
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
@@ -190,6 +191,7 @@ def create_app() -> FastAPI:
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(announcements_router, prefix="/api/v1")
     app.include_router(announcements_admin_router, prefix="/api/v1")
+    app.include_router(integrations_admin_router, prefix="/api/v1")
     app.include_router(files_router, prefix="/api/v1")
 
     return app
