@@ -64,6 +64,9 @@ class User(Base):
     phone_verified_at: Mapped[datetime | None]
     email: Mapped[str | None] = mapped_column(CITEXT)
     email_verified_at: Mapped[datetime | None]
+    # Notification language (plan 03.5 ruling 17); PATCH /auth/me is the OTP-guarded
+    # contact route, so the language switch gets its own PUT /auth/me/language.
+    language: Mapped[str] = mapped_column(server_default="uz_cyrl", default="uz_cyrl")
     mfa_secret: Mapped[str | None]  # Fernet-encrypted TOTP secret (ruling 5)
     oneid_profile: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # 3.2b ruling 4
     status: Mapped[str] = mapped_column(default="active")
@@ -77,6 +80,9 @@ class User(Base):
     __table_args__ = (
         CheckConstraint("status IN ('active', 'blocked', 'deleted')", name="status_valid"),
         CheckConstraint(r"pinfl IS NULL OR pinfl ~ '^[0-9]{14}$'", name="pinfl_format"),
+        CheckConstraint(
+            "language IN ('uz_cyrl', 'uz_latn', 'ru', 'kaa', 'en')", name="language_valid"
+        ),
     )
 
 

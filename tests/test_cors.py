@@ -55,6 +55,13 @@ def test_samesite_follows_the_cross_origin_setup():
         oneid_mode="real",
         eimzo_mode="real",
         sms_mode="real",
+        email_mode="real",
+        eskiz_email="bot@example.uz",
+        eskiz_password="a-real-eskiz-password",
+        eskiz_sender="4546",
+        eskiz_callback_secret="a-real-callback-secret",
+        smtp_host="smtp.example.uz",
+        smtp_from="noreply@example.uz",
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert cross_origin_prod.resolve_cookie_samesite() == "none"

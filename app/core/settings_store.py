@@ -80,6 +80,20 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ratelimit_challenge_per_minute", int, 10, "Per-IP limit for POST /auth/eimzo/challenge"
         ),
+        SettingSpec("notifications_sms_enabled", bool, True, "Ops kill switch for the SMS channel"),
+        SettingSpec(
+            "outbox_breaker_failures",
+            int,
+            5,
+            "Consecutive failures before a destination is skipped",
+        ),
+        SettingSpec(
+            "outbox_breaker_cooldown_seconds",
+            int,
+            60,
+            "How long a tripped destination stays skipped",
+        ),
+        SettingSpec("ratelimit_webhook_per_minute", int, 120, "Per-IP limit for provider webhooks"),
     )
 }
 
@@ -158,4 +172,10 @@ async def get_int(db: AsyncSession, key: str) -> int:
 async def get_str(db: AsyncSession, key: str) -> str:
     value = await get_setting(db, key)
     assert isinstance(value, str)  # SETTING_SPECS guarantees the type
+    return value
+
+
+async def get_bool(db: AsyncSession, key: str) -> bool:
+    value = await get_setting(db, key)
+    assert isinstance(value, bool)  # SETTING_SPECS guarantees the type
     return value
