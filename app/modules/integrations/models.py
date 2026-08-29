@@ -31,6 +31,9 @@ class OutboxMessage(Base):
     last_error: Mapped[str | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     delivered_at: Mapped[datetime | None]
+    # Stamped by the alert_dead_outbox job (plan 03.5 ruling 12) so a dead row is
+    # reported to administrators exactly once.
+    alerted_at: Mapped[datetime | None]
 
     __table_args__ = (
         CheckConstraint(

@@ -6,6 +6,10 @@ import contextlib
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+# Importing the module registers the 'sms' and 'email' senders. main.py gets them
+# transitively through the routers; a standalone worker process has no routers, so
+# without this import every notification would go dead as "unknown destination".
+import app.modules.notifications.service  # noqa: F401
 from app.modules.integrations import service
 
 logger = structlog.get_logger(__name__)

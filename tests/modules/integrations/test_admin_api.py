@@ -34,7 +34,7 @@ async def test_outbox_listing_filters_and_hides_payload(db):
     delivered_destination = f"_admin_test_ok_{uuid.uuid4().hex[:8]}"
     pending_destination = f"_admin_test_pending_{uuid.uuid4().hex[:8]}"
 
-    async def ok_sender(payload: dict) -> None:
+    async def ok_sender(db, payload: dict) -> None:
         return None
 
     senders.SENDERS[delivered_destination] = ok_sender

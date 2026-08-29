@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -44,12 +45,24 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         CronTrigger(hour=0, minute=5, timezone=TIMEZONE),
         next_run_time=now,
         id="expire_representations",
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     sched.add_job(
         _wrap(factory, jobs.purge_stale_rows),
         CronTrigger(hour=0, minute=15, timezone=TIMEZONE),
         next_run_time=now,
         id="purge_stale_rows",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    sched.add_job(
+        _wrap(factory, jobs.alert_dead_outbox),
+        IntervalTrigger(minutes=5, timezone=TIMEZONE),
+        next_run_time=now,
+        id="alert_dead_outbox",
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     return sched
 
