@@ -346,6 +346,47 @@ def downgrade() -> None:
             id=reasons_id
         )
     )
+
+    # These 14 regions are referenced by users.region_id (deferred FK closed in
+    # 0004) and, transitively, by districts.region_id (seeded via `python -m
+    # app.seed`, not by a migration) — none of those FKs are downgraded yet at
+    # this point in the chain. Decouple them first. Downgrade-only data loss of
+    # scoping values; the upgrade path above is untouched (it has run
+    # everywhere, this has run nowhere).
+    region_codes = [row[1] for row in REGIONS]
+    op.execute(
+        sa.text(
+            "UPDATE users SET region_id = NULL WHERE region_id IN "
+            "(SELECT id FROM regions WHERE code = ANY(:codes))"
+        ).bindparams(codes=region_codes)
+    )
+    op.execute(
+        sa.text(
+            "UPDATE organizations SET district_id = NULL WHERE district_id IN "
+            "(SELECT id FROM districts WHERE region_id IN "
+            "(SELECT id FROM regions WHERE code = ANY(:codes)))"
+        ).bindparams(codes=region_codes)
+    )
+    op.execute(
+        sa.text(
+            "UPDATE users SET district_id = NULL WHERE district_id IN "
+            "(SELECT id FROM districts WHERE region_id IN "
+            "(SELECT id FROM regions WHERE code = ANY(:codes)))"
+        ).bindparams(codes=region_codes)
+    )
+    op.execute(
+        sa.text(
+            "DELETE FROM districts WHERE region_id IN "
+            "(SELECT id FROM regions WHERE code = ANY(:codes))"
+        ).bindparams(codes=region_codes)
+    )
+    op.execute(
+        sa.text(
+            "UPDATE organizations SET region_id = NULL WHERE region_id IN "
+            "(SELECT id FROM regions WHERE code = ANY(:codes))"
+        ).bindparams(codes=region_codes)
+    )
+
     for table, rows in (
         ("classifiers", CLASSIFIERS),
         ("livestock_types", LIVESTOCK_TYPES),
