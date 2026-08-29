@@ -12,3 +12,9 @@ pg-data/
 .idea/
 .vscode/
 .superpowers/
+
+# .claude holds tooling scratch (worktrees, local settings) next to files we DO
+# track — ignore the directory and re-admit only what belongs in the repo.
+.claude/*
+!.claude/lessons.md
+!.claude/commands/
