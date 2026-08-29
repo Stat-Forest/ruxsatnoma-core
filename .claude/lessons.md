@@ -309,3 +309,96 @@ Rules for this file:
   already stuck mid-task, `git stash push .pre-commit-config.yaml` in your own
   tree is safer than `--no-verify`; if you do use `--no-verify`, run `make check`
   by hand and say so in the PR.
+
+## An outbox sender's return/raise choice IS the retry decision
+
+- **Rule:** A sender registered with `register_sender` must RETURN when a
+  failure is permanent (nothing will fix itself by retrying) and RAISE only
+  when a retry could plausibly help — the worker (`deliver_one`) retries on any
+  raised exception and treats a normal return as delivered.
+- **Why:** `notifications._deliver` sets the row `failed` and returns instead
+  of raising when the recipient has no verified phone/e-mail; raising there
+  would retry an unreachable recipient up to `outbox_max_attempts` times for
+  the exact same outcome, burning the circuit breaker's failure count and
+  holding back every other queued message on that destination for nothing.
+- **How to apply:** Before writing `raise` in a sender, ask "would a second
+  attempt with the same input succeed?" If no, set the terminal status
+  yourself and `return`.
+
+## `str.format` on admin-authored text is an attribute-access hole
+
+- **Rule:** Never render user/admin-authored template text with `str.format`
+  or an f-string; substitute placeholders with a whitelist regex
+  (`\{([a-z][a-z0-9_]*)\}`) instead.
+- **Why:** `"{x.__class__}".format(x=obj)` reaches Python attributes on
+  whatever object is passed in, and `.format()` raises `KeyError` on a
+  placeholder the caller forgot to supply — inside a business transaction that
+  turns an admin's typo into a failed application submission, not a rendering
+  glitch.
+- **How to apply:** Any text a non-developer can author and the code later
+  renders (notification templates today; announcements, rejection reasons or
+  report labels tomorrow) goes through `notifications.service.render`'s
+  pattern, never `.format(**params)`.
+
+## A partial unique index needs a `flush()` between the archive and the insert
+
+- **Rule:** When "supersede" means archive-the-old-row then insert-a-new-
+  active-one under a partial unique index (`WHERE status='active'`), `flush()`
+  after the archive UPDATE and before the new INSERT.
+- **Why:** Without the flush, the UPDATE and the INSERT are both still pending
+  in the same transaction when the index has to be checked — the old row has
+  not yet been "seen" as archived, so the insert can raise `IntegrityError` on
+  a conflict a flush would already have resolved.
+- **How to apply:** Every supersede-shaped write (classifier items since
+  3.3a, notification templates since 3.5) follows `old.status = "archived"`,
+  `await db.flush()`, then `db.add(new_row)` — copy that order, not just the
+  two statements.
+
+## Senders registered at module import must be imported by the standalone worker too
+
+- **Rule:** A destination registered via `register_sender(...)` at module
+  import time (e.g. inside `notifications/service.py`) only exists in a
+  process that actually imported that module — add the import to
+  `app/workers/outbox.py` explicitly, with a comment, in the same commit that
+  adds the destination.
+- **Why:** In every test and in the embedded-worker deployment, `app.main`
+  imports the routers, which transitively import `notifications.service`, so
+  registration always "just happens" — a standalone `python -m app.workers`
+  process imports neither, so without the explicit import every notification
+  goes `dead` as `unknown destination`, and no in-process test can ever catch
+  it (only a subprocess test that imports `app.workers.outbox` alone can).
+- **How to apply:** New outbox destination → grep `app/workers/outbox.py` for
+  the registering import → add it if missing → write or extend the subprocess
+  registration test.
+
+## A parsed form body can hold non-str values that a JSONB column cannot
+
+- **Rule:** Before storing a `request.form()` dict as JSON(B), coerce every
+  value to `str` (or a short type marker) — never assume form fields are
+  strings.
+- **Why:** A `multipart/form-data` file part parses to Starlette's
+  `UploadFile`, not a string; `json.dumps` cannot serialize it, so an
+  untouched form dict reaching a JSONB bind (the Eskiz callback's dead-letter
+  payload) 500'd on a one-line curl against an anonymous, internet-facing
+  route — exactly the case the route exists to survive.
+- **How to apply:** Any endpoint that accepts `request.form()` from an
+  untrusted or anonymous caller and persists the result:
+  `{k: v if isinstance(v, str) else f"<{type(v).__name__}>" for k, v in
+  form.items()}`, never a bare dict comprehension.
+
+## An in-place UPDATE leaves an `onupdate=func.now()` column expired, not refreshed
+
+- **Rule:** After mutating a row in place (an UPDATE, not an INSERT) and
+  flushing, `await db.refresh(row)` before returning/serializing it if the
+  response reads a column with `onupdate=func.now()` and no client-side
+  default.
+- **Why:** SQLAlchemy fetches a fresh `onupdate` value via `RETURNING` on an
+  INSERT but leaves it expired after a plain UPDATE; reading it outside the
+  session's async context then raises `MissingGreenlet` —
+  `notifications.service.archive_template` hit this serializing `updated_at`,
+  even though the sibling classifier-archive path (a bare `flush()`, no
+  read-back) never needed one.
+- **How to apply:** Whenever a service both mutates a row's `onupdate` column
+  AND returns/serializes that same row in the same call, add `refresh()`
+  after the `flush()` — don't assume an existing archive-path precedent
+  covers it.
