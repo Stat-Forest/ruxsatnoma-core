@@ -29,14 +29,24 @@ async def _sms_notification(db) -> Notification:
     return sms
 
 
-async def _post(monkeypatch, body: dict, *, secret: str = SECRET, form: bool = False):
+async def _post(
+    monkeypatch,
+    body: dict,
+    *,
+    secret: str = SECRET,
+    form: bool = False,
+    files: dict | None = None,
+):
     monkeypatch.setenv("ESKIZ_CALLBACK_SECRET", SECRET)
     from app.config import get_settings
 
     get_settings.cache_clear()
     async with make_client(create_app(), lifespan=True) as client:
         url = f"/api/v1/webhooks/eskiz/{secret}"
-        response = await (client.post(url, data=body) if form else client.post(url, json=body))
+        if files is not None:
+            response = await client.post(url, files=files)
+        else:
+            response = await (client.post(url, data=body) if form else client.post(url, json=body))
     get_settings.cache_clear()
     return response
 
@@ -121,3 +131,29 @@ async def test_a_body_without_a_status_becomes_a_dead_letter(db, monkeypatch):
     await db.commit()
     r = await _post(monkeypatch, {"user_sms_id": str(sms.id)})
     assert r.json()["result"] == "dead_letter"
+
+
+async def test_a_multipart_file_part_becomes_a_dead_letter(db, monkeypatch):
+    # A file part parses to an UploadFile, not a str — the one shape that must be
+    # sanitized rather than merely forwarded, or it reaches the JSONB payload
+    # column unencodable and a 500 replaces the dead letter (review finding).
+    r = await _post(monkeypatch, {}, files={"file": ("hostname", b"forest", "text/plain")})
+    assert r.status_code == 200
+    assert r.json()["result"] == "dead_letter"
+    letter = (
+        (await db.execute(select(InboundDeadLetter).where(InboundDeadLetter.source == "eskiz")))
+        .scalars()
+        .all()
+    )
+    assert any(row.payload.get("file") == "<UploadFile>" for row in letter)
+
+
+async def test_a_lowercase_status_is_normalized(db, monkeypatch):
+    # Every other test here sends an already-uppercase status, so this is the only
+    # one that would fail if apply_delivery_report's `.upper()` were ever deleted.
+    sms = await _sms_notification(db)
+    await db.commit()
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "delivrd"})
+    assert r.json()["result"] == "ok"
+    await db.refresh(sms)
+    assert sms.status == "delivered"

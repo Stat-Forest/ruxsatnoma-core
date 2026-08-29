@@ -18,14 +18,27 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 async def _body(request: Request) -> dict[str, Any]:
     """Eskiz's reports have arrived as JSON and as form posts over the years; accept
-    both, and treat anything else as an empty body (→ dead letter downstream)."""
+    both, and treat anything else as an empty body (→ dead letter downstream).
+
+    A multipart file part parses to an UploadFile, not a str — the one shape a
+    form body can hold that the JSONB payload column cannot store. It is replaced
+    by a short type marker rather than dropped: the dead letter should still show
+    that something arrived under that key (review finding on the first version of
+    this function — dropping it silently, or forwarding it as-is, both fail the
+    same invariant this whole route exists for: never 500 on a body we merely
+    fail to understand).
+    """
     try:
         payload = await request.json()
     except Exception:
         try:
-            payload = dict(await request.form())
+            form = await request.form()
         except Exception:
             return {}
+        return {
+            key: value if isinstance(value, str) else f"<{type(value).__name__}>"
+            for key, value in form.items()
+        }
     return payload if isinstance(payload, dict) else {}
 
 
