@@ -62,31 +62,55 @@ async def run_scheduler(
     retry_seconds: float = 30.0,
 ) -> None:
     """Hold the advisory lock on a dedicated connection; run APScheduler while
-    it lives. Lost connection → scheduler stops, loop re-competes for the lock."""
+    it lives. Lost connection → scheduler stops, loop re-competes for the lock.
+
+    Any failure here — including one before the lock is even acquired (e.g.
+    Postgres not reachable yet) — falls into the same retry sleep instead of
+    killing the task (review finding 2): a standby that can never connect must
+    keep retrying, not exit silently and leave jobs unscheduled forever.
+    """
     c, o = ADVISORY_LOCK
     logger.info("worker.scheduler.start")
     while not stop.is_set():
-        async with engine.connect() as conn:
-            got = (
-                await conn.execute(text("SELECT pg_try_advisory_lock(:c, :o)"), {"c": c, "o": o})
-            ).scalar()
-            if not got:
-                logger.debug("worker.scheduler.standby")
-            else:
-                sched = build_scheduler(factory)
-                sched.start()
-                logger.info("worker.scheduler.active")
-                try:
-                    while not stop.is_set():
-                        with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(stop.wait(), timeout=_HEARTBEAT_SECONDS)
-                        if stop.is_set():
-                            break
-                        await conn.execute(text("SELECT 1"))  # dead conn → lock is gone
-                except Exception:
-                    logger.exception("worker.scheduler.lost_lock")
-                finally:
-                    sched.shutdown(wait=False)
+        try:
+            async with engine.connect() as conn:
+                # AUTOCOMMIT: pg_try_advisory_lock and the heartbeat below are
+                # session-level, not transactional — without this the connection
+                # sits "idle in transaction" for as long as this process holds
+                # the lock (review finding 1), pinning xmin and blocking vacuum.
+                await conn.execution_options(isolation_level="AUTOCOMMIT")
+                got = (
+                    await conn.execute(
+                        text("SELECT pg_try_advisory_lock(:c, :o)"), {"c": c, "o": o}
+                    )
+                ).scalar()
+                if not got:
+                    logger.debug("worker.scheduler.standby")
+                else:
+                    sched = build_scheduler(factory)
+                    sched.start()
+                    logger.info("worker.scheduler.active")
+                    try:
+                        while not stop.is_set():
+                            with contextlib.suppress(TimeoutError):
+                                await asyncio.wait_for(stop.wait(), timeout=_HEARTBEAT_SECONDS)
+                            if stop.is_set():
+                                break
+                            await conn.execute(text("SELECT 1"))  # dead conn → lock is gone
+                    except Exception:
+                        logger.exception("worker.scheduler.lost_lock")
+                    finally:
+                        sched.shutdown(wait=False)
+                        # A checkin (plain `async with` exit) returns this connection
+                        # to the pool WITHOUT releasing the session-level advisory
+                        # lock (review finding 1) — an idle pooled connection would
+                        # then wedge every future election, cluster-wide, forever
+                        # (pool_pre_ping keeps pinging it "healthy"). invalidate()
+                        # physically closes it instead, which Postgres always
+                        # recognizes as the session ending, lock included.
+                        await conn.invalidate()
+        except Exception:
+            logger.exception("worker.scheduler.connect_error")
         if not stop.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=retry_seconds)

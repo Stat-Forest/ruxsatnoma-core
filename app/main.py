@@ -56,10 +56,15 @@ async def lifespan(app: FastAPI):
             run_all(app.state.engine, app.state.session_factory, stop=workers_stop)
         )
     yield
-    if workers_stop is not None and workers_task is not None:
-        workers_stop.set()
-        await workers_task
-    await app.state.engine.dispose()
+    try:
+        if workers_stop is not None and workers_task is not None:
+            workers_stop.set()
+            await workers_task
+    finally:
+        # dispose() must run even if awaiting workers_task raises (review
+        # finding 2) — otherwise a stuck/failed worker shutdown leaks the
+        # engine's whole connection pool instead of just failing loudly.
+        await app.state.engine.dispose()
 
 
 def _error_body(request: Request, code: str, message: str, details: dict | None) -> dict:
