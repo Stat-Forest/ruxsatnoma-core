@@ -76,7 +76,7 @@ async def deliver_one(db: AsyncSession) -> bool:
         )
     else:
         try:
-            await sender(row.payload)
+            await sender(db, row.payload)
         except Exception as exc:  # noqa: BLE001 — any sender failure is a retry case
             row.attempts += 1
             row.last_error = repr(exc)[:1000]
@@ -203,7 +203,7 @@ async def discard_dead_letter(
     return row
 
 
-async def _send_sms_otp(payload: dict[str, Any]) -> None:
+async def _send_sms_otp(db: AsyncSession, payload: dict[str, Any]) -> None:
     from app.modules.integrations.adapters.otp_sender import get_otp_sender
 
     await get_otp_sender().send(

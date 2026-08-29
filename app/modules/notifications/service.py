@@ -15,6 +15,9 @@ from app.core.errors import err
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.integrations import service as integrations_service
+from app.modules.integrations.adapters.email import get_email_sender
+from app.modules.integrations.adapters.sms import get_sms_sender
+from app.modules.integrations.senders import register_sender
 from app.modules.notifications import repo
 from app.modules.notifications.models import CHANNELS, Notification, NotificationTemplate
 from app.modules.notifications.schemas import TemplateIn
@@ -270,3 +273,39 @@ async def mark_read(
 
 async def mark_all_read(db: AsyncSession, user_id: uuid.UUID) -> int:
     return await repo.mark_all_read(db, user_id)
+
+
+async def _deliver(db: AsyncSession, payload: dict[str, Any]) -> None:
+    """Outbox sender for the `sms` and `email` destinations (registered below).
+
+    Runs inside the worker's delivery transaction, so the status write and the
+    attempt commit together. Raising means "retry"; returning means "done" — which
+    is why an unreachable recipient FAILS the notification and returns instead of
+    raising: no number of retries will conjure a verified phone.
+    """
+    row = await db.get(Notification, uuid.UUID(payload["notification_id"]))
+    if row is None:
+        logger.warning("notification.vanished", notification_id=payload["notification_id"])
+        return
+    contact = await auth_service.get_notification_contact(db, row.recipient_user_id)
+    if contact is None or not await _transport_allowed(db, channel=row.channel, contact=contact):
+        row.status = "failed"
+        row.error = "recipient is not reachable on this channel"
+        return
+    if row.channel == "sms":
+        assert contact.phone is not None  # _transport_allowed guarantees it
+        provider_id = await get_sms_sender().send(
+            phone=contact.phone, text=row.rendered_text, reference=str(row.id)
+        )
+    else:
+        assert contact.email is not None
+        provider_id = await get_email_sender().send(
+            to=contact.email, subject=row.subject or "", text=row.rendered_text
+        )
+    row.status = "sent"
+    row.sent_at = datetime.now(UTC)
+    row.provider_message_id = provider_id
+
+
+register_sender("sms", _deliver)
+register_sender("email", _deliver)

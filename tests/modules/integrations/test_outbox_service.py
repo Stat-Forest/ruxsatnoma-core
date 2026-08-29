@@ -30,7 +30,7 @@ def _test_destination():
     """A controllable sender registered for this module's tests."""
     calls: list[dict] = []
 
-    async def ok_sender(payload: dict) -> None:
+    async def ok_sender(db, payload: dict) -> None:
         calls.append(payload)
 
     senders.SENDERS["_test_ok"] = ok_sender
@@ -70,7 +70,7 @@ async def test_enqueue_duplicate_idempotency_key_returns_none(db):
 
 
 async def test_failed_delivery_backs_off_then_dies(db):
-    async def boom(payload: dict) -> None:
+    async def boom(db, payload: dict) -> None:
         raise RuntimeError("provider down")
 
     senders.SENDERS["_test_boom"] = boom

@@ -11,7 +11,7 @@ from app.workers.outbox import run_outbox_loop
 async def test_loop_delivers_and_stops(engine, db):
     delivered: list[dict] = []
 
-    async def sink(payload: dict) -> None:
+    async def sink(db, payload: dict) -> None:
         delivered.append(payload)
 
     senders.SENDERS["_loop_test"] = sink

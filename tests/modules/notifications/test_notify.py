@@ -3,7 +3,8 @@ template, no exception ever raised for a missing template (rulings 10 and 11).""
 
 import uuid
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import select, text
 
 from app.core import settings_store
 from app.core.models import SystemSetting
@@ -14,6 +15,17 @@ from tests.modules.auth.test_sessions import make_user
 from tests.modules.notifications.test_models import make_template
 
 EVENT = "permit.issued"  # seeded with inapp + sms templates by migration 0009
+
+
+@pytest.fixture(autouse=True)
+async def _clean_outbox(db):
+    """Same rationale as test_outbox_service.py's fixture of the same name: since
+    Task 4's test_channels.py exercises real sms delivery and commits its rows
+    outside the `db` fixture's rollback, this file's unscoped destination query
+    (test_duplicate_channels_collapse_to_a_single_send) would otherwise also see
+    them. Scoped to this file only — test_outbox_service.py keeps its own copy."""
+    await db.execute(text("DELETE FROM outbox_messages"))
+    await db.commit()
 
 
 async def _notes(db, user_id) -> list[Notification]:
