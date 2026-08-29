@@ -113,3 +113,19 @@ class VersionPatch(BaseModel):
     accuracy_m: Decimal | None = None
     survey_date: date | None = None
     effective_from: date | None = None
+
+
+class CheckResultOut(BaseModel):
+    """Mirrors `gis.checks.CheckResult` (a TypedDict, not a BaseModel, on the
+    Python side) for the one route that returns it over HTTP."""
+
+    check: str
+    result: str
+    details: dict[str, Any]
+
+
+class ChecksOut(BaseModel):
+    """`POST /gis/contours/{id}/versions/{vid}/checks`."""
+
+    checks: list[CheckResultOut]
+    blocked: bool

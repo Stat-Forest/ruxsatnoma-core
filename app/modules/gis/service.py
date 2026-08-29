@@ -13,7 +13,7 @@ from app.core.abac import zone_of
 from app.core.errors import err
 from app.modules.audit import service as audit
 from app.modules.auth.models import User
-from app.modules.gis import repo
+from app.modules.gis import checks, repo
 from app.modules.gis.models import Contour, ContourVersion, GisLayer
 
 
@@ -267,3 +267,22 @@ async def update_version(
         new_value={key: _json_safe(value) for key, value in fields.items()},
     )
     return version
+
+
+async def run_version_checks(
+    db: AsyncSession, contour_id: uuid.UUID, version_id: uuid.UUID, *, actor: User
+) -> list[checks.CheckResult]:
+    """`POST /gis/contours/{id}/versions/{vid}/checks` — the on-demand run of the
+    four topology checks (`gis.checks`) against one version. Zone-scoped the
+    same way every other action on a contour's own version is
+    (`_assert_in_zone`); read-only, so no audit row (the audit invariant covers
+    state-changing actions, and this changes nothing).
+    """
+    contour = await repo.contour_by_id(db, contour_id)
+    if contour is None:
+        raise err("ERR-SYS-003")
+    _assert_in_zone(actor, contour.organization_id)
+    version = await repo.version_by_id(db, version_id)
+    if version is None or version.contour_id != contour_id:
+        raise err("ERR-SYS-003")
+    return await checks.run_checks(db, version_id=version_id)

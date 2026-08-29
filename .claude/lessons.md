@@ -522,3 +522,25 @@ Rules for this file:
   order. Copy this pattern for any new signed-in-client fixture — in gis or
   another module — that will ever be combined with a write fixture in the same
   test; do not assume the client fixture's own setup-time commit is enough.
+
+## A fixed test geometry that a `_client_for` client commits accumulates forever
+
+- **Rule:** A fixture whose test needs an EMPTY neighbourhood (a "nothing else
+  overlaps here" assertion, for any geometry-bearing table) picks a randomised
+  location — `tests/modules/gis/conftest.py::random_box_wkt()` — never a fixed
+  literal, even a currently-unused-looking one.
+- **Why:** `published_contour` + a `gis_client`-family fixture commits for real
+  (the previous lesson's request hook), so every past run of
+  `test_a_draft_version_can_be_edited_but_a_published_one_cannot` (and any test
+  like it) has left another published contour at box_wkt(69.9, 41.5) in the
+  shared, persistent test DB — confirmed empirically while building task 4's
+  `overlap` check: 4 leftover rows there before this task's own runs, 11 after a
+  handful more. A NEW test asserting "no overlap" at that same coordinate is
+  flaky by construction from the moment it's written, not from bad luck later.
+- **How to apply:** Grep `tests/modules/gis/` for `box_wkt(69.9, 41.5)` (and its
+  69.91/69.905/60.0 neighbours) before adding a new fixture near it; if the test
+  needs isolation rather than deliberate proximity to an existing fixture
+  (`neighbouring_published_contour` and its siblings need the shared literal,
+  by design — they're robust to extra copies at that spot, verified), use
+  `random_box_wkt()` instead. Applies beyond gis to any future table that
+  stores real geometry and gets exercised through a committing client fixture.

@@ -120,6 +120,10 @@ async def contour_by_id(db: AsyncSession, contour_id: uuid.UUID) -> Contour | No
     return await db.get(Contour, contour_id)
 
 
+async def version_by_id(db: AsyncSession, version_id: uuid.UUID) -> ContourVersion | None:
+    return await db.get(ContourVersion, version_id)
+
+
 async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourVersion | None:
     result = await db.execute(
         select(ContourVersion).where(

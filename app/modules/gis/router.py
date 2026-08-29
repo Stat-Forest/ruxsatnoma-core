@@ -13,9 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_db
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
-from app.modules.gis import service
+from app.modules.gis import checks, service
 from app.modules.gis.permissions import CONTOURS_MANAGE
 from app.modules.gis.schemas import (
+    ChecksOut,
     ContourIn,
     ContourOut,
     ContourPatch,
@@ -89,3 +90,14 @@ async def patch_version(
         db, contour_id, version_id, actor=user, **payload.model_dump(exclude_unset=True)
     )
     return VersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/checks")
+async def check_version(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+) -> ChecksOut:
+    results = await service.run_version_checks(db, contour_id, version_id, actor=user)
+    return ChecksOut.model_validate({"checks": results, "blocked": checks.is_blocked(results)})

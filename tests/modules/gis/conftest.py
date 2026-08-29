@@ -3,7 +3,9 @@ test never hand-builds GeoJSON; areas are real (a 0.01° x 0.01° box near Tashk
 is roughly 92 ha), which is what makes the area assertions meaningful."""
 
 import json
+import random
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -14,11 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.models import MediaFile
+from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.auth.models import Applicant, User, UserPermission
-from app.modules.gis.models import Contour, ContourVersion, GisLayer
+from app.modules.gis import repo
+from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE, LAYERS_MANAGE
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client, signed_in_with
@@ -29,6 +33,32 @@ def box_wkt(min_lon: float, min_lat: float, size: float = 0.01) -> str:
     """A closed square polygon in WGS84 degrees."""
     x0, y0, x1, y1 = min_lon, min_lat, min_lon + size, min_lat + size
     return f"POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))"
+
+
+def random_box_wkt() -> str:
+    """A box_wkt-shaped box at a random spot, nowhere near the module's
+    conventional box_wkt(69.9, 41.5) (and its 69.91/69.905 neighbours) or the
+    "elsewhere" box_wkt(60.0, 41.5) — for a fixture that must be the ONLY thing
+    near its own location in the shared, persistent test DB. A fixed
+    'currently empty' spot is not good enough for that: box_wkt(69.9, 41.5)
+    already carries several leftover published contours from
+    test_contours_api.py's `published_contour` + `gis_client` combination,
+    accumulated commit by commit across past test runs (confirmed empirically
+    while building task 4) — a random spot cannot be poisoned by a fixed
+    literal some other test committed, past or future."""
+    return box_wkt(random.uniform(0.0, 40.0), random.uniform(0.0, 30.0))
+
+
+async def version_wkt(db: AsyncSession, version: ContourVersion) -> str:
+    """A version's own geometry as WKT, read back from PostGIS — lets a sibling
+    fixture (a restriction, a fire ban) sit exactly on top of wherever
+    `draft_version` actually is without hard-coding a second, independent copy
+    of its location that could drift apart from it."""
+    wkt = await db.scalar(
+        text("SELECT ST_AsText(geom) FROM contour_versions WHERE id = :id"), {"id": version.id}
+    )
+    assert wkt is not None
+    return wkt
 
 
 @pytest.fixture
@@ -137,6 +167,45 @@ async def make_contour(
     return contour
 
 
+async def make_version(
+    db: AsyncSession, contour_id: uuid.UUID, wkt: str, **over: Any
+) -> ContourVersion:
+    """A contour_version inserted directly (ORM), never through the API — the
+    shared shape behind task 4's version fixtures below (draft or published, at
+    whatever box the test needs). Mirrors `make_contour`'s pattern; `area_ha` is
+    a fixed placeholder since none of the checks read it."""
+    fields: dict[str, Any] = {
+        "contour_id": contour_id,
+        "version_no": 1,
+        "geom": func.ST_Multi(func.ST_GeomFromText(wkt, 4326)),
+        "area_ha": Decimal("92.0000"),
+        "source": "survey",
+        "status": "draft",
+    }
+    fields.update(over)
+    version = ContourVersion(**fields)
+    db.add(version)
+    await db.flush()
+    await db.refresh(version)
+    return version
+
+
+async def make_feature(db: AsyncSession, layer: GisLayer, wkt: str, **over: Any) -> LayerFeature:
+    """A layer_features row inserted directly (ORM) — the layer_features
+    endpoints arrive in task 6; a fixture that waited for them would be a
+    circular dependency (task-4 brief, decision 2)."""
+    fields: dict[str, Any] = {
+        "layer_id": layer.id,
+        "geom": func.ST_GeomFromText(wkt, 4326),
+        "status": "published",
+    }
+    fields.update(over)
+    feature = LayerFeature(**fields)
+    db.add(feature)
+    await db.flush()
+    return feature
+
+
 @pytest.fixture
 async def gis_user(db: AsyncSession) -> User:
     """Owns rows created directly (bypassing the API) by other gis fixtures and
@@ -179,6 +248,126 @@ async def published_contour(
     await db.flush()
     await db.refresh(version)
     return version
+
+
+# --- Task 4: topology-check fixtures ------------------------------------------
+#
+# None of these ever call `db.commit()` — only `db.add`/`db.flush` through the
+# `db` fixture's own session (tests/conftest.py), which rolls the whole
+# transaction back after the test. That is deliberate, not an oversight: it is
+# what keeps `published_fund_boundary_elsewhere` from poisoning every other
+# test's `skipped` assertion in this shared, persistent test DB (task-4 brief,
+# decision 3) — the row never survives past the test that created it, in this
+# run or the next. Do not combine any of these fixtures with a `_client_for`
+# based client (gis_client and friends): that would commit them for real
+# (lesson: "A `_client_for`-style fixture's setup-time commit only covers what
+# ran before it" — its request hook commits `db` unconditionally).
+
+
+@pytest.fixture
+async def draft_version(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> ContourVersion:
+    """A clean draft version at a random, isolated location (`random_box_wkt`,
+    not the module's conventional box_wkt(69.9, 41.5) — see that helper's own
+    note) — every check should come back pass or skipped."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    return await make_version(db, contour.id, random_box_wkt())
+
+
+@pytest.fixture
+async def neighbouring_published_contour(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, approval_doc: MediaFile
+) -> ContourVersion:
+    """A published contour at box_wkt(69.9, 41.5) — the 'other contour' the
+    overlap check compares a draft version against (task-4 brief)."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    return await make_version(
+        db,
+        contour.id,
+        box_wkt(69.9, 41.5),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+
+
+@pytest.fixture
+async def draft_version_touching_it(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> ContourVersion:
+    """Shares an edge with `neighbouring_published_contour` — a zero-area
+    intersection, a border rather than an overlap (ruling 15)."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    return await make_version(db, contour.id, box_wkt(69.91, 41.5))
+
+
+@pytest.fixture
+async def draft_version_overlapping_it(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> ContourVersion:
+    """A half-step offset from `neighbouring_published_contour` — a real overlap,
+    well above the tolerance."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    return await make_version(db, contour.id, box_wkt(69.905, 41.5))
+
+
+@pytest.fixture
+async def published_restriction_over_it(
+    db: AsyncSession, draft_version: ContourVersion
+) -> LayerFeature:
+    """A published `restrictions` feature over the exact box `draft_version`
+    uses — read back from `draft_version`'s own geometry (`version_wkt`) rather
+    than a second, independent literal, since `draft_version` itself now sits
+    at a random location (see its own note)."""
+    layer = await repo.layer_by_code(db, "restrictions")
+    assert layer is not None
+    return await make_feature(db, layer, await version_wkt(db, draft_version))
+
+
+@pytest.fixture
+async def expired_fire_ban_over_it(db: AsyncSession, draft_version: ContourVersion) -> LayerFeature:
+    """A `fire_bans` feature whose validity period ended well before today.
+    Built from `business_today()`, never `date.today()` (lesson) — the same
+    "today" `run_checks` defaults `on_date` to, so the fixture and the check
+    under test agree regardless of the server's own timezone."""
+    layer = await repo.layer_by_code(db, "fire_bans")
+    assert layer is not None
+    today = business_today()
+    return await make_feature(
+        db,
+        layer,
+        await version_wkt(db, draft_version),
+        valid_from=today - timedelta(days=400),
+        valid_to=today - timedelta(days=370),
+    )
+
+
+@pytest.fixture
+async def current_fire_ban_over_it(db: AsyncSession, draft_version: ContourVersion) -> LayerFeature:
+    """A `fire_bans` feature whose validity period spans today."""
+    layer = await repo.layer_by_code(db, "fire_bans")
+    assert layer is not None
+    today = business_today()
+    return await make_feature(
+        db,
+        layer,
+        await version_wkt(db, draft_version),
+        valid_from=today - timedelta(days=10),
+        valid_to=today + timedelta(days=10),
+    )
+
+
+@pytest.fixture
+async def published_fund_boundary_elsewhere(db: AsyncSession) -> LayerFeature:
+    """Ruling 9's `fail` branch needs a non-empty `forest_fund` layer — but the
+    layer is empty in production today (task-4 brief, decision 3), and every
+    OTHER test's `skipped` assertion depends on that staying true in the
+    shared, persistent test DB. See the module note above this section: this
+    fixture is never committed, so it cannot leak into any other test."""
+    layer = await repo.layer_by_code(db, "forest_fund")
+    assert layer is not None
+    return await make_feature(db, layer, box_wkt(60.0, 41.5))
 
 
 # --- Signed-in client fixtures for the gis HTTP API (task 2) -----------------
