@@ -81,7 +81,11 @@ async def begin(
     # an earlier begin() call on the same key (identity map) — with expire_on_commit=False
     # a plain get() would return that stale copy instead of the row's current DB state.
     row = await db.get(IdempotencyKey, (key, user_id), populate_existing=True)
-    assert row is not None  # just conflicted on it
+    if row is None:
+        # We conflicted on insert, but the row is gone by the time we looked it up —
+        # a concurrent request's stale re-claim (below) deleted it in between. Retry:
+        # our own insert is very likely to succeed now.
+        return await begin(db, key=key, user_id=user_id, method=method, path=path, body=body)
     if row.fingerprint != fp:
         raise err("ERR-SYS-005", details={"reason": "fingerprint_mismatch"})
     if row.response_status is not None and row.response_body is not None:
