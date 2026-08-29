@@ -9,8 +9,11 @@ start returning 429 after a few consecutive full-suite runs.
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import update
+import pytest
+from sqlalchemy import delete, update
 
+from app.core import settings_store
+from app.core.models import SystemSetting
 from app.core.security import hash_otp
 from app.main import create_app
 from app.modules.auth import repo
@@ -94,7 +97,29 @@ async def test_attempts_cap_burns_code(db):
     assert r.status_code == 400  # correct code no longer accepted
 
 
-async def test_rate_limit_429(db):
+@pytest.fixture
+async def _high_ip_otp_limit(db):
+    """This test drives 6 calls to /auth/otp/request from one client IP to reach
+    the per-target hourly business limit (ERR-AUTH-009) — but Task 6's per-IP
+    rate limiter defaults to the same threshold (5/minute) and, as a route
+    dependency, runs before the handler body, so it would otherwise win the race
+    and return ERR-SYS-006 instead. Push its ceiling out of the way so the test
+    still isolates the business rule it's named for.
+
+    The override must be committed, not just flushed: the HTTP calls below run
+    through the app's own db session (get_db), a separate connection from this
+    fixture's `db`."""
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == "ratelimit_otp_per_minute"))
+    db.add(SystemSetting(key="ratelimit_otp_per_minute", value=1000))
+    await db.commit()
+    settings_store.invalidate("ratelimit_otp_per_minute")
+    yield
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == "ratelimit_otp_per_minute"))
+    await db.commit()
+    settings_store.invalidate("ratelimit_otp_per_minute")
+
+
+async def test_rate_limit_429(db, _high_ip_otp_limit):
     phone = unique_phone()
     app = create_app()
     async with make_client(app, lifespan=True) as client:

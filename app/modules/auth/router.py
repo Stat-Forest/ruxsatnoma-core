@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core.deps import get_db
 from app.core.errors import err
+from app.core.ratelimit import rate_limit
 from app.core.security import new_token
 from app.core.time import business_today
 from app.modules.auth import repo, service
@@ -127,7 +128,11 @@ async def logout(
     response.delete_cookie("csrf_token")
 
 
-@router.post("/login", response_model=LoginOut)
+@router.post(
+    "/login",
+    response_model=LoginOut,
+    dependencies=[Depends(rate_limit("login", "ratelimit_login_per_minute"))],
+)
 async def login(
     body: LoginIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
 ) -> LoginOut:
@@ -204,7 +209,11 @@ async def oneid_callback(
     return await _me_out(db, user, role, csrf)
 
 
-@router.post("/eimzo/challenge", response_model=EimzoChallengeOut)
+@router.post(
+    "/eimzo/challenge",
+    response_model=EimzoChallengeOut,
+    dependencies=[Depends(rate_limit("eimzo_challenge", "ratelimit_challenge_per_minute"))],
+)
 async def eimzo_challenge(db: Annotated[AsyncSession, Depends(get_db)]) -> EimzoChallengeOut:
     return EimzoChallengeOut(challenge=await service.issue_eimzo_challenge(db))
 
@@ -240,7 +249,11 @@ async def password_change(
     )
 
 
-@router.post("/otp/request", status_code=204)
+@router.post(
+    "/otp/request",
+    status_code=204,
+    dependencies=[Depends(rate_limit("otp_request", "ratelimit_otp_per_minute"))],
+)
 async def otp_request(
     body: OtpRequestIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
 ) -> None:

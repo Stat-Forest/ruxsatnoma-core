@@ -45,6 +45,14 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
         await session.rollback()
 
 
+@pytest.fixture(autouse=True)
+def _reset_ratelimit():
+    from app.core import ratelimit
+
+    ratelimit.reset()
+    yield
+
+
 @asynccontextmanager
 async def make_client(
     app, *, lifespan: bool = False, raise_app_exceptions: bool = False
