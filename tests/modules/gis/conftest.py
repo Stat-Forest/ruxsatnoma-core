@@ -6,12 +6,12 @@ import uuid
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.models import MediaFile
-from app.db import uuid7
+from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.auth.models import Applicant
@@ -120,6 +120,53 @@ def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+async def _restore_gis_layers(engine):
+    """gis_layers is a small, FIXED catalogue (ruling 19) seeded once by
+    migration 0010 — never created or deleted, only its 3 presentation columns
+    ever change. `PATCH /gis/layers/{code}` mutates a row through the APP's own
+    session (`_client_for` above commits it explicitly, on the engine
+    `create_app()` builds inside its own lifespan) — NOT the `db` fixture's
+    session, so `db`'s teardown `rollback()` can never undo it, and a test that
+    patches a layer would otherwise leave the mutation in the shared, persistent
+    test DB forever (task-2 review, finding 1). This is why the restore below
+    also avoids `db`: committing on that session would additionally commit
+    whatever the test body itself left pending on it, silently widening what
+    the test is supposed to roll back.
+
+    Snapshots every row's style/is_public/status before the test on a session
+    of its own, restores them after through an explicit commit on another, and
+    re-reads to confirm the restore actually landed rather than trusting it
+    silently — so a regression here fails loudly (an assertion error in this
+    fixture's teardown) instead of corrupting the catalogue for whichever test
+    or task runs next.
+    """
+    factory = make_session_factory(engine)
+    async with factory() as session:
+        before = (
+            await session.execute(
+                select(GisLayer.id, GisLayer.style, GisLayer.is_public, GisLayer.status)
+            )
+        ).all()
+    snapshot = {row.id: (row.style, row.is_public, row.status) for row in before}
+    yield
+    async with factory() as session:
+        for layer_id, (style, is_public, status) in snapshot.items():
+            await session.execute(
+                update(GisLayer)
+                .where(GisLayer.id == layer_id)
+                .values(style=style, is_public=is_public, status=status)
+            )
+        await session.commit()
+        after = (
+            await session.execute(
+                select(GisLayer.id, GisLayer.style, GisLayer.is_public, GisLayer.status)
+            )
+        ).all()
+    restored = {row.id: (row.style, row.is_public, row.status) for row in after}
+    assert restored == snapshot, "gis_layers catalogue was not fully restored after the test"
 
 
 def unique_pinfl() -> str:

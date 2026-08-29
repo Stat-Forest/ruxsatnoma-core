@@ -12,6 +12,13 @@ from app.modules.gis import repo
 from app.modules.gis.models import GisLayer
 
 
+async def list_layers(db: AsyncSession) -> list[GisLayer]:
+    """A pass-through today (task-2 review, finding 2): this read acquires a real
+    rule inside this same stage — Task 8 must refuse a non-public layer's
+    features to an applicant — and that rule belongs here, not in the router."""
+    return await repo.list_layers(db)
+
+
 async def update_layer(
     db: AsyncSession,
     code: str,
