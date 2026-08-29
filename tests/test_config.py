@@ -97,3 +97,28 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("SMTP_FROM", "noreply@example.uz")
     settings = Settings()
     assert settings.oneid_mode == "real"
+
+
+def test_sms_mode_real_requires_eskiz_credentials():
+    # sms_mode=real is checked unconditionally (not just under app_env=prod), and
+    # ALL four Eskiz fields are required — leave exactly one empty to prove the
+    # `all(...)` guard, not just an "all missing" case.
+    with pytest.raises(ValidationError, match="sms_mode=real requires"):
+        Settings(
+            sms_mode="real",
+            eskiz_email="bot@example.uz",
+            eskiz_password="a-real-eskiz-password",
+            eskiz_sender="4546",
+            eskiz_callback_secret="",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+
+def test_email_mode_real_requires_smtp_host_and_from():
+    with pytest.raises(ValidationError, match="email_mode=real requires"):
+        Settings(
+            email_mode="real",
+            smtp_host="",
+            smtp_from="",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )

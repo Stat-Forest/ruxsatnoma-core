@@ -213,6 +213,9 @@ def upgrade() -> None:
         templates,
         [
             {
+                # Deliberately uuid4(), not app.db.uuid7 — migrations must not depend
+                # on app code that could move/rename later; ordering locality is moot
+                # for 13 rows anyway (0005 made the same call with gen_random_uuid()).
                 "id": uuid.uuid4(),
                 "event_code": event_code,
                 "channel": channel,
