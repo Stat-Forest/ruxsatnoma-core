@@ -50,3 +50,19 @@ async def test_autogenerate_diff_empty(engine):
 
         diff = await conn.run_sync(_diff)
     assert diff == []
+
+
+async def test_downgrade_upgrade_roundtrip(engine):
+    """upgrade head → downgrade base → upgrade head (plan 03.4 ruling 16).
+
+    KEEP THIS TEST LAST IN THIS FILE (and this file is alphabetically last):
+    downgrade base wipes the shared test DB — every table is dropped and
+    re-created; data other tests created is gone. Nothing may run after it."""
+    url = get_settings().database_url_test
+    cfg = _alembic_config(url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+    await asyncio.to_thread(command.downgrade, cfg, "base")
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+    async with engine.connect() as conn:
+        version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+    assert version == "0008"
