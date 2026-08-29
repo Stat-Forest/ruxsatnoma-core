@@ -293,3 +293,19 @@ Rules for this file:
 - **How to apply:** `make heads` covers this one (also a pre-commit hook on
   `migrations/versions/` and a CI step). Before writing any test about
   infrastructure the fixtures themselves depend on, ask which runs first.
+
+## pre-commit refuses to run while `.pre-commit-config.yaml` is modified-but-unstaged
+
+- **Rule:** Never edit `.pre-commit-config.yaml` (or any tooling file) in a working
+  copy another session is committing from — take a worktree, per the root
+  `CLAUDE.md`. If pre-commit says *"Your pre-commit configuration is unstaged"*,
+  the fix is to find whose edit it is, not to reach for `--no-verify`.
+- **Why:** pre-commit refuses to run against a config it cannot trust, so EVERY
+  commit in that tree is blocked — including commits from a session that never
+  touched the file. Hit twice on 2026-08-29 in the shared copy: a tooling session
+  had the config modified while the stage-3.5 session was committing, and that
+  session shipped one commit with `--no-verify` (hooks re-run by hand) to get out.
+- **How to apply:** One worktree per session (root `CLAUDE.md` → Git). If you are
+  already stuck mid-task, `git stash push .pre-commit-config.yaml` in your own
+  tree is safer than `--no-verify`; if you do use `--no-verify`, run `make check`
+  by hand and say so in the PR.
