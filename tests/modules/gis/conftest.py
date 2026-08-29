@@ -2,11 +2,14 @@
 test never hand-builds GeoJSON; areas are real (a 0.01° x 0.01° box near Tashkent
 is roughly 92 ha), which is what makes the area assertions meaningful."""
 
+import json
 import uuid
+from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -14,8 +17,8 @@ from app.core.models import MediaFile
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization
-from app.modules.auth.models import Applicant
-from app.modules.gis.models import Contour, GisLayer
+from app.modules.auth.models import Applicant, User
+from app.modules.gis.models import Contour, ContourVersion, GisLayer
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE, LAYERS_MANAGE
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client, signed_in_with
@@ -102,6 +105,50 @@ async def make_contour(
     return contour
 
 
+@pytest.fixture
+async def gis_user(db: AsyncSession) -> User:
+    """Owns rows created directly (bypassing the API) by other gis fixtures and
+    by test_geometry.py's repo-level tests — a `created_by` FK target, nothing
+    permission-bearing (repo functions enforce no permissions of their own)."""
+    return await make_user(db)
+
+
+async def wkt_to_geojson(db: AsyncSession, wkt: str) -> dict[str, Any]:
+    """PostGIS's own WKT->GeoJSON, so a test's geometry is defined once as WKT
+    (matching box_wkt) and converted through the same engine `insert_version`
+    itself relies on — never a hand-rolled GeoJSON literal that could silently
+    drift from what box_wkt actually describes."""
+    raw = await db.scalar(text("SELECT ST_AsGeoJSON(ST_GeomFromText(:wkt, 4326))"), {"wkt": wkt})
+    assert raw is not None
+    return json.loads(raw)
+
+
+@pytest.fixture
+async def published_contour(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, approval_doc: MediaFile
+) -> ContourVersion:
+    """A contour with a version already `published` — inserted directly (ORM),
+    never through the API: the publish endpoint is Task 5's, not built yet, and
+    a fixture depending on a later task's endpoint would be a circular
+    dependency. `approval_doc_id` is mandatory here — `published_needs_doc`
+    rejects a published row without one."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = ContourVersion(
+        contour_id=contour.id,
+        version_no=1,
+        geom=func.ST_Multi(func.ST_GeomFromText(box_wkt(69.9, 41.5), 4326)),
+        area_ha=Decimal("92.0000"),
+        source="survey",
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    db.add(version)
+    await db.flush()
+    await db.refresh(version)
+    return version
+
+
 # --- Signed-in client fixtures for the gis HTTP API (task 2) -----------------
 #
 # Thin wrappers over helpers this codebase already has: make_user/make_session
@@ -176,11 +223,32 @@ def unique_pinfl() -> str:
     return f"2{uuid.uuid4().int % 10**13:013d}"
 
 
+def _commit_pending_before_requests(client: httpx.AsyncClient, db: AsyncSession) -> None:
+    """pytest instantiates a test's fixtures in the left-to-right order of its
+    parameter list — e.g. `test_x(gis_client, leshoz)` sets `gis_client` up (and
+    its own commit below) BEFORE `leshoz` even runs. `leshoz` (and any other
+    fixture writing through the shared `db` session) is then only `flush()`ed,
+    not committed, when the test body's first request fires — invisible to the
+    app's own session, a different connection, until committed (confirmed
+    empirically: a fixture listed after a `_client_for`-based client is NOT
+    visible to a fresh connection at that point). Committing again right before
+    every outgoing request picks up whatever else `db` was given in the
+    meantime, regardless of fixture order — cheap, and a no-op commit when
+    there is nothing new to see."""
+
+    async def _commit_pending(request: httpx.Request) -> None:
+        await db.commit()
+
+    client.event_hooks["request"] = [*client.event_hooks.get("request", []), _commit_pending]
+
+
 async def _client_for(db: AsyncSession, *permissions: str):
     user, token, csrf = await signed_in_with(db, *permissions)
     await db.commit()
     async with make_client(create_app(), lifespan=True) as client:
-        yield auth_client(client, token, csrf)
+        auth_client(client, token, csrf)
+        _commit_pending_before_requests(client, db)
+        yield client
 
 
 @pytest.fixture
@@ -219,4 +287,6 @@ async def applicant_client(db: AsyncSession):
     _, token, csrf = await make_session(db, user)
     await db.commit()
     async with make_client(create_app(), lifespan=True) as client:
-        yield auth_client(client, token, csrf)
+        auth_client(client, token, csrf)
+        _commit_pending_before_requests(client, db)
+        yield client

@@ -28,6 +28,7 @@ from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
 from app.modules.auth.router import router as auth_router
 from app.modules.gis.layers_router import router as gis_layers_router
+from app.modules.gis.router import router as gis_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
@@ -201,5 +202,6 @@ def create_app() -> FastAPI:
     app.include_router(notifications_webhooks_router, prefix="/api/v1")
     app.include_router(files_router, prefix="/api/v1")
     app.include_router(gis_layers_router, prefix="/api/v1")
+    app.include_router(gis_router, prefix="/api/v1")
 
     return app

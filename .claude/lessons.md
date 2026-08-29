@@ -481,3 +481,44 @@ Rules for this file:
   (0009's pattern, unaffected by this bug) whenever it fits, or `json.dumps(value)`
   bound as text plus `CAST(:x AS jsonb)` otherwise — never a JSONB-typed `sa.literal`
   inside `bindparams`.
+
+## A fixed-scale `NUMERIC` column round-trips at its own precision, not the caller's
+
+- **Rule:** A pydantic response field backed by a `NUMERIC(p,s)` column strips
+  trailing zeros explicitly (`format(value, "f").rstrip("0").rstrip(".")`) before
+  the API returns it — never assume the value keeps the request's own precision,
+  and never reach for `Decimal.normalize()` to do the stripping.
+- **Why:** `contour_versions.declared_area_ha` is `NUMERIC(12,4)`; posting `"2.6"`
+  and reading it back gives `Decimal('2.6000')` (confirmed against real Postgres,
+  not just SQLAlchemy) — a bare `Decimal` field then serializes as `"2.6000"`,
+  silently failing a test asserting the reference figure `"2.6"` (task 3). Fixing
+  it with `.normalize()` trades one bug for another: `Decimal('100.0000')
+  .normalize()` is `Decimal('1E+2')`, not `100` — wrong for a whole-number area.
+- **How to apply:** Any new `Decimal`-backed response field on a fixed-scale
+  column gets a `field_serializer` doing the `format(..., "f")`-then-`rstrip`
+  dance (`gis.schemas._trim_decimal`), and a test asserting the exact JSON string
+  a round-tripped value produces — not just its `float()`.
+
+## A `_client_for`-style fixture's setup-time commit only covers what ran before it
+
+- **Rule:** When a test combines a signed-in HTTP-client fixture that commits
+  internally (e.g. `gis_client`) with a SEPARATE fixture writing through the same
+  `db` session (e.g. `leshoz`), the write-fixture's row is invisible to the app's
+  own session unless something commits it again AFTER that fixture runs — pytest
+  instantiates a test's fixtures in the LEFT-TO-RIGHT order of its parameter list
+  (verified empirically with a throwaway fixture-order test), so anything listed
+  AFTER the client is not covered by the client's own setup-time commit.
+- **Why:** `test_gis_specialist_creates_a_contour_and_a_draft_version(gis_client,
+  leshoz, contours_layer)` would FK-fail otherwise: `gis_client`'s internal commit
+  runs before `leshoz` even executes, so `leshoz`'s `flush()`-only row stays
+  invisible to the app's separate connection — confirmed empirically with a fresh,
+  independent asyncpg connection reading `organizations` right after fixture setup
+  and finding nothing there (task 3, first task to combine a `_client_for` client
+  with a write fixture in the same test).
+- **How to apply:** Every client fixture built over `_client_for`
+  (`tests/modules/gis/conftest.py`) registers an httpx `request` event hook
+  (`_commit_pending_before_requests`) that re-commits `db` right before every
+  outgoing call, so any other fixture's writes are picked up regardless of listed
+  order. Copy this pattern for any new signed-in-client fixture — in gis or
+  another module — that will ever be combined with a write fixture in the same
+  test; do not assume the client fixture's own setup-time commit is enough.
