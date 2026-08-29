@@ -247,3 +247,33 @@ def test_mask_target_full_phone():
 
 def test_mask_target_email():
     assert _mask_target("user@example.com") == "u***@example.com"
+
+
+async def test_real_otp_sender_routes_phone_to_sms_and_email_to_smtp(monkeypatch):
+    """The single OtpSender seam still hides the provider split (plan 03.5 Task 6)."""
+    from app.modules.integrations.adapters.otp_sender import RealOtpSender
+
+    sms_calls: list[dict] = []
+    email_calls: list[dict] = []
+
+    class _Sms:
+        async def send(self, *, phone, text, reference):
+            sms_calls.append({"phone": phone, "text": text})
+            return "id"
+
+    class _Email:
+        async def send(self, *, to, subject, text):
+            email_calls.append({"to": to, "text": text})
+            return None
+
+    monkeypatch.setattr(
+        "app.modules.integrations.adapters.otp_sender.get_sms_sender", lambda: _Sms()
+    )
+    monkeypatch.setattr(
+        "app.modules.integrations.adapters.otp_sender.get_email_sender", lambda: _Email()
+    )
+    sender = RealOtpSender()
+    await sender.send(target_type="phone", target="998901234567", code="123456")
+    await sender.send(target_type="email", target="u@example.com", code="654321")
+    assert "123456" in sms_calls[0]["text"] and sms_calls[0]["phone"] == "998901234567"
+    assert "654321" in email_calls[0]["text"] and email_calls[0]["to"] == "u@example.com"
