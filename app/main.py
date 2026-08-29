@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
+from app.core.idempotency import StoredIdempotentResponse
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
 from app.files_router import router as files_router
@@ -135,6 +136,10 @@ def create_app() -> FastAPI:
             status_code=exc.http_status,
             content=_error_body(request, exc.code, exc.message, exc.details),
         )
+
+    @app.exception_handler(StoredIdempotentResponse)
+    async def stored_idempotent_handler(request: Request, exc: StoredIdempotentResponse):
+        return JSONResponse(status_code=exc.status_code, content=exc.body)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):

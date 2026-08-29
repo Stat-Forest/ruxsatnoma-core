@@ -1,6 +1,7 @@
 """Request dependencies: current session/user. Other modules import from here."""
 
 import secrets
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -11,6 +12,7 @@ from app.config import get_settings
 from app.core import settings_store
 from app.core.deps import get_db
 from app.core.errors import err
+from app.core.idempotency import IdempotencyContext, begin
 from app.core.security import hash_token
 from app.core.time import business_today
 from app.modules.audit import service as audit
@@ -170,3 +172,23 @@ def require_any_permission(*codes: str):
         return user
 
     return _check
+
+
+async def idempotency_context(
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> IdempotencyContext:
+    """Idempotency-Key header → context (design/03: mandatory on critical POSTs).
+    Routes that declare this dependency must call ctx.save() before returning."""
+    raw = request.headers.get("Idempotency-Key")
+    if raw is None:
+        raise err("ERR-VAL-001", details={"reason": "idempotency_key_required"})
+    try:
+        key = uuid.UUID(raw)
+    except ValueError:
+        raise err("ERR-VAL-001", details={"reason": "idempotency_key_not_uuid"}) from None
+    body = await request.body()
+    return await begin(
+        db, key=key, user_id=user.id, method=request.method, path=request.url.path, body=body
+    )
