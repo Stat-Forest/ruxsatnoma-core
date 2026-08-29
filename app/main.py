@@ -1,5 +1,6 @@
 """Сборка приложения: lifespan (БД), обработчики ошибок; роутеры модулей — этап 3."""
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 
@@ -45,7 +46,19 @@ async def lifespan(app: FastAPI):
     app.state.session_factory = make_session_factory(app.state.engine)
     # Fresh dev/test MinIO volumes have no bucket yet; in prod this is an idempotent HEAD.
     await storage.ensure_bucket()
+    workers_stop: asyncio.Event | None = None
+    workers_task: asyncio.Task[None] | None = None
+    if settings.workers_mode == "embedded":
+        from app.workers.runner import run_all
+
+        workers_stop = asyncio.Event()
+        workers_task = asyncio.create_task(
+            run_all(app.state.engine, app.state.session_factory, stop=workers_stop)
+        )
     yield
+    if workers_stop is not None and workers_task is not None:
+        workers_stop.set()
+        await workers_task
     await app.state.engine.dispose()
 
 

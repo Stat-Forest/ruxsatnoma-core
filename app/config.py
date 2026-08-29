@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     oneid_mode: Literal["mock", "real"] = "mock"
     eimzo_mode: Literal["mock", "real"] = "mock"
     sms_mode: Literal["mock", "real"] = "mock"
+    workers_mode: Literal["embedded", "off"] = "embedded"
     oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
     oneid_scope: str = "mock-scope"
 

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import app.models_registry  # noqa: F401  # populate Base.metadata for migration tests
 from app.config import get_settings
 from app.db import make_engine, make_session_factory
+
+os.environ.setdefault("WORKERS_MODE", "off")  # lifespans in tests must not spawn workers
 
 
 @pytest.fixture(scope="session", autouse=True)
