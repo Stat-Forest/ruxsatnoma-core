@@ -464,3 +464,20 @@ Rules for this file:
   endpoint does the same" was the wrong defence: the others do not PERSIST the body.
 - **How to apply:** New anonymous ingest path → cap what it writes, and say in the
   stored row that it was capped.
+
+## `sa.literal(value, JSONB)` inside `.bindparams()` binds the wrong object
+
+- **Rule:** To insert a JSON/JSONB literal from a raw migration `sa.text(...).bindparams(...)`
+  call, pre-serialize with `json.dumps` and bind it as plain text with an explicit
+  `CAST(:x AS jsonb)` in the SQL — never pass `sa.literal(value, postgresql.JSONB)`
+  as the keyword value.
+- **Why:** `.bindparams(key=sa.literal(v, type_))` sets the param's bound value to
+  the `BindParameter` construct itself, not `v` — asyncpg then receives that
+  construct where it expects serialized text and raises `DataError: ... object has
+  no attribute 'encode'` (migration 0010, caught by the RED/GREEN cycle, never
+  reached a running database).
+- **How to apply:** A raw-SQL JSONB insert in a migration goes through `op.bulk_insert`
+  with a `sa.table`/`sa.column(..., postgresql.JSONB())` and a plain Python dict
+  (0009's pattern, unaffected by this bug) whenever it fits, or `json.dumps(value)`
+  bound as text plus `CAST(:x AS jsonb)` otherwise — never a JSONB-typed `sa.literal`
+  inside `bindparams`.
