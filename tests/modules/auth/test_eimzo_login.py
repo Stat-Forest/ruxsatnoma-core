@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from app.main import create_app
-from app.modules.auth.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
+from app.modules.integrations.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
 from tests.conftest import make_client
 
 API = "/api/v1"

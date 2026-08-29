@@ -5,10 +5,11 @@ import uuid
 from sqlalchemy import select
 
 from app.main import create_app
-from app.modules.auth.adapters.oneid import OneIdProfile, encode_mock_code
 from app.modules.auth.models import User, UserConsent
+from app.modules.integrations.adapters.oneid import OneIdProfile, encode_mock_code
 from tests.conftest import make_client
-from tests.modules.auth.test_otp import last_code, unique_phone
+from tests.modules.auth.conftest import _delivered_code
+from tests.modules.auth.test_otp import unique_phone
 
 API = "/api/v1"
 
@@ -32,7 +33,7 @@ def csrf_headers(client) -> dict[str, str]:
     return {"X-CSRF-Token": client.cookies.get("csrf_token")}
 
 
-async def verified_phone_token(client, phone: str) -> str:
+async def verified_phone_token(client, phone: str, *, db) -> str:
     r = await client.post(
         f"{API}/auth/otp/request",
         json={"target_type": "phone", "target": phone, "purpose": "phone_verify"},
@@ -40,7 +41,7 @@ async def verified_phone_token(client, phone: str) -> str:
     assert r.status_code == 204
     r = await client.post(
         f"{API}/auth/otp/verify",
-        json={"target": phone, "code": last_code(), "purpose": "phone_verify"},
+        json={"target": phone, "code": await _delivered_code(db), "purpose": "phone_verify"},
     )
     return r.json()["otp_token"]
 
@@ -61,7 +62,7 @@ async def test_full_registration_flow(db, engine):
     async with make_client(app, lifespan=True) as client:
         login = await oneid_login(client, pinfl)
         assert login.json()["registration_complete"] is False
-        token = await verified_phone_token(client, phone)
+        token = await verified_phone_token(client, phone, db=db)
         r = await client.post(
             f"{API}/auth/complete-registration",
             json=registration_body(phone, token),
@@ -104,7 +105,7 @@ async def test_stale_consent_version_422(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         await oneid_login(client, pinfl)
-        token = await verified_phone_token(client, phone)
+        token = await verified_phone_token(client, phone, db=db)
         r = await client.post(
             f"{API}/auth/complete-registration",
             json=registration_body(
@@ -121,7 +122,7 @@ async def test_otp_token_target_must_match_phone(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         await oneid_login(client, pinfl)
-        token = await verified_phone_token(client, unique_phone())
+        token = await verified_phone_token(client, unique_phone(), db=db)
         r = await client.post(
             f"{API}/auth/complete-registration",
             json=registration_body(unique_phone(), token),  # a different phone
@@ -136,14 +137,14 @@ async def test_double_registration_409(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         await oneid_login(client, pinfl)
-        token = await verified_phone_token(client, phone)
+        token = await verified_phone_token(client, phone, db=db)
         first = await client.post(
             f"{API}/auth/complete-registration",
             json=registration_body(phone, token),
             headers=csrf_headers(client),
         )
         assert first.status_code == 200
-        token2 = await verified_phone_token(client, phone)
+        token2 = await verified_phone_token(client, phone, db=db)
         r = await client.post(
             f"{API}/auth/complete-registration",
             json=registration_body(phone, token2),

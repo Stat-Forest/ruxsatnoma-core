@@ -1,4 +1,5 @@
-"""OTP request/verify: delivery via mock sender, attempts cap, rate limit, token issue.
+"""OTP request/verify: delivery via the outbox (mock sender), attempts cap, rate
+limit, token issue.
 
 Targets are unique per test AND per run: the test DB is persistent and the rate
 limit counts requests per target over the last hour — a fixed phone number would
@@ -8,13 +9,20 @@ start returning 429 after a few consecutive full-suite runs.
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import update
+import pytest
+from sqlalchemy import delete, update
 
+from app.core import settings_store
+from app.core.models import SystemSetting
+from app.core.security import hash_otp
 from app.main import create_app
-from app.modules.auth.adapters.otp_sender import MockOtpSender, get_otp_sender
+from app.modules.auth import repo
 from app.modules.auth.models import OtpCode
 from app.modules.auth.service import _mask_target
+from app.modules.integrations import service as integrations_service
+from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
 from tests.conftest import make_client
+from tests.modules.auth.conftest import _delivered_code
 
 API = "/api/v1"
 
@@ -27,20 +35,15 @@ def unique_email() -> str:
     return f"otp-{uuid.uuid4().hex[:10]}@test.uz"
 
 
-def last_code() -> str:
-    sender = get_otp_sender()
-    assert isinstance(sender, MockOtpSender)
-    return sender.sent[-1][2]
-
-
-async def request_and_verify(client, *, target, target_type="phone", purpose="phone_verify"):
+async def request_and_verify(client, db, *, target, target_type="phone", purpose="phone_verify"):
     r = await client.post(
         f"{API}/auth/otp/request",
         json={"target_type": target_type, "target": target, "purpose": purpose},
     )
     assert r.status_code == 204
+    code = await _delivered_code(db)
     r = await client.post(
-        f"{API}/auth/otp/verify", json={"target": target, "code": last_code(), "purpose": purpose}
+        f"{API}/auth/otp/verify", json={"target": target, "code": code, "purpose": purpose}
     )
     assert r.status_code == 200
     return r.json()["otp_token"]
@@ -49,7 +52,7 @@ async def request_and_verify(client, *, target, target_type="phone", purpose="ph
 async def test_full_phone_otp_flow(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        token = await request_and_verify(client, target=unique_phone())
+        token = await request_and_verify(client, db, target=unique_phone())
     assert len(token) >= 43
 
 
@@ -69,7 +72,7 @@ async def test_wrong_code_then_correct(db):
         assert bad.json()["error"]["code"] == "ERR-AUTH-010"
         good = await client.post(
             f"{API}/auth/otp/verify",
-            json={"target": phone, "code": last_code(), "purpose": "phone_verify"},
+            json={"target": phone, "code": await _delivered_code(db), "purpose": "phone_verify"},
         )
         assert good.status_code == 200
 
@@ -89,12 +92,34 @@ async def test_attempts_cap_burns_code(db):
             )
         r = await client.post(
             f"{API}/auth/otp/verify",
-            json={"target": phone, "code": last_code(), "purpose": "phone_verify"},
+            json={"target": phone, "code": await _delivered_code(db), "purpose": "phone_verify"},
         )
     assert r.status_code == 400  # correct code no longer accepted
 
 
-async def test_rate_limit_429(db):
+@pytest.fixture
+async def _high_ip_otp_limit(db):
+    """This test drives 6 calls to /auth/otp/request from one client IP to reach
+    the per-target hourly business limit (ERR-AUTH-009) — but Task 6's per-IP
+    rate limiter defaults to the same threshold (5/minute) and, as a route
+    dependency, runs before the handler body, so it would otherwise win the race
+    and return ERR-SYS-006 instead. Push its ceiling out of the way so the test
+    still isolates the business rule it's named for.
+
+    The override must be committed, not just flushed: the HTTP calls below run
+    through the app's own db session (get_db), a separate connection from this
+    fixture's `db`."""
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == "ratelimit_otp_per_minute"))
+    db.add(SystemSetting(key="ratelimit_otp_per_minute", value=1000))
+    await db.commit()
+    settings_store.invalidate("ratelimit_otp_per_minute")
+    yield
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == "ratelimit_otp_per_minute"))
+    await db.commit()
+    settings_store.invalidate("ratelimit_otp_per_minute")
+
+
+async def test_rate_limit_429(db, _high_ip_otp_limit):
     phone = unique_phone()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
@@ -128,7 +153,7 @@ async def test_expired_code_rejected(db):
         await db.commit()
         r = await client.post(
             f"{API}/auth/otp/verify",
-            json={"target": phone, "code": last_code(), "purpose": "phone_verify"},
+            json={"target": phone, "code": await _delivered_code(db), "purpose": "phone_verify"},
         )
     assert r.status_code == 400
 
@@ -148,7 +173,7 @@ async def test_email_flow_and_validation(db):
         )
         assert mismatch.status_code == 422
         token = await request_and_verify(
-            client, target=email, target_type="email", purpose="email_verify"
+            client, db, target=email, target_type="email", purpose="email_verify"
         )
         assert token
 
@@ -173,6 +198,41 @@ async def test_verify_malformed_phone_target_rejected_by_schema(db):
             json={"target": "901234567", "code": "000000", "purpose": "phone_verify"},
         )
     assert r.status_code == 422
+
+
+async def test_request_does_not_send_inline(db):
+    """Task 4: request_otp only enqueues to the outbox; nothing reaches the
+    sender until a worker (deliver_one) drains the queue."""
+    sender = get_otp_sender()
+    assert isinstance(sender, MockOtpSender)
+    before = len(sender.sent)
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r = await client.post(
+            f"{API}/auth/otp/request",
+            json={"target_type": "phone", "target": unique_phone(), "purpose": "phone_verify"},
+        )
+        assert r.status_code == 204
+    assert len(sender.sent) == before  # nothing sent until the worker delivers
+    assert await integrations_service.deliver_one(db) is True
+    assert len(sender.sent) == before + 1
+
+
+async def test_code_hash_is_hmac(db):
+    """Task 4: 6-digit codes are hashed with the keyed hash_otp, not plain sha256
+    (a bare sha256 of a 6-digit space is brute-forceable from a DB leak)."""
+    phone = unique_phone()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r = await client.post(
+            f"{API}/auth/otp/request",
+            json={"target_type": "phone", "target": phone, "purpose": "phone_verify"},
+        )
+        assert r.status_code == 204
+    code = await _delivered_code(db)
+    row = await repo.latest_pending_otp(db, target=phone, purpose="phone_verify")
+    assert row is not None
+    assert row.code_hash == hash_otp(code)
 
 
 def test_mask_target_short_non_email_never_echoes_full_value():

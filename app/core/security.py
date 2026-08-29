@@ -1,6 +1,7 @@
 """Passwords (Argon2id), opaque session/MFA tokens, TOTP (design/01: core/security)."""
 
 import hashlib
+import hmac
 import re
 import secrets
 
@@ -8,6 +9,7 @@ import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
+from app.config import get_settings
 from app.core.errors import err
 
 _hasher = PasswordHasher()  # argon2id, library defaults
@@ -46,6 +48,13 @@ def new_token() -> str:
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def hash_otp(code: str) -> str:
+    """HMAC for LOW-ENTROPY 6-digit codes only (plan 03.4 ruling 8): a bare
+    sha256 of a 6-digit space is brute-forceable from a DB leak. Long random
+    tokens keep hash_token (sha256) — 256-bit entropy needs no key."""
+    return hmac.new(get_settings().secret_key.encode(), code.encode(), "sha256").hexdigest()
 
 
 def new_totp_secret() -> str:

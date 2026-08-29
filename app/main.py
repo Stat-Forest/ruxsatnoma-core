@@ -1,5 +1,6 @@
 """Сборка приложения: lifespan (БД), обработчики ошибок; роутеры модулей — этап 3."""
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 
@@ -15,11 +16,13 @@ from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
+from app.core.idempotency import StoredIdempotentResponse
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
 from app.files_router import router as files_router
 from app.modules.admin.announcements_router import admin_router as announcements_admin_router
 from app.modules.admin.announcements_router import router as announcements_router
+from app.modules.admin.integrations_router import router as integrations_admin_router
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
@@ -45,8 +48,25 @@ async def lifespan(app: FastAPI):
     app.state.session_factory = make_session_factory(app.state.engine)
     # Fresh dev/test MinIO volumes have no bucket yet; in prod this is an idempotent HEAD.
     await storage.ensure_bucket()
+    workers_stop: asyncio.Event | None = None
+    workers_task: asyncio.Task[None] | None = None
+    if settings.workers_mode == "embedded":
+        from app.workers.runner import run_all
+
+        workers_stop = asyncio.Event()
+        workers_task = asyncio.create_task(
+            run_all(app.state.engine, app.state.session_factory, stop=workers_stop)
+        )
     yield
-    await app.state.engine.dispose()
+    try:
+        if workers_stop is not None and workers_task is not None:
+            workers_stop.set()
+            await workers_task
+    finally:
+        # dispose() must run even if awaiting workers_task raises (review
+        # finding 2) — otherwise a stuck/failed worker shutdown leaks the
+        # engine's whole connection pool instead of just failing loudly.
+        await app.state.engine.dispose()
 
 
 def _error_body(request: Request, code: str, message: str, details: dict | None) -> dict:
@@ -118,6 +138,10 @@ def create_app() -> FastAPI:
             content=_error_body(request, exc.code, exc.message, exc.details),
         )
 
+    @app.exception_handler(StoredIdempotentResponse)
+    async def stored_idempotent_handler(request: Request, exc: StoredIdempotentResponse):
+        return JSONResponse(status_code=exc.status_code, content=exc.body)
+
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         # Ловит и штатные fastapi.HTTPException (наследник), и роутинговые
@@ -167,6 +191,7 @@ def create_app() -> FastAPI:
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(announcements_router, prefix="/api/v1")
     app.include_router(announcements_admin_router, prefix="/api/v1")
+    app.include_router(integrations_admin_router, prefix="/api/v1")
     app.include_router(files_router, prefix="/api/v1")
 
     return app

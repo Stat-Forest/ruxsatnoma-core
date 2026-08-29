@@ -3,7 +3,7 @@
 `system_settings` lives here (stage 3.3a ruling 8) so that level-1 `auth` can read
 session/lockout policy without importing level-1 `admin` (that would be a cycle:
 `admin` already calls `auth`). Writes go through `admin.service.update_setting`.
-Later inhabitants of this file: `idempotency_keys`, `number_counters`.
+Later inhabitants of this file: `number_counters`.
 """
 
 import uuid
@@ -57,3 +57,21 @@ class MediaFile(Base):
         CheckConstraint("status IN ('active', 'archived')", name="status_valid"),
         Index("ix_media_files_uploaded_by", "uploaded_by"),
     )
+
+
+class IdempotencyKey(Base):
+    """Idempotency-Key on critical POSTs (design/03): the marker row is inserted
+    and committed before the handler runs; the response is stored by
+    `IdempotencyContext.save`. In-flight markers older than 5 minutes are
+    re-claimable (plan 03.4 ruling 13); completed rows are purged after
+    `purge_idempotency_after_hours`."""
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    fingerprint: Mapped[str]  # sha256 of "METHOD|path|body"
+    route: Mapped[str]
+    response_status: Mapped[int | None]
+    response_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())

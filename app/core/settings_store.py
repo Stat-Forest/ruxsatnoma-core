@@ -48,6 +48,38 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec("privacy_policy_version", str, "1.0", "Current privacy policy version"),
         SettingSpec("offer_version", str, "1.0", "Current public offer version"),
         SettingSpec("max_upload_mb", int, 20, "Maximum accepted upload size, MB"),
+        SettingSpec(
+            "outbox_max_attempts", int, 8, "Delivery attempts before an outbox row goes dead"
+        ),
+        SettingSpec(
+            "outbox_backoff_base_minutes", int, 1, "First retry delay; doubles each attempt"
+        ),
+        SettingSpec(
+            "purge_otp_after_days", int, 7, "Delete expired/used otp_codes after this many days"
+        ),
+        SettingSpec(
+            "purge_sessions_after_days",
+            int,
+            30,
+            "Delete expired/revoked sessions after this many days",
+        ),
+        SettingSpec(
+            "purge_outbox_delivered_after_days",
+            int,
+            7,
+            "Delete delivered outbox rows after this many days",
+        ),
+        SettingSpec(
+            "purge_idempotency_after_hours",
+            int,
+            24,
+            "Delete idempotency keys after this many hours",
+        ),
+        SettingSpec("ratelimit_login_per_minute", int, 10, "Per-IP limit for POST /auth/login"),
+        SettingSpec("ratelimit_otp_per_minute", int, 5, "Per-IP limit for POST /auth/otp/request"),
+        SettingSpec(
+            "ratelimit_challenge_per_minute", int, 10, "Per-IP limit for POST /auth/eimzo/challenge"
+        ),
     )
 }
 

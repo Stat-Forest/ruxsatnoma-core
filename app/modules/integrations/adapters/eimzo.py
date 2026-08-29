@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from app.config import get_settings
-from app.modules.auth.adapters.mock_codec import decode_payload, encode_payload
+from app.modules.integrations.adapters.mock_codec import decode_payload, encode_payload
 
 
 @dataclass(frozen=True)

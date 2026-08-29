@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.14
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: ruxsatnoma
+          POSTGRES_PASSWORD: ruxsatnoma
+          POSTGRES_DB: ruxsatnoma
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ruxsatnoma"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.14
+      - run: uv sync --frozen
+      # MinIO can't be a `services:` entry (needs a command); run it directly.
+      - run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=ruxsatnoma -e MINIO_ROOT_PASSWORD=ruxsatnoma-secret \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: |
+          PGPASSWORD=ruxsatnoma psql -h localhost -U ruxsatnoma -d ruxsatnoma \
+            -c "CREATE DATABASE ruxsatnoma_test OWNER ruxsatnoma"
+          PGPASSWORD=ruxsatnoma psql -h localhost -U ruxsatnoma -d ruxsatnoma_test \
+            -c "CREATE EXTENSION IF NOT EXISTS postgis"
+      - run: uv run pytest -q
+        env:
+          WORKERS_MODE: 'off'

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import app.models_registry  # noqa: F401  # populate Base.metadata for migration tests
 from app.config import get_settings
 from app.db import make_engine, make_session_factory
+
+os.environ.setdefault("WORKERS_MODE", "off")  # lifespans in tests must not spawn workers
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Force tests/test_migrations.py to run dead last, whole module.
+
+    Plain alphabetical collection already puts it after every other top-level
+    tests/*.py file, but tests/workers/ sorts after "test_..." ('w' > 't') and
+    would otherwise collect — and run — later. Its last test wipes the shared
+    test DB (downgrade base; every table dropped and re-created), so nothing
+    may run after it. list.sort is stable, so this only partitions
+    test_migrations.py to the end — relative order elsewhere is unchanged.
+    """
+    items.sort(key=lambda item: "test_migrations.py" in item.nodeid)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -40,6 +56,14 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
     async with factory() as session:
         yield session
         await session.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ratelimit():
+    from app.core import ratelimit
+
+    ratelimit.reset()
+    yield
 
 
 @asynccontextmanager

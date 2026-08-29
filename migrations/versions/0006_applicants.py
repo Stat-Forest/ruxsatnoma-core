@@ -169,6 +169,13 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
+    # 3.2b-purpose rows violate the restored (narrower) CHECK — delete them
+    # first. Downgrade-only data loss of ephemeral codes; the upgrade path
+    # above is untouched (it has run everywhere, this has run nowhere).
+    op.execute(
+        "DELETE FROM otp_codes WHERE purpose IN "
+        "('phone_verify_token', 'email_verify_token', 'eimzo_challenge')"
+    )
     op.drop_constraint("purpose_valid", "otp_codes", type_="check")
     op.create_check_constraint(
         "purpose_valid",
