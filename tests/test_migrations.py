@@ -55,7 +55,8 @@ async def test_autogenerate_diff_empty(engine):
 async def test_downgrade_upgrade_roundtrip(engine):
     """upgrade head → downgrade base → upgrade head (plan 03.4 ruling 16).
 
-    KEEP THIS TEST LAST IN THIS FILE (and this file is alphabetically last):
+    KEEP THIS TEST LAST IN THIS FILE (this file's ordering is guaranteed by the
+    collection hook in tests/conftest.py, not by alphabetical order):
     downgrade base wipes the shared test DB — every table is dropped and
     re-created; data other tests created is gone. Nothing may run after it."""
     url = get_settings().database_url_test

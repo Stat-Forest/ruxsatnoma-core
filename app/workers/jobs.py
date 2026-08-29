@@ -59,6 +59,13 @@ async def purge_stale_rows(factory: async_sessionmaker[AsyncSession]) -> dict[st
             )
         )
         counts["idempotency_keys"] = result.rowcount  # pyright: ignore[reportAttributeAccessIssue]
+        await audit.log(
+            db,
+            action="purge.run",
+            user_id=None,
+            correlation_id=f"job:{uuid.uuid4()}",
+            extra=counts,
+        )
         await db.commit()
     logger.info("job.purge_stale_rows", **counts)
     return counts

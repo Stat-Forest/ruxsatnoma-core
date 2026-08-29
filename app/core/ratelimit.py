@@ -36,6 +36,7 @@ def rate_limit(scope: str, setting_key: str):
 
     async def dep(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> None:
         per_minute = await settings_store.get_int(db, setting_key)
+        per_minute = max(1, per_minute)  # never divide by zero, whatever the setting holds
         ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
         bucket = _buckets.get((scope, ip))

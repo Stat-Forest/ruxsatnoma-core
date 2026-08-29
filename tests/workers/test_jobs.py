@@ -58,6 +58,11 @@ async def test_purge_deletes_only_stale_rows(engine, db):
     ).scalar_one()
     assert fresh_left == 1
 
+    audited = (
+        await db.execute(text("SELECT count(*) FROM audit_log WHERE action = 'purge.run'"))
+    ).scalar_one()
+    assert audited >= 1
+
 
 def _unique_stir() -> str:
     # Same shape as tests/modules/auth/test_legal_applicants.py's unique_stir():

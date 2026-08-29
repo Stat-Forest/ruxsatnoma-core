@@ -62,6 +62,8 @@ async def deliver_one(db: AsyncSession) -> bool:
     and the row is retried — no reaper, no stuck 'delivering' rows (ruling 5)."""
     row = await repo.pick_due(db)
     if row is None:
+        # Belt-and-braces: closes the open read transaction that made clock_timestamp necessary.
+        await db.rollback()
         return False
     started = time.monotonic()
     sender = SENDERS.get(row.destination)
@@ -90,7 +92,8 @@ async def deliver_one(db: AsyncSession) -> bool:
                 )
             else:
                 base = await settings_store.get_int(db, "outbox_backoff_base_minutes")
-                row.next_attempt_at = now + timedelta(minutes=base * 2 ** (row.attempts - 1))
+                # Clamp the exponent: unbounded growth can overflow datetime and poison the queue.
+                row.next_attempt_at = now + timedelta(minutes=base * 2 ** min(row.attempts - 1, 20))
         else:
             row.status = "delivered"
             row.delivered_at = now

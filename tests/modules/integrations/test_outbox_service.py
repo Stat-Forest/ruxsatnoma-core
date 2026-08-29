@@ -50,10 +50,11 @@ async def _drain(db) -> int:
 async def test_enqueue_and_deliver(db):
     msg = await service.enqueue(db, destination="_test_ok", payload={"n": 1})
     assert msg is not None
+    msg_id = msg.id  # read before the drain's idle rollback expires `msg` on this shared session
     await db.commit()
 
     assert await _drain(db) == 1
-    row = await db.get(OutboxMessage, msg.id)
+    row = await db.get(OutboxMessage, msg_id)
     assert row is not None and row.status == "delivered" and row.delivered_at is not None
     sender = senders.SENDERS["_test_ok"]
     assert sender.calls == [{"n": 1}]  # type: ignore[attr-defined]
@@ -116,10 +117,11 @@ async def test_unknown_destination_goes_dead_immediately(db):
 async def test_delivery_writes_integration_log(db):
     msg = await service.enqueue(db, destination="_test_ok", payload={"x": 1})
     assert msg is not None
+    msg_id = msg.id  # read before the drain's idle rollback expires `msg` on this shared session
     await db.commit()
     await _drain(db)
     rows = (
-        (await db.execute(select(IntegrationLog).where(IntegrationLog.endpoint == str(msg.id))))
+        (await db.execute(select(IntegrationLog).where(IntegrationLog.endpoint == str(msg_id))))
         .scalars()
         .all()
     )

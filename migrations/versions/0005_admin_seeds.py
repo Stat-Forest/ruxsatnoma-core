@@ -340,12 +340,16 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    reasons_id = CLASSIFIERS[0][0]
-    op.execute(
-        sa.text("DELETE FROM classifier_items WHERE classifier_id = CAST(:id AS uuid)").bindparams(
-            id=reasons_id
+    # All 5 seeded classifiers, not just rejection_reasons — once anything seeds
+    # items under the others too (3.6), downgrade must clear their rows before the
+    # classifiers themselves are deleted below, or the FK from classifier_items blocks it.
+    classifier_ids = [row[0] for row in CLASSIFIERS]
+    for classifier_id in classifier_ids:
+        op.execute(
+            sa.text(
+                "DELETE FROM classifier_items WHERE classifier_id = CAST(:id AS uuid)"
+            ).bindparams(id=classifier_id)
         )
-    )
 
     # These 14 regions are referenced by users.region_id (deferred FK closed in
     # 0004) and, transitively, by districts.region_id (seeded via `python -m
