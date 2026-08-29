@@ -36,3 +36,27 @@ class TemplateOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     warning: str | None = None
+
+
+class NotificationOut(BaseModel):
+    id: uuid.UUID
+    event_code: str
+    channel: str
+    subject: str | None
+    text: str = Field(validation_alias="rendered_text")
+    params: dict[str, Any]
+    status: str
+    object_type: str | None
+    object_id: uuid.UUID | None
+    created_at: datetime
+    read_at: datetime | None
+
+    model_config = {"populate_by_name": True}
+
+
+class UnreadCountOut(BaseModel):
+    count: int
+
+
+class MarkAllReadOut(BaseModel):
+    updated: int

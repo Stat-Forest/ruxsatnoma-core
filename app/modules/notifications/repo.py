@@ -1,8 +1,9 @@
 """SQL for notification templates and notifications. No business rules here."""
 
 import uuid
+from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.notifications.models import Notification, NotificationTemplate
@@ -76,3 +77,56 @@ async def list_templates(
 async def add(db: AsyncSession, row: NotificationTemplate | Notification) -> None:
     db.add(row)
     await db.flush()
+
+
+async def get_notification(db: AsyncSession, notification_id: uuid.UUID) -> Notification | None:
+    return await db.get(Notification, notification_id)
+
+
+def _inbox_stmt(user_id: uuid.UUID, unread_only: bool):
+    stmt = select(Notification).where(
+        Notification.recipient_user_id == user_id, Notification.channel == "inapp"
+    )
+    if unread_only:
+        stmt = stmt.where(Notification.read_at.is_(None))
+    return stmt
+
+
+async def list_inbox(
+    db: AsyncSession, *, user_id: uuid.UUID, unread_only: bool, page: int, page_size: int
+) -> tuple[list[Notification], int]:
+    stmt = _inbox_stmt(user_id, unread_only)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        (
+            await db.execute(
+                stmt.order_by(Notification.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows), total
+
+
+async def unread_count(db: AsyncSession, user_id: uuid.UUID) -> int:
+    return (
+        await db.execute(
+            select(func.count()).select_from(_inbox_stmt(user_id, unread_only=True).subquery())
+        )
+    ).scalar_one()
+
+
+async def mark_all_read(db: AsyncSession, user_id: uuid.UUID) -> int:
+    result = await db.execute(
+        update(Notification)
+        .where(
+            Notification.recipient_user_id == user_id,
+            Notification.channel == "inapp",
+            Notification.read_at.is_(None),
+        )
+        .values(read_at=datetime.now(UTC))
+    )
+    return result.rowcount  # pyright: ignore[reportAttributeAccessIssue]

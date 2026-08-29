@@ -16,6 +16,7 @@ class UserOut(BaseModel):
     phone: str | None
     email: str | None
     must_change_password: bool
+    language: str
 
 
 class RoleOut(BaseModel):
@@ -215,3 +216,7 @@ class ContactUpdateIn(BaseModel):
         if (self.phone is None) == (self.email is None):
             raise ValueError("exactly one of phone/email must be set")
         return self
+
+
+class LanguageIn(BaseModel):
+    language: Literal["uz_cyrl", "uz_latn", "ru", "kaa", "en"]

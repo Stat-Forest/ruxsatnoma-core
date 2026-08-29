@@ -3,16 +3,20 @@ upper modules call inside their own transaction (plan 03.5 ruling 4)."""
 
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.errors import err
 from app.modules.audit import service as audit
+from app.modules.auth import service as auth_service
+from app.modules.integrations import service as integrations_service
 from app.modules.notifications import repo
-from app.modules.notifications.models import NotificationTemplate
+from app.modules.notifications.models import CHANNELS, Notification, NotificationTemplate
 from app.modules.notifications.schemas import TemplateIn
 
 logger = structlog.get_logger(__name__)
@@ -137,3 +141,131 @@ async def archive_template(
         ip=ip,
     )
     return row
+
+
+DEFAULT_CHANNELS = ("inapp", "sms")
+
+
+def _fallback_body(event_code: str, params: Mapping[str, Any]) -> str:
+    """Ruling 10: an in-app notification is never lost to a missing template. The
+    text is deliberately raw — an administrator seeing it knows a template is due."""
+    rendered = ", ".join(f"{key}={value}" for key, value in sorted(params.items()))
+    return f"{event_code}: {rendered}" if rendered else event_code
+
+
+async def _transport_allowed(
+    db: AsyncSession, *, channel: str, contact: auth_service.NotificationContact
+) -> bool:
+    if contact.status != "active":
+        return False
+    if channel == "sms":
+        return bool(
+            contact.phone
+            and contact.phone_verified
+            and await settings_store.get_bool(db, "notifications_sms_enabled")
+        )
+    return bool(contact.email and contact.email_verified)
+
+
+async def notify(
+    db: AsyncSession,
+    *,
+    event_code: str,
+    recipient_user_id: uuid.UUID,
+    params: Mapping[str, Any] | None = None,
+    channels: Sequence[str] | None = None,
+    object_type: str | None = None,
+    object_id: uuid.UUID | None = None,
+    correlation_id: str | None = None,
+) -> list[Notification]:
+    """Create the notification rows for one event, in the CALLER'S transaction.
+
+    In-app is always written (С19: legally significant notifications reach the
+    cabinet even when other channels are off). Transport channels are enqueued on
+    the 3.4 outbox and delivered by its worker — nothing is sent from a request.
+    """
+    values = dict(params or {})
+    requested = tuple(channels) if channels is not None else DEFAULT_CHANNELS
+    unknown = sorted(set(requested) - set(CHANNELS))
+    if unknown:  # a caller typo, not user input — fail loudly in dev and in tests
+        raise ValueError(f"unknown notification channels: {unknown}")
+    contact = await auth_service.get_notification_contact(db, recipient_user_id)
+    if contact is None:
+        raise ValueError(f"unknown notification recipient: {recipient_user_id}")
+
+    created: list[Notification] = []
+    for channel in ("inapp", *(c for c in requested if c != "inapp")):
+        template = await repo.get_active_template(db, event_code=event_code, channel=channel)
+        if template is None:
+            if channel != "inapp":
+                continue  # never send an unrendered SMS
+            logger.error("notification.template_missing", event_code=event_code, channel=channel)
+        if channel != "inapp" and not await _transport_allowed(
+            db, channel=channel, contact=contact
+        ):
+            continue
+        row = Notification(
+            recipient_user_id=contact.user_id,
+            channel=channel,
+            event_code=event_code,
+            template_id=template.id if template else None,
+            params=values,
+            language=contact.language,
+            subject=(
+                render(template.subject, values, contact.language)
+                if template is not None and template.subject
+                else None
+            ),
+            rendered_text=(
+                render(template.body, values, contact.language)
+                if template is not None
+                else _fallback_body(event_code, values)
+            ),
+            object_type=object_type,
+            object_id=object_id,
+            correlation_id=correlation_id,
+        )
+        await repo.add(db, row)
+        if channel == "inapp":
+            row.status = "delivered"
+            row.delivered_at = datetime.now(UTC)
+        else:
+            message = await integrations_service.enqueue(
+                db,
+                destination=channel,
+                payload={"notification_id": str(row.id)},
+                correlation_id=correlation_id,
+            )
+            assert message is not None  # no idempotency key ⇒ always a fresh row
+            row.outbox_message_id = message.id
+        created.append(row)
+    return created
+
+
+async def list_inbox(
+    db: AsyncSession, *, user_id: uuid.UUID, unread_only: bool, page: int, page_size: int
+) -> tuple[list[Notification], int]:
+    return await repo.list_inbox(
+        db, user_id=user_id, unread_only=unread_only, page=page, page_size=page_size
+    )
+
+
+async def unread_count(db: AsyncSession, user_id: uuid.UUID) -> int:
+    return await repo.unread_count(db, user_id)
+
+
+async def mark_read(
+    db: AsyncSession, notification_id: uuid.UUID, *, user_id: uuid.UUID
+) -> Notification:
+    """Reading someone else's notification must be indistinguishable from reading a
+    row that does not exist — a 403 would confirm the id is real."""
+    row = await repo.get_notification(db, notification_id)
+    if row is None or row.recipient_user_id != user_id or row.channel != "inapp":
+        raise err("ERR-SYS-003", details={"notification": str(notification_id)})
+    if row.read_at is None:
+        row.read_at = datetime.now(UTC)
+    return row
+
+
+async def mark_all_read(db: AsyncSession, user_id: uuid.UUID) -> int:
+    return await repo.mark_all_read(db, user_id)
