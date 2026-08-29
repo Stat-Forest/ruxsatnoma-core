@@ -9,10 +9,17 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core.models import MediaFile
 from app.db import uuid7
+from app.main import create_app
 from app.modules.admin.models import Organization
+from app.modules.auth.models import Applicant
 from app.modules.gis.models import Contour, GisLayer
+from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE, LAYERS_MANAGE
+from tests.conftest import make_client
+from tests.modules.admin.test_organizations_admin import auth_client, signed_in_with
+from tests.modules.auth.test_sessions import make_session, make_user
 
 
 def box_wkt(min_lon: float, min_lat: float, size: float = 0.01) -> str:
@@ -93,3 +100,76 @@ async def make_contour(
     db.add(contour)
     await db.flush()
     return contour
+
+
+# --- Signed-in client fixtures for the gis HTTP API (task 2) -----------------
+#
+# Thin wrappers over helpers this codebase already has: make_user/make_session
+# (tests/modules/auth/test_sessions.py) and signed_in_with/auth_client
+# (tests/modules/admin/test_organizations_admin.py) build the user and the
+# session cookies; make_client (tests/conftest.py) drives a real app instance.
+# Task 3+ fixtures needing a different permission mix are added here, not in a
+# second file.
+
+
+@pytest.fixture(autouse=True)
+def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
+    """Same guard as tests/modules/notifications/conftest.py: the app under test
+    must open the TEST database, not the dev one."""
+    monkeypatch.setenv("DATABASE_URL", get_settings().database_url_test)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def unique_pinfl() -> str:
+    # Leading digit 2: 3/4/5/6/7 are already claimed by other test modules
+    # sharing this same persistent test DB (see tests/core/test_files_api.py's
+    # own comment on the same convention).
+    return f"2{uuid.uuid4().int % 10**13:013d}"
+
+
+async def _client_for(db: AsyncSession, *permissions: str):
+    user, token, csrf = await signed_in_with(db, *permissions)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        yield auth_client(client, token, csrf)
+
+
+@pytest.fixture
+async def gis_client(db: AsyncSession):
+    """The GIS specialist: draws, edits and imports, but never approves."""
+    async for client in _client_for(db, CONTOURS_MANAGE, LAYERS_MANAGE):
+        yield client
+
+
+@pytest.fixture
+async def rahbar_client(db: AsyncSession):
+    """The approver: approves and publishes, does not draw."""
+    async for client in _client_for(db, CONTOURS_APPROVE):
+        yield client
+
+
+@pytest.fixture
+async def applicant_client(db: AsyncSession):
+    """A fully registered applicant (role_code="applicant" WITH its own
+    `Applicant` row) — not a grantless executor_staff user standing in for one.
+
+    `signed_in_with(db)` with no codes would authenticate fine too (no gis route
+    checks a permission an applicant lacks by construction), but get_current_user
+    (app/modules/auth/deps.py) additionally gates any applicant-role user that
+    has no linked Applicant row to a short exempt-path list (ERR-AUTH-008) that
+    does not include /gis/*, and later gis read rules (contours, applications)
+    turn on the role itself, not just held permissions — so the fixture must be
+    a real, fully registered applicant. Shape mirrors
+    tests/core/test_files_api.py::registered_applicant.
+    """
+    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    db.add(
+        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+    )
+    await db.flush()
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        yield auth_client(client, token, csrf)
