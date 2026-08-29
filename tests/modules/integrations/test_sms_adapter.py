@@ -109,7 +109,26 @@ async def test_an_error_never_leaks_the_message_text_or_the_phone(db):
 
 
 async def test_a_transport_timeout_becomes_an_eskiz_error(db):
+    """Every request fails here, so the timeout actually lands on the login call
+    (there is no cached token yet) — this covers `_login`'s except block. See
+    `test_a_transport_timeout_during_send_becomes_an_eskiz_error` below for
+    `_post_send`'s (review finding, task 5: the two branches look alike but are
+    reached by different requests)."""
+
     def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("timed out")
+
+    with pytest.raises(EskizError):
+        await _sender(handler).send(phone="998901234567", text="hi", reference="r")
+
+
+async def test_a_transport_timeout_during_send_becomes_an_eskiz_error(db):
+    """Login succeeds, so the timeout lands on POST /api/message/sms/send instead
+    — this is the branch the test above does NOT reach."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, json={"data": {"token": "tok"}})
         raise httpx.ConnectTimeout("timed out")
 
     with pytest.raises(EskizError):
