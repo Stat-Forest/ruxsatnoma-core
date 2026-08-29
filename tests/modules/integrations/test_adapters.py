@@ -73,6 +73,27 @@ async def test_otp_sender_mock_records():
     assert get_otp_sender() is sender  # singleton for introspection
 
 
+async def test_otp_sender_uses_real_when_only_email_mode_is_real(monkeypatch):
+    """sms_mode=mock + email_mode=real must not fall back to MockOtpSender: an
+    explicitly-configured real channel must never be silently swallowed by the
+    other, still-mocked switch (review finding, plan 03.5 Task 6). Mirrors
+    test_sms_adapter.test_real_mode_returns_the_eskiz_sender's env-patch shape."""
+    from app.config import get_settings
+    from app.modules.integrations.adapters import otp_sender
+
+    monkeypatch.setenv("SMS_MODE", "mock")
+    monkeypatch.setenv("EMAIL_MODE", "real")
+    monkeypatch.setenv("SMTP_HOST", "smtp.test")
+    monkeypatch.setenv("SMTP_FROM", "Ruxsatnoma <robot@example.com>")
+    get_settings.cache_clear()
+    otp_sender.get_otp_sender.cache_clear()
+    try:
+        assert isinstance(otp_sender.get_otp_sender(), otp_sender.RealOtpSender)
+    finally:
+        get_settings.cache_clear()
+        otp_sender.get_otp_sender.cache_clear()
+
+
 async def test_oneid_profile_new_fields_roundtrip():
     profile = OneIdProfile(
         pinfl="12345678901234",

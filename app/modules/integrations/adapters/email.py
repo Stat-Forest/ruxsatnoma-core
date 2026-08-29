@@ -67,8 +67,16 @@ class SmtpEmailSender:
         except Exception as exc:
             # Same rule as the SMS sender: the body never reaches last_error.
             raise EmailError(f"smtp send failed: {type(exc).__name__}") from None
-        logger.info("email.smtp_send", to=to)
+        logger.info("email.smtp_send", to=_mask_email(to))
         return message["Message-ID"]
+
+
+def _mask_email(address: str) -> str:
+    """E-mail addresses are personal data; log the local part's first character
+    and the full domain only (auth._mask_target idiom, mirrored here — integrations
+    is level 0 and cannot import from auth — same reasoning as sms._mask)."""
+    local, _, host = address.partition("@")
+    return f"{local[:1]}***@{host}" if host else "***"
 
 
 @lru_cache(maxsize=1)

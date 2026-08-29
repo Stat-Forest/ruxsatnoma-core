@@ -39,6 +39,8 @@ async def test_sends_a_plain_text_message_with_the_configured_sender(captured):
     assert message_id == message["Message-ID"]
     assert captured[0]["kwargs"]["hostname"] == "smtp.test"
     assert captured[0]["kwargs"]["port"] == 587
+    assert captured[0]["kwargs"]["start_tls"] == SETTINGS.smtp_starttls
+    assert captured[0]["kwargs"]["timeout"] == SmtpEmailSender.TIMEOUT_SECONDS
 
 
 async def test_an_empty_subject_gets_the_default_one(captured):
@@ -75,3 +77,38 @@ async def test_prod_forbids_the_email_mock():
             eskiz_sender="c",
             eskiz_callback_secret="d",
         )
+
+
+async def test_real_mode_returns_the_smtp_sender(monkeypatch):
+    """Mirrors test_sms_adapter.test_real_mode_returns_the_eskiz_sender: the
+    factory-selection logic itself must be under test, not just the sender class
+    constructed directly (review finding, plan 03.5 Task 6)."""
+    from app.config import get_settings
+    from app.modules.integrations.adapters import email
+
+    monkeypatch.setenv("EMAIL_MODE", "real")
+    monkeypatch.setenv("SMTP_HOST", "smtp.test")
+    monkeypatch.setenv("SMTP_FROM", "Ruxsatnoma <robot@example.com>")
+    get_settings.cache_clear()
+    email.get_email_sender.cache_clear()
+    try:
+        assert isinstance(email.get_email_sender(), email.SmtpEmailSender)
+    finally:
+        get_settings.cache_clear()
+        email.get_email_sender.cache_clear()
+
+
+def test_mask_email():
+    """The success log must show only the local part's first character and the
+    full domain (review finding: the log line used to echo `to` unmasked)."""
+    from app.modules.integrations.adapters.email import _mask_email
+
+    assert _mask_email("user@example.com") == "u***@example.com"
+
+
+def test_mask_email_without_an_at_sign_never_echoes_the_input():
+    """Defense in depth, mirrors auth._mask_target's degenerate branch: must
+    degrade safely rather than echo the original value back."""
+    from app.modules.integrations.adapters.email import _mask_email
+
+    assert _mask_email("not-an-email") == "***"

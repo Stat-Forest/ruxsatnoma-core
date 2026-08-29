@@ -48,6 +48,12 @@ class RealOtpSender:
 
 @lru_cache(maxsize=1)
 def get_otp_sender() -> OtpSender:
-    if get_settings().sms_mode == "mock":
+    """Mock only when BOTH sms_mode and email_mode are mock. Either one set to
+    real must route through RealOtpSender — otherwise an explicitly-configured
+    real channel would be silently swallowed by the other, still-mocked switch
+    (review finding, plan 03.5 Task 6). In practice only two combinations occur:
+    both mock (dev/tests) and both real (prod, per Settings' prod guard)."""
+    settings = get_settings()
+    if settings.sms_mode == "mock" and settings.email_mode == "mock":
         return MockOtpSender()
     return RealOtpSender()
