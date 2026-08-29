@@ -3,17 +3,21 @@
 import asyncio
 import secrets
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import structlog
 from cryptography.fernet import InvalidToken
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store
 from app.core.crypto import decrypt_str
 from app.core.errors import err
 from app.core.models import MediaFile
+from app.core.schemas import LOCALES
 from app.core.security import (
     hash_otp,
     hash_password,
@@ -26,7 +30,15 @@ from app.core.security import (
 from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo
-from app.modules.auth.models import Applicant, OtpCode, Representation, Session, User, UserConsent
+from app.modules.auth.models import (
+    Applicant,
+    OtpCode,
+    Representation,
+    Role,
+    Session,
+    User,
+    UserConsent,
+)
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
 from app.modules.integrations.adapters.oneid import OneIdError, get_oneid_adapter
@@ -801,4 +813,69 @@ async def update_contact(
         user_id=user.id,
         extra={"field": "phone" if phone is not None else "email"},
         ip=ip,
+    )
+
+
+@dataclass(frozen=True)
+class NotificationContact:
+    """What `notifications` (level 2) needs to know about a recipient. Returning a
+    plain value object keeps the module boundary intact: no User instance and no
+    auth table leaves this service (design/01 rule 2)."""
+
+    user_id: uuid.UUID
+    full_name: str
+    language: str
+    status: str
+    phone: str | None
+    phone_verified: bool
+    email: str | None
+    email_verified: bool
+
+
+async def get_notification_contact(
+    db: AsyncSession, user_id: uuid.UUID
+) -> NotificationContact | None:
+    user = await db.get(User, user_id)
+    if user is None:
+        return None
+    return NotificationContact(
+        user_id=user.id,
+        full_name=user.full_name,
+        language=user.language,
+        status=user.status,
+        phone=user.phone,
+        phone_verified=user.phone_verified_at is not None,
+        email=user.email,
+        email_verified=user.email_verified_at is not None,
+    )
+
+
+async def list_user_ids_by_role_codes(
+    db: AsyncSession, role_codes: Sequence[str]
+) -> list[uuid.UUID]:
+    """Active users holding one of these roles — the audience of system alerts."""
+    rows = (
+        await db.execute(
+            select(User.id)
+            .join(Role, Role.id == User.role_id)
+            .where(Role.code.in_(role_codes), User.status == "active")
+        )
+    ).scalars()
+    return list(rows)
+
+
+async def set_language(db: AsyncSession, user: User, language: str, *, ip: str | None) -> None:
+    """Notification language (ruling 17). Not routed through the OTP-guarded contact
+    change: switching UI language is not a contact change."""
+    if language not in LOCALES:
+        raise err("ERR-VAL-001", details={"field": "language"})
+    user.language = language
+    await audit.log(
+        db,
+        action="user.set_language",
+        user_id=user.id,
+        object_type="user",
+        object_id=user.id,
+        ip=ip,
+        extra={"language": language},
     )

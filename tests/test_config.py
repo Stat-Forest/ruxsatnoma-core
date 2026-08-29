@@ -38,6 +38,14 @@ def test_prod_accepts_custom_secret_key():
         oneid_mode="real",
         eimzo_mode="real",
         sms_mode="real",
+        email_mode="real",
+        eskiz_email="bot@example.uz",
+        eskiz_password="a-real-eskiz-password",
+        eskiz_sender="4546",
+        eskiz_callback_secret="a-real-callback-secret",
+        public_base_url="https://ruxsatnoma.example.uz",
+        smtp_host="smtp.example.uz",
+        smtp_from="noreply@example.uz",
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert s.secret_key == "a-real-secret-value"
@@ -80,7 +88,91 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("SECRET_KEY", "real-secret-for-prod-guard-test")
     monkeypatch.setenv("S3_SECRET_KEY", "real-s3-secret-for-prod-guard-test")
-    for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE"):
+    for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE", "EMAIL_MODE"):
         monkeypatch.setenv(name, "real")
+    monkeypatch.setenv("ESKIZ_EMAIL", "bot@example.uz")
+    monkeypatch.setenv("ESKIZ_PASSWORD", "real-eskiz-password-for-prod-guard-test")
+    monkeypatch.setenv("ESKIZ_SENDER", "4546")
+    monkeypatch.setenv("ESKIZ_CALLBACK_SECRET", "real-callback-secret-for-prod-guard-test")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ruxsatnoma.example.uz")
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.uz")
+    monkeypatch.setenv("SMTP_FROM", "noreply@example.uz")
     settings = Settings()
     assert settings.oneid_mode == "real"
+
+
+def test_sms_mode_real_requires_eskiz_credentials():
+    # sms_mode=real is checked unconditionally (not just under app_env=prod), and
+    # ALL four Eskiz fields are required — leave exactly one empty to prove the
+    # `all(...)` guard, not just an "all missing" case.
+    with pytest.raises(ValidationError, match="sms_mode=real requires"):
+        Settings(
+            sms_mode="real",
+            eskiz_email="bot@example.uz",
+            eskiz_password="a-real-eskiz-password",
+            eskiz_sender="4546",
+            eskiz_callback_secret="",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+
+def test_email_mode_real_requires_smtp_host_and_from():
+    with pytest.raises(ValidationError, match="email_mode=real requires"):
+        Settings(
+            email_mode="real",
+            smtp_host="",
+            smtp_from="",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+
+def test_sms_mode_real_requires_a_reachable_public_base_url():
+    """The one Eskiz setting the guard used to miss, and the only one whose default
+    (`http://localhost:8000`) is a working-looking value: a prod deploy that sets
+    the four credentials and forgets the base URL still SENDS every SMS while every
+    delivery report goes nowhere, leaving each notification at `sent` forever with
+    no error anywhere (final whole-branch review of 3.5, finding 6)."""
+
+    def _settings(**overrides: str) -> Settings:
+        return Settings(
+            sms_mode="real",
+            eskiz_email="bot@example.uz",
+            eskiz_password="a-real-eskiz-password",
+            eskiz_sender="4546",
+            eskiz_callback_secret="a-real-callback-secret",
+            **overrides,
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+    with pytest.raises(ValidationError, match="public_base_url"):
+        _settings()  # the default, http://localhost:8000, looks configured but is not
+    with pytest.raises(ValidationError, match="public_base_url"):
+        _settings(public_base_url="http://127.0.0.1:8000")
+    assert _settings(public_base_url="https://ruxsatnoma.uz").public_base_url == (
+        "https://ruxsatnoma.uz"
+    )
+
+
+def test_env_example_is_a_working_env_file(tmp_path, monkeypatch):
+    """`cp .env.example .env` is the README's documented first step, so every entry
+    in that file must be a value the app can actually start on. pydantic-settings
+    does NOT ignore an empty env value: `EMAIL_MODE=` fails the Literal, `SMTP_PORT=`
+    fails int, `SMTP_STARTTLS=` fails bool, and `ESKIZ_BASE_URL=` silently replaces
+    a working default with "" (final whole-branch review of 3.5, finding 7)."""
+    import os
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parent.parent / ".env.example"
+    for field in Settings.model_fields:
+        monkeypatch.delenv(field.upper(), raising=False)  # the file, not this shell
+    target = tmp_path / ".env"
+    target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    assert os.environ.get("EMAIL_MODE") is None
+
+    settings = Settings(_env_file=target)  # pyright: ignore[reportCallIssue]
+
+    assert settings.email_mode == "mock"
+    assert settings.smtp_port == 587
+    assert settings.smtp_starttls is True
+    assert settings.eskiz_base_url.startswith("https://")
+    assert settings.public_base_url.startswith("http")

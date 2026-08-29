@@ -1,5 +1,6 @@
 """Outbox service: enqueue atomicity, delivery, backoff, dead, requeue, log."""
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -8,7 +9,7 @@ from sqlalchemy import select, text
 
 from app.core.errors import DomainError
 from app.db import uuid7
-from app.modules.integrations import repo, senders, service
+from app.modules.integrations import breaker, repo, senders, service
 from app.modules.integrations.models import InboundDeadLetter, IntegrationLog, OutboxMessage
 from tests.modules.auth.test_sessions import make_user
 
@@ -30,7 +31,7 @@ def _test_destination():
     """A controllable sender registered for this module's tests."""
     calls: list[dict] = []
 
-    async def ok_sender(payload: dict) -> None:
+    async def ok_sender(db, payload: dict) -> None:
         calls.append(payload)
 
     senders.SENDERS["_test_ok"] = ok_sender
@@ -70,7 +71,7 @@ async def test_enqueue_duplicate_idempotency_key_returns_none(db):
 
 
 async def test_failed_delivery_backs_off_then_dies(db):
-    async def boom(payload: dict) -> None:
+    async def boom(db, payload: dict) -> None:
         raise RuntimeError("provider down")
 
     senders.SENDERS["_test_boom"] = boom
@@ -94,6 +95,11 @@ async def test_failed_delivery_backs_off_then_dies(db):
             {"id": str(msg.id)},
         )
         await db.commit()
+        # This test is about the attempts/backoff/dead escalation, not the
+        # breaker (that has its own suite, test_breaker.py) — 8 straight
+        # failures on one destination is exactly what trips it, so keep it
+        # out of the way here.
+        breaker.reset()
         assert await service.deliver_one(db) is True
         await db.refresh(row)
         assert row.attempts == expected_attempts
@@ -253,3 +259,46 @@ async def test_list_dead_letters_and_get_dead_letter(db):
     fetched = await repo.get_dead_letter(db, letter.id)
     assert fetched is not None and fetched.id == letter.id
     assert await repo.get_dead_letter(db, uuid7()) is None
+
+
+async def test_requeue_clears_the_alert_stamp(db):
+    """`alert_dead_outbox` selects `status='dead' AND alerted_at IS NULL`. Leaving
+    the stamp on a requeued row makes its SECOND death silent — nobody is told, and
+    the notification it carried stays `queued` forever behind a dead transport
+    (final whole-branch review of 3.5, finding 5)."""
+    user = await make_user(db)
+    msg = await service.enqueue(db, destination="_no_such", payload={})
+    assert msg is not None
+    msg_id = msg.id
+    await db.commit()
+    await service.deliver_one(db)  # goes dead
+
+    dead = await db.get(OutboxMessage, msg_id)
+    assert dead is not None
+    dead.alerted_at = datetime.now(UTC)  # what alert_dead_outbox would have stamped
+    await db.flush()
+
+    row = await service.requeue_message(db, msg_id, actor_id=user.id, ip=None)
+    assert row.status == "pending"
+    assert row.alerted_at is None
+
+
+async def test_a_huge_dead_letter_payload_is_capped(db):
+    """`record_dead_letter` is reachable anonymously through the Eskiz callback and
+    persists whatever body arrives, while `error` right beside it is truncated. No
+    body-size middleware exists and no purge job covers dead letters (final review,
+    finding 4)."""
+    row = await service.record_dead_letter(
+        db, source="eskiz", payload={"blob": "x" * 200_000}, error="unknown reference"
+    )
+    assert len(json.dumps(row.payload)) <= service.DEAD_LETTER_PAYLOAD_MAX_BYTES + 200
+    assert row.payload["truncated"] is True
+    assert row.payload["original_bytes"] > service.DEAD_LETTER_PAYLOAD_MAX_BYTES
+    assert "xxx" in row.payload["preview"]  # a triage-sized sample survives
+
+    # A normal-sized report is stored untouched — the cap must not reshape the
+    # payload an administrator actually needs to read.
+    small = await service.record_dead_letter(
+        db, source="eskiz", payload={"status": "DELIVRD"}, error="unknown reference"
+    )
+    assert small.payload == {"status": "DELIVRD"}

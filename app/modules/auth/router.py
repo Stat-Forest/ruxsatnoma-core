@@ -26,6 +26,7 @@ from app.modules.auth.schemas import (
     ContactUpdateIn,
     EimzoChallengeOut,
     EimzoLoginIn,
+    LanguageIn,
     LoginIn,
     LoginOut,
     MeOut,
@@ -380,6 +381,22 @@ async def patch_me(
         email=str(body.email) if body.email else None,
         otp_token=body.otp_token,
         ip=request.client.host if request.client else None,
+    )
+    role = await repo.get_role(db, user.role_id)
+    assert role is not None
+    return await _me_out(db, user, role, session_row.csrf_token)
+
+
+@router.put("/me/language", response_model=MeOut)
+async def put_my_language(
+    body: LanguageIn,
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    session_row: Annotated[Session, Depends(get_current_session)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MeOut:
+    await service.set_language(
+        db, user, body.language, ip=request.client.host if request.client else None
     )
     role = await repo.get_role(db, user.role_id)
     assert role is not None

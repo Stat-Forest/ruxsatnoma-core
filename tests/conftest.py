@@ -66,6 +66,14 @@ def _reset_ratelimit():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_breaker():
+    from app.modules.integrations import breaker
+
+    breaker.reset()
+    yield
+
+
 @asynccontextmanager
 async def make_client(
     app, *, lifespan: bool = False, raise_app_exceptions: bool = False

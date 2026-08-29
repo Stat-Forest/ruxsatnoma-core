@@ -220,6 +220,13 @@ Rules for this file:
 - **How to apply:** The env name is the field name upper-cased. To prove a var
   actually lands: `uv run python -c "from app.config import get_settings;
   print(get_settings().<field>)"`.
+- **And the opposite failure:** an EMPTY value is not ignored, it is parsed.
+  `EMAIL_MODE=`/`SMTP_PORT=`/`SMTP_STARTTLS=` fail validation outright and
+  `ESKIZ_BASE_URL=` silently replaces a working default with `""`, so
+  `cp .env.example .env` — the README's first step — would not start (3.5 final
+  review). Every line in that file carries a real value or is commented out;
+  `tests/test_config.py::test_env_example_is_a_working_env_file` builds `Settings`
+  from a copy of it and is the guard.
 
 ## Log `repr(e)`, not `f"{e}"`
 
@@ -309,3 +316,151 @@ Rules for this file:
   already stuck mid-task, `git stash push .pre-commit-config.yaml` in your own
   tree is safer than `--no-verify`; if you do use `--no-verify`, run `make check`
   by hand and say so in the PR.
+
+## An outbox sender's return/raise choice IS the retry decision
+
+- **Rule:** A sender registered with `register_sender` must RETURN when a
+  failure is permanent (nothing will fix itself by retrying) and RAISE only
+  when a retry could plausibly help — the worker (`deliver_one`) retries on any
+  raised exception and treats a normal return as delivered.
+- **Why:** `notifications._deliver` sets the row `failed` and returns instead
+  of raising when the recipient has no verified phone/e-mail; raising there
+  would retry an unreachable recipient up to `outbox_max_attempts` times for
+  the exact same outcome, burning the circuit breaker's failure count and
+  holding back every other queued message on that destination for nothing.
+- **How to apply:** Before writing `raise` in a sender, ask "would a second
+  attempt with the same input succeed?" If no, set the terminal status
+  yourself and `return`.
+- **The mirror-image bug, hit in 3.5's final review:** the same helper answered
+  both "is this recipient reachable" (permanent) and "is the ops kill switch on"
+  (temporary), and `_deliver` treated both as permanent — so flipping
+  `notifications_sms_enabled` off for an hour DESTROYED every queued SMS with a
+  reason blaming the recipient, unrecoverably (admin requeue only works on `dead`
+  rows). A condition an operator can reverse must RAISE. Never let one boolean
+  stand for a permanent and a temporary reason at once.
+
+## `str.format` on admin-authored text is an attribute-access hole
+
+- **Rule:** Never render user/admin-authored template text with `str.format`
+  or an f-string; substitute placeholders with a whitelist regex
+  (`\{([a-z][a-z0-9_]*)\}`) instead.
+- **Why:** `"{x.__class__}".format(x=obj)` reaches Python attributes on
+  whatever object is passed in, and `.format()` raises `KeyError` on a
+  placeholder the caller forgot to supply — inside a business transaction that
+  turns an admin's typo into a failed application submission, not a rendering
+  glitch.
+- **How to apply:** Any text a non-developer can author and the code later
+  renders (notification templates today; announcements, rejection reasons or
+  report labels tomorrow) goes through `notifications.service.render`'s
+  pattern, never `.format(**params)`.
+
+## A partial unique index needs a `flush()` between the archive and the insert
+
+- **Rule:** When "supersede" means archive-the-old-row then insert-a-new-
+  active-one under a partial unique index (`WHERE status='active'`), `flush()`
+  after the archive UPDATE and before the new INSERT.
+- **Why:** Without the flush, the UPDATE and the INSERT are both still pending
+  in the same transaction when the index has to be checked — the old row has
+  not yet been "seen" as archived, so the insert can raise `IntegrityError` on
+  a conflict a flush would already have resolved.
+- **How to apply:** Every supersede-shaped write (classifier items since
+  3.3a, notification templates since 3.5) follows `old.status = "archived"`,
+  `await db.flush()`, then `db.add(new_row)` — copy that order, not just the
+  two statements.
+
+## Senders registered at module import must be imported by the standalone worker too
+
+- **Rule:** A destination registered via `register_sender(...)` at module
+  import time (e.g. inside `notifications/service.py`) only exists in a
+  process that actually imported that module — add the import to
+  `app/workers/outbox.py` explicitly, with a comment, in the same commit that
+  adds the destination.
+- **Why:** In every test and in the embedded-worker deployment, `app.main`
+  imports the routers, which transitively import `notifications.service`, so
+  registration always "just happens" — a standalone `python -m app.workers`
+  process imports neither, so without the explicit import every notification
+  goes `dead` as `unknown destination`, and no in-process test can ever catch
+  it (only a subprocess test that imports `app.workers.outbox` alone can).
+- **How to apply:** New outbox destination → grep `app/workers/outbox.py` for
+  the registering import → add it if missing → write or extend the subprocess
+  registration test.
+
+## A parsed form body can hold non-str values that a JSONB column cannot
+
+- **Rule:** Before storing a `request.form()` dict as JSON(B), coerce every
+  value to `str` (or a short type marker) — never assume form fields are
+  strings.
+- **Why:** A `multipart/form-data` file part parses to Starlette's
+  `UploadFile`, not a string; `json.dumps` cannot serialize it, so an
+  untouched form dict reaching a JSONB bind (the Eskiz callback's dead-letter
+  payload) 500'd on a one-line curl against an anonymous, internet-facing
+  route — exactly the case the route exists to survive.
+- **How to apply:** Any endpoint that accepts `request.form()` from an
+  untrusted or anonymous caller and persists the result:
+  `{k: v if isinstance(v, str) else f"<{type(v).__name__}>" for k, v in
+  form.items()}`, never a bare dict comprehension.
+
+## An in-place UPDATE leaves an `onupdate=func.now()` column expired, not refreshed
+
+- **Rule:** After mutating a row in place (an UPDATE, not an INSERT) and
+  flushing, `await db.refresh(row)` before returning/serializing it if the
+  response reads a column with `onupdate=func.now()` and no client-side
+  default.
+- **Why:** SQLAlchemy fetches a fresh `onupdate` value via `RETURNING` on an
+  INSERT but leaves it expired after a plain UPDATE; reading it outside the
+  session's async context then raises `MissingGreenlet` —
+  `notifications.service.archive_template` hit this serializing `updated_at`,
+  even though the sibling classifier-archive path (a bare `flush()`, no
+  read-back) never needed one.
+- **How to apply:** Whenever a service both mutates a row's `onupdate` column
+  AND returns/serializes that same row in the same call, add `refresh()`
+  after the `flush()` — don't assume an existing archive-path precedent
+  covers it.
+
+## A JSONB column fed by the stock `json.dumps` rejects `Decimal` and `date`
+
+- **Rule:** Coerce anything that is not a JSON primitive to `str` BEFORE it reaches
+  a JSONB bind — the engine configures no `json_serializer`, so there is no
+  encoder to fall back on.
+- **Why:** `notifications.params` is stored raw, and the seeded templates ask for
+  `{amount}` (a `Decimal` — money is `numeric` by project convention) and
+  `{due_date}`/`{valid_from}` (`date`). The natural 3.10 call would raise
+  `TypeError: Object of type Decimal is not JSON serializable` at flush, INSIDE
+  the caller's business transaction — turning invoice issuance into a 500, the
+  one outcome ruling 10 exists to prevent (3.5 final review; `service._jsonable`).
+- **How to apply:** Any new JSONB column written from domain values gets the same
+  coercion at its single write point, plus a test with a `Decimal` and a `date`.
+
+## `secrets.compare_digest` raises `TypeError` on non-ASCII strings
+
+- **Rule:** Compare secrets as BYTES — `compare_digest(a.encode(), b.encode())` —
+  whenever either side can come from a URL path, a header or a query string.
+- **Why:** `POST /api/v1/webhooks/eskiz/%CE%A9` hit the blanket 500 handler instead
+  of the intended 404, on the one route whose stated invariant is that it never
+  500s on garbage (3.5 final review). The str form only accepts ASCII operands.
+- **How to apply:** Every future provider webhook (Payme at 3.10, my.gov.uz later)
+  compares bytes, and gets a non-ASCII-path test alongside its wrong-secret test.
+
+## Never ask a provider for a callback you cannot correlate
+
+- **Rule:** Only request a delivery report / webhook for a send that has a stored
+  row to correlate it against; pass an explicit "no callback" flag otherwise.
+- **Why:** `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender`
+  passed a throwaway uuid as the reference, so at `sms_mode=real` EVERY OTP would
+  have produced one `inbound_dead_letters` row (holding the recipient's phone
+  number) plus one `integration_log` row, forever — no purge job covers dead
+  letters, and the DLQ's triage purpose would drown in the noise (3.5 final review).
+- **How to apply:** When wiring a provider callback, ask what the DLQ does with a
+  report that matches nothing — and remove the cause rather than filtering it.
+
+## An anonymous endpoint must cap what it PERSISTS, not just what it answers
+
+- **Rule:** Any column an unauthenticated caller can fill gets an explicit size cap
+  with a truncation marker, even where a sibling field is already truncated.
+- **Why:** `inbound_dead_letters.payload` stored an arbitrary-size body from the
+  anonymous Eskiz callback while `error` right beside it was cut to 1000 chars;
+  there is no body-size middleware in the app and no purge job for dead letters
+  (3.5 final review — `service.DEAD_LETTER_PAYLOAD_MAX_BYTES`). "Every other JSON
+  endpoint does the same" was the wrong defence: the others do not PERSIST the body.
+- **How to apply:** New anonymous ingest path → cap what it writes, and say in the
+  stored row that it was capped.
