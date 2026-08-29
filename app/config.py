@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     eimzo_mode: Literal["mock", "real"] = "mock"
     sms_mode: Literal["mock", "real"] = "mock"
     oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
+    oneid_scope: str = "mock-scope"
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:

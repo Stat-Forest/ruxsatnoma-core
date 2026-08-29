@@ -15,7 +15,7 @@ def _app_on_test_db(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clear_sent_codes():
-    from app.modules.auth.adapters.otp_sender import MockOtpSender, get_otp_sender
+    from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
 
     sender = get_otp_sender()
     if isinstance(sender, MockOtpSender):

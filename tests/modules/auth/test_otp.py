@@ -11,9 +11,9 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import update
 
 from app.main import create_app
-from app.modules.auth.adapters.otp_sender import MockOtpSender, get_otp_sender
 from app.modules.auth.models import OtpCode
 from app.modules.auth.service import _mask_target
+from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
 from tests.conftest import make_client
 
 API = "/api/v1"

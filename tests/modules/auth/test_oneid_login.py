@@ -5,8 +5,8 @@ import uuid
 from sqlalchemy import select
 
 from app.main import create_app
-from app.modules.auth.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
 from app.modules.auth.models import Role, User
+from app.modules.integrations.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
 from tests.conftest import make_client
 
 API = "/api/v1"

@@ -7,9 +7,9 @@ from sqlalchemy import select
 
 from app.core.models import MediaFile
 from app.main import create_app
-from app.modules.auth.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
-from app.modules.auth.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
 from app.modules.auth.models import User
+from app.modules.integrations.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
+from app.modules.integrations.adapters.oneid import OneIdLegalInfo, OneIdProfile, encode_mock_code
 from tests.conftest import make_client
 from tests.modules.auth.test_otp import last_code, unique_email, unique_phone
 

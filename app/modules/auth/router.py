@@ -13,7 +13,6 @@ from app.core.errors import err
 from app.core.security import new_token
 from app.core.time import business_today
 from app.modules.auth import repo, service
-from app.modules.auth.adapters.oneid import get_oneid_adapter
 from app.modules.auth.deps import SUPERUSER_ROLE, get_current_session, get_current_user
 from app.modules.auth.models import Applicant, Representation, Role, Session, User
 from app.modules.auth.permissions import PERMISSIONS
@@ -40,6 +39,7 @@ from app.modules.auth.schemas import (
     UserOut,
     ZoneOut,
 )
+from app.modules.integrations.adapters.oneid import get_oneid_adapter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -165,7 +165,9 @@ async def mfa_verify(
 async def oneid_authorize(response: Response) -> OneIdAuthorizeOut:
     settings = get_settings()
     state = new_token()
-    url = get_oneid_adapter().authorize_url(state=state, redirect_uri=settings.oneid_redirect_uri)
+    url = get_oneid_adapter().authorize_url(
+        state=state, redirect_uri=settings.oneid_redirect_uri, scope=settings.oneid_scope
+    )
     response.set_cookie(
         "oneid_state",
         state,

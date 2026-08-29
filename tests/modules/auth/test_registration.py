@@ -5,8 +5,8 @@ import uuid
 from sqlalchemy import select
 
 from app.main import create_app
-from app.modules.auth.adapters.oneid import OneIdProfile, encode_mock_code
 from app.modules.auth.models import User, UserConsent
+from app.modules.integrations.adapters.oneid import OneIdProfile, encode_mock_code
 from tests.conftest import make_client
 from tests.modules.auth.test_otp import last_code, unique_phone
 

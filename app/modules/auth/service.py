@@ -25,10 +25,10 @@ from app.core.security import (
 from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo
-from app.modules.auth.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
-from app.modules.auth.adapters.oneid import OneIdError, get_oneid_adapter
-from app.modules.auth.adapters.otp_sender import get_otp_sender
 from app.modules.auth.models import Applicant, OtpCode, Representation, Session, User, UserConsent
+from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
+from app.modules.integrations.adapters.oneid import OneIdError, get_oneid_adapter
+from app.modules.integrations.adapters.otp_sender import get_otp_sender
 
 # Timing-uniform response (user enumeration): computed once at import so the
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
