@@ -186,6 +186,7 @@ async def notify(
     """
     values = dict(params or {})
     requested = tuple(channels) if channels is not None else DEFAULT_CHANNELS
+    requested = tuple(dict.fromkeys(requested))  # de-dupe, order preserved: never double-send
     unknown = sorted(set(requested) - set(CHANNELS))
     if unknown:  # a caller typo, not user input — fail loudly in dev and in tests
         raise ValueError(f"unknown notification channels: {unknown}")

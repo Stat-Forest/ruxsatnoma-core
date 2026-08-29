@@ -121,3 +121,30 @@ async def test_unknown_channel_is_a_programming_error(db):
         await service.notify(
             db, event_code=EVENT, recipient_user_id=user.id, channels=("telegram",)
         )
+
+
+async def test_duplicate_channels_collapse_to_a_single_send(db):
+    """A repeated channel must never double-send — that would be a real second paid
+    SMS to a real phone number, with no error to signal it happened."""
+    from datetime import UTC, datetime
+
+    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    await service.notify(db, event_code=EVENT, recipient_user_id=user.id, channels=("sms", "sms"))
+    rows = await _notes(db, user.id)
+    assert sorted(r.channel for r in rows) == ["inapp", "sms"]
+    sms = next(r for r in rows if r.channel == "sms")
+    assert sms.outbox_message_id is not None
+    outbox_rows = (
+        (await db.execute(select(OutboxMessage).where(OutboxMessage.destination == "sms")))
+        .scalars()
+        .all()
+    )
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].id == sms.outbox_message_id
+
+
+async def test_unknown_recipient_is_a_programming_error(db):
+    import pytest
+
+    with pytest.raises(ValueError):
+        await service.notify(db, event_code=EVENT, recipient_user_id=uuid.uuid4(), params={})
