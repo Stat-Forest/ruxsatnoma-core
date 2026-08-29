@@ -1,17 +1,35 @@
 """The sms/email outbox destinations: a delivery attempt moves the notification to
 'sent' with the provider id, and a sender failure leaves the outbox to retry."""
 
+import uuid
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import text
 
 from app.modules.integrations import service as integrations_service
+from app.modules.integrations.adapters.email import MockEmailSender, get_email_sender
 from app.modules.integrations.adapters.sms import MockSmsSender, get_sms_sender
 from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service
 from tests.modules.auth.test_sessions import make_user
+from tests.modules.notifications.test_models import make_template
 
 EVENT = "permit.issued"
+
+
+@pytest.fixture(autouse=True)
+async def _clean_outbox(db):
+    """Same rationale as test_outbox_service.py's fixture of the same name — but
+    this file is the *source* of the leak, not just a target: it is the first in
+    the suite to commit real sms/email rows (delivery has to commit — deliver_one
+    always commits the outcome). Without this guard, a stray 'pending' row left by
+    an earlier file could be the one `pick_due` claims instead of the row a test
+    just created, and this file's own rows would otherwise reach later files — as
+    they did in test_notify.py before that file got its own copy of this fixture.
+    Scoped to this file only — test_outbox_service.py keeps its own copy."""
+    await db.execute(text("DELETE FROM outbox_messages"))
+    await db.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -113,3 +131,41 @@ async def test_unverified_recipient_at_delivery_time_fails_the_row_without_retry
     await db.refresh(sms)
     assert sms.status == "failed"
     assert sms.error is not None
+
+
+async def test_email_delivery_marks_the_notification_sent_and_records_the_provider_id(db):
+    """Mirrors the sms case above; the mock SMTP client returns no provider id at
+    all (unlike Eskiz), so `provider_message_id` must end up None, not a string."""
+    event = f"test.email.{uuid.uuid4().hex[:8]}"
+    await make_template(
+        db,
+        event_code=event,
+        channel="email",
+        subject={"uz_cyrl": "Рухсатнома {permit_number}"},
+        body={"uz_cyrl": "Рухсатнома {permit_number} расмийлаштирилди."},
+    )
+    email_address = f"{uuid.uuid4().hex[:8]}@example.com"  # compared after commits expire `user`
+    user = await make_user(db, email=email_address, email_verified_at=datetime.now(UTC))
+    rows = await service.notify(
+        db,
+        event_code=event,
+        recipient_user_id=user.id,
+        channels=("email",),
+        params={"permit_number": "P-9"},
+    )
+    email_row = next(r for r in rows if r.channel == "email")
+    await db.commit()
+
+    while await integrations_service.deliver_one(db):
+        pass
+
+    await db.refresh(email_row)
+    assert email_row.status == "sent"
+    assert email_row.sent_at is not None
+    sender = get_email_sender()
+    assert isinstance(sender, MockEmailSender)
+    to, subject, text_body = sender.sent[-1]
+    assert to == email_address
+    assert subject == email_row.subject
+    assert "P-9" in text_body
+    assert email_row.provider_message_id is None
