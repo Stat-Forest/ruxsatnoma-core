@@ -7,6 +7,9 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import text
 
+from app.core import settings_store
+from app.core.models import SystemSetting
+from app.modules.integrations import breaker
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.email import MockEmailSender, get_email_sender
 from app.modules.integrations.adapters.sms import MockSmsSender, get_sms_sender
@@ -131,6 +134,11 @@ async def test_unverified_recipient_at_delivery_time_fails_the_row_without_retry
     await db.refresh(sms)
     assert sms.status == "failed"
     assert sms.error is not None
+    # ...and the transport is DONE: unlike the kill switch below, no retry could
+    # ever conjure a verified phone, so the outbox row must not stay in the queue.
+    message = await db.get(OutboxMessage, sms.outbox_message_id)
+    assert message is not None
+    assert message.status == "delivered"
 
 
 async def test_email_delivery_marks_the_notification_sent_and_records_the_provider_id(db):
@@ -169,3 +177,39 @@ async def test_email_delivery_marks_the_notification_sent_and_records_the_provid
     assert subject == email_row.subject
     assert "P-9" in text_body
     assert email_row.provider_message_id is None
+
+
+async def test_the_kill_switch_pauses_the_queue_instead_of_destroying_it(db):
+    """`notifications_sms_enabled` is an ops switch whose documented purpose is a
+    spent SMS balance. Flipping it off must PAUSE delivery — the outbox's backoff
+    ladder rides the pause out — not permanently fail every queued message with a
+    reason blaming the recipient (final whole-branch review of 3.5, finding 2)."""
+    user = await _verified_user(db)
+    rows = await service.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
+    sms = next(r for r in rows if r.channel == "sms")
+    await db.commit()
+
+    db.add(SystemSetting(key="notifications_sms_enabled", value=False))
+    await db.flush()
+    settings_store.invalidate("notifications_sms_enabled")
+    try:
+        await integrations_service.deliver_one(db)
+    finally:
+        await db.execute(
+            text("DELETE FROM system_settings WHERE key = 'notifications_sms_enabled'")
+        )
+        await db.commit()
+        settings_store.invalidate("notifications_sms_enabled")
+        breaker.reset()
+
+    await db.refresh(sms)
+    assert sms.status == "queued"  # nothing destroyed, nothing mislabelled
+    assert sms.error is None
+    message = await db.get(OutboxMessage, sms.outbox_message_id)
+    assert message is not None
+    assert message.status == "pending"  # retryable: the switch may come back on
+    assert message.attempts == 1
+    # An admin reading last_error must see an operator switch, not a provider fault,
+    # and no personal data (this column is admin-visible AND logged).
+    assert "disabled" in (message.last_error or "")
+    assert "998901234567" not in (message.last_error or "")

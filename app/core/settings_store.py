@@ -93,7 +93,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             60,
             "How long a tripped destination stays skipped",
         ),
-        SettingSpec("ratelimit_webhook_per_minute", int, 120, "Per-IP limit for provider webhooks"),
+        SettingSpec(
+            "ratelimit_webhook_per_minute",
+            int,
+            1200,
+            # Deliberately high: providers post from a small, fixed IP set, so a bulk
+            # notification run's delivery reports all arrive from ONE bucket — and a
+            # 429'd report is simply gone (nothing retries it into the DLQ). The
+            # endpoint only writes a small status update and is guarded by a secret.
+            "Per-IP limit for provider webhooks (a provider's whole IP set shares one "
+            "bucket, and a throttled delivery report is lost, not retried)",
+        ),
     )
 }
 

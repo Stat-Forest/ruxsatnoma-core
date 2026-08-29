@@ -257,8 +257,8 @@ async def test_real_otp_sender_routes_phone_to_sms_and_email_to_smtp(monkeypatch
     email_calls: list[dict] = []
 
     class _Sms:
-        async def send(self, *, phone, text, reference):
-            sms_calls.append({"phone": phone, "text": text})
+        async def send(self, *, phone, text, reference, delivery_report=True):
+            sms_calls.append({"phone": phone, "text": text, "delivery_report": delivery_report})
             return "id"
 
     class _Email:
@@ -276,4 +276,7 @@ async def test_real_otp_sender_routes_phone_to_sms_and_email_to_smtp(monkeypatch
     await sender.send(target_type="phone", target="998901234567", code="123456")
     await sender.send(target_type="email", target="u@example.com", code="654321")
     assert "123456" in sms_calls[0]["text"] and sms_calls[0]["phone"] == "998901234567"
+    # An OTP asks for no delivery report: its reference matches no `notifications`
+    # row, so every report would dead-letter with the phone number in it (finding 1).
+    assert sms_calls[0]["delivery_report"] is False
     assert "654321" in email_calls[0]["text"] and email_calls[0]["to"] == "u@example.com"

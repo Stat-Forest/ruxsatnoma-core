@@ -149,6 +149,17 @@ async def alert_dead_outbox(factory: async_sessionmaker[AsyncSession]) -> int:
         )
         correlation = f"job:{uuid.uuid4()}"
         admin_ids = await auth_service.list_user_ids_by_role_codes(db, ADMIN_ROLE_CODES)
+        if not admin_ids:
+            # This job exists to make a silent failure noisy. With nobody to alert we
+            # would still stamp `alerted_at` and fail the notifications below, so the
+            # rows end up marked "alerted" with no human ever told — the exact silence
+            # the job was written to break. The log line is the fallback channel.
+            logger.error(
+                "job.alert_dead_outbox_no_admins",
+                dead_rows=len(rows),
+                by_destination=by_destination,
+                roles=list(ADMIN_ROLE_CODES),
+            )
         for destination, count in sorted(by_destination.items()):
             for user_id in admin_ids:
                 await notifications_service.notify(

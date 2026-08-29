@@ -41,7 +41,16 @@ class RealOtpSender:
     async def send(self, *, target_type: str, target: str, code: str) -> None:
         text = OTP_TEXT.format(code=code)
         if target_type == "phone":
-            await get_sms_sender().send(phone=target, text=text, reference=str(uuid.uuid4()))
+            # No delivery report: the reference below is a throwaway id that matches
+            # no `notifications` row, so every report Eskiz posted for it would be
+            # dead-lettered (with the phone number in the stored payload). OTP
+            # success is the user entering the code, never a provider callback.
+            await get_sms_sender().send(
+                phone=target,
+                text=text,
+                reference=str(uuid.uuid4()),
+                delivery_report=False,
+            )
         else:
             await get_email_sender().send(to=target, subject=OTP_SUBJECT, text=text)
 

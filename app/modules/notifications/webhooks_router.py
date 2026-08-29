@@ -53,6 +53,9 @@ async def eskiz_delivery_report(
 ) -> dict[str, str]:
     expected = get_settings().eskiz_callback_secret
     # 404, not 403: an anonymous caller must not learn that the path is real.
-    if not expected or not secrets.compare_digest(secret, expected):
+    # Compared as BYTES: `compare_digest` raises TypeError on non-ASCII str operands,
+    # so `POST /api/v1/webhooks/eskiz/%CE%A9` would 500 — on the one route whose
+    # whole point is never to 500 on a body or a path it merely fails to understand.
+    if not expected or not secrets.compare_digest(secret.encode(), expected.encode()):
         raise err("ERR-SYS-003", details={})
     return {"result": await service.apply_delivery_report(db, await _body(request))}

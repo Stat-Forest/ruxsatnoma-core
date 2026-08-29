@@ -60,6 +60,7 @@ def test_samesite_follows_the_cross_origin_setup():
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
         eskiz_callback_secret="a-real-callback-secret",
+        public_base_url="https://ruxsatnoma.example.uz",
         smtp_host="smtp.example.uz",
         smtp_from="noreply@example.uz",
         _env_file=None,  # pyright: ignore[reportCallIssue]

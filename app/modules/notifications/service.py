@@ -149,6 +149,32 @@ async def archive_template(
 DEFAULT_CHANNELS = ("inapp", "sms")
 
 
+# json.dumps handles exactly these without a custom encoder; the engine configures
+# no `json_serializer`, so anything else reaches the JSONB bind and raises.
+_JSON_PRIMITIVES = (str, int, float, bool, type(None))
+
+
+def _jsonable(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Make `params` safe to store in the JSONB column.
+
+    A `Decimal` (money is `numeric` by project convention, never float) or a `date`
+    — exactly what the seeded `{amount}`, `{due_date}`, `{valid_from}`, `{valid_to}`
+    placeholders will be handed at 3.10/3.11 — raises `TypeError: Object of type
+    Decimal is not JSON serializable` at flush, INSIDE the caller's business
+    transaction. That is the one thing ruling 10 forbids: a content-shaped problem
+    must never break the business action (invoice issuance would 500).
+
+    Non-primitives become their `str()` — the same form `render()` already
+    substitutes into the text, so display is unchanged; only the stored copy is.
+    Containers are stringified too rather than walked: a guaranteed-serializable
+    value matters more here than a faithful round-trip of a shape no caller uses.
+    """
+    return {
+        key: value if isinstance(value, _JSON_PRIMITIVES) else str(value)
+        for key, value in params.items()
+    }
+
+
 def _fallback_body(event_code: str, params: Mapping[str, Any]) -> str:
     """Ruling 10: an in-app notification is never lost to a missing template. The
     text is deliberately raw — an administrator seeing it knows a template is due."""
@@ -156,18 +182,46 @@ def _fallback_body(event_code: str, params: Mapping[str, Any]) -> str:
     return f"{event_code}: {rendered}" if rendered else event_code
 
 
-async def _transport_allowed(
-    db: AsyncSession, *, channel: str, contact: auth_service.NotificationContact
-) -> bool:
+SMS_KILL_SWITCH = "notifications_sms_enabled"
+
+
+class ChannelDisabled(Exception):
+    """An operator turned this channel off. Raised — never returned — from the
+    delivery path so the outbox's backoff ladder PAUSES the queue: the kill switch
+    exists for a spent provider balance, and topping it up must not have cost every
+    message queued in the meantime. Carries no personal data (`outbox_messages.
+    last_error` is admin-visible and logged) and says plainly that this is an
+    operator action, not a provider fault."""
+
+
+def _recipient_reachable(*, channel: str, contact: auth_service.NotificationContact) -> bool:
+    """Can this recipient be reached on this channel AT ALL? A False here is
+    PERMANENT: no number of retries conjures a verified phone, so the delivery path
+    fails the notification and returns (the outbox-sender lesson in
+    `.claude/lessons.md`). Deliberately separate from the kill switch below, which
+    is temporary and has nothing to do with the recipient."""
     if contact.status != "active":
         return False
     if channel == "sms":
-        return bool(
-            contact.phone
-            and contact.phone_verified
-            and await settings_store.get_bool(db, "notifications_sms_enabled")
-        )
+        return bool(contact.phone and contact.phone_verified)
     return bool(contact.email and contact.email_verified)
+
+
+async def _channel_enabled(db: AsyncSession, channel: str) -> bool:
+    """The ops kill switch — an operator's temporary pause. Only `sms` has one
+    (rulings 11 and 16)."""
+    return channel != "sms" or await settings_store.get_bool(db, SMS_KILL_SWITCH)
+
+
+async def _transport_allowed(
+    db: AsyncSession, *, channel: str, contact: auth_service.NotificationContact
+) -> bool:
+    """ENQUEUE-time filter only (ruling 11): both reasons mean the same thing here
+    — do not queue this message. At delivery time they mean opposite things and
+    must be asked separately; see `_deliver`."""
+    return _recipient_reachable(channel=channel, contact=contact) and await _channel_enabled(
+        db, channel
+    )
 
 
 async def notify(
@@ -187,7 +241,7 @@ async def notify(
     cabinet even when other channels are off). Transport channels are enqueued on
     the 3.4 outbox and delivered by its worker — nothing is sent from a request.
     """
-    values = dict(params or {})
+    values = _jsonable(params or {})
     requested = tuple(channels) if channels is not None else DEFAULT_CHANNELS
     requested = tuple(dict.fromkeys(requested))  # de-dupe, order preserved: never double-send
     unknown = sorted(set(requested) - set(CHANNELS))
@@ -279,21 +333,34 @@ async def _deliver(db: AsyncSession, payload: dict[str, Any]) -> None:
     """Outbox sender for the `sms` and `email` destinations (registered below).
 
     Runs inside the worker's delivery transaction, so the status write and the
-    attempt commit together. Raising means "retry"; returning means "done" — which
-    is why an unreachable recipient FAILS the notification and returns instead of
-    raising: no number of retries will conjure a verified phone.
+    attempt commit together. Raising means "retry"; returning means "done" — and
+    the two conditions `notify()` folds into one enqueue filter mean OPPOSITE
+    things here: an unreachable recipient is permanent (fail and return, since no
+    retry conjures a verified phone), while the kill switch is an operator's
+    temporary pause (raise, so the backoff ladder rides it out).
+
+    `with_for_update` locks the notification row for the whole send: without it, an
+    Eskiz delivery report arriving and committing mid-send would set `delivered`
+    and then be overwritten by the `sent` write below — the report silently lost
+    rather than dead-lettered. The callback now waits instead.
     """
-    row = await db.get(Notification, uuid.UUID(payload["notification_id"]))
+    row = await db.get(Notification, uuid.UUID(payload["notification_id"]), with_for_update=True)
     if row is None:
         logger.warning("notification.vanished", notification_id=payload["notification_id"])
         return
     contact = await auth_service.get_notification_contact(db, row.recipient_user_id)
-    if contact is None or not await _transport_allowed(db, channel=row.channel, contact=contact):
+    if contact is None or not _recipient_reachable(channel=row.channel, contact=contact):
         row.status = "failed"
         row.error = "recipient is not reachable on this channel"
         return
+    if not await _channel_enabled(db, row.channel):
+        raise ChannelDisabled(
+            f"{row.channel} channel is disabled by an operator "
+            f"(system setting {SMS_KILL_SWITCH} is off) — not a provider failure; "
+            "the outbox retries until it is switched back on"
+        )
     if row.channel == "sms":
-        assert contact.phone is not None  # _transport_allowed guarantees it
+        assert contact.phone is not None  # _recipient_reachable guarantees it
         provider_id = await get_sms_sender().send(
             phone=contact.phone, text=row.rendered_text, reference=str(row.id)
         )

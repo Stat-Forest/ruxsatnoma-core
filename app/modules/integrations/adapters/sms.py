@@ -14,10 +14,16 @@ logger = structlog.get_logger(__name__)
 
 
 class SmsSender(Protocol):
-    async def send(self, *, phone: str, text: str, reference: str) -> str | None:
+    async def send(
+        self, *, phone: str, text: str, reference: str, delivery_report: bool = True
+    ) -> str | None:
         """Deliver one SMS. `reference` is our own correlation id (the notification
         uuid), echoed back by the provider's delivery report. Returns the provider's
-        message id when it supplies one. Raises on failure — the outbox retries."""
+        message id when it supplies one. Raises on failure — the outbox retries.
+
+        `delivery_report=False` opts out of the provider callback for sends that
+        have no `notifications` row to correlate a report against — OTP today. A
+        report we cannot correlate is a dead letter, not information."""
         ...
 
 
@@ -25,9 +31,13 @@ class MockSmsSender:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str]] = []
 
-    async def send(self, *, phone: str, text: str, reference: str) -> str | None:
+    async def send(
+        self, *, phone: str, text: str, reference: str, delivery_report: bool = True
+    ) -> str | None:
         self.sent.append((phone, text, reference))
-        logger.info("sms.mock_send", phone=phone, reference=reference)
+        # Masked exactly like the Eskiz sender: this class is the copy-paste source
+        # for the next adapter, and a phone number is personal data in either.
+        logger.info("sms.mock_send", phone=_mask(phone), reference=reference)
         return f"mock-{reference}"
 
 
@@ -98,15 +108,24 @@ class EskizSmsSender:
         )
         return self._token if fresh and self._token else await self._login(client)
 
-    async def send(self, *, phone: str, text: str, reference: str) -> str | None:
+    async def send(
+        self, *, phone: str, text: str, reference: str, delivery_report: bool = True
+    ) -> str | None:
         digits = "".join(ch for ch in phone if ch.isdigit())
         payload = {
             "mobile_phone": digits,
             "message": text,
             "from": self._settings.eskiz_sender,
-            "callback_url": self.callback_url,
             "user_sms_id": reference,
         }
+        # Eskiz posts a report for every message that carries a callback_url. An OTP
+        # send has no `notifications` row behind its reference, so its report would
+        # dead-letter every single time — one inbound_dead_letters row (holding the
+        # recipient's phone number) plus one integration_log row per phone
+        # verification, forever, with no purge job covering dead letters. Do not ask
+        # for a report we would only have to throw away.
+        if delivery_report:
+            payload["callback_url"] = self.callback_url
         async with self._client() as client:
             token = await self._ensure_token(client)
             response = await self._post_send(client, payload, token)
@@ -133,8 +152,10 @@ class EskizSmsSender:
             raise EskizError(f"eskiz send transport error: {type(exc).__name__}") from None
 
 
-def _mask(digits: str) -> str:
-    """Phone numbers are personal data; log the tail only (auth._mask_target idiom)."""
+def _mask(phone: str) -> str:
+    """Phone numbers are personal data; log the tail only (auth._mask_target idiom).
+    Strips separators itself, so a caller may pass a raw or an already-digits form."""
+    digits = "".join(ch for ch in phone if ch.isdigit())
     return f"***{digits[-4:]}" if len(digits) > 4 else "***"
 
 

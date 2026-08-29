@@ -220,6 +220,13 @@ Rules for this file:
 - **How to apply:** The env name is the field name upper-cased. To prove a var
   actually lands: `uv run python -c "from app.config import get_settings;
   print(get_settings().<field>)"`.
+- **And the opposite failure:** an EMPTY value is not ignored, it is parsed.
+  `EMAIL_MODE=`/`SMTP_PORT=`/`SMTP_STARTTLS=` fail validation outright and
+  `ESKIZ_BASE_URL=` silently replaces a working default with `""`, so
+  `cp .env.example .env` — the README's first step — would not start (3.5 final
+  review). Every line in that file carries a real value or is commented out;
+  `tests/test_config.py::test_env_example_is_a_working_env_file` builds `Settings`
+  from a copy of it and is the guard.
 
 ## Log `repr(e)`, not `f"{e}"`
 
@@ -324,6 +331,13 @@ Rules for this file:
 - **How to apply:** Before writing `raise` in a sender, ask "would a second
   attempt with the same input succeed?" If no, set the terminal status
   yourself and `return`.
+- **The mirror-image bug, hit in 3.5's final review:** the same helper answered
+  both "is this recipient reachable" (permanent) and "is the ops kill switch on"
+  (temporary), and `_deliver` treated both as permanent — so flipping
+  `notifications_sms_enabled` off for an hour DESTROYED every queued SMS with a
+  reason blaming the recipient, unrecoverably (admin requeue only works on `dead`
+  rows). A condition an operator can reverse must RAISE. Never let one boolean
+  stand for a permanent and a temporary reason at once.
 
 ## `str.format` on admin-authored text is an attribute-access hole
 
@@ -402,3 +416,51 @@ Rules for this file:
   AND returns/serializes that same row in the same call, add `refresh()`
   after the `flush()` — don't assume an existing archive-path precedent
   covers it.
+
+## A JSONB column fed by the stock `json.dumps` rejects `Decimal` and `date`
+
+- **Rule:** Coerce anything that is not a JSON primitive to `str` BEFORE it reaches
+  a JSONB bind — the engine configures no `json_serializer`, so there is no
+  encoder to fall back on.
+- **Why:** `notifications.params` is stored raw, and the seeded templates ask for
+  `{amount}` (a `Decimal` — money is `numeric` by project convention) and
+  `{due_date}`/`{valid_from}` (`date`). The natural 3.10 call would raise
+  `TypeError: Object of type Decimal is not JSON serializable` at flush, INSIDE
+  the caller's business transaction — turning invoice issuance into a 500, the
+  one outcome ruling 10 exists to prevent (3.5 final review; `service._jsonable`).
+- **How to apply:** Any new JSONB column written from domain values gets the same
+  coercion at its single write point, plus a test with a `Decimal` and a `date`.
+
+## `secrets.compare_digest` raises `TypeError` on non-ASCII strings
+
+- **Rule:** Compare secrets as BYTES — `compare_digest(a.encode(), b.encode())` —
+  whenever either side can come from a URL path, a header or a query string.
+- **Why:** `POST /api/v1/webhooks/eskiz/%CE%A9` hit the blanket 500 handler instead
+  of the intended 404, on the one route whose stated invariant is that it never
+  500s on garbage (3.5 final review). The str form only accepts ASCII operands.
+- **How to apply:** Every future provider webhook (Payme at 3.10, my.gov.uz later)
+  compares bytes, and gets a non-ASCII-path test alongside its wrong-secret test.
+
+## Never ask a provider for a callback you cannot correlate
+
+- **Rule:** Only request a delivery report / webhook for a send that has a stored
+  row to correlate it against; pass an explicit "no callback" flag otherwise.
+- **Why:** `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender`
+  passed a throwaway uuid as the reference, so at `sms_mode=real` EVERY OTP would
+  have produced one `inbound_dead_letters` row (holding the recipient's phone
+  number) plus one `integration_log` row, forever — no purge job covers dead
+  letters, and the DLQ's triage purpose would drown in the noise (3.5 final review).
+- **How to apply:** When wiring a provider callback, ask what the DLQ does with a
+  report that matches nothing — and remove the cause rather than filtering it.
+
+## An anonymous endpoint must cap what it PERSISTS, not just what it answers
+
+- **Rule:** Any column an unauthenticated caller can fill gets an explicit size cap
+  with a truncation marker, even where a sibling field is already truncated.
+- **Why:** `inbound_dead_letters.payload` stored an arbitrary-size body from the
+  anonymous Eskiz callback while `error` right beside it was cut to 1000 chars;
+  there is no body-size middleware in the app and no purge job for dead letters
+  (3.5 final review — `service.DEAD_LETTER_PAYLOAD_MAX_BYTES`). "Every other JSON
+  endpoint does the same" was the wrong defence: the others do not PERSIST the body.
+- **How to apply:** New anonymous ingest path → cap what it writes, and say in the
+  stored row that it was capped.

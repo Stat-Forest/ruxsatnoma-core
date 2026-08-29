@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -70,6 +71,16 @@ class Settings(BaseSettings):
                 "sms_mode=real requires eskiz_email, eskiz_password, eskiz_sender "
                 "and eskiz_callback_secret"
             )
+        if self.sms_mode == "real" and _is_local_origin(self.public_base_url):
+            # The only Eskiz setting whose DEFAULT looks like a working value. Get it
+            # wrong and SMS still goes out while every delivery report is posted into
+            # the void: each notification sits at `sent` forever, with no error
+            # anywhere to say so.
+            raise ValueError(
+                "sms_mode=real requires public_base_url to be the externally reachable "
+                "origin — Eskiz posts its delivery reports back to it, and a local "
+                f"origin loses every one of them silently (got {self.public_base_url!r})"
+            )
         if self.email_mode == "real" and not all((self.smtp_host, self.smtp_from)):
             raise ValueError("email_mode=real requires smtp_host and smtp_from")
         return self
@@ -85,6 +96,15 @@ class Settings(BaseSettings):
         if self.cors_origins and self.resolve_cookie_secure():
             return "none"
         return "lax"
+
+
+# Not a bind address — the set of hostnames a PUBLIC_BASE_URL must NOT resolve to.
+_LOCAL_HOSTS = frozenset({"", "localhost", "127.0.0.1", "0.0.0.0", "::1"})  # noqa: S104  # nosec B104
+
+
+def _is_local_origin(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host in _LOCAL_HOSTS or host.endswith(".localhost")
 
 
 @lru_cache

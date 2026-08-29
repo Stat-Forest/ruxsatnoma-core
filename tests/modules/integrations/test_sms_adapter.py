@@ -144,6 +144,8 @@ async def test_real_mode_returns_the_eskiz_sender(monkeypatch):
     monkeypatch.setenv("ESKIZ_PASSWORD", "p")
     monkeypatch.setenv("ESKIZ_SENDER", "4546")
     monkeypatch.setenv("ESKIZ_CALLBACK_SECRET", "c")
+    # A localhost origin is rejected outright under sms_mode=real (finding 6).
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ruxsatnoma.example.uz")
     get_settings.cache_clear()
     sms.get_sms_sender.cache_clear()
     try:
@@ -151,3 +153,33 @@ async def test_real_mode_returns_the_eskiz_sender(monkeypatch):
     finally:
         get_settings.cache_clear()
         sms.get_sms_sender.cache_clear()
+
+
+async def test_an_otp_send_asks_for_no_delivery_report(db, monkeypatch):
+    """Eskiz posts a delivery report for every message carrying a `callback_url`,
+    and an OTP's `reference` is a throwaway uuid matching no `notifications` row —
+    so every OTP report would dead-letter, forever, with the recipient's phone
+    number in the stored payload. We never used delivery confirmation for OTP (the
+    user entering the code is the confirmation), so we do not ask for one at all
+    (final whole-branch review of 3.5, finding 1)."""
+    from app.modules.integrations.adapters import otp_sender
+
+    captured: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, json={"data": {"token": "tok"}})
+        captured.append(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={"id": "1"})
+
+    sender = _sender(handler)
+    monkeypatch.setattr(otp_sender, "get_sms_sender", lambda: sender)
+    await otp_sender.RealOtpSender().send(target_type="phone", target="998901234567", code="123456")
+    assert "callback_url" not in captured[-1]
+
+    # ...while a notification send still asks for one: without it nothing would
+    # ever move a notification from 'sent' to 'delivered'.
+    await sender.send(phone="998901234567", text="hi", reference="ref-1")
+    assert captured[-1]["callback_url"] == (
+        "https://ruxsatnoma.example/api/v1/webhooks/eskiz/cbsecret"
+    )

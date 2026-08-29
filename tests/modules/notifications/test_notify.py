@@ -160,3 +160,32 @@ async def test_unknown_recipient_is_a_programming_error(db):
 
     with pytest.raises(ValueError):
         await service.notify(db, event_code=EVENT, recipient_user_id=uuid.uuid4(), params={})
+
+
+async def test_non_primitive_params_do_not_break_the_callers_transaction(db):
+    """`params` goes straight into a JSONB column through the stock `json.dumps`
+    (no `json_serializer` is configured on the engine), and the seeded templates
+    ask for exactly the types that blows up on: `{amount}` is a Decimal by project
+    convention (money is `numeric`, never float) and `{due_date}`/`{valid_from}`
+    are `date` objects. The natural 3.10 call would raise TypeError at flush INSIDE
+    the caller's business transaction — turning invoice issuance into a 500, which
+    is precisely what ruling 10 exists to prevent (final review, finding 3)."""
+    from datetime import date
+    from decimal import Decimal
+
+    user = await make_user(db)
+    rows = await service.notify(
+        db,
+        event_code="invoice.issued",
+        recipient_user_id=user.id,
+        params={
+            "application_number": "A-1",
+            "amount": Decimal("1234.56"),
+            "due_date": date(2026, 9, 30),
+        },
+    )
+    inapp = next(r for r in rows if r.channel == "inapp")
+    assert inapp.params["amount"] == "1234.56"  # stored as text, exactly as rendered
+    assert inapp.params["due_date"] == "2026-09-30"
+    assert inapp.params["application_number"] == "A-1"  # a str is left alone
+    assert "1234.56" in inapp.rendered_text

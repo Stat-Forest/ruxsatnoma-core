@@ -157,3 +157,12 @@ async def test_a_lowercase_status_is_normalized(db, monkeypatch):
     assert r.json()["result"] == "ok"
     await db.refresh(sms)
     assert sms.status == "delivered"
+
+
+async def test_a_non_ascii_secret_is_a_404_not_a_500(db, monkeypatch):
+    """`secrets.compare_digest` raises TypeError on non-ASCII str operands, so a
+    single odd path segment turned the one route whose stated invariant is "never
+    500 on garbage" into a 500 (final whole-branch review of 3.5, finding 8)."""
+    r = await _post(monkeypatch, {"status": "DELIVRD"}, secret="Ω")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "ERR-SYS-003"

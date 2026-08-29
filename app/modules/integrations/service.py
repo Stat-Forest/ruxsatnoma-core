@@ -178,6 +178,10 @@ async def requeue_message(
     row.status = "pending"
     row.attempts = 0
     row.next_attempt_at = datetime.now(UTC)
+    # `alert_dead_outbox` selects `status='dead' AND alerted_at IS NULL`. Leaving the
+    # stamp on would make a SECOND death silent — nobody alerted, and any notification
+    # behind it stuck `queued` forever with a dead transport.
+    row.alerted_at = None
     await audit.log(
         db,
         action="outbox.requeue",
@@ -216,12 +220,33 @@ async def discard_dead_letter(
     return row
 
 
+# The inbound webhooks that feed the DLQ are ANONYMOUS and the app has no
+# body-size middleware, so this column is the one place an unauthenticated caller
+# can make us store data of their choosing — and no purge job covers dead letters.
+# A few KB is plenty to triage a delivery report by hand.
+DEAD_LETTER_PAYLOAD_MAX_BYTES = 4096
+
+
+def _capped_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bound what an untrusted body can persist, keeping a triage-sized sample and
+    saying plainly that it was cut (`error` beside it is truncated for the same
+    reason). `default=str` mirrors what the JSONB bind itself would need."""
+    encoded = json.dumps(payload, default=str).encode()
+    if len(encoded) <= DEAD_LETTER_PAYLOAD_MAX_BYTES:
+        return payload
+    return {
+        "truncated": True,
+        "original_bytes": len(encoded),
+        "preview": encoded[:DEAD_LETTER_PAYLOAD_MAX_BYTES].decode(errors="replace"),
+    }
+
+
 async def record_dead_letter(
     db: AsyncSession, *, source: str, payload: dict[str, Any], error: str
 ) -> InboundDeadLetter:
     """An inbound message we could not interpret (tz/09: schema mismatch → DLQ).
     Written in the caller's transaction; triage happens through /admin/integrations."""
-    row = InboundDeadLetter(source=source, payload=payload, error=error[:1000])
+    row = InboundDeadLetter(source=source, payload=_capped_payload(payload), error=error[:1000])
     db.add(row)
     await db.flush()
     logger.warning("dead_letter.recorded", source=source, error=error[:200])
