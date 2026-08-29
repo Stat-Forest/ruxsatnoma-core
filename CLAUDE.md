@@ -37,7 +37,7 @@ uv run python -m app.seed organizations app/seed/data/organizations.example.json
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`, stage 3.4): `lint` (single-Alembic-head check + ruff check + format check + pyright + bandit) and `test` (PostGIS service + MinIO, full pytest incl. the migration downgrade→upgrade round-trip) on every push/PR. Keep both green; the round-trip test runs last and wipes the shared test DB by design (collection order is pinned by a hook in `tests/conftest.py`). Git rules — branch/pull/push discipline for the parallel sessions — live in the root `../CLAUDE.md`.
+GitHub Actions (`.github/workflows/ci.yml`, stage 3.4): `lint` (single-Alembic-head check + ruff check + format check + pyright + bandit) and `test` (PostGIS service + MinIO, full pytest incl. the migration downgrade→upgrade round-trip) on every push/PR. Keep both green; the round-trip test runs last and wipes the shared test DB by design (collection order is pinned by a hook in `tests/conftest.py`). Git rules — branch/pull/push discipline for the parallel sessions — live in the root `../CLAUDE.md`. In short (decision #47): branch off `dev`, PR back into `dev`; `main` only ever receives `dev` through a release PR; direct commits on either are blocked by `no-commit-to-branch`.
 
 ## Continuous learning
 
