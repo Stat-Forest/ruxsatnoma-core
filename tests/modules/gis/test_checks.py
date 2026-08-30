@@ -31,6 +31,39 @@ async def test_within_fund_fails_once_a_boundary_exists_and_excludes_the_plot(
     assert result["result"] == "fail"
 
 
+async def test_within_fund_passes_when_a_contour_straddles_two_adjoining_fund_polygons(
+    db, contours_layer, leshoz
+):
+    """Task-4 review, finding 1: the fund boundary arrives as many polygons
+    (151 for Burchmulla alone) — a contour that legitimately sits inside the
+    fund but straddles the seam between two adjoining fund polygons is inside
+    neither one individually. `bool_or(ST_Within(v.geom, f.geom))` against
+    each row separately would report this as `outside_forest_fund`; the fix
+    unions only the fund features that intersect the contour first."""
+    from tests.modules.gis.conftest import (
+        box_wkt,
+        make_contour,
+        make_feature,
+        make_version,
+        random_anchor,
+    )
+
+    lon, lat = random_anchor()
+    layer = await repo.layer_by_code(db, "forest_fund")
+    assert layer is not None
+    await make_feature(db, layer, box_wkt(lon, lat))  # fund polygon A
+    await make_feature(
+        db, layer, box_wkt(lon + 0.01, lat)
+    )  # fund polygon B, adjoining A's east edge
+
+    contour = await make_contour(db, contours_layer, leshoz)
+    # Straddles the seam at lon + 0.01, half in A and half in B.
+    version = await make_version(db, contour.id, box_wkt(lon + 0.005, lat))
+
+    result = _result(await checks.run_checks(db, version_id=version.id), "within_fund")
+    assert result["result"] == "pass"
+
+
 async def test_a_shared_border_is_not_an_overlap(
     db, neighbouring_published_contour, draft_version_touching_it
 ):

@@ -65,16 +65,34 @@ async def _within_fund(db: AsyncSession, version_id: uuid.UUID) -> CheckResult:
     published features at all today (the Agency has not delivered the real
     boundary yet, П.7) — that is `skipped`, not a false `fail` against an empty
     layer. Once the layer is non-empty, a plot outside every published boundary
-    is a genuine data defect."""
+    is a genuine data defect.
+
+    The fund boundary arrives as many polygons (151 for Burchmulla alone), so
+    "inside" means inside their UNION, not inside any single one of them — a
+    contour that straddles the seam between two adjoining fund polygons is
+    inside neither individually but is still legitimately within the fund
+    (task-4 review, finding 1; a `bool_or(ST_Within(v.geom, f.geom))` against
+    each row separately reported that seam as `outside_forest_fund`). Union
+    only the features that actually intersect the contour, so the GIST index
+    still narrows the candidate set instead of unioning the whole layer on
+    every check. `COALESCE(..., v.geom)` is load-bearing: when nothing
+    intersects at all, `ST_Union` over zero rows is NULL and
+    `ST_Difference(geom, NULL)` is NULL too — reading that as "nothing lies
+    outside" would wrongly pass a contour nowhere near the fund.
+    """
     row = (
         await db.execute(
             text(
-                "SELECT (SELECT count(*) FROM layer_features f"
-                "        JOIN gis_layers l ON l.id = f.layer_id"
-                "        WHERE l.code = 'forest_fund' AND f.status = 'published') AS fund_features,"
-                "       (SELECT bool_or(ST_Within(v.geom, f.geom)) FROM layer_features f"
-                "        JOIN gis_layers l ON l.id = f.layer_id"
-                "        WHERE l.code = 'forest_fund' AND f.status = 'published') AS inside"
+                "WITH fund AS ("
+                "  SELECT f.geom FROM layer_features f"
+                "  JOIN gis_layers l ON l.id = f.layer_id"
+                "  WHERE l.code = 'forest_fund' AND f.status = 'published'"
+                ")"
+                " SELECT (SELECT count(*) FROM fund) AS fund_features,"
+                "        NOT ST_IsEmpty(COALESCE(ST_Difference(v.geom, ("
+                "          SELECT ST_Union(fund.geom) FROM fund"
+                "          WHERE ST_Intersects(fund.geom, v.geom)"
+                "        )), v.geom)) AS outside"
                 " FROM contour_versions v WHERE v.id = :vid"
             ),
             {"vid": version_id},
@@ -82,9 +100,13 @@ async def _within_fund(db: AsyncSession, version_id: uuid.UUID) -> CheckResult:
     ).one()
     if row.fund_features == 0:
         return {"check": "within_fund", "result": "skipped", "details": {"reason": "layer_empty"}}
-    if row.inside:
-        return {"check": "within_fund", "result": "pass", "details": {}}
-    return {"check": "within_fund", "result": "fail", "details": {"reason": "outside_forest_fund"}}
+    if row.outside:
+        return {
+            "check": "within_fund",
+            "result": "fail",
+            "details": {"reason": "outside_forest_fund"},
+        }
+    return {"check": "within_fund", "result": "pass", "details": {}}
 
 
 async def _intersections(
@@ -111,7 +133,7 @@ async def _intersections(
             text(
                 "SELECT t.layer, t.feature_id, t.name, t.area_m2 FROM ("
                 "  SELECT c.layer, c.feature_id, c.name,"
-                "         ST_Area(ST_Intersection(v.geom, c.geom)::geography) AS area_m2"
+                "         ST_Area(ST_Intersection(v.geom, c.geom)::geography)::numeric AS area_m2"
                 # Bandit flags this as B608 (string-built SQL) on the pattern
                 # alone; candidates_sql is always one of the two fixed constants
                 # below, never caller input, and every actual value is bound
@@ -130,7 +152,13 @@ async def _intersections(
             "layer": row.layer,
             "feature_id": row.feature_id,
             "name": row.name,
-            "area_m2": float(row.area_m2),
+            # Decimal, not float (project rule: areas are numeric) — the SQL
+            # casts ::numeric above, so this is asyncpg's own Decimal, not a
+            # Python float() conversion (task-4 review, finding 2). The one
+            # HTTP response that returns this value has its own serializer
+            # (schemas.CheckResultOut) so the JSON stays a number, not a
+            # stringified Decimal.
+            "area_m2": row.area_m2,
         }
         for row in rows
     ]

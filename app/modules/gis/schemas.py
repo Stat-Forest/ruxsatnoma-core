@@ -115,6 +115,26 @@ class VersionPatch(BaseModel):
     effective_from: date | None = None
 
 
+def _jsonable_details(value: Any) -> Any:
+    """`gis.checks`' `details` can carry a `Decimal` `area_m2` nested inside an
+    `items` list (task-4 review, finding 2: the checks module keeps areas as
+    `Decimal`, never `float`, per project convention). Pydantic's default JSON
+    encoding of a bare value nested inside an `Any`-typed field renders a
+    `Decimal` as a quoted STRING — confirmed empirically, and `json_encoders`
+    does not reach values nested under `Any` either — which would silently
+    turn a number into text on the one response that returns it. Recurse
+    rather than special-case the `area_m2` key by name: `details` is
+    deliberately left unstructured (deferred to a later review) and may grow
+    more Decimal-bearing keys later."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: _jsonable_details(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonable_details(item) for item in value]
+    return value
+
+
 class CheckResultOut(BaseModel):
     """Mirrors `gis.checks.CheckResult` (a TypedDict, not a BaseModel, on the
     Python side) for the one route that returns it over HTTP."""
@@ -122,6 +142,10 @@ class CheckResultOut(BaseModel):
     check: str
     result: str
     details: dict[str, Any]
+
+    @field_serializer("details")
+    def _serialize_details(self, value: dict[str, Any]) -> dict[str, Any]:
+        return _jsonable_details(value)
 
 
 class ChecksOut(BaseModel):

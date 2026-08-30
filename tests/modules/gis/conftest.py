@@ -35,18 +35,26 @@ def box_wkt(min_lon: float, min_lat: float, size: float = 0.01) -> str:
     return f"POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))"
 
 
-def random_box_wkt() -> str:
-    """A box_wkt-shaped box at a random spot, nowhere near the module's
-    conventional box_wkt(69.9, 41.5) (and its 69.91/69.905 neighbours) or the
-    "elsewhere" box_wkt(60.0, 41.5) — for a fixture that must be the ONLY thing
-    near its own location in the shared, persistent test DB. A fixed
+def random_anchor() -> tuple[float, float]:
+    """A random (lon, lat) pair, nowhere near the module's conventional
+    box_wkt(69.9, 41.5) (and its 69.91/69.905 neighbours) or the "elsewhere"
+    box_wkt(60.0, 41.5) — for a scenario that needs several boxes anchored
+    relative to EACH OTHER (e.g. two adjoining fund polygons and a contour
+    straddling their seam), not just one standalone box. A fixed
     'currently empty' spot is not good enough for that: box_wkt(69.9, 41.5)
     already carries several leftover published contours from
     test_contours_api.py's `published_contour` + `gis_client` combination,
     accumulated commit by commit across past test runs (confirmed empirically
     while building task 4) — a random spot cannot be poisoned by a fixed
     literal some other test committed, past or future."""
-    return box_wkt(random.uniform(0.0, 40.0), random.uniform(0.0, 30.0))
+    return random.uniform(0.0, 40.0), random.uniform(0.0, 30.0)
+
+
+def random_box_wkt() -> str:
+    """A box_wkt-shaped box at a random, isolated spot — see `random_anchor`'s
+    own note for why a fixed literal is not good enough here."""
+    lon, lat = random_anchor()
+    return box_wkt(lon, lat)
 
 
 async def version_wkt(db: AsyncSession, version: ContourVersion) -> str:
