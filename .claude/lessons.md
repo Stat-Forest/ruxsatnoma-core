@@ -840,3 +840,37 @@ Rules for this file:
   `tests/test_migrations.py` for the previous head string and update it as
   part of the same commit — it is not on any task brief's file list by
   default, so it is easy to only discover by actually running the suite.
+
+## A bind param immediately followed by `::` loses its last letter in `sa.text()`
+
+- **Rule:** Never write `:name::cast_type` inside a raw `sa.text(...)` SQL
+  string — write `CAST(:name AS cast_type)` instead.
+- **Why:** `TextClause`'s bind-param regex is `(?<![:\w\x5c]):(\w+)(?!:)`: the
+  trailing negative lookahead rejects a match sitting right before another
+  `:`, so on `:value::text` the greedy `\w+` backtracks one character and
+  registers the param as `valu`, not `value`. `.bindparams(value=...)` then
+  raises `sqlalchemy.exc.ArgumentError: This text() construct doesn't define a
+  bound parameter named 'value'` — caught immediately by the RED/GREEN cycle,
+  never reached a running database (migration 0012, stage 3.7 task 2).
+  `tests/modules/norms/conftest.py::param_row` writes the identical
+  `to_jsonb(:value::text)` and carries the same bug, unexercised because no
+  test calls that fixture yet.
+- **How to apply:** Grep any new raw-SQL migration or test for `:\w+::`
+  before running it. `to_jsonb(CAST(:value AS text))` is the drop-in fix;
+  `param_row`'s copy still needs it, before the first test calls it.
+
+## `dict(rows.all())` on a raw `text()` query passes at runtime, fails pyright
+
+- **Rule:** Build a dict from a raw-SQL `Result` with a comprehension —
+  `{row[0]: row[1] for row in rows.all()}` — never `dict(rows.all())`.
+- **Why:** A `text()` query's rows are `Row[Any]`; pyright cannot confirm an
+  untyped `Row` is a 2-tuple, so `dict()`'s overload resolution matches the
+  wrong overload (`Iterable[list[bytes]]`) and reports `reportCallIssue` +
+  `reportArgumentType` on code that runs and passes correctly (migration 0012
+  tests, stage 3.7 task 2). The identical `dict(rows.all())` over a TYPED ORM
+  `select(Col.a, Col.b)` result (`tests/modules/gis/test_import_publish.py`)
+  does not trip this, because SQLAlchemy can infer the tuple arity statically
+  there — only the raw-`text()` case is untyped enough to confuse it.
+- **How to apply:** Any new test turning raw-SQL rows into a dict uses the
+  comprehension form; reserve `dict(rows.all())` for a typed `select(...)`
+  result.
