@@ -62,6 +62,26 @@ async def test_creating_a_tariff_needs_the_manage_permission(
     assert response.status_code == 403
 
 
+async def test_creating_a_tariff_with_an_unknown_activity_type_is_refused(
+    tariffs_maker_client: AsyncClient,
+) -> None:
+    """`create_versioned`'s own guard (fix round 1): a garbage
+    `activity_type_id` must not reach `flush()` and surface as an uncaught
+    `IntegrityError` -> `ERR-SYS-001`/500."""
+    response = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(uuid.uuid4()),
+            "coefficient": "1.0",
+            "quantity_unit": "ha",
+            "effective_from": "2034-01-01",
+            "basis": "t",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == "unknown_activity_type"
+
+
 async def test_a_benefit_modifier_round_trips(
     tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
 ) -> None:

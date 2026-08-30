@@ -93,6 +93,17 @@ async def create_versioned(db: AsyncSession, kind: _Versioned, payload: Any, *, 
     """A fresh draft. No maker-checker or period check yet — those only bind a
     PUBLISHED row (ruling 10), so two drafts (or a draft and a published row)
     may freely overlap until someone tries to publish one of them."""
+    # `TariffIn.activity_type_id` is a real FK; `RuleParameterIn` has no such
+    # field at all, so `getattr(..., None)` skips this for a parameter without
+    # a per-kind branch. Unvalidated, a garbage id reached `flush()` and
+    # surfaced as an uncaught `IntegrityError` -> ERR-SYS-001/500 (found in
+    # task-4 review, `POST /tariffs`) — the same defect class this stage
+    # already guards against for `period_overlap`.
+    activity_type_id = getattr(payload, "activity_type_id", None)
+    if activity_type_id is not None:
+        known = await admin_repo.list_activity_types(db)
+        if not any(activity.id == activity_type_id for activity in known):
+            raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
     row = kind.model(**payload.model_dump(), status="draft", created_by=actor.id)
     db.add(row)
     await db.flush()
@@ -391,6 +402,20 @@ async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm
     only binds a PUBLISHED norm — and the survey document is optional here,
     required only to submit for review (`submit_norm_review`)."""
     await _assert_norm_zone(db, actor, payload.contour_id)
+    known = await admin_repo.list_activity_types(db)
+    if not any(activity.id == payload.activity_type_id for activity in known):
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    if payload.geobotanic_doc_id is not None:
+        # An EXISTENCE check (lesson), the same one `approve_norm` already
+        # applies to `approval_doc_id` — reusing `_assert_doc_active` rather
+        # than a second, near-identical document check.
+        await _assert_doc_active(db, payload.geobotanic_doc_id, reason="geobotanic_doc_required")
+    if payload.effective_to is not None and payload.effective_to < payload.effective_from:
+        # Caught here, not by the `period_valid` DB CHECK (mirrors
+        # admin.service.add_classifier_item's own reasoning): an
+        # IntegrityError has no handler in main.py and would surface as
+        # ERR-SYS-001/500.
+        raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
     norm = Norm(**payload.model_dump(), status="draft", created_by=actor.id)
     db.add(norm)
     await db.flush()
@@ -421,8 +446,15 @@ async def update_norm(
     await _assert_norm_zone(db, actor, norm.contour_id)
     if norm.status not in ("draft", "review"):
         raise err("ERR-NORM-005", details={"reason": "not_draft"})
+    fields = patch.model_dump(exclude_unset=True)
+    if fields.get("geobotanic_doc_id") is not None:
+        await _assert_doc_active(db, fields["geobotanic_doc_id"], reason="geobotanic_doc_required")
+    effective_from = fields.get("effective_from", norm.effective_from)
+    effective_to = fields.get("effective_to", norm.effective_to)
+    if effective_to is not None and effective_to < effective_from:
+        raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
     before = _snapshot(norm)
-    for field, value in patch.model_dump(exclude_unset=True).items():
+    for field, value in fields.items():
         setattr(norm, field, value)
     await db.flush()
     await db.refresh(norm)

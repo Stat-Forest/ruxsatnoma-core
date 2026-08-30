@@ -1017,12 +1017,13 @@ Rules for this file:
   publishes" — true of the DEFAULT `norms_publish_scope=central` OUTCOME, but
   wrong about the GRANT: migration 0011 gives the `leadership` role
   `norms.publish` too, and ruling 16's whole point is that the SETTING, not
-  the grant, is what blocks it in that mode. Without the grant here,
-  `test_in_central_mode_a_leshoz_actor_cannot_publish` (the brief's own
-  verbatim test) "passed" for the wrong reason at first try — 403
-  `ERR-ACL-001`, missing permission — instead of proving the scope check
-  (403 `ERR-ACL-002`), and its sibling `test_in_leshoz_mode_the_same_actor_
-  publishes` failed outright (still `ERR-ACL-001`, 403 instead of 200).
+  the grant, is what blocks it in that mode. Without the grant here, both
+  brief-verbatim tests FAILED OUTRIGHT on first run, not just for the wrong
+  reason: `test_in_central_mode_a_leshoz_actor_cannot_publish` asserts
+  `ERR-ACL-002` specifically and got `ERR-ACL-001` (missing permission, the
+  route's own dependency rejecting the request before the service's scope
+  check ever ran) — an `AssertionError`, not a pass; its sibling
+  `test_in_leshoz_mode_the_same_actor_publishes` got 403 where it asserts 200.
   Caught immediately by running the two tests the brief itself gives.
 - **How to apply:** Before trusting an existing zone-scoped client fixture's
   permission list for a new maker-checker-shaped or scope-gated test, check
@@ -1052,3 +1053,34 @@ Rules for this file:
   loop variable afterwards: use a tuple literal of that many placeholders
   (`for _ in (0, 1):`) instead of `range(n)` — a purely mechanical, same-
   runtime-behavior substitution, no `Optional`/pre-initialization needed.
+
+## Every caller-supplied FK and date-ordering pair needs its own pre-flush guard, not just the ones a test happened to exercise
+
+- **Rule:** Before calling a versioned-row creator (`create_norm`,
+  `create_versioned`) done, walk every field its payload lets a caller set
+  that is either an FK or half of a period pair, and confirm EACH one has a
+  service-level guard ahead of `flush()` — an existence check for the FK
+  (reusing an existing helper if the identical check already exists for a
+  sibling field, never a near-identical second copy), a `to < from`
+  comparison for the pair.
+- **Why:** Task 4's first pass validated `contour_id` (via
+  `_assert_norm_zone`) and `approval_doc_id` (via `_assert_doc_active`, but
+  only at approve time) while leaving `activity_type_id`, `geobotanic_doc_id`
+  and `effective_to < effective_from` unguarded on `create_norm`/
+  `update_norm` — each one reaches `flush()` on a garbage or inconsistent
+  value and surfaces as an uncaught `IntegrityError` -> `ERR-SYS-001`/500,
+  the exact defect class this stage's own contract already treats as a
+  blocker for `period_overlap`. The identical `activity_type_id` gap existed
+  in the SHARED `create_versioned` (tariffs/parameters) too — `POST /tariffs`
+  with a garbage `activity_type_id` was a 500 — caught in the same review
+  pass; fixing one sibling creator and leaving the other would have shipped
+  the same bug one call away (final review, stage 3.7 task 4).
+- **How to apply:** `admin.service.add_classifier_item`'s
+  `valid_to < valid_from` pre-check (`ERR-VAL-001`, ahead of the DB CHECK) is
+  the template for a period-pair guard; `_assert_doc_active`/
+  `gis.service._assert_approval_doc_active` is the template for an FK
+  existence guard — reuse the SAME helper for every field that means "does
+  this document exist and is it active" rather than writing a new one per
+  field. Any new versioned-row creator gets a pass down its own payload's
+  field list against this checklist before being reported done, not just
+  the fields the given tests happen to cover.
