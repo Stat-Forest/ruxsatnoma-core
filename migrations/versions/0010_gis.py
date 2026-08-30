@@ -474,6 +474,15 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Downgrade schema."""
     # Seeds — a downgrade must delete the rows its upgrade made legal (lesson).
+    # The notifications go FIRST: once the import job actually sends this event
+    # (task 7), `notifications.template_id` references the template row below,
+    # and deleting the template alone fails on
+    # `fk_notifications_template_id_notification_templates`. The upgrade is what
+    # made a `gis.import.finished` notification possible at all, and the
+    # `gis_imports` row each one points at is dropped a few lines further down,
+    # so leaving them behind would strand rows describing objects that no longer
+    # exist. Caught by the CI downgrade->upgrade round-trip, not in review.
+    op.execute(sa.text("DELETE FROM notifications WHERE event_code = 'gis.import.finished'"))
     op.execute(
         sa.text("DELETE FROM notification_templates WHERE event_code = 'gis.import.finished'")
     )
