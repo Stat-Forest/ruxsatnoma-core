@@ -4,7 +4,7 @@ applications 3.9): published_version(), list_contours(), run_checks()."""
 import json
 import math
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -967,24 +967,46 @@ async def publish_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) 
 # registration idiom as `core.files.ACCESS_CHECKS`. With nothing registered
 # (true today), occupancy is an explicit placeholder, never a silent zero that
 # could be mistaken for a real measurement.
-OccupancyProvider = Callable[[AsyncSession, uuid.UUID], Awaitable[Decimal]]
+#
+# The signature is BATCH-shaped — a whole page of contour ids in, a mapping
+# out — because `list_contours` needs one answer per row and the per-contour
+# shape made that a query per row: 3.11's very first registration would have
+# turned a page of 20 into 20 round-trips, and the whole-country list into
+# ~13,500. A provider is free to answer with fewer keys than it was asked
+# about; a contour it says nothing about counts as zero.
+OccupancyProvider = Callable[
+    [AsyncSession, Sequence[uuid.UUID]], Awaitable[Mapping[uuid.UUID, Decimal]]
+]
 OCCUPANCY_PROVIDERS: list[OccupancyProvider] = []
 
 
-async def occupancy_ha(db: AsyncSession, contour_id: uuid.UUID) -> tuple[Decimal, str]:
-    """Sum every registered provider's answer for one contour. `Decimal`,
-    never `float` (project convention: areas are numeric) — quantized to 4 dp
-    to match `contour_versions.area_ha`'s own NUMERIC(12,4) scale, the figure
-    `s_available_ha` is subtracted against. With no provider registered the
-    source is `"none"` and the figure is an explicit `Decimal('0.0000')`, so a
-    reader can never mistake this placeholder for a measurement; once
-    something registers, the source flips to `"permits"` (ruling 14)."""
+async def occupancy_map(
+    db: AsyncSession, contour_ids: Sequence[uuid.UUID]
+) -> tuple[dict[uuid.UUID, Decimal], str]:
+    """Sum every registered provider's answer for a whole page of contours, in
+    one call per provider. `Decimal`, never `float` (project convention: areas
+    are numeric) — quantized to 4 dp to match `contour_versions.area_ha`'s own
+    NUMERIC(12,4) scale, the figure `s_available_ha` is subtracted against.
+    With no provider registered the source is `"none"` and every figure is an
+    explicit `Decimal('0.0000')`, so a reader can never mistake this
+    placeholder for a measurement; once something registers, the source flips
+    to `"permits"` (ruling 14). Keys a provider returns that were not asked
+    about are ignored — the caller decides the page, not the provider."""
     if not OCCUPANCY_PROVIDERS:
-        return Decimal("0.0000"), "none"
-    total = Decimal("0")
+        return {contour_id: Decimal("0.0000") for contour_id in contour_ids}, "none"
+    totals = {contour_id: Decimal("0") for contour_id in contour_ids}
     for provider in OCCUPANCY_PROVIDERS:
-        total += await provider(db, contour_id)
-    return total.quantize(Decimal("0.0001")), "permits"
+        for contour_id, occupied in (await provider(db, list(contour_ids))).items():
+            if contour_id in totals:
+                totals[contour_id] += occupied
+    return {k: v.quantize(Decimal("0.0001")) for k, v in totals.items()}, "permits"
+
+
+async def occupancy_ha(db: AsyncSession, contour_id: uuid.UUID) -> tuple[Decimal, str]:
+    """One contour's occupancy — the single-card path (`contour_card`), over
+    the same batch call, so there is one summation rule and not two."""
+    totals, source = await occupancy_map(db, [contour_id])
+    return totals[contour_id], source
 
 
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
@@ -1058,21 +1080,19 @@ async def list_contours(
     rows = await repo.list_contours(
         db, organization_id=organization_id, bbox=parsed_bbox, zone=zone
     )
-    items: list[dict[str, Any]] = []
-    for row in rows:
-        occupied, source = await occupancy_ha(db, row.contour_id)
-        items.append(
-            {
-                "id": row.contour_id,
-                "number": row.number,
-                "organization_id": row.organization_id,
-                "area_ha": row.area_ha,
-                "occupied_ha": occupied,
-                "s_available_ha": row.area_ha - occupied,
-                "occupancy_source": source,
-            }
-        )
-    return items
+    occupied_by_id, source = await occupancy_map(db, [row.contour_id for row in rows])
+    return [
+        {
+            "id": row.contour_id,
+            "number": row.number,
+            "organization_id": row.organization_id,
+            "area_ha": row.area_ha,
+            "occupied_ha": occupied_by_id[row.contour_id],
+            "s_available_ha": row.area_ha - occupied_by_id[row.contour_id],
+            "occupancy_source": source,
+        }
+        for row in rows
+    ]
 
 
 async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
@@ -1097,6 +1117,31 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
         "s_available_ha": row.area_ha - occupied,
         "occupancy_source": source,
     }
+
+
+# --- The public surface for levels 3+ (this module's own docstring) ----------
+#
+# `published_version` lives in `repo` and `run_checks` in `checks`, and
+# `run_version_checks` above needs an HTTP actor plus a `contour_id` that a
+# norm-approval flow has no source for. Both are re-exported here as thin
+# pass-throughs so 3.7/3.9 never have to import `gis.repo` or `gis.checks`
+# directly and break the module-boundary rule (CLAUDE.md: cross-module calls
+# go through the other module's `service`).
+
+
+async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourVersion | None:
+    """The one version of this contour currently in force, or `None`. No
+    permission or zone rule: the caller is another SERVICE inside this
+    process, not an HTTP actor — the gates live on the routes that reach it."""
+    return await repo.published_version(db, contour_id)
+
+
+async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.CheckResult]:
+    """The four topology checks against one version, with no actor and no
+    contour id — what a norm or an application pre-check needs.
+    `run_version_checks` above is the HTTP-facing sibling: same checks, plus
+    the 404 lookup and the zone gate a request has to pass."""
+    return await checks.run_checks(db, version_id=version_id)
 
 
 async def list_features(

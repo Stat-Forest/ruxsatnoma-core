@@ -96,22 +96,58 @@ async def test_the_contour_card_declares_that_occupancy_is_a_placeholder(
     assert body["s_available_ha"] == body["area_ha"]
 
 
-async def test_a_registered_occupancy_provider_is_used(db, published_contour):
-    """The seam 3.11 will fill: registering a provider changes the answer and the source."""
+async def test_two_registered_occupancy_providers_are_summed_over_a_whole_page(
+    db, published_contour, draft_contour
+):
+    """The seam 3.11 will fill. Two providers, so the summation path is really
+    exercised, and a two-contour page, so the BATCH shape is: the provider is
+    asked once for every id on the page and answers with a mapping. The
+    per-contour signature it replaced made `list_contours` one query per row —
+    3.11's first registration would have turned a page of 20 into 20
+    round-trips. A provider may answer about fewer contours than it was asked
+    about (`second` below knows nothing about the draft one); a missing key
+    counts as zero."""
     from decimal import Decimal
 
     from app.modules.gis import service
 
-    async def provider(db_, contour_id):
-        return Decimal("10.0")
+    asked: list[list] = []
 
-    service.OCCUPANCY_PROVIDERS.append(provider)
+    async def first(db_, contour_ids):
+        asked.append(list(contour_ids))
+        return {contour_id: Decimal("10.0") for contour_id in contour_ids}
+
+    async def second(db_, contour_ids):
+        return {published_contour.contour_id: Decimal("2.5")}
+
+    service.OCCUPANCY_PROVIDERS.extend([first, second])
     try:
-        occupied, source = await service.occupancy_ha(db, published_contour.contour_id)
-        assert occupied == Decimal("10.0")
+        ids = [published_contour.contour_id, draft_contour.contour_id]
+        totals, source = await service.occupancy_map(db, ids)
         assert source == "permits"
+        assert totals[published_contour.contour_id] == Decimal("12.5000")
+        assert totals[draft_contour.contour_id] == Decimal("10.0000")
+        assert asked == [ids]  # one call for the whole page, not one per row
+
+        occupied, source = await service.occupancy_ha(db, published_contour.contour_id)
+        assert (occupied, source) == (Decimal("12.5000"), "permits")
     finally:
-        service.OCCUPANCY_PROVIDERS.remove(provider)
+        service.OCCUPANCY_PROVIDERS.remove(first)
+        service.OCCUPANCY_PROVIDERS.remove(second)
+
+
+async def test_the_public_surface_for_norms_and_applications_exists(db, published_contour):
+    """The module docstring promises `published_version()`, `list_contours()`
+    and `run_checks()` as gis's surface for levels 3+; only `list_contours`
+    was actually there. Without these two, 3.7 would have to import
+    `gis.repo`/`gis.checks` and break the module-boundary rule."""
+    from app.modules.gis import service
+
+    version = await service.published_version(db, published_contour.contour_id)
+    assert version is not None and version.id == published_contour.id
+
+    results = await service.run_checks(db, published_contour.id)
+    assert {r["check"] for r in results} == {"validity", "within_fund", "overlap", "restrictions"}
 
 
 async def test_features_are_returned_as_a_geojson_feature_collection(
