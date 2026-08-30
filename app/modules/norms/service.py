@@ -5,6 +5,7 @@ with maker-checker — so they share one implementation, keyed by a small
 descriptor. Norms have their own five-status lifecycle (Task 4)."""
 
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -24,7 +25,8 @@ from app.modules.auth import repo as auth_repo
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
-from app.modules.norms import repo
+from app.modules.norms import calculator, repo
+from app.modules.norms import params as norm_params
 from app.modules.norms.models import Norm, RuleParameter, Tariff
 from app.modules.norms.permissions import TARIFFS_PUBLISH
 from app.modules.norms.schemas import NormIn, NormPatch
@@ -254,8 +256,6 @@ async def archive_versioned(
 # `declared_area_ha` — and the parameters in force on the norm's own
 # `effective_from`, not today.
 
-LIMIT_PARAM_CODES = ("safety_reserve", "sb_feed_norm", "season_share")
-
 # (from, to) pairs that exist at all. `publish` additionally needs the central
 # permission, checked on the route; the send-backs mirror 3.6a's contour versions.
 NORM_TRANSITIONS = {
@@ -361,39 +361,27 @@ async def _assert_doc_active(db: AsyncSession, file_id: uuid.UUID, *, reason: st
         raise err("ERR-VAL-001", details={"reason": reason})
 
 
-@dataclass(frozen=True)
-class _LimitParams:
-    safety_reserve: Decimal
-    sb_feed_norm: Decimal
-    season_share: Decimal
+# Ruling 12: `ActivePermitsSB` is a registered seam, and it says so — the same
+# idiom as 3.6a's `OCCUPANCY_PROVIDERS` and `files.ACCESS_CHECKS`. Nothing
+# registers here until 3.11 wires the real permit-load query; until then the
+# load is always zero and `load_source` says "none" so a caller can never
+# mistake the placeholder for a measurement.
+LoadProvider = Callable[[AsyncSession, uuid.UUID, date, date], Awaitable[Decimal]]
+LOAD_PROVIDERS: list[LoadProvider] = []
 
 
-async def _load_limit_params(db: AsyncSession, *, on_date: date) -> _LimitParams:
-    """The three VMQ 689 constants MaxSB is computed from (seeded published,
-    open-ended, by migration 0012), in force on `on_date` — the norm's own
-    `effective_from` (ruling 17), not today, so a norm dated into the future
-    uses the numbers that will apply to it when it actually takes effect."""
-    rows = await repo.effective_parameters(db, LIMIT_PARAM_CODES, on_date)
-    missing = [code for code in LIMIT_PARAM_CODES if code not in rows]
-    if missing:
-        raise err("ERR-NORM-004", details={"reason": "missing_parameters", "codes": missing})
-    return _LimitParams(
-        safety_reserve=Decimal(str(rows["safety_reserve"].value)),
-        sb_feed_norm=Decimal(str(rows["sb_feed_norm"].value)),
-        season_share=Decimal(str(rows["season_share"].value)),
-    )
-
-
-def _max_sb(*, area_ha: Decimal, yield_c_per_ha: Decimal, params: _LimitParams) -> int:
-    """floor(area × yield × season_share × safety_reserve / sb_feed_norm) — VMQ
-    689's grazing-limit formula. Every operand is non-negative by construction
-    (CHECK constraints on the columns, positive seeded constants), so the
-    always-non-negative quotient makes truncating `int()` equivalent to floor —
-    the same approach the brief's own reference calculation uses."""
-    raw = (
-        area_ha * yield_c_per_ha * params.season_share * params.safety_reserve / params.sb_feed_norm
-    )
-    return int(raw)
+async def committed_load_sb(
+    db: AsyncSession, contour_id: uuid.UUID, period_from: date, period_to: date
+) -> tuple[Decimal, str]:
+    """Conditional heads already committed on this contour for an overlapping
+    period. Empty until 3.11 registers a provider — and the source string says
+    so, so a caller can never read the placeholder as a measurement."""
+    if not LOAD_PROVIDERS:
+        return Decimal("0"), "none"
+    total = Decimal("0")
+    for provider in LOAD_PROVIDERS:
+        total += await provider(db, contour_id, period_from, period_to)
+    return total, "permits"
 
 
 async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm:
@@ -589,9 +577,16 @@ async def publish_norm(db: AsyncSession, norm_id: uuid.UUID, *, actor: User) -> 
         raise err("ERR-NORM-005", details={"reason": "no_published_contour"})
 
     if norm.yield_c_per_ha is not None:
-        params = await _load_limit_params(db, on_date=norm.effective_from)
-        norm.max_sb = _max_sb(
-            area_ha=version.area_ha, yield_c_per_ha=norm.yield_c_per_ha, params=params
+        # `calculator.max_sb` is the SAME formula `norms.calculator.calculate`
+        # would use for a fresh preview — freezing it here and reading it back
+        # unchanged from `Norm.max_sb` everywhere else (lesson: two copies of
+        # the feed-stock formula is exactly the defect this stage exists to
+        # prevent). `load_limit_params` raises `ERR-NORM-004` naming whichever
+        # of `safety_reserve`/`sb_feed_norm`/`season_share` is missing the
+        # moment `calculator.max_sb` reads it, not before.
+        limit_params = await norm_params.load_limit_params(db, on_date=norm.effective_from)
+        norm.max_sb = calculator.max_sb(
+            area_ha=version.area_ha, yield_c_per_ha=norm.yield_c_per_ha, params=limit_params
         )
     norm.status = "published"
     norm.published_at = datetime.now(UTC)

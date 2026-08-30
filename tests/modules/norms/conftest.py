@@ -230,17 +230,37 @@ async def tariffs_checker_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncC
 
 
 @pytest.fixture
-async def published_coef_sb(db: AsyncSession) -> None:
-    """Publishes the ten seeded `coef_sb:*` drafts (ruling 8) for the tests that
-    need a grazing calculation to succeed. Scoped by code, never a blanket
-    UPDATE — the test database is shared (lesson)."""
-    await db.execute(
-        text(
-            "UPDATE rule_parameters SET status = 'published' "
-            "WHERE code LIKE 'coef_sb:%' AND status = 'draft'"
-        )
+async def published_coef_sb(db: AsyncSession) -> AsyncIterator[None]:
+    """Conditional-head coefficients a grazing calculation can actually read.
+
+    The ten seeded `coef_sb:*` rows are DRAFT by ruling 8 and are shared,
+    singleton rows: publishing them in place would leak through the first
+    `_client_for` request's commit and permanently break the seed test. Instead
+    this inserts its own published rows for the same codes — legal, because the
+    EXCLUDE constraint only covers `status = 'published'` and the seeds are not —
+    and deletes them by id in teardown."""
+    ids: list[uuid.UUID] = []
+    rows = await db.execute(
+        text("SELECT code, value #>> '{}' FROM rule_parameters WHERE code LIKE 'coef_sb:%'")
     )
-    await db.flush()
+    for code, value in rows.all():
+        row_id = uuid7()
+        await db.execute(
+            text(
+                "INSERT INTO rule_parameters (id, code, value, effective_from, basis, status) "
+                "VALUES (:id, :code, to_jsonb(CAST(:value AS text)), DATE '2020-01-01', "
+                "'test override', 'published')"
+            ).bindparams(id=row_id, code=code, value=value)
+        )
+        ids.append(row_id)
+    await db.commit()
+    try:
+        yield
+    finally:
+        await db.execute(
+            text("DELETE FROM rule_parameters WHERE id = ANY(:ids)").bindparams(ids=ids)
+        )
+        await db.commit()
 
 
 @pytest.fixture
@@ -258,7 +278,7 @@ def param_row(db: AsyncSession):
             text(
                 "INSERT INTO rule_parameters "
                 "(id, code, value, effective_from, effective_to, basis, status) "
-                "VALUES (:id, :code, to_jsonb(:value::text), :ef, :et, 'test', :status)"
+                "VALUES (:id, :code, to_jsonb(CAST(:value AS text)), :ef, :et, 'test', :status)"
             ).bindparams(
                 id=param_id,
                 code=code,
