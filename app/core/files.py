@@ -7,10 +7,11 @@ appends a checker that opens files attached to announcements the caller can see.
 
 import hashlib
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, storage
@@ -31,10 +32,55 @@ INLINE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 AccessChecker = Callable[[AsyncSession, uuid.UUID, Any], Awaitable[bool]]
 ACCESS_CHECKS: list[AccessChecker] = []
 
+# Streamed in fixed chunks so a body over the cap never materializes fully in RAM
+# (I2, 3.3b final review) — small enough to keep the abort latency low, large
+# enough that the chunk-count overhead is negligible next to real uploads.
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
 
-def _magic_ok(content_type: str, data: bytes) -> bool:
-    prefixes = ALLOWED_TYPES[content_type]
-    if not any(data.startswith(p) for p in prefixes):
+
+def sanitize_filename(filename: str) -> str:
+    """Strip characters that would break the Content-Disposition header (quotes end
+    the filename="..." value early, carriage returns/newlines inject headers) —
+    applied once at every ingest point so the stored value is already safe
+    wherever it is later reflected back."""
+    return filename.replace('"', "").replace("\r", "").replace("\n", " ")
+
+
+async def read_capped(file: UploadFile, cap_bytes: int, content_length: int | None) -> bytes:
+    """Enforces the upload size cap before the body sits fully in RAM as one
+    `bytes` object (I2, 3.3b final review — the plan's ruling 3 says the cap is
+    enforced first, but it was only checked after `file.read()` had already
+    pulled everything into memory). A `Content-Length` or Starlette's own
+    spooled-upload `file.size`, when known, rejects oversized bodies without
+    reading a single byte; otherwise the body streams in fixed chunks and aborts
+    the instant the running total exceeds the cap. `save_upload`'s own check
+    stays as the final authority (defense in depth) once this returns."""
+    if content_length is not None and content_length > cap_bytes:
+        raise err("ERR-VAL-001", details={"reason": "too_large"})
+    if file.size is not None and file.size > cap_bytes:
+        raise err("ERR-VAL-001", details={"reason": "too_large"})
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap_bytes:
+            raise err("ERR-VAL-001", details={"reason": "too_large"})
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _magic_ok(content_type: str, data: bytes, allowed: Mapping[str, tuple[bytes, ...]]) -> bool:
+    """An EMPTY prefix tuple means "this type has no reliable magic" and passes —
+    the only such entry today is gis's `text/csv` (a CSV starts with whatever its
+    first column header happens to be), where the real gate is the parser itself.
+    `any()` over an empty tuple is False, so without this branch such a type
+    could never be uploaded at all."""
+    prefixes = allowed[content_type]
+    if prefixes and not any(data.startswith(p) for p in prefixes):
         return False
     if content_type == "image/webp":
         return data[8:12] == b"WEBP"
@@ -42,14 +88,26 @@ def _magic_ok(content_type: str, data: bytes) -> bool:
 
 
 async def save_upload(
-    db: AsyncSession, *, data: bytes, filename: str, content_type: str, actor: Any
+    db: AsyncSession,
+    *,
+    data: bytes,
+    filename: str,
+    content_type: str,
+    actor: Any,
+    allowed: Mapping[str, tuple[bytes, ...]] | None = None,
+    cap_key: str = "max_upload_mb",
 ) -> MediaFile:
-    if content_type not in ALLOWED_TYPES:
+    """Persist one upload. `allowed`/`cap_key` let a caller with its own ingest
+    policy (gis's geodata import: a different MIME/magic table and the larger
+    `gis_import_max_mb` cap) reuse this path instead of widening the document
+    whitelist for every uploader in the system (plan 03.6a ruling 8)."""
+    table = ALLOWED_TYPES if allowed is None else allowed
+    if content_type not in table:
         raise err("ERR-VAL-001", details={"reason": "type_not_allowed"})
-    cap = await settings_store.get_int(db, "max_upload_mb") * 1024 * 1024
+    cap = await settings_store.get_int(db, cap_key) * 1024 * 1024
     if len(data) > cap:
         raise err("ERR-VAL-001", details={"reason": "too_large"})
-    if not _magic_ok(content_type, data):
+    if not _magic_ok(content_type, data, table):
         raise err("ERR-VAL-001", details={"reason": "content_mismatch"})
     file_id = uuid7()
     file = MediaFile(

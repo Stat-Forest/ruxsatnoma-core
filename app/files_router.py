@@ -14,18 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, settings_store
 from app.core.deps import get_db
-from app.core.errors import err
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.deps import get_current_user
 from app.modules.auth.models import User
 
 router = APIRouter(prefix="/files", tags=["files"])
-
-# Streamed in fixed chunks so a body over the cap never materializes fully in RAM
-# (I2, final review) — small enough to keep the abort latency low, large enough
-# that the chunk-count overhead is negligible next to real uploads.
-_UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 class FileOut(BaseModel):
@@ -35,14 +29,6 @@ class FileOut(BaseModel):
     size_bytes: int
     sha256: str
     created_at: datetime
-
-
-def _sanitize_filename(filename: str) -> str:
-    """Strip characters that would break the Content-Disposition header (quotes end
-    the filename="..." value early, carriage returns/newlines inject headers) —
-    applied once here so the stored value is already safe wherever it is later
-    reflected back."""
-    return filename.replace('"', "").replace("\r", "").replace("\n", " ")
 
 
 _NON_ASCII_PRINTABLE = re.compile(r"[^\x20-\x7e]")
@@ -76,33 +62,6 @@ def _content_disposition(disposition: str, filename: str) -> str:
     return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
-async def _read_capped(file: UploadFile, cap_bytes: int, content_length: int | None) -> bytes:
-    """Enforces the upload size cap before the body sits fully in RAM as one
-    `bytes` object (I2, final review — the plan's ruling 3 says the cap is
-    enforced first, but it was only checked after `file.read()` had already
-    pulled everything into memory). A `Content-Length` or Starlette's own
-    spooled-upload `file.size`, when known, rejects oversized bodies without
-    reading a single byte; otherwise the body streams in fixed chunks and aborts
-    the instant the running total exceeds the cap. `files.save_upload`'s own
-    check stays as the final authority (defense in depth) once this returns."""
-    if content_length is not None and content_length > cap_bytes:
-        raise err("ERR-VAL-001", details={"reason": "too_large"})
-    if file.size is not None and file.size > cap_bytes:
-        raise err("ERR-VAL-001", details={"reason": "too_large"})
-
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await file.read(_UPLOAD_CHUNK_SIZE)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > cap_bytes:
-            raise err("ERR-VAL-001", details={"reason": "too_large"})
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 @router.post("", status_code=201)
 async def upload_file(
     request: Request,
@@ -118,8 +77,8 @@ async def upload_file(
             content_length = int(raw_content_length)
         except ValueError:
             content_length = None  # malformed header — fall through to the chunked read
-    data = await _read_capped(file, cap_bytes, content_length)
-    filename = _sanitize_filename(file.filename or "file")
+    data = await files.read_capped(file, cap_bytes, content_length)
+    filename = files.sanitize_filename(file.filename or "file")
     saved = await files.save_upload(
         db,
         data=data,

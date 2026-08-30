@@ -10,6 +10,7 @@ from fastapi import UploadFile
 from sqlalchemy import select
 
 from app import files_router
+from app.core import files
 from app.core.errors import DomainError
 from app.main import create_app
 from app.modules.audit.models import AuditLog
@@ -223,7 +224,7 @@ def test_sanitize_filename_strips_bare_carriage_return():
     promised newline safety, but a bare `\\r` with no accompanying `\\n` survived
     untouched — still a header-injection seam on clients that treat lone CR as a
     line terminator."""
-    assert files_router._sanitize_filename("evil\rInjected: header") == "evilInjected: header"
+    assert files.sanitize_filename("evil\rInjected: header") == "evilInjected: header"
 
 
 # --- I2 (final review): the size cap must be enforced before the body sits in RAM --
@@ -240,7 +241,7 @@ async def test_read_capped_content_length_fast_path_skips_reading():
 
     file = UploadFile(_ExplodingStream(b""), filename="big.pdf")
     with pytest.raises(DomainError) as exc_info:
-        await files_router._read_capped(file, cap_bytes=10, content_length=999)
+        await files.read_capped(file, cap_bytes=10, content_length=999)
     assert exc_info.value.code == "ERR-VAL-001"
     assert exc_info.value.details == {"reason": "too_large"}
 
@@ -251,11 +252,11 @@ async def test_read_capped_chunked_path_aborts_once_over_cap():
     must never allocate anything close to a real oversized upload."""
     file = UploadFile(io.BytesIO(b"x" * 25), filename="small.pdf")
     with pytest.raises(DomainError) as exc_info:
-        await files_router._read_capped(file, cap_bytes=20, content_length=None)
+        await files.read_capped(file, cap_bytes=20, content_length=None)
     assert exc_info.value.details == {"reason": "too_large"}
 
 
 async def test_read_capped_returns_full_bytes_under_cap():
     file = UploadFile(io.BytesIO(PDF), filename="doc.pdf")
-    data = await files_router._read_capped(file, cap_bytes=1024, content_length=len(PDF))
+    data = await files.read_capped(file, cap_bytes=1024, content_length=len(PDF))
     assert data == PDF
