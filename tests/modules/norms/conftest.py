@@ -78,6 +78,29 @@ def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
+def frozen_on_date(monkeypatch: pytest.MonkeyPatch) -> date:
+    """Freezes the date `norms.service._compute` resolves as `on_date`
+    (`business_today()`) to a day inside the seeded `bhm` window (412 000
+    sum, 2025-08-01 to 2026-08-31) — request it on any test whose assertion
+    depends on WHICH `bhm` tranche is in force (an exact amount, or
+    `input_snapshot.params.bhm` itself).
+
+    Without this, `POST /calculations/preview`/`POST /calculations` resolve
+    `on_date` from the REAL Asia/Tashkent wall clock, so such a test starts
+    failing the moment it crosses 2026-09-01 (`bhm` -> 440 000) — with no code
+    change to explain why.
+
+    `service.py` imports the NAME `business_today`
+    (`from app.core.time import business_today`), so the binding it actually
+    calls at runtime is `app.modules.norms.service.business_today`, not
+    `app.core.time.business_today` — patching the latter would silently do
+    nothing here."""
+    frozen = date(2026, 8, 30)
+    monkeypatch.setattr("app.modules.norms.service.business_today", lambda: frozen)
+    return frozen
+
+
+@pytest.fixture
 def unique_suffix() -> str:
     """Collision-free discriminator for codes: the test database is shared and
     persistent (lesson), and this stage's EXCLUDE constraints turn a leaked row

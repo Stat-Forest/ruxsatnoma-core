@@ -3,6 +3,7 @@ nothing, so a failing check is reported INSIDE the body, not as an HTTP error
 (design/03: "ERR-NORM-001..003 inside `checks`, not as an HTTP error")."""
 
 import uuid
+from datetime import date
 
 import pytest
 from httpx import AsyncClient
@@ -15,8 +16,14 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_a_haymaking_preview_returns_the_amount_and_the_checks(
-    applicant_client: AsyncClient, published_contour: Contour, haymaking_activity_id: uuid.UUID
+    applicant_client: AsyncClient,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    frozen_on_date: date,
 ) -> None:
+    """`frozen_on_date` pins `on_date` inside the 412 000 `bhm` window — the
+    seeded rate switches to 440 000 on 2026-09-01, and this test's own
+    expected amount is only correct on one side of that date (lesson)."""
     response = await applicant_client.post(
         "/api/v1/calculations/preview",
         json={

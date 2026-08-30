@@ -6,6 +6,7 @@ so a recalculation for the same application is a second insert, never an
 update (ruling 21)."""
 
 import uuid
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -17,8 +18,14 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_saving_a_calculation_writes_a_row_and_returns_it(
-    applicant_client: AsyncClient, published_contour: Contour, haymaking_activity_id: uuid.UUID
+    applicant_client: AsyncClient,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    frozen_on_date: date,
 ) -> None:
+    """`frozen_on_date` pins `on_date` inside the 412 000 `bhm` window — both
+    the exact amount and the `bhm` value asserted below are only correct on
+    one side of the seeded 2026-09-01 switch to 440 000 (lesson)."""
     response = await applicant_client.post(
         "/api/v1/calculations",
         json={
