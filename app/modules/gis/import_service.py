@@ -23,7 +23,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import structlog
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, InternalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core import files, settings_store, storage
@@ -250,6 +250,49 @@ async def _organization_names(db: AsyncSession, organization_id: uuid.UUID) -> s
     return {_normalised_name(v) for v in (org.name or {}).values() if isinstance(v, str)}
 
 
+# How a driver failure is reported to an OPERATOR. Matched by SQLAlchemy's own
+# exception class, not by reading `exc.orig` — those classes are already mapped
+# from the SQLSTATE class and say the same thing without a driver dependency.
+_DB_ROW_ERRORS: tuple[tuple[type[DBAPIError], str, str], ...] = (
+    (
+        IntegrityError,
+        "constraint_violation",
+        "the database refused this row: a duplicate value or a reference to something missing",
+    ),
+    (DataError, "value_out_of_range", "a value in this row does not fit the column it maps to"),
+    (
+        InternalError,
+        "invalid_geometry",
+        "PostGIS refused this row's geometry — check the file's projection and its shapes",
+    ),
+)
+
+
+def _database_row_error(row: int, exc: DBAPIError) -> RowError:
+    """Map a driver failure to a code and a message an operator can act on.
+
+    `error_report` is a stored, operator-visible JSONB column returned whole by
+    `GET /gis/imports/{id}` — so the driver's own text never goes into it. A
+    PostgreSQL error DETAIL quotes the offending row's OWN VALUES (`Key
+    (organization_id, number)=(…, …) already exists`), which for the Agency's
+    files can include attributes we deliberately refuse to store, and the
+    lessons file already carries the rule for the sibling case (`Never echo an
+    outbound payload into a raised exception` — `outbox_messages.last_error`).
+    `repr(exc.orig)` stays in the structlog line, where an engineer can still
+    read it and an operator cannot.
+
+    One `except` clause with an isinstance ladder rather than several ordered
+    clauses: the lesson about ordering `IntegrityError` before `DBAPIError`
+    guards against a broad clause SWALLOWING a narrow one and raising the wrong
+    domain error — here every branch builds the same kind of value, and the
+    ladder is explicitly narrow-first for the same reason.
+    """
+    for kind, code, message in _DB_ROW_ERRORS:
+        if isinstance(exc, kind):
+            return RowError(row=row, code=code, message=message)
+    return RowError(row=row, code="database_error", message="the database refused this row")
+
+
 async def _write_batch(
     db: AsyncSession,
     row: GisImport,
@@ -265,14 +308,14 @@ async def _write_batch(
 
     Returns `(created, warnings, omitted_warnings)` — the counter is carried out
     rather than closed here, because `run_import` still extends the same list
-    with the organization-name warnings before it is stored (`_capped` runs once,
-    at the end, over the whole thing).
+    with the organization-name warnings before it is stored (`_truncate` runs
+    once, at the end, over the whole thing).
     """
     warnings: list[dict[str, Any]] = []
     omitted = 0
 
     def warn(entry: dict[str, Any]) -> None:
-        """Bounded append — see `_capped`. A 151-feature delivery never reaches
+        """Bounded append — see `_truncate`. A 151-feature delivery never reaches
         the cap; a mis-exported one whose every row mismatches would otherwise
         put one dict per row in memory and then in the column."""
         nonlocal omitted
@@ -377,9 +420,8 @@ async def _write_batch(
             # import, a value the column refuses. The savepoint is aborted now;
             # rolling it back (the caller's `async with`) is what makes the
             # session usable again for writing the report.
-            raise _BatchFailed(
-                [RowError(row=item.row, code="database_error", message=repr(exc.orig))]
-            ) from exc
+            logger.warning("gis.import.row_database_error", row=item.row, error=repr(exc.orig))
+            raise _BatchFailed([_database_row_error(item.row, exc)]) from exc
         created += 1
     return created, warnings, omitted
 

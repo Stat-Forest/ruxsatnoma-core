@@ -107,6 +107,13 @@ class VersionIn(BaseModel):
 
 
 class VersionOut(BaseModel):
+    """`approval_doc_id`/`approved_by`/`published_at` are part of the response
+    because a client driving the lifecycle otherwise cannot see WHO approved a
+    version or WHEN it went into force — the three facts every one of
+    `approve`/`publish`/`return-to-review` turns on. All three are null through
+    draft and review, which is exactly what tells an unapproved version from an
+    approved one on screen."""
+
     id: uuid.UUID
     contour_id: uuid.UUID
     version_no: int
@@ -117,6 +124,9 @@ class VersionOut(BaseModel):
     accuracy_m: Decimal | None
     survey_date: date | None
     effective_from: date | None
+    approval_doc_id: uuid.UUID | None
+    approved_by: uuid.UUID | None
+    published_at: datetime | None
 
     @field_serializer("area_ha", "declared_area_ha", "accuracy_m")
     def _serialize_decimal(self, value: Decimal | None) -> str | None:

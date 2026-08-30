@@ -37,22 +37,6 @@ async def layer_by_id(db: AsyncSession, layer_id: uuid.UUID) -> GisLayer | None:
     return await db.get(GisLayer, layer_id)
 
 
-def normalised(geojson_param: Any) -> Any:
-    """Ruling 10, as one SQL expression: force 2D (the source is PolygonZ with a
-    vertical datum we ignore), repair self-intersections, keep only polygonal
-    parts, wrap as MultiPolygon. Evaluated by PostGIS — never in Python."""
-    return func.ST_Multi(
-        func.ST_CollectionExtract(
-            func.ST_MakeValid(
-                func.ST_Force2D(func.ST_SetSRID(func.ST_GeomFromGeoJSON(geojson_param), 4326))
-            ),
-            3,
-        )
-    )
-
-
-AREA_HA = "ST_Area(geom::geography) / 10000.0"
-
 # The two ways geometry enters this module, as SQL. The API path (Task 3) posts
 # GeoJSON, already in WGS84; the import path (Task 7) hands over the source
 # file's own WKB plus the SRID `gis.importer.parse` read off it, and PostGIS
@@ -182,12 +166,12 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
 #
 # `layer_features.geom` is plain GEOMETRY, not MULTIPOLYGON: this catalogue
 # also holds points (`water_points`) and lines (`cattle_corridors`), which
-# `normalised()`/`insert_version`'s own `ST_CollectionExtract(..., 3)` above
-# would silently discard. The pipeline below stops one step earlier — force
-# 2D, repair self-intersections, wrap as Multi* — and the RESULT's own type is
-# validated by the caller (`gis.service.create_feature`) against the layer's
-# declared `geometry_type` instead (task-6 brief's design note). Do not reuse
-# `normalised()`/`insert_version`'s expression unchanged for this table.
+# `insert_version`'s own `ST_CollectionExtract(..., 3)` above would silently
+# discard. The pipeline below stops one step earlier — force 2D, repair
+# self-intersections, wrap as Multi* — and the RESULT's own type is validated
+# by the caller (`gis.service.create_feature`) against the layer's declared
+# `geometry_type` instead (task-6 brief's design note). Do not reuse
+# `insert_version`'s expression unchanged for this table.
 
 GEOMETRY_TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
     "POINT": ("ST_Point", "ST_MultiPoint"),

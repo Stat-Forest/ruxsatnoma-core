@@ -735,3 +735,53 @@ Rules for this file:
   an intersection AREA and compares it to a named, configurable tolerance
   setting — never a bare boolean `ST_Intersects`/`ST_Overlaps` used directly
   as the blocking test.
+
+## `request.body()` raises inside a dependency on any FORM route
+
+- **Rule:** A FastAPI dependency that needs the raw request body (`auth.deps.
+  idempotency_context` is the only one) must branch on the content type: for
+  `multipart/form-data` and `application/x-www-form-urlencoded` it reads
+  `await request.form()` (Starlette's cached `FormData`), never
+  `await request.body()`.
+- **Why:** FastAPI reads the body BEFORE solving dependencies, and for a form it
+  parses straight off the stream rather than caching bytes — so `Request.body()`
+  re-enters `Request.stream()`, hits `_stream_consumed` and raises
+  `RuntimeError("Stream consumed")`, an unhandled 500. Hit the moment
+  `POST /gis/imports` became the idempotency mechanism's first consumer (3.6a
+  fix wave); reproduced by wiring the dependency the plain way and watching the
+  upload come back 500.
+- **How to apply:** Any future `Idempotency-Key` consumer that takes a file
+  (payment receipts, act scans) is a multipart route and inherits this; the
+  fingerprint there is the form's scalar fields plus each file's
+  name/filename/content-type/size, sorted — never the file bytes, which would
+  mean re-reading a 100 MB upload per request.
+
+## A status-transition table is ambiguous wherever two source states share a target
+
+- **Rule:** When a state machine allows one target from more than one source
+  (`TRANSITIONS`: `review` is reachable from BOTH `draft` and `approved`), a
+  route driving one of those edges must assert the SOURCE state too, not only
+  "may this row become X".
+- **Why:** `return-to-review` (`CONTOURS_APPROVE`) and `submit-review`
+  (`CONTOURS_MANAGE`) both land on `review`. Checking the target alone let the
+  approver drive `draft` -> `review` — submit-review's own edge, under the wrong
+  permission — so an approver could advance a specialist's draft they otherwise
+  may not touch. Caught by the new route's own bad-transition test, which
+  returned 200 instead of 409 (3.6a fix wave).
+- **How to apply:** Before adding a route to an existing transition table, grep
+  the table for the target: more than one source means the route needs
+  `_assert_transition_from(version, source, target)`, not `_assert_transition`.
+
+## Paging a list breaks every test that asserted membership in the unpaged one
+
+- **Rule:** When you add `Page[T]` to a list endpoint, every existing test that
+  asserted "my fixture's row is in the response" must gain a filter narrowing to
+  that fixture's own data — a fresh `organization_id` is the usual one here.
+- **Why:** The test DB is shared and persistent, and committing client fixtures
+  leave their rows behind forever, so page 1 of 20 is full of previous runs'
+  contours: `test_an_applicant_sees_published_contours_only` went red the moment
+  `GET /gis/contours` was paged, for a reason that had nothing to do with the
+  change (3.6a fix wave).
+- **How to apply:** Page an endpoint and grep its tests for unfiltered `GET`s in
+  the same commit; assert against `total` and an explicitly scoped query, never
+  against membership in an unbounded default page.

@@ -3,6 +3,12 @@
 import asyncio
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import (
+    DataError,
+    IntegrityError,
+    InternalError,
+    OperationalError,
+)
 
 from app.modules.gis import import_service, importer
 from app.modules.gis.models import Contour, ContourVersion, GisImport, LayerFeature
@@ -488,3 +494,56 @@ async def test_organization_mismatch_warnings_survive_end_to_end_and_are_capped(
     # under the cap, 3 do not — and the marker says 3, not 0.
     assert warnings[-1]["omitted"] == 3
     assert {w["code"] for w in warnings[:-1]} == {"organization_mismatch"}
+
+
+async def test_a_driver_failure_is_reported_without_the_drivers_own_text():
+    """`error_report` is a stored, operator-visible JSONB column returned whole
+    by `GET /gis/imports/{id}`, and it used to carry `repr(exc.orig)`. A
+    PostgreSQL error DETAIL quotes the offending row's OWN VALUES (`Key
+    (organization_id, number)=(…, …) already exists`) — which for the Agency's
+    files can include attributes ruling 13 deliberately refuses to store. The
+    same rule the lessons file already carries for `outbox_messages.last_error`.
+    """
+    detail = "Key (organization_id, number)=(abc, 14510q) already exists"
+    orig = Exception(detail)
+
+    for exc, expected in (
+        (IntegrityError("stmt", {}, orig), "constraint_violation"),
+        (DataError("stmt", {}, orig), "value_out_of_range"),
+        (InternalError("stmt", {}, orig), "invalid_geometry"),
+        (OperationalError("stmt", {}, orig), "database_error"),
+    ):
+        reported = import_service._database_row_error(7, exc)
+        assert reported.row == 7
+        assert reported.code == expected
+        assert detail not in reported.message
+        assert reported.message  # a human sentence, not an empty placeholder
+
+
+async def test_a_version_reports_who_approved_it_and_when_it_published(
+    gis_client, rahbar_client, contour_with_draft, approval_doc
+):
+    """A client driving the lifecycle could not see who approved a version or
+    when it went into force — the three facts approve/publish/return-to-review
+    all turn on. Null through draft, populated from approve onwards."""
+    cid, vid = contour_with_draft
+    base = f"/api/v1/gis/contours/{cid}/versions/{vid}"
+
+    submitted = await gis_client.post(f"{base}/submit-review")
+    body = submitted.json()
+    assert (body["approval_doc_id"], body["approved_by"], body["published_at"]) == (
+        None,
+        None,
+        None,
+    )
+
+    approved = await rahbar_client.post(
+        f"{base}/approve", json={"approval_doc_id": str(approval_doc.id)}
+    )
+    body = approved.json()
+    assert body["approval_doc_id"] == str(approval_doc.id)
+    assert body["approved_by"] is not None
+    assert body["published_at"] is None
+
+    published = await rahbar_client.post(f"{base}/publish")
+    assert published.json()["published_at"] is not None
