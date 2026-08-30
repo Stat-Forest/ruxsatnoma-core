@@ -33,7 +33,8 @@ async def test_vmq_278_rates_are_seeded(
         text(
             "SELECT t.coefficient, t.quantity_unit, t.status, t.basis FROM tariffs t "
             "JOIN activity_types a ON a.id = t.activity_type_id "
-            "WHERE a.code = :activity AND t.livestock_group IS NOT DISTINCT FROM :group"
+            "WHERE a.code = :activity AND t.livestock_group IS NOT DISTINCT FROM :group "
+            "AND t.status = 'published'"
         ).bindparams(activity=activity, group=group)
     )
     coefficient_db, unit_db, status, basis = row.one()
