@@ -2,15 +2,25 @@
 calculation); write routes are gated by the tariff permissions, which live with
 the central office (decision #32).
 
-Maker-checker is not a permission split between two different actions: the SAME
-route (`/publish`, `/archive`) is reachable by anyone holding either
-`TARIFFS_MANAGE` or `TARIFFS_PUBLISH` (migration 0011 grants `central_admin`
-both at once, on purpose), and `service.publish_versioned` is what refuses a
-maker checking their own work, by comparing `created_by` to the actor — not by
-which permission code let the request through. Gating `/publish` on
-`TARIFFS_PUBLISH` alone would 403 a maker before the domain check ever ran,
-which is not what `test_a_maker_creates_a_draft_and_cannot_publish_it` (a
-`tariffs_maker_client`, `TARIFFS_MANAGE` only) exercises."""
+`/publish` and `/archive` both accept anyone holding either `TARIFFS_MANAGE` or
+`TARIFFS_PUBLISH` (migration 0011 grants `central_admin` both at once, on
+purpose) — but the two routes refuse for DIFFERENT reasons, and only one of
+them is enforced by the route dependency:
+
+- `/publish`'s real gate is an IDENTITY check: `service.publish_versioned`
+  refuses a maker publishing their own draft by comparing `created_by` to the
+  actor, not by which permission code let the request through. Gating on
+  `TARIFFS_PUBLISH` alone would 403 a maker before that domain check ever ran,
+  which is not what `test_a_maker_creates_a_draft_and_cannot_publish_it` (a
+  `tariffs_maker_client`, `TARIFFS_MANAGE` only) exercises.
+- `/archive` has no identity to compare — archiving is a single-actor action,
+  not a handoff between a maker's and a checker's own drafts of the same row.
+  Widening the route the same way would let ANY `TARIFFS_MANAGE` holder take a
+  row they never touched out of force, so `service.archive_versioned` carries
+  its OWN `ERR-ACL-001` check for that one case (the row being archived is
+  already `published`), via `_holds_tariffs_publish` — a maker keeps the
+  ability to discard their own DRAFT with no second person involved, which the
+  route dependency alone cannot distinguish from archiving a published row."""
 
 import uuid
 from datetime import date

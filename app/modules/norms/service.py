@@ -15,9 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import err
 from app.core.time import business_today
 from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
+from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.norms import repo
 from app.modules.norms.models import RuleParameter, Tariff
+from app.modules.norms.permissions import TARIFFS_PUBLISH
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,17 @@ def _snapshot(row: RuleParameter | Tariff) -> dict[str, Any]:
             value = value.isoformat()
         data[column.name] = value
     return data
+
+
+async def _holds_tariffs_publish(db: AsyncSession, actor: User) -> bool:
+    """Holds `norms.tariffs.publish`, or is the superuser that passes every
+    permission gate (decision #41 ruling 2) — the same two-branch shape
+    `gis.service._may_manage_layers`/`admin.users_service._may_manage` use for
+    a rule INSIDE a handler, as opposed to a `require_permission` dependency
+    on the route itself."""
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return TARIFFS_PUBLISH in await auth_repo.permission_codes(db, actor)
 
 
 async def create_versioned(db: AsyncSession, kind: _Versioned, payload: Any, *, actor: User) -> Any:
@@ -166,15 +180,32 @@ async def archive_versioned(
     db: AsyncSession, kind: _Versioned, row_id: uuid.UUID, *, actor: User
 ) -> Any:
     """Published or draft -> archived (idempotent: archiving an already-archived
-    row is a no-op, mirroring `admin.service.archive_classifier_item`). An open
-    `effective_to` is closed at `business_today() - 1 day`, clamped so it can
-    never precede `effective_from` — the exact clamp that precedent uses, for
-    the exact same reason: a row whose `effective_from` is today or later would
-    otherwise compute an end before its own start and fail the `period_valid`
-    CHECK at flush instead of archiving cleanly."""
+    row is a no-op, mirroring `admin.service.archive_classifier_item`).
+
+    Unlike `publish_versioned`, this has no `created_by` to compare against —
+    archiving is a single-actor action, not a handoff between two drafts of
+    the same row, so there is nothing to tell a maker apart from a checker BY
+    IDENTITY here. That means the router's shared
+    `require_any_permission(TARIFFS_PUBLISH, TARIFFS_MANAGE)` gate (widened for
+    the same reason `publish_parameter`'s is — `refs_router.py`'s module
+    docstring — so a maker reaches a domain answer instead of a bare 403) is
+    not enough on its own: taking a PUBLISHED row out of force is exactly the
+    one-person change to the numbers in force that
+    maker-checker exists to prevent, so it needs the checker's own permission,
+    checked here. Archiving a DRAFT stays available to a maker alone — a maker
+    must be able to discard their own draft without pulling in a second person.
+
+    An open `effective_to` is closed at `business_today() - 1 day`, clamped so
+    it can never precede `effective_from` — the exact clamp
+    `admin.service.archive_classifier_item` uses, for the exact same reason: a
+    row whose `effective_from` is today or later would otherwise compute an
+    end before its own start and fail the `period_valid` CHECK at flush
+    instead of archiving cleanly."""
     row = await _row_or_404(db, kind, row_id)
     if row.status == "archived":
         return row
+    if row.status == "published" and not await _holds_tariffs_publish(db, actor):
+        raise err("ERR-ACL-001")
     before = _snapshot(row)
     row.status = "archived"
     row.effective_to = row.effective_to or max(

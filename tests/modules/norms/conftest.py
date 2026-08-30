@@ -142,6 +142,27 @@ async def haymaking_activity_id(db: AsyncSession) -> uuid.UUID:
     return rows.scalar_one()
 
 
+@pytest.fixture
+async def science_activity_id(db: AsyncSession) -> AsyncIterator[uuid.UUID]:
+    """`science` has zero seeded tariff rows (`test_science_has_no_tariff` —
+    VMQ 278's annex has no rate for it), unlike every other activity, which is
+    already published open-ended from 2015-09-30. A test that needs to publish
+    a FRESH tariff without tripping `ex_tariffs_one_in_force` uses this key —
+    but `tariffs` has no delete-via-API (archived rows still count towards
+    `test_science_has_no_tariff`'s absolute-zero assertion, and a row a failed
+    permission check deliberately leaves PUBLISHED would otherwise conflict
+    with every later run's own attempt to publish another one), so this
+    fixture deletes every tariff row for this activity_type_id at teardown,
+    regardless of who created it — nothing else in the product is ever supposed
+    to write one, and the delete is scoped to this one FK, never a blanket
+    `DELETE FROM tariffs`."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'science'"))
+    activity_id = rows.scalar_one()
+    yield activity_id
+    await db.execute(text("DELETE FROM tariffs WHERE activity_type_id = :id"), {"id": activity_id})
+    await db.commit()
+
+
 # --- clients ---------------------------------------------------------------
 # `_client_for(db, *permissions, organization_id=None)` is an async generator
 # (see gis/conftest.py): drive it with `async for`, exactly as the gis fixtures
