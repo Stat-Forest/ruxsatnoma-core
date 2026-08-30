@@ -258,18 +258,43 @@ async def create_contour(
 
 
 async def update_contour(
-    db: AsyncSession, contour_id: uuid.UUID, *, actor: User, status: str | None = None
+    db: AsyncSession, contour_id: uuid.UUID, *, actor: User, **fields: Any
 ) -> Contour:
-    """`PATCH /gis/contours/{id}` — identity-level housekeeping only (today,
-    archiving). Geometry changes always go through a new version, never through
-    this route."""
+    """`PATCH /gis/contours/{id}` — identity-level housekeeping: archiving, and
+    the contour/sub-contour HIERARCHY. Geometry changes always go through a new
+    version, never through this route.
+
+    `kind`/`parent_id` are settable here because decision #49 ruling 11 says so:
+    the importer creates everything flat BECAUSE it refuses to guess a
+    hierarchy from the file, and this edit is what it assumed would exist.
+    `ContourPatch` carried `status` alone until the final review of 3.6a, so an
+    imported contour could never become a sub-contour at all — and stage 7's
+    data loading depends on it.
+
+    The `parent_needs_subcontour` pairing is checked against the row as it
+    WILL BE, not against the request alone: patching `parent_id` onto a row
+    that is still `kind='contour'`, or clearing `kind` back to `contour` while
+    a parent remains, are both the same violation from opposite directions, and
+    the DB CHECK would otherwise surface as an unhandled 500. Only fields the
+    request actually supplied are read (`exclude_unset` at the router), so
+    `{"status": "archived"}` never disturbs the hierarchy.
+    """
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
     await _assert_in_zone(db, actor, contour.organization_id)
-    before = {"status": contour.status}
-    if status is not None:
-        contour.status = status
+    kind = fields.get("kind", contour.kind)
+    parent_id = fields.get("parent_id", contour.parent_id)
+    if parent_id is not None:
+        if kind != "subcontour":
+            raise err("ERR-VAL-001", details={"reason": "parent_needs_subcontour"})
+        if parent_id != contour.parent_id:
+            await _assert_parent(
+                db, parent_id, organization_id=contour.organization_id, child_id=contour.id
+            )
+    before = {key: _json_safe(getattr(contour, key)) for key in fields}
+    for key, value in fields.items():
+        setattr(contour, key, value)
     await db.flush()
     # An in-place UPDATE leaves onupdate columns expired, not refreshed (lesson).
     await db.refresh(contour)
@@ -280,7 +305,7 @@ async def update_contour(
         object_type="contour",
         object_id=contour.id,
         old_value=before,
-        new_value={"status": contour.status},
+        new_value={key: _json_safe(getattr(contour, key)) for key in fields},
     )
     return contour
 

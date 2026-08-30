@@ -86,7 +86,9 @@ async def patch_contour(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
 ) -> ContourOut:
-    contour = await service.update_contour(db, contour_id, actor=user, status=payload.status)
+    contour = await service.update_contour(
+        db, contour_id, actor=user, **payload.model_dump(exclude_unset=True)
+    )
     return ContourOut.model_validate(contour, from_attributes=True)
 
 

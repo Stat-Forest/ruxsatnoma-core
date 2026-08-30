@@ -55,10 +55,27 @@ class ContourOut(BaseModel):
 
 
 class ContourPatch(BaseModel):
-    """Identity-level housekeeping only (archiving). Geometry changes always go
-    through a new version (`POST .../versions`), never through this route."""
+    """Identity-level housekeeping: archiving, and the contour/sub-contour
+    HIERARCHY. Geometry changes always go through a new version
+    (`POST .../versions`), never through this route.
+
+    `kind`/`parent_id` are here because decision #49 ruling 11 puts them here:
+    the importer creates every feature flat (`kind='contour'`,
+    `parent_id=NULL`) precisely BECAUSE it does not guess a hierarchy from the
+    file — the Burchmulla delivery has 92 distinct numbers across 151 features
+    — and the hierarchy is set afterwards, by hand, through this route. Stage
+    7's data loading depends on it, and until now `ContourPatch` carried
+    `status` alone, so an imported contour could never become a sub-contour at
+    all.
+
+    `exclude_unset` at the router keeps "not supplied" distinct from
+    "explicitly set to null", so `{"parent_id": null}` detaches a sub-contour
+    while `{"status": "archived"}` leaves the hierarchy alone.
+    """
 
     status: str | None = Field(default=None, pattern="^(active|archived)$")
+    kind: str | None = Field(default=None, pattern="^(contour|subcontour)$")
+    parent_id: uuid.UUID | None = None
 
 
 def _trim_decimal(value: Decimal | None) -> str | None:

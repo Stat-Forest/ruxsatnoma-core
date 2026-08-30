@@ -3,6 +3,7 @@
 import uuid
 
 from app.modules.gis import repo
+from tests.modules.gis.conftest import make_contour
 
 
 async def test_gis_specialist_creates_a_contour_and_a_draft_version(
@@ -277,3 +278,102 @@ async def test_an_unknown_organization_is_422_not_a_taken_number(gis_client, con
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["details"]["reason"] == "organization_not_found"
+
+
+async def test_an_imported_contour_becomes_a_subcontour(db, gis_client, leshoz, contours_layer):
+    """Decision #49 ruling 11: the importer creates everything flat BECAUSE it
+    refuses to guess a hierarchy from the file, and the hierarchy is set
+    afterwards through `PATCH /gis/contours/{id}` with `kind` and `parent_id`.
+    `ContourPatch` carried `status` alone, so that edit did not exist and an
+    imported contour could never become a sub-contour — stage 7's data loading
+    depends on it."""
+    parent = await make_contour(db, contours_layer, leshoz)
+    child = await make_contour(db, contours_layer, leshoz)
+
+    resp = await gis_client.patch(
+        f"/api/v1/gis/contours/{child.id}",
+        json={"kind": "subcontour", "parent_id": str(parent.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "subcontour"
+    assert body["parent_id"] == str(parent.id)
+
+
+async def test_a_parent_without_the_subcontour_kind_is_refused(
+    db, gis_client, leshoz, contours_layer
+):
+    """The `parent_needs_subcontour` CHECK, pre-checked against the row as it
+    WILL be — otherwise the DB CHECK surfaces as an unhandled 500."""
+    parent = await make_contour(db, contours_layer, leshoz)
+    child = await make_contour(db, contours_layer, leshoz)
+
+    resp = await gis_client.patch(
+        f"/api/v1/gis/contours/{child.id}", json={"parent_id": str(parent.id)}
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["details"]["reason"] == "parent_needs_subcontour"
+
+
+async def test_clearing_kind_while_a_parent_remains_is_refused(
+    db, gis_client, leshoz, contours_layer
+):
+    """The same violation from the other direction: the pairing is checked
+    against the merged row, not against the request in isolation."""
+    parent = await make_contour(db, contours_layer, leshoz)
+    child = await make_contour(db, contours_layer, leshoz, kind="subcontour", parent_id=parent.id)
+
+    resp = await gis_client.patch(f"/api/v1/gis/contours/{child.id}", json={"kind": "contour"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["details"]["reason"] == "parent_needs_subcontour"
+
+
+async def test_a_parent_in_another_organization_is_refused(
+    db, gis_client, leshoz, other_leshoz, contours_layer
+):
+    """`contours.parent_id` is a plain FK with no organization condition of its
+    own, so nothing below the service stops one leshoz hanging a sub-contour
+    off another leshoz's row."""
+    stranger = await make_contour(db, contours_layer, other_leshoz)
+    child = await make_contour(db, contours_layer, leshoz)
+
+    resp = await gis_client.patch(
+        f"/api/v1/gis/contours/{child.id}",
+        json={"kind": "subcontour", "parent_id": str(stranger.id)},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["details"]["reason"] == "parent_other_organization"
+
+
+async def test_an_unknown_parent_and_a_self_parent_are_both_refused(
+    db, gis_client, leshoz, contours_layer
+):
+    child = await make_contour(db, contours_layer, leshoz)
+
+    unknown = await gis_client.patch(
+        f"/api/v1/gis/contours/{child.id}",
+        json={"kind": "subcontour", "parent_id": str(uuid.uuid4())},
+    )
+    assert unknown.status_code == 422
+    assert unknown.json()["error"]["details"]["reason"] == "parent_not_found"
+
+    itself = await gis_client.patch(
+        f"/api/v1/gis/contours/{child.id}",
+        json={"kind": "subcontour", "parent_id": str(child.id)},
+    )
+    assert itself.status_code == 422
+    assert itself.json()["error"]["details"]["reason"] == "parent_is_self"
+
+
+async def test_archiving_alone_never_disturbs_the_hierarchy(db, gis_client, leshoz, contours_layer):
+    """`exclude_unset` keeps "not supplied" distinct from "set to null": a
+    status-only PATCH must not silently detach a sub-contour from its parent."""
+    parent = await make_contour(db, contours_layer, leshoz)
+    child = await make_contour(db, contours_layer, leshoz, kind="subcontour", parent_id=parent.id)
+
+    resp = await gis_client.patch(f"/api/v1/gis/contours/{child.id}", json={"status": "archived"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "archived"
+    assert body["parent_id"] == str(parent.id)
+    assert body["kind"] == "subcontour"
