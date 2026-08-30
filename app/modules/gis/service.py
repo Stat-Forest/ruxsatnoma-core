@@ -2,6 +2,7 @@
 applications 3.9): published_version(), list_contours(), run_checks()."""
 
 import json
+import math
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
@@ -933,19 +934,37 @@ async def occupancy_ha(db: AsyncSession, contour_id: uuid.UUID) -> tuple[Decimal
 
 
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
-    """Four comma-separated floats — anything else (wrong count, non-numeric,
-    min greater than max) is `ERR-VAL-001` (422), never a 500 (ruling 4: a
-    bare `float()` on user input inside a route is exactly how a `ValueError`
-    becomes one)."""
+    """Four comma-separated finite WGS84 degrees — anything else (wrong count,
+    non-numeric, non-finite, out of range, min greater than max) is
+    `ERR-VAL-001` (422), never a 500 (ruling 4: a bare `float()` on user input
+    inside a route is exactly how a `ValueError` becomes one).
+
+    `float()` also accepts `nan`, `inf` and `-inf`, and every comparison
+    against NaN is False — so `nan,nan,nan,nan` sailed through both guards
+    into `ST_MakeEnvelope`, where PostGIS raises and `app/main.py`, which has
+    no `DBAPIError` handler, turns it into a 500 on two endpoints every
+    authenticated user can reach (`GET /gis/contours`, `GET /gis/layers/
+    {code}/features`). `math.isfinite` runs BEFORE the range check for the same
+    reason: a NaN would silently pass `-180 <= x <= 180` as False either way,
+    but stating the rule explicitly is what keeps the next reader from
+    re-deriving it.
+    """
     if bbox is None:
         return None
     parts = bbox.split(",")
     if len(parts) != 4:
         raise err("ERR-VAL-001", details={"reason": "bbox_invalid"})
     try:
-        min_lon, min_lat, max_lon, max_lat = (float(part) for part in parts)
+        values = [float(part) for part in parts]
     except ValueError:
         raise err("ERR-VAL-001", details={"reason": "bbox_invalid"}) from None
+    if not all(math.isfinite(value) for value in values):
+        raise err("ERR-VAL-001", details={"reason": "bbox_invalid"})
+    min_lon, min_lat, max_lon, max_lat = values
+    if not (-180 <= min_lon <= 180 and -180 <= max_lon <= 180):
+        raise err("ERR-VAL-001", details={"reason": "bbox_out_of_range"})
+    if not (-90 <= min_lat <= 90 and -90 <= max_lat <= 90):
+        raise err("ERR-VAL-001", details={"reason": "bbox_out_of_range"})
     if min_lon > max_lon or min_lat > max_lat:
         raise err("ERR-VAL-001", details={"reason": "bbox_invalid"})
     return min_lon, min_lat, max_lon, max_lat

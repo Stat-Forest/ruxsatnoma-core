@@ -1,6 +1,7 @@
 """What 3.7 (norms) and 3.9 (applications) — and the applicant picking a plot —
 actually read. S_available is a declared placeholder until permits land (ruling 14)."""
 
+import pytest
 from sqlalchemy import func
 
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
@@ -25,6 +26,30 @@ async def test_the_bbox_filter_excludes_what_is_outside_it(applicant_client, pub
 async def test_a_malformed_bbox_is_422_not_500(applicant_client):
     resp = await applicant_client.get("/api/v1/gis/contours?bbox=nonsense")
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    [
+        "nonsense",  # non-numeric
+        "69.8,41.4,70.0",  # wrong count
+        "70.0,41.6,69.8,41.4",  # min greater than max
+        "nan,nan,nan,nan",  # float() accepts it and every NaN comparison is False
+        "-inf,-inf,inf,inf",  # ...as does infinity, which passes min<max
+        "-200,41.4,200,41.6",  # longitude outside +-180
+        "69.8,-91,70.0,91",  # latitude outside +-90
+    ],
+)
+async def test_every_bad_bbox_is_422_on_both_read_endpoints(applicant_client, bbox):
+    """`nan`/`inf` parse as floats and `nan > nan` is False, so they used to
+    pass both guards straight into `ST_MakeEnvelope`, where PostGIS raises —
+    and `app/main.py` has no `DBAPIError` handler, so it surfaced as a 500 on
+    two endpoints every authenticated user can reach. Out-of-range degrees
+    were never checked at all."""
+    contours = await applicant_client.get(f"/api/v1/gis/contours?bbox={bbox}")
+    assert contours.status_code == 422, contours.text
+    features = await applicant_client.get(f"/api/v1/gis/layers/fire_bans/features?bbox={bbox}")
+    assert features.status_code == 422, features.text
 
 
 async def test_the_list_is_filtered_for_a_region_scoped_actor(
