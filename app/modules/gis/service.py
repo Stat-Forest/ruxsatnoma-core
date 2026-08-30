@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import DomainError, err
 from app.core.models import MediaFile
+from app.core.schemas import PageParams
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
@@ -1161,9 +1162,14 @@ async def list_contours(
     *,
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
+    params: PageParams,
     actor: User,
-) -> list[dict[str, Any]]:
-    """`GET /gis/contours` — picking a plot (design/03, C3 item 3). Joins to
+) -> tuple[list[dict[str, Any]], int]:
+    """`GET /gis/contours` — picking a plot (design/03, C3 item 3). PAGED
+    (`Page[T]`/`PageParams`, `?page=1&page_size=20`, max 100 — design/03's own
+    convention, the same envelope `/admin/users` uses): unbounded, this
+    answered every published contour in the country, ~13,500 rows once the
+    leshozes land. Joins to
     each contour's PUBLISHED version only (decision 6): a draft has no
     geometry of record yet, so it is invisible here regardless of the caller's
     role — which is exactly what makes an applicant see published contours
@@ -1187,11 +1193,16 @@ async def list_contours(
         district_col=Organization.district_id,
         organization_col=Contour.organization_id,
     )
-    rows = await repo.list_contours(
-        db, organization_id=organization_id, bbox=parsed_bbox, zone=zone
+    rows, total = await repo.list_contours(
+        db,
+        organization_id=organization_id,
+        bbox=parsed_bbox,
+        zone=zone,
+        offset=params.offset,
+        limit=params.page_size,
     )
     occupied_by_id, source = await occupancy_map(db, [row.contour_id for row in rows])
-    return [
+    items = [
         {
             "id": row.contour_id,
             "number": row.number,
@@ -1203,6 +1214,7 @@ async def list_contours(
         }
         for row in rows
     ]
+    return items, total
 
 
 async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) -> dict[str, Any]:

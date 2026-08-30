@@ -384,6 +384,18 @@ async def import_versions(
 
 # --- Task 8: the read API for 3.7/3.9 -----------------------------------------
 
+# The hard ceiling on ONE `GET /gis/layers/{code}/features` response. This
+# endpoint answers a GeoJSON document, not a page: a map client asks for a
+# viewport and a `?bbox=` is the intended narrowing, so paging it would mean
+# inventing page semantics for something no map consumer paginates. Unbounded,
+# though, `GET /gis/layers/forest_fund/features` with no bbox serialises the
+# WHOLE fund boundary — hundreds of polygons the Agency has yet to deliver in
+# full — into one document. Hence a cap plus an explicit `truncated` flag in
+# the response (a foreign member, legal in RFC 7946), so a client can never
+# mistake a clipped collection for the whole layer; the fix is to pass a bbox,
+# and the flag is what tells them to.
+FEATURE_COLLECTION_LIMIT = 2000
+
 
 async def list_contours(
     db: AsyncSession,
@@ -391,7 +403,9 @@ async def list_contours(
     organization_id: uuid.UUID | None,
     bbox: tuple[float, float, float, float] | None,
     zone: Any,
-) -> list[Any]:
+    offset: int,
+    limit: int,
+) -> tuple[list[Any], int]:
     """One row (contour_id, number, organization_id, version_id, area_ha) per
     contour that HAS a published version, matching the given filters. `zone`
     is whatever `abac.zone_filter` built — always given, `true()` when the
@@ -402,7 +416,13 @@ async def list_contours(
     its own, and `zone_filter` fails closed (raises) rather than silently
     under-enforcing when a set zone axis has no column to check it against.
     Geometry is read only as a bbox PREDICATE (`ST_Intersects`), never
-    selected into Python (module docstring)."""
+    selected into Python (module docstring).
+
+    Paged (`offset`/`limit`, `PageParams`' own numbers) and returned with the
+    total, per design/03's `?page=1&page_size=20` convention. Unbounded, this
+    answered every published contour in the country to any authenticated
+    caller — ~13,500 rows once the leshozes land, and an applicant picking a
+    plot is exactly who reaches it."""
     conditions: list[Any] = [ContourVersion.status == "published", zone]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
@@ -414,6 +434,13 @@ async def list_contours(
                 func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
             )
         )
+    joined = (
+        select(Contour.id)
+        .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
     result = await db.execute(
         select(
             Contour.id.label("contour_id"),
@@ -426,8 +453,10 @@ async def list_contours(
         .join(Organization, Organization.id == Contour.organization_id)
         .where(*conditions)
         .order_by(Contour.number)
+        .offset(offset)
+        .limit(limit)
     )
-    return list(result.all())
+    return list(result.all()), total
 
 
 async def contour_card(db: AsyncSession, contour_id: uuid.UUID) -> Any | None:
@@ -508,10 +537,16 @@ async def features_geojson(
             .join(GisLayer, GisLayer.id == LayerFeature.layer_id)
             .where(*conditions)
             .order_by(LayerFeature.id)
+            # One past the cap, so "there are more" is a fact read off the
+            # query rather than a second COUNT over the same predicate.
+            .limit(FEATURE_COLLECTION_LIMIT + 1)
         )
     ).all()
+    truncated = len(rows) > FEATURE_COLLECTION_LIMIT
+    rows = rows[:FEATURE_COLLECTION_LIMIT]
     return {
         "type": "FeatureCollection",
+        "truncated": truncated,
         "features": [
             {
                 "type": "Feature",

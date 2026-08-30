@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.core.schemas import Page, PageParams
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import checks, service
@@ -25,7 +26,6 @@ from app.modules.gis.schemas import (
     ChecksOut,
     ContourCardOut,
     ContourIn,
-    ContourList,
     ContourListItem,
     ContourOut,
     ContourPatch,
@@ -37,18 +37,31 @@ from app.modules.gis.schemas import (
 router = APIRouter(prefix="/gis", tags=["gis"])
 
 
-@router.get("/contours")
+@router.get("/contours", response_model=Page[ContourListItem])
 async def list_contours(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
+    params: Annotated[PageParams, Depends()],
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
-) -> ContourList:
+) -> Page[ContourListItem]:
     """Reading published contours needs no permission at all (ruling 5): an
     applicant must be able to pick a plot the same way any authenticated user
-    already reads `GET /gis/layers` (ruling 18)."""
-    items = await service.list_contours(db, organization_id=organization_id, bbox=bbox, actor=user)
-    return ContourList(items=[ContourListItem.model_validate(item) for item in items])
+    already reads `GET /gis/layers` (ruling 18).
+
+    Paged with core's own `Page[T]`/`PageParams` (design/03: `?page=1&
+    page_size=20`, max 100), the same envelope `/admin/users` uses — this list
+    was unbounded, and an applicant picking a plot would have received every
+    published contour in the country."""
+    items, total = await service.list_contours(
+        db, organization_id=organization_id, bbox=bbox, params=params, actor=user
+    )
+    return Page[ContourListItem](
+        items=[ContourListItem.model_validate(item) for item in items],
+        total=total,
+        page=params.page,
+        page_size=params.page_size,
+    )
 
 
 @router.get("/contours/{contour_id}")

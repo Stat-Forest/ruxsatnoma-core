@@ -8,12 +8,54 @@ from tests.modules.gis.conftest import make_contour, make_version, random_box_wk
 
 
 async def test_an_applicant_sees_published_contours_only(
-    applicant_client, published_contour, draft_contour
+    applicant_client, leshoz, published_contour, draft_contour
 ):
-    resp = await applicant_client.get("/api/v1/gis/contours")
+    """Filtered to the fixture's own (fresh) leshoz: the list is paged now, and
+    the shared, persistent test DB carries every published contour every past
+    run of this suite left behind — page 1 of 20 says nothing about this
+    fixture without the filter."""
+    resp = await applicant_client.get(f"/api/v1/gis/contours?organization_id={leshoz.id}")
     ids = {item["id"] for item in resp.json()["items"]}
     assert str(published_contour.contour_id) in ids
     assert str(draft_contour.contour_id) not in ids
+
+
+async def test_the_contour_list_is_paged(
+    db, applicant_client, leshoz, contours_layer, approval_doc
+):
+    """design/03's own convention (`?page=1&page_size=20`, max 100), the same
+    `Page[T]` envelope `/admin/users` uses. Unbounded, this answered every
+    published contour in the country to any authenticated caller — ~13,500 rows
+    once the leshozes land, and an applicant picking a plot is exactly who
+    reaches it."""
+    for _ in range(3):
+        contour = await make_contour(db, contours_layer, leshoz)
+        await make_version(
+            db,
+            contour.id,
+            random_box_wkt(),
+            status="published",
+            approval_doc_id=approval_doc.id,
+            published_at=func.now(),
+        )
+
+    first = await applicant_client.get(
+        f"/api/v1/gis/contours?organization_id={leshoz.id}&page=1&page_size=2"
+    )
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["total"] == 3
+    assert (body["page"], body["page_size"]) == (1, 2)
+    assert len(body["items"]) == 2
+
+    second = await applicant_client.get(
+        f"/api/v1/gis/contours?organization_id={leshoz.id}&page=2&page_size=2"
+    )
+    assert len(second.json()["items"]) == 1
+    assert not {i["id"] for i in body["items"]} & {i["id"] for i in second.json()["items"]}
+
+    over_cap = await applicant_client.get("/api/v1/gis/contours?page_size=101")
+    assert over_cap.status_code == 422
 
 
 async def test_the_bbox_filter_excludes_what_is_outside_it(applicant_client, published_contour):

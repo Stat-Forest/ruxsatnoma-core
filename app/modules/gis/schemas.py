@@ -305,10 +305,6 @@ class ContourListItem(BaseModel):
         return _trim_decimal(value)
 
 
-class ContourList(BaseModel):
-    items: list[ContourListItem]
-
-
 class ContourCardOut(BaseModel):
     """`GET /gis/contours/{id}` — the published version's own geometry plus
     the same occupancy placeholder `ContourListItem` carries (ruling 14).
@@ -336,7 +332,16 @@ class ContourCardOut(BaseModel):
 class FeatureCollectionOut(BaseModel):
     """`GET /gis/layers/{code}/features` — built entirely in SQL
     (`gis.repo.features_geojson`); this schema only shapes what the service
-    already assembled and never touches geometry itself."""
+    already assembled and never touches geometry itself.
+
+    `truncated` is a GeoJSON foreign member (legal per RFC 7946) saying that
+    the layer holds more than `repo.FEATURE_COLLECTION_LIMIT` matching features
+    and this document is a clipped prefix of them. It exists so a client can
+    never mistake a capped collection for the whole layer — an uncapped
+    `forest_fund` read with no bbox would have serialised the entire fund
+    boundary into one response. The fix is to pass a `?bbox=`, and this flag is
+    what tells them to."""
 
     type: str
+    truncated: bool = False
     features: list[dict[str, Any]]
