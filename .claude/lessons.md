@@ -607,3 +607,31 @@ Rules for this file:
   `drain_pending_imports` shape: autouse, package-scoped, bounded by a DRAIN_LIMIT
   that fails loudly rather than looping. Fixed test literals in the same fixtures
   (a `storage_key`, a contour number) need randomising for the same reason.
+
+## A per-endpoint guard is not a root fix when sibling endpoints share a precondition but gate on different permissions
+
+- **Rule:** When several endpoints each perform one step of a shared multi-step
+  transition (submit-review/approve/publish), a precondition belonging to the
+  WHOLE transition — "is this even a valid target for this workflow at all" —
+  must live in ONE function every step calls, never only in the step a
+  well-behaved caller happens to reach first.
+- **Why:** `gis.service.submit_import_review` alone got the "refuse a
+  non-contour import batch" guard in task 8's first review fix;
+  `approve_import`/`publish_import` still gated on `row.status` alone. Since
+  `CONTOURS_APPROVE` (the rahbar's own permission) is a DIFFERENT permission
+  from `CONTOURS_MANAGE` (submit-review's), a rahbar-only actor could call
+  `/approve` directly on a batch that had just finished parsing — never
+  having called, or being able to call, submit-review at all — and both loops
+  silently found zero `ContourVersion` rows and still advanced
+  `gis_imports.status`, reaching the exact false "done" with zero published
+  the guard was written to prevent. The contour-batch sibling of the same bug:
+  `/approve` called before `/submit-review` finds zero `review`-status
+  versions and still sets `row.status = "approved"`, having approved nothing.
+  Reproduced for real with `git stash` on the fix (both cases answered `200`,
+  not `409`) before confirming the root-cause version.
+- **How to apply:** Any future multi-step, multi-permission transition (norms'
+  own Draft→Review→Approved→Published cycle is the next one to carry this
+  shape) factors its shared preamble — row lookup, zone check, any "is this a
+  valid target" check, status check — into one function every step calls, and
+  separately refuses a transition whose loop would move zero child rows: a
+  loop finding nothing is not evidence that nothing needed to happen.

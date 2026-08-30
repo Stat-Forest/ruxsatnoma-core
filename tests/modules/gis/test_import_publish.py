@@ -83,3 +83,36 @@ async def test_a_non_contour_batch_is_refused_at_submit_review(
     )
     assert resp.status_code == 409
     assert resp.json()["error"]["details"]["reason"] == "not_a_contour_batch"
+
+
+async def test_a_non_contour_batch_is_refused_at_approve_and_publish_too(
+    rahbar_client, processed_restrictions_import
+):
+    """Re-review: the layer guard has to live somewhere EVERY entry point
+    passes through. `CONTOURS_APPROVE` is a DIFFERENT permission from
+    `CONTOURS_MANAGE` — `rahbar_client` cannot call `/submit-review` at all
+    (403), so it can reach `/approve` and `/publish` directly on a batch
+    that just finished parsing, never having gone through submit-review.
+    Both must still be refused, not silently loop zero versions to a false
+    `done`."""
+    iid = processed_restrictions_import.id
+    approve_resp = await rahbar_client.post(f"/api/v1/gis/imports/{iid}/approve")
+    assert approve_resp.status_code == 409
+    assert approve_resp.json()["error"]["details"]["reason"] == "not_a_contour_batch"
+
+    publish_resp = await rahbar_client.post(f"/api/v1/gis/imports/{iid}/publish")
+    assert publish_resp.status_code == 409
+    assert publish_resp.json()["error"]["details"]["reason"] == "not_a_contour_batch"
+
+
+async def test_approving_a_batch_that_skipped_submit_review_is_refused(
+    rahbar_client, processed_import
+):
+    """Re-review's contour-batch sibling: `processed_import`'s versions are
+    still `draft` (nobody called `/submit-review`), so the `review`-status
+    query `/approve` loops over finds nothing — a transition that would move
+    zero versions must be refused, not silently advance `gis_imports.status`
+    to `approved` having approved nothing."""
+    resp = await rahbar_client.post(f"/api/v1/gis/imports/{processed_import.id}/approve")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["details"]["reason"] == "empty_batch"

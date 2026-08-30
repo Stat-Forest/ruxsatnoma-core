@@ -722,6 +722,56 @@ async def archive_feature(db: AsyncSession, feature_id: uuid.UUID, *, actor: Use
 # batch's own `gis_imports.status` alongside them.
 
 
+async def _load_import_for_transition(
+    db: AsyncSession, import_id: uuid.UUID, *, actor: Any, expected_status: str
+) -> GisImport:
+    """Shared preamble for all three batch actions below: row lookup, zone
+    check, layer check, status check — factored out after the re-review found
+    the layer check ALONE in `submit_import_review` closed only one of three
+    doors. `approve_import`/`publish_import` gate on `row.status` alone and
+    require `CONTOURS_APPROVE`, a DIFFERENT permission from
+    `submit_import_review`'s `CONTOURS_MANAGE` — so an actor holding only the
+    former (the rahbar) can reach either directly, never having called, or
+    been able to call, submit-review at all. Every one of the three now goes
+    through this SAME function, so no entry point can be reached without the
+    layer check.
+
+    The layer check runs BEFORE the status check, on purpose: a non-contour
+    batch called at the "wrong" endpoint for its actual status (e.g.
+    `/publish` on a batch still at `review`) reports the useful reason
+    (`not_a_contour_batch`) instead of a `bad_transition` that does not say
+    why. A `restrictions`/`fire_bans`/etc. batch creates `layer_features`
+    rows, not `ContourVersion` ones — without this check, ANY of the three
+    would loop zero rows and sail through to a false success. Refused loudly
+    here instead of inventing a second, feature-batch lifecycle: those rows
+    still publish one at a time through Task 6's own
+    `POST /layers/{code}/features/{id}/publish` — no bulk path for them yet,
+    a known and named gap, not one this silently papers over.
+    """
+    row = await repo.import_by_id(db, import_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    _assert_in_zone(actor, row.organization_id)
+    layer = await db.get(GisLayer, row.layer_id)
+    if layer is None or layer.code != "contours":
+        raise err("ERR-GIS-005", details={"reason": "not_a_contour_batch"})
+    if row.status != expected_status:
+        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
+    return row
+
+
+def _assert_batch_not_empty(versions: list[ContourVersion]) -> None:
+    """A transition that would move zero versions is not a successful no-op —
+    it is the same defect `_load_import_for_transition`'s layer check closes,
+    reached a different way: a CONTOUR batch that skipped an earlier step
+    (e.g. `/approve` called before `/submit-review`, so every version is
+    still `draft` and the `review`-status query finds nothing) would
+    otherwise silently advance `gis_imports.status` without moving a single
+    version."""
+    if not versions:
+        raise err("ERR-GIS-005", details={"reason": "empty_batch"})
+
+
 async def submit_import_review(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) -> GisImport:
     """`POST /gis/imports/{id}/submit-review` — `CONTOURS_MANAGE` (the GIS
     specialist who ran the import submits their own batch, same actor who
@@ -729,27 +779,11 @@ async def submit_import_review(db: AsyncSession, import_id: uuid.UUID, *, actor:
     `status='review'` the moment it parses cleanly — this action does not move
     THAT status at all; its real effect is cascading every version the import
     created from `draft` to `review`, one `submit_review` call each, so
-    `approve_import` below has something in the right state to work on.
-
-    Review finding 1: refused for any import whose layer is not `contours`.
-    A `restrictions`/`fire_bans`/etc. batch creates `layer_features` rows, not
-    `ContourVersion` ones — without this guard all three batch actions below
-    would loop zero rows and sail straight through to a false `done` with
-    `{"published": 0, "blocked": []}`, indistinguishable from a real, empty
-    delivery. Refused loudly here instead of inventing a second, feature-batch
-    lifecycle: those rows still publish one at a time through Task 6's own
-    `POST /layers/{code}/features/{id}/publish` — no bulk path for them yet,
-    a known and named gap, not one this silently papers over."""
-    row = await repo.import_by_id(db, import_id)
-    if row is None:
-        raise err("ERR-SYS-003")
-    _assert_in_zone(actor, row.organization_id)
-    if row.status != "review":
-        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
-    layer = await db.get(GisLayer, row.layer_id)
-    if layer is None or layer.code != "contours":
-        raise err("ERR-GIS-005", details={"reason": "not_a_contour_batch"})
-    for version in await repo.import_versions(db, import_id, status="draft"):
+    `approve_import` below has something in the right state to work on."""
+    row = await _load_import_for_transition(db, import_id, actor=actor, expected_status="review")
+    versions = await repo.import_versions(db, import_id, status="draft")
+    _assert_batch_not_empty(versions)
+    for version in versions:
         await submit_review(db, version.id, actor=actor)
     await audit.log(
         db,
@@ -768,13 +802,10 @@ async def approve_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) 
     (ruling 3: one basis document for the whole delivery, nobody signs a
     decree per contour) by calling `approve_version` once per version still in
     `review`, then advances the batch row itself to `approved`."""
-    row = await repo.import_by_id(db, import_id)
-    if row is None:
-        raise err("ERR-SYS-003")
-    _assert_in_zone(actor, row.organization_id)
-    if row.status != "review":
-        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
-    for version in await repo.import_versions(db, import_id, status="review"):
+    row = await _load_import_for_transition(db, import_id, actor=actor, expected_status="review")
+    versions = await repo.import_versions(db, import_id, status="review")
+    _assert_batch_not_empty(versions)
+    for version in versions:
         await approve_version(db, version.id, actor=actor, approval_doc_id=row.approval_doc_id)
     row.status = "approved"
     row.approved_by = actor.id
@@ -814,14 +845,11 @@ async def publish_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) 
     `publish_import` is safe to call again, since an already-`published`
     version is simply absent from the next `status='approved'` batch.
     """
-    row = await repo.import_by_id(db, import_id)
-    if row is None:
-        raise err("ERR-SYS-003")
-    _assert_in_zone(actor, row.organization_id)
-    if row.status != "approved":
-        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
+    row = await _load_import_for_transition(db, import_id, actor=actor, expected_status="approved")
+    versions = await repo.import_versions(db, import_id, status="approved")
+    _assert_batch_not_empty(versions)
     published, blocked = 0, []
-    for version in await repo.import_versions(db, import_id, status="approved"):
+    for version in versions:
         try:
             await publish_version(db, version.id, actor=actor)
             published += 1
