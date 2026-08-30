@@ -233,6 +233,18 @@ async def wkt_to_geojson(db: AsyncSession, wkt: str) -> dict[str, Any]:
 
 
 @pytest.fixture
+async def restrictions_polygon(db: AsyncSession) -> dict[str, Any]:
+    """A polygon GeoJSON at a random, isolated location (`random_box_wkt`, never
+    the module's conventional box_wkt(69.9, 41.5) spot) — task 6's own tests
+    PUBLISH real `restrictions`/`protection`/`fire_bans` rows through the API
+    (a `_client_for` client commits for real), so this must stay clear of every
+    coordinate a Task 4/5 check test depends on remaining empty or predictable
+    (lesson: 'A fixed test geometry that a _client_for client commits
+    accumulates forever' — task-6 controller, decision 2)."""
+    return await wkt_to_geojson(db, random_box_wkt())
+
+
+@pytest.fixture
 async def published_contour(
     db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, approval_doc: MediaFile
 ) -> ContourVersion:
@@ -617,6 +629,17 @@ async def org_scoped_gis_client(db: AsyncSession, leshoz: Organization):
     stays zone-free (`organization_id=None`, republic-wide) on purpose, so the
     other 3.6a tests are unaffected by this addition."""
     async for client in _client_for(db, CONTOURS_MANAGE, organization_id=leshoz.id):
+        yield client
+
+
+@pytest.fixture
+async def org_scoped_layers_client(db: AsyncSession, leshoz: Organization):
+    """A `LAYERS_MANAGE` actor zoned to `leshoz` — the shape the layer-feature
+    zone rule (task-6 controller, decision 3) has to defend against: without
+    it, a leshoz-level specialist could publish a republic-wide (no
+    `organization_id`) fire ban through their own zone-scoped account. Mirrors
+    `org_scoped_gis_client`'s own reasoning, one permission set over."""
+    async for client in _client_for(db, LAYERS_MANAGE, organization_id=leshoz.id):
         yield client
 
 

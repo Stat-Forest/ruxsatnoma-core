@@ -1,6 +1,11 @@
-"""The layer catalogue. Reading is open to any authenticated user — an applicant
-must be able to see which layers exist to pick a plot (ruling 18)."""
+"""The layer catalogue, and the restriction/protection/fire-ban objects that
+live inside its layers (task 6). Reading the catalogue is open to any
+authenticated user — an applicant must be able to see which layers exist to
+pick a plot (ruling 18); writing a layer OBJECT (a fire ban, a water point)
+requires `gis.layers.manage`, the same permission `PATCH /layers/{code}`
+already uses for the layer's own presentation."""
 
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -11,7 +16,14 @@ from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import service
 from app.modules.gis.permissions import LAYERS_MANAGE
-from app.modules.gis.schemas import LayerList, LayerOut, LayerPatch
+from app.modules.gis.schemas import (
+    FeatureIn,
+    FeatureOut,
+    FeaturePatch,
+    LayerList,
+    LayerOut,
+    LayerPatch,
+)
 
 router = APIRouter(prefix="/gis", tags=["gis"])
 
@@ -41,3 +53,60 @@ async def patch_layer(
         status=payload.status,
     )
     return LayerOut.model_validate(layer, from_attributes=True)
+
+
+@router.post("/layers/{code}/features", status_code=201)
+async def create_feature(
+    code: str,
+    payload: FeatureIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
+) -> FeatureOut:
+    feature = await service.create_feature(
+        db,
+        code,
+        geojson=payload.geom,
+        organization_id=payload.organization_id,
+        name=payload.name.root if payload.name is not None else None,
+        props=payload.props,
+        valid_from=payload.valid_from,
+        valid_to=payload.valid_to,
+        actor=user,
+    )
+    return FeatureOut.model_validate(feature, from_attributes=True)
+
+
+@router.patch("/layers/{code}/features/{feature_id}")
+async def patch_feature(
+    code: str,
+    feature_id: uuid.UUID,
+    payload: FeaturePatch,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
+) -> FeatureOut:
+    feature = await service.update_feature(
+        db, feature_id, actor=user, **payload.model_dump(exclude_unset=True)
+    )
+    return FeatureOut.model_validate(feature, from_attributes=True)
+
+
+@router.post("/layers/{code}/features/{feature_id}/publish")
+async def publish_feature(
+    code: str,
+    feature_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
+) -> FeatureOut:
+    feature = await service.publish_feature(db, feature_id, actor=user)
+    return FeatureOut.model_validate(feature, from_attributes=True)
+
+
+@router.post("/layers/{code}/features/{feature_id}/archive")
+async def archive_feature(
+    code: str,
+    feature_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
+) -> FeatureOut:
+    feature = await service.archive_feature(db, feature_id, actor=user)
+    return FeatureOut.model_validate(feature, from_attributes=True)

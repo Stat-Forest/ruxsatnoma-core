@@ -15,7 +15,7 @@ from app.core.models import MediaFile
 from app.modules.audit import service as audit
 from app.modules.auth.models import User
 from app.modules.gis import checks, repo
-from app.modules.gis.models import Contour, ContourVersion, GisLayer
+from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
 
 
 def _json_safe(value: Any) -> Any:
@@ -492,3 +492,211 @@ async def archive_version(
         new_value={"status": "archived"},
     )
     return version
+
+
+# --- Task 6: layer_features — restriction, protection and fire-ban layers ---
+#
+# These layers have NO review step. `tz/07` gives the Draft->Review->
+# Approved->Published->Archived lifecycle to CONTOURS only — a layer feature
+# goes draft -> published -> archived, full stop. Do not "restore" a missing
+# review stage here later; there was never one to begin with.
+
+FEATURE_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "draft": ("published",),
+    "published": ("archived",),
+    "archived": (),
+}
+
+
+def _assert_feature_transition(feature: LayerFeature, target: str) -> None:
+    """Same reasoning as `_assert_transition` above: a transition the row's
+    CURRENT status does not allow is a conflict with its state, not a
+    malformed request body — `ERR-GIS-005` (409), never `ERR-VAL-001`."""
+    if target not in FEATURE_TRANSITIONS[feature.status]:
+        raise err(
+            "ERR-GIS-005",
+            details={"reason": "bad_transition", "from": feature.status, "to": target},
+        )
+
+
+def _assert_feature_zone(actor: User, organization_id: uuid.UUID | None) -> None:
+    """Extends `_assert_in_zone` for `layer_features`, whose `organization_id`
+    is nullable — `contours.organization_id` never is, so `_assert_in_zone`
+    itself has no branch for a missing one. `None` here means a
+    REPUBLIC-WIDE object (a nationwide fire ban belongs to no single
+    organization); ruling (task-6 controller, decision 3): only an actor who
+    is THEMSELVES republic-level (no organization of their own) may create,
+    edit, publish or archive one — otherwise a leshoz specialist could reach
+    every leshoz at once through their own zone-scoped account. When
+    `organization_id` IS set, this is exactly `_assert_in_zone`'s existing
+    'own organization only' rule, applied to every write below the same way
+    every contour write already applies it."""
+    if organization_id is None:
+        if zone_of(actor).organization_id is not None:
+            raise err("ERR-ACL-001")
+        return
+    _assert_in_zone(actor, organization_id)
+
+
+async def create_feature(
+    db: AsyncSession,
+    code: str,
+    *,
+    geojson: dict[str, Any],
+    actor: User,
+    organization_id: uuid.UUID | None = None,
+    name: dict[str, Any] | None = None,
+    props: dict[str, Any] | None = None,
+    valid_from: date | None = None,
+    valid_to: date | None = None,
+) -> LayerFeature:
+    """`POST /gis/layers/{code}/features` — a restriction, protection zone,
+    fire ban or any other non-contour layer object (tz/07 items 8/9/14).
+
+    `geom`'s TYPE is checked against the layer's own declared `geometry_type`
+    (`repo.GEOMETRY_TYPE_FAMILIES`) rather than silently reduced to it:
+    `repo.insert_version`'s `ST_CollectionExtract(..., 3)` would throw away
+    the points `water_points` and lines `cattle_corridors` need (task-6
+    brief's design note) — a mismatch is `ERR-VAL-001`,
+    reason=geometry_type_mismatch, never a 500 or a silently-wrong shape.
+    """
+    layer = await repo.layer_by_code(db, code)
+    if layer is None:
+        raise err("ERR-SYS-003")
+    _assert_feature_zone(actor, organization_id)
+    try:
+        geometry_type = await repo.feature_geometry_type(db, geojson)
+    except DBAPIError as exc:
+        # Malformed GeoJSON: ST_GeomFromGeoJSON's own parse failure poisons
+        # the session the same way create_version's DBAPIError branch
+        # documents — raise immediately, no further `db` use on this path.
+        raise err("ERR-GIS-001", details={"reason": "unreadable_geometry"}) from exc
+    if geometry_type is None:
+        raise err("ERR-GIS-001", details={"reason": "empty_geometry"})
+    allowed = repo.GEOMETRY_TYPE_FAMILIES.get(layer.geometry_type, ())
+    if allowed and geometry_type not in allowed:
+        raise err("ERR-VAL-001", details={"reason": "geometry_type_mismatch"})
+    try:
+        feature = await repo.insert_feature(
+            db,
+            layer_id=layer.id,
+            geojson=geojson,
+            organization_id=organization_id,
+            name=name,
+            props=props if props is not None else {},
+            valid_from=valid_from,
+            valid_to=valid_to,
+            created_by=actor.id,
+        )
+    except IntegrityError as exc:
+        # The one FK in this INSERT a caller actually supplies a value for —
+        # layer_id/created_by always come from a real layer/actor row, never
+        # the request body. Session is poisoned after this, same reasoning as
+        # create_contour's own IntegrityError handling — raise immediately.
+        raise err("ERR-VAL-001", details={"reason": "organization_not_found"}) from exc
+    await audit.log(
+        db,
+        action="layer_feature.create",
+        user_id=actor.id,
+        object_type="layer_feature",
+        object_id=feature.id,
+        new_value={
+            "layer_id": str(layer.id),
+            "layer_code": code,
+            "organization_id": str(organization_id) if organization_id is not None else None,
+            "valid_from": _json_safe(valid_from),
+            "valid_to": _json_safe(valid_to),
+        },
+    )
+    return feature
+
+
+async def update_feature(
+    db: AsyncSession, feature_id: uuid.UUID, *, actor: User, **fields: Any
+) -> LayerFeature:
+    """`PATCH /gis/layers/{code}/features/{id}` — draft-only metadata edits
+    (name/props/valid_from/valid_to); geometry is never patched in place, the
+    same 'a changed shape is a new object' rule `update_version` applies to
+    contours."""
+    feature = await repo.feature_by_id(db, feature_id)
+    if feature is None:
+        raise err("ERR-SYS-003")
+    _assert_feature_zone(actor, feature.organization_id)
+    if feature.status != "draft":
+        raise err("ERR-GIS-005", details={"reason": "not_draft"})
+    before = {key: _json_safe(getattr(feature, key)) for key in fields}
+    for key, value in fields.items():
+        setattr(feature, key, value)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # The one CHECK a partial PATCH can still violate that
+        # FeaturePatch's own model_validator cannot see: patching only ONE
+        # side of an existing valid_from/valid_to pair (task-6 controller,
+        # decision 4 — exactly why the DB CHECK stays even though pydantic
+        # already covers the same-request case). Session poisoned after
+        # this, same reasoning as create_version's own handling — raise
+        # immediately, no further `db` use on this path.
+        raise err("ERR-VAL-001", details={"reason": "validity_period_invalid"}) from exc
+    await db.refresh(feature)
+    await audit.log(
+        db,
+        action="layer_feature.update",
+        user_id=actor.id,
+        object_type="layer_feature",
+        object_id=feature.id,
+        old_value=before,
+        new_value={key: _json_safe(value) for key, value in fields.items()},
+    )
+    return feature
+
+
+async def publish_feature(db: AsyncSession, feature_id: uuid.UUID, *, actor: User) -> LayerFeature:
+    """`POST .../features/{id}/publish` — draft -> published. No check suite
+    here (unlike `publish_version`'s topology gate): these layers carry no
+    geometry rule of their own to satisfy — they ARE what the contour checks
+    read (`checks._restrictions`) — and there is no review step to have
+    passed first (decision 5: draft -> published -> archived, full stop)."""
+    feature = await repo.feature_by_id(db, feature_id)
+    if feature is None:
+        raise err("ERR-SYS-003")
+    _assert_feature_zone(actor, feature.organization_id)
+    _assert_feature_transition(feature, "published")
+    feature.status = "published"
+    await db.flush()
+    await db.refresh(feature)
+    await audit.log(
+        db,
+        action="layer_feature.publish",
+        user_id=actor.id,
+        object_type="layer_feature",
+        object_id=feature.id,
+        old_value={"status": "draft"},
+        new_value={"status": "published"},
+    )
+    return feature
+
+
+async def archive_feature(db: AsyncSession, feature_id: uuid.UUID, *, actor: User) -> LayerFeature:
+    """`POST .../features/{id}/archive` — published -> archived, the end of
+    the line (decision 5). Unlike `publish_version`, there is no 'replace and
+    archive the previous one' step here — a feature never supersedes another
+    one automatically; each is archived on its own, explicit call."""
+    feature = await repo.feature_by_id(db, feature_id)
+    if feature is None:
+        raise err("ERR-SYS-003")
+    _assert_feature_zone(actor, feature.organization_id)
+    _assert_feature_transition(feature, "archived")
+    feature.status = "archived"
+    await db.flush()
+    await db.refresh(feature)
+    await audit.log(
+        db,
+        action="layer_feature.archive",
+        user_id=actor.id,
+        object_type="layer_feature",
+        object_id=feature.id,
+        old_value={"status": "published"},
+        new_value={"status": "archived"},
+    )
+    return feature

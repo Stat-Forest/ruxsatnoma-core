@@ -5,9 +5,9 @@ variant in pydantic would duplicate a parser we already have in the database."""
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, model_validator
 
 from app.core.schemas import LocalizedName
 from app.modules.gis import checks
@@ -149,3 +149,72 @@ class ChecksOut(BaseModel):
 
     checks: list[CheckResultOut]
     blocked: bool
+
+
+def _validate_period(valid_from: date | None, valid_to: date | None) -> None:
+    """Shared by `FeatureIn`/`FeaturePatch` below so the comparison itself
+    cannot drift between the two — only the pydantic wiring around it differs
+    per model (task-6 controller, decision 4: validated here AND by the DB
+    CHECK from Task 1, on purpose)."""
+    if valid_from is not None and valid_to is not None and valid_to < valid_from:
+        raise ValueError("valid_to must not be before valid_from")
+
+
+class FeatureIn(BaseModel):
+    """`POST /gis/layers/{code}/features` — a restriction, protection zone or
+    fire ban (a period plus a territory: tz/07 items 8/9/14) or any other
+    non-contour layer object. `geom` is GeoJSON, parsed by PostGIS the same
+    way `VersionIn.geom` is; its TYPE is checked against the layer's own
+    declared `geometry_type` in the service (`ERR-VAL-001`,
+    reason=geometry_type_mismatch), not here — that check needs the layer
+    catalogue row this schema knows nothing about.
+
+    The validity-period check below runs TWICE on purpose (decision 4): here,
+    for a same-request 422 with a clear reason instead of a raw DB error; and
+    again at the `validity_period_valid` DB CHECK (migration 0010), which is
+    what actually guards Task 7's bulk importer — that path never goes
+    through this schema at all.
+    """
+
+    geom: dict[str, Any]
+    organization_id: uuid.UUID | None = None
+    name: LocalizedName | None = None
+    props: dict[str, Any] = Field(default_factory=dict)
+    valid_from: date | None = None
+    valid_to: date | None = None
+
+    @model_validator(mode="after")
+    def _check_validity_period(self) -> Self:
+        _validate_period(self.valid_from, self.valid_to)
+        return self
+
+
+class FeatureOut(BaseModel):
+    id: uuid.UUID
+    layer_id: uuid.UUID
+    organization_id: uuid.UUID | None
+    name: dict[str, Any] | None
+    props: dict[str, Any]
+    valid_from: date | None
+    valid_to: date | None
+    status: str
+
+
+class FeaturePatch(BaseModel):
+    """Draft-only metadata edits (service 409s otherwise, reason=not_draft —
+    the same rule `VersionPatch` already applies to contours): geometry is
+    never patched in place, a corrected shape is a new feature. Re-validates
+    the validity period when BOTH dates are given in THIS same request; a
+    PATCH that only moves one side of an existing period relies on the DB
+    CHECK instead (`gis.service.update_feature` catches that `IntegrityError`
+    as the same `ERR-VAL-001`, reason=validity_period_invalid)."""
+
+    name: LocalizedName | None = None
+    props: dict[str, Any] | None = None
+    valid_from: date | None = None
+    valid_to: date | None = None
+
+    @model_validator(mode="after")
+    def _check_validity_period(self) -> Self:
+        _validate_period(self.valid_from, self.valid_to)
+        return self

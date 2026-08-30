@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.db import uuid7
-from app.modules.gis.models import Contour, ContourVersion, GisLayer
+from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
 
 
 async def list_layers(db: AsyncSession) -> list[GisLayer]:
@@ -131,3 +131,130 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
         )
     )
     return result.scalar_one_or_none()
+
+
+# --- Task 6: layer_features (restriction, protection, fire-ban and every
+# other non-contour layer object) --------------------------------------------
+#
+# `layer_features.geom` is plain GEOMETRY, not MULTIPOLYGON: this catalogue
+# also holds points (`water_points`) and lines (`cattle_corridors`), which
+# `normalised()`/`insert_version`'s own `ST_CollectionExtract(..., 3)` above
+# would silently discard. The pipeline below stops one step earlier — force
+# 2D, repair self-intersections, wrap as Multi* — and the RESULT's own type is
+# validated by the caller (`gis.service.create_feature`) against the layer's
+# declared `geometry_type` instead (task-6 brief's design note). Do not reuse
+# `normalised()`/`insert_version`'s expression unchanged for this table.
+
+GEOMETRY_TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "POINT": ("ST_Point", "ST_MultiPoint"),
+    "LINESTRING": ("ST_LineString", "ST_MultiLineString"),
+    "POLYGON": ("ST_Polygon", "ST_MultiPolygon"),
+    "MULTIPOLYGON": ("ST_Polygon", "ST_MultiPolygon"),
+    "GEOMETRY": (),  # anything goes — the `restrictions` layer is deliberately mixed
+}
+
+
+def _feature_geom(geojson: dict[str, Any]) -> Any:
+    """The ONE normalisation expression shared by `feature_geometry_type` and
+    `insert_feature` below — defined once so the type the former VALIDATES is
+    provably the same geometry the latter INSERTS. Two independent copies of
+    this computation would risk exactly the kind of silent divergence this
+    project has already hit once (lesson: `checks.jsonable`'s history as two
+    near-identical local copies that had already drifted apart by the time a
+    review caught it)."""
+    return func.ST_Multi(
+        func.ST_MakeValid(
+            func.ST_Force2D(func.ST_SetSRID(func.ST_GeomFromGeoJSON(json.dumps(geojson)), 4326))
+        )
+    )
+
+
+async def feature_geometry_type(db: AsyncSession, geojson: dict[str, Any]) -> str | None:
+    """PostGIS's own `ST_GeometryType()` for `_feature_geom`, computed WITHOUT
+    inserting anything — lets `gis.service.create_feature` read the layer's
+    own `geometry_type`, resolve its family from `GEOMETRY_TYPE_FAMILIES` and
+    compare before writing a row. `None` means the geometry normalised to
+    nothing (an empty/degenerate input, distinct from a type mismatch — the
+    caller reports each as its own reason). Only a short type name (e.g.
+    'ST_MultiPoint') ever crosses into Python, never the geometry itself
+    (module docstring: PostGIS evaluates every predicate).
+
+    A malformed GeoJSON dict (unparseable, not just the wrong shape) makes
+    `ST_GeomFromGeoJSON` raise inside this SELECT — that surfaces to the
+    caller as a `DBAPIError`, exactly like `insert_version`'s own parse
+    failure, and poisons the session the same way; the caller is responsible
+    for catching it there, not here.
+    """
+    g = _feature_geom(geojson)
+    geometry_type, is_empty = (
+        await db.execute(select(func.ST_GeometryType(g), func.ST_IsEmpty(g)))
+    ).one()
+    return geometry_type if is_empty is False else None
+
+
+async def insert_feature(
+    db: AsyncSession,
+    *,
+    layer_id: uuid.UUID,
+    geojson: dict[str, Any],
+    organization_id: uuid.UUID | None,
+    created_by: uuid.UUID | None,
+    name: dict[str, Any] | None = None,
+    props: dict[str, Any] | None = None,
+    valid_from: date | None = None,
+    valid_to: date | None = None,
+    approval_doc_id: uuid.UUID | None = None,
+    import_id: uuid.UUID | None = None,
+    status: str = "draft",
+) -> LayerFeature:
+    """Insert one feature, geometry normalised in the database via the SAME
+    `_feature_geom` expression `feature_geometry_type` already validated —
+    mirrors `insert_version`'s own division of labour (geometry construction
+    stays entirely in PostGIS; Python only supplies the GeoJSON and reads back
+    a fully-formed row). Built through the ORM rather than a hand-written
+    `INSERT ... RETURNING`, unlike `insert_version`: `name`/`props` are JSONB,
+    and `LayerFeature`'s own mapped column type already serialises a plain
+    Python dict correctly on every other write path in this module (e.g.
+    `gis_layer.style`) — hand-binding a JSONB value through raw `text()` is a
+    new, unproven pattern in application code (only Alembic migrations have
+    needed the `json.dumps` + `CAST(... AS jsonb)` workaround the lessons file
+    describes for that lower-level API), so this reuses the already-correct
+    path instead of introducing a second one for `geom` alone to justify.
+
+    Keyword-only, and `approval_doc_id`/`import_id` accepted (defaulted to
+    `None`) even though `FeatureIn` exposes neither today: Task 7's bulk
+    importer is expected to insert through this exact function with
+    `import_id` set, and this shape makes that a pure addition later, not a
+    signature change — same reasoning `insert_version` documents for its own
+    keyword-only shape.
+
+    The caller validates the geometry (type and non-emptiness) via
+    `feature_geometry_type` BEFORE calling this — so `geom` here is never
+    empty in normal use; still built as a database-evaluated expression, never
+    a Python-side geometry value, per this module's own docstring.
+    """
+    feature = LayerFeature(
+        layer_id=layer_id,
+        organization_id=organization_id,
+        geom=_feature_geom(geojson),
+        name=name,
+        props=props if props is not None else {},
+        valid_from=valid_from,
+        valid_to=valid_to,
+        approval_doc_id=approval_doc_id,
+        import_id=import_id,
+        status=status,
+        created_by=created_by,
+    )
+    db.add(feature)
+    await db.flush()
+    # geom was assigned as a SQL expression, not a Python value — refresh to
+    # read back what PostGIS actually stored (mirrors conftest's make_version;
+    # same care the "onupdate columns are left expired" lesson describes,
+    # applied here to a server-evaluated INSERT expression instead).
+    await db.refresh(feature)
+    return feature
+
+
+async def feature_by_id(db: AsyncSession, feature_id: uuid.UUID) -> LayerFeature | None:
+    return await db.get(LayerFeature, feature_id)
