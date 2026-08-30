@@ -1085,28 +1085,40 @@ Rules for this file:
   field list against this checklist before being reported done, not just
   the fields the given tests happen to cover.
 
-## `calculator.calculate`'s own `used_sb` is gated on a norm existing — a caller needing it standalone must validate separately
+## A gate that reads only ONE of the two things it guards is bundling two concerns
 
-- **Rule:** Do not assume `CalcResult.used_sb` is populated whenever a grazing
-  request carries `items` — `calculate` only resolves `coef_sb:<code>` (and
-  therefore only raises `ERR-NORM-004` for a missing one) `if snapshot.norm is
-  not None`, since it needs the number solely for the breakdown's `limit`
-  line. A caller that wants the same honest error for a grazing request with
-  NO norm on record yet (a real, supported case — VMQ 689's norm and this
-  route are drafted independently) must check `coef_sb:<code>` itself before
-  calling `calculate`.
-- **Why:** Every task-5/6 test exercising grazing-with-items supplies an
-  explicit `NormFact`, so this gap stayed invisible until task 7 wired a real
-  HTTP route where a norm can genuinely be absent: `POST /calculations/preview`
-  for a fresh contour with no VMQ 689 norm yet used to silently return
-  `used_sb=None` (no error at all) for an unpublished `coef_sb:*` livestock
-  code, instead of the missing-parameter error the brief's own test expects
-  (`test_a_grazing_preview_reports_the_missing_coefficient_rather_than_guessing`).
-- **How to apply:** `norms.service._assert_grazing_coefficients_known` is the
-  fix — called from `_compute`, before `calculator.calculate`, so both
-  `preview` and `save_calculation` inherit it for free. Any FUTURE caller that
-  builds a `CalcRequest`/`ParamSnapshot` pair without going through
-  `_compute` (a new pipeline, not 3.9's application precheck, which reuses
-  `_compute` itself) needs the same guard again — `calculator.py` itself was
-  deliberately left alone (task 7's own file list), so this is not something
-  a `calculate()` caller can discover by reading its signature.
+- **Rule:** When an `if` condition guards a block computing several values,
+  check that EVERY value in the block actually reads something from the
+  condition itself — a value the block computes without ever touching the
+  condition's own subject is gated on the wrong thing, even if it happens to
+  be correct today. In `calculator.calculate`, `used_sb` (Σ `request.items`
+  count × `coef_sb:<code>`) reads only `request.items`/`snapshot.values` — a
+  REQUEST fact — so it is gated on `request.activity_code == GRAZING`, never
+  on `snapshot.norm`; `max_sb`/`remaining_sb`/the breakdown's `limit` line
+  genuinely ARE a NORM fact (`snapshot.norm.max_sb`, the committed load
+  against it) and stay gated on `snapshot.norm is not None`.
+- **Why:** Task 5 originally computed both under one `if snapshot.norm is not
+  None:` block, since at the time it only needed `used_sb` for that one
+  breakdown line. Task 7 needed the identical number to validate a grazing
+  request's `coef_sb:<code>` for the checks EVEN WHEN NO NORM EXISTS YET (a
+  real, supported case — VMQ 689's norm and a fee preview are drafted
+  independently) — `POST /calculations/preview` for a fresh contour with no
+  norm used to silently return `used_sb=None` (no error at all) for an
+  unpublished `coef_sb:*` code, instead of the missing-parameter error
+  `test_a_grazing_preview_reports_the_missing_coefficient_rather_than_guessing`
+  expects. The first fix (task 7's own review round 1) added a SECOND,
+  service-layer resolution of the identical `coef_sb:<code>` lookup ahead of
+  `calculate` — passing that test, but creating a real two-sources-of-truth
+  risk on a limit-relevant number: two places deciding which coefficient a
+  grazing request needs, agreeing only because they read identical inputs
+  identically.
+- **How to apply:** Fixed at the root instead — split `calculate`'s single
+  `if snapshot.norm is not None:` into its own `if request.activity_code ==
+  GRAZING:` for `used_sb` and a separate `if snapshot.norm is not None:` for
+  `max_sb`/`remaining_sb`/the breakdown line — so ANY caller (3.9's
+  application precheck included) gets the honest `ERR-NORM-004` straight from
+  `calculate` itself, whether or not a norm happens to exist yet, with no
+  caller-side duplication. Before adding a caller-side workaround for a gap
+  in a shared function, check whether the gate actually reads what it claims
+  to gate on — a condition never referenced inside its own guarded block is
+  the tell.
