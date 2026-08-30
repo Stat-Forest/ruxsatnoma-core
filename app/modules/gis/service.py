@@ -1,7 +1,9 @@
 """Business rules of the spatial core. Public surface for levels 3+ (norms 3.7,
 applications 3.9): published_version(), list_contours(), run_checks()."""
 
+import json
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -9,13 +11,14 @@ from typing import Any
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.abac import Zone, zone_of
-from app.core.errors import err
+from app.core.abac import Zone, zone_filter, zone_of
+from app.core.errors import DomainError, err
 from app.core.models import MediaFile
 from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
 from app.modules.auth.models import User
 from app.modules.gis import checks, repo
-from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
+from app.modules.gis.models import Contour, ContourVersion, GisImport, GisLayer, LayerFeature
 
 
 def _json_safe(value: Any) -> Any:
@@ -705,3 +708,253 @@ async def archive_feature(db: AsyncSession, feature_id: uuid.UUID, *, actor: Use
         new_value={"status": "archived"},
     )
     return feature
+
+
+# --- Task 8: batch publication + the read API for 3.7/3.9 --------------------
+#
+# The Agency delivers whole leshozes, not one contour at a time, so ruling 3
+# gives the WHOLE BATCH one basis document, one review and one publication —
+# but every version it created still goes through the SAME submit_review /
+# approve_version / publish_version above as a hand-drawn one, called in a
+# loop. There is exactly one implementation of each lifecycle step; these
+# three functions only decide WHICH versions to call it on and how to read the
+# batch's own `gis_imports.status` alongside them.
+
+
+async def submit_import_review(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) -> GisImport:
+    """`POST /gis/imports/{id}/submit-review` — `CONTOURS_MANAGE` (the GIS
+    specialist who ran the import submits their own batch, same actor who
+    would submit one hand-drawn draft). Task 7 already leaves the batch row at
+    `status='review'` the moment it parses cleanly — this action does not move
+    THAT status at all; its real effect is cascading every version the import
+    created from `draft` to `review`, one `submit_review` call each, so
+    `approve_import` below has something in the right state to work on."""
+    row = await repo.import_by_id(db, import_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    _assert_in_zone(actor, row.organization_id)
+    if row.status != "review":
+        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
+    for version in await repo.import_versions(db, import_id, status="draft"):
+        await submit_review(db, version.id, actor=actor)
+    await audit.log(
+        db,
+        action="gis_import.submit_review",
+        user_id=actor.id,
+        object_type="gis_import",
+        object_id=row.id,
+        new_value={"status": row.status},
+    )
+    return row
+
+
+async def approve_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) -> GisImport:
+    """`POST /gis/imports/{id}/approve` — `CONTOURS_APPROVE` (the rahbar).
+    Stamps the BATCH's own `approval_doc_id` onto every version it created
+    (ruling 3: one basis document for the whole delivery, nobody signs a
+    decree per contour) by calling `approve_version` once per version still in
+    `review`, then advances the batch row itself to `approved`."""
+    row = await repo.import_by_id(db, import_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    _assert_in_zone(actor, row.organization_id)
+    if row.status != "review":
+        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
+    for version in await repo.import_versions(db, import_id, status="review"):
+        await approve_version(db, version.id, actor=actor, approval_doc_id=row.approval_doc_id)
+    row.status = "approved"
+    row.approved_by = actor.id
+    await db.flush()
+    # An in-place UPDATE leaves onupdate columns expired, not refreshed (lesson).
+    await db.refresh(row)
+    await audit.log(
+        db,
+        action="gis_import.approve",
+        user_id=actor.id,
+        object_type="gis_import",
+        object_id=row.id,
+        old_value={"status": "review"},
+        new_value={"status": "approved"},
+    )
+    return row
+
+
+async def publish_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) -> dict[str, Any]:
+    """`POST /gis/imports/{id}/publish` — `CONTOURS_APPROVE`. Ruling 3: the
+    batch is the unit of publication, but each version goes through the SAME
+    `publish_version` a hand-made one uses, one implementation called in a
+    loop — never a second, batch-only publish path.
+
+    `DomainError` is caught deliberately narrowly: only `ERR-GIS-003` (the
+    check report) means "this one version cannot publish" — a blocked version
+    keeps its `approved` status, is reported in `blocked[]` with its own check
+    report, and does not stop its siblings, so a 151-feature delivery is never
+    hostage to one bad polygon. Anything else — a bad transition, a missing
+    row, a database error — is a defect of the batch itself, not a per-feature
+    business outcome, and must propagate and roll the whole call back;
+    catching `Exception` here would turn a broken migration into a silent
+    "0 published" instead of a loud failure.
+
+    The batch reaches `done` only when nothing was blocked; otherwise it stays
+    `approved` so the operator can fix the offending feature and re-run —
+    `publish_import` is safe to call again, since an already-`published`
+    version is simply absent from the next `status='approved'` batch.
+    """
+    row = await repo.import_by_id(db, import_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    _assert_in_zone(actor, row.organization_id)
+    if row.status != "approved":
+        raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
+    published, blocked = 0, []
+    for version in await repo.import_versions(db, import_id, status="approved"):
+        try:
+            await publish_version(db, version.id, actor=actor)
+            published += 1
+        except DomainError as exc:
+            if exc.code != "ERR-GIS-003":
+                raise
+            assert exc.details is not None  # publish_version always sets details={"checks": ...}
+            blocked.append({"version_id": str(version.id), "checks": exc.details["checks"]})
+    row.status = "done" if not blocked else "approved"
+    row.stats = {**(row.stats or {}), "published": published, "blocked": len(blocked)}
+    await db.flush()
+    await audit.log(
+        db,
+        action="gis_import.publish",
+        user_id=actor.id,
+        object_type="gis_import",
+        object_id=row.id,
+        new_value={"published": published, "blocked": len(blocked)},
+    )
+    return {"published": published, "blocked": blocked}
+
+
+# The occupancy seam (ruling 3/14): `gis` must never import `permits` (which
+# does not exist yet), so a future stage plugs in here instead — the same
+# registration idiom as `core.files.ACCESS_CHECKS`. With nothing registered
+# (true today), occupancy is an explicit placeholder, never a silent zero that
+# could be mistaken for a real measurement.
+OccupancyProvider = Callable[[AsyncSession, uuid.UUID], Awaitable[Decimal]]
+OCCUPANCY_PROVIDERS: list[OccupancyProvider] = []
+
+
+async def occupancy_ha(db: AsyncSession, contour_id: uuid.UUID) -> tuple[Decimal, str]:
+    """Sum every registered provider's answer for one contour. `Decimal`,
+    never `float` (project convention: areas are numeric) — quantized to 4 dp
+    to match `contour_versions.area_ha`'s own NUMERIC(12,4) scale, the figure
+    `s_available_ha` is subtracted against. With no provider registered the
+    source is `"none"` and the figure is an explicit `Decimal('0.0000')`, so a
+    reader can never mistake this placeholder for a measurement; once
+    something registers, the source flips to `"permits"` (ruling 14)."""
+    if not OCCUPANCY_PROVIDERS:
+        return Decimal("0.0000"), "none"
+    total = Decimal("0")
+    for provider in OCCUPANCY_PROVIDERS:
+        total += await provider(db, contour_id)
+    return total.quantize(Decimal("0.0001")), "permits"
+
+
+def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
+    """Four comma-separated floats — anything else (wrong count, non-numeric,
+    min greater than max) is `ERR-VAL-001` (422), never a 500 (ruling 4: a
+    bare `float()` on user input inside a route is exactly how a `ValueError`
+    becomes one)."""
+    if bbox is None:
+        return None
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        raise err("ERR-VAL-001", details={"reason": "bbox_invalid"})
+    try:
+        min_lon, min_lat, max_lon, max_lat = (float(part) for part in parts)
+    except ValueError:
+        raise err("ERR-VAL-001", details={"reason": "bbox_invalid"}) from None
+    if min_lon > max_lon or min_lat > max_lat:
+        raise err("ERR-VAL-001", details={"reason": "bbox_invalid"})
+    return min_lon, min_lat, max_lon, max_lat
+
+
+async def list_contours(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None = None,
+    bbox: str | None = None,
+    actor: User,
+) -> list[dict[str, Any]]:
+    """`GET /gis/contours` — picking a plot (design/03, C3 item 3). Joins to
+    each contour's PUBLISHED version only (decision 6): a draft has no
+    geometry of record yet, so it is invisible here regardless of the caller's
+    role — which is exactly what makes an applicant see published contours
+    only, with no role branch of its own. `zone_filter` narrows this to the
+    actor's own organization for a zone-scoped staff member and is a no-op
+    (`true()`) for a republic-wide one or an applicant (`Contour` carries no
+    region_id/district_id of its own, the same single-axis limit
+    `_assert_in_zone` already documents)."""
+    parsed_bbox = _parse_bbox(bbox)
+    zone = zone_filter(zone_of(actor), organization_col=Contour.organization_id)
+    rows = await repo.list_contours(
+        db, organization_id=organization_id, bbox=parsed_bbox, zone=zone
+    )
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        occupied, source = await occupancy_ha(db, row.contour_id)
+        items.append(
+            {
+                "id": row.contour_id,
+                "number": row.number,
+                "organization_id": row.organization_id,
+                "area_ha": row.area_ha,
+                "occupied_ha": occupied,
+                "s_available_ha": row.area_ha - occupied,
+                "occupancy_source": source,
+            }
+        )
+    return items
+
+
+async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
+    """`GET /gis/contours/{id}` — the published version's geometry plus the
+    same occupancy placeholder `list_contours` carries (ruling 14). Requires a
+    published version to exist, for every role alike (mirrors `list_contours`'
+    own join) — a contour that never reached `published` has nothing here yet
+    to show as its card."""
+    row = await repo.contour_card(db, contour_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    occupied, source = await occupancy_ha(db, contour_id)
+    return {
+        "id": row.contour_id,
+        "number": row.number,
+        "organization_id": row.organization_id,
+        "kind": row.kind,
+        "version_id": row.version_id,
+        "area_ha": row.area_ha,
+        "geometry": json.loads(row.geometry),
+        "occupied_ha": occupied,
+        "s_available_ha": row.area_ha - occupied,
+        "occupancy_source": source,
+    }
+
+
+async def list_features(
+    db: AsyncSession,
+    code: str,
+    *,
+    bbox: str | None = None,
+    valid_on: date | None = None,
+    actor: User,
+) -> dict[str, Any]:
+    """`GET /gis/layers/{code}/features` — the GeoJSON a map draws (ruling 5).
+    A non-public layer is refused to an actor whose ROLE is `applicant`
+    specifically — not a permission gate (every staff role reads any layer's
+    features regardless of a held grant, the same way `GET /gis/layers`
+    itself is open to any authenticated user, ruling 18)."""
+    layer = await repo.layer_by_code(db, code)
+    if layer is None:
+        raise err("ERR-SYS-003")
+    if not layer.is_public:
+        role = await auth_repo.role_code(db, actor)
+        if role == "applicant":
+            raise err("ERR-ACL-001")
+    parsed_bbox = _parse_bbox(bbox)
+    return await repo.features_geojson(db, layer_code=code, bbox=parsed_bbox, valid_on=valid_on)

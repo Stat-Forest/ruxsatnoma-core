@@ -7,7 +7,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
@@ -353,3 +353,145 @@ async def contour_numbers(db: AsyncSession, organization_id: uuid.UUID) -> set[s
         select(Contour.number).where(Contour.organization_id == organization_id)
     )
     return set(rows.scalars().all())
+
+
+async def import_versions(
+    db: AsyncSession, import_id: uuid.UUID, *, status: str
+) -> list[ContourVersion]:
+    """Every version ONE import batch created, at a given status — what
+    `gis.service.submit_import_review`/`approve_import`/`publish_import` each
+    loop over, one status per call so a batch action never touches a version
+    already past (or not yet at) the stage it is meant for."""
+    result = await db.execute(
+        select(ContourVersion)
+        .where(ContourVersion.import_id == import_id, ContourVersion.status == status)
+        .order_by(ContourVersion.created_at)
+    )
+    return list(result.scalars().all())
+
+
+# --- Task 8: the read API for 3.7/3.9 -----------------------------------------
+
+
+async def list_contours(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    bbox: tuple[float, float, float, float] | None,
+    zone: Any,
+) -> list[Any]:
+    """One row (contour_id, number, organization_id, version_id, area_ha) per
+    contour that HAS a published version, matching the given filters. `zone`
+    is whatever `abac.zone_filter` built — always given, `true()` when the
+    actor carries no zone at all (a republic-wide staff member, or any
+    applicant). Geometry is read only as a bbox PREDICATE (`ST_Intersects`),
+    never selected into Python (module docstring)."""
+    conditions: list[Any] = [ContourVersion.status == "published", zone]
+    if organization_id is not None:
+        conditions.append(Contour.organization_id == organization_id)
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        conditions.append(
+            func.ST_Intersects(
+                ContourVersion.geom,
+                func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
+            )
+        )
+    result = await db.execute(
+        select(
+            Contour.id.label("contour_id"),
+            Contour.number,
+            Contour.organization_id,
+            ContourVersion.id.label("version_id"),
+            ContourVersion.area_ha,
+        )
+        .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+        .where(*conditions)
+        .order_by(Contour.number)
+    )
+    return list(result.all())
+
+
+async def contour_card(db: AsyncSession, contour_id: uuid.UUID) -> Any | None:
+    """The published version's card: identity + area + geometry
+    (`ST_AsGeoJSON`, computed in SQL — only the resulting STRING crosses into
+    Python, module docstring). `None` when the contour has no published
+    version (or does not exist at all) — the service turns that into
+    `ERR-SYS-003`."""
+    result = await db.execute(
+        select(
+            Contour.id.label("contour_id"),
+            Contour.number,
+            Contour.organization_id,
+            Contour.kind,
+            ContourVersion.id.label("version_id"),
+            ContourVersion.area_ha,
+            func.ST_AsGeoJSON(ContourVersion.geom).label("geometry"),
+        )
+        .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+        .where(Contour.id == contour_id, ContourVersion.status == "published")
+    )
+    return result.one_or_none()
+
+
+async def features_geojson(
+    db: AsyncSession,
+    *,
+    layer_code: str,
+    bbox: tuple[float, float, float, float] | None,
+    valid_on: date | None,
+) -> dict[str, Any]:
+    """The layer's published features as one GeoJSON FeatureCollection, built
+    entirely in SQL (`ST_AsGeoJSON` per row, decision 6): geometry crosses
+    into Python only as the string PostGIS already rendered, never as a value
+    this module reconstructs itself (module docstring). `valid_on`, when
+    given, keeps only features whose validity period (if any) contains that
+    date — the same window `checks._RESTRICTIONS_CANDIDATES_SQL` gates
+    `fire_bans` on, generalised here to every feature since most carry no
+    period at all (`valid_from`/`valid_to` both NULL means "always valid")."""
+    conditions: list[Any] = [GisLayer.code == layer_code, LayerFeature.status == "published"]
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        conditions.append(
+            func.ST_Intersects(
+                LayerFeature.geom,
+                func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
+            )
+        )
+    if valid_on is not None:
+        conditions.append(
+            or_(LayerFeature.valid_from.is_(None), LayerFeature.valid_from <= valid_on)
+        )
+        conditions.append(or_(LayerFeature.valid_to.is_(None), LayerFeature.valid_to >= valid_on))
+    rows = (
+        await db.execute(
+            select(
+                LayerFeature.id,
+                LayerFeature.name,
+                LayerFeature.props,
+                LayerFeature.valid_from,
+                LayerFeature.valid_to,
+                func.ST_AsGeoJSON(LayerFeature.geom).label("geometry"),
+            )
+            .join(GisLayer, GisLayer.id == LayerFeature.layer_id)
+            .where(*conditions)
+            .order_by(LayerFeature.id)
+        )
+    ).all()
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "id": str(row.id),
+                "geometry": json.loads(row.geometry),
+                "properties": {
+                    "name": row.name,
+                    "props": row.props,
+                    "valid_from": row.valid_from.isoformat() if row.valid_from else None,
+                    "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+                },
+            }
+            for row in rows
+        ],
+    }

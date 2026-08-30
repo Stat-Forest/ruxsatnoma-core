@@ -15,14 +15,17 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
-from app.modules.auth.deps import require_permission
+from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import checks, service
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import (
     ApproveIn,
     ChecksOut,
+    ContourCardOut,
     ContourIn,
+    ContourList,
+    ContourListItem,
     ContourOut,
     ContourPatch,
     VersionIn,
@@ -31,6 +34,30 @@ from app.modules.gis.schemas import (
 )
 
 router = APIRouter(prefix="/gis", tags=["gis"])
+
+
+@router.get("/contours")
+async def list_contours(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    organization_id: uuid.UUID | None = None,
+    bbox: str | None = None,
+) -> ContourList:
+    """Reading published contours needs no permission at all (ruling 5): an
+    applicant must be able to pick a plot the same way any authenticated user
+    already reads `GET /gis/layers` (ruling 18)."""
+    items = await service.list_contours(db, organization_id=organization_id, bbox=bbox, actor=user)
+    return ContourList(items=[ContourListItem.model_validate(item) for item in items])
+
+
+@router.get("/contours/{contour_id}")
+async def get_contour_card(
+    contour_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> ContourCardOut:
+    card = await service.contour_card(db, contour_id, actor=user)
+    return ContourCardOut.model_validate(card)
 
 
 @router.post("/contours", status_code=201)

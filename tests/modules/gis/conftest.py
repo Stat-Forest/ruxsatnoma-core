@@ -1044,6 +1044,174 @@ async def pending_import_utm42(
     )
 
 
+# --- Task 8: batch publication + the read API for 3.7/3.9 --------------------
+#
+# `approved_import`/`approved_import_with_one_overlap` are built directly at ORM
+# level, already at the state `/publish` alone needs — mirrors task 5's
+# `contour_with_two_versions`: what those two tests need is the STATE, not a
+# second proof that submit-review/approve themselves work (already covered by
+# `test_a_batch_is_reviewed_approved_and_published_in_three_calls`, which drives
+# `processed_import` through all three calls for real). Every one of these gets
+# combined with a `_client_for`-based client in its own test and therefore
+# commits for real (the same lesson task 5/6/7's own fixtures document), so
+# geometry is anchored with `random_box_wkt()`/`random_anchor()`, never the
+# module's conventional box_wkt(69.9, 41.5) spot or its neighbours.
+
+
+@pytest.fixture
+async def processed_import(
+    db: AsyncSession, session_factory: async_sessionmaker[AsyncSession], pending_import: GisImport
+) -> GisImport:
+    """Task 7's own terminal state for a clean batch — `status='review'`, two
+    `draft` versions — reached by running the REAL job (never hand-built: what
+    the job itself does right is task 7's own tests to prove, not this one's).
+    """
+    await import_service.process_pending(session_factory)
+    await db.refresh(pending_import)
+    return pending_import
+
+
+@pytest.fixture
+async def approved_import(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    gis_user: User,
+) -> GisImport:
+    """A batch already through submit-review AND approve — two clean `approved`
+    versions, ready for `/publish` alone. `file_id` reuses `approval_doc`'s own
+    row (a real media_files id is all the FK needs; nothing in these tests
+    ever reads it back)."""
+    row = GisImport(
+        layer_id=contours_layer.id,
+        organization_id=leshoz.id,
+        file_id=approval_doc.id,
+        approval_doc_id=approval_doc.id,
+        format="geojson",
+        status="approved",
+        stats={"created": 2, "warnings": []},
+        started_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(row)
+    await db.flush()
+    for _ in range(2):
+        contour = await make_contour(db, contours_layer, leshoz)
+        await make_version(
+            db,
+            contour.id,
+            random_box_wkt(),
+            status="approved",
+            approval_doc_id=approval_doc.id,
+            import_id=row.id,
+        )
+    return row
+
+
+@pytest.fixture
+async def approved_import_with_one_overlap(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    gis_user: User,
+) -> GisImport:
+    """A two-version batch, both `approved`: one clean, one overlapping an
+    UNRELATED, already-published contour — ruling 1's own scenario, proving a
+    single bad polygon does not hold its sibling hostage. The published contour
+    and the overlapping version share one random anchor plus a fixed
+    0.005-degree offset, the same half-step `approved_version_overlapping_a_
+    published_one` (task 5) uses against `neighbouring_published_contour` — so
+    the only thing the overlapping version ever overlaps is the row this
+    fixture creates alongside it."""
+    lon, lat = random_anchor()
+    published = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        published.id,
+        box_wkt(lon, lat),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    row = GisImport(
+        layer_id=contours_layer.id,
+        organization_id=leshoz.id,
+        file_id=approval_doc.id,
+        approval_doc_id=approval_doc.id,
+        format="geojson",
+        status="approved",
+        stats={"created": 2, "warnings": []},
+        started_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(row)
+    await db.flush()
+    clean = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        clean.id,
+        random_box_wkt(),
+        status="approved",
+        approval_doc_id=approval_doc.id,
+        import_id=row.id,
+    )
+    overlapping = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        overlapping.id,
+        box_wkt(lon + 0.005, lat),
+        status="approved",
+        approval_doc_id=approval_doc.id,
+        import_id=row.id,
+    )
+    return row
+
+
+@pytest.fixture
+async def draft_contour(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> ContourVersion:
+    """A contour with only a `draft` version, never published — the negative
+    case `test_an_applicant_sees_published_contours_only` needs: `list_contours`
+    joins to a PUBLISHED version (decision 6), so this one must never appear in
+    its result. A dedicated fixture rather than reusing `draft_version`: that
+    one is explicitly documented to never be combined with a `_client_for`
+    client, and this test does exactly that (`applicant_client`)."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    return await make_version(db, contour.id, random_box_wkt())
+
+
+@pytest.fixture
+async def published_fire_ban(db: AsyncSession) -> LayerFeature:
+    """A published `fire_bans` feature (is_public=True, migration 0010) inside
+    the fixed bbox `test_features_are_returned_as_a_geojson_feature_collection`
+    queries (69.8,41.4 – 70.0,41.6) — the module's conventional box_wkt(69.9,
+    41.5) spot already sits inside it, so this reuses that literal rather than
+    inventing a second one the test's own bbox would have to match by hand."""
+    layer = await repo.layer_by_code(db, "fire_bans")
+    assert layer is not None
+    today = business_today()
+    return await make_feature(
+        db,
+        layer,
+        box_wkt(69.9, 41.5),
+        valid_from=today - timedelta(days=1),
+        valid_to=today + timedelta(days=1),
+    )
+
+
+@pytest.fixture
+async def published_restriction(db: AsyncSession) -> LayerFeature:
+    """A published `restrictions` feature — not public (migration 0010), the
+    layer `test_a_non_public_layer_is_refused_to_an_applicant` needs. That test
+    never filters by bbox, so a random, isolated location is fine."""
+    layer = await repo.layer_by_code(db, "restrictions")
+    assert layer is not None
+    return await make_feature(db, layer, random_box_wkt())
+
+
 DRAIN_LIMIT = 50
 
 

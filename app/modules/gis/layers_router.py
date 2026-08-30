@@ -6,6 +6,7 @@ requires `gis.layers.manage`, the same permission `PATCH /layers/{code}`
 already uses for the layer's own presentation."""
 
 import uuid
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -17,6 +18,7 @@ from app.modules.auth.models import User
 from app.modules.gis import service
 from app.modules.gis.permissions import LAYERS_MANAGE
 from app.modules.gis.schemas import (
+    FeatureCollectionOut,
     FeatureIn,
     FeatureOut,
     FeaturePatch,
@@ -53,6 +55,21 @@ async def patch_layer(
         status=payload.status,
     )
     return LayerOut.model_validate(layer, from_attributes=True)
+
+
+@router.get("/layers/{code}/features")
+async def list_features(
+    code: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    bbox: str | None = None,
+    valid_on: date | None = None,
+) -> FeatureCollectionOut:
+    """No permission required (ruling 5, mirrors `GET /gis/layers` — ruling
+    18): the service itself refuses a non-public layer to an applicant
+    specifically (`ERR-ACL-001`), a ROLE gate rather than a held-grant one."""
+    collection = await service.list_features(db, code, bbox=bbox, valid_on=valid_on, actor=user)
+    return FeatureCollectionOut.model_validate(collection)
 
 
 @router.post("/layers/{code}/features", status_code=201)

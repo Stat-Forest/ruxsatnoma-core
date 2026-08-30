@@ -250,3 +250,76 @@ class ImportOut(BaseModel):
     error_report: list[Any] | None
     created_at: datetime
     finished_at: datetime | None
+
+
+# --- Task 8: batch publication + the read API for 3.7/3.9 --------------------
+
+
+class PublishImportOut(BaseModel):
+    """`POST /gis/imports/{id}/publish`. `blocked` items are
+    `{"version_id": str, "checks": [...]}`; `checks` is already JSON-safe
+    (`gis.checks.jsonable`, applied once at `publish_version`'s own
+    `ERR-GIS-003` — see that function's docstring for why this must not be
+    re-derived here)."""
+
+    published: int
+    blocked: list[dict[str, Any]]
+
+
+class ContourListItem(BaseModel):
+    """One row of `GET /gis/contours` — attributes only, no geometry (the
+    card, not the list, carries what a picker needs to actually render a
+    plot). `occupied_ha`/`s_available_ha`/`occupancy_source` are ruling 14's
+    placeholder, shared with `ContourCardOut` below: `s_available_ha`
+    degrades to the full `area_ha` until something registers an
+    `OCCUPANCY_PROVIDERS` entry, and `occupancy_source` says so explicitly so
+    a front-end can never mistake the placeholder for a measurement."""
+
+    id: uuid.UUID
+    number: str
+    organization_id: uuid.UUID
+    area_ha: Decimal
+    occupied_ha: Decimal
+    s_available_ha: Decimal
+    occupancy_source: str
+
+    @field_serializer("area_ha", "s_available_ha")
+    def _serialize_area(self, value: Decimal) -> str | None:
+        return _trim_decimal(value)
+
+
+class ContourList(BaseModel):
+    items: list[ContourListItem]
+
+
+class ContourCardOut(BaseModel):
+    """`GET /gis/contours/{id}` — the published version's own geometry plus
+    the same occupancy placeholder `ContourListItem` carries (ruling 14).
+    `occupied_ha` is intentionally NOT run through `_trim_decimal`: it is a
+    computed sum, not a value round-tripped through a NUMERIC column, and
+    keeping its full 4-dp precision (`"0.0000"`, not `"0"`) is what makes it
+    read as a real figure rather than a rounded-away one."""
+
+    id: uuid.UUID
+    number: str
+    organization_id: uuid.UUID
+    kind: str
+    version_id: uuid.UUID
+    area_ha: Decimal
+    geometry: dict[str, Any]
+    occupied_ha: Decimal
+    s_available_ha: Decimal
+    occupancy_source: str
+
+    @field_serializer("area_ha", "s_available_ha")
+    def _serialize_area(self, value: Decimal) -> str | None:
+        return _trim_decimal(value)
+
+
+class FeatureCollectionOut(BaseModel):
+    """`GET /gis/layers/{code}/features` — built entirely in SQL
+    (`gis.repo.features_geojson`); this schema only shapes what the service
+    already assembled and never touches geometry itself."""
+
+    type: str
+    features: list[dict[str, Any]]

@@ -27,8 +27,9 @@ from app.core.errors import err
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
 from app.modules.gis import import_service
-from app.modules.gis.permissions import CONTOURS_MANAGE
-from app.modules.gis.schemas import ImportAccepted, ImportOut
+from app.modules.gis import service as gis_service
+from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
+from app.modules.gis.schemas import ImportAccepted, ImportOut, PublishImportOut
 
 router = APIRouter(prefix="/gis", tags=["gis"])
 
@@ -100,3 +101,37 @@ async def get_import(
 ) -> ImportOut:
     row = await import_service.get_import(db, import_id, actor=user)
     return ImportOut.model_validate(row, from_attributes=True)
+
+
+@router.post("/imports/{import_id}/submit-review")
+async def submit_import_review(
+    import_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+) -> ImportOut:
+    """The GIS specialist who ran the import submits their own batch —
+    `CONTOURS_MANAGE`, the same permission `POST /gis/imports` itself uses."""
+    row = await gis_service.submit_import_review(db, import_id, actor=user)
+    return ImportOut.model_validate(row, from_attributes=True)
+
+
+@router.post("/imports/{import_id}/approve")
+async def approve_import(
+    import_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
+) -> ImportOut:
+    """The rahbar approves the whole batch at once (ruling 3) — `CONTOURS_APPROVE`,
+    never the specialist who filed it."""
+    row = await gis_service.approve_import(db, import_id, actor=user)
+    return ImportOut.model_validate(row, from_attributes=True)
+
+
+@router.post("/imports/{import_id}/publish")
+async def publish_import(
+    import_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
+) -> PublishImportOut:
+    result = await gis_service.publish_import(db, import_id, actor=user)
+    return PublishImportOut.model_validate(result)
