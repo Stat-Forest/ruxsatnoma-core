@@ -48,6 +48,14 @@ def shapefile_zip_bytes(tmp_path) -> bytes:
     return archive_path.read_bytes()
 
 
+def idem() -> dict[str, str]:
+    """`POST /gis/imports` requires an Idempotency-Key (3.4's mechanism, first
+    consumer). A FRESH key per call here: the client convention is that a retry
+    reuses its key and a genuinely new request mints a new one, so a test that
+    is not about replay must not accidentally replay."""
+    return {"Idempotency-Key": str(uuid.uuid4())}
+
+
 def form(*, org_id, doc_id, fmt="shp", layer_code="contours", attributes=None):
     return {
         "layer_code": layer_code,
@@ -80,6 +88,7 @@ async def test_a_gis_specialist_queues_a_zipped_shapefile(
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 202, response.text
     import_id = uuid.UUID(response.json()["import_id"])
@@ -105,6 +114,7 @@ async def test_the_status_route_reports_the_batch_back(
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     import_id = created.json()["import_id"]
     response = await gis_client.get(f"/api/v1/gis/imports/{import_id}")
@@ -124,6 +134,7 @@ async def test_a_document_type_is_not_a_geodata_type(gis_client, leshoz, approva
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id, fmt="zip"),
         files={"file": ("decree.pdf", b"%PDF-1.4 x", "application/pdf")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["details"]["reason"] == "type_not_allowed"
@@ -136,6 +147,7 @@ async def test_bytes_that_do_not_match_the_declared_type_are_refused(
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id, fmt="zip"),
         files={"file": ("layer.zip", b"not a zip at all", "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["details"]["reason"] == "content_mismatch"
@@ -146,6 +158,7 @@ async def test_a_body_over_the_cap_is_refused(gis_client, leshoz, approval_doc, 
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id, fmt="zip"),
         files={"file": ("big.zip", b"PK\x03\x04" + b"\x00" * (2 * 1024 * 1024), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["details"]["reason"] == "too_large"
@@ -158,6 +171,7 @@ async def test_an_unsupported_format_is_a_format_error(gis_client, leshoz, appro
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id, fmt="rar"),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "ERR-GIS-004"
@@ -168,6 +182,7 @@ async def test_an_unknown_layer_is_a_404(gis_client, leshoz, approval_doc, tmp_p
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id, layer_code="not_a_layer"),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 404
 
@@ -179,6 +194,7 @@ async def test_an_approval_document_that_is_not_on_record_is_refused(gis_client,
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=uuid.uuid4()),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["details"]["reason"] == "approval_doc_not_found"
@@ -196,6 +212,7 @@ async def test_a_malformed_attribute_map_is_rejected_at_the_request(
             "attributes": "{not json",
         },
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["details"]["reason"] == "attributes_not_json"
@@ -211,6 +228,7 @@ async def test_a_nested_attribute_map_is_rejected_too(gis_client, leshoz, approv
             "attributes": json.dumps({"number": {"field": "number"}}),
         },
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 422
     assert response.json()["error"]["details"]["reason"] == "attributes_not_a_string_map"
@@ -226,6 +244,7 @@ async def test_a_leshoz_scoped_specialist_cannot_import_into_another_leshoz(
         "/api/v1/gis/imports",
         data=form(org_id=other_leshoz.id, doc_id=approval_doc.id),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 403
 
@@ -237,6 +256,7 @@ async def test_an_approver_may_not_import(rahbar_client, leshoz, approval_doc, t
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     assert response.status_code == 403
 
@@ -248,6 +268,7 @@ async def test_an_applicant_cannot_read_an_import_at_all(
         "/api/v1/gis/imports",
         data=form(org_id=leshoz.id, doc_id=approval_doc.id),
         files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=idem(),
     )
     import_id = created.json()["import_id"]
     response = await applicant_client.get(f"/api/v1/gis/imports/{import_id}")
@@ -257,3 +278,68 @@ async def test_an_applicant_cannot_read_an_import_at_all(
 async def test_an_unknown_import_is_a_404(gis_client):
     response = await gis_client.get(f"/api/v1/gis/imports/{uuid.uuid4()}")
     assert response.status_code == 404
+
+
+async def test_a_replayed_upload_returns_the_stored_202_and_queues_nothing_new(
+    gis_client, db, leshoz, approval_doc, tmp_path
+):
+    """The reason `POST /gis/imports` carries an Idempotency-Key at all: a
+    retried or double-clicked upload files a SECOND batch which then SUCCEEDS —
+    151 `duplicate_number` warnings and a `/2` suffix on every contour — and
+    there is no delete path, archiving being one contour at a time. The replay
+    must come back with the ORIGINAL import_id and leave one row behind, not
+    two. `auth.deps.idempotency_context` has shipped since 3.4 with no
+    consumer; this is its first."""
+    key = {"Idempotency-Key": str(uuid.uuid4())}
+    payload = {
+        "data": form(org_id=leshoz.id, doc_id=approval_doc.id),
+        "files": {"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+    }
+
+    first = await gis_client.post("/api/v1/gis/imports", **payload, headers=key)
+    assert first.status_code == 202, first.text
+    second = await gis_client.post("/api/v1/gis/imports", **payload, headers=key)
+    assert second.status_code == 202, second.text
+    assert second.json() == first.json()
+
+    filed = await db.execute(select(GisImport.id).where(GisImport.organization_id == leshoz.id))
+    assert [row for row in filed.scalars().all()] == [uuid.UUID(first.json()["import_id"])]
+
+
+async def test_an_upload_without_an_idempotency_key_is_refused(
+    gis_client, leshoz, approval_doc, tmp_path
+):
+    response = await gis_client.post(
+        "/api/v1/gis/imports",
+        data=form(org_id=leshoz.id, doc_id=approval_doc.id),
+        files={"file": ("burchmulla.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["details"]["reason"] == "idempotency_key_required"
+
+
+async def test_a_different_upload_under_the_same_key_is_a_conflict(
+    gis_client, leshoz, approval_doc, tmp_path
+):
+    """The fingerprint of a MULTIPART request is taken over the parsed form —
+    FastAPI has already consumed the stream by the time a dependency runs, so
+    `Request.body()` raises `RuntimeError("Stream consumed")` there (a 500,
+    reproduced before the fix). Each file contributes its name, filename,
+    content type and size, so a genuinely different upload under a reused key
+    is still ERR-SYS-005 rather than a silent replay."""
+    key = {"Idempotency-Key": str(uuid.uuid4())}
+    first = await gis_client.post(
+        "/api/v1/gis/imports",
+        data=form(org_id=leshoz.id, doc_id=approval_doc.id),
+        files={"file": ("a.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=key,
+    )
+    assert first.status_code == 202, first.text
+    second = await gis_client.post(
+        "/api/v1/gis/imports",
+        data=form(org_id=leshoz.id, doc_id=approval_doc.id),
+        files={"file": ("a-different-name.zip", shapefile_zip_bytes(tmp_path), "application/zip")},
+        headers=key,
+    )
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "ERR-SYS-005"

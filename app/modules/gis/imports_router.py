@@ -5,6 +5,11 @@ but never approves — the batch's own approve/publish arrive in Task 8) and bot
 are ALSO zone-scoped in the service on `organization_id`, a separate gate from
 the permission check (lesson: "Zone scoping is not a permission check").
 
+`POST /gis/imports` additionally requires an `Idempotency-Key` — a retried
+upload must replay its 202, never queue a second batch (see the route's own
+docstring). `ERR-SYS-005` means an Idempotency-Key conflict here and nothing
+else; this module's own state conflicts are `ERR-GIS-005`.
+
 The upload is capped BEFORE the body exists as one `bytes` object (ruling 8,
 lesson: "A cap checked after reading the body is not a cap"): `read_capped`
 rejects an oversized `Content-Length` without reading a byte and otherwise
@@ -24,7 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import files, settings_store
 from app.core.deps import get_db
 from app.core.errors import err
-from app.modules.auth.deps import require_permission
+from app.core.idempotency import IdempotencyContext
+from app.modules.auth.deps import idempotency_context, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import import_service
 from app.modules.gis import service as gis_service
@@ -70,12 +76,24 @@ async def create_import(
     fmt: Annotated[str, Form(alias="format")],
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+    ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
     attributes: Annotated[str, Form()] = "{}",
 ) -> ImportAccepted:
     """202, not 201: the file is stored and the work is QUEUED (ruling 6). The
     parse happens in `jobs.process_gis_imports`, which is why a 151-feature
     delivery does not need the browser to stay open — the initiator gets a
-    `gis.import.finished` notification when it lands."""
+    `gis.import.finished` notification when it lands.
+
+    Idempotency-Key is MANDATORY (3.4's mechanism, `app/core/idempotency.py`;
+    this is its first consumer). Without it a retried or double-clicked upload
+    files a SECOND batch which then succeeds — 151 `duplicate_number` warnings
+    and a `/2` suffix on every contour — and there is no delete path: archiving
+    is one contour at a time. `ctx.save()` runs before the response so a replay
+    of the same key returns the stored 202 with the ORIGINAL `import_id`
+    instead of queueing a duplicate. `ctx` is declared after `user` so the
+    permission check runs first and an unauthorized caller never mints a
+    marker row.
+    """
     cap_bytes = await settings_store.get_int(db, "gis_import_max_mb") * 1024 * 1024
     data = await files.read_capped(file, cap_bytes, files.declared_length(request.headers))
     row = await import_service.create_import(
@@ -90,7 +108,9 @@ async def create_import(
         content_type=file.content_type or "application/octet-stream",
         actor=user,
     )
-    return ImportAccepted(import_id=row.id)
+    accepted = ImportAccepted(import_id=row.id)
+    await ctx.save(db, status_code=202, body=accepted.model_dump(mode="json"))
+    return accepted
 
 
 @router.get("/imports/{import_id}")
