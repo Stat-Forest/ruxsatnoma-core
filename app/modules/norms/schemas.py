@@ -87,6 +87,63 @@ class TariffOut(BaseModel):
         return str(value)
 
 
+class NormIn(BaseModel):
+    contour_id: uuid.UUID
+    activity_type_id: uuid.UUID
+    yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    season: dict[str, Any] | None = None
+    rotation: dict[str, Any] | None = None
+    geobotanic_doc_id: uuid.UUID | None = None
+    effective_from: date
+    effective_to: date | None = None
+
+
+class NormPatch(BaseModel):
+    """`contour_id`/`activity_type_id` are identity and stay out of this patch,
+    the same way `TariffPatch` excludes its own key fields."""
+
+    yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    season: dict[str, Any] | None = None
+    rotation: dict[str, Any] | None = None
+    geobotanic_doc_id: uuid.UUID | None = None
+    effective_from: date | None = None
+    effective_to: date | None = None
+
+
+class NormApproveIn(BaseModel):
+    approval_doc_id: uuid.UUID
+
+
+class NormOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    contour_id: uuid.UUID
+    activity_type_id: uuid.UUID
+    yield_c_per_ha: Decimal | None
+    season: dict[str, Any] | None
+    rotation: dict[str, Any] | None
+    max_sb: int | None
+    geobotanic_doc_id: uuid.UUID | None
+    approval_doc_id: uuid.UUID | None
+    effective_from: date
+    effective_to: date | None
+    status: str
+    created_by: uuid.UUID
+    approved_by: uuid.UUID | None
+    published_at: datetime | None
+    created_at: datetime
+
+    # Same fixed-scale-NUMERIC lesson as `TariffOut.coefficient` (plain `str`,
+    # not the trim-then-rstrip dance `gis.schemas._trim_decimal` uses for a
+    # measured area): a yield figure is a caller-supplied rate like a
+    # coefficient, not a measured quantity, so the response shows the STORED
+    # precision rather than echoing the caller's own input shape.
+    @field_serializer("yield_c_per_ha")
+    def _yield_c_per_ha(self, value: Decimal | None) -> str | None:
+        return str(value) if value is not None else None
+
+
 class Warning(BaseModel):
     code: str
     message: str

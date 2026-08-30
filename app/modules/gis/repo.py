@@ -161,6 +161,13 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
     return result.scalar_one_or_none()
 
 
+async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
+    """The leshoz a contour is filed under, or None if there is no such contour.
+    Identity only — no version, no geometry."""
+    rows = await db.execute(select(Contour.organization_id).where(Contour.id == contour_id))
+    return rows.scalar_one_or_none()
+
+
 # --- Task 6: layer_features (restriction, protection, fire-ban and every
 # other non-contour layer object) --------------------------------------------
 #

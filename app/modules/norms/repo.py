@@ -141,6 +141,29 @@ async def list_tariffs(
     return await paginate(db, stmt, limit, offset)
 
 
+async def list_norms(
+    db: AsyncSession,
+    *,
+    contour_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    status: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Norm], int]:
+    """Every norm matching the given filters, any status — a specialist's own
+    drafts must show up here too, the same reasoning `list_parameters`
+    documents for rule parameters."""
+    stmt = select(Norm)
+    if contour_id is not None:
+        stmt = stmt.where(Norm.contour_id == contour_id)
+    if activity_type_id is not None:
+        stmt = stmt.where(Norm.activity_type_id == activity_type_id)
+    if status is not None:
+        stmt = stmt.where(Norm.status == status)
+    stmt = stmt.order_by(Norm.effective_from, Norm.id)
+    return await paginate(db, stmt, limit, offset)
+
+
 async def paginate(db: AsyncSession, stmt: Select, limit: int, offset: int) -> tuple[list, int]:
     """`Page`-shaped result: the window plus the unwindowed total."""
     total = (

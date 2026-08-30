@@ -188,8 +188,19 @@ async def other_zone_specialist_client(
 
 @pytest.fixture
 async def leadership_client(db: AsyncSession, leshoz) -> AsyncIterator[httpx.AsyncClient]:
-    """The raҳbar: approves, never publishes (ruling 16)."""
-    async for client in _client_for(db, NORMS_APPROVE, NORMS_MANAGE, organization_id=leshoz.id):
+    """The raҳbar: approves, and also HOLDS `norms.publish` — migration 0011
+    grants both to the `leadership` role in production. Ruling 16's split
+    lives in the SERVICE, on top of that grant, not in what this actor may
+    reach: in the default 'central' scope the grant sits unused (a
+    zone-scoped actor is refused regardless of holding the permission — the
+    SETTING, not the grant, decides), and flipping `norms_publish_scope` to
+    'leshoz' is what makes it usable. Without the grant here, the
+    central-mode refusal test below would pass for the wrong reason (missing
+    permission, `ERR-ACL-001`) instead of the one ruling 16 is actually about
+    (`ERR-ACL-002`)."""
+    async for client in _client_for(
+        db, NORMS_APPROVE, NORMS_MANAGE, NORMS_PUBLISH, organization_id=leshoz.id
+    ):
         yield client
 
 

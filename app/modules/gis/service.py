@@ -1315,6 +1315,12 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
     return await repo.published_version(db, contour_id)
 
 
+async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
+    """Which leshoz owns this contour — what a level-3 module needs to apply its
+    own zone rule without importing `gis.repo` (CLAUDE.md module boundary)."""
+    return await repo.contour_organization(db, contour_id)
+
+
 async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.CheckResult]:
     """The four topology checks against one version, with no actor and no
     contour id — what a norm or an application pre-check needs.

@@ -1001,3 +1001,54 @@ Rules for this file:
   constrained table without one follows this shape, and gets run TWICE in a
   row (or as part of the full suite, not just its own file) before being
   trusted, specifically because this class of bug is invisible in isolation.
+
+## A `_client_for` fixture's permission list must mirror the PRODUCTION role's own grants, not just its usual outcome
+
+- **Rule:** When a migration grants a ROLE more than one permission code
+  (e.g. `leadership` gets both `norms.approve` and `norms.publish`), a test
+  fixture standing in for that role via `_client_for(db, ..., organization_id=
+  ...)` needs ALL of them listed explicitly — that branch builds the user
+  under `role_code="executor_staff"` with ONLY the personal grants it is
+  given (`tests/modules/gis/conftest.py::_client_for`), so it inherits
+  NOTHING from the real role's own `role_permissions` row no matter what the
+  fixture's docstring calls it.
+- **Why:** `leadership_client` (stage 3.7 task 4) was written with just
+  `NORMS_APPROVE, NORMS_MANAGE` under the docstring "approves, never
+  publishes" — true of the DEFAULT `norms_publish_scope=central` OUTCOME, but
+  wrong about the GRANT: migration 0011 gives the `leadership` role
+  `norms.publish` too, and ruling 16's whole point is that the SETTING, not
+  the grant, is what blocks it in that mode. Without the grant here,
+  `test_in_central_mode_a_leshoz_actor_cannot_publish` (the brief's own
+  verbatim test) "passed" for the wrong reason at first try — 403
+  `ERR-ACL-001`, missing permission — instead of proving the scope check
+  (403 `ERR-ACL-002`), and its sibling `test_in_leshoz_mode_the_same_actor_
+  publishes` failed outright (still `ERR-ACL-001`, 403 instead of 200).
+  Caught immediately by running the two tests the brief itself gives.
+- **How to apply:** Before trusting an existing zone-scoped client fixture's
+  permission list for a new maker-checker-shaped or scope-gated test, check
+  what the REAL role actually holds in its seeding migration, not just the
+  fixture's own docstring — a docstring can accurately describe a common-case
+  OUTCOME while quietly omitting a GRANT the row really has, and the two only
+  diverge once a test specifically targets the grant/outcome split.
+
+## pyright's possibly-unbound check treats `range(n)` as possibly empty, but not a fixed tuple literal
+
+- **Rule:** A loop variable assigned inside `for _ in range(n):` and read
+  AFTER the loop is `reportPossiblyUnboundVariable` under pyright even when
+  `n` is a positive integer literal; the identical shape over a fixed tuple
+  display (`for _ in (0, 1):`, `for x in (a, b):`) is NOT flagged — pyright's
+  definite-assignment analysis special-cases a literal-arity tuple, never a
+  `range()` call, regardless of how "obviously" non-empty the range is.
+- **Why:** Confirmed empirically with a throwaway repro (`for _ in range(2):
+  x = 1` then `return x` errors; the same shape over `(0, 1)` or over a
+  2-tuple of dicts does not). A stage-3.7 task-4 brief's own verbatim test
+  body used `for _ in range(2):` with `response` read after the loop (two
+  publish attempts, asserting the SECOND one 409s) — copied exactly as given,
+  it failed `make check`'s pyright gate, even though
+  `test_parameters_api.py::test_publishing_an_overlapping_period_is_a_409`
+  (iterating a 2-tuple of payload dicts, same shape otherwise) already passes
+  clean today.
+- **How to apply:** Iterating a fixed small number of times and reading the
+  loop variable afterwards: use a tuple literal of that many placeholders
+  (`for _ in (0, 1):`) instead of `range(n)` — a purely mechanical, same-
+  runtime-behavior substitution, no `Optional`/pre-initialization needed.
