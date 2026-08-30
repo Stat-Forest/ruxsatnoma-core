@@ -168,3 +168,14 @@ def test_an_unknown_format_is_rejected_before_gdal_sees_it():
     features, errors, _ = importer.parse(b"PK\x03\x04", fmt="rar")
     assert features == []
     assert errors[0].code == "unsupported_format"
+
+
+def test_the_parsers_format_table_matches_the_column_the_endpoint_validates_against():
+    """Two tuples describing one thing is two sources of truth (lesson). The
+    endpoint validates `format` against `models.IMPORT_FORMATS` (which mirrors
+    the `format_valid` DB CHECK), and the parser dispatches on `_SUFFIX`: a
+    format accepted by one and unknown to the other would be a 202 that can only
+    ever fail in the job."""
+    from app.modules.gis.models import IMPORT_FORMATS
+
+    assert set(importer._SUFFIX) == set(IMPORT_FORMATS)

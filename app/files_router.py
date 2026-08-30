@@ -70,14 +70,7 @@ async def upload_file(
     user: Annotated[User, Depends(get_current_user)],
 ) -> FileOut:
     cap_bytes = await settings_store.get_int(db, "max_upload_mb") * 1024 * 1024
-    raw_content_length = request.headers.get("content-length")
-    content_length: int | None = None
-    if raw_content_length is not None:
-        try:
-            content_length = int(raw_content_length)
-        except ValueError:
-            content_length = None  # malformed header — fall through to the chunked read
-    data = await files.read_capped(file, cap_bytes, content_length)
+    data = await files.read_capped(file, cap_bytes, files.declared_length(request.headers))
     filename = files.sanitize_filename(file.filename or "file")
     saved = await files.save_upload(
         db,

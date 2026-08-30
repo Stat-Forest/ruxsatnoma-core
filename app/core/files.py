@@ -46,6 +46,23 @@ def sanitize_filename(filename: str) -> str:
     return filename.replace('"', "").replace("\r", "").replace("\n", " ")
 
 
+def declared_length(headers: Mapping[str, str]) -> int | None:
+    """The request's own `Content-Length` as an int, or None when it is absent or
+    malformed — in which case `read_capped` falls through to the chunked read and
+    enforces the cap there. Shared by every capped ingest route (`POST /files`,
+    `POST /gis/imports`) so the parse of an attacker-controlled header has one
+    definition, not one per router."""
+    raw = headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    # Deliberately parenthesized, not the PEP 758 bare form (see
+    # settings_store.coerce for the reasoning).
+    except (TypeError, ValueError):  # fmt: skip
+        return None
+
+
 async def read_capped(file: UploadFile, cap_bytes: int, content_length: int | None) -> bytes:
     """Enforces the upload size cap before the body sits fully in RAM as one
     `bytes` object (I2, 3.3b final review — the plan's ruling 3 says the cap is

@@ -3,7 +3,7 @@ PostGIS (ST_GeomFromGeoJSON raises on malformed input) — modelling every GeoJS
 variant in pydantic would duplicate a parser we already have in the database."""
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Self
 
@@ -218,3 +218,35 @@ class FeaturePatch(BaseModel):
     def _check_validity_period(self) -> Self:
         _validate_period(self.valid_from, self.valid_to)
         return self
+
+
+# --- Task 7: geodata import ---------------------------------------------------
+
+
+class ImportAccepted(BaseModel):
+    """`POST /gis/imports` answers 202 with nothing but the id: the file is
+    stored and QUEUED, and the parse happens in the job (ruling 6). Poll
+    `GET /gis/imports/{id}` or wait for the `gis.import.finished` notification."""
+
+    import_id: uuid.UUID
+
+
+class ImportOut(BaseModel):
+    """`GET /gis/imports/{id}`. `stats` carries `created` plus the non-blocking
+    `warnings` of ruling 7 (area mismatch, duplicate number, organization-name
+    mismatch); `error_report` is `[{row, code, message}]` and is only ever
+    populated on a `failed` batch — the two are mutually exclusive by
+    construction, since an error rolls every write back."""
+
+    id: uuid.UUID
+    layer_id: uuid.UUID
+    organization_id: uuid.UUID
+    file_id: uuid.UUID
+    approval_doc_id: uuid.UUID
+    format: str
+    status: str
+    attribute_map: dict[str, Any]
+    stats: dict[str, Any] | None
+    error_report: list[Any] | None
+    created_at: datetime
+    finished_at: datetime | None

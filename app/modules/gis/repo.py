@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.db import uuid7
-from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
+from app.modules.gis.models import Contour, ContourVersion, GisImport, GisLayer, LayerFeature
 
 
 async def list_layers(db: AsyncSession) -> list[GisLayer]:
@@ -41,13 +41,39 @@ def normalised(geojson_param: Any) -> Any:
 
 AREA_HA = "ST_Area(geom::geography) / 10000.0"
 
+# The two ways geometry enters this module, as SQL. The API path (Task 3) posts
+# GeoJSON, already in WGS84; the import path (Task 7) hands over the source
+# file's own WKB plus the SRID `gis.importer.parse` read off it, and PostGIS
+# does the reprojection — decision #13, with exactly ONE reprojection engine in
+# the system rather than GDAL's answer and PostGIS's answer side by side.
+# Both are constants chosen by an `if`, never interpolated from caller data.
+_GEOJSON_SOURCE = "ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326)"
+_WKB_SOURCE = "ST_Transform(ST_SetSRID(ST_GeomFromWKB(:wkb), :srid), 4326)"
+
+
+def _geom_source_sql(
+    geojson: dict[str, Any] | None, wkb: bytes | None, srid: int
+) -> tuple[str, dict[str, Any]]:
+    """Pick the geometry-source fragment and its own bind parameters.
+
+    Exactly one of `geojson`/`wkb` must be supplied; neither or both is an
+    `AssertionError`, not a domain error — no request body can produce it, only
+    a miswritten call.
+    """
+    assert (geojson is None) != (wkb is None), "supply exactly one of geojson= or wkb="
+    if geojson is not None:
+        return _GEOJSON_SOURCE, {"geojson": json.dumps(geojson)}
+    return _WKB_SOURCE, {"wkb": wkb, "srid": srid}
+
 
 async def insert_version(
     db: AsyncSession,
     *,
     contour_id: uuid.UUID,
     version_no: int,
-    geojson: dict[str, Any],
+    geojson: dict[str, Any] | None = None,
+    wkb: bytes | None = None,
+    srid: int = 4326,
     source: str,
     created_by: uuid.UUID | None,
     declared_area_ha: Decimal | None = None,
@@ -62,12 +88,13 @@ async def insert_version(
     that normalises to nothing (a line, a point, an empty collection) is
     ERR-GIS-001 — never an empty row.
 
-    Keyword-only, `geojson` included, and every other geometry-adjacent keyword
-    left out entirely rather than defaulted to None: Task 7 (file import) adds a
-    second, mutually exclusive way to supply geometry (`wkb=` + `srid=`, since
-    reprojection happens in PostGIS) alongside this one, and this shape makes
-    that a pure addition — no existing caller has to change.
+    Geometry arrives EITHER as `geojson` (the API path, already WGS84) OR as
+    `wkb=` + `srid=` (the import path — `gis.importer` reads the source file's
+    own projection and lets PostGIS transform it). Exactly one; neither or both
+    is an `AssertionError`. Both feed the SAME normalisation expression below,
+    so an imported version and a hand-drawn one are repaired identically.
     """
+    geom_sql, geom_params = _geom_source_sql(geojson, wkb, srid)
     row = (
         await db.execute(
             text(
@@ -79,7 +106,12 @@ async def insert_version(
                 " :declared_area_ha, :source, :accuracy_m, :survey_date, :effective_from,"
                 " :approval_doc_id, :import_id, :status, :created_by"
                 " FROM (SELECT ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_Force2D("
-                "   ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326))), 3)) AS g) AS n"
+                # Bandit flags this as B608 (string-built SQL) on the pattern
+                # alone; `geom_sql` is always one of the two module constants
+                # above, chosen by an `if`, never caller input — every actual
+                # value crosses the wire bound, through `geom_params` below.
+                # Same reasoning (and the same nosec) as `checks._intersections`.
+                f"   {geom_sql})), 3)) AS g) AS n"  # nosec B608
                 " WHERE g IS NOT NULL AND NOT ST_IsEmpty(g)"
                 " RETURNING id"
             ),
@@ -87,7 +119,7 @@ async def insert_version(
                 "id": uuid7(),
                 "contour_id": contour_id,
                 "version_no": version_no,
-                "geojson": json.dumps(geojson),
+                **geom_params,
                 "declared_area_ha": declared_area_ha,
                 "source": source,
                 "accuracy_m": accuracy_m,
@@ -154,22 +186,41 @@ GEOMETRY_TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _feature_geom(geojson: dict[str, Any]) -> Any:
+def _feature_source(geojson: dict[str, Any] | None, wkb: bytes | None, srid: int) -> Any:
+    """`_geom_source_sql`'s counterpart for this table, as a SQLAlchemy
+    construct instead of a raw fragment (this table is written through the ORM,
+    `contour_versions` through `text()` — see `insert_feature`'s own note on
+    why). Same rule: exactly one of `geojson`/`wkb`, neither or both is an
+    `AssertionError`."""
+    assert (geojson is None) != (wkb is None), "supply exactly one of geojson= or wkb="
+    if geojson is not None:
+        return func.ST_SetSRID(func.ST_GeomFromGeoJSON(json.dumps(geojson)), 4326)
+    return func.ST_Transform(func.ST_SetSRID(func.ST_GeomFromWKB(wkb), srid), 4326)
+
+
+def _feature_geom(source: Any) -> Any:
     """The ONE normalisation expression shared by `feature_geometry_type` and
     `insert_feature` below — defined once so the type the former VALIDATES is
     provably the same geometry the latter INSERTS. Two independent copies of
     this computation would risk exactly the kind of silent divergence this
     project has already hit once (lesson: `checks.jsonable`'s history as two
     near-identical local copies that had already drifted apart by the time a
-    review caught it)."""
-    return func.ST_Multi(
-        func.ST_MakeValid(
-            func.ST_Force2D(func.ST_SetSRID(func.ST_GeomFromGeoJSON(json.dumps(geojson)), 4326))
-        )
-    )
+    review caught it).
+
+    Takes the already-SRID-resolved source expression (`_feature_source`) rather
+    than GeoJSON, so Task 7's import path — WKB plus the file's own SRID,
+    reprojected by PostGIS — reuses this same normalisation instead of adding a
+    third copy of it."""
+    return func.ST_Multi(func.ST_MakeValid(func.ST_Force2D(source)))
 
 
-async def feature_geometry_type(db: AsyncSession, geojson: dict[str, Any]) -> str | None:
+async def feature_geometry_type(
+    db: AsyncSession,
+    geojson: dict[str, Any] | None = None,
+    *,
+    wkb: bytes | None = None,
+    srid: int = 4326,
+) -> str | None:
     """PostGIS's own `ST_GeometryType()` for `_feature_geom`, computed WITHOUT
     inserting anything — lets `gis.service.create_feature` read the layer's
     own `geometry_type`, resolve its family from `GEOMETRY_TYPE_FAMILIES` and
@@ -185,7 +236,7 @@ async def feature_geometry_type(db: AsyncSession, geojson: dict[str, Any]) -> st
     failure, and poisons the session the same way; the caller is responsible
     for catching it there, not here.
     """
-    g = _feature_geom(geojson)
+    g = _feature_geom(_feature_source(geojson, wkb, srid))
     geometry_type, is_empty = (
         await db.execute(select(func.ST_GeometryType(g), func.ST_IsEmpty(g)))
     ).one()
@@ -196,7 +247,9 @@ async def insert_feature(
     db: AsyncSession,
     *,
     layer_id: uuid.UUID,
-    geojson: dict[str, Any],
+    geojson: dict[str, Any] | None = None,
+    wkb: bytes | None = None,
+    srid: int = 4326,
     organization_id: uuid.UUID | None,
     created_by: uuid.UUID | None,
     name: dict[str, Any] | None = None,
@@ -223,10 +276,14 @@ async def insert_feature(
 
     Keyword-only, and `approval_doc_id`/`import_id` accepted (defaulted to
     `None`) even though `FeatureIn` exposes neither today: Task 7's bulk
-    importer is expected to insert through this exact function with
-    `import_id` set, and this shape makes that a pure addition later, not a
-    signature change — same reasoning `insert_version` documents for its own
-    keyword-only shape.
+    importer inserts through this exact function with `import_id` set, and
+    this shape made that a pure addition rather than a signature change —
+    same reasoning `insert_version` documents for its own keyword-only shape.
+
+    Geometry arrives EITHER as `geojson` (the API path) OR as `wkb=` + `srid=`
+    (the import path), exactly like `insert_version`; `_feature_source` picks
+    between them and `_feature_geom` normalises whichever it gets, so an
+    imported feature and a hand-drawn one are repaired identically.
 
     The caller validates the geometry (type and non-emptiness) via
     `feature_geometry_type` BEFORE calling this — so `geom` here is never
@@ -236,7 +293,7 @@ async def insert_feature(
     feature = LayerFeature(
         layer_id=layer_id,
         organization_id=organization_id,
-        geom=_feature_geom(geojson),
+        geom=_feature_geom(_feature_source(geojson, wkb, srid)),
         name=name,
         props=props if props is not None else {},
         valid_from=valid_from,
@@ -258,3 +315,41 @@ async def insert_feature(
 
 async def feature_by_id(db: AsyncSession, feature_id: uuid.UUID) -> LayerFeature | None:
     return await db.get(LayerFeature, feature_id)
+
+
+# --- Task 7: the import queue ------------------------------------------------
+
+
+async def claim_pending_import(db: AsyncSession) -> GisImport | None:
+    """Claim the oldest `pending` import; the row lock is held until the caller
+    commits or rolls back.
+
+    The same idiom as `integrations.repo.pick_due` (the outbox worker's claim):
+    SKIP LOCKED lets any number of worker processes drain the queue without
+    stepping on each other. Deliberately NOT the outbox itself — the outbox
+    carries messages LEAVING the system, this is inbound work (ruling 6).
+    """
+    return (
+        await db.execute(
+            select(GisImport)
+            .where(GisImport.status == "pending")
+            .order_by(GisImport.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+    ).scalar_one_or_none()
+
+
+async def import_by_id(db: AsyncSession, import_id: uuid.UUID) -> GisImport | None:
+    return await db.get(GisImport, import_id)
+
+
+async def contour_numbers(db: AsyncSession, organization_id: uuid.UUID) -> set[str]:
+    """Every contour number already taken inside one organization — read ONCE
+    per import so the `/2`, `/3` suffixing of ruling 11 is decided in Python
+    against a single snapshot instead of one SELECT per feature (151 of them in
+    the real Burchmulla delivery)."""
+    rows = await db.execute(
+        select(Contour.number).where(Contour.organization_id == organization_id)
+    )
+    return set(rows.scalars().all())

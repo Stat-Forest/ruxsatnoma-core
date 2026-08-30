@@ -64,6 +64,18 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # Every 10 seconds: an operator who just uploaded a leshoz should not wait
+    # a minute for anything to start happening (plan 03.6a ruling 6). Cheap
+    # when idle — one indexed SELECT ... FOR UPDATE SKIP LOCKED against
+    # `ix_gis_imports_pending`.
+    sched.add_job(
+        _wrap(factory, jobs.process_gis_imports),
+        IntervalTrigger(seconds=10, timezone=TIMEZONE),
+        next_run_time=now,
+        id="process_gis_imports",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     return sched
 
 

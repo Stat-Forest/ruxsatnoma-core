@@ -15,6 +15,7 @@ from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Representation, Session
+from app.modules.gis import import_service as gis_import_service
 from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
@@ -180,3 +181,22 @@ async def alert_dead_outbox(factory: async_sessionmaker[AsyncSession]) -> int:
         await db.commit()
     logger.info("job.alert_dead_outbox", **by_destination)
     return len(rows)
+
+
+async def process_gis_imports(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Drain the geodata import queue (plan 03.6a ruling 6).
+
+    Deliberately NOT the outbox: the outbox carries messages LEAVING the system,
+    this is inbound work. It shares the outbox's claim idiom (FOR UPDATE SKIP
+    LOCKED) so any number of workers can drain the queue side by side.
+
+    One row per tick, not a loop: the scheduler runs this every 10 seconds with
+    `coalesce=True`, so a backlog drains steadily while a single 151-feature
+    parse can never hold the scheduler's thread for minutes at a time.
+    `import_service` handles its own audit and its own failure records — a
+    return of 0 simply means the queue was empty.
+    """
+    processed = await gis_import_service.process_pending(factory)
+    if processed:
+        logger.info("job.process_gis_imports", processed=processed)
+    return processed

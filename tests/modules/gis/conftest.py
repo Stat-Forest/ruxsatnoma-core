@@ -2,27 +2,33 @@
 test never hand-builds GeoJSON; areas are real (a 0.01° x 0.01° box near Tashkent
 is roughly 92 ha), which is what makes the area assertions meaningful."""
 
+import hashlib
 import json
 import random
 import uuid
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import httpx
+import numpy as np
 import pytest
+import shapely
+from pyogrio.raw import write
 from sqlalchemy import func, select, text, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
+from app.core import storage
 from app.core.models import MediaFile
 from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization, Region
 from app.modules.auth.models import Applicant, User, UserPermission
-from app.modules.gis import repo
-from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
+from app.modules.gis import import_service, repo
+from app.modules.gis.models import Contour, ContourVersion, GisImport, GisLayer, LayerFeature
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE, LAYERS_MANAGE
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client, signed_in_with
@@ -709,3 +715,298 @@ async def applicant_client(db: AsyncSession):
         auth_client(client, token, csrf)
         _commit_pending_before_requests(client, db)
         yield client
+
+
+# --- Task 7: import fixtures --------------------------------------------------
+#
+# Unlike the task-4 fixtures above, every one of these COMMITS: the import job
+# runs in a session of its own (`process_pending(factory)`), so nothing it must
+# see may sit unflushed in the `db` fixture's transaction. The rows therefore
+# survive in the shared, persistent test DB — which is safe here because each
+# fixture builds its own fresh `leshoz` (so contour numbers never collide across
+# runs) and anchors its geometry with `random_box_wkt()` (lesson: "A fixed test
+# geometry that a `_client_for` client commits accumulates forever").
+
+
+@pytest.fixture
+def session_factory(engine) -> async_sessionmaker[AsyncSession]:
+    """What the workers get in production — `app.workers.runner` builds exactly
+    this and hands it to every job."""
+    return make_session_factory(engine)
+
+
+def geojson_bytes(features: list[tuple[str | None, dict[str, Any]]]) -> bytes:
+    """A FeatureCollection from `(wkt_or_None, properties)` pairs. A `None`
+    geometry is the deliberate bad row of the atomicity tests; the WKT is
+    converted here by shapely rather than by PostGIS, because these bytes have
+    to be a real file on disk before any session exists."""
+    return json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": None
+                    if wkt is None
+                    else json.loads(shapely.to_geojson(shapely.from_wkt(wkt))),
+                    "properties": properties,
+                }
+                for wkt, properties in features
+            ],
+        }
+    ).encode()
+
+
+def geopackage_bytes(
+    tmp_path: Path, features: list[tuple[str, dict[str, Any]]], *, crs: str
+) -> bytes:
+    """A real GeoPackage in the given projection — the only format in this suite
+    that carries a CRS other than 4326 without a sidecar (GeoJSON is 4326 by
+    specification, and a shapefile needs its whole .prj/.dbf/.shx entourage
+    zipped alongside). Written with pyogrio, so it is a genuine GDAL source, not
+    a fixture that merely resembles one."""
+    names = list(features[0][1])
+    write(
+        str(tmp_path / "layer.gpkg"),
+        geometry=shapely.to_wkb(np.array([shapely.from_wkt(wkt) for wkt, _ in features])),
+        field_data=[
+            np.array([properties[name] for _, properties in features], dtype=object)
+            for name in names
+        ],
+        fields=np.array(names, dtype=object),
+        geometry_type="Polygon",
+        crs=crs,
+        driver="GPKG",
+    )
+    return (tmp_path / "layer.gpkg").read_bytes()
+
+
+async def make_media_file(db: AsyncSession, data: bytes, *, filename: str, content_type: str):
+    """A `media_files` row whose object really exists in MinIO — `run_import`
+    reads the bytes back through `core.storage.get_object`, so a row alone is
+    not enough."""
+    file = MediaFile(
+        id=uuid7(),
+        storage_key=f"test/{uuid.uuid4().hex}",
+        filename=filename,
+        content_type=content_type,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    await storage.put_object(file.storage_key, data, content_type)
+    db.add(file)
+    await db.flush()
+    return file
+
+
+async def make_import(
+    db: AsyncSession,
+    *,
+    layer: GisLayer,
+    org: Organization,
+    started_by: User,
+    data: bytes,
+    fmt: str = "geojson",
+    content_type: str = "application/geo+json",
+    attribute_map: dict[str, Any] | None = None,
+) -> GisImport:
+    file = await make_media_file(db, data, filename=f"import.{fmt}", content_type=content_type)
+    doc = await make_media_file(
+        db, b"%PDF-1.4 decree", filename="decree.pdf", content_type="application/pdf"
+    )
+    row = GisImport(
+        id=uuid7(),
+        layer_id=layer.id,
+        organization_id=org.id,
+        file_id=file.id,
+        approval_doc_id=doc.id,
+        format=fmt,
+        attribute_map=attribute_map if attribute_map is not None else {"number": "number"},
+        status="pending",
+        started_by=started_by.id,
+    )
+    db.add(row)
+    await db.flush()
+    await db.commit()  # the job runs in its OWN session and cannot see uncommitted rows
+    return row
+
+
+@pytest.fixture
+async def pending_import(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Two clean polygons with a number each — the happy path."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [
+                (random_box_wkt(), {"number": "14510q"}),
+                (random_box_wkt(), {"number": "14511q"}),
+            ]
+        ),
+    )
+
+
+@pytest.fixture
+async def pending_import_with_a_broken_row(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """A feature with no geometry at all — the parser reports it and nothing is
+    written (ruling 7: an import is atomic)."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [(random_box_wkt(), {"number": "14512q"}), (None, {"number": "14513q"})]
+        ),
+    )
+
+
+@pytest.fixture
+async def pending_import_missing_number(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Row 1 carries no contour number (a shapefile writes a NULL text field as
+    an empty string, which is what this reproduces). Caught in the pure-Python
+    mapping pass, before any write — so the whole file's attribute problems are
+    reported at once instead of one per run."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [(random_box_wkt(), {"number": "14514q"}), (random_box_wkt(), {"number": ""})]
+        ),
+    )
+
+
+@pytest.fixture
+async def pending_import_non_polygon_on_row_1(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Row 0 is a clean polygon and row 1 is a LINESTRING — real geometry the
+    parser happily reads, which `insert_version`'s
+    `ST_CollectionExtract(..., 3)` then reduces to nothing (ruling 10). The
+    failure therefore happens HALFWAY THROUGH THE WRITES, which is the case the
+    savepoint actually exists for: the attribute fixtures above never reach
+    them."""
+    lon, lat = random_anchor()
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [
+                (box_wkt(lon, lat), {"number": "14517q"}),
+                (f"LINESTRING({lon} {lat}, {lon + 0.01} {lat + 0.01})", {"number": "14518q"}),
+            ]
+        ),
+    )
+
+
+@pytest.fixture
+async def pending_import_restrictions(
+    db: AsyncSession, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """A non-contour layer: ruling 13 says the UNMAPPED attributes go into
+    `props jsonb`, which is what that column is for — the narrow
+    number/declared-area mapping is a CONTOUR-layer rule, not a global one."""
+    layer = (await db.execute(select(GisLayer).where(GisLayer.code == "restrictions"))).scalar_one()
+    return await make_import(
+        db,
+        layer=layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [(random_box_wkt(), {"title": "Water protection zone", "note": "SanPiN", "rank": 2})]
+        ),
+        attribute_map={"name": "title"},
+    )
+
+
+@pytest.fixture
+async def pending_import_area_mismatch(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Declared 2.6 ha against a box that really is ~92 — 36 of Burchmulla's 151
+    features look like this (ruling 2), and they must import anyway."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes([(random_box_wkt(), {"number": "14516q", "area_ha": 2.6})]),
+        attribute_map={"number": "number", "declared_area_ha": "area_ha"},
+    )
+
+
+@pytest.fixture
+async def pending_import_duplicate_numbers(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Both rows carry the same number in the source — several tenants share one
+    contour in the real file (92 distinct numbers across 151 features)."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [(random_box_wkt(), {"number": "14515q"}), (random_box_wkt(), {"number": "14515q"})]
+        ),
+    )
+
+
+@pytest.fixture
+async def pending_import_utm42(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User, tmp_path: Path
+) -> GisImport:
+    """A GeoPackage in UTM zone 42N — metres, not degrees. Nothing in this
+    fixture converts it; PostGIS does, at insert (decision #13)."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        fmt="gpkg",
+        content_type="application/geopackage+sqlite3",
+        data=geopackage_bytes(
+            tmp_path,
+            [
+                (
+                    "POLYGON((400000 4600000, 401000 4600000, 401000 4601000,"
+                    " 400000 4601000, 400000 4600000))",
+                    {"number": "utm-1"},
+                )
+            ],
+            crs="EPSG:32642",
+        ),
+    )
+
+
+DRAIN_LIMIT = 50
+
+
+async def drain_pending_imports(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Run the import job until the queue is empty, and say how many rows it
+    took.
+
+    The claim is queue-WIDE: `process_pending` takes the oldest `pending` row in
+    the database, not the one a given test created. The import fixtures commit
+    (the job runs in a session of its own and cannot see an uncommitted row), so
+    an interrupted run strands a `pending` row in the shared, persistent test DB
+    forever — and every later run would then claim that stranger instead of its
+    own. Draining first is exactly what a real worker does: no unscoped
+    UPDATE/DELETE, just the job running its course over whatever is queued.
+    """
+    for drained in range(DRAIN_LIMIT):
+        if not await import_service.process_pending(factory):
+            return drained
+    raise AssertionError("the pending gis_imports queue would not drain")
