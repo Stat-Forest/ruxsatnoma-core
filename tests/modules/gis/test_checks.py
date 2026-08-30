@@ -1,7 +1,9 @@
 """The four checks of tz/07, with decision #24's correction (ST_Intersects plus an
 area threshold, not ST_Overlaps) and ruling 15's tolerance."""
 
+import json
 import uuid
+from decimal import Decimal
 
 from app.modules.gis import checks, repo
 
@@ -247,3 +249,46 @@ async def test_the_checks_endpoint_reports_a_real_overlap_with_its_area(
     item = overlap["details"]["items"][0]
     assert item["area_m2"] > 100
     uuid.UUID(item["feature_id"])  # a valid UUID string, not a raw dict/object leaking through
+
+
+# --- Task 5's fix round: `jsonable` unifies what used to be two diverging
+# local copies (`service._checks_jsonable` and `schemas._jsonable_details`) —
+# the schemas one never grew a UUID branch and only worked by accident,
+# because pydantic's own encoder covered for it on that one path. This test
+# targets the function directly, with BOTH a Decimal and a UUID in one
+# structure, so a future edit that fixes only one of the two conversions
+# fails here instead of surfacing as a 500 the next time an overlap blocks a
+# publish.
+
+
+def test_jsonable_handles_a_decimal_and_a_uuid_nested_in_a_check_result():
+    """Mirrors the exact shape `_intersections` produces (an `items` list
+    with `area_m2: Decimal` and `feature_id: uuid.UUID`, nested inside a
+    `CheckResult`'s `details`) and asserts the result survives a PLAIN
+    `json.dumps` — not just that it looks right in Python — since that raw
+    encoder, with no fallback for either type, is exactly what
+    `publish_version`'s `ERR-GIS-003` path feeds it through
+    `app.main`'s `DomainError` handler."""
+    feature_id = uuid.uuid4()
+    raw: checks.CheckResult = {
+        "check": "overlap",
+        "result": "fail",
+        "details": {
+            "items": [
+                {
+                    "layer": "contours",
+                    "feature_id": feature_id,
+                    "name": "42",
+                    "area_m2": Decimal("123.45"),
+                }
+            ]
+        },
+    }
+
+    converted = checks.jsonable(raw)
+
+    item = converted["details"]["items"][0]
+    assert item["feature_id"] == str(feature_id)
+    assert item["area_m2"] == 123.45
+    assert isinstance(item["area_m2"], float)
+    json.dumps(converted)  # must not raise — the exact call that used to 500

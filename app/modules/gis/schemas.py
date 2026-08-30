@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_serializer
 
 from app.core.schemas import LocalizedName
+from app.modules.gis import checks
 
 
 class LayerOut(BaseModel):
@@ -125,29 +126,14 @@ class ApproveIn(BaseModel):
     approval_doc_id: uuid.UUID | None = None
 
 
-def _jsonable_details(value: Any) -> Any:
-    """`gis.checks`' `details` can carry a `Decimal` `area_m2` nested inside an
-    `items` list (task-4 review, finding 2: the checks module keeps areas as
-    `Decimal`, never `float`, per project convention). Pydantic's default JSON
-    encoding of a bare value nested inside an `Any`-typed field renders a
-    `Decimal` as a quoted STRING — confirmed empirically, and `json_encoders`
-    does not reach values nested under `Any` either — which would silently
-    turn a number into text on the one response that returns it. Recurse
-    rather than special-case the `area_m2` key by name: `details` is
-    deliberately left unstructured (deferred to a later review) and may grow
-    more Decimal-bearing keys later."""
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, dict):
-        return {key: _jsonable_details(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_jsonable_details(item) for item in value]
-    return value
-
-
 class CheckResultOut(BaseModel):
     """Mirrors `gis.checks.CheckResult` (a TypedDict, not a BaseModel, on the
-    Python side) for the one route that returns it over HTTP."""
+    Python side) for the one route that returns it over HTTP. `details` can
+    carry a `Decimal` `area_m2` and a `uuid.UUID` `feature_id` nested inside
+    an `items` list — `checks.jsonable` (shared with `gis.service.
+    publish_version`'s `ERR-GIS-003` details, which need the exact same
+    conversion for a different, less forgiving reason — see that function's
+    own docstring) makes both safe to serialize."""
 
     check: str
     result: str
@@ -155,7 +141,7 @@ class CheckResultOut(BaseModel):
 
     @field_serializer("details")
     def _serialize_details(self, value: dict[str, Any]) -> dict[str, Any]:
-        return _jsonable_details(value)
+        return checks.jsonable(value)
 
 
 class ChecksOut(BaseModel):

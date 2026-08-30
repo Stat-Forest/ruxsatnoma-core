@@ -35,39 +35,6 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _checks_jsonable(value: Any) -> Any:
-    """Recursively makes a `checks.CheckResult` structure safe for a plain
-    `json.dumps` — needed because `publish_version`'s `ERR-GIS-003` details
-    reach the wire through `app.main`'s `DomainError` handler, which builds
-    the response with Starlette's `JSONResponse`: stock `json.dumps`, no
-    encoder at all (confirmed: it raises `TypeError` on a bare `Decimal` or
-    `uuid.UUID`). `checks._intersections`' `overlap`/`restrictions` results
-    carry exactly both — `area_m2` (`Decimal`, project convention: areas are
-    numeric, never float) and `feature_id` (`uuid.UUID`) — so a blocked
-    publish with a real overlap would 500 while building the very 422 it is
-    supposed to return cleanly, without this.
-
-    Mirrors `schemas._jsonable_details` (same choice of float-for-Decimal,
-    str-for-UUID, so `area_m2` reads as a JSON number here exactly as it does
-    from the sibling `POST .../checks` endpoint) rather than reusing
-    `_json_safe` above: `_json_safe` stringifies a `Decimal` for the audit
-    trail's JSONB columns, a different consumer with a different correctness
-    requirement (exact-precision text, not a wire number). Kept as a second,
-    local copy rather than an import from `schemas.py` — the same reasoning
-    that already keeps `_json_safe` itself local instead of shared with
-    admin's copy: different files, mirror rather than share.
-    """
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, dict):
-        return {key: _checks_jsonable(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_checks_jsonable(item) for item in value]
-    return value
-
-
 async def list_layers(db: AsyncSession) -> list[GisLayer]:
     """A pass-through today (task-2 review, finding 2): this read acquires a real
     rule inside this same stage — Task 8 must refuse a non-public layer's
@@ -472,10 +439,10 @@ async def publish_version(
     _assert_transition(version, "published")
     results = await checks.run_checks(db, version_id=version_id)
     if checks.is_blocked(results):
-        # See `_checks_jsonable`'s own docstring: without this conversion, a
+        # See `checks.jsonable`'s own docstring: without this conversion, a
         # real overlap's Decimal/UUID payload raises TypeError while Starlette
         # renders THIS very response, turning the 422 into a 500.
-        raise err("ERR-GIS-003", details={"checks": _checks_jsonable(results)})
+        raise err("ERR-GIS-003", details={"checks": checks.jsonable(results)})
     previous = await repo.published_version(db, version.contour_id)
     if previous is not None:
         previous.status = "archived"

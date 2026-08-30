@@ -11,6 +11,7 @@ rows. Adding a layer to BLOCKING is a product decision, not a refactor.
 
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Any, TypedDict
 
 from sqlalchemy import text
@@ -32,6 +33,56 @@ BLOCKING = frozenset({"validity", "within_fund", "overlap"})
 
 def is_blocked(results: list[CheckResult]) -> bool:
     return any(r["check"] in BLOCKING and r["result"] == "fail" for r in results)
+
+
+def jsonable(value: Any) -> Any:
+    """Recursively converts a `CheckResult`-shaped structure (or any value
+    nested inside one) into something a plain `json.dumps` can serialize:
+    `Decimal` -> `float`, `uuid.UUID` -> `str`, recursing through `dict`/
+    `list`, everything else passed through unchanged.
+
+    `CheckResult` has two callers that need this, for DIFFERENT reasons —
+    and the UUID branch is NOT optional for either of them, even though only
+    ONE of the two would actually break without it:
+
+    - `gis.service.publish_version`'s `ERR-GIS-003` details reach the wire
+      through `app.main`'s `DomainError` handler, which renders the response
+      with Starlette's `JSONResponse` — stock `json.dumps`, NO encoder at
+      all (confirmed by reading Starlette's own `render()`). `_intersections`'
+      `overlap`/`restrictions` results carry a raw `Decimal` (`area_m2`) AND
+      a raw `uuid.UUID` (`feature_id`); either one reaching `json.dumps`
+      unconverted raises `TypeError` INSIDE the exception handler itself,
+      turning a clean 422 into a 500 — reproduced for real by temporarily
+      dropping this call and watching
+      `test_publishing_an_overlapping_version_is_refused_with_the_check_report`
+      fail with exactly that traceback.
+    - `gis.schemas.CheckResultOut.details` (typed `dict[str, Any]`) reaches
+      the wire through pydantic's own response-model serializer instead.
+      Pydantic's "infer the type at runtime" encoding for a bare value
+      nested under `Any` already renders a `uuid.UUID` correctly on its own
+      — so the UUID branch happens to be a no-op on THIS path — but still
+      renders a `Decimal` as a quoted STRING instead of a JSON number, wrong
+      for `area_m2` regardless of which path is asking.
+
+    Do not read the schemas path's tolerance for a missing UUID branch as
+    evidence the branch is optional: that tolerance is a property of
+    pydantic's encoder, not of this data. This used to be two separate,
+    near-identical local copies — one in `service.py`, one in `schemas.py`
+    — that had ALREADY diverged exactly this way (the schemas copy never
+    grew a UUID branch, quietly relying on pydantic to cover for it) before
+    a review caught it. Unified here, in the module that defines
+    `CheckResult` itself, so there is only one place to update when
+    `details` grows a new kind of non-primitive value.
+    """
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [jsonable(item) for item in value]
+    return value
 
 
 async def run_checks(
