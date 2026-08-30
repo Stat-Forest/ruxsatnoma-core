@@ -9,7 +9,7 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -64,11 +64,20 @@ async def list_features(
     user: Annotated[User, Depends(get_current_user)],
     bbox: str | None = None,
     valid_on: date | None = None,
+    status: Annotated[str | None, Query(pattern="^(draft|published|archived)$")] = None,
+    import_id: uuid.UUID | None = None,
 ) -> FeatureCollectionOut:
     """No permission required (ruling 5, mirrors `GET /gis/layers` — ruling
     18): the service itself refuses a non-public layer to an applicant
-    specifically (`ERR-ACL-001`), a ROLE gate rather than a held-grant one."""
-    collection = await service.list_features(db, code, bbox=bbox, valid_on=valid_on, actor=user)
+    specifically (`ERR-ACL-001`), a ROLE gate rather than a held-grant one.
+
+    `status` defaults to `published`; asking for `draft`/`archived` is an
+    operator action and the service gates it behind `gis.layers.manage` — it
+    is the only way to learn the ids an import created, and an applicant must
+    never see a draft."""
+    collection = await service.list_features(
+        db, code, bbox=bbox, valid_on=valid_on, status=status, import_id=import_id, actor=user
+    )
     return FeatureCollectionOut.model_validate(collection)
 
 

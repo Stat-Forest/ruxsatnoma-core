@@ -458,16 +458,30 @@ async def features_geojson(
     layer_code: str,
     bbox: tuple[float, float, float, float] | None,
     valid_on: date | None,
+    status: str = "published",
+    import_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
-    """The layer's published features as one GeoJSON FeatureCollection, built
+    """The layer's features at one status as a GeoJSON FeatureCollection, built
     entirely in SQL (`ST_AsGeoJSON` per row, decision 6): geometry crosses
     into Python only as the string PostGIS already rendered, never as a value
     this module reconstructs itself (module docstring). `valid_on`, when
     given, keeps only features whose validity period (if any) contains that
     date — the same window `checks._RESTRICTIONS_CANDIDATES_SQL` gates
     `fire_bans` on, generalised here to every feature since most carry no
-    period at all (`valid_from`/`valid_to` both NULL means "always valid")."""
-    conditions: list[Any] = [GisLayer.code == layer_code, LayerFeature.status == "published"]
+    period at all (`valid_from`/`valid_to` both NULL means "always valid").
+
+    `status` was hard-coded to `published` until the final review of 3.6a,
+    which left an imported non-contour batch's `draft` rows unreachable: the
+    batch endpoints refuse a non-contour batch, the per-feature publish route
+    needs an id, and no endpoint returned those ids. That mattered most for
+    `forest_fund` — `checks._within_fund` stays `skipped` until that layer has
+    published features, so the stage's own gating check could not be switched
+    on through its own API. `gis.service.list_features` gates any non-published
+    status behind `gis.layers.manage`; an applicant never sees a draft.
+    """
+    conditions: list[Any] = [GisLayer.code == layer_code, LayerFeature.status == status]
+    if import_id is not None:
+        conditions.append(LayerFeature.import_id == import_id)
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
         conditions.append(

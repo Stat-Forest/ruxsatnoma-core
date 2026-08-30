@@ -164,3 +164,49 @@ async def test_a_non_public_layer_is_refused_to_an_applicant(
 ):
     resp = await applicant_client.get("/api/v1/gis/layers/restrictions/features")
     assert resp.status_code == 403
+
+
+async def test_an_operator_lists_an_imports_draft_features_and_publishes_one(
+    gis_client, processed_restrictions_import
+):
+    """The one gap that made a `forest_fund` delivery unpublishable: an import
+    writes non-contour features at `status='draft'`, the batch endpoints refuse
+    a non-contour batch, the per-feature publish route needs an id — and no
+    endpoint returned those ids, because `features_geojson` hard-coded
+    `status == 'published'` and `GET /gis/imports/{id}` returns only counters.
+    `checks._within_fund` stays `skipped` until that layer has published
+    features, so the stage's own gating check could not be switched on through
+    its own API."""
+    drafts = await gis_client.get(
+        "/api/v1/gis/layers/restrictions/features"
+        f"?status=draft&import_id={processed_restrictions_import.id}"
+    )
+    assert drafts.status_code == 200
+    features = drafts.json()["features"]
+    assert features, "the import's own draft features must be reachable by id"
+
+    feature_id = features[0]["id"]
+    published = await gis_client.post(
+        f"/api/v1/gis/layers/restrictions/features/{feature_id}/publish"
+    )
+    assert published.status_code == 200
+    assert published.json()["status"] == "published"
+
+    still_draft = await gis_client.get(
+        "/api/v1/gis/layers/restrictions/features"
+        f"?status=draft&import_id={processed_restrictions_import.id}"
+    )
+    assert feature_id not in {f["id"] for f in still_draft.json()["features"]}
+
+
+async def test_an_applicant_may_not_ask_for_drafts(applicant_client, published_fire_ban):
+    """`fire_bans` is a PUBLIC layer, so the applicant passes the layer gate —
+    the status gate is what has to refuse them, not the layer's own visibility."""
+    resp = await applicant_client.get("/api/v1/gis/layers/fire_bans/features?status=draft")
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_an_unknown_status_is_422(gis_client):
+    resp = await gis_client.get("/api/v1/gis/layers/fire_bans/features?status=nonsense")
+    assert resp.status_code == 422

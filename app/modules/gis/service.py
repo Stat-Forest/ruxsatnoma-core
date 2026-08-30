@@ -19,6 +19,7 @@ from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
+from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import checks, repo
 from app.modules.gis.models import (
@@ -29,6 +30,7 @@ from app.modules.gis.models import (
     GisLayer,
     LayerFeature,
 )
+from app.modules.gis.permissions import LAYERS_MANAGE
 
 
 def _json_safe(value: Any) -> Any:
@@ -1144,19 +1146,42 @@ async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.Che
     return await checks.run_checks(db, version_id=version_id)
 
 
+async def _may_manage_layers(db: AsyncSession, actor: User) -> bool:
+    """Holds `gis.layers.manage`, or is the superuser that passes every
+    permission gate (decision #41 ruling 2) — the same two-branch shape
+    `admin.users_service._may_manage` uses, since this is a rule INSIDE a
+    handler rather than a `require_permission` dependency on the route."""
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return LAYERS_MANAGE in await auth_repo.permission_codes(db, actor)
+
+
 async def list_features(
     db: AsyncSession,
     code: str,
     *,
     bbox: str | None = None,
     valid_on: date | None = None,
+    status: str | None = None,
+    import_id: uuid.UUID | None = None,
     actor: User,
 ) -> dict[str, Any]:
     """`GET /gis/layers/{code}/features` — the GeoJSON a map draws (ruling 5).
     A non-public layer is refused to an actor whose ROLE is `applicant`
     specifically — not a permission gate (every staff role reads any layer's
     features regardless of a held grant, the same way `GET /gis/layers`
-    itself is open to any authenticated user, ruling 18)."""
+    itself is open to any authenticated user, ruling 18).
+
+    `status` defaults to `published`, which is the whole of what the map and
+    every applicant ever see. Asking for anything else is an OPERATOR action —
+    the only way to learn the ids an import created, since the batch endpoints
+    refuse a non-contour batch and `GET /gis/imports/{id}` returns counters
+    only — so it is gated behind `gis.layers.manage`, the same permission the
+    per-feature publish route uses. Without it a `forest_fund` delivery could
+    never be published at all, and `checks._within_fund` would stay `skipped`
+    forever. `import_id` narrows to one batch and needs no gate of its own: on
+    published rows it reveals nothing a plain listing does not.
+    """
     layer = await repo.layer_by_code(db, code)
     if layer is None:
         raise err("ERR-SYS-003")
@@ -1164,5 +1189,14 @@ async def list_features(
         role = await auth_repo.role_code(db, actor)
         if role == "applicant":
             raise err("ERR-ACL-001")
+    if status is not None and status != "published" and not await _may_manage_layers(db, actor):
+        raise err("ERR-ACL-001")
     parsed_bbox = _parse_bbox(bbox)
-    return await repo.features_geojson(db, layer_code=code, bbox=parsed_bbox, valid_on=valid_on)
+    return await repo.features_geojson(
+        db,
+        layer_code=code,
+        bbox=parsed_bbox,
+        valid_on=valid_on,
+        status=status or "published",
+        import_id=import_id,
+    )
