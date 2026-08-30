@@ -93,6 +93,38 @@ async def test_a_zone_scoped_actor_creates_a_feature_for_their_own_organization(
     assert resp.json()["organization_id"] == str(leshoz.id)
 
 
+async def test_a_region_scoped_actor_cannot_create_a_republic_wide_feature(
+    region_scoped_layers_client, restrictions_polygon
+):
+    """Final review on task 6: `_assert_feature_zone` originally checked
+    `organization_id` alone. `Zone` has three independent axes
+    (`app/core/abac.py`) — an actor scoped to a REGION but no organization
+    passed the old check as "republic-level" and could reach every leshoz in
+    their region (or the whole country) through a nominally republic-wide
+    fire ban. The gate must require the whole zone empty, not just one axis
+    of it."""
+    resp = await region_scoped_layers_client.post(
+        "/api/v1/gis/layers/fire_bans/features",
+        json={"geom": restrictions_polygon},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_a_genuinely_republic_level_actor_creates_a_republic_wide_feature(
+    gis_client, restrictions_polygon
+):
+    """The positive side of the same boundary: an actor whose zone is empty on
+    EVERY axis — region, district AND organization; `gis_client` is exactly
+    this — may still create a republic-wide feature."""
+    resp = await gis_client.post(
+        "/api/v1/gis/layers/fire_bans/features",
+        json={"geom": restrictions_polygon},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["organization_id"] is None
+
+
 async def test_an_unknown_layer_code_is_404(gis_client, restrictions_polygon):
     resp = await gis_client.post(
         "/api/v1/gis/layers/nope/features", json={"geom": restrictions_polygon}

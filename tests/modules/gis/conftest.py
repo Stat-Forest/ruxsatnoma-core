@@ -19,7 +19,7 @@ from app.core.models import MediaFile
 from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
-from app.modules.admin.models import Organization
+from app.modules.admin.models import Organization, Region
 from app.modules.auth.models import Applicant, User, UserPermission
 from app.modules.gis import repo
 from app.modules.gis.models import Contour, ContourVersion, GisLayer, LayerFeature
@@ -590,18 +590,27 @@ def _commit_pending_before_requests(client: httpx.AsyncClient, db: AsyncSession)
 
 
 async def _client_for(
-    db: AsyncSession, *permissions: str, organization_id: uuid.UUID | None = None
+    db: AsyncSession,
+    *permissions: str,
+    organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
 ):
-    """`organization_id`, when given, zones the actor to one organization
-    (`User.organization_id`) instead of the zone-free default `signed_in_with`
-    builds — `signed_in_with` itself has no parameter for this (it lives in
+    """`organization_id`/`region_id`, when given, zone the actor to that
+    organization/region (`User.organization_id`/`User.region_id`) instead of
+    the zone-free default `signed_in_with` builds — `signed_in_with` itself
+    has no parameter for this (it lives in
     `tests/modules/admin/test_organizations_admin.py`, shared by other modules'
-    tests too), so the org-scoped path is built inline here rather than
-    widening that shared helper for one gis-only case."""
-    if organization_id is None:
+    tests too), so the zone-scoped path is built inline here rather than
+    widening that shared helper for one gis-only case. The two are
+    independent, matching `Zone`'s own three independent axes
+    (`app/core/abac.py`) — a caller can set one, the other, or (not needed
+    today) both."""
+    if organization_id is None and region_id is None:
         user, token, csrf = await signed_in_with(db, *permissions)
     else:
-        user = await make_user(db, role_code="executor_staff", organization_id=organization_id)
+        user = await make_user(
+            db, role_code="executor_staff", organization_id=organization_id, region_id=region_id
+        )
         for code in permissions:
             db.add(UserPermission(user_id=user.id, permission_code=code))
         await db.flush()
@@ -640,6 +649,20 @@ async def org_scoped_layers_client(db: AsyncSession, leshoz: Organization):
     `organization_id`) fire ban through their own zone-scoped account. Mirrors
     `org_scoped_gis_client`'s own reasoning, one permission set over."""
     async for client in _client_for(db, LAYERS_MANAGE, organization_id=leshoz.id):
+        yield client
+
+
+@pytest.fixture
+async def region_scoped_layers_client(db: AsyncSession):
+    """A `LAYERS_MANAGE` actor zoned to a REGION but no organization — the
+    shape `_assert_feature_zone`'s republic-wide gate originally missed
+    (task-6 final review): checking `organization_id` alone let an actor
+    scoped to a region (or district) reach a nominally republic-wide feature.
+    `Region.code == "fergana"` is the same known-seeded row (migration 0005)
+    admin's own tests already key off, e.g.
+    `tests/modules/admin/test_refs_api.py`."""
+    region_id = (await db.execute(select(Region.id).where(Region.code == "fergana"))).scalar_one()
+    async for client in _client_for(db, LAYERS_MANAGE, region_id=region_id):
         yield client
 
 

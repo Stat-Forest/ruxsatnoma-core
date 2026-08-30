@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.abac import zone_of
+from app.core.abac import Zone, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
 from app.modules.audit import service as audit
@@ -524,15 +524,20 @@ def _assert_feature_zone(actor: User, organization_id: uuid.UUID | None) -> None
     is nullable — `contours.organization_id` never is, so `_assert_in_zone`
     itself has no branch for a missing one. `None` here means a
     REPUBLIC-WIDE object (a nationwide fire ban belongs to no single
-    organization); ruling (task-6 controller, decision 3): only an actor who
-    is THEMSELVES republic-level (no organization of their own) may create,
-    edit, publish or archive one — otherwise a leshoz specialist could reach
-    every leshoz at once through their own zone-scoped account. When
-    `organization_id` IS set, this is exactly `_assert_in_zone`'s existing
-    'own organization only' rule, applied to every write below the same way
-    every contour write already applies it."""
+    organization); ruling (task-6 controller, decision 3, sharpened by
+    review): only an actor whose `Zone` is EMPTY ON EVERY AXIS — no region,
+    no district, no organization (`Zone` has three independent axes,
+    `app/core/abac.py`) — may create, edit, publish or archive one.
+    Checking `organization_id` alone let a region- or district-scoped actor
+    with no organization of their own pass as "republic-level" and reach
+    every leshoz in their region (or the whole country) through a nominally
+    republic-wide feature — the same escalation this rule exists to
+    prevent, one administrative tier up. When `organization_id` IS set,
+    this is exactly `_assert_in_zone`'s existing 'own organization only'
+    rule, applied to every write below the same way every contour write
+    already applies it."""
     if organization_id is None:
-        if zone_of(actor).organization_id is not None:
+        if zone_of(actor) != Zone(None, None, None):
             raise err("ERR-ACL-001")
         return
     _assert_in_zone(actor, organization_id)
