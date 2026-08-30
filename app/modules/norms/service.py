@@ -2,7 +2,12 @@
 
 Tariffs and rule parameters share one lifecycle — draft → published → archived
 with maker-checker — so they share one implementation, keyed by a small
-descriptor. Norms have their own five-status lifecycle (Task 4)."""
+descriptor. Norms have their own five-status lifecycle (Task 4).
+
+Public surface for levels 4+ (applications 3.9, payments 3.10, permits 3.11):
+preview(), save_calculation(), effective_norm(), run_checks(), LOAD_PROVIDERS
+— see the dedicated section near the end of this module for what a caller at
+those levels may and may not do with them."""
 
 import uuid
 from collections.abc import Awaitable, Callable
@@ -653,16 +658,13 @@ async def _resolve_activity_code(db: AsyncSession, activity_type_id: uuid.UUID) 
     return activity.code
 
 
-async def _compute(
+async def _build_request_and_snapshot(
     db: AsyncSession, payload: CalculationIn
-) -> tuple[
-    calculator.CalcRequest,
-    calculator.ParamSnapshot,
-    calculator.CalcResult,
-    list[checks.CheckResult],
-]:
-    """Builds the request, loads the snapshot, computes the amount and runs
-    every admissibility check against that SAME request/snapshot pair.
+) -> tuple[calculator.CalcRequest, calculator.ParamSnapshot]:
+    """Builds the request and loads the snapshot — the one place that does, so
+    `_compute` (a priced answer: preview/save) and `run_checks` (a reviewer's
+    screen, unpriced) can never see two different requests for what is
+    supposed to be the same input.
 
     `contour_id` is checked for existence the way `_assert_norm_zone` checks
     it for a norm — via `gis_service.contour_organization`, never a direct
@@ -672,13 +674,7 @@ async def _compute(
     for `input_snapshot` from the contour's own PUBLISHED area (never a
     caller-declared figure, same principle as `contour_versions.area_ha`
     itself) — `Decimal('0')` when the contour has none, since it plays no
-    part in `Amount` either way (calculator.py's own docstring).
-
-    Does NOT itself guard `period_to < period_from`: `checks.run_checks`
-    already rejects a reversed or oversized period before any check runs, and
-    duplicating that guard here would be exactly the class of bug the 'a
-    per-endpoint guard is not a root fix' lesson warns about — this module IS
-    that one shared entry point, so the guard stays where it already lives."""
+    part in `Amount` either way (calculator.py's own docstring)."""
     activity_code = await _resolve_activity_code(db, payload.activity_type_id)
     if await gis_service.contour_organization(db, payload.contour_id) is None:
         raise err("ERR-SYS-003")
@@ -703,6 +699,28 @@ async def _compute(
         contour_id=payload.contour_id,
         activity_type_id=payload.activity_type_id,
     )
+    return request, snapshot
+
+
+async def _compute(
+    db: AsyncSession, payload: CalculationIn
+) -> tuple[
+    calculator.CalcRequest,
+    calculator.ParamSnapshot,
+    calculator.CalcResult,
+    list[checks.CheckResult],
+]:
+    """`_build_request_and_snapshot`, then computes the amount and runs every
+    admissibility check against that SAME request/snapshot pair, with the
+    amount's own `used_sb` fed into the limit check — `preview`/
+    `save_calculation`'s shared arithmetic.
+
+    Does NOT itself guard `period_to < period_from`: `checks.run_checks`
+    already rejects a reversed or oversized period before any check runs, and
+    duplicating that guard here would be exactly the class of bug the 'a
+    per-endpoint guard is not a root fix' lesson warns about — this module IS
+    that one shared entry point, so the guard stays where it already lives."""
+    request, snapshot = await _build_request_and_snapshot(db, payload)
     result = calculator.calculate(request, snapshot)
     check_results = await checks.run_checks(
         db,
@@ -786,3 +804,64 @@ async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calcul
     if row is None:
         raise err("ERR-SYS-003")
     return row
+
+
+# --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
+# 3.10, permits 3.11) ---------------------------------------------------------
+#
+# Five entry points, and nothing else: `preview` and `save_calculation` above
+# (Task 7), `LOAD_PROVIDERS`/`committed_load_sb` above (Task 4, ruling 12),
+# and `effective_norm`/`run_checks` right below. A level-4+ caller must NEVER:
+#   - import `norms.repo` (or any other private module here) directly — every
+#     fact it could read that way is already reachable through one of the
+#     five, the same reason a level-3 module reaches `gis` only through
+#     `gis.service` (module boundary, CLAUDE.md);
+#   - read `tariffs`/`rule_parameters`/`norms` as tables of its own — a rate
+#     or a limit is only ever correct as of the SNAPSHOT `preview`/
+#     `save_calculation`/`run_checks` resolved it under, never as a fresh
+#     query against "whatever is published today";
+#   - recompute a stored `Calculation`'s amount from its own
+#     `input_snapshot` — a saved row is already the answer (`rule_code_version`
+#     names the exact arithmetic that produced it), and a second, local
+#     re-implementation is exactly the two-sources-of-truth risk this stage's
+#     own `_compute`/`_build_request_and_snapshot` split exists to prevent.
+#
+# `effective_norm` is a thin pass-through: `repo.effective_norm` has existed
+# since Task 3, but living only in `repo` would leave 3.11 with no LEGAL way
+# to reach it at all (mirrors `gis.service.published_version`, added for the
+# identical reason). `run_checks` is not a bare pass-through — it shares
+# `_build_request_and_snapshot` with `_compute` but always calls
+# `checks.run_checks` with `used_sb=None`, `checks.py`'s own "checks without
+# the money" path (`_limit_check`'s docstring) — so a reviewer can see whether
+# a request is admissible at all without ever pricing it, and a missing
+# coefficient can never turn an admissibility screen into an error the way
+# pricing legitimately would.
+
+
+async def effective_norm(
+    db: AsyncSession, contour_id: uuid.UUID, activity_type_id: uuid.UUID, on_date: date
+) -> Norm | None:
+    """The published norm in force for this contour × activity on `on_date`,
+    or `None`. No permission or zone rule: the caller is another SERVICE
+    inside this process, not an HTTP actor — mirrors
+    `gis.service.published_version`."""
+    return await repo.effective_norm(db, contour_id, activity_type_id, on_date)
+
+
+async def run_checks(db: AsyncSession, *, payload: CalculationIn) -> list[checks.CheckResult]:
+    """Every admissibility rule for `payload`, without the arithmetic — for a
+    reviewer's screen (3.9) that needs to know whether a request is admissible
+    before, or without ever, pricing it. Always resolves `used_sb=None`
+    (never a manufactured zero load), so the limit check reports `skipped`
+    rather than a computed comparison; every other check (norm, season,
+    rotation, fire-ban, restrictions) runs exactly as it would inside
+    `preview`/`save_calculation`, off the identical request/snapshot pair."""
+    request, snapshot = await _build_request_and_snapshot(db, payload)
+    return await checks.run_checks(
+        db,
+        request=request,
+        contour_id=payload.contour_id,
+        activity_type_id=payload.activity_type_id,
+        snapshot=snapshot,
+        used_sb=None,
+    )
