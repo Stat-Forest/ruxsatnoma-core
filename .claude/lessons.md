@@ -1084,3 +1084,29 @@ Rules for this file:
   field. Any new versioned-row creator gets a pass down its own payload's
   field list against this checklist before being reported done, not just
   the fields the given tests happen to cover.
+
+## `calculator.calculate`'s own `used_sb` is gated on a norm existing — a caller needing it standalone must validate separately
+
+- **Rule:** Do not assume `CalcResult.used_sb` is populated whenever a grazing
+  request carries `items` — `calculate` only resolves `coef_sb:<code>` (and
+  therefore only raises `ERR-NORM-004` for a missing one) `if snapshot.norm is
+  not None`, since it needs the number solely for the breakdown's `limit`
+  line. A caller that wants the same honest error for a grazing request with
+  NO norm on record yet (a real, supported case — VMQ 689's norm and this
+  route are drafted independently) must check `coef_sb:<code>` itself before
+  calling `calculate`.
+- **Why:** Every task-5/6 test exercising grazing-with-items supplies an
+  explicit `NormFact`, so this gap stayed invisible until task 7 wired a real
+  HTTP route where a norm can genuinely be absent: `POST /calculations/preview`
+  for a fresh contour with no VMQ 689 norm yet used to silently return
+  `used_sb=None` (no error at all) for an unpublished `coef_sb:*` livestock
+  code, instead of the missing-parameter error the brief's own test expects
+  (`test_a_grazing_preview_reports_the_missing_coefficient_rather_than_guessing`).
+- **How to apply:** `norms.service._assert_grazing_coefficients_known` is the
+  fix — called from `_compute`, before `calculator.calculate`, so both
+  `preview` and `save_calculation` inherit it for free. Any FUTURE caller that
+  builds a `CalcRequest`/`ParamSnapshot` pair without going through
+  `_compute` (a new pipeline, not 3.9's application precheck, which reuses
+  `_compute` itself) needs the same guard again — `calculator.py` itself was
+  deliberately left alone (task 7's own file list), so this is not something
+  a `calculate()` caller can discover by reading its signature.
