@@ -968,7 +968,11 @@ def _assert_batch_not_empty(versions: list[ContourVersion]) -> None:
     (e.g. `/approve` called before `/submit-review`, so every version is
     still `draft` and the `review`-status query finds nothing) would
     otherwise silently advance `gis_imports.status` without moving a single
-    version."""
+    version.
+
+    `approve_import` is the only caller left: `submit_import_review` and
+    `publish_import` each need to tell one particular already-finished shape
+    apart from a genuinely empty batch, and do it inline."""
     if not versions:
         raise err("ERR-GIS-005", details={"reason": "empty_batch"})
 
@@ -983,7 +987,16 @@ async def submit_import_review(db: AsyncSession, import_id: uuid.UUID, *, actor:
     `approve_import` below has something in the right state to work on."""
     row = await _load_import_for_transition(db, import_id, actor=actor, expected_status="review")
     versions = await repo.import_versions(db, import_id, status="draft")
-    _assert_batch_not_empty(versions)
+    if not versions:
+        # Still a 409 either way — this action really did nothing, and
+        # advancing anything here would jump the batch a state it never
+        # earned. Only the REASON is sharpened: a second `/submit-review` on a
+        # batch already at `review` or beyond is an operator double-click, not
+        # the "this batch has no versions at all" defect `empty_batch` names.
+        statuses = await repo.import_version_statuses(db, import_id)
+        if statuses:
+            raise err("ERR-GIS-005", details={"reason": "already_submitted"})
+        raise err("ERR-GIS-005", details={"reason": "empty_batch"})
     for version in versions:
         await submit_review(db, version.id, actor=actor)
     await audit.log(
@@ -1044,11 +1057,42 @@ async def publish_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) 
     The batch reaches `done` only when nothing was blocked; otherwise it stays
     `approved` so the operator can fix the offending feature and re-run —
     `publish_import` is safe to call again, since an already-`published`
-    version is simply absent from the next `status='approved'` batch.
+    version is simply absent from the next `status='approved'` batch. When
+    that leaves NO approved versions but every version of the batch is
+    `published`, the batch is finished and this reports it as such
+    (`done`, `{"published": 0, "blocked": []}`) rather than 409-ing a batch
+    that has in fact completed — the operator's own last fix may well have
+    gone through the single-version route.
     """
     row = await _load_import_for_transition(db, import_id, actor=actor, expected_status="approved")
     versions = await repo.import_versions(db, import_id, status="approved")
-    _assert_batch_not_empty(versions)
+    if not versions:
+        # The corollary of `_assert_batch_not_empty`, and ONLY here: a batch
+        # whose every version is already `published` has nothing left to do,
+        # and the row sitting at `approved` is the only thing still saying
+        # otherwise. That happens for real — the operator publishes the last
+        # blocked version through the single-version route after fixing it, and
+        # `publish_import` is documented as safe to call again. Reporting
+        # `empty_batch` there would be a 409 for a batch that is, in fact,
+        # done. `submit_import_review`/`approve_import` deliberately do NOT get
+        # this: for them it would advance the row two states from an action
+        # that moved nothing.
+        statuses = await repo.import_version_statuses(db, import_id)
+        if statuses and all(status == "published" for status in statuses):
+            row.status = "done"
+            row.stats = {**(row.stats or {}), "published": 0, "blocked": 0}
+            await db.flush()
+            await audit.log(
+                db,
+                action="gis_import.publish",
+                user_id=actor.id,
+                object_type="gis_import",
+                object_id=row.id,
+                old_value={"status": "approved"},
+                new_value={"status": "done", "published": 0, "blocked": 0},
+            )
+            return {"published": 0, "blocked": []}
+        raise err("ERR-GIS-005", details={"reason": "empty_batch"})
     published, blocked = 0, []
     for version in versions:
         try:

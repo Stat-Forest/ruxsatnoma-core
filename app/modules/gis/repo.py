@@ -382,6 +382,17 @@ async def import_versions(
     return list(result.scalars().all())
 
 
+async def import_version_statuses(db: AsyncSession, import_id: uuid.UUID) -> list[str]:
+    """Every status one import's versions currently hold, regardless of which.
+    `import_versions` above answers "which rows are at status X"; this answers
+    "where has this batch got to as a whole", which is what tells an
+    already-finished batch from one that never had any versions at all."""
+    rows = await db.execute(
+        select(ContourVersion.status).where(ContourVersion.import_id == import_id)
+    )
+    return list(rows.scalars().all())
+
+
 # --- Task 8: the read API for 3.7/3.9 -----------------------------------------
 
 # The hard ceiling on ONE `GET /gis/layers/{code}/features` response. This

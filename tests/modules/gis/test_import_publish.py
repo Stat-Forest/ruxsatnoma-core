@@ -3,7 +3,7 @@ because the Agency delivers whole leshozes and nobody issues a decree per contou
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.modules.gis.models import ContourVersion
 
@@ -116,3 +116,55 @@ async def test_approving_a_batch_that_skipped_submit_review_is_refused(
     resp = await rahbar_client.post(f"/api/v1/gis/imports/{processed_import.id}/approve")
     assert resp.status_code == 409
     assert resp.json()["error"]["details"]["reason"] == "empty_batch"
+
+
+async def test_republishing_a_batch_whose_versions_all_published_reports_done(
+    rahbar_client, db, approved_import
+):
+    """`publish_import` is documented as safe to call again — but a second call
+    found no `approved` versions and answered 409 `empty_batch`, for a batch
+    that had in fact completed. This is the corollary of the empty-batch
+    refusal, and it belongs to `publish_import` alone: in `submit-review` or
+    `approve` the same shortcut would advance the row two states from an action
+    that moved nothing."""
+    first = await rahbar_client.post(f"/api/v1/gis/imports/{approved_import.id}/publish")
+    assert first.status_code == 200
+    assert first.json() == {"published": 2, "blocked": []}
+    await db.refresh(approved_import)
+    assert approved_import.status == "done"
+
+    # ...and a batch left at `approved` whose versions all published anyway —
+    # the operator's last fix going through the single-version route.
+    approved_import.status = "approved"
+    await db.commit()
+
+    again = await rahbar_client.post(f"/api/v1/gis/imports/{approved_import.id}/publish")
+    assert again.status_code == 200, again.text
+    assert again.json() == {"published": 0, "blocked": []}
+    await db.refresh(approved_import)
+    assert approved_import.status == "done"
+
+
+async def test_a_batch_with_no_versions_at_all_is_still_an_empty_batch(
+    rahbar_client, db, approved_import
+):
+    """The refusal this corollary must not swallow: `empty_batch` still names
+    the real defect — a batch that never had versions."""
+    await db.execute(delete(ContourVersion).where(ContourVersion.import_id == approved_import.id))
+    await db.commit()
+
+    resp = await rahbar_client.post(f"/api/v1/gis/imports/{approved_import.id}/publish")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["details"]["reason"] == "empty_batch"
+
+
+async def test_submitting_an_already_submitted_batch_says_so(gis_client, processed_import):
+    """Repeated `/submit-review` keeps its 409 — the action really did nothing
+    and nothing may advance — but `empty_batch` was the wrong word for an
+    operator double-click on a batch already at `review` or beyond."""
+    first = await gis_client.post(f"/api/v1/gis/imports/{processed_import.id}/submit-review")
+    assert first.status_code == 200
+
+    second = await gis_client.post(f"/api/v1/gis/imports/{processed_import.id}/submit-review")
+    assert second.status_code == 409
+    assert second.json()["error"]["details"]["reason"] == "already_submitted"
