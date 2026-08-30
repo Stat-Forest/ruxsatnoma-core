@@ -965,6 +965,39 @@ async def pending_import_duplicate_numbers(
 
 
 @pytest.fixture
+async def pending_import_many_missing_numbers(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Twelve rows, every one of them missing its contour number — the usual
+    shape of a wrong attribute map, and the case whose report has to be capped
+    (the test lowers `MAX_REPORT_ROWS` rather than building a real million-row
+    file)."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes([(random_box_wkt(), {"number": ""}) for _ in range(12)]),
+    )
+
+
+@pytest.fixture
+async def pending_import_many_duplicate_numbers(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Twelve rows sharing one number: one clean insert and eleven
+    `duplicate_number` WARNINGS, which import fine (ruling 7) — the case that
+    proves the warnings list is bounded too, not just the error list."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes([(random_box_wkt(), {"number": "14519q"}) for _ in range(12)]),
+    )
+
+
+@pytest.fixture
 async def pending_import_utm42(
     db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User, tmp_path: Path
 ) -> GisImport:
@@ -992,6 +1025,27 @@ async def pending_import_utm42(
 
 
 DRAIN_LIMIT = 50
+
+
+@pytest.fixture(autouse=True)
+async def _drain_leftover_imports(session_factory):
+    """Empty the pending-import queue before EVERY test in this package.
+
+    Autouse and in the package conftest, not in one test module: the claim is
+    queue-WIDE (`process_pending` takes the oldest pending row in the database),
+    and every import fixture commits, so any test module that files an import
+    leaves rows for whatever runs next. When this lived in `test_import_job.py`
+    alone it only worked because that module sorts first and happened to drain
+    `test_imports_api.py`'s leftovers from the PREVIOUS run — so running
+    `test_imports_api.py` on its own repeatedly would pile rows up until
+    DRAIN_LIMIT tripped, and the next full run would fail. Task 8 adds more
+    import tests, which would inherit exactly that order-dependence.
+
+    Draining is what a real worker does anyway: no unscoped UPDATE/DELETE (which
+    the lessons file forbids against this shared, persistent database), just the
+    job running its course over whatever is queued.
+    """
+    await drain_pending_imports(session_factory)
 
 
 async def drain_pending_imports(factory: async_sessionmaker[AsyncSession]) -> int:

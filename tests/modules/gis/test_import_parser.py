@@ -179,3 +179,28 @@ def test_the_parsers_format_table_matches_the_column_the_endpoint_validates_agai
     from app.modules.gis.models import IMPORT_FORMATS
 
     assert set(importer._SUFFIX) == set(IMPORT_FORMATS)
+
+
+def test_a_report_is_capped_and_the_last_entry_says_how_many_were_omitted():
+    """`error_report` is stored whole in one JSONB column and returned whole by
+    `GET /gis/imports/{id}`. Under the 100 MB upload cap a mis-exported layer of
+    null-geometry features is on the order of a million rows — reachable by
+    accident, not only by malice — so the list is bounded here, at the point it
+    is ACCUMULATED, and the marker keeps a truncated report from reading as a
+    complete one."""
+    rows = importer.MAX_REPORT_ROWS + 5
+    payload = json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "geometry": None, "properties": {"n": i}} for i in range(rows)
+            ],
+        }
+    ).encode()
+    features, errors, _ = importer.parse(payload, fmt="geojson")
+    assert features == []
+    assert len(errors) == importer.MAX_REPORT_ROWS + 1  # the cap plus the marker
+    assert {e.code for e in errors[:-1]} == {"empty_geometry"}
+    assert errors[-1].code == "report_truncated"
+    assert errors[-1].row == -1  # not a row number: this entry describes the REPORT
+    assert "5 further" in errors[-1].message

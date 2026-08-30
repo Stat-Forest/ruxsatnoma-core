@@ -573,3 +573,37 @@ Rules for this file:
   by design — they're robust to extra copies at that spot, verified), use
   `random_box_wkt()` instead. Applies beyond gis to any future table that
   stores real geometry and gets exercised through a committing client fixture.
+
+## A seeded notification template becomes undeletable once something has sent it
+
+- **Rule:** A migration whose `downgrade()` deletes a seeded `notification_templates`
+  row must delete the `notifications` referencing it FIRST — and any migration that
+  seeds a template owes its downgrade both statements from the start.
+- **Why:** 0010 seeded `gis.import.finished` and deleted only the template on the way
+  down. That was fine for two tasks, because nothing sent the event yet; the moment
+  task 7's import job actually sent it, `fk_notifications_template_id_notification_templates`
+  turned the CI downgrade→upgrade round-trip red — in a task that never touched the
+  migration — and a real rollback of 0010 would have failed the same way in production.
+- **How to apply:** Seeding a template in a migration means writing
+  `DELETE FROM notifications WHERE event_code = '<code>'` immediately above the
+  template delete, not when someone finally sends it; and when the round-trip test
+  goes red in a task that changed no migration, look for the event that task started
+  emitting.
+
+## A queue-wide `FOR UPDATE SKIP LOCKED` claim makes a whole test module order-dependent
+
+- **Rule:** A worker that claims the OLDEST row of a table needs a drain step in an
+  autouse fixture at the PACKAGE conftest level, not in one test module — and the
+  drain runs the job itself, never an unscoped `DELETE`.
+- **Why:** `gis.import_service.process_pending` claims the oldest `pending` import in
+  the database, not the one the test created, and every import fixture commits (the
+  job runs in a session of its own and cannot see an uncommitted row). An interrupted
+  run therefore strands a `pending` row forever in the shared, persistent test DB, and
+  the next run claims that stranger instead of its own: `test_two_workers…` sees
+  `[1, 1]` instead of `[0, 1]`. A module-local drain only masked it, and only because
+  that module sorted first and happened to drain the other module's leftovers.
+- **How to apply:** Any future claim-the-oldest worker (batch publication in 3.6b,
+  report generation, export jobs) gets `tests/…/conftest.py`'s
+  `drain_pending_imports` shape: autouse, package-scoped, bounded by a DRAIN_LIMIT
+  that fails loudly rather than looping. Fixed test literals in the same fixtures
+  (a `storage_key`, a contour number) need randomising for the same reason.

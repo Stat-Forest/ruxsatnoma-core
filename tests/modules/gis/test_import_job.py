@@ -2,22 +2,10 @@
 
 import asyncio
 
-import pytest
 from sqlalchemy import func, select
 
-from app.modules.gis import import_service
+from app.modules.gis import import_service, importer
 from app.modules.gis.models import Contour, ContourVersion, GisImport, LayerFeature
-from tests.modules.gis.conftest import drain_pending_imports
-
-
-@pytest.fixture(autouse=True)
-async def _drain_leftover_imports(session_factory):
-    """See `conftest.drain_pending_imports`: the claim is queue-wide, and the
-    import fixtures commit, so a run interrupted halfway strands a `pending` row
-    that every later run would otherwise claim ahead of its own. Autouse and
-    listed first, so it runs before any `pending_import*` fixture creates this
-    test's own row."""
-    await drain_pending_imports(session_factory)
 
 
 async def test_a_clean_batch_creates_contours_and_draft_versions(
@@ -272,3 +260,137 @@ async def test_a_pending_row_that_is_not_ready_is_left_for_the_next_tick(
     assert await import_service.process_pending(session_factory) == 0
     left = await db.get(GisImport, pending_import.id)
     assert left is not None
+
+
+# --- Bounded reports (review finding 2) --------------------------------------
+#
+# The cap is lowered rather than fed a real million-row file: `_map_features`,
+# `_write_batch` and `_finish` all read `importer.MAX_REPORT_ROWS` at call time,
+# so a small value exercises exactly the production code path in milliseconds.
+# `test_import_parser.py` covers the same bound at its real value.
+
+SMALL_CAP = 5
+
+
+async def test_the_stored_error_report_is_capped_and_says_what_was_omitted(
+    db, session_factory, pending_import_many_missing_numbers, monkeypatch
+):
+    monkeypatch.setattr(importer, "MAX_REPORT_ROWS", SMALL_CAP)
+    await import_service.process_pending(session_factory)
+    await db.refresh(pending_import_many_missing_numbers)
+
+    report = pending_import_many_missing_numbers.error_report
+    assert pending_import_many_missing_numbers.status == "failed"
+    assert len(report) == SMALL_CAP + 1  # the cap plus the marker
+    assert {e["code"] for e in report[:-1]} == {"missing_attribute"}
+    assert report[-1]["code"] == "report_truncated"
+    assert "7 further" in report[-1]["message"]  # 12 bad rows - 5 reported
+
+
+async def test_the_warning_list_is_capped_too(
+    db, session_factory, pending_import_many_duplicate_numbers, monkeypatch
+):
+    """Warnings do not fail a batch (ruling 7), so an unbounded warning list is
+    the case that actually IMPORTS its way into a huge column — 151 features all
+    mismatching on area is a plausible delivery, not a hostile one."""
+    monkeypatch.setattr(importer, "MAX_REPORT_ROWS", SMALL_CAP)
+    await import_service.process_pending(session_factory)
+    await db.refresh(pending_import_many_duplicate_numbers)
+
+    assert pending_import_many_duplicate_numbers.status == "review"  # still imported
+    assert pending_import_many_duplicate_numbers.stats["created"] == 12
+    warnings = pending_import_many_duplicate_numbers.stats["warnings"]
+    assert len(warnings) == SMALL_CAP + 1
+    assert {w["code"] for w in warnings[:-1]} == {"duplicate_number"}
+    assert warnings[-1]["code"] == "report_truncated"
+    assert warnings[-1]["omitted"] == 6  # 11 duplicates - 5 reported
+
+
+# --- The crash path still audits and notifies (review finding 1) -------------
+
+
+async def test_a_crashed_job_marks_the_row_and_still_audits_and_notifies(
+    db, session_factory, pending_import, monkeypatch
+):
+    """Only OUR OWN defects reach `_mark_crashed` — which is exactly why the
+    audit entry matters most here, and why the initiator must still be told:
+    `_finish` notifies on a failed file, and a crash that stayed silent would
+    strand them worse, since nothing else will ever speak."""
+    from app.modules.audit.models import AuditLog
+    from app.modules.notifications.models import Notification
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated defect inside run_import")
+
+    monkeypatch.setattr(import_service, "run_import", boom)
+    assert await import_service.process_pending(session_factory) == 1
+
+    await db.refresh(pending_import)
+    assert pending_import.status == "failed"
+    assert pending_import.error_report[0]["code"] == "internal_error"
+    assert pending_import.finished_at is not None
+
+    entry = (
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.object_id == pending_import.id,
+                    AuditLog.action == import_service.FINISH_ACTION,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert entry.user_id is None  # a job's own action
+    assert entry.result == "error"
+    assert entry.correlation_id.startswith("job:")
+    assert entry.new_value["reason"] == "internal_error"
+
+    notified = (
+        (
+            await db.execute(
+                select(Notification).where(
+                    Notification.object_id == pending_import.id,
+                    Notification.event_code == import_service.IMPORT_EVENT,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert notified, "the initiator was left with no word that their import died"
+    assert notified[0].recipient_user_id == pending_import.started_by
+
+
+async def test_a_crash_with_no_initiator_still_audits(
+    db, session_factory, pending_import, monkeypatch
+):
+    """A seeded/scripted import has nobody to notify; the audit entry is not
+    optional for that reason."""
+    from app.modules.audit.models import AuditLog
+
+    pending_import.started_by = None
+    await db.commit()
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated defect inside run_import")
+
+    monkeypatch.setattr(import_service, "run_import", boom)
+    await import_service.process_pending(session_factory)
+
+    await db.refresh(pending_import)
+    assert pending_import.status == "failed"
+    entry = (
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.object_id == pending_import.id,
+                    AuditLog.action == import_service.FINISH_ACTION,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert entry.user_id is None

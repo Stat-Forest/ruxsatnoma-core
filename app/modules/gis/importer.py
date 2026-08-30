@@ -62,6 +62,21 @@ _CRS84 = ("OGC:CRS84", "urn:ogc:def:crs:OGC:1.3:CRS84")
 # caller only ever reads the SRID of a parse that produced no errors.
 _NO_SRID = 0
 
+# How many bad rows a report ever carries. The list is accumulated here, stored
+# whole in one `gis_imports.error_report` JSONB value and returned whole by
+# `GET /gis/imports/{id}` — so an unbounded list is unbounded memory in the
+# worker, an unbounded column, and a response that cannot be serialized. Under
+# the 100 MB upload cap a mis-exported GeoJSON of null-geometry features is on
+# the order of a million rows, which is an ACCIDENT away, not an attack.
+#
+# 200: an operator fixing a delivery works from the first screenful of distinct
+# problems, not from row 40 000 — the Burchmulla file is 151 features, so a real
+# delivery never truncates, and a file that does has one systematic defect
+# repeated, whose first 200 examples say everything the 200 001st would. The
+# shape (cap plus an explicit marker) is `integrations.service`'s own
+# DEAD_LETTER_PAYLOAD_MAX_BYTES.
+MAX_REPORT_ROWS = 200
+
 
 @dataclass(slots=True)
 class ParsedFeature:
@@ -81,6 +96,18 @@ class RowError:
         error type"). Built here rather than in the service so the JSONB payload
         has one definition, not one per writer."""
         return {"row": self.row, "code": self.code, "message": self.message}
+
+
+def truncation_marker(omitted: int) -> RowError:
+    """The final entry of a capped report (`MAX_REPORT_ROWS`). A truncated report
+    must never read as a complete one — without this an operator would fix the
+    200 rows they were shown and be surprised by the 201st. `row=-1` is not a
+    row number: it marks an entry that describes the REPORT, not the file."""
+    return RowError(
+        row=-1,
+        code="report_truncated",
+        message=f"{omitted} further bad row(s) omitted from this report",
+    )
 
 
 def _scalar(value: Any) -> Any:
@@ -184,12 +211,22 @@ def parse(data: bytes, *, fmt: str) -> tuple[list[ParsedFeature], list[RowError]
         # Paired once, not per row: `meta["fields"]` and `field_data` are two
         # halves of one structure and must line up (strict=True says so out loud).
         columns = list(zip(fields, field_data, strict=True))
+        omitted = 0
         for i, wkb in enumerate(geometry):
-            attributes = {name: _scalar(column[i]) for name, column in columns}
             if wkb is None or len(wkb) == 0:
-                errors.append(
-                    RowError(row=i, code="empty_geometry", message="feature has no geometry")
-                )
+                # Counted past the cap, not accumulated: the attributes dict is
+                # not even built for a row that will never be reported, so the
+                # memory a million-row disaster costs is bounded too, not just
+                # the column it would be written to.
+                if len(errors) < MAX_REPORT_ROWS:
+                    errors.append(
+                        RowError(row=i, code="empty_geometry", message="feature has no geometry")
+                    )
+                else:
+                    omitted += 1
                 continue
+            attributes = {name: _scalar(column[i]) for name, column in columns}
             features.append(ParsedFeature(row=i, wkb=bytes(wkb), attributes=attributes))
+        if omitted:
+            errors.append(truncation_marker(omitted))
         return features, errors, srid

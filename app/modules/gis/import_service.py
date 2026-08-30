@@ -66,6 +66,34 @@ NAME_KEY = "name"
 _MAX_DECLARED_AREA = Decimal(10) ** 8
 
 
+def _capped(entries: list[Any], omitted: int, marker: Any) -> list[Any]:
+    """Close a bounded report: append the truncation marker when anything was
+    dropped, so a truncated report never reads as a complete one.
+
+    Both report lists — `error_report` and `stats["warnings"]` — are stored
+    whole in one JSONB column and returned whole by `GET /gis/imports/{id}`.
+    Unbounded, they are unbounded worker memory, an unbounded column and a
+    response that cannot be serialized; under the 100 MB upload cap a
+    mis-exported layer of null-geometry features reaches that by accident, not
+    only by malice. Cap and marker are `importer.MAX_REPORT_ROWS` and the shape
+    `integrations.service.DEAD_LETTER_PAYLOAD_MAX_BYTES` already uses.
+    """
+    if omitted <= 0:
+        return entries
+    return [*entries[: importer.MAX_REPORT_ROWS], marker]
+
+
+def _warning_truncated(omitted: int) -> dict[str, Any]:
+    """`importer.truncation_marker`'s counterpart for the warnings list, which
+    holds plain dicts rather than `RowError`s."""
+    return {
+        "row": -1,
+        "code": "report_truncated",
+        "omitted": omitted,
+        "message": f"{omitted} further warning(s) omitted from this report",
+    }
+
+
 class _BatchFailed(Exception):
     """Carries the rows to report out of the savepoint block that must roll
     back. A private control-flow signal, never an API error — the caller turns
@@ -120,18 +148,28 @@ def _map_features(
 
     mapped: list[_Mapped] = []
     errors: list[RowError] = []
+    omitted = 0
+
+    def fail(row: int, code: str, message: str) -> None:
+        """Bounded append: past the cap a bad row is COUNTED, not built — a file
+        whose every row is wrong (the usual shape of a wrong attribute map)
+        must not cost one dict per row."""
+        nonlocal omitted
+        if len(errors) < importer.MAX_REPORT_ROWS:
+            errors.append(RowError(row=row, code=code, message=message))
+        else:
+            omitted += 1
+
     for feature in features:
         item = _Mapped(row=feature.row, wkb=feature.wkb)
         item.organization_name = _text(feature.attributes.get(org_field)) if org_field else None
         if is_contour_layer:
             item.number = _text(feature.attributes.get(number_field)) if number_field else None
             if item.number is None:
-                errors.append(
-                    RowError(
-                        row=feature.row,
-                        code="missing_attribute",
-                        message=f"no contour number in field {number_field!r}",
-                    )
+                fail(
+                    feature.row,
+                    "missing_attribute",
+                    f"no contour number in field {number_field!r}",
                 )
                 continue
         else:
@@ -150,26 +188,22 @@ def _map_features(
                 # so the bare shape reads like that trap (same fmt:skip as
                 # core.settings_store.coerce).
                 except (InvalidOperation, ValueError):  # fmt: skip
-                    errors.append(
-                        RowError(
-                            row=feature.row,
-                            code="invalid_attribute",
-                            message=f"{area_field!r} is not a number: {raw!r}",
-                        )
+                    fail(
+                        feature.row,
+                        "invalid_attribute",
+                        f"{area_field!r} is not a number: {raw!r}",
                     )
                     continue
                 if abs(declared) >= _MAX_DECLARED_AREA:
-                    errors.append(
-                        RowError(
-                            row=feature.row,
-                            code="invalid_attribute",
-                            message=f"{area_field!r} does not fit numeric(12,4): {raw!r}",
-                        )
+                    fail(
+                        feature.row,
+                        "invalid_attribute",
+                        f"{area_field!r} does not fit numeric(12,4): {raw!r}",
                     )
                     continue
                 item.declared_area_ha = declared
         mapped.append(item)
-    return mapped, errors
+    return mapped, _capped(errors, omitted, importer.truncation_marker(omitted))
 
 
 def _unique_number(number: str, taken: set[str]) -> tuple[str, bool]:
@@ -210,14 +244,29 @@ async def _write_batch(
     srid: int,
     *,
     mismatch_pct: int,
-) -> tuple[int, list[dict[str, Any]]]:
+) -> tuple[int, list[dict[str, Any]], int]:
     """Insert every feature of one batch. Raises `_BatchFailed` on the first
     row the database refuses — the caller's savepoint then undoes everything
     this wrote, which is the whole point of running it inside one.
 
-    Returns `(created, warnings)`.
+    Returns `(created, warnings, omitted_warnings)` — the counter is carried out
+    rather than closed here, because `run_import` still extends the same list
+    with the organization-name warnings before it is stored (`_capped` runs once,
+    at the end, over the whole thing).
     """
     warnings: list[dict[str, Any]] = []
+    omitted = 0
+
+    def warn(entry: dict[str, Any]) -> None:
+        """Bounded append — see `_capped`. A 151-feature delivery never reaches
+        the cap; a mis-exported one whose every row mismatches would otherwise
+        put one dict per row in memory and then in the column."""
+        nonlocal omitted
+        if len(warnings) < importer.MAX_REPORT_ROWS:
+            warnings.append(entry)
+        else:
+            omitted += 1
+
     is_contour_layer = layer.code == CONTOUR_LAYER_CODE
     taken = await repo.contour_numbers(db, row.organization_id) if is_contour_layer else set()
     allowed_types = repo.GEOMETRY_TYPE_FAMILIES.get(layer.geometry_type, ())
@@ -230,7 +279,7 @@ async def _write_batch(
                 number, duplicated = _unique_number(item.number, taken)
                 taken.add(number)
                 if duplicated:
-                    warnings.append(
+                    warn(
                         {
                             "row": item.row,
                             "code": "duplicate_number",
@@ -264,7 +313,7 @@ async def _write_batch(
                     item.row, item.declared_area_ha, version.area_ha, mismatch_pct
                 )
                 if mismatch is not None:
-                    warnings.append(mismatch)
+                    warn(mismatch)
             else:
                 geometry_type = await repo.feature_geometry_type(db, wkb=item.wkb, srid=srid)
                 if geometry_type is None:
@@ -318,7 +367,7 @@ async def _write_batch(
                 [RowError(row=item.row, code="database_error", message=repr(exc.orig))]
             ) from exc
         created += 1
-    return created, warnings
+    return created, warnings, omitted
 
 
 def _area_mismatch(
@@ -373,7 +422,14 @@ async def _finish(
     fails."""
     row.status = status
     row.stats = stats
-    row.error_report = [e.as_dict() for e in errors] if errors else None
+    # The single write point for `error_report`, so the hard bound on the column
+    # lives here regardless of which producer filled the list — the producers cap
+    # their own accumulation for MEMORY, this caps what is STORED. A list already
+    # closed by `_capped` carries its marker as its last entry and is unchanged
+    # by the slice below.
+    row.error_report = (
+        [e.as_dict() for e in errors[: importer.MAX_REPORT_ROWS + 1]] if errors else None
+    )
     row.finished_at = datetime.now(UTC)
     await db.flush()
     correlation = f"job:{uuid.uuid4()}"
@@ -466,7 +522,7 @@ async def run_import(db: AsyncSession, row: GisImport) -> None:
         # together, while the outer transaction — and the failure record written
         # on it below — survives.
         async with db.begin_nested():
-            created, warnings = await _write_batch(
+            created, warnings, omitted_warnings = await _write_batch(
                 db, row, layer, mapped, srid, mismatch_pct=mismatch_pct
             )
     except _BatchFailed as exc:
@@ -479,7 +535,10 @@ async def run_import(db: AsyncSession, row: GisImport) -> None:
         row,
         layer.code,
         status="review",
-        stats={"created": created, "warnings": warnings},
+        stats={
+            "created": created,
+            "warnings": _capped(warnings, omitted_warnings, _warning_truncated(omitted_warnings)),
+        },
         errors=None,
     )
 
@@ -537,6 +596,22 @@ async def process_pending(factory: async_sessionmaker[AsyncSession]) -> int:
 
 
 async def _mark_crashed(factory: async_sessionmaker[AsyncSession], import_id: uuid.UUID) -> None:
+    """Terminal-fail an import whose job crashed, on a session of its own.
+
+    This writes exactly what `_finish` writes, and for the same two reasons.
+    The audit entry: the invariant is absolute — every state-changing action
+    logs in the same transaction, and a job's own write audits with
+    `user_id=None` — and the trail matters MOST here, because only our own
+    defects reach this path; a status flipping to `failed` with nothing in
+    `audit_log` to say who did it is the one case an investigator cannot
+    reconstruct. The notification: `_finish` deliberately tells the initiator
+    when an import fails (ruling 6 — a long import must not need the browser
+    to stay open), and a crash that stayed silent would strand them worse than
+    a bad file does, since nothing else will ever speak.
+
+    Both go in BEFORE the single commit, so the row, the audit entry and the
+    notification land together or not at all.
+    """
     try:
         async with factory() as db:
             row = await repo.import_by_id(db, import_id)
@@ -549,6 +624,41 @@ async def _mark_crashed(factory: async_sessionmaker[AsyncSession], import_id: uu
                 ).as_dict()
             ]
             row.finished_at = datetime.now(UTC)
+            await db.flush()
+            correlation = f"job:{uuid.uuid4()}"
+            layer = await db.get(GisLayer, row.layer_id)
+            if row.started_by is not None:
+                await notifications_service.notify(
+                    db,
+                    event_code=IMPORT_EVENT,
+                    recipient_user_id=row.started_by,
+                    params={
+                        "layer": layer.code if layer is not None else "?",
+                        "created": 0,
+                        "status": "failed",
+                    },
+                    object_type="gis_import",
+                    object_id=row.id,
+                    correlation_id=correlation,
+                )
+            else:
+                logger.warning("gis.import.no_initiator", import_id=str(row.id))
+            await audit.log(
+                db,
+                action=FINISH_ACTION,
+                user_id=None,
+                object_type="gis_import",
+                object_id=row.id,
+                correlation_id=correlation,
+                result="error",  # unlike _finish's failures, this one is OUR bug
+                new_value={
+                    "status": "failed",
+                    "created": 0,
+                    "warnings": 0,
+                    "errors": 1,
+                    "reason": "internal_error",
+                },
+            )
             await db.commit()
     except Exception:
         logger.exception("gis.import.crash_marking_failed", import_id=str(import_id))
