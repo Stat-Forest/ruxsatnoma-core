@@ -184,3 +184,24 @@ async def test_sending_back_needs_the_right_permission_for_each_direction(
     base = f"/api/v1/gis/contours/{cid}/versions/{vid}"
     assert (await gis_client.post(f"{base}/return-to-review")).status_code == 403
     assert (await rahbar_client.post(f"{base}/return-to-draft")).status_code == 403
+
+
+async def test_submit_review_cannot_drive_the_rework_edge_it_shares_a_target_with(
+    gis_client, contour_with_two_versions
+):
+    """The mirror of the leak the send-back routes were guarded against, on the
+    OLDER route. `review` is the one state in `TRANSITIONS` with two sources,
+    so `"review" in TRANSITIONS["approved"]` is True: a target-only check let a
+    `CONTOURS_MANAGE` holder submit-review an ALREADY APPROVED version and
+    drive `approved` -> `review` — `return-to-review`'s edge, which is
+    `CONTOURS_APPROVE` — and audited it under the wrong action code. Pre-dated
+    this wave; leaving it would have defeated the permission split the wave
+    installed."""
+    cid, _published_vid, approved_vid = contour_with_two_versions
+    resp = await gis_client.post(
+        f"/api/v1/gis/contours/{cid}/versions/{approved_vid}/submit-review"
+    )
+    assert resp.status_code == 409, resp.text
+    details = resp.json()["error"]["details"]
+    assert details["reason"] == "bad_transition"
+    assert (details["from"], details["to"]) == ("approved", "review")

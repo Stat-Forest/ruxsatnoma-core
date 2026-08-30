@@ -234,7 +234,7 @@ async def create_contour(
     try:
         await db.flush()
     except IntegrityError as exc:
-        # `uq_contours_org_number`, the one constraint left that a pre-check
+        # `uq_contour_number`, the one constraint left that a pre-check
         # cannot own: the number's uniqueness genuinely races against other
         # concurrent creates. The session is poisoned after this (same
         # reasoning as create_version's DBAPIError below) — raise immediately,
@@ -450,9 +450,12 @@ def _assert_transition_from(version: ContourVersion, source: str, target: str) -
     would let `return-to-review` — `CONTOURS_APPROVE` — also drive
     `draft` -> `review`, which is `submit_review`'s edge and `CONTOURS_MANAGE`.
     An approver could then advance a specialist's draft they may not otherwise
-    touch. The rework routes therefore name the state they are the way OUT of,
-    not only the state they lead to (caught by this fix wave's own
-    bad-transition test, which returned 200 before this existed)."""
+    touch. The mirror is just as real and older: `submit_review` on an ALREADY
+    APPROVED version drove `approved` -> `review` under `CONTOURS_MANAGE`.
+    Every route touching `review` therefore names the state it is the way OUT
+    of, not only the state it leads to (the first direction was caught by this
+    fix wave's own bad-transition test, which returned 200 before this existed;
+    the second by the scoped re-review that followed)."""
     if version.status != source:
         raise err(
             "ERR-GIS-005",
@@ -496,10 +499,20 @@ async def _assert_approval_doc_active(db: AsyncSession, file_id: uuid.UUID) -> N
 async def submit_review(db: AsyncSession, version_id: uuid.UUID, *, actor: User) -> ContourVersion:
     """`POST .../submit-review` — draft -> review, `CONTOURS_MANAGE` (the GIS
     specialist hands their own draft to the rahbar). A plain transition: the
-    check suite (Task 4) runs at publish, not here."""
+    check suite (Task 4) runs at publish, not here.
+
+    `_assert_transition_from`, not the bare `_assert_transition`: `review` is
+    the one state in `TRANSITIONS` with two sources, and `"review" in
+    TRANSITIONS["approved"]` is True — so a target-only check let a
+    `CONTOURS_MANAGE` holder call this on an APPROVED version and drive
+    `approved` -> `review`, which is `return_to_review`'s edge and
+    `CONTOURS_APPROVE`. That is the exact mirror of the leak the rework routes
+    were guarded against, on the older of the two routes, and it also audited
+    the rework under the wrong action code (`contour_version.submit_review`).
+    """
     version, contour = await _version_and_contour(db, version_id)
     await _assert_in_zone(db, actor, contour.organization_id)
-    _assert_transition(version, "review")
+    _assert_transition_from(version, "draft", "review")
     version.status = "review"
     await db.flush()
     # An in-place UPDATE leaves onupdate columns expired, not refreshed (lesson).

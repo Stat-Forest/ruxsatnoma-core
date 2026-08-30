@@ -754,23 +754,37 @@ Rules for this file:
   (payment receipts, act scans) is a multipart route and inherits this; the
   fingerprint there is the form's scalar fields plus each file's
   name/filename/content-type/size, sorted — never the file bytes, which would
-  mean re-reading a 100 MB upload per request.
+  mean re-reading a 100 MB upload per request. **The mirror is a trap too:** the
+  branch keys on the CONTENT TYPE, not on the route, so a JSON-body route
+  declaring `idempotency_context` that is sent `multipart/form-data` takes the
+  form branch, `request.form()` consumes the stream, and FastAPI's OWN
+  `await request.body()` for the JSON body field then raises the same
+  `RuntimeError`. Not reachable today — `imports_router` is the only consumer
+  and is itself multipart — but the next consumer needs to know, and a route
+  that accepts both shapes needs the branch reconsidered rather than reused.
 
 ## A status-transition table is ambiguous wherever two source states share a target
 
 - **Rule:** When a state machine allows one target from more than one source
-  (`TRANSITIONS`: `review` is reachable from BOTH `draft` and `approved`), a
-  route driving one of those edges must assert the SOURCE state too, not only
-  "may this row become X".
+  (`TRANSITIONS`: `review` is reachable from BOTH `draft` and `approved`),
+  EVERY route driving any of those edges must assert the SOURCE state too, not
+  only "may this row become X" — the new route and the one that was already
+  there.
 - **Why:** `return-to-review` (`CONTOURS_APPROVE`) and `submit-review`
   (`CONTOURS_MANAGE`) both land on `review`. Checking the target alone let the
   approver drive `draft` -> `review` — submit-review's own edge, under the wrong
   permission — so an approver could advance a specialist's draft they otherwise
   may not touch. Caught by the new route's own bad-transition test, which
-  returned 200 instead of 409 (3.6a fix wave).
+  returned 200 instead of 409 (3.6a fix wave). The MIRROR was still open after
+  that fix and had to be closed separately: `submit_review` (`CONTOURS_MANAGE`)
+  kept the bare check, so it drove `approved` -> `review` — the rework edge just
+  gated behind `CONTOURS_APPROVE` — and audited it as `submit_review`. Guarding
+  only the route you are adding leaves the split it installs defeated from the
+  other side.
 - **How to apply:** Before adding a route to an existing transition table, grep
-  the table for the target: more than one source means the route needs
-  `_assert_transition_from(version, source, target)`, not `_assert_transition`.
+  the table for the target: more than one source means EVERY route reaching
+  that target needs `_assert_transition_from(version, source, target)`, not
+  just the new one. Fix the siblings in the same commit.
 
 ## Paging a list breaks every test that asserted membership in the unpaged one
 

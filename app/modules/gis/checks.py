@@ -99,9 +99,10 @@ async def run_checks(
 
 
 async def _validity(db: AsyncSession, version_id: uuid.UUID) -> CheckResult:
-    """Normalisation (task 3's `repo.normalised`) already repairs self-
-    intersections on the way in — a failure here means the repair itself
-    produced something invalid, not that the source data was messy."""
+    """Normalisation (`repo.insert_version`'s own `ST_MakeValid` pipeline)
+    already repairs self-intersections on the way in — a failure here means the
+    repair itself produced something invalid, not that the source data was
+    messy."""
     valid = await db.scalar(
         text("SELECT ST_IsValid(geom) FROM contour_versions WHERE id = :vid"),
         {"vid": version_id},
