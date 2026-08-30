@@ -115,6 +115,16 @@ class VersionPatch(BaseModel):
     effective_from: date | None = None
 
 
+class ApproveIn(BaseModel):
+    """`POST .../approve`. `approval_doc_id` stays optional HERE (not a
+    required field) on purpose: a missing id must reach the caller as this
+    module's own `ERR-VAL-001` envelope (`gis.service.approve_version`'s own
+    check), not FastAPI's generic request-validation-error body — see the
+    task-5 controller's decision on this point."""
+
+    approval_doc_id: uuid.UUID | None = None
+
+
 def _jsonable_details(value: Any) -> Any:
     """`gis.checks`' `details` can carry a `Decimal` `area_m2` nested inside an
     `items` list (task-4 review, finding 2: the checks module keeps areas as

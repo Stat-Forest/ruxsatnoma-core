@@ -2,7 +2,7 @@
 applications 3.9): published_version(), list_contours(), run_checks()."""
 
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.abac import zone_of
 from app.core.errors import err
+from app.core.models import MediaFile
 from app.modules.audit import service as audit
 from app.modules.auth.models import User
 from app.modules.gis import checks, repo
@@ -31,6 +32,39 @@ def _json_safe(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, Decimal):
         return str(value)
+    return value
+
+
+def _checks_jsonable(value: Any) -> Any:
+    """Recursively makes a `checks.CheckResult` structure safe for a plain
+    `json.dumps` — needed because `publish_version`'s `ERR-GIS-003` details
+    reach the wire through `app.main`'s `DomainError` handler, which builds
+    the response with Starlette's `JSONResponse`: stock `json.dumps`, no
+    encoder at all (confirmed: it raises `TypeError` on a bare `Decimal` or
+    `uuid.UUID`). `checks._intersections`' `overlap`/`restrictions` results
+    carry exactly both — `area_m2` (`Decimal`, project convention: areas are
+    numeric, never float) and `feature_id` (`uuid.UUID`) — so a blocked
+    publish with a real overlap would 500 while building the very 422 it is
+    supposed to return cleanly, without this.
+
+    Mirrors `schemas._jsonable_details` (same choice of float-for-Decimal,
+    str-for-UUID, so `area_m2` reads as a JSON number here exactly as it does
+    from the sibling `POST .../checks` endpoint) rather than reusing
+    `_json_safe` above: `_json_safe` stringifies a `Decimal` for the audit
+    trail's JSONB columns, a different consumer with a different correctness
+    requirement (exact-precision text, not a wire number). Kept as a second,
+    local copy rather than an import from `schemas.py` — the same reasoning
+    that already keeps `_json_safe` itself local instead of shared with
+    admin's copy: different files, mirror rather than share.
+    """
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: _checks_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_checks_jsonable(item) for item in value]
     return value
 
 
@@ -286,3 +320,208 @@ async def run_version_checks(
     if version is None or version.contour_id != contour_id:
         raise err("ERR-SYS-003")
     return await checks.run_checks(db, version_id=version_id)
+
+
+# --- Task 5: Draft -> Review -> Approved -> Published -> Archived ------------
+#
+# `TRANSITIONS` lists every edge of tz/07's lifecycle, including two this task
+# has no endpoint for yet (`review` -> `draft`, `approved` -> `review`: sending
+# work back for rework) — the table describes the full state graph even where
+# only four of its edges are reachable through an HTTP route today.
+
+TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "draft": ("review",),
+    "review": ("approved", "draft"),  # sending back to draft is a rework
+    "approved": ("published", "review"),
+    "published": ("archived",),
+    "archived": (),
+}
+
+
+def _assert_transition(version: ContourVersion, target: str) -> None:
+    """A transition not listed in `TRANSITIONS[version.status]` is a conflict
+    with the version's CURRENT state, not a malformed request body — so this
+    raises `ERR-GIS-005` (409), the same code `create_version`/`update_version`
+    already use for `version_conflict`/`not_draft`/`number_taken`, never
+    `ERR-VAL-001` (422, reserved for the request body itself being wrong)."""
+    if target not in TRANSITIONS[version.status]:
+        raise err(
+            "ERR-GIS-005",
+            details={"reason": "bad_transition", "from": version.status, "to": target},
+        )
+
+
+async def _version_and_contour(
+    db: AsyncSession, version_id: uuid.UUID
+) -> tuple[ContourVersion, Contour]:
+    """Shared 404 lookup for the four lifecycle actions below. Deliberately
+    does NOT also apply `_assert_in_zone` itself — each of the four callers
+    does that explicitly, right after calling this, so a reviewer can confirm
+    every single one of the four actually applies it (lesson: 'Zone scoping is
+    not a permission check — a read path needs both'; a previous task shipped
+    with exactly one write path missing it)."""
+    version = await repo.version_by_id(db, version_id)
+    if version is None:
+        raise err("ERR-SYS-003")
+    contour = await repo.contour_by_id(db, version.contour_id)
+    if contour is None:
+        raise err("ERR-SYS-003")
+    return version, contour
+
+
+async def _assert_approval_doc_active(db: AsyncSession, file_id: uuid.UUID) -> None:
+    """Confirms a `media_files` row with this id exists and is not archived —
+    an EXISTENCE check, mirroring `auth.service._check_poa_file` (lesson: 'An
+    existence check is not a validity check'). It proves the document is ON
+    RECORD, nothing about whether it actually authorises THIS contour: that
+    judgement is the rahbar's own, made before they ever call this endpoint,
+    not something the code can verify. Unlike `_check_poa_file`, this does not
+    also check `uploaded_by` or `content_type`: an approval decree can be
+    scanned by staff other than the approver and need not be a PDF."""
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "approval_doc_not_found"})
+
+
+async def submit_review(db: AsyncSession, version_id: uuid.UUID, *, actor: User) -> ContourVersion:
+    """`POST .../submit-review` — draft -> review, `CONTOURS_MANAGE` (the GIS
+    specialist hands their own draft to the rahbar). A plain transition: the
+    check suite (Task 4) runs at publish, not here."""
+    version, contour = await _version_and_contour(db, version_id)
+    _assert_in_zone(actor, contour.organization_id)
+    _assert_transition(version, "review")
+    version.status = "review"
+    await db.flush()
+    # An in-place UPDATE leaves onupdate columns expired, not refreshed (lesson).
+    await db.refresh(version)
+    await audit.log(
+        db,
+        action="contour_version.submit_review",
+        user_id=actor.id,
+        object_type="contour_version",
+        object_id=version.id,
+        old_value={"status": "draft"},
+        new_value={"status": "review"},
+    )
+    return version
+
+
+async def approve_version(
+    db: AsyncSession,
+    version_id: uuid.UUID,
+    *,
+    actor: User,
+    approval_doc_id: uuid.UUID | None,
+) -> ContourVersion:
+    """`POST .../approve` — review -> approved, `CONTOURS_APPROVE` (the
+    rahbar — role code `leadership` — or `chief_forester`; never the GIS
+    specialist who drew the version, so approval is always a second pair of
+    eyes). `approval_doc_id` is mandatory here even though the column stays
+    nullable through draft/review: the CHECK `published_needs_doc` only fires
+    at publish, but the basis document has to be on record before the
+    rahbar's own approval means anything, so this endpoint asks for it one
+    step earlier and stamps it onto the version together with `approved_by`.
+    Zone-checked before the request body is even inspected — same ordering
+    `create_contour` already documents ("organization_id is zone-checked
+    before anything else"), applied here too.
+    """
+    version, contour = await _version_and_contour(db, version_id)
+    _assert_in_zone(actor, contour.organization_id)
+    if approval_doc_id is None:
+        raise err("ERR-VAL-001", details={"reason": "approval_doc_id_required"})
+    _assert_transition(version, "approved")
+    await _assert_approval_doc_active(db, approval_doc_id)
+    version.status = "approved"
+    version.approval_doc_id = approval_doc_id
+    version.approved_by = actor.id
+    await db.flush()
+    await db.refresh(version)
+    await audit.log(
+        db,
+        action="contour_version.approve",
+        user_id=actor.id,
+        object_type="contour_version",
+        object_id=version.id,
+        old_value={"status": "review"},
+        new_value={"status": "approved", "approval_doc_id": str(approval_doc_id)},
+    )
+    return version
+
+
+async def publish_version(
+    db: AsyncSession, version_id: uuid.UUID, *, actor: User
+) -> ContourVersion:
+    """`POST .../publish` — approved -> published, `CONTOURS_APPROVE`. Runs
+    the full check suite (`checks.run_checks`) and refuses with `ERR-GIS-003`
+    (422) plus the full report in `details.checks` when a BLOCKING check
+    fails — `validity`/`within_fund`/`overlap`; `checks.is_blocked` decides,
+    not reimplemented here. A `restrictions` intersection is only a warning
+    and never blocks (ruling 16) — that is exactly what `is_blocked` already
+    encodes.
+
+    Archives whatever version was published before this one, IN THE SAME
+    transaction, flushing between the archive UPDATE and the new published
+    status: `uq_contour_published_version` is a partial unique index (`WHERE
+    status = 'published'`) and is checked against pending statements too, so
+    without the flush the old row has not yet been "seen" as archived when
+    the new row's uniqueness is checked, and the update can raise on a
+    conflict the flush would already have resolved (lesson).
+    """
+    version, contour = await _version_and_contour(db, version_id)
+    _assert_in_zone(actor, contour.organization_id)
+    _assert_transition(version, "published")
+    results = await checks.run_checks(db, version_id=version_id)
+    if checks.is_blocked(results):
+        # See `_checks_jsonable`'s own docstring: without this conversion, a
+        # real overlap's Decimal/UUID payload raises TypeError while Starlette
+        # renders THIS very response, turning the 422 into a 500.
+        raise err("ERR-GIS-003", details={"checks": _checks_jsonable(results)})
+    previous = await repo.published_version(db, version.contour_id)
+    if previous is not None:
+        previous.status = "archived"
+        # Flush the archive before the new published state is written — the
+        # partial unique index needs to see it first (lesson).
+        await db.flush()
+    version.status = "published"
+    version.published_at = datetime.now(UTC)
+    await db.flush()
+    await db.refresh(version)
+    await audit.log(
+        db,
+        action="contour_version.publish",
+        user_id=actor.id,
+        object_type="contour_version",
+        object_id=version.id,
+        old_value={"status": "approved"},
+        new_value={
+            "status": "published",
+            "replaced": str(previous.id) if previous is not None else None,
+        },
+    )
+    return version
+
+
+async def archive_version(
+    db: AsyncSession, version_id: uuid.UUID, *, actor: User
+) -> ContourVersion:
+    """`POST .../archive` — published -> archived, `CONTOURS_APPROVE`. For
+    taking a published version out of force WITHOUT replacing it (e.g. the
+    leshoz stopped issuing permits over that contour). `publish_version`'s own
+    supersede step archives the version it replaces as a side effect — never
+    through this endpoint, no separate request is made for that case."""
+    version, contour = await _version_and_contour(db, version_id)
+    _assert_in_zone(actor, contour.organization_id)
+    _assert_transition(version, "archived")
+    version.status = "archived"
+    await db.flush()
+    await db.refresh(version)
+    await audit.log(
+        db,
+        action="contour_version.archive",
+        user_id=actor.id,
+        object_type="contour_version",
+        object_id=version.id,
+        old_value={"status": "published"},
+        new_value={"status": "archived"},
+    )
+    return version

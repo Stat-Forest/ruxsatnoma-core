@@ -1,8 +1,12 @@
-"""Contour identity and draft versions. Every route here requires
-`CONTOURS_MANAGE` (the GIS specialist draws, edits and imports, but never
-approves — that permission gate matches `gis_client` in the test fixtures);
-Task 5 adds the approve/publish lifecycle under `CONTOURS_APPROVE` next to
-these, in the same router."""
+"""Contour identity, draft versions, and the version lifecycle. Creating and
+editing (`POST/PATCH .../contours`, `.../versions`) requires `CONTOURS_MANAGE`
+(the GIS specialist draws, edits and imports, but never approves — that
+permission gate matches `gis_client` in the test fixtures); `submit-review` is
+`CONTOURS_MANAGE` too (the specialist hands their own draft on), while
+`approve`/`publish`/`archive` require `CONTOURS_APPROVE` (the rahbar —
+`rahbar_client` in the tests). Every write below is ALSO zone-scoped through
+`service._assert_in_zone`, a separate gate from the permission check (lesson:
+'Zone scoping is not a permission check — a read path needs both')."""
 
 import uuid
 from typing import Annotated
@@ -14,8 +18,9 @@ from app.core.deps import get_db
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
 from app.modules.gis import checks, service
-from app.modules.gis.permissions import CONTOURS_MANAGE
+from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import (
+    ApproveIn,
     ChecksOut,
     ContourIn,
     ContourOut,
@@ -101,3 +106,50 @@ async def check_version(
 ) -> ChecksOut:
     results = await service.run_version_checks(db, contour_id, version_id, actor=user)
     return ChecksOut.model_validate({"checks": results, "blocked": checks.is_blocked(results)})
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/submit-review")
+async def submit_review(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+) -> VersionOut:
+    version = await service.submit_review(db, version_id, actor=user)
+    return VersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/approve")
+async def approve_version(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    payload: ApproveIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
+) -> VersionOut:
+    version = await service.approve_version(
+        db, version_id, actor=user, approval_doc_id=payload.approval_doc_id
+    )
+    return VersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/publish")
+async def publish_version(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
+) -> VersionOut:
+    version = await service.publish_version(db, version_id, actor=user)
+    return VersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/archive")
+async def archive_version(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
+) -> VersionOut:
+    version = await service.archive_version(db, version_id, actor=user)
+    return VersionOut.model_validate(version, from_attributes=True)

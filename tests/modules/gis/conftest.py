@@ -378,6 +378,112 @@ async def published_fund_boundary_elsewhere(db: AsyncSession) -> LayerFeature:
     return await make_feature(db, layer, box_wkt(60.0, 41.5))
 
 
+# --- Task 5: lifecycle fixtures ------------------------------------------
+#
+# Unlike the task-4 fixtures just above, every one of these gets combined with
+# a `_client_for`-based client (`gis_client`/`rahbar_client` and friends) in
+# its own test, which commits it for real (lesson: "A `_client_for`-style
+# fixture's setup-time commit only covers what ran before it"). Any of these
+# that ends up `published` therefore sticks around forever in the shared,
+# persistent test DB — exactly the shape "A fixed test geometry that a
+# `_client_for` client commits accumulates forever" warns about — so every one
+# is anchored with `random_box_wkt()`/`random_anchor()`, never the module's
+# conventional box_wkt(69.9, 41.5) spot or its neighbours (decision 2 from the
+# task-5 controller).
+
+
+@pytest.fixture
+async def contour_with_draft(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A fresh contour with one `draft` version — the lifecycle's own starting
+    point, ready to run submit-review -> approve -> publish end to end."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(db, contour.id, random_box_wkt())
+    return contour.id, version.id
+
+
+@pytest.fixture
+async def contour_in_review(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A version already in `review` — the precondition `approve` needs, for
+    the tests that stop there and never reach publish (a permission 403, a
+    zone 403, and a missing-document 422)."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(db, contour.id, random_box_wkt(), status="review")
+    return contour.id, version.id
+
+
+@pytest.fixture
+async def contour_with_two_versions(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, approval_doc: MediaFile
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """One contour, two versions: the first already `published`, the second
+    `approved` and ready to replace it — the exact shape `publish_version`'s
+    archive-the-previous step needs. Both sit at the same random, isolated
+    anchor; `_overlap`'s own candidate query excludes a version from every
+    OTHER version of its OWN contour regardless of location
+    (`ov.contour_id <> ...`), so sharing one location is safe and the random
+    anchor is only to stay clear of whatever a previous run left behind
+    elsewhere."""
+    wkt = random_box_wkt()
+    contour = await make_contour(db, contours_layer, leshoz)
+    first = await make_version(
+        db,
+        contour.id,
+        wkt,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    second = await make_version(
+        db,
+        contour.id,
+        wkt,
+        version_no=2,
+        status="approved",
+        approval_doc_id=approval_doc.id,
+    )
+    return contour.id, first.id, second.id
+
+
+@pytest.fixture
+async def approved_version_overlapping_a_published_one(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, approval_doc: MediaFile
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """An `approved` version that overlaps a DIFFERENT contour's already-
+    published one — the one deliberate collision this task needs (decision 2
+    from the task-5 controller). Both geometries come from a single random
+    anchor plus a fixed 0.005-degree offset — the same half-step
+    `draft_version_overlapping_it` (task 4) uses against
+    `neighbouring_published_contour`, just anchored randomly instead of at the
+    module's conventional box_wkt(69.9, 41.5) — so the only thing this version
+    ever overlaps is the published row this fixture creates alongside it,
+    never whatever an earlier run of this suite left behind elsewhere in the
+    shared, persistent test DB.
+    """
+    lon, lat = random_anchor()
+    published = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        published.id,
+        box_wkt(lon, lat),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db,
+        contour.id,
+        box_wkt(lon + 0.005, lat),
+        status="approved",
+        approval_doc_id=approval_doc.id,
+    )
+    return contour.id, version.id
+
+
 # --- Signed-in client fixtures for the gis HTTP API (task 2) -----------------
 #
 # Thin wrappers over helpers this codebase already has: make_user/make_session
@@ -518,6 +624,17 @@ async def org_scoped_gis_client(db: AsyncSession, leshoz: Organization):
 async def rahbar_client(db: AsyncSession):
     """The approver: approves and publishes, does not draw."""
     async for client in _client_for(db, CONTOURS_APPROVE):
+        yield client
+
+
+@pytest.fixture
+async def org_scoped_rahbar_client(db: AsyncSession, other_leshoz: Organization):
+    """A `CONTOURS_APPROVE` actor zoned to `other_leshoz` — the shape the zone
+    check on the four lifecycle actions (submit-review/approve/publish/archive)
+    has to defend against (task-5 controller, decision 6: every one of them is
+    zone-scoped, not only permission-gated). Mirrors `org_scoped_gis_client`'s
+    own reasoning, one permission set over."""
+    async for client in _client_for(db, CONTOURS_APPROVE, organization_id=other_leshoz.id):
         yield client
 
 
