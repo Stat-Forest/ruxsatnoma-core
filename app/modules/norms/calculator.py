@@ -293,12 +293,16 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
     """Resolves the tariff (for grazing, one per livestock group via
     `tariff_group:<code>`; otherwise the single row with `livestock_group IS
     NULL`), applies a claimed benefit modifier, multiplies, sums, rounds once
-    at the end, and computes `used_sb`/`max_sb`/`remaining_sb` when a norm is
-    present. `breakdown` carries one line per tariff row applied, plus a
-    `benefit` line per claimed-and-honoured benefit and a `limit` line when a
-    norm is present — every `Decimal` already stringified by `jsonable`.
-    `input_snapshot` is complete enough to recompute this exact row years from
-    now without the database."""
+    at the end, and computes `used_sb` for any grazing request — a herd's
+    conditional-head load is a fact about the REQUEST (`request.items` ×
+    `coef_sb:<code>`), never about whether a norm happens to exist yet — plus
+    `max_sb`/`remaining_sb` when a norm IS present (those two, unlike
+    `used_sb`, are genuinely a NORM fact: `snapshot.norm.max_sb` and the
+    committed load against it). `breakdown` carries one line per tariff row
+    applied, plus a `benefit` line per claimed-and-honoured benefit and a
+    `limit` line when a norm is present — every `Decimal` already stringified
+    by `jsonable`. `input_snapshot` is complete enough to recompute this exact
+    row years from now without the database."""
     values = snapshot.values
     bhm = _decimal(values, "bhm")
     breakdown: list[dict[str, Any]] = []
@@ -392,11 +396,22 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
     used_sb: Decimal | None = None
     max_sb_value: int | None = None
     remaining_sb: Decimal | None = None
-    if snapshot.norm is not None:
+    # `used_sb` depends only on `request.items`/`snapshot.values` — it reads
+    # nothing from `snapshot.norm` — so it is gated on the ACTIVITY, not on
+    # whether a norm happens to be on record for this contour yet (fix-round
+    # 2: a request's own conditional-head load must be knowable, and a
+    # missing `coef_sb:<code>` must raise, even before VMQ 689's norm for
+    # this contour exists — bundling this under `if snapshot.norm is not
+    # None` used to force any caller needing that number in the no-norm case
+    # to duplicate this exact resolution itself).
+    if request.activity_code == GRAZING:
         used_sb = Decimal("0")
         for item in request.items:
             coefficient = _decimal(values, f"coef_sb:{item.livestock_code}")
             used_sb += coefficient * item.count
+    # `max_sb`/`remaining_sb` genuinely ARE a norm fact (the limit itself, and
+    # the committed load against it) and stay gated on the norm's presence.
+    if snapshot.norm is not None:
         max_sb_value = snapshot.norm.max_sb
         if max_sb_value is not None:
             remaining_sb = Decimal(max_sb_value) - snapshot.load_sb

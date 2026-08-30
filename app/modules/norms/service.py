@@ -653,28 +653,6 @@ async def _resolve_activity_code(db: AsyncSession, activity_type_id: uuid.UUID) 
     return activity.code
 
 
-def _assert_grazing_coefficients_known(
-    request: calculator.CalcRequest, snapshot: calculator.ParamSnapshot
-) -> None:
-    """`calculator.calculate` only resolves `coef_sb:<code>` when a norm is
-    already on record for this contour — it needs the number solely for the
-    breakdown's `limit` line, which has nothing to compare against otherwise
-    (see `calculate`'s own `if snapshot.norm is not None:` gate). But a herd's
-    size in conditional heads is knowable independent of whether VMQ 689's
-    norm has been drafted for THIS contour yet, and a missing `coef_sb:<code>`
-    is a broken INPUT either way (ruling 6: never a default, never a silent
-    zero). Checked up front so a grazing request gets the same self-naming
-    ERR-NORM-004 whether or not a norm happens to exist yet — never a preview
-    that quietly shows no limit at all because the coefficient it would need
-    to check one was never even looked up."""
-    if request.activity_code != calculator.GRAZING:
-        return
-    for item in request.items:
-        code = f"coef_sb:{item.livestock_code}"
-        if code not in snapshot.values:
-            raise err("ERR-NORM-004", details={"code": code})
-
-
 async def _compute(
     db: AsyncSession, payload: CalculationIn
 ) -> tuple[
@@ -725,7 +703,6 @@ async def _compute(
         contour_id=payload.contour_id,
         activity_type_id=payload.activity_type_id,
     )
-    _assert_grazing_coefficients_known(request, snapshot)
     result = calculator.calculate(request, snapshot)
     check_results = await checks.run_checks(
         db,
