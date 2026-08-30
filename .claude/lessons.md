@@ -635,3 +635,103 @@ Rules for this file:
   valid target" check, status check — into one function every step calls, and
   separately refuses a transition whose loop would move zero child rows: a
   loop finding nothing is not evidence that nothing needed to happen.
+
+## The rahbar's role code is `leadership`, not `rahbar`
+
+- **Rule:** Before granting a permission to "the raҳbar" (leshoz head) in a
+  migration or a plan, check `roles.code` in migration `0003_auth` — it is
+  seeded as `leadership`. There is no role code `rahbar`.
+- **Why:** `plans/03.6a-gis-core.md` was written with role code `rahbar`; an
+  `INSERT … SELECT … WHERE code = 'rahbar'` inserts zero rows silently, so
+  `gis.contours.approve` would have reached nobody and every "the rahbar
+  approves" test would have passed for the wrong reason (a personal grant,
+  not the role) — caught only because the implementer ran it and watched the
+  grant not land (stage 3.6a Task 1).
+- **How to apply:** Any future migration or plan that seeds a role-based
+  permission grant: grep `leadership`/`rahbar` in `migrations/versions/
+  0003_auth.py` first, never trust a role name from spec/plan prose alone.
+
+## `IntegrityError` IS a `DBAPIError` — the narrow `except` must come first
+
+- **Rule:** When a function needs to catch both `IntegrityError` and the
+  broader `DBAPIError`, write `except IntegrityError` BEFORE `except
+  DBAPIError` — never after, and never as one clause that inspects `exc.orig`
+  by hand instead.
+- **Why:** `gis.service.create_version` originally had only `except
+  DBAPIError`, mapping every DB failure to `ERR-GIS-001` ("unreadable
+  geometry"); a `uq_contour_version_no` race from two concurrent creates
+  raises `IntegrityError`, a `DBAPIError` subclass, so it was silently
+  swallowed by the broad clause and reported as a geometry defect instead of
+  the version-number conflict it actually was (stage 3.6a Task 3, final
+  review finding 3 — confirmed empirically against real Postgres, not from
+  documentation, that the two failure modes even raise different exception
+  types; Task 7's bulk importer drives the very same path, so the bug was
+  live, not theoretical).
+- **How to apply:** Before adding a second `except` clause alongside an
+  existing `except DBAPIError`, check whether the new one is a subclass
+  (`IntegrityError.__mro__`) — if so, order it first, and verify empirically
+  which exception a given real constraint violation actually raises rather
+  than assuming from the constraint's name.
+
+## A service-level pre-check can leave its mirrored DB CHECK permanently unexercised
+
+- **Rule:** When a service pre-checks a rule a DB CHECK also enforces (this
+  project's defense-in-depth pattern), write a SEPARATE model-level test that
+  inserts through the ORM directly, bypassing the service — an API-level test
+  alone never reaches the CHECK.
+- **Why:** `Contour.parent_needs_subcontour` has had a test since Task 1, but
+  it only ever went through `POST /gis/contours`, which raises `ERR-VAL-001`
+  from the SERVICE's own pre-check before a row is even constructed — the
+  CHECK itself was never fired by any test until Task 3 added one that builds
+  `Contour(...)` directly and asserts the `IntegrityError` (Task 1 deferred
+  minor, closed at Task 3).
+- **How to apply:** Any CHECK mirrored by a service-level guard needs two
+  tests, not one: the service's 422/409 through the API, AND a direct-ORM
+  insert asserting the CHECK's own `IntegrityError` — when adding a
+  `CheckConstraint`, grep for whether a `pytest.raises(IntegrityError)` test
+  actually exercises it, not just the guard in front of it.
+
+## An empty layer makes a containment check meaningless — decide what "no data" means before the data exists
+
+- **Rule:** Before a topology/containment check goes live against a layer or
+  table that might still be empty, implement its THIRD outcome — `skipped`,
+  never `pass` or `fail` — for the "no reference data yet" case, decided at
+  design time rather than left for whoever notices the check always fires the
+  same way.
+- **Why:** `gis.checks._within_fund` (`ST_Within` against the `forest_fund`
+  layer) would report every contour as `outside_forest_fund` — a hard `fail`
+  blocking every publication — for as long as the Agency's fund-boundary
+  delivery is pending (plan ruling 9); without the `skipped`/`layer_empty`
+  branch (returned straight from `count(*) == 0` in the same query that would
+  otherwise test containment), not one contour could have published this
+  month. The check turns itself on the day the data lands, with no code
+  change.
+- **How to apply:** Any check whose candidate/reference set is a layer or
+  table this project does not yet fully control the population of (a layer
+  awaiting real Agency data, a not-yet-onboarded integration) gets an
+  explicit empty-set branch decided up front, returned as its own named
+  result — never silently defaulted to `pass` or `fail` once real rows start
+  arriving.
+
+## `ST_Intersects` alone reports every shared border as an overlap — real cadastral data needs an area tolerance
+
+- **Rule:** A geometric "do these overlap" predicate over real (hand-digitised
+  or GIS-sourced) polygons is never plain `ST_Intersects`/`ST_Overlaps` —
+  compute the actual intersection area and compare it against a configurable
+  tolerance, because two legitimately adjacent polygons share a border of
+  zero area, and `ST_Intersects` is `true` for that exactly as it is for a
+  genuine double-booked overlap.
+- **Why:** Two neighbouring published contours sharing a fence line are the
+  NORMAL case on real cadastral data, not an edge case — a plain-`ST_Intersects`
+  publish-blocking check (the spec's own `ST_Overlaps`) would have refused to
+  publish perfectly valid neighbouring contours (decision #24's correction;
+  `gis.checks._intersections` computes `ST_Area(ST_Intersection(a,b)
+  ::geography)` and compares it to `gis_overlap_tolerance_m2`, default
+  100 m², proven by `test_checks.py`'s `draft_version_touching_it` vs
+  `draft_version_overlapping_it` pair — one shares an edge and must pass, the
+  other genuinely overlaps and must block).
+- **How to apply:** Any new geometric predicate over contour/parcel-shaped
+  data (norms' own territory checks, 3.7+, are the next candidate) computes
+  an intersection AREA and compares it to a named, configurable tolerance
+  setting — never a bare boolean `ST_Intersects`/`ST_Overlaps` used directly
+  as the blocking test.
