@@ -12,6 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.db import uuid7
+
+# `Organization` (region_id/district_id) is read-only here, for the zone JOIN
+# `list_contours` needs — gis is one of the modules CLAUDE.md's module-
+# boundaries rule explicitly grants read-only table access to reference data,
+# alongside the reporting/dashboard/search readers.
+from app.modules.admin.models import Organization
 from app.modules.gis.models import Contour, ContourVersion, GisImport, GisLayer, LayerFeature
 
 
@@ -384,8 +390,13 @@ async def list_contours(
     contour that HAS a published version, matching the given filters. `zone`
     is whatever `abac.zone_filter` built — always given, `true()` when the
     actor carries no zone at all (a republic-wide staff member, or any
-    applicant). Geometry is read only as a bbox PREDICATE (`ST_Intersects`),
-    never selected into Python (module docstring)."""
+    applicant). Joins `organizations` (review finding 2) so a REGION- or
+    DISTRICT-scoped actor's zone can be enforced too, not just the
+    organization axis: `Contour` itself carries no region_id/district_id of
+    its own, and `zone_filter` fails closed (raises) rather than silently
+    under-enforcing when a set zone axis has no column to check it against.
+    Geometry is read only as a bbox PREDICATE (`ST_Intersects`), never
+    selected into Python (module docstring)."""
     conditions: list[Any] = [ContourVersion.status == "published", zone]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
@@ -406,6 +417,7 @@ async def list_contours(
             ContourVersion.area_ha,
         )
         .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+        .join(Organization, Organization.id == Contour.organization_id)
         .where(*conditions)
         .order_by(Contour.number)
     )

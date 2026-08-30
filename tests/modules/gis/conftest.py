@@ -1212,6 +1212,48 @@ async def published_restriction(db: AsyncSession) -> LayerFeature:
     return await make_feature(db, layer, random_box_wkt())
 
 
+@pytest.fixture
+async def processed_restrictions_import(
+    db: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    pending_import_restrictions: GisImport,
+) -> GisImport:
+    """Task 7's own terminal state (`status='review'`), but for a NON-contour
+    layer — review finding 1: such a batch must be refused at submit-review,
+    not ride the contour batch machinery to a false `done`. Reuses task 7's
+    own `pending_import_restrictions` fixture rather than inventing a second
+    non-contour import fixture."""
+    await import_service.process_pending(session_factory)
+    await db.refresh(pending_import_restrictions)
+    return pending_import_restrictions
+
+
+@pytest.fixture
+async def leshoz_in_fergana(db: AsyncSession, leshoz: Organization) -> Organization:
+    """`leshoz` itself never sets a region (most gis fixtures need none) —
+    review finding 2 needs ONE organization that actually sits in a region, to
+    prove `list_contours`' `zone_filter` call narrows correctly for a
+    region-scoped actor instead of raising. `Region.code == "fergana"` is the
+    same known-seeded row `region_scoped_layers_client` already keys off."""
+    region_id = (await db.execute(select(Region.id).where(Region.code == "fergana"))).scalar_one()
+    leshoz.region_id = region_id
+    await db.flush()
+    return leshoz
+
+
+@pytest.fixture
+async def region_scoped_client(db: AsyncSession):
+    """An actor zoned to a REGION but no organization, and holding no gis
+    permission at all — `GET /gis/contours` requires only authentication
+    (review finding 2: `admin.users_service.create_user` sets region_id,
+    district_id and organization_id independently with no cross-validation,
+    so a region-scoped, organization-less 'regional inspector' is creatable
+    today)."""
+    region_id = (await db.execute(select(Region.id).where(Region.code == "fergana"))).scalar_one()
+    async for client in _client_for(db, region_id=region_id):
+        yield client
+
+
 DRAIN_LIMIT = 50
 
 

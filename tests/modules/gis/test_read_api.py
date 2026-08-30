@@ -1,6 +1,10 @@
 """What 3.7 (norms) and 3.9 (applications) — and the applicant picking a plot —
 actually read. S_available is a declared placeholder until permits land (ruling 14)."""
 
+from sqlalchemy import func
+
+from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+
 
 async def test_an_applicant_sees_published_contours_only(
     applicant_client, published_contour, draft_contour
@@ -21,6 +25,39 @@ async def test_the_bbox_filter_excludes_what_is_outside_it(applicant_client, pub
 async def test_a_malformed_bbox_is_422_not_500(applicant_client):
     resp = await applicant_client.get("/api/v1/gis/contours?bbox=nonsense")
     assert resp.status_code == 422
+
+
+async def test_the_list_is_filtered_for_a_region_scoped_actor(
+    db, region_scoped_client, contours_layer, leshoz_in_fergana, other_leshoz, approval_doc
+):
+    """Review finding 2: `zone_filter` fails closed — it raises when a zone
+    axis is set but its column was not supplied — and a region-scoped,
+    organization-less actor (creatable today) hit exactly that. Must see a
+    FILTERED list (the contour in their own region), not a 500 and not
+    everything (a contour under an unrelated, region-less organization)."""
+    in_region = await make_contour(db, contours_layer, leshoz_in_fergana)
+    await make_version(
+        db,
+        in_region.id,
+        random_box_wkt(),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    outside = await make_contour(db, contours_layer, other_leshoz)
+    await make_version(
+        db,
+        outside.id,
+        random_box_wkt(),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    resp = await region_scoped_client.get("/api/v1/gis/contours")
+    assert resp.status_code == 200
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert str(in_region.id) in ids
+    assert str(outside.id) not in ids
 
 
 async def test_the_contour_card_declares_that_occupancy_is_a_placeholder(

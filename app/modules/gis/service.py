@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import DomainError, err
 from app.core.models import MediaFile
+from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.models import User
@@ -728,13 +729,26 @@ async def submit_import_review(db: AsyncSession, import_id: uuid.UUID, *, actor:
     `status='review'` the moment it parses cleanly — this action does not move
     THAT status at all; its real effect is cascading every version the import
     created from `draft` to `review`, one `submit_review` call each, so
-    `approve_import` below has something in the right state to work on."""
+    `approve_import` below has something in the right state to work on.
+
+    Review finding 1: refused for any import whose layer is not `contours`.
+    A `restrictions`/`fire_bans`/etc. batch creates `layer_features` rows, not
+    `ContourVersion` ones — without this guard all three batch actions below
+    would loop zero rows and sail straight through to a false `done` with
+    `{"published": 0, "blocked": []}`, indistinguishable from a real, empty
+    delivery. Refused loudly here instead of inventing a second, feature-batch
+    lifecycle: those rows still publish one at a time through Task 6's own
+    `POST /layers/{code}/features/{id}/publish` — no bulk path for them yet,
+    a known and named gap, not one this silently papers over."""
     row = await repo.import_by_id(db, import_id)
     if row is None:
         raise err("ERR-SYS-003")
     _assert_in_zone(actor, row.organization_id)
     if row.status != "review":
         raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})
+    layer = await db.get(GisLayer, row.layer_id)
+    if layer is None or layer.code != "contours":
+        raise err("ERR-GIS-005", details={"reason": "not_a_contour_batch"})
     for version in await repo.import_versions(db, import_id, status="draft"):
         await submit_review(db, version.id, actor=actor)
     await audit.log(
@@ -886,12 +900,26 @@ async def list_contours(
     geometry of record yet, so it is invisible here regardless of the caller's
     role — which is exactly what makes an applicant see published contours
     only, with no role branch of its own. `zone_filter` narrows this to the
-    actor's own organization for a zone-scoped staff member and is a no-op
-    (`true()`) for a republic-wide one or an applicant (`Contour` carries no
-    region_id/district_id of its own, the same single-axis limit
-    `_assert_in_zone` already documents)."""
+    actor's own zone; it is a no-op (`true()`) for a republic-wide staff
+    member or an applicant.
+
+    All THREE zone axes are supplied (review finding 2), even though `Contour`
+    itself only carries `organization_id`: `zone_filter` fails closed and
+    RAISES when a zone axis is set but its column is not — unlike
+    `_assert_in_zone`'s own hand-rolled check elsewhere in this module, which
+    silently checks organization only. `admin.users_service.create_user` sets
+    region_id/district_id/organization_id independently with no
+    cross-validation, so a region- or district-scoped, organization-less
+    actor is real and reachable here; `repo.list_contours` joins
+    `organizations` so `Organization.region_id`/`district_id` are available to
+    check against."""
     parsed_bbox = _parse_bbox(bbox)
-    zone = zone_filter(zone_of(actor), organization_col=Contour.organization_id)
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Contour.organization_id,
+    )
     rows = await repo.list_contours(
         db, organization_id=organization_id, bbox=parsed_bbox, zone=zone
     )
