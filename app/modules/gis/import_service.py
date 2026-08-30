@@ -728,7 +728,7 @@ async def create_import(
     instead would mean widening the document whitelist for every uploader in
     the system.
     """
-    gis_service._assert_in_zone(actor, organization_id)
+    await gis_service._assert_in_zone(db, actor, organization_id)
     layer = await repo.layer_by_code(db, layer_code)
     if layer is None:
         raise err("ERR-SYS-003")
@@ -782,5 +782,5 @@ async def get_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) -> G
     row = await repo.import_by_id(db, import_id)
     if row is None:
         raise err("ERR-SYS-003")
-    gis_service._assert_in_zone(actor, row.organization_id)
+    await gis_service._assert_in_zone(db, actor, row.organization_id)
     return row

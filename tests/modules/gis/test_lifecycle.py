@@ -83,3 +83,21 @@ async def test_approve_is_refused_outside_the_actors_zone(
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_a_region_scoped_approver_cannot_publish_into_another_region(
+    other_region_rahbar_client, leshoz_in_fergana, contour_with_two_versions
+):
+    """The final-review hole, mirrored from
+    `test_a_region_scoped_actor_cannot_create_a_republic_wide_feature`: an
+    actor holding a REGION but no organization used to pass `_assert_in_zone`
+    for every organization in the country, because it compared
+    `zone.organization_id` alone. `contour_with_two_versions` sits under a
+    leshoz in fergana; this actor is scoped to andijan and must be refused
+    even though they hold `CONTOURS_APPROVE`."""
+    cid, _first_vid, second_vid = contour_with_two_versions
+    resp = await other_region_rahbar_client.post(
+        f"/api/v1/gis/contours/{cid}/versions/{second_vid}/publish"
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ERR-ACL-001"

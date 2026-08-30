@@ -691,6 +691,23 @@ async def org_scoped_rahbar_client(db: AsyncSession, other_leshoz: Organization)
 
 
 @pytest.fixture
+async def other_region_rahbar_client(db: AsyncSession):
+    """A `CONTOURS_APPROVE` actor zoned to a REGION (andijan) and no
+    organization of their own — the exact shape `_assert_in_zone` under-served
+    until the final review of 3.6a: comparing `zone.organization_id` alone let
+    such an actor pass for EVERY organization in the country, and migration
+    0010 grants `gis.contours.approve` to `leadership`/`chief_forester`, so an
+    oblast-level chief forester could approve and publish contour versions for
+    any leshoz nationwide. Paired with `leshoz_in_fergana` (a DIFFERENT
+    region), so the refusal is unambiguous rather than resting on a NULL
+    region. `andijan` is seeded by migration 0005, like the `fergana` row the
+    other zone fixtures key off."""
+    region_id = (await db.execute(select(Region.id).where(Region.code == "andijan"))).scalar_one()
+    async for client in _client_for(db, CONTOURS_APPROVE, region_id=region_id):
+        yield client
+
+
+@pytest.fixture
 async def applicant_client(db: AsyncSession):
     """A fully registered applicant (role_code="applicant" WITH its own
     `Applicant` row) — not a grantless executor_staff user standing in for one.

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import DomainError, err
 from app.core.models import MediaFile
+from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
@@ -81,23 +82,56 @@ async def update_layer(
     return layer
 
 
-def _assert_in_zone(actor: User, organization_id: uuid.UUID) -> None:
-    """Per-request zone check on the one axis `contours` carries
-    (`organization_id`) — same 'own zone' semantics as
-    `admin.users_service._within_zone`, kept local since gis has no reason to
-    import an admin-module internal. This is separate from the
-    `CONTOURS_MANAGE` permission check the router already applies (lesson:
-    "Zone scoping is not a permission check — a read path needs both", and here
-    every write path needs both too): it answers WHOSE organization, not
-    WHETHER the actor may manage contours at all. Takes the organization id
-    directly rather than a `Contour` row — `create_contour` has no row yet when
-    it needs this check (final review, finding 1: it must run before the row is
-    constructed, since `organization_id` comes straight from the request body).
-    `Contour` has no region_id/district_id of its own, so only the organization
-    axis of the actor's zone is enforced; a region/district-scoped zone is a
-    shape this stage does not assign to CONTOURS_MANAGE holders."""
+def _organization_in_zone(zone: Zone, org: Organization) -> bool:
+    """Per-row equivalent of `zone_filter`'s SQL for ONE organization row —
+    the same semantics `admin.users_service._within_zone` applies to a `User`,
+    applied here to the organization a gis object hangs off: an axis the zone
+    leaves `None` is unrestricted, a set axis must match exactly."""
+    if zone.region_id is not None and zone.region_id != org.region_id:
+        return False
+    if zone.district_id is not None and zone.district_id != org.district_id:
+        return False
+    if zone.organization_id is not None and zone.organization_id != org.id:
+        return False
+    return True
+
+
+async def _assert_in_zone(db: AsyncSession, actor: User, organization_id: uuid.UUID) -> None:
+    """Per-request zone check on ALL THREE axes of `app/core/abac.py`'s `Zone`.
+    Separate from the `CONTOURS_MANAGE`/`CONTOURS_APPROVE` permission check the
+    router already applies (lesson: "Zone scoping is not a permission check — a
+    read path needs both", and here every write path needs both too): it
+    answers WHOSE organization, not WHETHER the actor may manage contours at
+    all. Takes the organization id rather than a `Contour` row — `create_contour`
+    has no row yet when it needs this check, since `organization_id` comes
+    straight from the request body.
+
+    `Contour`/`GisImport` carry only `organization_id`, so the region and
+    district axes are resolved by loading the ORGANIZATION and comparing its
+    own `region_id`/`district_id` — exactly what `repo.list_contours`' JOIN to
+    `organizations` already does for the read path. Comparing
+    `zone.organization_id` alone (what this did until the final review of
+    3.6a) let an actor with a region — or district — but NO organization of
+    their own pass for every organization in the country: that shape is
+    creatable today (`admin.users_service.create_user` sets the three columns
+    independently) and migration 0010 grants `gis.contours.approve` to
+    `leadership`/`chief_forester`, so an oblast-level chief forester could
+    approve and publish contour versions for any leshoz nationwide.
+
+    An organization that does not exist fails the check for a zoned actor:
+    nothing can prove it is inside their zone. A zone empty on every axis is
+    republic-wide and short-circuits before the read, so the common case costs
+    no query at all.
+
+    Read through `admin.repo` — reference data is never re-queried from another
+    module's repo (CLAUDE.md); `db.get`'s identity map makes a repeated lookup
+    inside one request free.
+    """
     zone = zone_of(actor)
-    if zone.organization_id is not None and zone.organization_id != organization_id:
+    if zone == Zone(None, None, None):
+        return
+    org = await admin_repo.get_organization(db, organization_id)
+    if org is None or not _organization_in_zone(zone, org):
         raise err("ERR-ACL-001")
 
 
@@ -130,7 +164,7 @@ async def create_contour(
     to an existing row, applied here to the request's own value before any row
     exists (final review, finding 1).
     """
-    _assert_in_zone(actor, organization_id)
+    await _assert_in_zone(db, actor, organization_id)
     if parent_id is not None and kind != "subcontour":
         raise err("ERR-VAL-001", details={"reason": "parent_needs_subcontour"})
     contour = Contour(
@@ -175,7 +209,7 @@ async def update_contour(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     before = {"status": contour.status}
     if status is not None:
         contour.status = status
@@ -200,7 +234,7 @@ async def create_version(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     version_no = await repo.next_version_no(db, contour_id)
     try:
         version = await repo.insert_version(
@@ -250,7 +284,7 @@ async def update_version(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     version = await db.get(ContourVersion, version_id)
     if version is None or version.contour_id != contour_id:
         raise err("ERR-SYS-003")
@@ -286,7 +320,7 @@ async def run_version_checks(
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     version = await repo.version_by_id(db, version_id)
     if version is None or version.contour_id != contour_id:
         raise err("ERR-SYS-003")
@@ -359,7 +393,7 @@ async def submit_review(db: AsyncSession, version_id: uuid.UUID, *, actor: User)
     specialist hands their own draft to the rahbar). A plain transition: the
     check suite (Task 4) runs at publish, not here."""
     version, contour = await _version_and_contour(db, version_id)
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     _assert_transition(version, "review")
     version.status = "review"
     await db.flush()
@@ -397,7 +431,7 @@ async def approve_version(
     before anything else"), applied here too.
     """
     version, contour = await _version_and_contour(db, version_id)
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     if approval_doc_id is None:
         raise err("ERR-VAL-001", details={"reason": "approval_doc_id_required"})
     _assert_transition(version, "approved")
@@ -439,7 +473,7 @@ async def publish_version(
     conflict the flush would already have resolved (lesson).
     """
     version, contour = await _version_and_contour(db, version_id)
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     _assert_transition(version, "published")
     results = await checks.run_checks(db, version_id=version_id)
     if checks.is_blocked(results):
@@ -481,7 +515,7 @@ async def archive_version(
     supersede step archives the version it replaces as a side effect — never
     through this endpoint, no separate request is made for that case."""
     version, contour = await _version_and_contour(db, version_id)
-    _assert_in_zone(actor, contour.organization_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
     _assert_transition(version, "archived")
     version.status = "archived"
     await db.flush()
@@ -523,7 +557,9 @@ def _assert_feature_transition(feature: LayerFeature, target: str) -> None:
         )
 
 
-def _assert_feature_zone(actor: User, organization_id: uuid.UUID | None) -> None:
+async def _assert_feature_zone(
+    db: AsyncSession, actor: User, organization_id: uuid.UUID | None
+) -> None:
     """Extends `_assert_in_zone` for `layer_features`, whose `organization_id`
     is nullable — `contours.organization_id` never is, so `_assert_in_zone`
     itself has no branch for a missing one. `None` here means a
@@ -537,14 +573,13 @@ def _assert_feature_zone(actor: User, organization_id: uuid.UUID | None) -> None
     every leshoz in their region (or the whole country) through a nominally
     republic-wide feature — the same escalation this rule exists to
     prevent, one administrative tier up. When `organization_id` IS set,
-    this is exactly `_assert_in_zone`'s existing 'own organization only'
-    rule, applied to every write below the same way every contour write
-    already applies it."""
+    this is exactly `_assert_in_zone`'s own all-three-axes rule, applied to
+    every write below the same way every contour write already applies it."""
     if organization_id is None:
         if zone_of(actor) != Zone(None, None, None):
             raise err("ERR-ACL-001")
         return
-    _assert_in_zone(actor, organization_id)
+    await _assert_in_zone(db, actor, organization_id)
 
 
 async def create_feature(
@@ -572,7 +607,7 @@ async def create_feature(
     layer = await repo.layer_by_code(db, code)
     if layer is None:
         raise err("ERR-SYS-003")
-    _assert_feature_zone(actor, organization_id)
+    await _assert_feature_zone(db, actor, organization_id)
     try:
         geometry_type = await repo.feature_geometry_type(db, geojson)
     except DBAPIError as exc:
@@ -630,7 +665,7 @@ async def update_feature(
     feature = await repo.feature_by_id(db, feature_id)
     if feature is None:
         raise err("ERR-SYS-003")
-    _assert_feature_zone(actor, feature.organization_id)
+    await _assert_feature_zone(db, actor, feature.organization_id)
     if feature.status != "draft":
         raise err("ERR-GIS-005", details={"reason": "not_draft"})
     before = {key: _json_safe(getattr(feature, key)) for key in fields}
@@ -669,7 +704,7 @@ async def publish_feature(db: AsyncSession, feature_id: uuid.UUID, *, actor: Use
     feature = await repo.feature_by_id(db, feature_id)
     if feature is None:
         raise err("ERR-SYS-003")
-    _assert_feature_zone(actor, feature.organization_id)
+    await _assert_feature_zone(db, actor, feature.organization_id)
     _assert_feature_transition(feature, "published")
     feature.status = "published"
     await db.flush()
@@ -694,7 +729,7 @@ async def archive_feature(db: AsyncSession, feature_id: uuid.UUID, *, actor: Use
     feature = await repo.feature_by_id(db, feature_id)
     if feature is None:
         raise err("ERR-SYS-003")
-    _assert_feature_zone(actor, feature.organization_id)
+    await _assert_feature_zone(db, actor, feature.organization_id)
     _assert_feature_transition(feature, "archived")
     feature.status = "archived"
     await db.flush()
@@ -751,7 +786,7 @@ async def _load_import_for_transition(
     row = await repo.import_by_id(db, import_id)
     if row is None:
         raise err("ERR-SYS-003")
-    _assert_in_zone(actor, row.organization_id)
+    await _assert_in_zone(db, actor, row.organization_id)
     layer = await db.get(GisLayer, row.layer_id)
     if layer is None or layer.code != "contours":
         raise err("ERR-GIS-005", details={"reason": "not_a_contour_batch"})
@@ -933,14 +968,13 @@ async def list_contours(
 
     All THREE zone axes are supplied (review finding 2), even though `Contour`
     itself only carries `organization_id`: `zone_filter` fails closed and
-    RAISES when a zone axis is set but its column is not — unlike
-    `_assert_in_zone`'s own hand-rolled check elsewhere in this module, which
-    silently checks organization only. `admin.users_service.create_user` sets
-    region_id/district_id/organization_id independently with no
-    cross-validation, so a region- or district-scoped, organization-less
-    actor is real and reachable here; `repo.list_contours` joins
-    `organizations` so `Organization.region_id`/`district_id` are available to
-    check against."""
+    RAISES when a zone axis is set but its column is not.
+    `admin.users_service.create_user` sets region_id/district_id/organization_id
+    independently with no cross-validation, so a region- or district-scoped,
+    organization-less actor is real and reachable here; `repo.list_contours`
+    joins `organizations` so `Organization.region_id`/`district_id` are
+    available to check against — the same resolution `_assert_in_zone` does
+    row-by-row on the write paths."""
     parsed_bbox = _parse_bbox(bbox)
     zone = zone_filter(
         zone_of(actor),
