@@ -37,13 +37,14 @@ async def test_a_leshoz_publishes_a_norm_and_an_applicant_gets_a_priced_answer(
     db: AsyncSession,
 ) -> None:
     """`frozen_on_date` pins `on_date` inside the 412 000 `bhm` window, the same
-    reason every preview/save test in this package needs it (lesson: the
-    expected amount is only correct on one side of the seeded 2026-09-01
-    switch). Neither `norms.checks` nor `norms.params` call `business_today()`
-    themselves — both only ever see the ALREADY-resolved `request.on_date` —
-    so patching `norms.service`'s own binding is enough for the whole scenario,
-    norm publication included (`publish_norm` never reads `business_today()`
-    at all; it prices the limit off the norm's own `effective_from`)."""
+    reason `test_preview_api.py`/`test_calculations_api.py`'s own exact-amount
+    tests need it (lesson: the expected amount is only correct on one side of
+    the seeded 2026-09-01 switch). Neither `norms.checks` nor `norms.params`
+    call `business_today()` themselves — both only ever see the
+    already-resolved `request.on_date` — so patching `norms.service`'s own
+    binding is enough for the whole scenario, norm publication included
+    (`publish_norm` never reads `business_today()` at all; it prices the
+    limit off the norm's own `effective_from`)."""
     # 1. The Agency's annex 5 arrives: the central office publishes the
     #    conditional-head coefficient this scenario needs (it ships as a
     #    draft, ruling 8). The seeded `coef_sb:*` rows are SHARED, SINGLETON
