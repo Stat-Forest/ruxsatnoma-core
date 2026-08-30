@@ -45,7 +45,8 @@ async def test_six_activity_types(db):
         "science",
     }
     assert by_code["grazing"].quantity_unit == "head"
-    assert by_code["haymaking"].quantity_unit == "ton"
+    # Migration 0012 (stage 3.7 Task 2) corrects this to the real VMQ 278 unit.
+    assert by_code["haymaking"].quantity_unit == "ha"
     assert by_code["apiary"].quantity_unit == "hive"
 
 
