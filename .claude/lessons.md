@@ -944,3 +944,60 @@ Rules for this file:
   comparison rather than a status check, gate the route on
   `require_any_permission` across every role that can legitimately reach
   that step — not the step's own nominal permission alone.
+- **The mirror bug, caught by review in the very same task:** widening
+  `/publish` this way does NOT mean every sibling route sharing its
+  permission pair is safe to widen identically. `archive_versioned` has NO
+  `created_by` to compare — archiving is a single-actor action, not a
+  handoff between two drafts of the same row — so applying the identical
+  `require_any_permission(TARIFFS_PUBLISH, TARIFFS_MANAGE)` to `/archive`
+  with no service-level check let ANY `TARIFFS_MANAGE` holder take ANY
+  published row out of force single-handedly: the exact one-person change
+  maker-checker exists to prevent, and worse than the original bug, since it
+  is a silent 200 rather than a loud, wrong status code. `gis/router.py`'s
+  own precedent was already sitting right there and says otherwise —
+  `approve`/`publish`/`archive`/`return-to-review` all gate on
+  `CONTOURS_APPROVE` alone, with no path in for the manage-level role. Fixed
+  by keeping the route wide (so a maker still gets a domain 403 instead of a
+  bare one) but adding `archive_versioned`'s own in-handler check —
+  `gis.service._may_manage_layers`'s two-branch shape (role-code superuser
+  bypass, then a specific permission code) — that only fires when the row
+  being archived is `published`; archiving a `draft` stays a maker's own
+  call, unchecked, exactly as it was. Before widening a permission gate on
+  ANY route, check every SIBLING route sharing that gate for whether it has
+  its OWN identity-or-status escape hatch — "this other route already
+  refuses the identity case" is a fact about ONE route, never an assumption
+  that extends to its neighbours.
+
+## A negative test's FAILURE PATH can leave state that poisons a different test's invariant
+
+- **Rule:** Before writing a test whose whole point is that an action gets
+  REFUSED (a blocked publish, a blocked archive, a blocked approve), ask what
+  state the refused row is left in, and whether ANY other test in the suite
+  asserts something absolute (a `count(*) == 0`, "no row of this kind exists")
+  that a leftover row of that kind — in ANY status — would break, forever,
+  in the shared persistent test DB.
+- **Why:** `test_a_maker_cannot_archive_a_published_tariff` (this task's own
+  archive-permission fix) publishes a tariff for the `science` activity
+  specifically because it is the one key with no seeded row
+  (`ex_tariffs_one_in_force` blocks a fresh publish against every OTHER
+  activity, which are all already published open-ended from 2015-09-30) —
+  but the test's own SUCCESS is that the maker's archive attempt is REFUSED,
+  so the row stays `published` forever once the test passes. That broke two
+  things at once, only visible running the FULL suite (not the two files in
+  isolation, where nothing else touches `science`): Task 2's
+  `test_science_has_no_tariff` (`count(*) == 0`, no status filter — archived
+  counts too, since `tariffs` has no delete-via-API) started failing, and the
+  test's OWN next run failed at its own publish step with `period_overlap`
+  against the row IT left behind the time before.
+- **How to apply:** `tests/modules/norms/conftest.py::science_activity_id` is
+  now a yield-fixture whose teardown runs a scoped
+  `DELETE FROM tariffs WHERE activity_type_id = :id` — chosen over archiving
+  the row because archived still counts toward the OTHER test's zero-row
+  assertion, and chosen over "pick a random key" because a `Tariff`'s
+  identity (`activity_type_id` + `livestock_group`) has no randomizable
+  component the way `unique_suffix` gives `rule_parameters.code` or
+  `random_box_wkt()` gives a contour's geometry — every future test needing a
+  "definitely publishable, definitely repeatable" row for an EXCLUDE-
+  constrained table without one follows this shape, and gets run TWICE in a
+  row (or as part of the full suite, not just its own file) before being
+  trusted, specifically because this class of bug is invisible in isolation.
