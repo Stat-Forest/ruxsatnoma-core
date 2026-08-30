@@ -541,10 +541,16 @@ Rules for this file:
   watching the same test fail with exactly that traceback).
 - **How to apply:** Any new `err(..., details=...)` call whose details
   originate from a DB read needs its own recursive JSON-safety pass first —
-  `gis.service._checks_jsonable` is the template. `gis.schemas._jsonable_details`
-  solves the same problem one layer up, for a pydantic-serialized response —
-  a different code path hitting the same root cause, kept as a separate
-  local copy rather than shared (see that module's own note).
+  `gis.checks.jsonable` is the template AND the one place to extend it. It
+  started as two near-identical local copies (`service._checks_jsonable`,
+  `schemas._jsonable_details`, one per consumer) and they had ALREADY
+  diverged by the time the task's own review caught it — the schemas copy
+  had no `uuid.UUID` branch, silently relying on pydantic's own Any-typed
+  encoder to cover for it on that one path only. Unlike `_json_safe`
+  (deliberately kept as separate, DIFFERENTLY-behaved local copies per
+  consumer — see its own entry above), a coercer whose two callers need
+  IDENTICAL conversions belongs in one shared function, not a mirror: a
+  mirror only earns its keep when the two copies are supposed to diverge.
 
 ## A fixed test geometry that a `_client_for` client commits accumulates forever
 
