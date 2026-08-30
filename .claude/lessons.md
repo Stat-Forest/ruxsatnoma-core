@@ -416,6 +416,17 @@ Rules for this file:
   AND returns/serializes that same row in the same call, add `refresh()`
   after the `flush()` — don't assume an existing archive-path precedent
   covers it.
+- **The INSERT-side mirror, hit in stage 3.7 task 3:** "an INSERT gets it via
+  RETURNING" only covers columns the DB/SQLAlchemy itself generates
+  (`server_default`, identity) — a caller-supplied value for a FIXED-SCALE
+  column (`Tariff.coefficient numeric(12,6)`) is not one of those, so it is
+  NOT part of the implicit RETURNING either: posting `"1.5"` left the
+  in-memory row showing the caller's own unpadded string while Postgres had
+  already stored `"1.500000"`. `norms.service.create_versioned` needed the
+  identical `db.refresh(row)` right after `flush()` on a fresh INSERT, not
+  only on the UPDATE paths — caught by printing the raw response before and
+  after the fix, since no given test asserted create-response precision
+  until one was added for exactly this.
 
 ## A JSONB column fed by the stock `json.dumps` rejects `Decimal` and `date`
 
@@ -874,3 +885,62 @@ Rules for this file:
 - **How to apply:** Any new test turning raw-SQL rows into a dict uses the
   comprehension form; reserve `dict(rows.all())` for a typed `select(...)`
   result.
+
+## A `response_model` mismatch is invisible to ruff and pyright — it only fails when the route actually runs
+
+- **Rule:** After writing any route with `response_model=`, hit it once for
+  real (a focused pytest run, or a throwaway two-line `TestClient` script)
+  before trusting a brief/plan's own snippet verbatim — pyright type-checks
+  the handler body, never whether the value it returns actually satisfies
+  the declared `response_model` at runtime.
+- **Why:** Two separate defects in the same APPROVED plan
+  (`docs/plans/03.7-norms.md` Task 3), both invisible to `make check`'s
+  static gates and both raising only when a real request hit the route:
+  (1) `Page[T]` requires `page`/`page_size`, but the plan's own
+  `list_parameters`/`GET /tariffs` snippets return
+  `{"items", "total", "limit", "offset"}` —
+  `fastapi.exceptions.ResponseValidationError: ... Field required` on every
+  call; (2) `PublishOut.item: Any` held a raw ORM row exactly as the plan's
+  own `publish_parameter` snippet built it — `Any` gets NO from-attributes
+  treatment (unlike a concrete `BaseModel` field, which FastAPI/pydantic
+  converts an ORM object into automatically), so
+  `pydantic_core.PydanticSerializationError: Unable to serialize unknown
+  type` fired inside the response encoder. Both confirmed with a throwaway
+  FastAPI app before writing the real router, not guessed from a traceback.
+- **How to apply:** A list endpoint whose repo layer takes `limit`/`offset`
+  (rather than this project's usual `PageParams`) must still build
+  `Page[T]` with an explicit `page`/`page_size` derived from them
+  (`offset // limit + 1`, `limit`) — never return the raw
+  `{"items", "total", "limit", "offset"}` dict some future task's own brief
+  may repeat from the same plan document. Any envelope schema with an
+  `Any`-typed field that might hold an ORM row (`PublishOut.item` here, and
+  anything shaped like it in Task 4/7) needs `SomeOut.model_validate(row)`
+  at the call site, never the bare row.
+
+## A maker-checker route needs BOTH roles' permission — the service tells them apart, not the router
+
+- **Rule:** When a lifecycle step's real gate is "not the same person who
+  did the earlier step" (maker != checker), the route dependency must
+  accept `require_any_permission(EARLIER_CODE, LATER_CODE)`, never
+  `require_permission` of just the later role's own code — the identity
+  check belongs in the service, after the permission gate, not instead of it.
+- **Why:** `norms.service.publish_versioned` (plan ruling 10) refuses a
+  maker publishing their own draft by comparing `created_by` to `actor.id`
+  — a check that only runs AFTER the route's permission dependency lets the
+  request through. The plan's own `publish_parameter` snippet gated on
+  `require_permission(TARIFFS_PUBLISH)` alone, so `tariffs_maker_client`
+  (`TARIFFS_MANAGE` only, by design — makers do not hold `TARIFFS_PUBLISH`)
+  got a 403 `ERR-ACL-001` on `/publish` instead of ever reaching the
+  service's 409 `ERR-NORM-005`/`not_maker_checker`:
+  `test_a_maker_creates_a_draft_and_cannot_publish_it` failed on the wrong
+  status code and body shape (stage 3.7 task 3). Migration 0011 grants
+  `central_admin` BOTH `norms.tariffs.manage` AND `norms.tariffs.publish`
+  at once, which only makes sense if a single role is meant to reach
+  `/publish` as EITHER a maker or a checker, never both for the same row.
+- **How to apply:** Task 4's norm lifecycle (`NORMS_MANAGE`/`NORMS_APPROVE`/
+  `NORMS_PUBLISH`) and any future maker-checker-shaped transition: check
+  whether the fixture granting the "earlier" role deliberately withholds
+  the "later" one, and if the service's own refusal is an identity
+  comparison rather than a status check, gate the route on
+  `require_any_permission` across every role that can legitimately reach
+  that step — not the step's own nominal permission alone.
