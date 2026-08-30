@@ -386,10 +386,14 @@ async def run_version_checks(
 
 # --- Task 5: Draft -> Review -> Approved -> Published -> Archived ------------
 #
-# `TRANSITIONS` lists every edge of tz/07's lifecycle, including two this task
-# has no endpoint for yet (`review` -> `draft`, `approved` -> `review`: sending
-# work back for rework) — the table describes the full state graph even where
-# only four of its edges are reachable through an HTTP route today.
+# `TRANSITIONS` lists every edge of tz/07's lifecycle. The two rework edges
+# (`approved` -> `review`, `review` -> `draft`) sat in this table with no route
+# driving either until the final review of 3.6a: a version `publish_import`
+# blocked could then never be edited, sent back or archived — `update_version`
+# refuses anything but `draft` and `archive_version` requires `published` — so
+# it was stuck at `approved` forever, while `publish_import`'s own docstring
+# and design/03 both promise the operator can fix it and re-run. Every edge is
+# now reachable (`return_to_review`/`return_to_draft` below).
 
 TRANSITIONS: dict[str, tuple[str, ...]] = {
     "draft": ("review",),
@@ -411,6 +415,24 @@ def _assert_transition(version: ContourVersion, target: str) -> None:
             "ERR-GIS-005",
             details={"reason": "bad_transition", "from": version.status, "to": target},
         )
+
+
+def _assert_transition_from(version: ContourVersion, source: str, target: str) -> None:
+    """`_assert_transition` alone is ambiguous wherever two source states share
+    one target: `TRANSITIONS` allows `review` from BOTH `draft` (submit-review)
+    and `approved` (the rework edge), so a bare "may this become `review`?"
+    would let `return-to-review` — `CONTOURS_APPROVE` — also drive
+    `draft` -> `review`, which is `submit_review`'s edge and `CONTOURS_MANAGE`.
+    An approver could then advance a specialist's draft they may not otherwise
+    touch. The rework routes therefore name the state they are the way OUT of,
+    not only the state they lead to (caught by this fix wave's own
+    bad-transition test, which returned 200 before this existed)."""
+    if version.status != source:
+        raise err(
+            "ERR-GIS-005",
+            details={"reason": "bad_transition", "from": version.status, "to": target},
+        )
+    _assert_transition(version, target)
 
 
 async def _version_and_contour(
@@ -559,6 +581,67 @@ async def publish_version(
             "status": "published",
             "replaced": str(previous.id) if previous is not None else None,
         },
+    )
+    return version
+
+
+async def return_to_review(
+    db: AsyncSession, version_id: uuid.UUID, *, actor: User
+) -> ContourVersion:
+    """`POST .../return-to-review` — approved -> review, `CONTOURS_APPROVE`
+    (the same actor who approved it takes the approval back). This is the
+    first half of the way OUT of a stuck state: `publish_import` leaves a
+    version a check blocked at `approved`, and nothing else in this module
+    moves it — `update_version` refuses anything but `draft`,
+    `archive_version` requires `published`.
+
+    `approval_doc_id`/`approved_by` are deliberately LEFT on the row: the
+    document was really produced and really signed, and clearing it would
+    erase that fact from the record. `approve_version` overwrites both when
+    the version is approved again, which is where a correction belongs.
+    """
+    version, contour = await _version_and_contour(db, version_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
+    _assert_transition_from(version, "approved", "review")
+    version.status = "review"
+    await db.flush()
+    # An in-place UPDATE leaves onupdate columns expired, not refreshed (lesson).
+    await db.refresh(version)
+    await audit.log(
+        db,
+        action="contour_version.return_to_review",
+        user_id=actor.id,
+        object_type="contour_version",
+        object_id=version.id,
+        old_value={"status": "approved"},
+        new_value={"status": "review"},
+    )
+    return version
+
+
+async def return_to_draft(
+    db: AsyncSession, version_id: uuid.UUID, *, actor: User
+) -> ContourVersion:
+    """`POST .../return-to-draft` — review -> draft, `CONTOURS_MANAGE` (the GIS
+    specialist takes their own submission back to the bench). The second half
+    of the way out: only a `draft` is editable, so this is what makes a
+    blocked version fixable at all, and `submit_review` then sends it round
+    the same cycle again."""
+    version, contour = await _version_and_contour(db, version_id)
+    await _assert_in_zone(db, actor, contour.organization_id)
+    _assert_transition_from(version, "review", "draft")
+    version.status = "draft"
+    await db.flush()
+    # An in-place UPDATE leaves onupdate columns expired, not refreshed (lesson).
+    await db.refresh(version)
+    await audit.log(
+        db,
+        action="contour_version.return_to_draft",
+        user_id=actor.id,
+        object_type="contour_version",
+        object_id=version.id,
+        old_value={"status": "review"},
+        new_value={"status": "draft"},
     )
     return version
 

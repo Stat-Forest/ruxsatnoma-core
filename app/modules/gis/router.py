@@ -2,8 +2,9 @@
 editing (`POST/PATCH .../contours`, `.../versions`) requires `CONTOURS_MANAGE`
 (the GIS specialist draws, edits and imports, but never approves — that
 permission gate matches `gis_client` in the test fixtures); `submit-review` is
-`CONTOURS_MANAGE` too (the specialist hands their own draft on), while
-`approve`/`publish`/`archive` require `CONTOURS_APPROVE` (the rahbar —
+`CONTOURS_MANAGE` too (the specialist hands their own draft on), as is
+`return-to-draft` (they take it back), while `approve`/`publish`/`archive`
+and `return-to-review` require `CONTOURS_APPROVE` (the rahbar —
 `rahbar_client` in the tests). Every write below is ALSO zone-scoped through
 `service._assert_in_zone`, a separate gate from the permission check (lesson:
 'Zone scoping is not a permission check — a read path needs both')."""
@@ -168,6 +169,32 @@ async def publish_version(
     user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
 ) -> VersionOut:
     version = await service.publish_version(db, version_id, actor=user)
+    return VersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/return-to-review")
+async def return_to_review(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_APPROVE))],
+) -> VersionOut:
+    """approved -> review: the approver takes their own approval back so the
+    specialist can fix a version a publish check blocked."""
+    version = await service.return_to_review(db, version_id, actor=user)
+    return VersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/contours/{contour_id}/versions/{version_id}/return-to-draft")
+async def return_to_draft(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+) -> VersionOut:
+    """review -> draft: the specialist takes their own submission back — only a
+    draft is editable, so this is what makes a blocked version fixable."""
+    version = await service.return_to_draft(db, version_id, actor=user)
     return VersionOut.model_validate(version, from_attributes=True)
 
 
