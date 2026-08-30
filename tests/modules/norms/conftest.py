@@ -26,6 +26,9 @@ from app.core.models import MediaFile
 from app.db import make_session_factory, uuid7
 from app.modules.auth.models import User
 from app.modules.gis.models import Contour, GisLayer
+from app.modules.norms import calculator
+from app.modules.norms import params as norm_params
+from app.modules.norms.models import Norm
 from app.modules.norms.permissions import (
     NORMS_APPROVE,
     NORMS_MANAGE,
@@ -38,7 +41,6 @@ from tests.modules.gis.conftest import (
     _client_for,
     applicant_client,  # noqa: F401 — a fixture imported into a conftest IS available
     box_wkt,  # noqa: F401 — re-exported for a future fixed-geometry test
-    gis_user,  # noqa: F401 — the `created_by` FK target the tests below use
     make_contour,
     make_version,
     random_box_wkt,
@@ -48,6 +50,9 @@ from tests.modules.gis.conftest import (
 )
 from tests.modules.gis.conftest import (
     contours_layer as contours_layer,  # re-exported AND used as a parameter name below
+)
+from tests.modules.gis.conftest import (
+    gis_user as gis_user,  # re-exported AND used as a parameter name below (the `created_by` FK)
 )
 from tests.modules.gis.conftest import (
     leshoz as leshoz,  # re-exported AND used as a parameter name below
@@ -110,6 +115,48 @@ async def draft_only_contour(db: AsyncSession, contours_layer: GisLayer, leshoz)
     await make_version(db, contour.id, random_box_wkt(), status="draft")
     await db.flush()
     return contour
+
+
+@pytest.fixture
+async def published_grazing_norm(
+    db: AsyncSession,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> uuid.UUID:
+    """A published VMQ 689 norm for `published_contour` × grazing — a direct
+    insert (publishing through the API needs the whole approve→publish chain,
+    task 4's own territory), but `max_sb` is frozen the same way
+    `service.publish_norm` would freeze it: via `calculator.max_sb` against
+    the REAL seeded VMQ 689 constants, never a hand-typed number, so a future
+    change to those constants cannot silently desync this fixture from what
+    the real lifecycle would have produced (92 ha × 12 c/ha -> 250, the
+    task-7 brief's own worked example). The season window covers the whole
+    May-September range this stage's preview/save tests run their periods
+    over, and an empty `rest_years` never blocks on rotation — this fixture
+    exists to test the LIMIT, not season/rotation admissibility."""
+    effective_from = date(2020, 1, 1)
+    limit_params = await norm_params.load_limit_params(db, on_date=effective_from)
+    max_sb_value = calculator.max_sb(
+        area_ha=CONTOUR_AREA_HA, yield_c_per_ha=Decimal("12.0"), params=limit_params
+    )
+    norm = Norm(
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        yield_c_per_ha=Decimal("12.0"),
+        season={"windows": [{"from": "04-01", "to": "10-31"}]},
+        rotation={"rest_years": []},
+        max_sb=max_sb_value,
+        effective_from=effective_from,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+    return norm.id
 
 
 @pytest.fixture

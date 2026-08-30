@@ -25,11 +25,11 @@ from app.modules.auth import repo as auth_repo
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
-from app.modules.norms import calculator, repo
+from app.modules.norms import calculator, checks, repo
 from app.modules.norms import params as norm_params
-from app.modules.norms.models import Norm, RuleParameter, Tariff
+from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
 from app.modules.norms.permissions import TARIFFS_PUBLISH
-from app.modules.norms.schemas import NormIn, NormPatch
+from app.modules.norms.schemas import CalculationIn, NormIn, NormPatch
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,7 @@ async def _row_or_404(db: AsyncSession, kind: _Versioned, row_id: uuid.UUID) -> 
     return row
 
 
-def _snapshot(row: RuleParameter | Tariff | Norm) -> dict[str, Any]:
+def _snapshot(row: RuleParameter | Tariff | Norm | Calculation) -> dict[str, Any]:
     """JSON-safe view of a versioned row for audit `old_value`/`new_value`
     (lesson: a JSONB column fed by the stock `json.dumps` rejects
     Decimal/date/UUID — `DomainError`'s own response has the same gap, but
@@ -68,7 +68,12 @@ def _snapshot(row: RuleParameter | Tariff | Norm) -> dict[str, Any]:
     of those three). Built by walking the mapped columns rather than a
     hand-typed field list, since `RuleParameter`/`Tariff`/`Norm` share no field
     names beyond the versioned-lifecycle ones. `Norm`'s own `season`/`rotation`
-    JSONB dicts need no extra handling here — they are already JSON-safe."""
+    JSONB dicts need no extra handling here — they are already JSON-safe.
+    Reused as-is for `Calculation` (Task 7): its `input_snapshot`/`breakdown`
+    JSONB columns are already fully `jsonable()`-safe by the time a row is
+    built, so this walk's per-column Decimal/date/UUID coercion never has
+    anything left to do for those two — it only matters for the plain scalar
+    columns beside them (`amount`, `used_sb`, `created_at`, ...)."""
     data: dict[str, Any] = {}
     for column in row.__table__.columns:
         value = getattr(row, column.name)
@@ -627,3 +632,180 @@ async def archive_norm(db: AsyncSession, norm_id: uuid.UUID, *, actor: User) -> 
         new_value=_snapshot(norm),
     )
     return norm
+
+
+# --- Task 7: preview and saved calculations. `_compute` is the ONE path both
+# `preview` and `save_calculation` run through, so the arithmetic behind them
+# can never become two implementations that quietly drift apart — they differ
+# only in what they do with the result: a preview reports it, a save commits
+# it (or refuses to).
+
+
+async def _resolve_activity_code(db: AsyncSession, activity_type_id: uuid.UUID) -> str:
+    """Same existence guard `create_norm`/`create_versioned` already apply to
+    this FK, plus the CODE `CalcRequest.activity_code` needs — resolved
+    through `admin.repo`, never a direct `activity_types` query (module
+    boundary, 'Reference data')."""
+    known = await admin_repo.list_activity_types(db)
+    activity = next((a for a in known if a.id == activity_type_id), None)
+    if activity is None:
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    return activity.code
+
+
+def _assert_grazing_coefficients_known(
+    request: calculator.CalcRequest, snapshot: calculator.ParamSnapshot
+) -> None:
+    """`calculator.calculate` only resolves `coef_sb:<code>` when a norm is
+    already on record for this contour — it needs the number solely for the
+    breakdown's `limit` line, which has nothing to compare against otherwise
+    (see `calculate`'s own `if snapshot.norm is not None:` gate). But a herd's
+    size in conditional heads is knowable independent of whether VMQ 689's
+    norm has been drafted for THIS contour yet, and a missing `coef_sb:<code>`
+    is a broken INPUT either way (ruling 6: never a default, never a silent
+    zero). Checked up front so a grazing request gets the same self-naming
+    ERR-NORM-004 whether or not a norm happens to exist yet — never a preview
+    that quietly shows no limit at all because the coefficient it would need
+    to check one was never even looked up."""
+    if request.activity_code != calculator.GRAZING:
+        return
+    for item in request.items:
+        code = f"coef_sb:{item.livestock_code}"
+        if code not in snapshot.values:
+            raise err("ERR-NORM-004", details={"code": code})
+
+
+async def _compute(
+    db: AsyncSession, payload: CalculationIn
+) -> tuple[
+    calculator.CalcRequest,
+    calculator.ParamSnapshot,
+    calculator.CalcResult,
+    list[checks.CheckResult],
+]:
+    """Builds the request, loads the snapshot, computes the amount and runs
+    every admissibility check against that SAME request/snapshot pair.
+
+    `contour_id` is checked for existence the way `_assert_norm_zone` checks
+    it for a norm — via `gis_service.contour_organization`, never a direct
+    `contours` query (module boundary) — but WITHOUT a zone check: an
+    applicant has no leshoz of their own, and pricing any contour nationwide
+    is exactly what `tz/04` С3 asks this route to do. `area_ha` is recorded
+    for `input_snapshot` from the contour's own PUBLISHED area (never a
+    caller-declared figure, same principle as `contour_versions.area_ha`
+    itself) — `Decimal('0')` when the contour has none, since it plays no
+    part in `Amount` either way (calculator.py's own docstring).
+
+    Does NOT itself guard `period_to < period_from`: `checks.run_checks`
+    already rejects a reversed or oversized period before any check runs, and
+    duplicating that guard here would be exactly the class of bug the 'a
+    per-endpoint guard is not a root fix' lesson warns about — this module IS
+    that one shared entry point, so the guard stays where it already lives."""
+    activity_code = await _resolve_activity_code(db, payload.activity_type_id)
+    if await gis_service.contour_organization(db, payload.contour_id) is None:
+        raise err("ERR-SYS-003")
+    version = await gis_service.published_version(db, payload.contour_id)
+    area_ha = version.area_ha if version is not None else Decimal("0")
+
+    request = calculator.CalcRequest(
+        activity_code=activity_code,
+        on_date=business_today(),
+        period_from=payload.period_from,
+        period_to=payload.period_to,
+        area_ha=area_ha,
+        items=tuple(
+            calculator.LivestockItem(item.livestock_code, item.count) for item in payload.items
+        ),
+        quantity=payload.quantity,
+        benefit_code=payload.benefit_code,
+    )
+    snapshot = await norm_params.load_snapshot(
+        db,
+        request=request,
+        contour_id=payload.contour_id,
+        activity_type_id=payload.activity_type_id,
+    )
+    _assert_grazing_coefficients_known(request, snapshot)
+    result = calculator.calculate(request, snapshot)
+    check_results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=payload.contour_id,
+        activity_type_id=payload.activity_type_id,
+        snapshot=snapshot,
+        used_sb=result.used_sb,
+    )
+    return request, snapshot, result, check_results
+
+
+async def preview(db: AsyncSession, *, payload: CalculationIn, actor: User) -> dict[str, Any]:
+    """Compute and report. Changes nothing, so a failed CHECK is data in the
+    response, not an HTTP error (design/03) — but a broken INPUT still is one:
+    a missing parameter (ERR-NORM-004) or an unknown benefit code (ERR-VAL-001)
+    mean the answer would be a fiction, and a fiction is worse than a 422.
+
+    `actor` is unused today (no permission or zone rule beyond the route's own
+    `get_current_user` — an applicant prices their own request, tz/04 С3) and
+    kept only for signature symmetry with `save_calculation`; nothing here is
+    audited either, matching `test_a_preview_writes_nothing`'s own name."""
+    _, _, result, check_results = await _compute(db, payload)
+    return calculator.jsonable(
+        {
+            "amount": result.amount,
+            "used_sb": result.used_sb,
+            "max_sb": result.max_sb,
+            "remaining_sb": result.remaining_sb,
+            "breakdown": result.breakdown,
+            "rule_code_version": result.rule_code_version,
+            "checks": check_results,
+            "input_snapshot": result.input_snapshot,
+        }
+    )
+
+
+async def save_calculation(db: AsyncSession, *, payload: CalculationIn, actor: User) -> Calculation:
+    """The same arithmetic, persisted. Here a blocking check DOES refuse:
+    `first_blocking_error` raises ERR-NORM-001/002/003 with the whole check
+    list in `details`. A saved calculation is what an invoice is built from
+    (3.10) — always a NEW row (`calculations` is append-only, migration 0011):
+    a recalculation for the same `application_id` is a second insert, never
+    an UPDATE (ruling 21)."""
+    _, _, result, check_results = await _compute(db, payload)
+    blocking = checks.first_blocking_error(check_results)
+    if blocking is not None:
+        raise blocking
+    row = Calculation(
+        application_id=payload.application_id,
+        contour_id=payload.contour_id,
+        activity_type_id=payload.activity_type_id,
+        rule_code_version=result.rule_code_version,
+        input_snapshot=result.input_snapshot,
+        used_sb=result.used_sb,
+        max_sb=result.max_sb,
+        remaining_sb=result.remaining_sb,
+        amount=result.amount,
+        breakdown=result.breakdown,
+        created_by=actor.id,
+    )
+    db.add(row)
+    await db.flush()
+    # A fixed-scale NUMERIC round-trips at the COLUMN's own precision, not the
+    # calculator's (lesson) — refresh before either the audit snapshot below or
+    # the response reads amount/used_sb/remaining_sb back.
+    await db.refresh(row)
+    await audit.log(
+        db,
+        action="calculation.create",
+        user_id=actor.id,
+        object_type="calculation",
+        object_id=row.id,
+        new_value=_snapshot(row),
+    )
+    return row
+
+
+async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calculation:
+    row = await db.get(Calculation, calculation_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    return row

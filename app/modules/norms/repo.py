@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.norms.models import Norm, RuleParameter, Tariff
+from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
 
 
 def _in_force(model: type[RuleParameter] | type[Tariff] | type[Norm], on_date: date):
@@ -161,6 +161,20 @@ async def list_norms(
     if status is not None:
         stmt = stmt.where(Norm.status == status)
     stmt = stmt.order_by(Norm.effective_from, Norm.id)
+    return await paginate(db, stmt, limit, offset)
+
+
+async def list_calculations(
+    db: AsyncSession, *, application_id: uuid.UUID | None, limit: int, offset: int
+) -> tuple[list[Calculation], int]:
+    """An append-only table's history, NEWEST first — the one list in this
+    module not ordered by `effective_from`, since a calculation has no period
+    of its own. `id` breaks a `created_at` tie: `uuid7` is time-ordered, so it
+    agrees with insertion order even when two saves land in the same tick."""
+    stmt = select(Calculation)
+    if application_id is not None:
+        stmt = stmt.where(Calculation.application_id == application_id)
+    stmt = stmt.order_by(Calculation.created_at.desc(), Calculation.id.desc())
     return await paginate(db, stmt, limit, offset)
 
 
