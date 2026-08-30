@@ -523,6 +523,29 @@ Rules for this file:
   another module — that will ever be combined with a write fixture in the same
   test; do not assume the client fixture's own setup-time commit is enough.
 
+## `DomainError`'s JSON response has no encoder — a raw Decimal/UUID in `details` is a 500
+
+- **Rule:** Before passing any value read from the database (not a hand-built
+  dict of plain strings) into `err(..., details=...)`, convert it to a
+  JSON-safe structure first (`float`/`str`, recursively) — never assume
+  `details` gets the same treatment a pydantic `response_model` would.
+- **Why:** `app.main`'s `DomainError` handler renders the response with
+  Starlette's `JSONResponse` — stock `json.dumps`, no encoder configured at
+  all — unlike a `response_model` route, which goes through pydantic's own
+  serializer. `gis.service.publish_version`'s `ERR-GIS-003` details carry
+  `checks._intersections`' raw `Decimal` (`area_m2`) and `uuid.UUID`
+  (`feature_id`): passing them through unconverted raised `TypeError` INSIDE
+  the exception handler itself while it built the response, turning a
+  blocked publish's clean 422 into a 500 (stage 3.6a task 5; caught by the
+  task's own overlap test, confirmed by temporarily reverting the fix and
+  watching the same test fail with exactly that traceback).
+- **How to apply:** Any new `err(..., details=...)` call whose details
+  originate from a DB read needs its own recursive JSON-safety pass first —
+  `gis.service._checks_jsonable` is the template. `gis.schemas._jsonable_details`
+  solves the same problem one layer up, for a pydantic-serialized response —
+  a different code path hitting the same root cause, kept as a separate
+  local copy rather than shared (see that module's own note).
+
 ## A fixed test geometry that a `_client_for` client commits accumulates forever
 
 - **Rule:** A fixture whose test needs an EMPTY neighbourhood (a "nothing else
