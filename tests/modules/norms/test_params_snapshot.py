@@ -8,9 +8,11 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
+from app.db import make_session_factory
 from app.modules.auth.models import User
 from app.modules.gis.models import Contour
 from app.modules.norms import params
@@ -179,3 +181,35 @@ async def test_load_snapshot_returns_the_published_norm_in_force(
     assert snapshot.norm.max_sb == 27
     assert snapshot.norm.yield_c_per_ha == Decimal("12.0")
     assert snapshot.norm.season == {"windows": [{"from": "04-01", "to": "10-31"}]}
+
+
+async def test_published_coef_sb_does_not_leak_a_sibling_fixtures_flushed_row(
+    published_contour: Contour,
+    published_coef_sb: None,
+    engine,
+) -> None:
+    """Fix-round 1, finding 5, regression pin. `published_coef_sb` used to
+    take the test's own `db` fixture and call `db.commit()` directly — the
+    `db` fixture's isolation is `yield session; await session.rollback()`,
+    and `published_contour` (via `make_contour`/`make_version`) only
+    `add()`+`flush()`es on that SAME session, relying on that rollback for
+    cleanup. Committing the shared session would have committed the contour
+    too, permanently, into the shared test database.
+
+    Listing `published_contour` BEFORE `published_coef_sb` (pytest
+    instantiates a test's fixtures left-to-right) reproduces the exact
+    ordering the old bug needed: the contour is flushed first, then
+    `published_coef_sb` used to commit everything pending. Checking through a
+    THIRD, wholly independent session — never the test's own `db` — proves
+    the contour was never actually persisted; only `published_coef_sb`'s own
+    rows were, through its own session, and those are cleaned up in its own
+    teardown."""
+    factory = make_session_factory(engine)
+    async with factory() as fresh:
+        row = await fresh.execute(
+            text("SELECT 1 FROM contours WHERE id = :id"), {"id": published_contour.id}
+        )
+        assert row.first() is None, (
+            "a flush-only sibling fixture's row became visible on an unrelated "
+            "session — published_coef_sb's commit leaked it"
+        )

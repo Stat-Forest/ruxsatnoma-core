@@ -3,7 +3,11 @@
 Formulas (tz/06, corrected against VMQ 689 by plan 03.7 ruling 5):
     Oz          = yield_c_per_ha × area_ha × season_share
     Oz_eff      = Oz × safety_reserve                       (0.85, the 15% weather reserve)
-    MaxSB       = floor(Oz_eff / sb_feed_norm)              (3.74 c of feed units per head)
+    MaxSB       = round_heads(Oz_eff / sb_feed_norm)        (3.74 c of feed units per head;
+                                                              `rounding_heads` decides floor vs
+                                                              half-up — ruling 19 defaults it to
+                                                              floor, never up, but the MODE itself
+                                                              is a parameter like any other)
     UsedSB      = Σ count_i × coef_sb:<code_i>
     RemainingSB = MaxSB − already-committed load            (LOAD_PROVIDERS, ruling 12)
     Amount      = БҲМ × coefficient × quantity              (VMQ 278; the unit is per activity)
@@ -151,9 +155,9 @@ def _rule(values: Mapping[str, Any], code: str) -> Mapping[str, Any]:
     `rounding_money`/`rounding_heads` via `CAST(:value AS jsonb)`, not
     `to_jsonb(CAST(:value AS text))`, so they come back as a `dict`, never a
     `str`. `_param`'s own `-> str` annotation would be the wrong shape to
-    reuse here (and a real pyright mismatch against `_round_money`'s
-    `Mapping[str, Any]` parameter) — same self-naming ERR-NORM-004, different
-    declared type."""
+    reuse here (and a real pyright mismatch against `_round_money`'s and
+    `_round_heads`'s `Mapping[str, Any]` parameter) — same self-naming
+    ERR-NORM-004, different declared type."""
     if code not in values:
         raise err("ERR-NORM-004", details={"code": code})
     return values[code]
@@ -162,11 +166,44 @@ def _rule(values: Mapping[str, Any], code: str) -> Mapping[str, Any]:
 def _round_money(amount: Decimal, rule: Mapping[str, Any]) -> Decimal:
     """ROUND_HALF_UP, not Python's default ROUND_HALF_EVEN: tz/06 says ≥0.5 goes
     up, and a banker's-rounding sum would be a cent off in a way nobody can
-    explain to an accountant."""
-    step = Decimal(str(rule.get("step", 1)))
-    if rule.get("mode") == "half_up":
+    explain to an accountant.
+
+    `mode` and `step` are both REQUIRED (fix-round 1, finding 4): this used to
+    default a missing `step` to 1 and silently take the floor branch for
+    ANY mode other than `"half_up"` — so an admin's `{"mode": "HALF_UP"}`
+    typo (wrong case) or a `rounding_money` republished with no `step` at all
+    floored the 0.5-rounds-up boundary DOWN to 0 with no error, defeating the
+    one test written to prevent exactly that. An unrecognised mode or a
+    missing step is now the same self-naming ERR-NORM-004 as every other
+    missing/invalid parameter, never a silent default."""
+    if "step" not in rule:
+        raise err("ERR-NORM-004", details={"code": "rounding_money"})
+    step = Decimal(str(rule["step"]))
+    mode = rule.get("mode")
+    if mode == "half_up":
         return (amount / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step
-    return (amount / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if mode == "floor":
+        return (amount / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    raise err("ERR-NORM-004", details={"code": "rounding_money"})
+
+
+def _round_heads(value: Decimal, rule: Mapping[str, Any]) -> int:
+    """Applies `rounding_heads` to the feed-stock quotient inside `max_sb` —
+    `"floor"` (ruling 19: a limit is never rounded in the applicant's favour)
+    or `"half_up"`, nothing else.
+
+    Fix-round 1, finding 3: `rounding_heads` used to be loaded into every
+    snapshot and never read at all — half of "rounding is a parameter" was
+    silently unenforced. An unrecognised mode is exactly as dangerous here as
+    it is for money (a limit rounded the wrong way silently over- or
+    under-grants grazing capacity), so it raises the same self-naming
+    ERR-NORM-004 rather than defaulting."""
+    mode = rule.get("mode")
+    if mode == "floor":
+        return int(value.to_integral_value(ROUND_FLOOR))
+    if mode == "half_up":
+        return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    raise err("ERR-NORM-004", details={"code": "rounding_heads"})
 
 
 def _fmt6(value: Decimal) -> str:
@@ -197,14 +234,20 @@ def _apply_benefit(
 ) -> tuple[Decimal, dict[str, Any] | None]:
     """The coefficient after a claimed benefit, and the breakdown line that
     records it — or `(tariff.coefficient, None)` unchanged when none is
-    claimed. Ruling 20: a benefit code this tariff does not recognise is
-    REJECTED, never silently ignored — charging full price for a claimed
-    benefit is the worst of the three possible behaviours."""
+    claimed, OR when this particular row does not itself define it.
+
+    Whether the CLAIM as a whole is legitimate is `_check_benefit_claim`'s
+    job, called once up front against every row `calculate` resolved for this
+    request. By the time this runs, the code is already known to be real for
+    the request as a whole, so a row that happens not to grant it (a benefit
+    that only some livestock groups carry, say) is not an error here — just a
+    no-op for that one line, never a silent full-price charge for the request
+    as a whole (ruling 20)."""
     if benefit_code is None:
         return tariff.coefficient, None
     modifiers: dict[str, str] = tariff.benefit_modifiers or {}
     if benefit_code not in modifiers:
-        raise err("ERR-VAL-001", details={"reason": "unknown_benefit_code", "code": benefit_code})
+        return tariff.coefficient, None
     modifier = str(modifiers[benefit_code])
     coefficient_after = tariff.coefficient * Decimal(modifier)
     line = {
@@ -217,10 +260,33 @@ def _apply_benefit(
     return coefficient_after, line
 
 
+def _check_benefit_claim(benefit_code: str | None, tariffs: list[TariffFact]) -> None:
+    """Ruling 20, closed fully (fix-round 1, finding 1): validates a claimed
+    benefit ONCE, up front, against the UNION of every tariff row `calculate`
+    actually resolved for this request — never deferred to `_apply_benefit`,
+    which only ever sees rows that already exist and so could not catch a
+    code that reaches no row at all. Three paths used to accept a bogus code
+    with no error at all, silently recording it in `input_snapshot` as if it
+    had been honoured: grazing with an empty `items`, a flat activity with no
+    tariff row (`science`), and a grazing group whose own tariff row is
+    missing (now closed structurally — that case raises `ERR-NORM-004` in
+    `calculate` before this function is even reached). A code valid for AT
+    LEAST ONE resolved row is accepted for the whole request; `_apply_benefit`
+    then decides per row whether it actually applies there."""
+    if benefit_code is None:
+        return
+    known: set[str] = set()
+    for tariff in tariffs:
+        known.update((tariff.benefit_modifiers or {}).keys())
+    if benefit_code not in known:
+        raise err("ERR-VAL-001", details={"reason": "unknown_benefit_code", "code": benefit_code})
+
+
 def max_sb(*, area_ha: Decimal, yield_c_per_ha: Decimal, params: Mapping[str, Any]) -> int:
     oz = yield_c_per_ha * area_ha * _decimal(params, "season_share")
     oz_eff = oz * _decimal(params, "safety_reserve")
-    return int((oz_eff / _decimal(params, "sb_feed_norm")).to_integral_value(ROUND_FLOOR))
+    quotient = oz_eff / _decimal(params, "sb_feed_norm")
+    return _round_heads(quotient, _rule(params, "rounding_heads"))
 
 
 def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
@@ -239,21 +305,30 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
     total = Decimal("0")
 
     if request.activity_code == GRAZING:
+        resolved: list[tuple[LivestockItem, str, TariffFact]] = []
         for item in request.items:
             group = _param(values, f"tariff_group:{item.livestock_code}")
             tariff = _resolve_group_tariff(snapshot.tariffs, group)
             if tariff is None:
-                breakdown.append(
-                    {
-                        "kind": "tariff",
-                        "reason": "no_tariff_by_law",
-                        "livestock_code": item.livestock_code,
-                        "group": group,
-                        "count": item.count,
-                        "amount": jsonable(Decimal("0")),
-                    }
+                # VMQ 278 has a published rate for all four grazing groups, so
+                # a missing row here is a GAP in our own tariff table (an
+                # archived row whose replacement has not started yet — legal
+                # under the EXCLUDE index), never the law being silent.
+                # Billing zero under "no_tariff_by_law" would be silent
+                # under-billing with the audit trail asserting lawfulness —
+                # fix-round 1, finding 2.
+                raise err(
+                    "ERR-NORM-004",
+                    details={"code": f"tariff:{request.activity_code}:{group}"},
                 )
-                continue
+            resolved.append((item, group, tariff))
+
+        # Validated ONCE, up front, against every row this request actually
+        # resolved — fix-round 1, finding 1 (an empty `items` used to let a
+        # bogus code through with no error at all).
+        _check_benefit_claim(request.benefit_code, [tariff for _, _, tariff in resolved])
+
+        for item, group, tariff in resolved:
             coefficient, benefit_line = _apply_benefit(tariff, request.benefit_code)
             line_amount = bhm * coefficient * item.count
             total += line_amount
@@ -273,9 +348,17 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
                 breakdown.append(benefit_line)
     else:
         tariff = _resolve_flat_tariff(snapshot.tariffs)
+        # Same up-front validation as the grazing branch, against whatever
+        # was (or was not) resolved — fix-round 1, finding 1's second leak
+        # path: `science` (no tariff row at all) used to accept any bogus
+        # code silently.
+        _check_benefit_claim(request.benefit_code, [tariff] if tariff is not None else [])
         if tariff is None:
-            # Ruling 1: VMQ 278 has no rate for `science` — contracted
-            # separately. A missing tariff is a legitimate zero, not an error.
+            # Ruling 1: VMQ 278 genuinely has no rate for `science` (and any
+            # other flat activity with no published row) — contracted
+            # separately. Unlike the grazing branch above, there is no
+            # per-group table to have a GAP in: a missing flat tariff IS the
+            # law being silent, so this is a legitimate zero, not an error.
             breakdown.append(
                 {
                     "kind": "tariff",
@@ -334,6 +417,11 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
         "tariffs": [jsonable(asdict(t)) for t in snapshot.tariffs],
         "norm": jsonable(asdict(snapshot.norm)) if snapshot.norm is not None else None,
         "rule_code_version": RULE_CODE_VERSION,
+        # Fix-round 1, finding 6 (controller ruling): remaining_sb = max_sb -
+        # load_sb, so without these two the snapshot alone cannot reproduce
+        # that one number years later — the whole point of this column.
+        "load_sb": jsonable(snapshot.load_sb),
+        "load_source": snapshot.load_source,
     }
 
     return CalcResult(

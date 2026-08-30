@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.models import MediaFile
-from app.db import uuid7
+from app.db import make_session_factory, uuid7
 from app.modules.auth.models import User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.norms.permissions import (
@@ -230,7 +230,7 @@ async def tariffs_checker_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncC
 
 
 @pytest.fixture
-async def published_coef_sb(db: AsyncSession) -> AsyncIterator[None]:
+async def published_coef_sb(engine) -> AsyncIterator[None]:
     """Conditional-head coefficients a grazing calculation can actually read.
 
     The ten seeded `coef_sb:*` rows are DRAFT by ruling 8 and are shared,
@@ -238,29 +238,48 @@ async def published_coef_sb(db: AsyncSession) -> AsyncIterator[None]:
     `_client_for` request's commit and permanently break the seed test. Instead
     this inserts its own published rows for the same codes — legal, because the
     EXCLUDE constraint only covers `status = 'published'` and the seeds are not —
-    and deletes them by id in teardown."""
-    ids: list[uuid.UUID] = []
-    rows = await db.execute(
-        text("SELECT code, value #>> '{}' FROM rule_parameters WHERE code LIKE 'coef_sb:%'")
-    )
-    for code, value in rows.all():
-        row_id = uuid7()
-        await db.execute(
+    and deletes them by id in teardown.
+
+    Fix-round 1, finding 5: this used to take the TEST's own `db` fixture and
+    call `db.commit()` on it directly — but the `db` fixture's isolation is
+    `yield session; await session.rollback()`, and sibling fixtures like
+    `published_contour`/`survey_doc`/`approval_doc` only `add()`+`flush()` on
+    that SAME session, relying on that rollback for cleanup. Committing the
+    shared session here would commit THEIR pending rows too, permanently —
+    exactly the corruption class this stage has already shipped twice
+    (lessons.md). Opening its own session via `make_session_factory(engine)`
+    means this fixture's commit can never reach anything the test's `db`
+    session has only flushed. The SELECT is also now scoped to
+    `status = 'draft'`, so a published row leaked by an earlier failure
+    cannot make this insert a second, overlapping published row for the same
+    code."""
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        ids: list[uuid.UUID] = []
+        rows = await own_db.execute(
             text(
-                "INSERT INTO rule_parameters (id, code, value, effective_from, basis, status) "
-                "VALUES (:id, :code, to_jsonb(CAST(:value AS text)), DATE '2020-01-01', "
-                "'test override', 'published')"
-            ).bindparams(id=row_id, code=code, value=value)
+                "SELECT code, value #>> '{}' FROM rule_parameters "
+                "WHERE code LIKE 'coef_sb:%' AND status = 'draft'"
+            )
         )
-        ids.append(row_id)
-    await db.commit()
-    try:
-        yield
-    finally:
-        await db.execute(
-            text("DELETE FROM rule_parameters WHERE id = ANY(:ids)").bindparams(ids=ids)
-        )
-        await db.commit()
+        for code, value in rows.all():
+            row_id = uuid7()
+            await own_db.execute(
+                text(
+                    "INSERT INTO rule_parameters (id, code, value, effective_from, basis, status) "
+                    "VALUES (:id, :code, to_jsonb(CAST(:value AS text)), DATE '2020-01-01', "
+                    "'test override', 'published')"
+                ).bindparams(id=row_id, code=code, value=value)
+            )
+            ids.append(row_id)
+        await own_db.commit()
+        try:
+            yield
+        finally:
+            await own_db.execute(
+                text("DELETE FROM rule_parameters WHERE id = ANY(:ids)").bindparams(ids=ids)
+            )
+            await own_db.commit()
 
 
 @pytest.fixture
