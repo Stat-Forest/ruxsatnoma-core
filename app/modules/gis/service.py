@@ -21,7 +21,14 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.models import User
 from app.modules.gis import checks, repo
-from app.modules.gis.models import Contour, ContourVersion, GisImport, GisLayer, LayerFeature
+from app.modules.gis.models import (
+    CONTOUR_LAYER_CODE,
+    Contour,
+    ContourVersion,
+    GisImport,
+    GisLayer,
+    LayerFeature,
+)
 
 
 def _json_safe(value: Any) -> Any:
@@ -136,6 +143,29 @@ async def _assert_in_zone(db: AsyncSession, actor: User, organization_id: uuid.U
         raise err("ERR-ACL-001")
 
 
+async def _assert_parent(
+    db: AsyncSession,
+    parent_id: uuid.UUID,
+    *,
+    organization_id: uuid.UUID,
+    child_id: uuid.UUID | None = None,
+) -> None:
+    """A sub-contour's parent must exist and belong to the SAME organization —
+    `contours.parent_id` is a plain FK with no organization condition of its
+    own, so nothing below this stops a leshoz from hanging its sub-contour off
+    another leshoz's row. Shared by `create_contour` and `update_contour`
+    (decision #49 ruling 11: the importer creates everything flat and the
+    hierarchy is set afterwards through `PATCH /gis/contours/{id}`), so the two
+    cannot drift apart."""
+    if child_id is not None and parent_id == child_id:
+        raise err("ERR-VAL-001", details={"reason": "parent_is_self"})
+    parent = await repo.contour_by_id(db, parent_id)
+    if parent is None:
+        raise err("ERR-VAL-001", details={"reason": "parent_not_found"})
+    if parent.organization_id != organization_id:
+        raise err("ERR-VAL-001", details={"reason": "parent_other_organization"})
+
+
 async def create_contour(
     db: AsyncSession,
     *,
@@ -164,10 +194,31 @@ async def create_contour(
     same check `update_contour`/`create_version`/`update_version` already apply
     to an existing row, applied here to the request's own value before any row
     exists (final review, finding 1).
+
+    Every reference the request supplies — `layer_id`, `organization_id`,
+    `parent_id` — is resolved BEFORE the insert, so the one `IntegrityError`
+    left to catch is the unique violation it names. `except IntegrityError`
+    also catches an FK violation, and this function used to report all four
+    failures as `409 ERR-GIS-005 {"reason": "number_taken"}`: a nonexistent
+    layer answered "that number is taken". Nothing checked that the layer WAS
+    the contours layer either, so a contour could be created under
+    `water_points` and would still appear in `list_contours`, which filters by
+    no layer at all. `create_feature` already reasons this way (layer resolved
+    first, the residual `IntegrityError` meaning the one FK the caller
+    supplies); this now matches it.
     """
     await _assert_in_zone(db, actor, organization_id)
-    if parent_id is not None and kind != "subcontour":
-        raise err("ERR-VAL-001", details={"reason": "parent_needs_subcontour"})
+    layer = await repo.layer_by_id(db, layer_id)
+    if layer is None:
+        raise err("ERR-SYS-003")
+    if layer.code != CONTOUR_LAYER_CODE:
+        raise err("ERR-VAL-001", details={"reason": "not_the_contours_layer"})
+    if await admin_repo.get_organization(db, organization_id) is None:
+        raise err("ERR-VAL-001", details={"reason": "organization_not_found"})
+    if parent_id is not None:
+        if kind != "subcontour":
+            raise err("ERR-VAL-001", details={"reason": "parent_needs_subcontour"})
+        await _assert_parent(db, parent_id, organization_id=organization_id)
     contour = Contour(
         layer_id=layer_id,
         organization_id=organization_id,
@@ -180,9 +231,12 @@ async def create_contour(
     try:
         await db.flush()
     except IntegrityError as exc:
-        # The session is poisoned after this (same reasoning as create_version's
-        # DBAPIError below) — raise immediately, touch `db` no further on this
-        # path; get_db's rollback-on-exception clears the aborted transaction.
+        # `uq_contours_org_number`, the one constraint left that a pre-check
+        # cannot own: the number's uniqueness genuinely races against other
+        # concurrent creates. The session is poisoned after this (same
+        # reasoning as create_version's DBAPIError below) — raise immediately,
+        # touch `db` no further on this path; get_db's rollback-on-exception
+        # clears the aborted transaction.
         raise err("ERR-GIS-005", details={"reason": "number_taken"}) from exc
     await audit.log(
         db,
@@ -789,7 +843,7 @@ async def _load_import_for_transition(
         raise err("ERR-SYS-003")
     await _assert_in_zone(db, actor, row.organization_id)
     layer = await db.get(GisLayer, row.layer_id)
-    if layer is None or layer.code != "contours":
+    if layer is None or layer.code != CONTOUR_LAYER_CODE:
         raise err("ERR-GIS-005", details={"reason": "not_a_contour_batch"})
     if row.status != expected_status:
         raise err("ERR-GIS-005", details={"reason": "bad_transition", "from": row.status})

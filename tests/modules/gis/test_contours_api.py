@@ -1,5 +1,7 @@
 """Contour identity + draft versions through the API, with the zone rule of ruling 18."""
 
+import uuid
+
 from app.modules.gis import repo
 
 
@@ -223,3 +225,55 @@ async def test_a_version_number_race_is_a_conflict_not_a_geometry_error(
     body = second.json()
     assert body["error"]["code"] == "ERR-GIS-005"
     assert body["error"]["details"]["reason"] == "version_conflict"
+
+
+async def test_an_unknown_layer_is_404_not_a_taken_number(gis_client, leshoz):
+    """`except IntegrityError` used to swallow the FK violations on
+    `layer_id`/`organization_id`/`parent_id` alongside the unique violation it
+    was written for, so a nonexistent layer answered
+    `409 ERR-GIS-005 {"reason": "number_taken"}` — "that number is taken" for a
+    layer that does not exist."""
+    resp = await gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(uuid.uuid4()),
+            "organization_id": str(leshoz.id),
+            "number": f"nolayer-{uuid.uuid4().hex[:6]}",
+            "kind": "contour",
+        },
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "ERR-SYS-003"
+
+
+async def test_a_contour_cannot_be_created_under_a_non_contour_layer(db, gis_client, leshoz):
+    """Nothing checked that `layer_id` WAS the contours layer, so a contour
+    could be created under `water_points` — and would still show up in
+    `list_contours`, which filters by no layer at all."""
+    water_points = await repo.layer_by_code(db, "water_points")
+    assert water_points is not None
+    resp = await gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(water_points.id),
+            "organization_id": str(leshoz.id),
+            "number": f"wrong-layer-{uuid.uuid4().hex[:6]}",
+            "kind": "contour",
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["details"]["reason"] == "not_the_contours_layer"
+
+
+async def test_an_unknown_organization_is_422_not_a_taken_number(gis_client, contours_layer):
+    resp = await gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(contours_layer.id),
+            "organization_id": str(uuid.uuid4()),
+            "number": f"noorg-{uuid.uuid4().hex[:6]}",
+            "kind": "contour",
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["details"]["reason"] == "organization_not_found"

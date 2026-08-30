@@ -31,6 +31,12 @@ async def layer_by_code(db: AsyncSession, code: str) -> GisLayer | None:
     return result.scalar_one_or_none()
 
 
+async def layer_by_id(db: AsyncSession, layer_id: uuid.UUID) -> GisLayer | None:
+    """The catalogue row a request named by id — `POST /gis/contours` takes
+    `layer_id` in its body, not a code."""
+    return await db.get(GisLayer, layer_id)
+
+
 def normalised(geojson_param: Any) -> Any:
     """Ruling 10, as one SQL expression: force 2D (the source is PolygonZ with a
     vertical datum we ignore), repair self-intersections, keep only polygonal

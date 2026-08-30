@@ -42,6 +42,11 @@ IMPORT_STATUSES = ("pending", "processing", "review", "approved", "done", "faile
 IMPORT_FORMATS = ("shp", "geojson", "kml", "kmz", "gpkg", "csv", "zip")
 GEOMETRY_SOURCES = ("cadastre", "survey", "aerial", "gps", "import")
 
+# The one layer whose features are contours (identity + versioned geometry);
+# every other layer's features are `layer_features` rows. Lives here rather
+# than in a service so `service` and `import_service` share ONE definition.
+CONTOUR_LAYER_CODE = "contours"
+
 
 class GisLayer(Base):
     """The 15 layers of tz/07, seeded by migration 0010 with fixed ids."""

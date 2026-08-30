@@ -39,7 +39,13 @@ from app.modules.gis import importer, repo
 # bitten by before. Nothing outside `gis` reaches for them.
 from app.modules.gis import service as gis_service
 from app.modules.gis.importer import ParsedFeature, RowError
-from app.modules.gis.models import IMPORT_FORMATS, Contour, GisImport, GisLayer
+from app.modules.gis.models import (
+    CONTOUR_LAYER_CODE,
+    IMPORT_FORMATS,
+    Contour,
+    GisImport,
+    GisLayer,
+)
 from app.modules.notifications import service as notifications_service
 
 logger = structlog.get_logger(__name__)
@@ -47,10 +53,6 @@ logger = structlog.get_logger(__name__)
 CREATE_ACTION = "gis_import.create"
 FINISH_ACTION = "gis_import.finish"
 IMPORT_EVENT = "gis.import.finished"
-
-# The one layer whose features are contours (identity + versioned geometry);
-# every other layer's features are `layer_features` rows.
-CONTOUR_LAYER_CODE = "contours"
 
 # Attribute-map keys this importer understands. Deliberately narrow for the
 # contour layer (ruling 13): the Agency's file also carries tenant names and
