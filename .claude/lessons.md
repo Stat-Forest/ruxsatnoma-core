@@ -799,3 +799,44 @@ Rules for this file:
 - **How to apply:** Page an endpoint and grep its tests for unfiltered `GET`s in
   the same commit; assert against `total` and an explicitly scoped query, never
   against membership in an unbounded default page.
+
+## A re-exported fixture shadowed by a same-file parameter trips ruff's F811, unlike a fixture defined locally
+
+- **Rule:** When a conftest.py imports another module's fixture ONLY to re-export
+  it (`# noqa: F401`) and ALSO uses that same name as a plain parameter on a
+  fixture defined in the SAME file, import it as `from module import name as
+  name` instead — never rename the parameter, since that would break pytest's
+  name-based fixture injection.
+- **Why:** Pyflakes flags a parameter shadowing an import it considers "unused"
+  as `RedefinedWhileUnused` (F811), even though the identical shape is silent
+  when the earlier binding is a locally-defined `@pytest.fixture` function
+  instead of an import — confirmed empirically both ways: `tests/modules/gis/
+  conftest.py`'s own `published_contour(db, contours_layer, leshoz,
+  approval_doc)` never trips it (those four are DEFINED there), while
+  `tests/modules/norms/conftest.py` re-exporting the same four from gis's
+  conftest and then using them as parameters on `published_contour`/
+  `draft_only_contour`/three client fixtures failed `ruff check` on all four
+  until switched to `as`-imports (stage 3.7 task 1; verified in isolation with
+  a two-line repro — `import os  # noqa: F401` then `def foo(os): return os`
+  — under this project's exact ruff config).
+- **How to apply:** Any new conftest.py that re-exports another module's
+  fixture AND ALSO consumes it locally by parameter name: keep `# noqa: F401`
+  for names you only re-export, but import the ones you also use as a local
+  parameter with `as <same name>` — `ruff check --fix` will even relocate each
+  into its own `from ... import (...)` statement; let it.
+
+## The round-trip test's expected head version is a hardcoded string every new migration must bump
+
+- **Rule:** After adding a migration, update `tests/test_migrations.py::
+  test_downgrade_upgrade_roundtrip`'s `assert version == "<old head>"` to the
+  new revision id, in the same commit.
+- **Why:** The assertion is a literal string, not derived from `alembic
+  heads` — a brand-new migration passes every test of its OWN and still fails
+  this one with a confusing `assert '0011' == '0010'` that reads like a
+  migration-chain bug rather than a one-line test update (hit adding 0011 in
+  stage 3.7 task 1; migration 0010 must have needed the identical bump from
+  `"0009"` and left no trace of having done so).
+- **How to apply:** Whenever a new migration advances the head, grep
+  `tests/test_migrations.py` for the previous head string and update it as
+  part of the same commit — it is not on any task brief's file list by
+  default, so it is easy to only discover by actually running the suite.
