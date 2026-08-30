@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.norms import checks
@@ -19,6 +20,9 @@ pytestmark = pytest.mark.asyncio
 
 SUMMER = {"windows": [{"from": "04-01", "to": "10-31"}]}
 WINTER = {"windows": [{"from": "11-01", "to": "03-31"}]}
+# Two windows with a real gap between them (June) — the case that justifies
+# walking every day instead of just the two ends (fix round 1).
+GAP = {"windows": [{"from": "04-01", "to": "05-31"}, {"from": "07-01", "to": "08-31"}]}
 
 
 def _request(period_from: date, period_to: date, **over) -> CalcRequest:
@@ -295,3 +299,70 @@ async def test_a_norm_with_no_rotation_recorded_passes(
         snapshot=snapshot,
     )
     assert next(c for c in results if c["check"] == "rotation")["result"] == "pass"
+
+
+async def test_the_season_check_catches_a_gap_between_two_windows(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """Fix round 1: two windows can each cover one END of a period while
+    leaving a gap between them uncovered — 04-15 sits inside the first window,
+    08-15 sits inside the second, but the whole of June is in neither. This is
+    the case that justifies walking every day instead of just `period_from`/
+    `period_to`; without it, "optimising" the walk back down to a
+    boundaries-only check would still pass this test suite."""
+    snapshot = _snapshot(
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=Decimal("12"),
+            max_sb=250,
+            season=GAP,
+            rotation={"rest_years": []},
+        )
+    )
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 4, 15), date(2026, 8, 15)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=snapshot,
+    )
+    season_check = next(c for c in results if c["check"] == "season")
+    assert season_check["result"] == "fail"
+    assert season_check["details"]["reason"] == "outside_season"
+
+
+async def test_a_reversed_period_is_refused_before_any_check_runs(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """`period_to < period_from` must not be allowed to quietly no-op every
+    check to a false `pass` — most dangerously `features_intersecting`'s own
+    validity predicate, which would drop a fire ban that genuinely covers the
+    request out of its result set entirely."""
+    with pytest.raises(DomainError) as raised:
+        await checks.run_checks(
+            db,
+            request=_request(date(2026, 9, 30), date(2026, 5, 1)),
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+            snapshot=_snapshot(),
+        )
+    assert raised.value.code == "ERR-VAL-001"
+    assert raised.value.details == {"reason": "period_reversed"}
+
+
+async def test_a_period_longer_than_five_years_is_refused(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """VMQ 689's geobotanical survey is redone every five years — a
+    norm-backed period cannot outlive the survey it is checked against, and
+    the day-by-day season walk stays cheap as a result."""
+    with pytest.raises(DomainError) as raised:
+        await checks.run_checks(
+            db,
+            request=_request(date(2020, 1, 1), date(2027, 1, 1)),
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+            snapshot=_snapshot(),
+        )
+    assert raised.value.code == "ERR-VAL-001"
+    assert raised.value.details == {"reason": "period_too_long"}

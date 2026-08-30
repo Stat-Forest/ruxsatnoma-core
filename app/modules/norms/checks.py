@@ -28,6 +28,13 @@ BLOCKING = frozenset({"norm", "season", "rotation", "fire_ban", "limit"})
 
 SEASON_ERROR = "ERR-NORM-003"
 
+# VMQ 689's geobotanical survey — the basis of a norm's own `season`/
+# `rotation` — is redone every five years, so a requested period cannot
+# outlive the survey it is checked against; this is a domain ceiling, not a
+# tuning knob for the day-by-day walk below (though it also keeps that walk
+# to a few thousand iterations at most, never tens of thousands).
+MAX_PERIOD_DAYS = 5 * 365
+
 # Ruling 15: one round trip against all three layers, split by code afterwards
 # — `fire_bans` becomes its own blocking check, `restrictions`/`protection`
 # fold into one advisory check. Re-declared here (not imported from
@@ -224,21 +231,35 @@ async def run_checks(
     `params.load_snapshot` (the same three pieces of request context) — every
     check below reads what it needs from `request`, `snapshot` and
     `contour_id` instead, since `snapshot.norm` was already resolved for this
-    exact activity by the time it gets here."""
+    exact activity by the time it gets here.
+
+    Guards `period_from`/`period_to` before any check runs, fail-closed: a
+    reversed period would make `_season_check`'s walk and `_rotation_check`'s
+    range both no-op to a false `pass`, and would make
+    `features_intersecting`'s validity predicate (written assuming the normal
+    ordering) drop a fire ban that genuinely covers the request out of its
+    result set entirely — turning the one check this stage exists to make
+    blocking into a false `pass` instead. A per-endpoint guard on whichever
+    router eventually builds `CalcRequest` would not be a root fix: this
+    module is the shared entry point (3.9 calls it directly too), so the
+    guard lives here (lesson: a per-endpoint guard is not a root fix when
+    sibling callers share a precondition)."""
+    period_from, period_to = request.period_from, request.period_to
+    if period_to < period_from:
+        raise err("ERR-VAL-001", details={"reason": "period_reversed"})
+    if (period_to - period_from).days > MAX_PERIOD_DAYS:
+        raise err("ERR-VAL-001", details={"reason": "period_too_long"})
+
     results: list[CheckResult] = [_norm_check(request, snapshot.norm)]
 
     if snapshot.norm is not None:
-        results.append(_season_check(request.period_from, request.period_to, snapshot.norm.season))
-        results.append(
-            _rotation_check(request.period_from, request.period_to, snapshot.norm.rotation)
-        )
+        results.append(_season_check(period_from, period_to, snapshot.norm.season))
+        results.append(_rotation_check(period_from, period_to, snapshot.norm.rotation))
     else:
         results.append({"check": "season", "result": "skipped", "details": {"reason": "no_norm"}})
         results.append({"check": "rotation", "result": "skipped", "details": {"reason": "no_norm"}})
 
-    fire_ban, restrictions = await _territory_checks(
-        db, contour_id, request.period_from, request.period_to
-    )
+    fire_ban, restrictions = await _territory_checks(db, contour_id, period_from, period_to)
     results.append(fire_ban)
     results.append(restrictions)
 
