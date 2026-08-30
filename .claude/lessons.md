@@ -1122,3 +1122,25 @@ Rules for this file:
   in a shared function, check whether the gate actually reads what it claims
   to gate on — a condition never referenced inside its own guarded block is
   the tell.
+
+## A "public surface" task's own end-to-end test can ship the surface untested
+
+- **Rule:** When a task adds new adapter/pass-through functions to a module's
+  public surface FOR a caller that does not exist yet (3.9/3.10/3.11 here),
+  and also writes an HTTP-driven end-to-end test, check whether that test
+  actually calls the NEW functions — an HTTP-only scenario exercises the
+  ROUTES, not the in-process functions a future module will call directly.
+- **Why:** Task 8's given end-to-end test drives `preview`/`save_calculation`/
+  `publish_norm` entirely over `httpx`; the two new functions the task also
+  adds (`service.effective_norm`, `service.run_checks`) are exactly what
+  3.9/3.11 will call IN-PROCESS once they exist, but nothing in the HTTP
+  scenario reaches either — confirmed empirically by hard-coding
+  `run_checks`'s `used_sb=None` to a real Decimal and watching the
+  brief-verbatim test stay green throughout (it has no assertion that could
+  ever fail from that change).
+- **How to apply:** Any task that "documents the public surface" by adding
+  functions for a not-yet-built caller: add a direct in-process call to each
+  NEW function inside the SAME end-to-end test (reusing its already-committed
+  fixtures/state — no second test file needed), asserting it agrees with what
+  the HTTP path already proved. Never ship a contract function whose only
+  verification is that it type-checks.
