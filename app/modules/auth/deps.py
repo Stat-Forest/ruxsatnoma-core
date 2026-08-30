@@ -7,6 +7,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import UploadFile
 
 from app.config import get_settings
 from app.core import settings_store
@@ -174,6 +175,44 @@ def require_any_permission(*codes: str):
     return _check
 
 
+_FORM_CONTENT_TYPES = ("multipart/form-data", "application/x-www-form-urlencoded")
+
+
+async def _fingerprint_body(request: Request) -> bytes:
+    """The bytes the Idempotency-Key fingerprint is taken over.
+
+    A JSON route's raw body is readable here: FastAPI reads it BEFORE solving
+    dependencies and Starlette caches it on the request, so `Request.body()`
+    replays the cache. A FORM route's is not — FastAPI parses the form straight
+    off the stream, leaving `_stream_consumed` set, so the same call re-enters
+    `Request.stream()` and raises `RuntimeError("Stream consumed")`, a 500
+    (reproduced against Starlette 1.6 by wiring `POST /gis/imports` the plain
+    way and watching the request come back 500 before this branch existed).
+
+    For a form request the fingerprint is taken over the already-parsed form
+    instead — `Request.form()` returns Starlette's cached `FormData` and does
+    not touch the stream again. Every scalar field goes in verbatim; a file
+    contributes its field name, filename, content type and size, never its own
+    bytes: re-reading a 100 MB upload on every request would cost far more than
+    the mechanism saves, and those four already tell "the same upload retried"
+    from "a different upload sent under the same key", which is the only
+    question a fingerprint answers. The parts are sorted, so a client that
+    reorders its form fields between the original and the retry still replays
+    rather than colliding with `ERR-SYS-005`.
+    """
+    content_type = request.headers.get("content-type", "")
+    if not any(content_type.startswith(kind) for kind in _FORM_CONTENT_TYPES):
+        return await request.body()
+    form = await request.form()
+    parts: list[str] = []
+    for name, value in form.multi_items():
+        if isinstance(value, UploadFile):
+            parts.append(f"{name}=file:{value.filename}:{value.content_type}:{value.size}")
+        else:
+            parts.append(f"{name}={value}")
+    return "\n".join(sorted(parts)).encode()
+
+
 async def idempotency_context(
     request: Request,
     user: Annotated[User, Depends(get_current_user)],
@@ -188,7 +227,7 @@ async def idempotency_context(
         key = uuid.UUID(raw)
     except ValueError:
         raise err("ERR-VAL-001", details={"reason": "idempotency_key_not_uuid"}) from None
-    body = await request.body()
+    body = await _fingerprint_body(request)
     return await begin(
         db, key=key, user_id=user.id, method=request.method, path=request.url.path, body=body
     )

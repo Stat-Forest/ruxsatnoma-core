@@ -464,3 +464,338 @@ Rules for this file:
   endpoint does the same" was the wrong defence: the others do not PERSIST the body.
 - **How to apply:** New anonymous ingest path → cap what it writes, and say in the
   stored row that it was capped.
+
+## `sa.literal(value, JSONB)` inside `.bindparams()` binds the wrong object
+
+- **Rule:** To insert a JSON/JSONB literal from a raw migration `sa.text(...).bindparams(...)`
+  call, pre-serialize with `json.dumps` and bind it as plain text with an explicit
+  `CAST(:x AS jsonb)` in the SQL — never pass `sa.literal(value, postgresql.JSONB)`
+  as the keyword value.
+- **Why:** `.bindparams(key=sa.literal(v, type_))` sets the param's bound value to
+  the `BindParameter` construct itself, not `v` — asyncpg then receives that
+  construct where it expects serialized text and raises `DataError: ... object has
+  no attribute 'encode'` (migration 0010, caught by the RED/GREEN cycle, never
+  reached a running database).
+- **How to apply:** A raw-SQL JSONB insert in a migration goes through `op.bulk_insert`
+  with a `sa.table`/`sa.column(..., postgresql.JSONB())` and a plain Python dict
+  (0009's pattern, unaffected by this bug) whenever it fits, or `json.dumps(value)`
+  bound as text plus `CAST(:x AS jsonb)` otherwise — never a JSONB-typed `sa.literal`
+  inside `bindparams`.
+
+## A fixed-scale `NUMERIC` column round-trips at its own precision, not the caller's
+
+- **Rule:** A pydantic response field backed by a `NUMERIC(p,s)` column strips
+  trailing zeros explicitly (`format(value, "f").rstrip("0").rstrip(".")`) before
+  the API returns it — never assume the value keeps the request's own precision,
+  and never reach for `Decimal.normalize()` to do the stripping.
+- **Why:** `contour_versions.declared_area_ha` is `NUMERIC(12,4)`; posting `"2.6"`
+  and reading it back gives `Decimal('2.6000')` (confirmed against real Postgres,
+  not just SQLAlchemy) — a bare `Decimal` field then serializes as `"2.6000"`,
+  silently failing a test asserting the reference figure `"2.6"` (task 3). Fixing
+  it with `.normalize()` trades one bug for another: `Decimal('100.0000')
+  .normalize()` is `Decimal('1E+2')`, not `100` — wrong for a whole-number area.
+- **How to apply:** Any new `Decimal`-backed response field on a fixed-scale
+  column gets a `field_serializer` doing the `format(..., "f")`-then-`rstrip`
+  dance (`gis.schemas._trim_decimal`), and a test asserting the exact JSON string
+  a round-tripped value produces — not just its `float()`.
+
+## A `_client_for`-style fixture's setup-time commit only covers what ran before it
+
+- **Rule:** When a test combines a signed-in HTTP-client fixture that commits
+  internally (e.g. `gis_client`) with a SEPARATE fixture writing through the same
+  `db` session (e.g. `leshoz`), the write-fixture's row is invisible to the app's
+  own session unless something commits it again AFTER that fixture runs — pytest
+  instantiates a test's fixtures in the LEFT-TO-RIGHT order of its parameter list
+  (verified empirically with a throwaway fixture-order test), so anything listed
+  AFTER the client is not covered by the client's own setup-time commit.
+- **Why:** `test_gis_specialist_creates_a_contour_and_a_draft_version(gis_client,
+  leshoz, contours_layer)` would FK-fail otherwise: `gis_client`'s internal commit
+  runs before `leshoz` even executes, so `leshoz`'s `flush()`-only row stays
+  invisible to the app's separate connection — confirmed empirically with a fresh,
+  independent asyncpg connection reading `organizations` right after fixture setup
+  and finding nothing there (task 3, first task to combine a `_client_for` client
+  with a write fixture in the same test).
+- **How to apply:** Every client fixture built over `_client_for`
+  (`tests/modules/gis/conftest.py`) registers an httpx `request` event hook
+  (`_commit_pending_before_requests`) that re-commits `db` right before every
+  outgoing call, so any other fixture's writes are picked up regardless of listed
+  order. Copy this pattern for any new signed-in-client fixture — in gis or
+  another module — that will ever be combined with a write fixture in the same
+  test; do not assume the client fixture's own setup-time commit is enough.
+
+## `DomainError`'s JSON response has no encoder — a raw Decimal/UUID in `details` is a 500
+
+- **Rule:** Before passing any value read from the database (not a hand-built
+  dict of plain strings) into `err(..., details=...)`, convert it to a
+  JSON-safe structure first (`float`/`str`, recursively) — never assume
+  `details` gets the same treatment a pydantic `response_model` would.
+- **Why:** `app.main`'s `DomainError` handler renders the response with
+  Starlette's `JSONResponse` — stock `json.dumps`, no encoder configured at
+  all — unlike a `response_model` route, which goes through pydantic's own
+  serializer. `gis.service.publish_version`'s `ERR-GIS-003` details carry
+  `checks._intersections`' raw `Decimal` (`area_m2`) and `uuid.UUID`
+  (`feature_id`): passing them through unconverted raised `TypeError` INSIDE
+  the exception handler itself while it built the response, turning a
+  blocked publish's clean 422 into a 500 (stage 3.6a task 5; caught by the
+  task's own overlap test, confirmed by temporarily reverting the fix and
+  watching the same test fail with exactly that traceback).
+- **How to apply:** Any new `err(..., details=...)` call whose details
+  originate from a DB read needs its own recursive JSON-safety pass first —
+  `gis.checks.jsonable` is the template AND the one place to extend it. It
+  started as two near-identical local copies (`service._checks_jsonable`,
+  `schemas._jsonable_details`, one per consumer) and they had ALREADY
+  diverged by the time the task's own review caught it — the schemas copy
+  had no `uuid.UUID` branch, silently relying on pydantic's own Any-typed
+  encoder to cover for it on that one path only. Unlike `_json_safe`
+  (deliberately kept as separate, DIFFERENTLY-behaved local copies per
+  consumer — see its own entry above), a coercer whose two callers need
+  IDENTICAL conversions belongs in one shared function, not a mirror: a
+  mirror only earns its keep when the two copies are supposed to diverge.
+
+## A fixed test geometry that a `_client_for` client commits accumulates forever
+
+- **Rule:** A fixture whose test needs an EMPTY neighbourhood (a "nothing else
+  overlaps here" assertion, for any geometry-bearing table) picks a randomised
+  location — `tests/modules/gis/conftest.py::random_box_wkt()` — never a fixed
+  literal, even a currently-unused-looking one.
+- **Why:** `published_contour` + a `gis_client`-family fixture commits for real
+  (the previous lesson's request hook), so every past run of
+  `test_a_draft_version_can_be_edited_but_a_published_one_cannot` (and any test
+  like it) has left another published contour at box_wkt(69.9, 41.5) in the
+  shared, persistent test DB — confirmed empirically while building task 4's
+  `overlap` check: 4 leftover rows there before this task's own runs, 11 after a
+  handful more. A NEW test asserting "no overlap" at that same coordinate is
+  flaky by construction from the moment it's written, not from bad luck later.
+- **How to apply:** Grep `tests/modules/gis/` for `box_wkt(69.9, 41.5)` (and its
+  69.91/69.905/60.0 neighbours) before adding a new fixture near it; if the test
+  needs isolation rather than deliberate proximity to an existing fixture
+  (`neighbouring_published_contour` and its siblings need the shared literal,
+  by design — they're robust to extra copies at that spot, verified), use
+  `random_box_wkt()` instead. Applies beyond gis to any future table that
+  stores real geometry and gets exercised through a committing client fixture.
+
+## A seeded notification template becomes undeletable once something has sent it
+
+- **Rule:** A migration whose `downgrade()` deletes a seeded `notification_templates`
+  row must delete the `notifications` referencing it FIRST — and any migration that
+  seeds a template owes its downgrade both statements from the start.
+- **Why:** 0010 seeded `gis.import.finished` and deleted only the template on the way
+  down. That was fine for two tasks, because nothing sent the event yet; the moment
+  task 7's import job actually sent it, `fk_notifications_template_id_notification_templates`
+  turned the CI downgrade→upgrade round-trip red — in a task that never touched the
+  migration — and a real rollback of 0010 would have failed the same way in production.
+- **How to apply:** Seeding a template in a migration means writing
+  `DELETE FROM notifications WHERE event_code = '<code>'` immediately above the
+  template delete, not when someone finally sends it; and when the round-trip test
+  goes red in a task that changed no migration, look for the event that task started
+  emitting.
+
+## A queue-wide `FOR UPDATE SKIP LOCKED` claim makes a whole test module order-dependent
+
+- **Rule:** A worker that claims the OLDEST row of a table needs a drain step in an
+  autouse fixture at the PACKAGE conftest level, not in one test module — and the
+  drain runs the job itself, never an unscoped `DELETE`.
+- **Why:** `gis.import_service.process_pending` claims the oldest `pending` import in
+  the database, not the one the test created, and every import fixture commits (the
+  job runs in a session of its own and cannot see an uncommitted row). An interrupted
+  run therefore strands a `pending` row forever in the shared, persistent test DB, and
+  the next run claims that stranger instead of its own: `test_two_workers…` sees
+  `[1, 1]` instead of `[0, 1]`. A module-local drain only masked it, and only because
+  that module sorted first and happened to drain the other module's leftovers.
+- **How to apply:** Any future claim-the-oldest worker (batch publication in 3.6b,
+  report generation, export jobs) gets `tests/…/conftest.py`'s
+  `drain_pending_imports` shape: autouse, package-scoped, bounded by a DRAIN_LIMIT
+  that fails loudly rather than looping. Fixed test literals in the same fixtures
+  (a `storage_key`, a contour number) need randomising for the same reason.
+
+## A per-endpoint guard is not a root fix when sibling endpoints share a precondition but gate on different permissions
+
+- **Rule:** When several endpoints each perform one step of a shared multi-step
+  transition (submit-review/approve/publish), a precondition belonging to the
+  WHOLE transition — "is this even a valid target for this workflow at all" —
+  must live in ONE function every step calls, never only in the step a
+  well-behaved caller happens to reach first.
+- **Why:** `gis.service.submit_import_review` alone got the "refuse a
+  non-contour import batch" guard in task 8's first review fix;
+  `approve_import`/`publish_import` still gated on `row.status` alone. Since
+  `CONTOURS_APPROVE` (the rahbar's own permission) is a DIFFERENT permission
+  from `CONTOURS_MANAGE` (submit-review's), a rahbar-only actor could call
+  `/approve` directly on a batch that had just finished parsing — never
+  having called, or being able to call, submit-review at all — and both loops
+  silently found zero `ContourVersion` rows and still advanced
+  `gis_imports.status`, reaching the exact false "done" with zero published
+  the guard was written to prevent. The contour-batch sibling of the same bug:
+  `/approve` called before `/submit-review` finds zero `review`-status
+  versions and still sets `row.status = "approved"`, having approved nothing.
+  Reproduced for real with `git stash` on the fix (both cases answered `200`,
+  not `409`) before confirming the root-cause version.
+- **How to apply:** Any future multi-step, multi-permission transition (norms'
+  own Draft→Review→Approved→Published cycle is the next one to carry this
+  shape) factors its shared preamble — row lookup, zone check, any "is this a
+  valid target" check, status check — into one function every step calls, and
+  separately refuses a transition whose loop would move zero child rows: a
+  loop finding nothing is not evidence that nothing needed to happen.
+
+## The rahbar's role code is `leadership`, not `rahbar`
+
+- **Rule:** Before granting a permission to "the raҳbar" (leshoz head) in a
+  migration or a plan, check `roles.code` in migration `0003_auth` — it is
+  seeded as `leadership`. There is no role code `rahbar`.
+- **Why:** `plans/03.6a-gis-core.md` was written with role code `rahbar`; an
+  `INSERT … SELECT … WHERE code = 'rahbar'` inserts zero rows silently, so
+  `gis.contours.approve` would have reached nobody and every "the rahbar
+  approves" test would have passed for the wrong reason (a personal grant,
+  not the role) — caught only because the implementer ran it and watched the
+  grant not land (stage 3.6a Task 1).
+- **How to apply:** Any future migration or plan that seeds a role-based
+  permission grant: grep `leadership`/`rahbar` in `migrations/versions/
+  0003_auth.py` first, never trust a role name from spec/plan prose alone.
+
+## `IntegrityError` IS a `DBAPIError` — the narrow `except` must come first
+
+- **Rule:** When a function needs to catch both `IntegrityError` and the
+  broader `DBAPIError`, write `except IntegrityError` BEFORE `except
+  DBAPIError` — never after, and never as one clause that inspects `exc.orig`
+  by hand instead.
+- **Why:** `gis.service.create_version` originally had only `except
+  DBAPIError`, mapping every DB failure to `ERR-GIS-001` ("unreadable
+  geometry"); a `uq_contour_version_no` race from two concurrent creates
+  raises `IntegrityError`, a `DBAPIError` subclass, so it was silently
+  swallowed by the broad clause and reported as a geometry defect instead of
+  the version-number conflict it actually was (stage 3.6a Task 3, final
+  review finding 3 — confirmed empirically against real Postgres, not from
+  documentation, that the two failure modes even raise different exception
+  types; Task 7's bulk importer drives the very same path, so the bug was
+  live, not theoretical).
+- **How to apply:** Before adding a second `except` clause alongside an
+  existing `except DBAPIError`, check whether the new one is a subclass
+  (`IntegrityError.__mro__`) — if so, order it first, and verify empirically
+  which exception a given real constraint violation actually raises rather
+  than assuming from the constraint's name.
+
+## A service-level pre-check can leave its mirrored DB CHECK permanently unexercised
+
+- **Rule:** When a service pre-checks a rule a DB CHECK also enforces (this
+  project's defense-in-depth pattern), write a SEPARATE model-level test that
+  inserts through the ORM directly, bypassing the service — an API-level test
+  alone never reaches the CHECK.
+- **Why:** `Contour.parent_needs_subcontour` has had a test since Task 1, but
+  it only ever went through `POST /gis/contours`, which raises `ERR-VAL-001`
+  from the SERVICE's own pre-check before a row is even constructed — the
+  CHECK itself was never fired by any test until Task 3 added one that builds
+  `Contour(...)` directly and asserts the `IntegrityError` (Task 1 deferred
+  minor, closed at Task 3).
+- **How to apply:** Any CHECK mirrored by a service-level guard needs two
+  tests, not one: the service's 422/409 through the API, AND a direct-ORM
+  insert asserting the CHECK's own `IntegrityError` — when adding a
+  `CheckConstraint`, grep for whether a `pytest.raises(IntegrityError)` test
+  actually exercises it, not just the guard in front of it.
+
+## An empty layer makes a containment check meaningless — decide what "no data" means before the data exists
+
+- **Rule:** Before a topology/containment check goes live against a layer or
+  table that might still be empty, implement its THIRD outcome — `skipped`,
+  never `pass` or `fail` — for the "no reference data yet" case, decided at
+  design time rather than left for whoever notices the check always fires the
+  same way.
+- **Why:** `gis.checks._within_fund` (`ST_Within` against the `forest_fund`
+  layer) would report every contour as `outside_forest_fund` — a hard `fail`
+  blocking every publication — for as long as the Agency's fund-boundary
+  delivery is pending (plan ruling 9); without the `skipped`/`layer_empty`
+  branch (returned straight from `count(*) == 0` in the same query that would
+  otherwise test containment), not one contour could have published this
+  month. The check turns itself on the day the data lands, with no code
+  change.
+- **How to apply:** Any check whose candidate/reference set is a layer or
+  table this project does not yet fully control the population of (a layer
+  awaiting real Agency data, a not-yet-onboarded integration) gets an
+  explicit empty-set branch decided up front, returned as its own named
+  result — never silently defaulted to `pass` or `fail` once real rows start
+  arriving.
+
+## `ST_Intersects` alone reports every shared border as an overlap — real cadastral data needs an area tolerance
+
+- **Rule:** A geometric "do these overlap" predicate over real (hand-digitised
+  or GIS-sourced) polygons is never plain `ST_Intersects`/`ST_Overlaps` —
+  compute the actual intersection area and compare it against a configurable
+  tolerance, because two legitimately adjacent polygons share a border of
+  zero area, and `ST_Intersects` is `true` for that exactly as it is for a
+  genuine double-booked overlap.
+- **Why:** Two neighbouring published contours sharing a fence line are the
+  NORMAL case on real cadastral data, not an edge case — a plain-`ST_Intersects`
+  publish-blocking check (the spec's own `ST_Overlaps`) would have refused to
+  publish perfectly valid neighbouring contours (decision #24's correction;
+  `gis.checks._intersections` computes `ST_Area(ST_Intersection(a,b)
+  ::geography)` and compares it to `gis_overlap_tolerance_m2`, default
+  100 m², proven by `test_checks.py`'s `draft_version_touching_it` vs
+  `draft_version_overlapping_it` pair — one shares an edge and must pass, the
+  other genuinely overlaps and must block).
+- **How to apply:** Any new geometric predicate over contour/parcel-shaped
+  data (norms' own territory checks, 3.7+, are the next candidate) computes
+  an intersection AREA and compares it to a named, configurable tolerance
+  setting — never a bare boolean `ST_Intersects`/`ST_Overlaps` used directly
+  as the blocking test.
+
+## `request.body()` raises inside a dependency on any FORM route
+
+- **Rule:** A FastAPI dependency that needs the raw request body (`auth.deps.
+  idempotency_context` is the only one) must branch on the content type: for
+  `multipart/form-data` and `application/x-www-form-urlencoded` it reads
+  `await request.form()` (Starlette's cached `FormData`), never
+  `await request.body()`.
+- **Why:** FastAPI reads the body BEFORE solving dependencies, and for a form it
+  parses straight off the stream rather than caching bytes — so `Request.body()`
+  re-enters `Request.stream()`, hits `_stream_consumed` and raises
+  `RuntimeError("Stream consumed")`, an unhandled 500. Hit the moment
+  `POST /gis/imports` became the idempotency mechanism's first consumer (3.6a
+  fix wave); reproduced by wiring the dependency the plain way and watching the
+  upload come back 500.
+- **How to apply:** Any future `Idempotency-Key` consumer that takes a file
+  (payment receipts, act scans) is a multipart route and inherits this; the
+  fingerprint there is the form's scalar fields plus each file's
+  name/filename/content-type/size, sorted — never the file bytes, which would
+  mean re-reading a 100 MB upload per request. **The mirror is a trap too:** the
+  branch keys on the CONTENT TYPE, not on the route, so a JSON-body route
+  declaring `idempotency_context` that is sent `multipart/form-data` takes the
+  form branch, `request.form()` consumes the stream, and FastAPI's OWN
+  `await request.body()` for the JSON body field then raises the same
+  `RuntimeError`. Not reachable today — `imports_router` is the only consumer
+  and is itself multipart — but the next consumer needs to know, and a route
+  that accepts both shapes needs the branch reconsidered rather than reused.
+
+## A status-transition table is ambiguous wherever two source states share a target
+
+- **Rule:** When a state machine allows one target from more than one source
+  (`TRANSITIONS`: `review` is reachable from BOTH `draft` and `approved`),
+  EVERY route driving any of those edges must assert the SOURCE state too, not
+  only "may this row become X" — the new route and the one that was already
+  there.
+- **Why:** `return-to-review` (`CONTOURS_APPROVE`) and `submit-review`
+  (`CONTOURS_MANAGE`) both land on `review`. Checking the target alone let the
+  approver drive `draft` -> `review` — submit-review's own edge, under the wrong
+  permission — so an approver could advance a specialist's draft they otherwise
+  may not touch. Caught by the new route's own bad-transition test, which
+  returned 200 instead of 409 (3.6a fix wave). The MIRROR was still open after
+  that fix and had to be closed separately: `submit_review` (`CONTOURS_MANAGE`)
+  kept the bare check, so it drove `approved` -> `review` — the rework edge just
+  gated behind `CONTOURS_APPROVE` — and audited it as `submit_review`. Guarding
+  only the route you are adding leaves the split it installs defeated from the
+  other side.
+- **How to apply:** Before adding a route to an existing transition table, grep
+  the table for the target: more than one source means EVERY route reaching
+  that target needs `_assert_transition_from(version, source, target)`, not
+  just the new one. Fix the siblings in the same commit.
+
+## Paging a list breaks every test that asserted membership in the unpaged one
+
+- **Rule:** When you add `Page[T]` to a list endpoint, every existing test that
+  asserted "my fixture's row is in the response" must gain a filter narrowing to
+  that fixture's own data — a fresh `organization_id` is the usual one here.
+- **Why:** The test DB is shared and persistent, and committing client fixtures
+  leave their rows behind forever, so page 1 of 20 is full of previous runs'
+  contours: `test_an_applicant_sees_published_contours_only` went red the moment
+  `GET /gis/contours` was paged, for a reason that had nothing to do with the
+  change (3.6a fix wave).
+- **How to apply:** Page an endpoint and grep its tests for unfiltered `GET`s in
+  the same commit; assert against `total` and an explicitly scoped query, never
+  against membership in an unbounded default page.

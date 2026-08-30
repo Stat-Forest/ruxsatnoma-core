@@ -104,6 +104,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "Per-IP limit for provider webhooks (a provider's whole IP set shares one "
             "bucket, and a throttled delivery report is lost, not retried)",
         ),
+        SettingSpec(
+            "gis_area_mismatch_pct",
+            int,
+            10,
+            "Import warns when declared and computed area differ by more than this %",
+        ),
+        SettingSpec(
+            "gis_overlap_tolerance_m2",
+            int,
+            100,
+            "Intersections below this area are a shared border, not an overlap",
+        ),
+        SettingSpec("gis_import_max_mb", int, 100, "Upload cap for a geodata import file, MB"),
     )
 }
 
