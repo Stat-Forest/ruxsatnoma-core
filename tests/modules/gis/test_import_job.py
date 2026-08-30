@@ -394,3 +394,97 @@ async def test_a_crash_with_no_initiator_still_audits(
         .one()
     )
     assert entry.user_id is None
+
+
+# --- The warnings cap holds across producers (re-review finding) --------------
+#
+# `stats["warnings"]` is filled by TWO producers: `_write_batch` (duplicate
+# number, area mismatch) and `_organization_warnings`, which runs afterwards.
+# The first version capped only the first producer and computed the marker from
+# its counter alone, so a later contribution could both push the list past the
+# cap unnoticed AND make the marker under-state its own truncation. These call
+# the real functions directly, no database — the arithmetic is the whole point.
+
+
+def _org_mismatch_rows(count: int) -> list[import_service._Mapped]:
+    """`count` features, each naming a DIFFERENT organization — what pointing
+    `attribute_map`'s `organization_name` at a high-cardinality column (a tenant
+    name, which the Agency's files carry) does in ordinary operation."""
+    return [
+        import_service._Mapped(row=i, wkb=b"", organization_name=f"Leshoz {i}")
+        for i in range(count)
+    ]
+
+
+def test_a_later_producer_cannot_push_the_warning_list_past_the_cap(monkeypatch):
+    """Failure mode 1: `_write_batch` stayed under the cap, so its counter was 0,
+    and the old code returned the whole combined list untouched — no truncation
+    and no marker, however many warnings the second producer added."""
+    monkeypatch.setattr(importer, "MAX_REPORT_ROWS", SMALL_CAP)
+    org_warnings, dropped_org = import_service._organization_warnings(
+        _org_mismatch_rows(SMALL_CAP + 7), {"somewhere else"}
+    )
+    combined = import_service._truncate(
+        list(org_warnings), dropped=0 + dropped_org, marker=import_service._warning_truncated
+    )
+    assert len(combined) == SMALL_CAP + 1
+    assert combined[-1]["code"] == "report_truncated"
+    assert combined[-1]["omitted"] == 7
+
+
+def test_the_marker_counts_what_both_producers_dropped(monkeypatch):
+    """Failure mode 2, the worse half: `_write_batch` already dropped 3 and a
+    later producer added 10 past the cap. The old code silently erased all 10
+    while claiming "3 further omitted" — a report that under-states its own
+    truncation is more dangerous than one that does not truncate at all."""
+    monkeypatch.setattr(importer, "MAX_REPORT_ROWS", SMALL_CAP)
+    from_write_batch = [
+        {"row": i, "code": "duplicate_number"} for i in range(SMALL_CAP)
+    ]  # already at the cap
+    dropped_by_write_batch = 3
+    org_warnings, dropped_org = import_service._organization_warnings(
+        _org_mismatch_rows(10), {"somewhere else"}
+    )
+    combined = import_service._truncate(
+        [*from_write_batch, *org_warnings],
+        dropped=dropped_by_write_batch + dropped_org,
+        marker=import_service._warning_truncated,
+    )
+    assert len(combined) == SMALL_CAP + 1
+    # 3 refused by _write_batch + 10 org warnings that no longer fit = 13, and
+    # not one entry of the organization_mismatch category vanishes unaccounted.
+    assert combined[-1]["omitted"] == 13
+    assert {w["code"] for w in combined[:-1]} == {"duplicate_number"}
+
+
+def test_the_organization_producer_bounds_its_own_accumulation(monkeypatch):
+    """Memory, not just the column: de-duplicating by name is not a bound when
+    every row carries a distinct name."""
+    monkeypatch.setattr(importer, "MAX_REPORT_ROWS", SMALL_CAP)
+    warnings, dropped = import_service._organization_warnings(
+        _org_mismatch_rows(SMALL_CAP + 4), {"somewhere else"}
+    )
+    assert len(warnings) == SMALL_CAP
+    assert dropped == 4
+
+
+async def test_organization_mismatch_warnings_survive_end_to_end_and_are_capped(
+    db, session_factory, pending_import_many_org_mismatches, monkeypatch
+):
+    """The same arithmetic through the real job, and the first test anywhere to
+    exercise `organization_mismatch` at all: `organization_id` comes from the
+    REQUEST and the file's own leshoz name is only COMPARED (ruling 12), so a
+    disagreement warns and the batch still imports."""
+    monkeypatch.setattr(importer, "MAX_REPORT_ROWS", SMALL_CAP)
+    await import_service.process_pending(session_factory)
+    await db.refresh(pending_import_many_org_mismatches)
+
+    assert pending_import_many_org_mismatches.status == "review"  # a warning, not an error
+    assert pending_import_many_org_mismatches.stats["created"] == 8
+    warnings = pending_import_many_org_mismatches.stats["warnings"]
+    assert len(warnings) == SMALL_CAP + 1
+    assert warnings[-1]["code"] == "report_truncated"
+    # 8 distinct names, none matching the organization the request named: 5 fit
+    # under the cap, 3 do not — and the marker says 3, not 0.
+    assert warnings[-1]["omitted"] == 3
+    assert {w["code"] for w in warnings[:-1]} == {"organization_mismatch"}

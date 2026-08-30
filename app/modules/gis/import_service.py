@@ -16,6 +16,7 @@ name that disagrees with the request) roll nothing back; they land in
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -66,21 +67,32 @@ NAME_KEY = "name"
 _MAX_DECLARED_AREA = Decimal(10) ** 8
 
 
-def _capped(entries: list[Any], omitted: int, marker: Any) -> list[Any]:
-    """Close a bounded report: append the truncation marker when anything was
-    dropped, so a truncated report never reads as a complete one.
+def _truncate(entries: list[Any], *, dropped: int, marker: Callable[[int], Any]) -> list[Any]:
+    """Close a bounded report, stating the TRUE number of omitted entries.
 
     Both report lists — `error_report` and `stats["warnings"]` — are stored
     whole in one JSONB column and returned whole by `GET /gis/imports/{id}`.
     Unbounded, they are unbounded worker memory, an unbounded column and a
     response that cannot be serialized; under the 100 MB upload cap a
-    mis-exported layer of null-geometry features reaches that by accident, not
-    only by malice. Cap and marker are `importer.MAX_REPORT_ROWS` and the shape
+    mis-exported layer reaches that by accident, not only by malice. Cap and
+    marker shape are `importer.MAX_REPORT_ROWS` and what
     `integrations.service.DEAD_LETTER_PAYLOAD_MAX_BYTES` already uses.
+
+    The count is `dropped` (what producers refused to accumulate) PLUS whatever
+    this slice itself removes — never one producer's counter alone. The previous
+    version trusted a single producer's number and only sliced when that number
+    was above zero, which had two failure modes, both hit by a re-review: a list
+    grown past the cap by a LATER producer was stored whole with no marker at
+    all, and a list where an earlier producer had dropped 3 while a later one
+    added 10 past the cap reported "3 omitted" while silently erasing 13 —
+    a report that under-states its own truncation is worse than one that does
+    not truncate. Hence: one function, one authoritative arithmetic, called at
+    the single write point.
     """
+    omitted = dropped + max(len(entries) - importer.MAX_REPORT_ROWS, 0)
     if omitted <= 0:
         return entries
-    return [*entries[: importer.MAX_REPORT_ROWS], marker]
+    return [*entries[: importer.MAX_REPORT_ROWS], marker(omitted)]
 
 
 def _warning_truncated(omitted: int) -> dict[str, Any]:
@@ -203,7 +215,7 @@ def _map_features(
                     continue
                 item.declared_area_ha = declared
         mapped.append(item)
-    return mapped, _capped(errors, omitted, importer.truncation_marker(omitted))
+    return mapped, _truncate(errors, dropped=omitted, marker=importer.truncation_marker)
 
 
 def _unique_number(number: str, taken: set[str]) -> tuple[str, bool]:
@@ -413,20 +425,33 @@ async def _finish(
     layer_code: str,
     *,
     status: str,
-    stats: dict[str, Any] | None,
-    errors: list[RowError] | None,
+    errors: list[RowError] | None = None,
+    created: int = 0,
+    warnings: list[dict[str, Any]] | None = None,
+    dropped_warnings: int = 0,
 ) -> None:
     """The one exit of every import, successful or not: stamp the row, tell the
     initiator, audit. A failed import notifies too — a 20-minute import must not
     need the browser to stay open (ruling 6), and that is just as true when it
-    fails."""
+    fails.
+
+    This is the SINGLE write point for both JSONB report columns, and it builds
+    `stats` itself rather than taking a pre-built dict: the bound on what is
+    stored then holds regardless of which producer contributed to a list, or in
+    what order. Producers still cap their own accumulation, but for MEMORY —
+    the column's bound, and the truncation marker's number, are decided here and
+    nowhere else. `warnings is None` distinguishes a failure (no stats at all)
+    from a clean import with nothing to warn about (`warnings=[]`).
+    """
     row.status = status
-    row.stats = stats
-    # The single write point for `error_report`, so the hard bound on the column
-    # lives here regardless of which producer filled the list — the producers cap
-    # their own accumulation for MEMORY, this caps what is STORED. A list already
-    # closed by `_capped` carries its marker as its last entry and is unchanged
-    # by the slice below.
+    row.stats = (
+        None
+        if warnings is None
+        else {
+            "created": created,
+            "warnings": _truncate(warnings, dropped=dropped_warnings, marker=_warning_truncated),
+        }
+    )
     row.error_report = (
         [e.as_dict() for e in errors[: importer.MAX_REPORT_ROWS + 1]] if errors else None
     )
@@ -438,11 +463,7 @@ async def _finish(
             db,
             event_code=IMPORT_EVENT,
             recipient_user_id=row.started_by,
-            params={
-                "layer": layer_code,
-                "created": (stats or {}).get("created", 0),
-                "status": status,
-            },
+            params={"layer": layer_code, "created": created, "status": status},
             object_type="gis_import",
             object_id=row.id,
             correlation_id=correlation,
@@ -460,9 +481,9 @@ async def _finish(
         correlation_id=correlation,
         new_value={
             "status": status,
-            "created": (stats or {}).get("created", 0),
-            "warnings": len((stats or {}).get("warnings", [])),
-            "errors": len(errors or []),
+            "created": created,
+            "warnings": len((row.stats or {}).get("warnings", [])),
+            "errors": len(row.error_report or []),
         },
     )
 
@@ -484,7 +505,6 @@ async def run_import(db: AsyncSession, row: GisImport) -> None:
             row,
             layer_code="?",
             status="failed",
-            stats=None,
             errors=[RowError(row=0, code="unknown_layer", message=str(row.layer_id))],
         )
         return
@@ -496,7 +516,6 @@ async def run_import(db: AsyncSession, row: GisImport) -> None:
             row,
             layer.code,
             status="failed",
-            stats=None,
             errors=[RowError(row=0, code="file_missing", message="stored object is gone")],
         )
         return
@@ -512,7 +531,7 @@ async def run_import(db: AsyncSession, row: GisImport) -> None:
             is_contour_layer=layer.code == CONTOUR_LAYER_CODE,
         )
     if errors:
-        await _finish(db, row, layer.code, status="failed", stats=None, errors=errors)
+        await _finish(db, row, layer.code, status="failed", errors=errors)
         return
 
     mismatch_pct = await settings_store.get_int(db, "gis_area_mismatch_pct")
@@ -526,34 +545,45 @@ async def run_import(db: AsyncSession, row: GisImport) -> None:
                 db, row, layer, mapped, srid, mismatch_pct=mismatch_pct
             )
     except _BatchFailed as exc:
-        await _finish(db, row, layer.code, status="failed", stats=None, errors=exc.errors)
+        await _finish(db, row, layer.code, status="failed", errors=exc.errors)
         return
 
-    warnings.extend(_organization_warnings(mapped, org_names))
+    # Both producers hand over their raw list AND what they refused to
+    # accumulate; `_finish` does the one truncation, over the combined list.
+    org_warnings, dropped_org = _organization_warnings(mapped, org_names)
+    warnings.extend(org_warnings)
     await _finish(
         db,
         row,
         layer.code,
         status="review",
-        stats={
-            "created": created,
-            "warnings": _capped(warnings, omitted_warnings, _warning_truncated(omitted_warnings)),
-        },
-        errors=None,
+        created=created,
+        warnings=warnings,
+        dropped_warnings=omitted_warnings + dropped_org,
     )
 
 
-def _organization_warnings(mapped: list[_Mapped], org_names: set[str]) -> list[dict[str, Any]]:
+def _organization_warnings(
+    mapped: list[_Mapped], org_names: set[str]
+) -> tuple[list[dict[str, Any]], int]:
     """Ruling 12: `organization_id` comes from the REQUEST, never from the file
     — matching ~90 leshozes by a free-text Cyrillic name would fail silently and
     attach a whole batch to the wrong one. The file's own leshoz name is only
     COMPARED, and a disagreement is one warning per distinct name, not one per
     feature: 151 identical lines would bury every other warning in the report.
+
+    Returns `(warnings, dropped)`. De-duplicating by name is NOT a bound: point
+    `attribute_map`'s `organization_name` at a high-cardinality column — a tenant
+    name, which the Agency's files do carry — and every distinct value is its own
+    warning, one per row in the limit. That is ordinary misconfiguration, not
+    abuse, so this accumulates under the same cap every other producer respects
+    and hands its overflow count to `_truncate`.
     """
     if not org_names:
-        return []
+        return [], 0
     seen: set[str] = set()
     warnings: list[dict[str, Any]] = []
+    dropped = 0
     for item in mapped:
         if item.organization_name is None:
             continue
@@ -561,6 +591,9 @@ def _organization_warnings(mapped: list[_Mapped], org_names: set[str]) -> list[d
         if normalised in org_names or normalised in seen:
             continue
         seen.add(normalised)
+        if len(warnings) >= importer.MAX_REPORT_ROWS:
+            dropped += 1
+            continue
         warnings.append(
             {
                 "row": item.row,
@@ -568,7 +601,7 @@ def _organization_warnings(mapped: list[_Mapped], org_names: set[str]) -> list[d
                 "file_name": item.organization_name,
             }
         )
-    return warnings
+    return warnings, dropped
 
 
 async def process_pending(factory: async_sessionmaker[AsyncSession]) -> int:

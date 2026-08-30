@@ -998,6 +998,26 @@ async def pending_import_many_duplicate_numbers(
 
 
 @pytest.fixture
+async def pending_import_many_org_mismatches(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User
+) -> GisImport:
+    """Eight rows, each naming a DIFFERENT leshoz, none of them the organization
+    the request names — what pointing `organization_name` at a high-cardinality
+    column does (ruling 12: the name is compared, never matched on). Every row
+    imports; every distinct name is its own warning."""
+    return await make_import(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        started_by=gis_user,
+        data=geojson_bytes(
+            [(random_box_wkt(), {"number": f"1452{i}q", "leshoz": f"Leshoz {i}"}) for i in range(8)]
+        ),
+        attribute_map={"number": "number", "organization_name": "leshoz"},
+    )
+
+
+@pytest.fixture
 async def pending_import_utm42(
     db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, gis_user: User, tmp_path: Path
 ) -> GisImport:
