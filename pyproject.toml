@@ -23,6 +23,7 @@ dependencies = [
     "httpx>=0.27",
     "aiosmtplib>=3.0",
     "pyogrio>=0.13",
+    "numpy>=2.5",
 ]
 
 [dependency-groups]
