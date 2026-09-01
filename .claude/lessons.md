@@ -1172,3 +1172,26 @@ Rules for this file:
   affected module a frozen-date fixture. Tests that pass `on_date` explicitly,
   build their own parameter dict, or assert the seeded rows' own dates need
   nothing — only the ones that read the wall clock.
+
+## `Literal[*TUPLE]` is a pyright error — spell the members out and assert them equal
+
+- **Rule:** A pydantic schema bound that must mirror a DB CHECK's allowed values
+  is written as an explicit `Literal["a", "b", ...]`, never `Literal[*TUPLE]`,
+  and the duplication is closed by a test asserting
+  `set(get_args(TheLiteral)) == set(THE_TUPLE)`.
+- **Why:** `Literal[*LIVESTOCK_GROUPS]` runs fine and pydantic accepts it, but
+  pyright reports "Variable not allowed in type expression"
+  (`reportInvalidTypeForm`) — a `Literal`'s members are exactly what a type
+  checker has to see statically, and a module-level tuple is not that. Hit
+  adding the `livestock_group`/`quantity_unit` bounds in stage 3.7's fix wave
+  (finding I8), where the tuples already existed as
+  `norms.models.LIVESTOCK_GROUPS` and `admin.models.QUANTITY_UNITS`. Writing
+  the members out re-creates precisely the "constraint strings duplicated in
+  Python tuples are two sources of truth" problem this file already warns
+  about — a value added on one side and forgotten on the other is a 422 that
+  should have been a 201, or an IntegrityError 500 that should have been a 422.
+- **How to apply:** `norms/schemas.py`'s `LivestockGroup`/`QuantityUnit` plus
+  `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints`
+  are the shape: the `Literal` carries a comment saying WHY it is spelled out
+  and where the guard lives, and the guard is one `get_args` comparison per
+  tuple. Any future enum-ish column gets the same pair, not a bare `str`.
