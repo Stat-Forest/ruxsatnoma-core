@@ -40,7 +40,11 @@ SEASON_ERROR = "ERR-NORM-003"
 # outlive the survey it is checked against; this is a domain ceiling, not a
 # tuning knob for the day-by-day walk below (though it also keeps that walk
 # to a few thousand iterations at most, never tens of thousands).
-MAX_PERIOD_DAYS = 5 * 365
+#
+# 366, not 365 (I10): a real five-CALENDAR-year span is 1826-1827 days
+# (`2024-01-01 .. 2028-12-31` is `.days == 1826`), so `5 * 365` refused a
+# lawful maximum period by a day or two.
+MAX_PERIOD_DAYS = 5 * 366
 
 # Ruling 15: one round trip against all three layers, split by code afterwards
 # — `fire_bans` becomes its own blocking check, `restrictions`/`protection`

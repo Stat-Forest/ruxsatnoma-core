@@ -155,11 +155,22 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(f"DELETE FROM tariffs WHERE basis = '{VMQ_278}'")
+    # Both deletes are scoped to `created_by IS NULL` (finding I3): keyed on
+    # CONTENT alone they also destroyed rows this migration never inserted.
+    # After deployment an admin publishes a new `bhm` (the next presidential
+    # decree), the real `coef_sb:*` set (ruling 8's whole point) and new
+    # tariffs — and citing "ВМҚ 278-сон, 30.09.2015, илова" as a new tariff's
+    # `basis` is the natural thing to write. These are the money rows; nothing
+    # else in the schema can reconstruct them, and `calculations` keeps only a
+    # copy inside `input_snapshot`. `created_by IS NULL` is exact: a
+    # user-created row always has a maker, and a migration is the only thing
+    # that inserts without one.
+    op.execute(f"DELETE FROM tariffs WHERE basis = '{VMQ_278}' AND created_by IS NULL")
     op.execute(
-        "DELETE FROM rule_parameters WHERE code LIKE 'coef_sb:%' OR code LIKE 'tariff_group:%' "
+        "DELETE FROM rule_parameters WHERE created_by IS NULL AND ("
+        "code LIKE 'coef_sb:%' OR code LIKE 'tariff_group:%' "
         "OR code IN ('bhm', 'safety_reserve', 'sb_feed_norm', 'season_share', "
-        "'rounding_money', 'rounding_heads')"
+        "'rounding_money', 'rounding_heads'))"
     )
     op.execute("UPDATE activity_types SET quantity_unit = 'ton' WHERE code = 'haymaking'")
     op.execute("UPDATE activity_types SET quantity_unit = 'ha' WHERE code = 'recreation'")

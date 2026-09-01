@@ -393,3 +393,23 @@ async def test_a_period_longer_than_five_years_is_refused(
         )
     assert raised.value.code == "ERR-VAL-001"
     assert raised.value.details == {"reason": "period_too_long"}
+
+
+async def test_a_real_five_calendar_year_period_is_accepted(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """I10: `MAX_PERIOD_DAYS` was `5 * 365`, but a five-CALENDAR-year span is
+    1826-1827 days — `2024-01-01 .. 2028-12-31` is `.days == 1826` — so the
+    guard refused a lawful maximum period by a day or two. The bound is the
+    survey's five-year life, not 1825 days."""
+    assert (date(2028, 12, 31) - date(2024, 1, 1)).days == 1826
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2024, 1, 1), date(2028, 12, 31)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(),
+    )
+    # It gets past the guard and is judged on its merits (this one is out of
+    # season, which is a CHECK result, not a refusal to look at all).
+    assert {c["check"] for c in results} >= {"norm", "season", "rotation", "limit"}
