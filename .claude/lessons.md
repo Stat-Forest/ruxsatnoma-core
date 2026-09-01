@@ -1260,12 +1260,78 @@ Rules for this file:
   refusal, the shape the *existing* "owned by another user" branch already
   uses, could never satisfy that. `bind_certificate` instead leaves an
   unproven certificate row UNBOUND (`user_id` stays `None`) and returns it;
-  `sign()` reads `cert.user_id != user.id` off the result and overrides its
-  own `Verdict` to `invalid`, which reuses the exact insert-row/audit/commit/
-  raise tail every other invalid verdict already goes through — zero
-  duplicated evidence-writing code.
+  `sign()` overrides its own `Verdict` to `invalid`, which reuses the exact
+  insert-row/audit/commit/raise tail every other invalid verdict already
+  goes through — zero duplicated evidence-writing code. (Fix round 3, fix 2
+  replaced the original `cert.user_id != user.id` re-check this paragraph
+  described with a live re-run of the same ownership proof on every call —
+  the SIGNAL-BACK shape below is still exactly what makes that possible.)
 - **How to apply:** Before widening a helper's signature or making it raise
   with partial evidence, ask whether its caller already has an
   evidence-then-raise tail the helper could feed instead — a dataclass
   `Verdict`/result object with a `replace`-able outcome, read by the caller
   right after the helper returns, composes better than a second raise site.
+
+## Recovering from a failed flush to write evidence needs a SAVEPOINT, not `db.rollback()`
+
+- **Rule:** When a function catches an `IntegrityError` from its own
+  `flush()` and then wants to KEEP USING the same session afterward (e.g. to
+  write an audit entry and commit), wrap the risky insert in
+  `async with db.begin_nested():` (a SAVEPOINT) rather than catching the
+  error and calling `db.rollback()`. A bare `db.rollback()` undoes the WHOLE
+  transaction back to its start, not just the failed statement.
+- **Why:** `signatures.service.sign()`'s `except IntegrityError` (the
+  `ERR-SIGN-002` race path, fix round 3, fix 1) needs to write an audit
+  entry and commit AFTER recovering from the failed insert. A first version
+  called a plain `await db.rollback()` before the audit write, reasoning
+  only about clearing Postgres's own aborted-transaction state (confirmed
+  necessary: using `db` again without ANY rollback raises
+  `PendingRollbackError`). Verified empirically against the real test
+  suite instead of trusting that reasoning: `db.rollback()` also discarded
+  the calling test's own `a_user` fixture — flushed earlier in the SAME
+  session but never committed, exactly like a real caller's own pending
+  work under this module's documented transaction contract (fix round 3,
+  fix 4: a caller may have other state open on the same `db` before calling
+  `sign()`) — and the subsequent audit INSERT then failed on
+  `audit_log`'s own `user_id` FK, because the user it pointed at had just
+  been un-inserted by the rollback. A SAVEPOINT (`begin_nested()`) scopes
+  the rollback to only what happened inside the `async with` block; a probe
+  script confirmed a row flushed BEFORE the block survives a failure INSIDE
+  it, all the way through a later real commit.
+- **How to apply:** `signatures.service.sign()`'s own `try: async with
+  db.begin_nested(): ... except IntegrityError:` is the template. A bare
+  `except IntegrityError: raise err(...)` (no attempt to keep using `db`
+  afterward — `create_contour`'s own race handling in `gis/service.py`)
+  needs no savepoint, since `get_db` cleans up the whole aborted transaction
+  once the exception is allowed to propagate; a savepoint is only for the
+  "catch it, write more, and still commit on this session" shape.
+
+## Telling WHICH constraint fired needs `exc.orig.__cause__`, not `exc.orig`
+
+- **Rule:** To distinguish one specific constraint's `IntegrityError` from
+  another on the SAME insert (so only one becomes a domain error and the
+  rest surface unmapped), read `getattr(exc.orig.__cause__, "constraint_name",
+  None)` — never `exc.orig` directly, and never the formatted message.
+- **Why:** `signatures.service.sign()`'s insert can violate three different
+  constraints (`uq_signatures_valid_purpose`, the `certificate_id` FK, the
+  `verification_status` CHECK) and only the first should ever map to
+  `ERR-SIGN-002` (review fix 6). SQLAlchemy's asyncpg dialect wraps the raw
+  driver error in its OWN thin `AsyncAdapt_asyncpg_dbapi.IntegrityError` and
+  re-raises it `from` the original — so `exc.orig` (SQLAlchemy's wrapper)
+  exposes only `pgcode`/`sqlstate` (generic per SQLSTATE CLASS, e.g. every
+  unique violation is `23505` regardless of which index), while
+  `exc.orig.__cause__` is asyncpg's OWN exception
+  (`UniqueViolationError`/`CheckViolationError`/`ForeignKeyViolationError`),
+  which carries `constraint_name` populated from Postgres's own wire-protocol
+  error fields. Verified empirically against a real UNIQUE, CHECK and FK
+  violation on this same table — all three populate it identically
+  (`uq_certificate_identity`, `ck_certificates_status_valid`,
+  `fk_signatures_certificate_id_certificates`).
+- **How to apply:** `signatures.service.sign()`'s `except IntegrityError`
+  clause is the template — defensive `getattr` chain, compared against the
+  ONE literal constraint name the branch cares about, comment explaining
+  the `.orig.__cause__` indirection so the next reader doesn't "simplify"
+  it back to `exc.orig`. Do not parse `str(exc)` for the same purpose — it
+  also carries the constraint's DETAIL, which quotes the offending row's
+  own values (the same PII concern `gis/import_service.py`'s
+  `_database_row_error` already documents for outbound messages).
