@@ -876,14 +876,16 @@ async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calcul
 # --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
 # 3.10, permits 3.11) ---------------------------------------------------------
 #
-# Six entry points, and nothing else: `preview` and `save_calculation` above
-# (Task 7), `LOAD_PROVIDERS` and `committed_load_sb` above (Task 4, ruling
-# 12 — the seam and the reader over it are two separate things a caller
-# touches, not one), and `effective_norm`/`run_checks` right below. A
-# level-4+ caller must NEVER:
+# Seven entry points, and nothing else: `preview` and `save_calculation`
+# above (Task 7), `LOAD_PROVIDERS` and `committed_load_sb` above (Task 4,
+# ruling 12 — the seam and the reader over it are two separate things a
+# caller touches, not one), `effective_norm`/`run_checks` right below, and
+# `calculator.from_input_snapshot` (I9) — VERIFICATION only, rebuilding the
+# request/snapshot pair to confirm a stored row still recomputes to the same
+# numbers, never for pricing a new one. A level-4+ caller must NEVER:
 #   - import `norms.repo` (or any other private module here) directly — every
 #     fact it could read that way is already reachable through one of the
-#     five, the same reason a level-3 module reaches `gis` only through
+#     seven, the same reason a level-3 module reaches `gis` only through
 #     `gis.service` (module boundary, CLAUDE.md);
 #   - read `tariffs`/`rule_parameters`/`norms` as tables of its own — a rate
 #     or a limit is only ever correct as of the SNAPSHOT `preview`/
