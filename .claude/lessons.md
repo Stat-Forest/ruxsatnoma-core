@@ -128,6 +128,19 @@ Tooling and environment.
   'value'` (migration 0012, 3.7 t2; caught RED/GREEN).
 - **How to apply:** Grep any new raw-SQL migration or test for `:\w+::` before running it.
 
+## A bare `alembic` CLI command targets the shared dev DB, not your worktree's test DB
+
+- **Rule:** Never run `uv run alembic revision --autogenerate` or `upgrade head` bare in a
+  worktree — export `DATABASE_URL="$DATABASE_URL_TEST"` for that one command first (mirror
+  `tests/conftest.py::_migrated_test_db`).
+- **Why:** `migrations/env.py::_resolve_url()` falls back to the shared dev DB whenever
+  nothing overrides it, and a sibling worktree's not-yet-merged branch may have already
+  advanced ITS `alembic_version` past revisions yours doesn't have — the bare command then
+  fails `Can't locate revision identified by '0013'`, reading like local corruption, not a
+  shared DB ahead of your files (hit building 3.8).
+- **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
+  naming a version you don't have locally means check which DB you connected to first.
+
 ---
 
 # DB constraints vs Python
@@ -191,6 +204,25 @@ Tooling and environment.
   defect (3.6a t3). Task 7's bulk importer drives the same path — the bug was live.
 - **How to apply:** Before adding a second `except` beside an existing `DBAPIError`, check
   `__mro__`, and verify empirically which exception a real constraint violation raises.
+
+## Recovering from a failed insert to keep writing on the same session needs a SAVEPOINT and `exc.orig.__cause__`
+
+- **Rule:** To catch one specific constraint's `IntegrityError` and still use the same
+  session afterward (write evidence, commit), wrap the risky insert in `async with
+  db.begin_nested():` (a SAVEPOINT), never a bare `db.rollback()`; identify WHICH
+  constraint fired via `getattr(exc.orig.__cause__, "constraint_name", None)`, never
+  `exc.orig` or the formatted message.
+- **Why:** `signatures.service.sign()`'s race path writes an audit entry and commits after
+  recovering. A bare `db.rollback()` undoes the WHOLE transaction, not just the failed
+  statement — it silently discarded a caller's own earlier, uncommitted work on the same
+  session, and the next INSERT then failed on an FK pointing at a just-un-inserted row.
+  Separately, `exc.orig` is SQLAlchemy's asyncpg wrapper and exposes only `pgcode` (generic
+  per SQLSTATE class — every unique violation is `23505` regardless of index);
+  `exc.orig.__cause__` is asyncpg's OWN exception, which alone carries `constraint_name`.
+- **How to apply:** `signatures.service.sign()`'s `try: async with db.begin_nested(): ...
+  except IntegrityError:` block, compared against the ONE literal constraint name the
+  branch cares about, is the template — a savepoint only when the caller keeps using `db`
+  afterward; a bare `except IntegrityError: raise err(...)` needs none.
 
 ---
 
@@ -417,6 +449,21 @@ Tooling and environment.
   directly), not in each router's schema. `ERR-VAL-001` with `period_reversed`/`period_too_long`;
   the ceiling is a named constant carrying its domain reason (`MAX_PERIOD_DAYS` — ВМҚ 689
   redoes the geobotanical survey every five years). `from == to` must still pass.
+
+## A narrow helper without full context signals a refusal back, it does not raise on partial evidence
+
+- **Rule:** When a helper lacks the object/purpose/context a refusal's evidence row would
+  need, don't widen its signature or raise from inside it — leave the affected state
+  caller-detectable (e.g. an unset FK) and let the full-context caller override its own
+  result through the evidence-then-raise tail it already has.
+- **Why:** `signatures.bind_certificate(db, *, info, user)` has no `object_type`/`purpose`,
+  so it cannot itself write a `signatures` row for "certificate owned by someone else"; it
+  leaves the certificate UNBOUND and returns, and `sign()` downgrades its own `Verdict` to
+  `invalid`, reusing the one insert/audit/commit/raise tail every refusal already goes
+  through — zero duplicated evidence-writing code (3.8, fix rounds 1 and 3).
+- **How to apply:** Before widening a helper's parameters so it can raise directly, check
+  whether its caller already has an evidence-then-raise tail the helper could feed via a
+  `replace`-able result object instead.
 
 ---
 
@@ -689,6 +736,50 @@ Tooling and environment.
   `select(Col.a, Col.b)` does not trip it — SQLAlchemy infers the arity statically there.
 - **How to apply:** Comprehension for raw SQL; reserve `dict(rows.all())` for a typed
   `select(...)`.
+
+## An uncommitted test setup on the same session gets committed for real by an expected refusal
+
+- **Rule:** Never leave an uncommitted prerequisite (a settings override via
+  `db.merge`/`flush`) on the SAME session earlier in a test whose next call is expected to
+  raise via the early-commit-before-raise pattern (`CLAUDE.md`) — commit it separately
+  first, or assert against the default instead.
+- **Why:** A signatures test wrote an uncommitted `SystemSetting` override, then called
+  `sign()` expecting `ERR-SIGN-001` — the refusal's own `db.commit()` commits EVERYTHING
+  pending on that session, so the override persisted for real. Invisible alone; surfaced
+  only running the whole file, because an earlier test had already cached the now-wrong
+  default via `settings_store`'s 60-second cache (3.8 t6).
+- **How to apply:** Before combining a settings-override write with a call that could be
+  refused, ask whether that call's whole point IS the refusal — if so, keep the write out of
+  that test entirely.
+
+## A module's first HTTP-driven test file needs its own `_app_on_test_db` guard
+
+- **Rule:** The first test file in a module that drives requests through `create_app()`
+  (not direct `service.py` calls) must add an autouse fixture monkeypatching `DATABASE_URL`
+  to `database_url_test` plus `get_settings.cache_clear()` — copy it from any other
+  HTTP-tested module's `conftest.py`, never assume it is inherited.
+- **Why:** Without it, `create_app()`'s lifespan opens the shared dev `DATABASE_URL`, not
+  the test one — every session cookie a fixture wrote is invisible to it, and EVERY request
+  401s (`ERR-AUTH-002`), reading as a blanket auth failure with no hint that the database is
+  the actual bug (hit on `signatures/test_api.py`, 3.8 t7).
+- **How to apply:** Adding a module's first `router.py` test file, grep its own
+  `conftest.py` for `_app_on_test_db` before writing a single `client.get(...)`; add it
+  there (autouse) if missing, rather than per-file.
+
+## An unannotated test fixture parameter hides a `str | None` argument-type error pyright would catch
+
+- **Rule:** Annotate test function parameters with their real fixture type (`a_user: User`,
+  not bare `a_user`) — pyright then checks attribute access against the actual model,
+  catching a nullable-column mismatch an unannotated (implicit `Any`) parameter silently
+  swallows.
+- **Why:** `tests/modules/signatures/test_sign.py` calls `_pkcs7(a_user.pinfl)` (a
+  `str`-only parameter) with zero pyright errors ONLY because its test functions never type
+  `a_user` — `User.pinfl: Mapped[str | None]` needs narrowing. Adding `a_user: User` in a
+  new file surfaced three real `reportArgumentType` errors for the identical expression
+  (3.8 t5).
+- **How to apply:** Prefer typed test parameters generally; narrow a fixture's nullable
+  attribute explicitly at the call site (`assert a_user.pinfl is not None`) instead of
+  leaving the parameter unannotated to dodge the check.
 
 ---
 
