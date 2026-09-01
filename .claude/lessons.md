@@ -1335,3 +1335,26 @@ Rules for this file:
   also carries the constraint's DETAIL, which quotes the offending row's
   own values (the same PII concern `gis/import_service.py`'s
   `_database_row_error` already documents for outbound messages).
+
+## An unannotated test parameter hides a `str | None` argument-type error pyright would catch if annotated
+
+- **Rule:** When a test function's fixture parameter carries an explicit type
+  (`a_user: User`), pyright checks attribute access against the REAL model
+  type, and a nullable column like `User.pinfl: Mapped[str | None]` then
+  correctly flags `a_user.pinfl` passed to a `str`-only parameter. Narrow it
+  with `assert a_user.pinfl is not None` right before use — the same idiom
+  Task 4 already used for `DomainError.details`.
+- **Why:** `tests/modules/signatures/test_sign.py`'s own
+  `_pkcs7(a_user.pinfl)` calls (a `str`-only parameter) pass pyright with
+  zero errors ONLY because that file's test functions never annotate
+  `a_user`'s type (`def test_x(db, a_user):`) — an unannotated parameter is
+  implicit `Any` to pyright, which silently swallows the exact same
+  `str | None` mismatch a typed parameter would catch. Adding `a_user: User`
+  in a new file (`test_ri05.py`, stage 3.8 Task 5) surfaced three
+  `reportArgumentType` errors for the identical expression against the same
+  fixture and the same helper's sibling call (`encode_mock_signature`).
+- **How to apply:** Prefer annotating test function parameters — it catches
+  real bugs an unannotated signature would hide, not just this one. When a
+  fixture's attribute is a nullable column you know is set by construction
+  in that fixture, narrow it explicitly at the call site rather than leaving
+  the parameter unannotated to dodge the check.

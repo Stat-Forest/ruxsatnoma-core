@@ -33,6 +33,24 @@ from app.modules.signatures.verify import Verdict, build_verdict
 # find every signing attempt against an object with one filter.
 SIGNATURE_CREATE = "signature.create"
 
+# RI-05 (docs/tz/10-klassifikatory.md): "an attempt to sign with a revoked or
+# expired certificate", severity high. `build_verdict` (verify.py) also
+# reports "certificate_invalid_at_signing" for a certificate that was outside
+# its own validity window at the moment it signed -- the same
+# certificate-standing failure the classifier names, just caught by the
+# validity-window check rather than the live revoked/expired status, so it
+# counts too. Deliberately excludes the two ownership reasons
+# ("certificate_pinfl_mismatch", "signer_pinfl_unknown" -- a stranger's or an
+# unrecorded PINFL, not a bad certificate) and "signature_invalid" (a broken
+# signature, not a certificate problem): marking those would flood stage
+# 4.2's risk report (not built yet -- this task only marks the event) with
+# the wrong events. Public (not `_`-prefixed) so a reader -- a test, or
+# stage 4.2 itself -- has one place to check "does this reason count",
+# rather than a second, separately maintained copy of the three strings.
+CERTIFICATE_STANDING_REASONS = frozenset(
+    {"certificate_revoked", "certificate_expired", "certificate_invalid_at_signing"}
+)
+
 
 async def get_certificate(db: AsyncSession, certificate_id: uuid.UUID) -> Certificate:
     cert = await repo.get_certificate(db, certificate_id)
@@ -415,6 +433,13 @@ async def sign(
         object_id=object_id,
         result="success" if verdict.status == "valid" else "denied",
         basis=verdict.reason,
+        # Ruling 10: mark a certificate-standing refusal for stage 4.2's risk
+        # report (RI-05) -- additive only, same audit call, same commit.
+        extra=(
+            {"risk_indicator": "RI-05", "reason": verdict.reason}
+            if verdict.reason in CERTIFICATE_STANDING_REASONS
+            else None
+        ),
     )
 
     if verdict.status == "invalid":
