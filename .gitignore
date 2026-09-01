@@ -18,3 +18,4 @@ pg-data/
 .claude/*
 !.claude/lessons.md
 !.claude/commands/
+!.claude/skills/

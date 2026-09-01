@@ -1,6 +1,6 @@
 # Single entry point for the local gate. `make check` mirrors CI
 # (.github/workflows/ci.yml) exactly, so the two can never drift apart.
-.PHONY: help install hooks up down logs migrate revision bootstrap seed api workers test lint fmt type security check heads
+.PHONY: help install hooks up down logs migrate revision bootstrap seed api workers test lint fmt type security check heads lessons-check
 
 help:               ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -30,6 +30,9 @@ heads:              ## Assert exactly one Alembic head — no DB needed (.claude
 	@uv run python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; \
 	h = ScriptDirectory.from_config(Config('alembic.ini')).get_heads(); print('alembic heads:', ', '.join(h)); \
 	raise SystemExit(0 if len(h) == 1 else 'FAIL: multiple Alembic heads — run: uv run alembic merge heads -m merge')"
+
+lessons-check:      ## Check .claude/lessons.md structure and size budget
+	@uv run python scripts/lessons_check.py
 
 bootstrap:          ## Create the first sys_admin — make bootstrap LOGIN=admin NAME="Admin"
 	uv run python -m app.bootstrap --login "$(LOGIN)" --full-name "$(NAME)"
@@ -62,4 +65,4 @@ security:           ## Security scan (bandit), same args as CI and pre-commit
 	# pyproject.toml. Version pinned so local and CI report the same findings.
 	uvx bandit@1.9.4 -ll --skip B101 -r app
 
-check: heads lint type security test  ## The full local gate — exactly what CI runs
+check: heads lessons-check lint type security test  ## The full local gate — exactly what CI runs
