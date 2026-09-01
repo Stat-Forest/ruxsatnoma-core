@@ -5,9 +5,9 @@ The file is read before every coding task, so its size is a running cost paid by
 every session. Prose cannot hold a size budget on its own — this does.
 
 Fails on a malformed entry (missing one of the three bullets), an entry past the hard
-ceiling, or the whole file past its cap. Entries over the soft budget are reported but
-do not fail: only a MERGE, which deletes other entries, earns those lines, and no script
-can tell a merge from a story.
+ceiling, the whole file past its cap, or a limit stated differently in prose than it is
+here. Entries over the soft budget are reported but do not fail: only a MERGE, which
+deletes other entries, earns those lines, and no script can tell a merge from a story.
 
 The per-entry limits and the file cap answer different failures. Short entries are still
 entries, so without the cap the file grows back one well-formed lesson at a time — which
@@ -21,7 +21,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-LESSONS = Path(__file__).resolve().parent.parent / ".claude" / "lessons.md"
+ROOT = Path(__file__).resolve().parent.parent
+LESSONS = ROOT / ".claude" / "lessons.md"
+SKILL = ROOT / ".claude" / "skills" / "writing-lessons" / "SKILL.md"
 
 SOFT_LIMIT = 12  # a new entry
 HARD_LIMIT = 24  # a merge replacing two or more entries — nothing goes past this
@@ -36,6 +38,26 @@ REQUIRED_BULLETS = ("- **Rule:**", "- **Why:**", "- **How to apply:**")
 # numbers only as a deliberate decision, never to unblock a commit.
 MAX_ENTRIES = 60
 MAX_LINES = 900
+
+# The four numbers above are also stated in prose, in `lessons.md`'s header and in the
+# skill — three copies, exactly the "two sources of truth" shape `lessons.md`'s own
+# enum-column entry warns about. Nothing but this stopped a raised constant from leaving
+# both documents quietly lying. The phrases are BUILT from the constants, so changing one
+# fails here, naming the file and the sentence to update. It does pin that wording: reword
+# these sentences and the check fails until the pattern below is reworded with them. That
+# is the trade — a fixed phrase per number, against prose that silently goes stale.
+DECLARED_IN_PROSE = {
+    LESSONS: (
+        f"at most {SOFT_LIMIT} lines",
+        f"never past {HARD_LIMIT}",
+        f"{MAX_ENTRIES} entries / {MAX_LINES} lines",
+    ),
+    SKILL: (
+        f"{SOFT_LIMIT} lines is the budget",
+        f"{HARD_LIMIT}-line ceiling",
+        f"{MAX_ENTRIES} entries / {MAX_LINES} lines",
+    ),
+}
 
 
 class Entry:
@@ -82,6 +104,27 @@ def parse(path: Path) -> list[Entry]:
     return entries
 
 
+def prose_drift() -> list[str]:
+    """Report every limit a document states differently from the constant above it."""
+    problems: list[str] = []
+    for path, phrases in DECLARED_IN_PROSE.items():
+        if not path.exists():
+            problems.append(
+                f"  {path.relative_to(ROOT)} not found — it states the limits and must exist"
+            )
+            continue
+        text = path.read_text(encoding="utf-8")
+        for phrase in phrases:
+            if phrase not in text:
+                problems.append(
+                    f'  {path.name} no longer says "{phrase}"\n'
+                    f"      A limit changed in {Path(__file__).name} and the prose still\n"
+                    f"      carries the old number, or the sentence was reworded. Update the\n"
+                    f"      document, or DECLARED_IN_PROSE if the wording moved on purpose."
+                )
+    return problems
+
+
 def main() -> int:
     if not LESSONS.exists():
         print(f"FAIL: {LESSONS} not found")
@@ -89,7 +132,7 @@ def main() -> int:
 
     entries = parse(LESSONS)
     total_lines = len(LESSONS.read_text(encoding="utf-8").splitlines())
-    failures: list[str] = []
+    failures: list[str] = prose_drift()
     over_soft: list[Entry] = []
 
     for entry in entries:
