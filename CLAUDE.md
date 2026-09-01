@@ -6,7 +6,7 @@ FastAPI modular monolith for the forest-permit system. Architecture, DB schema a
 
 ## Run / test
 
-`make help` lists every target; **`make check` is the local gate and mirrors CI exactly** (ruff check + format check + pyright + pytest) — run it before every commit, together with `uv run pre-commit run --all-files`. The raw commands behind it:
+`make help` lists every target; **`make check` is the local gate and mirrors CI exactly** (single Alembic head + lessons budget + ruff check + format check + pyright + bandit + pytest) — run it before every commit, together with `uv run pre-commit run --all-files`. The raw commands behind it:
 
 ```bash
 uv sync
@@ -44,11 +44,16 @@ GitHub Actions (`.github/workflows/ci.yml`, stage 3.4): `lint` (single-Alembic-h
 
 ## Continuous learning
 
-After fixing any non-trivial bug or discovering a non-obvious gotcha, **append a
-terse entry to `.claude/lessons.md`** — short topic title + **Rule:** / **Why:** /
-**How to apply:**, one line each. Ruxsatnoma-specific only; general Python/FastAPI
-advice does not belong there. This is part of finishing a task, not optional
-polish: closing a stage includes the lessons its reviews produced.
+After fixing any non-trivial bug or discovering a non-obvious gotcha, record it with
+the **`writing-lessons` skill** (`.claude/skills/writing-lessons/`). Do not simply
+append: the skill picks between a mechanical check, sharpening the existing entry for
+that class, another file, and a new entry in `.claude/lessons.md`. "Append a terse
+entry" was the whole instruction until 2026-09-01, and it is how that file reached 1217
+lines with six classes of gotcha written down twice. `make lessons-check` enforces the
+per-entry and whole-file budgets, but a well-formed duplicate passes it — only the
+skill's search step catches that. Ruxsatnoma-specific only; general Python/FastAPI
+advice does not belong there. This is part of finishing a task, not optional polish:
+closing a stage includes the lessons its reviews produced.
 
 Where a finding belongs:
 
