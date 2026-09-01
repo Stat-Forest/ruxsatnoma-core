@@ -13,6 +13,7 @@ E-IMZO only through the `integrations.adapters.eimzo` seam
 import hashlib
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +51,22 @@ SIGNATURE_CREATE = "signature.create"
 CERTIFICATE_STANDING_REASONS = frozenset(
     {"certificate_revoked", "certificate_expired", "certificate_invalid_at_signing"}
 )
+
+
+def _ri05_extra(reason: str | None) -> dict[str, Any] | None:
+    """The `extra=` value for an `audit.log` call reporting `reason` on a
+    signing attempt -- `None` when `reason` is not a certificate-standing
+    problem. `sign()` has two call sites that can report one of these three
+    reasons (the final call, reached once a certificate was parsed; the
+    earlier `info is None` refusal, reached when the adapter could not parse
+    one at all -- unreachable with today's mock, but a real adapter at stage
+    5.2 could report `certificate_invalid_at_signing` there too), and this is
+    the one place both ask "does this reason count", so the two can never
+    answer it differently (fix round 1 -- the same drift 3.7's own review
+    caught: two call sites deciding the same thing independently)."""
+    if reason in CERTIFICATE_STANDING_REASONS:
+        return {"risk_indicator": "RI-05", "reason": reason}
+    return None
 
 
 async def get_certificate(db: AsyncSession, certificate_id: uuid.UUID) -> Certificate:
@@ -298,6 +315,7 @@ async def sign(
             object_id=object_id,
             result="denied",
             basis=verdict.reason,
+            extra=_ri05_extra(verdict.reason),
         )
         await db.commit()
         raise err("ERR-SIGN-001", details={"reason": verdict.reason})
@@ -435,11 +453,7 @@ async def sign(
         basis=verdict.reason,
         # Ruling 10: mark a certificate-standing refusal for stage 4.2's risk
         # report (RI-05) -- additive only, same audit call, same commit.
-        extra=(
-            {"risk_indicator": "RI-05", "reason": verdict.reason}
-            if verdict.reason in CERTIFICATE_STANDING_REASONS
-            else None
-        ),
+        extra=_ri05_extra(verdict.reason),
     )
 
     if verdict.status == "invalid":

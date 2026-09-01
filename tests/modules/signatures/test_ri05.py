@@ -1,8 +1,12 @@
 """RI-05 (docs/tz/10-klassifikatory.md): an attempt to sign with a
 certificate that is not in good standing -- revoked, expired, or not within
-its own validity window at the moment it signed. Task 5 only marks the audit
-entry for these three reasons on `service.sign`'s final `audit.log` call
-(plan ruling 10); stage 4.2, not built yet, is what later reads the marker
+its own validity window at the moment it signed. `service.sign` has two
+`audit.log` call sites that can report one of these three reasons -- the
+final call (always reached once a certificate was parsed, success or not)
+and the earlier `info is None` refusal (a verification result with no
+certificate at all) -- and fix round 1 routes both through the one
+`service._ri05_extra` helper so they cannot mark the event differently
+(plan ruling 10). Stage 4.2, not built yet, is what later reads the marker
 and turns it into a risk report.
 
 Certificate identities below use a random suffix rather than a fixed literal
@@ -29,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import DomainError
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User
-from app.modules.integrations.adapters.eimzo import encode_mock_signature
+from app.modules.integrations.adapters.eimzo import EimzoVerification, encode_mock_signature
 from app.modules.signatures import service
 from tests.modules.auth.test_sessions import make_user
 
@@ -211,3 +215,62 @@ async def test_an_ownership_refusal_is_not_flagged_as_ri05(db: AsyncSession, a_u
     entry = await _latest_signature_create_entry(db, object_id=obj_id)
     assert entry.result == "denied"
     assert entry.extra is None
+
+
+@pytest.mark.asyncio
+async def test_a_certificateless_refusal_with_a_qualifying_reason_is_flagged_as_ri05(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+):
+    """Covers `sign()`'s OTHER `audit.log` call site -- the `info is None`
+    branch (`result.subject_certificate` is `None`, so there is no
+    certificate to bind and no `signatures` row to write) -- which today's
+    `MockEimzo` can never reach with a qualifying RI-05 reason: its own
+    `_verify_envelope` (eimzo.py) only ever returns `status_code` 1 (match)
+    or -10 (anything else), and -10 maps to `signature_invalid`, not one of
+    the three `CERTIFICATE_STANDING_REASONS`. Task 5's own report flagged
+    this precise gap: a real adapter (stage 5.2) reporting `status_code=-12`
+    (`EIMZO_STATUS_REASONS[-12] == "certificate_invalid_at_signing"`) on an
+    envelope it also could not parse a certificate from would reach this
+    branch with a qualifying reason, and before this fix that branch never
+    passed `extra=` at all.
+
+    No adapter that exists today produces that combination, so the only
+    honest way to exercise this call site is to stand in for one: a fake
+    adapter, monkeypatched in place of `get_eimzo_adapter` (the way
+    `test_sign.py`'s own race tests stand in for a stale read), returns
+    exactly that shape. This proves `sign()` marks it correctly IF an
+    adapter ever returns it -- it does not prove the real E-IMZO adapter
+    will; that remains unexercised until stage 5.2 lands a real one."""
+
+    class _FakeAdapter:
+        async def verify_detached(self, *, document: bytes, pkcs7: str) -> EimzoVerification:
+            return EimzoVerification(
+                status_code=-12,
+                subject_certificate=None,
+                signed_at=None,
+                timestamp_token=None,
+                raw={},
+            )
+
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _FakeAdapter())
+
+    obj_id = uuid.uuid4()
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=DOC,
+            pkcs7="unused-the-fake-adapter-ignores-this",
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "certificate_invalid_at_signing"
+
+    entry = await _latest_signature_create_entry(db, object_id=obj_id)
+    assert entry.result == "denied"
+    assert entry.extra is not None
+    assert entry.extra["risk_indicator"] == "RI-05"
+    assert entry.extra["reason"] == "certificate_invalid_at_signing"
