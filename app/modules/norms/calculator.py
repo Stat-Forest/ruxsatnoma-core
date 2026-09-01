@@ -328,6 +328,77 @@ def remaining_sb(max_sb_value: int, load_sb: Decimal, params: Mapping[str, Any])
     return Decimal(_round_heads(Decimal(max_sb_value) - load_sb, _rule(params, "rounding_heads")))
 
 
+def from_input_snapshot(input_snapshot: Mapping[str, Any]) -> tuple[CalcRequest, ParamSnapshot]:
+    """Rebuilds the exact `(request, snapshot)` pair a stored calculation was
+    computed from, using nothing but its own `input_snapshot` column.
+
+    This is what ruling 18's promise MEANS — "sufficient to recompute it years
+    later" — turned from a claim into something executable: feed the result
+    back through `calculate` and the same `amount`/`used_sb`/`max_sb`/
+    `remaining_sb` must come out. Until I9 (final review) nothing proved it;
+    the tests asserted only that particular KEYS were present, which is how
+    the missing `load_sb`/`load_source` went unnoticed until fix-round 1.
+
+    It is a VERIFICATION tool, not a pricing path. The public-surface note at
+    the end of `service.py` still stands: a level-4+ caller must never
+    recompute a stored `Calculation`'s amount — a saved row is already the
+    answer, and `rule_code_version` names the arithmetic that produced it.
+    Reading a snapshot written under a DIFFERENT `RULE_CODE_VERSION` than this
+    module's would recompute it under today's formula shape, which is exactly
+    the thing that would silently disagree with the stored figure.
+
+    Every value comes back as the string `jsonable` produced; `_decimal`/
+    `_rule` accept those forms, and the conversions below cover the fields
+    whose TYPE (not merely precision) has to be restored — the dates, the
+    `Decimal` quantities and the `uuid.UUID` identifiers."""
+    raw_request = input_snapshot["request"]
+    request = CalcRequest(
+        activity_code=raw_request["activity_code"],
+        on_date=date.fromisoformat(raw_request["on_date"]),
+        period_from=date.fromisoformat(raw_request["period_from"]),
+        period_to=date.fromisoformat(raw_request["period_to"]),
+        area_ha=Decimal(raw_request["area_ha"]),
+        items=tuple(
+            LivestockItem(item["livestock_code"], int(item["count"]))
+            for item in raw_request["items"]
+        ),
+        quantity=None if raw_request["quantity"] is None else Decimal(raw_request["quantity"]),
+        benefit_code=raw_request["benefit_code"],
+    )
+    tariffs = tuple(
+        TariffFact(
+            id=None if row["id"] is None else uuid.UUID(row["id"]),
+            livestock_group=row["livestock_group"],
+            coefficient=Decimal(row["coefficient"]),
+            quantity_unit=row["quantity_unit"],
+            benefit_modifiers=row["benefit_modifiers"],
+        )
+        for row in input_snapshot["tariffs"]
+    )
+    raw_norm = input_snapshot["norm"]
+    norm = (
+        None
+        if raw_norm is None
+        else NormFact(
+            id=None if raw_norm["id"] is None else uuid.UUID(raw_norm["id"]),
+            yield_c_per_ha=(
+                None if raw_norm["yield_c_per_ha"] is None else Decimal(raw_norm["yield_c_per_ha"])
+            ),
+            max_sb=raw_norm["max_sb"],
+            season=raw_norm["season"],
+            rotation=raw_norm["rotation"],
+        )
+    )
+    snapshot = ParamSnapshot(
+        values=input_snapshot["params"],
+        tariffs=tariffs,
+        norm=norm,
+        load_sb=Decimal(input_snapshot["load_sb"]),
+        load_source=input_snapshot["load_source"],
+    )
+    return request, snapshot
+
+
 def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
     """Resolves the tariff (for grazing, one per livestock group via
     `tariff_group:<code>`; otherwise the single row with `livestock_group IS

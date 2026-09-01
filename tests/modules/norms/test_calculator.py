@@ -2,6 +2,8 @@
 source: VMQ 689 for the limit (0.85, 3.74), VMQ 278 for the rates, and the real
 BHM (412 000 sum until 2026-08-31, 440 000 from 2026-09-01)."""
 
+import json
+import uuid
 from datetime import date
 from decimal import Decimal
 
@@ -15,6 +17,7 @@ from app.modules.norms.calculator import (
     ParamSnapshot,
     TariffFact,
     calculate,
+    from_input_snapshot,
     max_sb,
     remaining_sb,
 )
@@ -672,3 +675,113 @@ def test_the_calculated_remaining_sb_is_the_rounded_one() -> None:
     assert result.remaining_sb == Decimal("23")
     limit_line = next(line for line in result.breakdown if line["kind"] == "limit")
     assert limit_line["remaining_sb"] == "23"
+
+
+def test_a_stored_calculation_recomputes_to_the_same_numbers() -> None:
+    """I9 (final review), and the stage's headline guarantee (ruling 18):
+    "every stored calculation carries `rule_version` + `input_snapshot`
+    sufficient to recompute it years later". Until now the tests asserted
+    only that particular KEYS were present — which is precisely how the
+    missing `load_sb`/`load_source` went unnoticed until fix-round 1 added
+    them. This rebuilds the request and the snapshot from the stored column
+    ALONE, recomputes, and compares every number.
+
+    Deliberately the richest shape available: grazing (two groups, so both
+    tariff rows and both `coef_sb` coefficients matter), a claimed benefit
+    that applies to only one of them, a norm with a frozen `max_sb`, and a
+    non-zero committed load — the last being the one `remaining_sb` cannot be
+    reproduced without."""
+    request = CalcRequest(
+        activity_code="grazing",
+        on_date=date(2026, 8, 30),
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 9, 30),
+        area_ha=Decimal("92.0000"),
+        items=(LivestockItem("sheep_goat_6m", 50), LivestockItem("cattle_adult", 3)),
+        quantity=None,
+        benefit_code="veteran",
+    )
+    tariffs = (
+        TariffFact(
+            id=uuid.uuid4(),
+            livestock_group="small_adult",
+            coefficient=Decimal("0.1"),
+            quantity_unit="head",
+            benefit_modifiers={"veteran": "0.5"},
+        ),
+        TariffFact(
+            id=uuid.uuid4(),
+            livestock_group="large_adult",
+            coefficient=Decimal("0.45"),
+            quantity_unit="head",
+            benefit_modifiers=None,
+        ),
+    )
+    snapshot = ParamSnapshot(
+        values=PARAMS,
+        tariffs=tariffs,
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=Decimal("12"),
+            max_sb=250,
+            season={"windows": [{"from": "04-01", "to": "10-31"}]},
+            rotation={"rest_years": [2027]},
+        ),
+        load_sb=Decimal("3.5"),
+        load_source="permits",
+    )
+    original = calculate(request, snapshot)
+
+    # Round-trip through JSON, because that is what the JSONB column does to
+    # it — nothing may depend on a Python object that survived in memory.
+    stored = json.loads(json.dumps(original.input_snapshot))
+    assert stored["rule_code_version"] == original.rule_code_version
+
+    rebuilt_request, rebuilt_snapshot = from_input_snapshot(stored)
+    recomputed = calculate(rebuilt_request, rebuilt_snapshot)
+
+    assert recomputed.amount == original.amount
+    assert recomputed.used_sb == original.used_sb
+    assert recomputed.max_sb == original.max_sb
+    assert recomputed.remaining_sb == original.remaining_sb
+    assert recomputed.breakdown == original.breakdown
+    # And it is a real number, not two matching Nones.
+    assert original.amount > 0
+    assert original.remaining_sb is not None
+
+
+def test_the_recomputation_survives_the_shape_the_database_returns() -> None:
+    """The same guarantee against a snapshot read back OUT of Postgres rather
+    than the dict `calculate` just built: JSONB preserves the strings
+    `jsonable` wrote, and the rebuild must not depend on anything else."""
+    request = CalcRequest(
+        activity_code="haymaking",
+        on_date=date(2026, 8, 30),
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 9, 30),
+        area_ha=Decimal("10"),
+        items=(),
+        quantity=Decimal("4"),
+        benefit_code=None,
+    )
+    snapshot = ParamSnapshot(
+        values=PARAMS,
+        tariffs=(
+            TariffFact(
+                id=None,
+                livestock_group=None,
+                coefficient=Decimal("1.5"),
+                quantity_unit="ha",
+                benefit_modifiers=None,
+            ),
+        ),
+        norm=None,
+        load_sb=Decimal("0"),
+        load_source="none",
+    )
+    original = calculate(request, snapshot)
+    assert original.amount == Decimal("2472000")  # 4 ha × 1.5 × 412 000
+
+    rebuilt = calculate(*from_input_snapshot(json.loads(json.dumps(original.input_snapshot))))
+    assert rebuilt.amount == original.amount
+    assert rebuilt.breakdown == original.breakdown
