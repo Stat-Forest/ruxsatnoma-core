@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.integrations.adapters.eimzo import EimzoCertificateInfo
@@ -116,3 +116,73 @@ async def list_for_object(
         .order_by(Signature.signed_at)
     )
     return list(rows.scalars())
+
+
+async def get_signature(db: AsyncSession, signature_id: uuid.UUID) -> Signature | None:
+    return await db.get(Signature, signature_id)
+
+
+async def signed_by(
+    db: AsyncSession, *, object_type: str, object_id: uuid.UUID, signer_user_id: uuid.UUID
+) -> bool:
+    """Whether `signer_user_id` has at least one signature row — valid or
+    invalid, an attempt is still evidence (ruling 8) — against this object.
+    Task 7's own definition of "the object's owner" for `GET /signatures`: the
+    only ownership signal available to a module that owns no
+    `permits`/`applications` table of its own to ask (module docstring,
+    Level 2 — this module never queries another module's tables)."""
+    rows = await db.execute(
+        select(Signature.id)
+        .where(
+            Signature.object_type == object_type,
+            Signature.object_id == object_id,
+            Signature.signer_user_id == signer_user_id,
+        )
+        .limit(1)
+    )
+    return rows.first() is not None
+
+
+async def list_for_object_page(
+    db: AsyncSession, *, object_type: str, object_id: uuid.UUID, offset: int, limit: int
+) -> tuple[list[Signature], int]:
+    """The paged twin of `list_for_object` above — that one stays UNPAGED
+    forever, since `missing_purposes`/`is_complete` read EVERY row through it
+    and silently truncating to page 1 would corrupt a completeness answer
+    (lesson: paging a list breaks assumed membership). This is Task 7's own,
+    for `GET /signatures` only, ordered `(signed_at, id)` — `signed_at` alone
+    ties whenever two signatures land in the same instant, and an unordered
+    tie leaves `items[0]` to Postgres' own row order (pre-flight ruling P6)."""
+    conditions = (Signature.object_type == object_type, Signature.object_id == object_id)
+    total = (
+        await db.execute(select(func.count()).select_from(Signature).where(*conditions))
+    ).scalar_one()
+    rows = await db.execute(
+        select(Signature)
+        .where(*conditions)
+        .order_by(Signature.signed_at, Signature.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars()), total
+
+
+async def list_certificates(
+    db: AsyncSession, *, user_id: uuid.UUID, offset: int, limit: int
+) -> tuple[list[Certificate], int]:
+    """A user's own BOUND certificates (`unbound_at IS NULL`) — Task 7's own
+    `GET /certificates`. Unbinding (below) never deletes a row, so a
+    certificate a signature still references keeps existing, just off this
+    list."""
+    conditions = (Certificate.user_id == user_id, Certificate.unbound_at.is_(None))
+    total = (
+        await db.execute(select(func.count()).select_from(Certificate).where(*conditions))
+    ).scalar_one()
+    rows = await db.execute(
+        select(Certificate)
+        .where(*conditions)
+        .order_by(Certificate.bound_at, Certificate.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars()), total

@@ -1386,3 +1386,26 @@ Rules for this file:
   `sign()` call in the same test, ask whether that `sign()` call could be
   refused — if a test's whole point IS the refusal, keep the settings write
   out of that test entirely.
+
+## A module's first HTTP-driven test file needs its own `_app_on_test_db` guard
+
+- **Rule:** The first test file in a module that drives requests through
+  `create_app()` (as opposed to calling `service.py` in-process) must add an
+  autouse `monkeypatch.setenv("DATABASE_URL", get_settings().database_url_test)`
+  + `get_settings.cache_clear()` fixture to that module's own `conftest.py` —
+  copy the identical fixture every other HTTP-tested module already carries
+  (`tests/modules/{gis,admin,auth,norms,notifications,integrations}/conftest.py`,
+  `tests/core/conftest.py`), never assume it is inherited from the root.
+- **Why:** Without it, `create_app()`'s own lifespan opens `DATABASE_URL` (the
+  shared dev database), not `DATABASE_URL_TEST` — every session cookie a
+  test's fixtures wrote is invisible to it, and EVERY request 401s
+  (`ERR-AUTH-002`), including plain GETs, which reads as a blanket auth
+  failure with no hint that the actual bug is which database the app opened.
+  Hit building 3.8 Task 7's `test_api.py`: Tasks 1-6 never needed this (no
+  HTTP client, only direct `service.sign()` calls), so `tests/modules/
+  signatures/conftest.py` never grew the guard until the module's first
+  router test needed one.
+- **How to apply:** Adding a module's first `router.py` test file → grep the
+  module's own `conftest.py` for `_app_on_test_db` before writing a single
+  `client.get(...)`; if it is missing, add it there (autouse, so every test
+  in the directory gets it for free) rather than per-file.

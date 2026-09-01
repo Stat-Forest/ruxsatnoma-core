@@ -8,7 +8,13 @@ Level 2 (`models.py`'s own docstring): this module reaches `auth` through the
 certificate belongs to its presenter) — never queries `users`/
 `representations` itself, only ever through `auth`'s own service. Reaches
 E-IMZO only through the `integrations.adapters.eimzo` seam
-(`get_eimzo_adapter`; real verification arrives at stage 5.2)."""
+(`get_eimzo_adapter`; real verification arrives at stage 5.2). Task 7 adds
+one further, narrow exception: `auth.repo.role_code`/`permission_codes`,
+read directly rather than through `auth`'s service, for a permission check
+that must run INSIDE a handler rather than as a route-level
+`require_permission` dependency (`_holds_view_any`, below) — the same
+`auth_repo` import `norms.service`/`gis.service`/`admin.users_service`
+already use for the identical shape of check."""
 
 import hashlib
 import uuid
@@ -20,12 +26,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store
 from app.core.errors import err
+from app.core.schemas import PageParams
 from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
+from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
-from app.modules.integrations.adapters.eimzo import EimzoCertificateInfo, get_eimzo_adapter
+from app.modules.integrations.adapters.eimzo import (
+    EIMZO_STATUS_REASONS,
+    EimzoCertificateInfo,
+    get_eimzo_adapter,
+)
 from app.modules.signatures import repo
 from app.modules.signatures.models import Certificate, Signature
+from app.modules.signatures.permissions import VIEW_ANY
 from app.modules.signatures.verify import Verdict, build_verdict
 
 # design/01 rule 6 / CLAUDE.md audit invariant: "<object>.<verb>" in English,
@@ -34,6 +48,19 @@ from app.modules.signatures.verify import Verdict, build_verdict
 # refusal with no signature row at all — shares this one code, so a reader can
 # find every signing attempt against an object with one filter.
 SIGNATURE_CREATE = "signature.create"
+
+# Task 7's own three actions — distinct from SIGNATURE_CREATE because none of
+# them is a signing attempt: binding a certificate ahead of time, unbinding
+# one, and oversight re-verification are their own events with their own
+# "<object>.<verb>" codes, so a reader filtering "every signing attempt" by
+# SIGNATURE_CREATE alone is not also handed unrelated certificate-lifecycle
+# noise. `bind_certificate`'s OWN internal "owned by another user" refusal
+# (below) keeps using SIGNATURE_CREATE regardless of which caller reached it
+# — that behaviour is Task 4's, already relied on by `sign()`'s tests, and
+# this task does not change it.
+CERTIFICATE_BIND = "certificate.bind"
+CERTIFICATE_UNBIND = "certificate.unbind"
+SIGNATURE_REVERIFY = "signature.reverify"
 
 # RI-05 (docs/tz/10-klassifikatory.md): "an attempt to sign with a revoked or
 # expired certificate", severity high. `build_verdict` (verify.py) also
@@ -530,3 +557,271 @@ async def sign(
         raise err("ERR-SIGN-001", details={"reason": verdict.reason})
 
     return signature
+
+
+# ---------------------------------------------------------------------------
+# Task 7: the HTTP surface's own support — certificate list/bind/unbind, the
+# object's signature list, and oversight re-verification. Everything above
+# this line is Tasks 1-6; nothing above was changed to build this.
+# ---------------------------------------------------------------------------
+
+
+async def _holds_view_any(db: AsyncSession, user: User) -> bool:
+    """Holds `signatures.view_any`, or is the superuser that passes every
+    permission gate (decision #41 ruling 2) — the same two-branch shape
+    `norms.service._holds_tariffs_publish` / `gis.service._may_manage_layers`
+    / `admin.users_service._may_manage` use for a rule checked INSIDE a
+    handler, as opposed to a `require_permission` dependency on the route
+    itself. `GET /signatures` needs exactly this shape: the route also
+    admits the object's OWN signer, who does not hold `view_any` at all, so
+    the permission check cannot live in a route-level dependency the way
+    `POST /signatures/{id}/reverify`'s `REVERIFY`-only gate does — that would
+    reject the signer before `list_signatures_page` ever got a chance to
+    check ownership instead (lesson: a permission check alone is not enough
+    on a read path that also needs an ownership check)."""
+    if await auth_repo.role_code(db, user) == SUPERUSER_ROLE:
+        return True
+    return VIEW_ANY in await auth_repo.permission_codes(db, user)
+
+
+async def list_my_certificates(
+    db: AsyncSession, *, user: User, params: PageParams
+) -> tuple[list[Certificate], int]:
+    """`GET /certificates`: the caller's own bound certificates only."""
+    return await repo.list_certificates(
+        db, user_id=user.id, offset=params.offset, limit=params.page_size
+    )
+
+
+async def register_certificate(db: AsyncSession, *, pkcs7: str, user: User) -> Certificate:
+    """`POST /certificates` (ruling 4's second sentence): register a
+    certificate ahead of any actual signing, from a self-contained signed
+    challenge (`verify_attached` — there is no external document to hand
+    alongside it, unlike `sign()`'s detached form).
+
+    Reuses `bind_certificate`'s own ownership rule (`_ownership_reason`, fix
+    rounds 1-2) via `bind_certificate` itself, but where THAT function leaves
+    an unproven certificate quietly unbound for a later `sign()` call to
+    explain (it has no document/purpose/object to hang the evidence on right
+    there), this route has no such later call coming — an unproven
+    presentation is refused directly, here, audited the same early-commit way
+    as every other ERR-SIGN-001 refusal in this module (`bind_certificate`'s
+    own docstring names this route explicitly as the reason its permissive
+    branch cannot be the only check)."""
+    adapter = get_eimzo_adapter()
+    result = await adapter.verify_attached(pkcs7)
+    info = result.subject_certificate
+    if info is None or result.status_code != 1:
+        reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")
+        await audit.log(
+            db,
+            action=CERTIFICATE_BIND,
+            user_id=user.id,
+            object_type="certificate",
+            result="denied",
+            basis=reason,
+            extra=_ri05_extra(reason),
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": reason})
+
+    cert = await bind_certificate(db, info=info, user=user)  # may itself raise ERR-SIGN-001
+    if cert.user_id != user.id:
+        # bind_certificate's own "unproven, leave unbound" branch: re-derive
+        # WHY, the same function `bind_certificate` itself would have asked,
+        # so this refusal names the same reason `sign()` would have named had
+        # there been a signature to attach it to.
+        reason = await _ownership_reason(db, info=info, user=user)
+        await audit.log(
+            db,
+            action=CERTIFICATE_BIND,
+            user_id=user.id,
+            object_type="certificate",
+            object_id=cert.id,
+            result="denied",
+            basis=reason,
+            extra=_ri05_extra(reason),
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": reason})
+
+    await audit.log(
+        db,
+        action=CERTIFICATE_BIND,
+        user_id=user.id,
+        object_type="certificate",
+        object_id=cert.id,
+        result="success",
+    )
+    return cert
+
+
+async def unbind_certificate(db: AsyncSession, *, certificate_id: uuid.UUID, user: User) -> None:
+    """`DELETE /certificates/{id}`: the OWNER only. Sets `unbound_at`, never a
+    delete and never a `status` change (pre-flight ruling P3: `status` is the
+    certificate's own PKI state, per `design/02`, not our binding concept) —
+    a certificate a signature references must survive forever (models.py).
+    `get_certificate` raises `ERR-SYS-003` when the id does not exist at all;
+    ownership is checked here, the same reason string `bind_certificate` uses
+    for the identical fact reached from a different route."""
+    cert = await get_certificate(db, certificate_id)
+    if cert.user_id != user.id:
+        await audit.log(
+            db,
+            action=CERTIFICATE_UNBIND,
+            user_id=user.id,
+            object_type="certificate",
+            object_id=cert.id,
+            result="denied",
+            basis="certificate_owned_by_another_user",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": "certificate_owned_by_another_user"})
+    cert.unbound_at = datetime.now(UTC)
+    await db.flush()
+    await audit.log(
+        db,
+        action=CERTIFICATE_UNBIND,
+        user_id=user.id,
+        object_type="certificate",
+        object_id=cert.id,
+        result="success",
+    )
+
+
+async def list_signatures_page(
+    db: AsyncSession,
+    *,
+    object_type: str,
+    object_id: uuid.UUID,
+    user: User,
+    params: PageParams,
+) -> tuple[list[Signature], int]:
+    """`GET /signatures`: the object's OWNER — defined, in a module that owns
+    no `permits`/`applications` table of its own to ask (module docstring,
+    Level 2), as anyone holding at least one signature row against this
+    object (valid or invalid: an attempt is still evidence they were
+    involved, ruling 8) — OR `signatures.view_any` (oversight). Checked here,
+    inside the service, not as a route-level `require_permission` dependency,
+    which would reject the object's own signer outright (see
+    `_holds_view_any`'s own docstring). `ERR-ACL-001` on denial, matching the
+    code `require_permission` itself raises for "no permission for this" —
+    there is no territorial axis on `certificates`/`signatures` at all
+    (`ERR-ACL-002` stays reserved for an actual zone mismatch elsewhere)."""
+    if not await _holds_view_any(db, user):
+        if not await repo.signed_by(
+            db, object_type=object_type, object_id=object_id, signer_user_id=user.id
+        ):
+            raise err("ERR-ACL-001", details={"permission": VIEW_ANY})
+    return await repo.list_for_object_page(
+        db,
+        object_type=object_type,
+        object_id=object_id,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+
+
+async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> Signature:
+    """`POST /signatures/{id}/reverify` (ruling 5): oversight's own re-check,
+    writing a brand NEW row rather than touching the original — the stored
+    verdict is evidence of what was true AT SIGNING TIME, not a cache to
+    refresh in place.
+
+    No crypto re-check is possible here: this module never stores the
+    original document bytes, only `doc_hash` (module docstring) — so the only
+    fact that can meaningfully change since the original snapshot is the
+    certificate's OWN current standing (revoked/expired since), fetched fresh
+    from the adapter the same way `sign()` itself does, via
+    `_reconcile_status` — which also means a reverify legitimately updates
+    the CERTIFICATE row's own `status`/`revoked_at` (that is simply the truth
+    becoming known), even though it must never touch the SIGNATURE row it was
+    asked to re-check.
+
+    `purpose` is written as `f"{original.purpose}:reverify"` (brief,
+    verbatim) so ruling 8's partial unique index — `(object_type, object_id,
+    purpose) WHERE verification_status = 'valid'` — never treats this as a
+    second valid attempt at the ORIGINAL purpose's own slot;
+    `missing_purposes` only ever asks `required_purposes` for the unsuffixed
+    name, so a reverify row can never satisfy a requirement, by construction,
+    with no special case needed there.
+
+    A second reverify of the SAME original signature, while its certificate
+    remains untouched (still `active`), would produce a second `valid` row at
+    the exact same `(object_type, object_id, purpose:reverify)` slot — the
+    one collision the suffix trick does not by itself avoid. Guarded the same
+    way every other conflict in this module is: a SAVEPOINT around the insert
+    (a bare rollback would undo everything else pending on this session, not
+    just this insert — lesson), mapped to `ERR-SIGN-004` (409, already this
+    module's own code for "a certificate or signature state conflict"),
+    reusing rather than a fresh ERR code for one more shape of the same
+    fact."""
+    original = await repo.get_signature(db, signature_id)
+    if original is None:
+        raise err("ERR-SYS-003")
+    cert = await get_certificate(db, original.certificate_id)
+    adapter = get_eimzo_adapter()
+    live_status = await adapter.certificate_status(serial=cert.serial_number, issuer=cert.issuer)
+    await _reconcile_status(db, cert, live_status)
+
+    now = datetime.now(UTC)
+    if live_status == "revoked":
+        new_status, reason = "invalid", "certificate_revoked"
+    elif live_status == "expired":
+        new_status, reason = "invalid", "certificate_expired"
+    else:
+        new_status, reason = "valid", None
+    record: dict[str, Any] = {
+        **original.verification,
+        "certificate_status": live_status,
+        "reverified_at": now.isoformat(),
+        "reverified_by": str(user.id),
+        "reason": reason,
+    }
+
+    try:
+        async with db.begin_nested():
+            new_row = await repo.insert_signature(
+                db,
+                object_type=original.object_type,
+                object_id=original.object_id,
+                purpose=f"{original.purpose}:reverify",
+                signer_user_id=original.signer_user_id,
+                certificate_id=original.certificate_id,
+                doc_hash=original.doc_hash,
+                signature_value=original.signature_value,
+                signed_at=original.signed_at,
+                verification=record,
+                verification_status=new_status,
+            )
+    except IntegrityError as exc:
+        # Same diagnostic as sign()'s own except clause: IntegrityError IS a
+        # DBAPIError, this narrow clause must be checked first, and
+        # exc.orig.__cause__ (not exc.orig) is what actually names the
+        # constraint (lesson).
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "uq_signatures_valid_purpose":
+            raise
+        await audit.log(
+            db,
+            action=SIGNATURE_REVERIFY,
+            user_id=user.id,
+            object_type=original.object_type,
+            object_id=original.object_id,
+            result="denied",
+            basis="already_reverified",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-004", details={"reason": "already_reverified"}) from exc
+
+    await audit.log(
+        db,
+        action=SIGNATURE_REVERIFY,
+        user_id=user.id,
+        object_type=original.object_type,
+        object_id=original.object_id,
+        result="success",
+        basis=reason,
+        extra=_ri05_extra(reason),
+    )
+    return new_row
