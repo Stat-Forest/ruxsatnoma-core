@@ -16,7 +16,7 @@ flagged the gap; this closes it). `sys_admin` gets no row — it bypasses
 explicit grant would be redundant.
 
 Revision ID: 0014
-Revises: 0010
+Revises: 0013
 Create Date: 2026-09-01 19:23:25.575563
 
 """
@@ -29,7 +29,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "0014"
-down_revision: str | Sequence[str] | None = "0010"
+down_revision: str | Sequence[str] | None = "0013"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

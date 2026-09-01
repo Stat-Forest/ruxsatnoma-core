@@ -117,6 +117,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "Intersections below this area are a shared border, not an overlap",
         ),
         SettingSpec("gis_import_max_mb", int, 100, "Upload cap for a geodata import file, MB"),
+        SettingSpec(
+            "norms_publish_scope",
+            str,
+            "central",
+            "Who may put a norm in force: 'central' (the office, per VMQ 689) or 'leshoz'",
+        ),
     )
 }
 

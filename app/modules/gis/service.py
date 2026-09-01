@@ -1315,12 +1315,32 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
     return await repo.published_version(db, contour_id)
 
 
+async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
+    """Which leshoz owns this contour — what a level-3 module needs to apply its
+    own zone rule without importing `gis.repo` (CLAUDE.md module boundary)."""
+    return await repo.contour_organization(db, contour_id)
+
+
 async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.CheckResult]:
     """The four topology checks against one version, with no actor and no
     contour id — what a norm or an application pre-check needs.
     `run_version_checks` above is the HTTP-facing sibling: same checks, plus
     the 404 lookup and the zone gate a request has to pass."""
     return await checks.run_checks(db, version_id=version_id)
+
+
+async def features_intersecting(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    layer_codes: Sequence[str],
+    period_from: date,
+    period_to: date,
+) -> list[Any]:
+    """Published features of the given layers overlapping this contour's
+    published geometry (by more than the tolerance) and valid during the given
+    period — `norms.checks`' own fire-ban/restriction split (ruling 15) reads
+    this instead of `gis.repo` directly, same reasoning as `run_checks` above."""
+    return await repo.features_intersecting(db, contour_id, layer_codes, period_from, period_to)
 
 
 async def _may_manage_layers(db: AsyncSession, actor: User) -> bool:

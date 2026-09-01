@@ -416,6 +416,17 @@ Rules for this file:
   AND returns/serializes that same row in the same call, add `refresh()`
   after the `flush()` — don't assume an existing archive-path precedent
   covers it.
+- **The INSERT-side mirror, hit in stage 3.7 task 3:** "an INSERT gets it via
+  RETURNING" only covers columns the DB/SQLAlchemy itself generates
+  (`server_default`, identity) — a caller-supplied value for a FIXED-SCALE
+  column (`Tariff.coefficient numeric(12,6)`) is not one of those, so it is
+  NOT part of the implicit RETURNING either: posting `"1.5"` left the
+  in-memory row showing the caller's own unpadded string while Postgres had
+  already stored `"1.500000"`. `norms.service.create_versioned` needed the
+  identical `db.refresh(row)` right after `flush()` on a fresh INSERT, not
+  only on the UPDATE paths — caught by printing the raw response before and
+  after the fix, since no given test asserted create-response precision
+  until one was added for exactly this.
 
 ## A JSONB column fed by the stock `json.dumps` rejects `Decimal` and `date`
 
@@ -825,3 +836,408 @@ Rules for this file:
   inline). If the error names a revision you don't have locally, check which
   database the bare command actually connected to before suspecting the
   migration files.
+
+## A re-exported fixture shadowed by a same-file parameter trips ruff's F811, unlike a fixture defined locally
+
+- **Rule:** When a conftest.py imports another module's fixture ONLY to re-export
+  it (`# noqa: F401`) and ALSO uses that same name as a plain parameter on a
+  fixture defined in the SAME file, import it as `from module import name as
+  name` instead — never rename the parameter, since that would break pytest's
+  name-based fixture injection.
+- **Why:** Pyflakes flags a parameter shadowing an import it considers "unused"
+  as `RedefinedWhileUnused` (F811), even though the identical shape is silent
+  when the earlier binding is a locally-defined `@pytest.fixture` function
+  instead of an import — confirmed empirically both ways: `tests/modules/gis/
+  conftest.py`'s own `published_contour(db, contours_layer, leshoz,
+  approval_doc)` never trips it (those four are DEFINED there), while
+  `tests/modules/norms/conftest.py` re-exporting the same four from gis's
+  conftest and then using them as parameters on `published_contour`/
+  `draft_only_contour`/three client fixtures failed `ruff check` on all four
+  until switched to `as`-imports (stage 3.7 task 1; verified in isolation with
+  a two-line repro — `import os  # noqa: F401` then `def foo(os): return os`
+  — under this project's exact ruff config).
+- **How to apply:** Any new conftest.py that re-exports another module's
+  fixture AND ALSO consumes it locally by parameter name: keep `# noqa: F401`
+  for names you only re-export, but import the ones you also use as a local
+  parameter with `as <same name>` — `ruff check --fix` will even relocate each
+  into its own `from ... import (...)` statement; let it.
+
+## The round-trip test's expected head version is a hardcoded string every new migration must bump
+
+- **Rule:** After adding a migration, update `tests/test_migrations.py::
+  test_downgrade_upgrade_roundtrip`'s `assert version == "<old head>"` to the
+  new revision id, in the same commit.
+- **Why:** The assertion is a literal string, not derived from `alembic
+  heads` — a brand-new migration passes every test of its OWN and still fails
+  this one with a confusing `assert '0011' == '0010'` that reads like a
+  migration-chain bug rather than a one-line test update (hit adding 0011 in
+  stage 3.7 task 1; migration 0010 must have needed the identical bump from
+  `"0009"` and left no trace of having done so).
+- **How to apply:** Whenever a new migration advances the head, grep
+  `tests/test_migrations.py` for the previous head string and update it as
+  part of the same commit — it is not on any task brief's file list by
+  default, so it is easy to only discover by actually running the suite.
+
+## A bind param immediately followed by `::` loses its last letter in `sa.text()`
+
+- **Rule:** Never write `:name::cast_type` inside a raw `sa.text(...)` SQL
+  string — write `CAST(:name AS cast_type)` instead.
+- **Why:** `TextClause`'s bind-param regex is `(?<![:\w\x5c]):(\w+)(?!:)`: the
+  trailing negative lookahead rejects a match sitting right before another
+  `:`, so on `:value::text` the greedy `\w+` backtracks one character and
+  registers the param as `valu`, not `value`. `.bindparams(value=...)` then
+  raises `sqlalchemy.exc.ArgumentError: This text() construct doesn't define a
+  bound parameter named 'value'` — caught immediately by the RED/GREEN cycle,
+  never reached a running database (migration 0012, stage 3.7 task 2).
+  `tests/modules/norms/conftest.py::param_row` writes the identical
+  `to_jsonb(:value::text)` and carries the same bug, unexercised because no
+  test calls that fixture yet.
+- **How to apply:** Grep any new raw-SQL migration or test for `:\w+::`
+  before running it. `to_jsonb(CAST(:value AS text))` is the drop-in fix;
+  `param_row`'s copy still needs it, before the first test calls it.
+
+## `dict(rows.all())` on a raw `text()` query passes at runtime, fails pyright
+
+- **Rule:** Build a dict from a raw-SQL `Result` with a comprehension —
+  `{row[0]: row[1] for row in rows.all()}` — never `dict(rows.all())`.
+- **Why:** A `text()` query's rows are `Row[Any]`; pyright cannot confirm an
+  untyped `Row` is a 2-tuple, so `dict()`'s overload resolution matches the
+  wrong overload (`Iterable[list[bytes]]`) and reports `reportCallIssue` +
+  `reportArgumentType` on code that runs and passes correctly (migration 0012
+  tests, stage 3.7 task 2). The identical `dict(rows.all())` over a TYPED ORM
+  `select(Col.a, Col.b)` result (`tests/modules/gis/test_import_publish.py`)
+  does not trip this, because SQLAlchemy can infer the tuple arity statically
+  there — only the raw-`text()` case is untyped enough to confuse it.
+- **How to apply:** Any new test turning raw-SQL rows into a dict uses the
+  comprehension form; reserve `dict(rows.all())` for a typed `select(...)`
+  result.
+
+## A `response_model` mismatch is invisible to ruff and pyright — it only fails when the route actually runs
+
+- **Rule:** After writing any route with `response_model=`, hit it once for
+  real (a focused pytest run, or a throwaway two-line `TestClient` script)
+  before trusting a brief/plan's own snippet verbatim — pyright type-checks
+  the handler body, never whether the value it returns actually satisfies
+  the declared `response_model` at runtime.
+- **Why:** Two separate defects in the same APPROVED plan
+  (`docs/plans/03.7-norms.md` Task 3), both invisible to `make check`'s
+  static gates and both raising only when a real request hit the route:
+  (1) `Page[T]` requires `page`/`page_size`, but the plan's own
+  `list_parameters`/`GET /tariffs` snippets return
+  `{"items", "total", "limit", "offset"}` —
+  `fastapi.exceptions.ResponseValidationError: ... Field required` on every
+  call; (2) `PublishOut.item: Any` held a raw ORM row exactly as the plan's
+  own `publish_parameter` snippet built it — `Any` gets NO from-attributes
+  treatment (unlike a concrete `BaseModel` field, which FastAPI/pydantic
+  converts an ORM object into automatically), so
+  `pydantic_core.PydanticSerializationError: Unable to serialize unknown
+  type` fired inside the response encoder. Both confirmed with a throwaway
+  FastAPI app before writing the real router, not guessed from a traceback.
+- **How to apply:** A list endpoint whose repo layer takes `limit`/`offset`
+  (rather than this project's usual `PageParams`) must still build
+  `Page[T]` with an explicit `page`/`page_size` derived from them
+  (`offset // limit + 1`, `limit`) — never return the raw
+  `{"items", "total", "limit", "offset"}` dict some future task's own brief
+  may repeat from the same plan document. Any envelope schema with an
+  `Any`-typed field that might hold an ORM row (`PublishOut.item` here, and
+  anything shaped like it in Task 4/7) needs `SomeOut.model_validate(row)`
+  at the call site, never the bare row.
+
+## A maker-checker route needs BOTH roles' permission — the service tells them apart, not the router
+
+- **Rule:** When a lifecycle step's real gate is "not the same person who
+  did the earlier step" (maker != checker), the route dependency must
+  accept `require_any_permission(EARLIER_CODE, LATER_CODE)`, never
+  `require_permission` of just the later role's own code — the identity
+  check belongs in the service, after the permission gate, not instead of it.
+- **Why:** `norms.service.publish_versioned` (plan ruling 10) refuses a
+  maker publishing their own draft by comparing `created_by` to `actor.id`
+  — a check that only runs AFTER the route's permission dependency lets the
+  request through. The plan's own `publish_parameter` snippet gated on
+  `require_permission(TARIFFS_PUBLISH)` alone, so `tariffs_maker_client`
+  (`TARIFFS_MANAGE` only, by design — makers do not hold `TARIFFS_PUBLISH`)
+  got a 403 `ERR-ACL-001` on `/publish` instead of ever reaching the
+  service's 409 `ERR-NORM-005`/`not_maker_checker`:
+  `test_a_maker_creates_a_draft_and_cannot_publish_it` failed on the wrong
+  status code and body shape (stage 3.7 task 3). Migration 0011 grants
+  `central_admin` BOTH `norms.tariffs.manage` AND `norms.tariffs.publish`
+  at once, which only makes sense if a single role is meant to reach
+  `/publish` as EITHER a maker or a checker, never both for the same row.
+- **How to apply:** Task 4's norm lifecycle (`NORMS_MANAGE`/`NORMS_APPROVE`/
+  `NORMS_PUBLISH`) and any future maker-checker-shaped transition: check
+  whether the fixture granting the "earlier" role deliberately withholds
+  the "later" one, and if the service's own refusal is an identity
+  comparison rather than a status check, gate the route on
+  `require_any_permission` across every role that can legitimately reach
+  that step — not the step's own nominal permission alone.
+- **The mirror bug, caught by review in the very same task:** widening
+  `/publish` this way does NOT mean every sibling route sharing its
+  permission pair is safe to widen identically. `archive_versioned` has NO
+  `created_by` to compare — archiving is a single-actor action, not a
+  handoff between two drafts of the same row — so applying the identical
+  `require_any_permission(TARIFFS_PUBLISH, TARIFFS_MANAGE)` to `/archive`
+  with no service-level check let ANY `TARIFFS_MANAGE` holder take ANY
+  published row out of force single-handedly: the exact one-person change
+  maker-checker exists to prevent, and worse than the original bug, since it
+  is a silent 200 rather than a loud, wrong status code. `gis/router.py`'s
+  own precedent was already sitting right there and says otherwise —
+  `approve`/`publish`/`archive`/`return-to-review` all gate on
+  `CONTOURS_APPROVE` alone, with no path in for the manage-level role. Fixed
+  by keeping the route wide (so a maker still gets a domain 403 instead of a
+  bare one) but adding `archive_versioned`'s own in-handler check —
+  `gis.service._may_manage_layers`'s two-branch shape (role-code superuser
+  bypass, then a specific permission code) — that only fires when the row
+  being archived is `published`; archiving a `draft` stays a maker's own
+  call, unchecked, exactly as it was. Before widening a permission gate on
+  ANY route, check every SIBLING route sharing that gate for whether it has
+  its OWN identity-or-status escape hatch — "this other route already
+  refuses the identity case" is a fact about ONE route, never an assumption
+  that extends to its neighbours.
+
+## A negative test's FAILURE PATH can leave state that poisons a different test's invariant
+
+- **Rule:** Before writing a test whose whole point is that an action gets
+  REFUSED (a blocked publish, a blocked archive, a blocked approve), ask what
+  state the refused row is left in, and whether ANY other test in the suite
+  asserts something absolute (a `count(*) == 0`, "no row of this kind exists")
+  that a leftover row of that kind — in ANY status — would break, forever,
+  in the shared persistent test DB.
+- **Why:** `test_a_maker_cannot_archive_a_published_tariff` (this task's own
+  archive-permission fix) publishes a tariff for the `science` activity
+  specifically because it is the one key with no seeded row
+  (`ex_tariffs_one_in_force` blocks a fresh publish against every OTHER
+  activity, which are all already published open-ended from 2015-09-30) —
+  but the test's own SUCCESS is that the maker's archive attempt is REFUSED,
+  so the row stays `published` forever once the test passes. That broke two
+  things at once, only visible running the FULL suite (not the two files in
+  isolation, where nothing else touches `science`): Task 2's
+  `test_science_has_no_tariff` (`count(*) == 0`, no status filter — archived
+  counts too, since `tariffs` has no delete-via-API) started failing, and the
+  test's OWN next run failed at its own publish step with `period_overlap`
+  against the row IT left behind the time before.
+- **How to apply:** `tests/modules/norms/conftest.py::science_activity_id` is
+  now a yield-fixture whose teardown runs a scoped
+  `DELETE FROM tariffs WHERE activity_type_id = :id` — chosen over archiving
+  the row because archived still counts toward the OTHER test's zero-row
+  assertion, and chosen over "pick a random key" because a `Tariff`'s
+  identity (`activity_type_id` + `livestock_group`) has no randomizable
+  component the way `unique_suffix` gives `rule_parameters.code` or
+  `random_box_wkt()` gives a contour's geometry — every future test needing a
+  "definitely publishable, definitely repeatable" row for an EXCLUDE-
+  constrained table without one follows this shape, and gets run TWICE in a
+  row (or as part of the full suite, not just its own file) before being
+  trusted, specifically because this class of bug is invisible in isolation.
+
+## A `_client_for` fixture's permission list must mirror the PRODUCTION role's own grants, not just its usual outcome
+
+- **Rule:** When a migration grants a ROLE more than one permission code
+  (e.g. `leadership` gets both `norms.approve` and `norms.publish`), a test
+  fixture standing in for that role via `_client_for(db, ..., organization_id=
+  ...)` needs ALL of them listed explicitly — that branch builds the user
+  under `role_code="executor_staff"` with ONLY the personal grants it is
+  given (`tests/modules/gis/conftest.py::_client_for`), so it inherits
+  NOTHING from the real role's own `role_permissions` row no matter what the
+  fixture's docstring calls it.
+- **Why:** `leadership_client` (stage 3.7 task 4) was written with just
+  `NORMS_APPROVE, NORMS_MANAGE` under the docstring "approves, never
+  publishes" — true of the DEFAULT `norms_publish_scope=central` OUTCOME, but
+  wrong about the GRANT: migration 0011 gives the `leadership` role
+  `norms.publish` too, and ruling 16's whole point is that the SETTING, not
+  the grant, is what blocks it in that mode. Without the grant here, both
+  brief-verbatim tests FAILED OUTRIGHT on first run, not just for the wrong
+  reason: `test_in_central_mode_a_leshoz_actor_cannot_publish` asserts
+  `ERR-ACL-002` specifically and got `ERR-ACL-001` (missing permission, the
+  route's own dependency rejecting the request before the service's scope
+  check ever ran) — an `AssertionError`, not a pass; its sibling
+  `test_in_leshoz_mode_the_same_actor_publishes` got 403 where it asserts 200.
+  Caught immediately by running the two tests the brief itself gives.
+- **How to apply:** Before trusting an existing zone-scoped client fixture's
+  permission list for a new maker-checker-shaped or scope-gated test, check
+  what the REAL role actually holds in its seeding migration, not just the
+  fixture's own docstring — a docstring can accurately describe a common-case
+  OUTCOME while quietly omitting a GRANT the row really has, and the two only
+  diverge once a test specifically targets the grant/outcome split.
+
+## Every caller-supplied FK and date-ordering pair needs its own pre-flush guard, not just the ones a test happened to exercise
+
+- **Rule:** Before reporting a versioned-row creator (`create_norm`,
+  `create_versioned`) done, walk every field its payload lets a caller set
+  that is either an FK or half of a period pair, and confirm EACH one has a
+  service-level guard ahead of `flush()` — an existence check for the FK
+  (reusing an existing helper if the identical check already exists for a
+  sibling field, never a near-identical second copy), a `to < from`
+  comparison for the pair.
+- **Why:** Task 4's first pass validated `contour_id` (via
+  `_assert_norm_zone`) and `approval_doc_id` (via `_assert_doc_active`, but
+  only at approve time) while leaving `activity_type_id`, `geobotanic_doc_id`
+  and `effective_to < effective_from` unguarded on `create_norm`/
+  `update_norm` — each one reaches `flush()` on a garbage or inconsistent
+  value and surfaces as an uncaught `IntegrityError` -> `ERR-SYS-001`/500,
+  the exact defect class this stage's own contract already treats as a
+  blocker for `period_overlap`. The identical `activity_type_id` gap existed
+  in the SHARED `create_versioned` (tariffs/parameters) too — `POST /tariffs`
+  with a garbage `activity_type_id` was a 500 — caught in the same review
+  pass; fixing one sibling creator and leaving the other would have shipped
+  the same bug one call away (final review, stage 3.7 task 4).
+- **How to apply:** `admin.service.add_classifier_item`'s
+  `valid_to < valid_from` pre-check (`ERR-VAL-001`, ahead of the DB CHECK) is
+  the template for a period-pair guard; `_assert_doc_active`/
+  `gis.service._assert_approval_doc_active` is the template for an FK
+  existence guard — reuse the SAME helper for every field that means "does
+  this document exist and is it active" rather than writing a new one per
+  field. Any new versioned-row creator gets a pass down its own payload's
+  field list against this checklist before being reported done, not just
+  the fields the given tests happen to cover.
+
+## A gate that reads only ONE of the two things it guards is bundling two concerns
+
+- **Rule:** When an `if` condition guards a block computing several values,
+  check that EVERY value in the block actually reads something from the
+  condition itself — a value the block computes without ever touching the
+  condition's own subject is gated on the wrong thing, even if it happens to
+  be correct today. In `calculator.calculate`, `used_sb` (Σ `request.items`
+  count × `coef_sb:<code>`) reads only `request.items`/`snapshot.values` — a
+  REQUEST fact — so it is gated on `request.activity_code == GRAZING`, never
+  on `snapshot.norm`; `max_sb`/`remaining_sb`/the breakdown's `limit` line
+  genuinely ARE a NORM fact (`snapshot.norm.max_sb`, the committed load
+  against it) and stay gated on `snapshot.norm is not None`.
+- **Why:** Task 5 originally computed both under one `if snapshot.norm is not
+  None:` block, since at the time it only needed `used_sb` for that one
+  breakdown line. Task 7 needed the identical number to validate a grazing
+  request's `coef_sb:<code>` for the checks EVEN WHEN NO NORM EXISTS YET (a
+  real, supported case — VMQ 689's norm and a fee preview are drafted
+  independently) — `POST /calculations/preview` for a fresh contour with no
+  norm used to silently return `used_sb=None` (no error at all) for an
+  unpublished `coef_sb:*` code, instead of the missing-parameter error
+  `test_a_grazing_preview_reports_the_missing_coefficient_rather_than_guessing`
+  expects. The first fix (task 7's own review round 1) added a SECOND,
+  service-layer resolution of the identical `coef_sb:<code>` lookup ahead of
+  `calculate` — passing that test, but creating a real two-sources-of-truth
+  risk on a limit-relevant number: two places deciding which coefficient a
+  grazing request needs, agreeing only because they read identical inputs
+  identically.
+- **How to apply:** Fixed at the root instead — split `calculate`'s single
+  `if snapshot.norm is not None:` into its own `if request.activity_code ==
+  GRAZING:` for `used_sb` and a separate `if snapshot.norm is not None:` for
+  `max_sb`/`remaining_sb`/the breakdown line — so ANY caller (3.9's
+  application precheck included) gets the honest `ERR-NORM-004` straight from
+  `calculate` itself, whether or not a norm happens to exist yet, with no
+  caller-side duplication. Before adding a caller-side workaround for a gap
+  in a shared function, check whether the gate actually reads what it claims
+  to gate on — a condition never referenced inside its own guarded block is
+  the tell.
+
+## A "public surface" task's own end-to-end test can ship the surface untested
+
+- **Rule:** When a task adds new adapter/pass-through functions to a module's
+  public surface FOR a caller that does not exist yet (3.9/3.10/3.11 here),
+  and also writes an HTTP-driven end-to-end test, check whether that test
+  actually calls the NEW functions — an HTTP-only scenario exercises the
+  ROUTES, not the in-process functions a future module will call directly.
+- **Why:** Task 8's given end-to-end test drives `preview`/`save_calculation`/
+  `publish_norm` entirely over `httpx`; the two new functions the task also
+  adds (`service.effective_norm`, `service.run_checks`) are exactly what
+  3.9/3.11 will call IN-PROCESS once they exist, but nothing in the HTTP
+  scenario reaches either — confirmed empirically by hard-coding
+  `run_checks`'s `used_sb=None` to a real Decimal and watching the
+  brief-verbatim test stay green throughout (it has no assertion that could
+  ever fail from that change).
+- **How to apply:** Any task that "documents the public surface" by adding
+  functions for a not-yet-built caller: add a direct in-process call to each
+  NEW function inside the SAME end-to-end test (reusing its already-committed
+  fixtures/state — no second test file needed), asserting it agrees with what
+  the HTTP path already proved. Never ship a contract function whose only
+  verification is that it type-checks.
+
+## A reversed date period does not just skip a check — it inverts a range predicate and hides the rows it should find
+
+- **Rule:** Any function that walks a period day by day, iterates its years, or
+  passes both ends into a SQL overlap predicate must reject
+  `period_to < period_from` **at the shared entry point**, fail-closed, before
+  any of that runs — never rely on the caller's schema to have ordered the
+  dates.
+- **Why:** `norms.checks.run_checks` takes `period_from`/`period_to` from a
+  request. With them swapped, `_season_check`'s `while day <= period_to` and
+  `_rotation_check`'s `range(...)` both no-op and report `pass` having
+  examined nothing — bad, but visible. The real damage is
+  `gis.service.features_intersecting`, whose validity predicate
+  (`valid_from <= :period_to AND valid_to >= :period_from`) is written for the
+  normal ordering: with the dates swapped, a fire ban that genuinely covers
+  the requested days fails BOTH legs and drops out of the result set, so the
+  one check this stage exists to make blocking returns a confident `pass`
+  (stage 3.7 task 6). An unbounded period is the same class of problem from
+  the other side: the day-by-day walk is linear in days, on the event loop.
+- **How to apply:** Guard inside the module's own public entry point, not in
+  each router's request schema — `run_checks` is what 3.9 calls directly, and
+  a per-endpoint guard is not a root fix (existing lesson). `ERR-VAL-001` with
+  `reason` `period_reversed` / `period_too_long`; the ceiling is a named
+  constant carrying its domain reason (`MAX_PERIOD_DAYS` — ВМҚ 689 redoes the
+  geobotanical survey every five years), not a tuning knob. A single-day
+  period (`from == to`) must still pass.
+
+## Seeded reference data with future effective dates is a scheduled test failure
+
+- **Rule:** A test that asserts an exact money/norm figure computed from
+  `business_today()` must FREEZE the date — patch `business_today` in the
+  CALLING module's namespace (`app.modules.norms.service.business_today`),
+  never in `app.core.time` — and pin it inside the window of the seeded row it
+  means to exercise. Never "fix" such a test by recomputing the expectation
+  from whatever row happens to be in force.
+- **Why:** migration `0012` seeds `bhm` as two dated rows (412 000 until
+  2026-08-31, 440 000 from 2026-09-01). Stage 3.7 task 7's new tests
+  hard-coded amounts derived from 412 000 while `_compute` resolved
+  `on_date=business_today()`, so the suite was green on the day it was written
+  and would have gone red on 1 September with no code change and nobody
+  touching the repository — demonstrated by moving the frozen date past the
+  boundary and watching the two tests fail with 2 640 000 against an expected
+  2 472 000. Recomputing the expectation instead would have made the test pass
+  even against a WRONG tariff, which is the opposite of what it is for.
+- **How to apply:** When adding a seed row whose effective period starts in
+  the future, sweep the suite for literals derived from the currently-in-force
+  value (`grep` for the figure and for `business_today`) and give every
+  affected module a frozen-date fixture. Tests that pass `on_date` explicitly,
+  build their own parameter dict, or assert the seeded rows' own dates need
+  nothing — only the ones that read the wall clock.
+
+## `Literal[*TUPLE]` is a pyright error — spell the members out and assert them equal
+
+- **Rule:** A pydantic schema bound that must mirror a DB CHECK's allowed values
+  is written as an explicit `Literal["a", "b", ...]`, never `Literal[*TUPLE]`,
+  and the duplication is closed by a test asserting
+  `set(get_args(TheLiteral)) == set(THE_TUPLE)`.
+- **Why:** `Literal[*LIVESTOCK_GROUPS]` runs fine and pydantic accepts it, but
+  pyright reports "Variable not allowed in type expression"
+  (`reportInvalidTypeForm`) — a `Literal`'s members are exactly what a type
+  checker has to see statically, and a module-level tuple is not that. Hit
+  adding the `livestock_group`/`quantity_unit` bounds in stage 3.7's fix wave
+  (finding I8), where the tuples already existed as
+  `norms.models.LIVESTOCK_GROUPS` and `admin.models.QUANTITY_UNITS`. Writing
+  the members out re-creates precisely the "constraint strings duplicated in
+  Python tuples are two sources of truth" problem this file already warns
+  about — a value added on one side and forgotten on the other is a 422 that
+  should have been a 201, or an IntegrityError 500 that should have been a 422.
+- **How to apply:** `norms/schemas.py`'s `LivestockGroup`/`QuantityUnit` plus
+  `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints`
+  are the shape: the `Literal` carries a comment saying WHY it is spelled out
+  and where the guard lives, and the guard is one `get_args` comparison per
+  tuple. Any future enum-ish column gets the same pair, not a bare `str`.
+
+## `Decimal` ordering comparisons raise on NaN, not just construction
+
+- **Rule:** A validator that parses a `Decimal` from user input and then
+  bounds it with an ordering comparison (`<=`/`<`/`>`/`>=`) must keep the
+  comparison INSIDE the same `try`/`except InvalidOperation` as the parse —
+  "it parsed" is not "it is safe to compare".
+- **Why:** `Decimal("NaN")` parses without error; the exception comes one
+  line later, from the ordering operator itself. `InvalidOperation` is an
+  `ArithmeticError`, not a `ValueError`, so pydantic never converts it to a
+  422 — it escapes as a 500. Hit twice on the same field: I7's fix wrapped
+  only the parse in `norms.schemas._benefit_modifiers`, and the scoped
+  re-review of that fix caught `"NaN"` reaching `POST /tariffs` as a 500.
+  `"Infinity"`/`"-Infinity"` were unaffected — ordering against infinity
+  never raises, only NaN does — which is why they read as a plausible "it
+  already works" until actually tried.
+- **How to apply:** `norms/schemas.py::_benefit_modifiers` is the shape now
+  — parse and bound-check share one `try`, one `except InvalidOperation`.
+  Grep for the same split (`Decimal(...)` in a `try`, a bound comparison
+  after the `except`) before adding the next `Decimal`-bounded validator.
