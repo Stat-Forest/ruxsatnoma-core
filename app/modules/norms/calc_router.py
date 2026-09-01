@@ -57,6 +57,12 @@ async def create_calculation(
 # the application this calculation belongs to". Stage 3.9 must narrow both
 # routes below to the application's owner and its reviewers once that
 # ownership exists (carried over in the stage plan).
+#
+# The WRITE path is closed rather than carried over (I4, final review):
+# `CalculationIn.application_id` refuses a non-null value outright, because a
+# route that persists an unvalidated id into an append-only table is a
+# permanent fact nobody can correct. 3.9 opens the field and adds the
+# ownership check in the same change — see that field's own comment.
 
 
 @router.get("/calculations", response_model=Page[CalculationOut])

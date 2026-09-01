@@ -270,15 +270,25 @@ class CalculationIn(BaseModel):
     `POST /calculations` (`norms.service._compute` is the one path both run
     through). `items` carries grazing's per-group head counts; `quantity` is
     the declared amount for every other activity (VMQ 278's `quantity` is per
-    activity — ha for haymaking, m3 for deadwood). `application_id` has no FK
-    yet (ruling 4, `Calculation.application_id`) — a preview simply ignores it.
+    activity — ha for haymaking, m3 for deadwood).
 
     Deliberately absent: `on_date` (always `business_today()` — a caller
     cannot backdate which rates apply) and `area_ha` (recorded on
     `input_snapshot` from the contour's own published area, never a
     client-declared figure — see `service._compute`)."""
 
-    application_id: uuid.UUID | None = None
+    # REFUSED for the whole of 3.7 (I4, final review), and opened by STAGE 3.9
+    # — the stage that creates `applications` and with them the ownership this
+    # request cannot ask about. `POST /calculations` used to persist whatever
+    # arrived here: no FK (ruling 4 defers it), no ownership check, and
+    # `calculations` is append-only, so a row bound to ANY application id
+    # could be written by any authenticated user and never deleted or
+    # corrected. 3.10 builds an invoice from "the newest row for the
+    # application", which makes a pre-seeded row a live under-billing vector
+    # the moment `applications` exists. Nothing in this stage can validate the
+    # id and no legitimate caller has one yet, so it fails closed at the edge
+    # rather than staying an undocumented open write.
+    application_id: None = None
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     period_from: date
