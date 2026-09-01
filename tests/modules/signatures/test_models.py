@@ -42,3 +42,22 @@ async def test_one_valid_signature_per_object_and_purpose(db, a_certificate):
     await insert("invalid")  # an invalid attempt does not occupy the slot (ruling 8)
     with pytest.raises(IntegrityError):
         await insert("valid")
+
+
+@pytest.mark.asyncio
+async def test_signatures_permission_seeds(db):
+    """prosecutor is oversight-read-only: view_any but not reverify (reverify writes
+    a new signature row). central_admin holds both. sys_admin gets no row — it
+    bypasses require_permission entirely (decision #41 ruling 2)."""
+    rows = await db.execute(
+        text(
+            "SELECT r.code, rp.permission_code FROM role_permissions rp"
+            " JOIN roles r ON r.id = rp.role_id"
+            " WHERE rp.permission_code IN ('signatures.view_any', 'signatures.reverify')"
+        )
+    )
+    assert {(row[0], row[1]) for row in rows} == {
+        ("prosecutor", "signatures.view_any"),
+        ("central_admin", "signatures.view_any"),
+        ("central_admin", "signatures.reverify"),
+    }
