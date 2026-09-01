@@ -123,6 +123,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "central",
             "Who may put a norm in force: 'central' (the office, per VMQ 689) or 'leshoz'",
         ),
+        SettingSpec(
+            "permit_required_signatures",
+            str,
+            "permit_head,permit_chief_forester,permit_accountant,permit_recipient",
+            "Purposes that must all be signed before a permit may become ACTIVE (C11)",
+        ),
     )
 }
 

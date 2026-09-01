@@ -1,1217 +1,833 @@
 # Ruxsatnoma Lessons
 
-Hard-won gotchas specific to this backend. General Python/FastAPI advice belongs
-in `CLAUDE.md` or your head, not here.
+Hard-won gotchas specific to this backend. **Read this file before any coding work.**
+A lesson beats an instinct; a `../docs/decisions.md` ruling beats a lesson.
 
-**When you fix a non-trivial bug or discover a non-obvious pattern, APPEND a new
-lesson.** Every stage plan and every subagent brief must read this file before
-any work — each entry saves a future agent from repeating a mistake that already
-cost us a review round.
+What does NOT belong here: general Python/FastAPI advice, a project convention
+(`CLAUDE.md`), a deploy-only fact (`CLAUDE.md` → Deploy notes), a product ruling
+(`../docs/decisions.md`), an open question (`../docs/tz/12-otkrytye-voprosy.md`).
 
-Format per entry:
+**Adding a lesson: use the `writing-lessons` skill** (`.claude/skills/writing-lessons/`).
+It carries the three steps missing from "APPEND a lesson", which is how this file reached
+1217 lines: can it be a mechanical check instead, does the class already have an entry,
+and is it a lesson at all rather than a convention or a ruling.
+
+Format and budget:
 
 ```
-## {Short topic title}
-- **Rule:** {one line}
-- **Why:** {one line — the past incident, a hidden invariant, or a strong preference}
-- **How to apply:** {one line — when/where this guidance kicks in}
+## {Short topic title — state the rule, not the symptom}
+- **Rule:** {1–2 lines: what to do}
+- **Why:** {2–3 lines: the incident with its concrete symptom — error, status code, file}
+- **How to apply:** {1–2 lines: the trigger, and where the reference implementation lives}
 ```
+
+**A new entry is at most 12 lines.** Only a MERGE — an entry replacing two or more existing
+ones — may go past that, and never past 24. Over 12 while deleting nothing means you are
+writing a story: the incident is evidence, so name the error and the file, and drop the
+retelling of how it was found.
+
+**The file itself is capped at 60 entries / 900 lines.** Short entries still add up, and
+reading cost is how many times how long. Once the cap is reached a new lesson has to be
+paid for by merging two old ones of the same class, or by deleting one whose trap a check
+has since made impossible — that is the point, not an obstacle. A pre-commit hook,
+`make check` and CI all enforce both limits; `make lessons-check` is the same check on
+its own.
 
 Rules for this file:
 
-- One incident, one entry. If the same class of bug reappears, sharpen the
-  existing entry instead of adding a second one.
-- Only what is NOT obvious from reading the code. "Use async" is a convention
-  (`CLAUDE.md`); "`\d` means something different in Postgres" is a lesson.
+- **One class, one entry.** Before appending, grep the headings below for the class.
+  If an entry covers it, sharpen that one and add your case as a sub-bullet.
+- Only what is NOT obvious from reading the code. "Use async" is a convention;
+  "`\d` means something different in Postgres" is a lesson.
 - Every entry states a real trigger. No hypotheticals.
-- Entries marked *(seeded from ControlAI)* were carried over from a sibling
-  project on a close stack (FastAPI + async SQLAlchemy + Alembic + Postgres),
-  and each was verified to apply here before it was written down.
+- *(from ControlAI)* marks an entry carried over from a sibling project on a close
+  stack, each verified to apply here before it was written down.
+
+Sections: Migrations and schema · DB constraints vs Python · Values: dates, decimals,
+precision · JSON boundaries · Permissions, roles, transitions · Root fixes ·
+PostGIS · HTTP layer · Outbox and integrations · Tests and the shared test DB ·
+Tooling and environment.
 
 ---
 
-## `\d` is Unicode-aware in Python but ASCII-only in a Postgres CHECK
-
-- **Rule:** In any pattern that guards a column ALSO constrained by a DB CHECK
-  (`pinfl`, `stir`, phone, codes), write the ASCII class explicitly —
-  `^[0-9]{9}$`, never `^\d{9}$`.
-- **Why:** pydantic/Python `\d` matches Arabic-Indic and other Unicode digits, the
-  Postgres CHECK does not — so a non-ASCII digit string passes validation and
-  then blows up as a 500 at the DB. Hit twice: `organizations.stir` (3.3a
-  close-out, `527d4e0`) and `users.pinfl` (fixed in 3.3b).
-- **How to apply:** Whenever a schema pattern and a CHECK constraint describe the
-  same field, they must be the SAME regex dialect — read the migration before
-  writing the pydantic pattern.
+# Migrations and schema
 
 ## A model file missing from `models_registry.py` yields an EMPTY migration, silently
 
 - **Rule:** After adding `app/modules/<name>/models.py`, import it in
-  `app/models_registry.py` in the same commit, then run `alembic check` and read
-  the generated migration before applying it.
-- **Why:** Autogenerate only sees what `Base.metadata` knows about. A forgotten
-  import produces a valid, empty, green migration — no error, no warning. Flagged
-  as deferred polish since 3.1; the sweep autotest is still not written.
-- **How to apply:** New model file → registry import → `alembic revision
-  --autogenerate` → the diff must be non-empty and must contain your tables.
+  `app/models_registry.py` in the same commit, then read the generated migration
+  before applying it.
+- **Why:** Autogenerate only sees what `Base.metadata` knows about. A forgotten import
+  produces a valid, empty, green migration — no error, no warning. Open since 3.1; the
+  sweep autotest is still not written (`tests/conftest.py` only imports the registry).
+- **How to apply:** New model file → registry import → `alembic revision --autogenerate`
+  → the diff must be non-empty and must contain your tables.
 
-## A downgrade must delete the rows its upgrade made legal
+## A downgrade must delete whatever its upgrade made possible
 
-- **Rule:** When a migration widens a CHECK (new enum value, new purpose, new
-  status), its `downgrade()` must `DELETE` the rows carrying the new value BEFORE
-  restoring the narrow constraint.
-- **Why:** Migration `0006` extended `otp_codes.purpose`; its downgrade restored
-  the old CHECK against rows that already violated it, so `downgrade` failed on
-  any database that had been used. Only surfaced when 3.4 added the round-trip
-  test to CI — which then forced downgrade-only fixes to both `0005` and `0006`.
-- **How to apply:** Every migration that widens a constraint gets a data-cleanup
-  statement in its downgrade. The CI round-trip test is the gate; do not weaken it.
+- **Rule:** A migration that widens a CHECK, or seeds a row other tables will reference,
+  owes its `downgrade()` the matching `DELETE` — written when the migration is written,
+  not when someone finally hits it.
+- **Why:** Two shapes, both already red in CI: `0006` widened `otp_codes.purpose` and
+  restored the narrow CHECK against rows that already violated it; `0010` seeded the
+  `gis.import.finished` template and deleted only the template, so
+  `fk_notifications_template_id_notification_templates` broke the round-trip the moment
+  task 7 actually sent the event — in a task that touched no migration.
+- **How to apply:** Widening a constraint → data-cleanup statement in the downgrade.
+  Seeding a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the
+  template delete. When the round-trip goes red in a task that changed no migration, look
+  for the event that task started emitting.
 
 ## Multiple Alembic heads: resolve with an empty merge migration
 
-- **Rule:** When two branches each add a migration and `alembic upgrade head`
-  reports multiple heads, run `alembic merge heads` — never delete a migration or
-  hand-edit `down_revision`.
-- **Why:** Rewriting revision history breaks every environment that already
-  applied the original revisions (dev DB, test DB, CI, and later prod).
-  *(seeded from ControlAI; the risk is live here — Oybek runs parallel sessions,
-  and there is no single-head regression test in `tests/` yet.)*
-- **How to apply:** `uv run alembic merge heads -m "merge"`, commit the merge
-  revision, keep going. Check `uv run alembic heads` after any rebase onto `main`.
+- **Rule:** When two branches each add a migration, run `alembic merge heads` — never
+  delete a migration or hand-edit `down_revision`.
+- **Why:** Rewriting revision history breaks every environment that already applied the
+  original revisions (dev DB, test DB, CI, later prod). *(from ControlAI; live risk here
+  — Oybek runs parallel sessions.)*
+- **How to apply:** `uv run alembic merge heads -m "merge"`, commit it, keep going.
+  `make heads` is the gate; check `uv run alembic heads` after any rebase.
+
+## The round-trip test's expected head version is a hardcoded string every migration must bump
+
+- **Rule:** After adding a migration, update `tests/test_migrations.py::
+  test_downgrade_upgrade_roundtrip`'s `assert version == "<old head>"` in the same commit.
+- **Why:** The assertion is a literal, not derived from `alembic heads` — a brand-new
+  migration passes every test of its own and fails this one with `assert '0011' == '0010'`,
+  which reads like a chain bug rather than a one-line test update (hit adding 0011, 3.7 t1).
+- **How to apply:** New head → grep `tests/test_migrations.py` for the previous head string.
+  It is on no task brief's file list, so only a full run surfaces it.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
-- **Rule:** A fresh `postgis/postgis:16-3.4` volume comes with `tiger_geocoder`,
-  `topology` and `fuzzystrmatch` pre-installed; the init script
-  `docker/…/02-drop-image-extras.sql` removes them — keep it.
-- **Why:** Those extensions bring their own tables into the DB, so `alembic check`
-  against a raw dev database reports a diff that has nothing to do with our
-  models, and autogenerate proposes dropping them. Cleaned 27.08 (`8c00270`).
-- **How to apply:** If `alembic check` is suddenly dirty on a machine that just
-  recreated its volumes, check for those schemas before suspecting the models.
-
-## A partial unique index only constrains the rows it covers
-
-- **Rule:** Before relying on a unique index for an invariant, re-read its `WHERE`
-  clause and ask what happens to the rows OUTSIDE it.
-- **Why:** The classifier uniqueness index covers `status='active'` only, so
-  superseding an already-archived item inserted a second overlapping row and a
-  historical `on_date` lookup returned two rows for one code (3.3a fix wave —
-  the operation is now rejected outright).
-- **How to apply:** Any code path that writes a row a partial index does NOT cover
-  needs its own guard in the service layer.
-
-## Business dates come from `business_today()`, never `date.today()`
-
-- **Rule:** Anything that gates on "today" — validity windows, expiry, seasons,
-  permit terms — uses `app/core/time.py::business_today()` (Asia/Tashkent).
-- **Why:** `date.today()` follows the SERVER's zone; on a UTC container it reports
-  yesterday for ~5 hours a day. An expired fixed-term account (a prosecutor's,
-  say) could still authenticate between 00:00 and 05:00 Tashkent (fixed in 3.3a
-  close-out, `527d4e0`), and the classifier read path had the same bug.
-- **How to apply:** Grep for `date.today()` in review — every hit outside
-  `app/core/time.py` is a bug. Storage stays UTC `timestamptz`; only the
-  *calendar-day decision* is Tashkent.
-
-## Zone scoping is not a permission check — a read path needs both
-
-- **Rule:** `require_permission(...)` answers "may this role do this at all";
-  `zone_filter` answers "on whose rows". Every endpoint that returns
-  territory-scoped data needs BOTH, including the small sibling endpoints.
-- **Why:** `GET /admin/users/{id}/permissions` passed the permission gate but was
-  not zone-scoped like the user card next to it, so a regional admin could read
-  another region's user through it (final review of 3.3b, fixed in `aa1d551`).
-- **How to apply:** When you add an endpoint next to a scoped one, copy its
-  scoping, not just its permission code. Add a cross-zone denial test.
-
-## A superuser bypass must be reflected in every path that REPORTS permissions
-
-- **Rule:** `sys_admin` skips the permission check in `require_permission`
-  (decision #41) — so every endpoint that answers "what may I do" must special-case
-  it too.
-- **Why:** `GET /auth/me` reported an empty `permissions[]` for a superuser holding
-  no personal grants: fully privileged in fact, powerless on screen, and the
-  adminka would have hidden every button (3.3a fix wave — `MeOut.is_superuser`
-  plus the full registry from `/auth/me` and `/auth/mfa/verify`).
-- **How to apply:** Any new "what can this user do" response gets the superuser
-  branch, not just the enforcement point.
-
-## An existence check is not a validity check
-
-- **Rule:** Verifying that a referenced object EXISTS (an FK, a file row, a
-  certificate) says nothing about whether it is legitimate. State which one you
-  did in the docstring.
-- **Why:** Power-of-attorney representations validate that the poa file exists, is
-  owned by the caller and is a PDF (3.3b) — none of which is proof of a valid
-  power of attorney. The product ruling on staff review is still open, parked
-  before 3.9.
-- **How to apply:** When a check is only structural, say so at the call site so the
-  next agent does not read it as authorization.
-
-## Never echo an outbound payload into a raised exception
-
-- **Rule:** An adapter/sender may report the transport failure (status code,
-  provider error code) — never the message body it was trying to send.
-- **Why:** `outbox_messages.last_error` is admin-visible via
-  `/admin/integrations/*` AND logged; a sender that formats the payload into its
-  exception leaks live OTP codes to anyone with the admin outbox permission. This
-  is the last remaining OTP-code leak channel and it lands with the real Eskiz
-  sender in 3.5.
-- **How to apply:** Every new sender in `integrations/senders.py`: raise with
-  transport metadata only; add a test asserting the code is NOT in `str(exc)`.
-
-## Behind a proxy, uvicorn without `--proxy-headers` is a system-wide login outage
-
-- **Rule:** Any deployment behind nginx/traefik runs uvicorn with
-  `--proxy-headers --forwarded-allow-ips=<proxy ip>`.
-- **Why:** The per-IP rate limiter keys on `request.client.host`. Without those
-  flags every client presents as the proxy's IP, so one 10/min bucket throttles
-  ALL logins at once. The audit trail records the wrong IP too.
-- **How to apply:** Deploy checklist item, not a code change — but the code review
-  should ask where the app sits when it touches rate limiting or audit IPs.
-
-## `workers_mode=off` without a standalone worker stops delivery silently
-
-- **Rule:** Either `workers_mode=embedded` (default, workers live in the API
-  lifespan) or a separate `python -m app.workers` process — never neither.
-- **Why:** With the outbox loop absent, `enqueue()` still succeeds and the request
-  still returns 200; messages just accumulate as `pending` and no OTP is ever
-  delivered. Nothing errors. Tests set `WORKERS_MODE=off` deliberately.
-- **How to apply:** Deploy checklist; and when debugging "the SMS never arrived",
-  check `outbox_messages.status` before suspecting the provider.
-
-## The app's upload cap is not the proxy's
-
-- **Rule:** `max_upload_mb` (default 20) must be mirrored by the outer proxy's
-  `client_max_body_size` (nginx) or equivalent.
-- **Why:** Otherwise an oversized body is rejected by whatever the untuned proxy
-  default happens to be, with a different status and a different body than the
-  app's own error — inconsistent for the client, and untestable.
-- **How to apply:** When `max_upload_mb` changes, the deploy config changes with it.
-
-## A cap checked after reading the body is not a cap
-
-- **Rule:** Enforce a size limit from `Content-Length` / `UploadFile.size` FIRST,
-  then chunked-read with a running total — never `await file.read()` and measure
-  afterwards.
-- **Why:** The 3.3b upload path read the whole body into RAM before comparing it to
-  `max_upload_mb`: the limit was enforced, the memory was already spent, and an
-  attacker only needed a large body to feel it (final review, fixed in `aa1d551`).
-- **How to apply:** Applies to every future ingest path — attachments in 3.9,
-  geodata import in 3.6.
-
-## `Content-Disposition` filenames must be RFC 6266/5987-encoded
-
-- **Rule:** Emit both `filename="<ascii fallback>"` and `filename*=UTF-8''<pct>` —
-  never interpolate the raw name into the header.
-- **Why:** A Cyrillic or Uzbek-Latin-with-diacritics filename made
-  `GET /files/{id}` return 500, because the header must be latin-1 encodable
-  (3.3b final review, `aa1d551`). Our users upload exactly such filenames.
-- **How to apply:** Any new download endpoint reuses the helper in
-  `app/core/files.py` rather than building the header again.
-
-## `.env.example` drifts silently — `extra="ignore"` swallows typos
-
-- **Rule:** Adding or renaming a `Settings` field means editing `.env.example` in
-  the same commit, and grepping it for the OLD name.
-- **Why:** `app/config.py` sets `extra="ignore"`, so an unknown env var is dropped
-  without a warning: the field keeps its default and the operator believes they
-  configured it. *(seeded from ControlAI, where a `.env.example` shipped
-  `WHISPER_DEVICE` for months while the code read `STT_DEVICE`.)*
-- **How to apply:** The env name is the field name upper-cased. To prove a var
-  actually lands: `uv run python -c "from app.config import get_settings;
-  print(get_settings().<field>)"`.
-- **And the opposite failure:** an EMPTY value is not ignored, it is parsed.
-  `EMAIL_MODE=`/`SMTP_PORT=`/`SMTP_STARTTLS=` fail validation outright and
-  `ESKIZ_BASE_URL=` silently replaces a working default with `""`, so
-  `cp .env.example .env` — the README's first step — would not start (3.5 final
-  review). Every line in that file carries a real value or is commented out;
-  `tests/test_config.py::test_env_example_is_a_working_env_file` builds `Settings`
-  from a copy of it and is the guard.
-
-## Log `repr(e)`, not `f"{e}"`
-
-- **Rule:** In every `except Exception as e:` that produces a log line, log
-  `repr(e)` (or `type(e).__name__` plus the message) and attach the traceback.
-- **Why:** asyncio-flavour `TimeoutError` — from `asyncio.wait_for`, an asyncpg
-  pool acquire, an httpx timeout — has an EMPTY `str()`. The line becomes
-  `"delivery failed: "` and the incident is undiagnosable without a redeploy.
-  *(seeded from ControlAI; our outbox worker, MinIO client and the 3.5 HTTP
-  senders are exactly the code that times out.)*
-- **How to apply:** structlog: `log.error("…", error=repr(e), exc_info=True)`.
-
-## Python 3.14: `except A, B:` without parens is VALID — check syntax with the project's Python
-
-- **Rule:** Verify a file with `uv run python -m py_compile <file>`, never the
-  macOS system `python3` (3.9). And do not "fix" `except A, B:` back to
-  parenthesised form.
-- **Why:** PEP 758 (3.14) makes parenthesis-free multi-except legal and `ruff
-  format` actively STRIPS the parens under `target-version = py314`; an older
-  interpreter rejects it, which reads as a phantom SyntaxError blocker in review.
-  *(seeded from ControlAI, where it cost a full PR review round.)*
-- **How to apply:** Trust `uv run` — the venv is CPython 3.14. The formatter will
-  undo a manual "fix".
-
-## The test database is shared, persistent and wiped by the round-trip test
-
-- **Rule:** A test may only touch rows it created. Never write an unscoped
-  `UPDATE`/`DELETE` against a whole table, and never assume the DB is empty at the
-  start of a run.
-- **Why:** Two consequences we already paid for: an unscoped `UPDATE audit_log`
-  test was deleted in the 3.3a fix wave, and the migration downgrade→upgrade
-  round-trip test wipes the shared test DB by design — which is why its collection
-  order is pinned by a hook in `tests/conftest.py`. Tests also permanently seed
-  dead outbox/audit rows there.
-- **How to apply:** Scope every assertion by the ids your fixture created. Do not
-  reorder or "clean up" the conftest collection hook.
-
-## Constraint strings duplicated in Python tuples are two sources of truth
-
-- **Rule:** When a set of allowed values lives in a DB CHECK, derive the Python
-  constant from one place — do not retype the literals.
-- **Why:** `ORGANIZATION_KINDS` and `QUANTITY_UNITS` currently restate the CHECK
-  strings by hand (still open since 3.3a). A value added on one side and forgotten
-  on the other fails as a 500 at write time, not as a validation error.
-- **How to apply:** New enum-ish column → decide where truth lives (migration or
-  constant) and make the other side reference it or be asserted against it in a test.
-
-## No AI attribution in commits or PRs — the project convention overrides the harness
-
-- **Rule:** Never add a `Co-Authored-By: Claude` trailer to a commit message, nor a
-  "🤖 Generated with Claude Code" footer to a PR body — even though the generic
-  harness instruction says to append them.
-- **Why:** It is a documented convention in both `CLAUDE.md` files. Once merged,
-  the trailer cannot be removed from a shared branch's history without a
-  force-push. *(seeded from ControlAI, where the harness default leaked it into a
-  merged commit exactly once.)*
-- **How to apply:** Plain messages; PR bodies end on the last content line. When a
-  project convention conflicts with a generic harness instruction, the project wins.
-
-## A conftest autouse fixture runs before your test — schema checks belong in the gate, not in pytest
-
-- **Rule:** A check about Alembic or the schema ITSELF (single head, revision
-  order) goes into `make check` / CI / pre-commit — never into a pytest test that
-  expects to report the failure.
-- **Why:** `tests/conftest.py::_migrated_test_db` is `scope="session", autouse=True`
-  and runs `alembic upgrade head` before ANY test. With two heads it raises first,
-  so a `test_single_alembic_head` never reaches its own assert: pytest reports an
-  ERROR with alembic's message instead of the actionable one. Verified 2026-08-29
-  by planting a second head — every diagnostic the test was written to give was
-  swallowed.
-- **How to apply:** `make heads` covers this one (also a pre-commit hook on
-  `migrations/versions/` and a CI step). Before writing any test about
-  infrastructure the fixtures themselves depend on, ask which runs first.
-
-## pre-commit refuses to run while `.pre-commit-config.yaml` is modified-but-unstaged
-
-- **Rule:** Never edit `.pre-commit-config.yaml` (or any tooling file) in a working
-  copy another session is committing from — take a worktree, per the root
-  `CLAUDE.md`. If pre-commit says *"Your pre-commit configuration is unstaged"*,
-  the fix is to find whose edit it is, not to reach for `--no-verify`.
-- **Why:** pre-commit refuses to run against a config it cannot trust, so EVERY
-  commit in that tree is blocked — including commits from a session that never
-  touched the file. Hit twice on 2026-08-29 in the shared copy: a tooling session
-  had the config modified while the stage-3.5 session was committing, and that
-  session shipped one commit with `--no-verify` (hooks re-run by hand) to get out.
-- **How to apply:** One worktree per session (root `CLAUDE.md` → Git). If you are
-  already stuck mid-task, `git stash push .pre-commit-config.yaml` in your own
-  tree is safer than `--no-verify`; if you do use `--no-verify`, run `make check`
-  by hand and say so in the PR.
-
-## An outbox sender's return/raise choice IS the retry decision
-
-- **Rule:** A sender registered with `register_sender` must RETURN when a
-  failure is permanent (nothing will fix itself by retrying) and RAISE only
-  when a retry could plausibly help — the worker (`deliver_one`) retries on any
-  raised exception and treats a normal return as delivered.
-- **Why:** `notifications._deliver` sets the row `failed` and returns instead
-  of raising when the recipient has no verified phone/e-mail; raising there
-  would retry an unreachable recipient up to `outbox_max_attempts` times for
-  the exact same outcome, burning the circuit breaker's failure count and
-  holding back every other queued message on that destination for nothing.
-- **How to apply:** Before writing `raise` in a sender, ask "would a second
-  attempt with the same input succeed?" If no, set the terminal status
-  yourself and `return`.
-- **The mirror-image bug, hit in 3.5's final review:** the same helper answered
-  both "is this recipient reachable" (permanent) and "is the ops kill switch on"
-  (temporary), and `_deliver` treated both as permanent — so flipping
-  `notifications_sms_enabled` off for an hour DESTROYED every queued SMS with a
-  reason blaming the recipient, unrecoverably (admin requeue only works on `dead`
-  rows). A condition an operator can reverse must RAISE. Never let one boolean
-  stand for a permanent and a temporary reason at once.
-
-## `str.format` on admin-authored text is an attribute-access hole
-
-- **Rule:** Never render user/admin-authored template text with `str.format`
-  or an f-string; substitute placeholders with a whitelist regex
-  (`\{([a-z][a-z0-9_]*)\}`) instead.
-- **Why:** `"{x.__class__}".format(x=obj)` reaches Python attributes on
-  whatever object is passed in, and `.format()` raises `KeyError` on a
-  placeholder the caller forgot to supply — inside a business transaction that
-  turns an admin's typo into a failed application submission, not a rendering
-  glitch.
-- **How to apply:** Any text a non-developer can author and the code later
-  renders (notification templates today; announcements, rejection reasons or
-  report labels tomorrow) goes through `notifications.service.render`'s
-  pattern, never `.format(**params)`.
-
-## A partial unique index needs a `flush()` between the archive and the insert
-
-- **Rule:** When "supersede" means archive-the-old-row then insert-a-new-
-  active-one under a partial unique index (`WHERE status='active'`), `flush()`
-  after the archive UPDATE and before the new INSERT.
-- **Why:** Without the flush, the UPDATE and the INSERT are both still pending
-  in the same transaction when the index has to be checked — the old row has
-  not yet been "seen" as archived, so the insert can raise `IntegrityError` on
-  a conflict a flush would already have resolved.
-- **How to apply:** Every supersede-shaped write (classifier items since
-  3.3a, notification templates since 3.5) follows `old.status = "archived"`,
-  `await db.flush()`, then `db.add(new_row)` — copy that order, not just the
-  two statements.
-
-## Senders registered at module import must be imported by the standalone worker too
-
-- **Rule:** A destination registered via `register_sender(...)` at module
-  import time (e.g. inside `notifications/service.py`) only exists in a
-  process that actually imported that module — add the import to
-  `app/workers/outbox.py` explicitly, with a comment, in the same commit that
-  adds the destination.
-- **Why:** In every test and in the embedded-worker deployment, `app.main`
-  imports the routers, which transitively import `notifications.service`, so
-  registration always "just happens" — a standalone `python -m app.workers`
-  process imports neither, so without the explicit import every notification
-  goes `dead` as `unknown destination`, and no in-process test can ever catch
-  it (only a subprocess test that imports `app.workers.outbox` alone can).
-- **How to apply:** New outbox destination → grep `app/workers/outbox.py` for
-  the registering import → add it if missing → write or extend the subprocess
-  registration test.
-
-## A parsed form body can hold non-str values that a JSONB column cannot
-
-- **Rule:** Before storing a `request.form()` dict as JSON(B), coerce every
-  value to `str` (or a short type marker) — never assume form fields are
-  strings.
-- **Why:** A `multipart/form-data` file part parses to Starlette's
-  `UploadFile`, not a string; `json.dumps` cannot serialize it, so an
-  untouched form dict reaching a JSONB bind (the Eskiz callback's dead-letter
-  payload) 500'd on a one-line curl against an anonymous, internet-facing
-  route — exactly the case the route exists to survive.
-- **How to apply:** Any endpoint that accepts `request.form()` from an
-  untrusted or anonymous caller and persists the result:
-  `{k: v if isinstance(v, str) else f"<{type(v).__name__}>" for k, v in
-  form.items()}`, never a bare dict comprehension.
-
-## An in-place UPDATE leaves an `onupdate=func.now()` column expired, not refreshed
-
-- **Rule:** After mutating a row in place (an UPDATE, not an INSERT) and
-  flushing, `await db.refresh(row)` before returning/serializing it if the
-  response reads a column with `onupdate=func.now()` and no client-side
-  default.
-- **Why:** SQLAlchemy fetches a fresh `onupdate` value via `RETURNING` on an
-  INSERT but leaves it expired after a plain UPDATE; reading it outside the
-  session's async context then raises `MissingGreenlet` —
-  `notifications.service.archive_template` hit this serializing `updated_at`,
-  even though the sibling classifier-archive path (a bare `flush()`, no
-  read-back) never needed one.
-- **How to apply:** Whenever a service both mutates a row's `onupdate` column
-  AND returns/serializes that same row in the same call, add `refresh()`
-  after the `flush()` — don't assume an existing archive-path precedent
-  covers it.
-- **The INSERT-side mirror, hit in stage 3.7 task 3:** "an INSERT gets it via
-  RETURNING" only covers columns the DB/SQLAlchemy itself generates
-  (`server_default`, identity) — a caller-supplied value for a FIXED-SCALE
-  column (`Tariff.coefficient numeric(12,6)`) is not one of those, so it is
-  NOT part of the implicit RETURNING either: posting `"1.5"` left the
-  in-memory row showing the caller's own unpadded string while Postgres had
-  already stored `"1.500000"`. `norms.service.create_versioned` needed the
-  identical `db.refresh(row)` right after `flush()` on a fresh INSERT, not
-  only on the UPDATE paths — caught by printing the raw response before and
-  after the fix, since no given test asserted create-response precision
-  until one was added for exactly this.
-
-## A JSONB column fed by the stock `json.dumps` rejects `Decimal` and `date`
-
-- **Rule:** Coerce anything that is not a JSON primitive to `str` BEFORE it reaches
-  a JSONB bind — the engine configures no `json_serializer`, so there is no
-  encoder to fall back on.
-- **Why:** `notifications.params` is stored raw, and the seeded templates ask for
-  `{amount}` (a `Decimal` — money is `numeric` by project convention) and
-  `{due_date}`/`{valid_from}` (`date`). The natural 3.10 call would raise
-  `TypeError: Object of type Decimal is not JSON serializable` at flush, INSIDE
-  the caller's business transaction — turning invoice issuance into a 500, the
-  one outcome ruling 10 exists to prevent (3.5 final review; `service._jsonable`).
-- **How to apply:** Any new JSONB column written from domain values gets the same
-  coercion at its single write point, plus a test with a `Decimal` and a `date`.
-
-## `secrets.compare_digest` raises `TypeError` on non-ASCII strings
-
-- **Rule:** Compare secrets as BYTES — `compare_digest(a.encode(), b.encode())` —
-  whenever either side can come from a URL path, a header or a query string.
-- **Why:** `POST /api/v1/webhooks/eskiz/%CE%A9` hit the blanket 500 handler instead
-  of the intended 404, on the one route whose stated invariant is that it never
-  500s on garbage (3.5 final review). The str form only accepts ASCII operands.
-- **How to apply:** Every future provider webhook (Payme at 3.10, my.gov.uz later)
-  compares bytes, and gets a non-ASCII-path test alongside its wrong-secret test.
-
-## Never ask a provider for a callback you cannot correlate
-
-- **Rule:** Only request a delivery report / webhook for a send that has a stored
-  row to correlate it against; pass an explicit "no callback" flag otherwise.
-- **Why:** `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender`
-  passed a throwaway uuid as the reference, so at `sms_mode=real` EVERY OTP would
-  have produced one `inbound_dead_letters` row (holding the recipient's phone
-  number) plus one `integration_log` row, forever — no purge job covers dead
-  letters, and the DLQ's triage purpose would drown in the noise (3.5 final review).
-- **How to apply:** When wiring a provider callback, ask what the DLQ does with a
-  report that matches nothing — and remove the cause rather than filtering it.
-
-## An anonymous endpoint must cap what it PERSISTS, not just what it answers
-
-- **Rule:** Any column an unauthenticated caller can fill gets an explicit size cap
-  with a truncation marker, even where a sibling field is already truncated.
-- **Why:** `inbound_dead_letters.payload` stored an arbitrary-size body from the
-  anonymous Eskiz callback while `error` right beside it was cut to 1000 chars;
-  there is no body-size middleware in the app and no purge job for dead letters
-  (3.5 final review — `service.DEAD_LETTER_PAYLOAD_MAX_BYTES`). "Every other JSON
-  endpoint does the same" was the wrong defence: the others do not PERSIST the body.
-- **How to apply:** New anonymous ingest path → cap what it writes, and say in the
-  stored row that it was capped.
+- **Rule:** A fresh `postgis/postgis:16-3.4` volume ships `tiger_geocoder`, `topology` and
+  `fuzzystrmatch`; the init script `docker/…/02-drop-image-extras.sql` removes them — keep it.
+- **Why:** Those extensions bring their own tables, so `alembic check` on a raw dev DB
+  reports a diff unrelated to our models and autogenerate proposes dropping them (`8c00270`).
+- **How to apply:** If `alembic check` is suddenly dirty on a machine that just recreated
+  its volumes, check for those schemas before suspecting the models.
 
 ## `sa.literal(value, JSONB)` inside `.bindparams()` binds the wrong object
 
-- **Rule:** To insert a JSON/JSONB literal from a raw migration `sa.text(...).bindparams(...)`
-  call, pre-serialize with `json.dumps` and bind it as plain text with an explicit
-  `CAST(:x AS jsonb)` in the SQL — never pass `sa.literal(value, postgresql.JSONB)`
-  as the keyword value.
-- **Why:** `.bindparams(key=sa.literal(v, type_))` sets the param's bound value to
-  the `BindParameter` construct itself, not `v` — asyncpg then receives that
-  construct where it expects serialized text and raises `DataError: ... object has
-  no attribute 'encode'` (migration 0010, caught by the RED/GREEN cycle, never
-  reached a running database).
-- **How to apply:** A raw-SQL JSONB insert in a migration goes through `op.bulk_insert`
-  with a `sa.table`/`sa.column(..., postgresql.JSONB())` and a plain Python dict
-  (0009's pattern, unaffected by this bug) whenever it fits, or `json.dumps(value)`
-  bound as text plus `CAST(:x AS jsonb)` otherwise — never a JSONB-typed `sa.literal`
-  inside `bindparams`.
-
-## A fixed-scale `NUMERIC` column round-trips at its own precision, not the caller's
-
-- **Rule:** A pydantic response field backed by a `NUMERIC(p,s)` column strips
-  trailing zeros explicitly (`format(value, "f").rstrip("0").rstrip(".")`) before
-  the API returns it — never assume the value keeps the request's own precision,
-  and never reach for `Decimal.normalize()` to do the stripping.
-- **Why:** `contour_versions.declared_area_ha` is `NUMERIC(12,4)`; posting `"2.6"`
-  and reading it back gives `Decimal('2.6000')` (confirmed against real Postgres,
-  not just SQLAlchemy) — a bare `Decimal` field then serializes as `"2.6000"`,
-  silently failing a test asserting the reference figure `"2.6"` (task 3). Fixing
-  it with `.normalize()` trades one bug for another: `Decimal('100.0000')
-  .normalize()` is `Decimal('1E+2')`, not `100` — wrong for a whole-number area.
-- **How to apply:** Any new `Decimal`-backed response field on a fixed-scale
-  column gets a `field_serializer` doing the `format(..., "f")`-then-`rstrip`
-  dance (`gis.schemas._trim_decimal`), and a test asserting the exact JSON string
-  a round-tripped value produces — not just its `float()`.
-
-## A `_client_for`-style fixture's setup-time commit only covers what ran before it
-
-- **Rule:** When a test combines a signed-in HTTP-client fixture that commits
-  internally (e.g. `gis_client`) with a SEPARATE fixture writing through the same
-  `db` session (e.g. `leshoz`), the write-fixture's row is invisible to the app's
-  own session unless something commits it again AFTER that fixture runs — pytest
-  instantiates a test's fixtures in the LEFT-TO-RIGHT order of its parameter list
-  (verified empirically with a throwaway fixture-order test), so anything listed
-  AFTER the client is not covered by the client's own setup-time commit.
-- **Why:** `test_gis_specialist_creates_a_contour_and_a_draft_version(gis_client,
-  leshoz, contours_layer)` would FK-fail otherwise: `gis_client`'s internal commit
-  runs before `leshoz` even executes, so `leshoz`'s `flush()`-only row stays
-  invisible to the app's separate connection — confirmed empirically with a fresh,
-  independent asyncpg connection reading `organizations` right after fixture setup
-  and finding nothing there (task 3, first task to combine a `_client_for` client
-  with a write fixture in the same test).
-- **How to apply:** Every client fixture built over `_client_for`
-  (`tests/modules/gis/conftest.py`) registers an httpx `request` event hook
-  (`_commit_pending_before_requests`) that re-commits `db` right before every
-  outgoing call, so any other fixture's writes are picked up regardless of listed
-  order. Copy this pattern for any new signed-in-client fixture — in gis or
-  another module — that will ever be combined with a write fixture in the same
-  test; do not assume the client fixture's own setup-time commit is enough.
-
-## `DomainError`'s JSON response has no encoder — a raw Decimal/UUID in `details` is a 500
-
-- **Rule:** Before passing any value read from the database (not a hand-built
-  dict of plain strings) into `err(..., details=...)`, convert it to a
-  JSON-safe structure first (`float`/`str`, recursively) — never assume
-  `details` gets the same treatment a pydantic `response_model` would.
-- **Why:** `app.main`'s `DomainError` handler renders the response with
-  Starlette's `JSONResponse` — stock `json.dumps`, no encoder configured at
-  all — unlike a `response_model` route, which goes through pydantic's own
-  serializer. `gis.service.publish_version`'s `ERR-GIS-003` details carry
-  `checks._intersections`' raw `Decimal` (`area_m2`) and `uuid.UUID`
-  (`feature_id`): passing them through unconverted raised `TypeError` INSIDE
-  the exception handler itself while it built the response, turning a
-  blocked publish's clean 422 into a 500 (stage 3.6a task 5; caught by the
-  task's own overlap test, confirmed by temporarily reverting the fix and
-  watching the same test fail with exactly that traceback).
-- **How to apply:** Any new `err(..., details=...)` call whose details
-  originate from a DB read needs its own recursive JSON-safety pass first —
-  `gis.checks.jsonable` is the template AND the one place to extend it. It
-  started as two near-identical local copies (`service._checks_jsonable`,
-  `schemas._jsonable_details`, one per consumer) and they had ALREADY
-  diverged by the time the task's own review caught it — the schemas copy
-  had no `uuid.UUID` branch, silently relying on pydantic's own Any-typed
-  encoder to cover for it on that one path only. Unlike `_json_safe`
-  (deliberately kept as separate, DIFFERENTLY-behaved local copies per
-  consumer — see its own entry above), a coercer whose two callers need
-  IDENTICAL conversions belongs in one shared function, not a mirror: a
-  mirror only earns its keep when the two copies are supposed to diverge.
-
-## A fixed test geometry that a `_client_for` client commits accumulates forever
-
-- **Rule:** A fixture whose test needs an EMPTY neighbourhood (a "nothing else
-  overlaps here" assertion, for any geometry-bearing table) picks a randomised
-  location — `tests/modules/gis/conftest.py::random_box_wkt()` — never a fixed
-  literal, even a currently-unused-looking one.
-- **Why:** `published_contour` + a `gis_client`-family fixture commits for real
-  (the previous lesson's request hook), so every past run of
-  `test_a_draft_version_can_be_edited_but_a_published_one_cannot` (and any test
-  like it) has left another published contour at box_wkt(69.9, 41.5) in the
-  shared, persistent test DB — confirmed empirically while building task 4's
-  `overlap` check: 4 leftover rows there before this task's own runs, 11 after a
-  handful more. A NEW test asserting "no overlap" at that same coordinate is
-  flaky by construction from the moment it's written, not from bad luck later.
-- **How to apply:** Grep `tests/modules/gis/` for `box_wkt(69.9, 41.5)` (and its
-  69.91/69.905/60.0 neighbours) before adding a new fixture near it; if the test
-  needs isolation rather than deliberate proximity to an existing fixture
-  (`neighbouring_published_contour` and its siblings need the shared literal,
-  by design — they're robust to extra copies at that spot, verified), use
-  `random_box_wkt()` instead. Applies beyond gis to any future table that
-  stores real geometry and gets exercised through a committing client fixture.
-
-## A seeded notification template becomes undeletable once something has sent it
-
-- **Rule:** A migration whose `downgrade()` deletes a seeded `notification_templates`
-  row must delete the `notifications` referencing it FIRST — and any migration that
-  seeds a template owes its downgrade both statements from the start.
-- **Why:** 0010 seeded `gis.import.finished` and deleted only the template on the way
-  down. That was fine for two tasks, because nothing sent the event yet; the moment
-  task 7's import job actually sent it, `fk_notifications_template_id_notification_templates`
-  turned the CI downgrade→upgrade round-trip red — in a task that never touched the
-  migration — and a real rollback of 0010 would have failed the same way in production.
-- **How to apply:** Seeding a template in a migration means writing
-  `DELETE FROM notifications WHERE event_code = '<code>'` immediately above the
-  template delete, not when someone finally sends it; and when the round-trip test
-  goes red in a task that changed no migration, look for the event that task started
-  emitting.
-
-## A queue-wide `FOR UPDATE SKIP LOCKED` claim makes a whole test module order-dependent
-
-- **Rule:** A worker that claims the OLDEST row of a table needs a drain step in an
-  autouse fixture at the PACKAGE conftest level, not in one test module — and the
-  drain runs the job itself, never an unscoped `DELETE`.
-- **Why:** `gis.import_service.process_pending` claims the oldest `pending` import in
-  the database, not the one the test created, and every import fixture commits (the
-  job runs in a session of its own and cannot see an uncommitted row). An interrupted
-  run therefore strands a `pending` row forever in the shared, persistent test DB, and
-  the next run claims that stranger instead of its own: `test_two_workers…` sees
-  `[1, 1]` instead of `[0, 1]`. A module-local drain only masked it, and only because
-  that module sorted first and happened to drain the other module's leftovers.
-- **How to apply:** Any future claim-the-oldest worker (batch publication in 3.6b,
-  report generation, export jobs) gets `tests/…/conftest.py`'s
-  `drain_pending_imports` shape: autouse, package-scoped, bounded by a DRAIN_LIMIT
-  that fails loudly rather than looping. Fixed test literals in the same fixtures
-  (a `storage_key`, a contour number) need randomising for the same reason.
-
-## A per-endpoint guard is not a root fix when sibling endpoints share a precondition but gate on different permissions
-
-- **Rule:** When several endpoints each perform one step of a shared multi-step
-  transition (submit-review/approve/publish), a precondition belonging to the
-  WHOLE transition — "is this even a valid target for this workflow at all" —
-  must live in ONE function every step calls, never only in the step a
-  well-behaved caller happens to reach first.
-- **Why:** `gis.service.submit_import_review` alone got the "refuse a
-  non-contour import batch" guard in task 8's first review fix;
-  `approve_import`/`publish_import` still gated on `row.status` alone. Since
-  `CONTOURS_APPROVE` (the rahbar's own permission) is a DIFFERENT permission
-  from `CONTOURS_MANAGE` (submit-review's), a rahbar-only actor could call
-  `/approve` directly on a batch that had just finished parsing — never
-  having called, or being able to call, submit-review at all — and both loops
-  silently found zero `ContourVersion` rows and still advanced
-  `gis_imports.status`, reaching the exact false "done" with zero published
-  the guard was written to prevent. The contour-batch sibling of the same bug:
-  `/approve` called before `/submit-review` finds zero `review`-status
-  versions and still sets `row.status = "approved"`, having approved nothing.
-  Reproduced for real with `git stash` on the fix (both cases answered `200`,
-  not `409`) before confirming the root-cause version.
-- **How to apply:** Any future multi-step, multi-permission transition (norms'
-  own Draft→Review→Approved→Published cycle is the next one to carry this
-  shape) factors its shared preamble — row lookup, zone check, any "is this a
-  valid target" check, status check — into one function every step calls, and
-  separately refuses a transition whose loop would move zero child rows: a
-  loop finding nothing is not evidence that nothing needed to happen.
-
-## The rahbar's role code is `leadership`, not `rahbar`
-
-- **Rule:** Before granting a permission to "the raҳbar" (leshoz head) in a
-  migration or a plan, check `roles.code` in migration `0003_auth` — it is
-  seeded as `leadership`. There is no role code `rahbar`.
-- **Why:** `plans/03.6a-gis-core.md` was written with role code `rahbar`; an
-  `INSERT … SELECT … WHERE code = 'rahbar'` inserts zero rows silently, so
-  `gis.contours.approve` would have reached nobody and every "the rahbar
-  approves" test would have passed for the wrong reason (a personal grant,
-  not the role) — caught only because the implementer ran it and watched the
-  grant not land (stage 3.6a Task 1).
-- **How to apply:** Any future migration or plan that seeds a role-based
-  permission grant: grep `leadership`/`rahbar` in `migrations/versions/
-  0003_auth.py` first, never trust a role name from spec/plan prose alone.
-
-## `IntegrityError` IS a `DBAPIError` — the narrow `except` must come first
-
-- **Rule:** When a function needs to catch both `IntegrityError` and the
-  broader `DBAPIError`, write `except IntegrityError` BEFORE `except
-  DBAPIError` — never after, and never as one clause that inspects `exc.orig`
-  by hand instead.
-- **Why:** `gis.service.create_version` originally had only `except
-  DBAPIError`, mapping every DB failure to `ERR-GIS-001` ("unreadable
-  geometry"); a `uq_contour_version_no` race from two concurrent creates
-  raises `IntegrityError`, a `DBAPIError` subclass, so it was silently
-  swallowed by the broad clause and reported as a geometry defect instead of
-  the version-number conflict it actually was (stage 3.6a Task 3, final
-  review finding 3 — confirmed empirically against real Postgres, not from
-  documentation, that the two failure modes even raise different exception
-  types; Task 7's bulk importer drives the very same path, so the bug was
-  live, not theoretical).
-- **How to apply:** Before adding a second `except` clause alongside an
-  existing `except DBAPIError`, check whether the new one is a subclass
-  (`IntegrityError.__mro__`) — if so, order it first, and verify empirically
-  which exception a given real constraint violation actually raises rather
-  than assuming from the constraint's name.
-
-## A service-level pre-check can leave its mirrored DB CHECK permanently unexercised
-
-- **Rule:** When a service pre-checks a rule a DB CHECK also enforces (this
-  project's defense-in-depth pattern), write a SEPARATE model-level test that
-  inserts through the ORM directly, bypassing the service — an API-level test
-  alone never reaches the CHECK.
-- **Why:** `Contour.parent_needs_subcontour` has had a test since Task 1, but
-  it only ever went through `POST /gis/contours`, which raises `ERR-VAL-001`
-  from the SERVICE's own pre-check before a row is even constructed — the
-  CHECK itself was never fired by any test until Task 3 added one that builds
-  `Contour(...)` directly and asserts the `IntegrityError` (Task 1 deferred
-  minor, closed at Task 3).
-- **How to apply:** Any CHECK mirrored by a service-level guard needs two
-  tests, not one: the service's 422/409 through the API, AND a direct-ORM
-  insert asserting the CHECK's own `IntegrityError` — when adding a
-  `CheckConstraint`, grep for whether a `pytest.raises(IntegrityError)` test
-  actually exercises it, not just the guard in front of it.
-
-## An empty layer makes a containment check meaningless — decide what "no data" means before the data exists
-
-- **Rule:** Before a topology/containment check goes live against a layer or
-  table that might still be empty, implement its THIRD outcome — `skipped`,
-  never `pass` or `fail` — for the "no reference data yet" case, decided at
-  design time rather than left for whoever notices the check always fires the
-  same way.
-- **Why:** `gis.checks._within_fund` (`ST_Within` against the `forest_fund`
-  layer) would report every contour as `outside_forest_fund` — a hard `fail`
-  blocking every publication — for as long as the Agency's fund-boundary
-  delivery is pending (plan ruling 9); without the `skipped`/`layer_empty`
-  branch (returned straight from `count(*) == 0` in the same query that would
-  otherwise test containment), not one contour could have published this
-  month. The check turns itself on the day the data lands, with no code
-  change.
-- **How to apply:** Any check whose candidate/reference set is a layer or
-  table this project does not yet fully control the population of (a layer
-  awaiting real Agency data, a not-yet-onboarded integration) gets an
-  explicit empty-set branch decided up front, returned as its own named
-  result — never silently defaulted to `pass` or `fail` once real rows start
-  arriving.
-
-## `ST_Intersects` alone reports every shared border as an overlap — real cadastral data needs an area tolerance
-
-- **Rule:** A geometric "do these overlap" predicate over real (hand-digitised
-  or GIS-sourced) polygons is never plain `ST_Intersects`/`ST_Overlaps` —
-  compute the actual intersection area and compare it against a configurable
-  tolerance, because two legitimately adjacent polygons share a border of
-  zero area, and `ST_Intersects` is `true` for that exactly as it is for a
-  genuine double-booked overlap.
-- **Why:** Two neighbouring published contours sharing a fence line are the
-  NORMAL case on real cadastral data, not an edge case — a plain-`ST_Intersects`
-  publish-blocking check (the spec's own `ST_Overlaps`) would have refused to
-  publish perfectly valid neighbouring contours (decision #24's correction;
-  `gis.checks._intersections` computes `ST_Area(ST_Intersection(a,b)
-  ::geography)` and compares it to `gis_overlap_tolerance_m2`, default
-  100 m², proven by `test_checks.py`'s `draft_version_touching_it` vs
-  `draft_version_overlapping_it` pair — one shares an edge and must pass, the
-  other genuinely overlaps and must block).
-- **How to apply:** Any new geometric predicate over contour/parcel-shaped
-  data (norms' own territory checks, 3.7+, are the next candidate) computes
-  an intersection AREA and compares it to a named, configurable tolerance
-  setting — never a bare boolean `ST_Intersects`/`ST_Overlaps` used directly
-  as the blocking test.
-
-## `request.body()` raises inside a dependency on any FORM route
-
-- **Rule:** A FastAPI dependency that needs the raw request body (`auth.deps.
-  idempotency_context` is the only one) must branch on the content type: for
-  `multipart/form-data` and `application/x-www-form-urlencoded` it reads
-  `await request.form()` (Starlette's cached `FormData`), never
-  `await request.body()`.
-- **Why:** FastAPI reads the body BEFORE solving dependencies, and for a form it
-  parses straight off the stream rather than caching bytes — so `Request.body()`
-  re-enters `Request.stream()`, hits `_stream_consumed` and raises
-  `RuntimeError("Stream consumed")`, an unhandled 500. Hit the moment
-  `POST /gis/imports` became the idempotency mechanism's first consumer (3.6a
-  fix wave); reproduced by wiring the dependency the plain way and watching the
-  upload come back 500.
-- **How to apply:** Any future `Idempotency-Key` consumer that takes a file
-  (payment receipts, act scans) is a multipart route and inherits this; the
-  fingerprint there is the form's scalar fields plus each file's
-  name/filename/content-type/size, sorted — never the file bytes, which would
-  mean re-reading a 100 MB upload per request. **The mirror is a trap too:** the
-  branch keys on the CONTENT TYPE, not on the route, so a JSON-body route
-  declaring `idempotency_context` that is sent `multipart/form-data` takes the
-  form branch, `request.form()` consumes the stream, and FastAPI's OWN
-  `await request.body()` for the JSON body field then raises the same
-  `RuntimeError`. Not reachable today — `imports_router` is the only consumer
-  and is itself multipart — but the next consumer needs to know, and a route
-  that accepts both shapes needs the branch reconsidered rather than reused.
-
-## A status-transition table is ambiguous wherever two source states share a target
-
-- **Rule:** When a state machine allows one target from more than one source
-  (`TRANSITIONS`: `review` is reachable from BOTH `draft` and `approved`),
-  EVERY route driving any of those edges must assert the SOURCE state too, not
-  only "may this row become X" — the new route and the one that was already
-  there.
-- **Why:** `return-to-review` (`CONTOURS_APPROVE`) and `submit-review`
-  (`CONTOURS_MANAGE`) both land on `review`. Checking the target alone let the
-  approver drive `draft` -> `review` — submit-review's own edge, under the wrong
-  permission — so an approver could advance a specialist's draft they otherwise
-  may not touch. Caught by the new route's own bad-transition test, which
-  returned 200 instead of 409 (3.6a fix wave). The MIRROR was still open after
-  that fix and had to be closed separately: `submit_review` (`CONTOURS_MANAGE`)
-  kept the bare check, so it drove `approved` -> `review` — the rework edge just
-  gated behind `CONTOURS_APPROVE` — and audited it as `submit_review`. Guarding
-  only the route you are adding leaves the split it installs defeated from the
-  other side.
-- **How to apply:** Before adding a route to an existing transition table, grep
-  the table for the target: more than one source means EVERY route reaching
-  that target needs `_assert_transition_from(version, source, target)`, not
-  just the new one. Fix the siblings in the same commit.
-
-## Paging a list breaks every test that asserted membership in the unpaged one
-
-- **Rule:** When you add `Page[T]` to a list endpoint, every existing test that
-  asserted "my fixture's row is in the response" must gain a filter narrowing to
-  that fixture's own data — a fresh `organization_id` is the usual one here.
-- **Why:** The test DB is shared and persistent, and committing client fixtures
-  leave their rows behind forever, so page 1 of 20 is full of previous runs'
-  contours: `test_an_applicant_sees_published_contours_only` went red the moment
-  `GET /gis/contours` was paged, for a reason that had nothing to do with the
-  change (3.6a fix wave).
-- **How to apply:** Page an endpoint and grep its tests for unfiltered `GET`s in
-  the same commit; assert against `total` and an explicitly scoped query, never
-  against membership in an unbounded default page.
-
-## A re-exported fixture shadowed by a same-file parameter trips ruff's F811, unlike a fixture defined locally
-
-- **Rule:** When a conftest.py imports another module's fixture ONLY to re-export
-  it (`# noqa: F401`) and ALSO uses that same name as a plain parameter on a
-  fixture defined in the SAME file, import it as `from module import name as
-  name` instead — never rename the parameter, since that would break pytest's
-  name-based fixture injection.
-- **Why:** Pyflakes flags a parameter shadowing an import it considers "unused"
-  as `RedefinedWhileUnused` (F811), even though the identical shape is silent
-  when the earlier binding is a locally-defined `@pytest.fixture` function
-  instead of an import — confirmed empirically both ways: `tests/modules/gis/
-  conftest.py`'s own `published_contour(db, contours_layer, leshoz,
-  approval_doc)` never trips it (those four are DEFINED there), while
-  `tests/modules/norms/conftest.py` re-exporting the same four from gis's
-  conftest and then using them as parameters on `published_contour`/
-  `draft_only_contour`/three client fixtures failed `ruff check` on all four
-  until switched to `as`-imports (stage 3.7 task 1; verified in isolation with
-  a two-line repro — `import os  # noqa: F401` then `def foo(os): return os`
-  — under this project's exact ruff config).
-- **How to apply:** Any new conftest.py that re-exports another module's
-  fixture AND ALSO consumes it locally by parameter name: keep `# noqa: F401`
-  for names you only re-export, but import the ones you also use as a local
-  parameter with `as <same name>` — `ruff check --fix` will even relocate each
-  into its own `from ... import (...)` statement; let it.
-
-## The round-trip test's expected head version is a hardcoded string every new migration must bump
-
-- **Rule:** After adding a migration, update `tests/test_migrations.py::
-  test_downgrade_upgrade_roundtrip`'s `assert version == "<old head>"` to the
-  new revision id, in the same commit.
-- **Why:** The assertion is a literal string, not derived from `alembic
-  heads` — a brand-new migration passes every test of its OWN and still fails
-  this one with a confusing `assert '0011' == '0010'` that reads like a
-  migration-chain bug rather than a one-line test update (hit adding 0011 in
-  stage 3.7 task 1; migration 0010 must have needed the identical bump from
-  `"0009"` and left no trace of having done so).
-- **How to apply:** Whenever a new migration advances the head, grep
-  `tests/test_migrations.py` for the previous head string and update it as
-  part of the same commit — it is not on any task brief's file list by
-  default, so it is easy to only discover by actually running the suite.
+- **Rule:** For a JSONB literal in a raw migration `sa.text(...)`, pre-serialize with
+  `json.dumps` and bind it as text with an explicit `CAST(:x AS jsonb)` — never pass
+  `sa.literal(value, postgresql.JSONB)` as the keyword value.
+- **Why:** `.bindparams(key=sa.literal(v, type_))` binds the `BindParameter` construct
+  itself, not `v`; asyncpg then raises `DataError: ... object has no attribute 'encode'`
+  (migration 0010, caught RED/GREEN, never reached a database).
+- **How to apply:** Prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and a
+  plain dict (0009's pattern, unaffected); otherwise `json.dumps` + `CAST`.
 
 ## A bind param immediately followed by `::` loses its last letter in `sa.text()`
 
-- **Rule:** Never write `:name::cast_type` inside a raw `sa.text(...)` SQL
-  string — write `CAST(:name AS cast_type)` instead.
-- **Why:** `TextClause`'s bind-param regex is `(?<![:\w\x5c]):(\w+)(?!:)`: the
-  trailing negative lookahead rejects a match sitting right before another
-  `:`, so on `:value::text` the greedy `\w+` backtracks one character and
-  registers the param as `valu`, not `value`. `.bindparams(value=...)` then
-  raises `sqlalchemy.exc.ArgumentError: This text() construct doesn't define a
-  bound parameter named 'value'` — caught immediately by the RED/GREEN cycle,
-  never reached a running database (migration 0012, stage 3.7 task 2).
-  `tests/modules/norms/conftest.py::param_row` writes the identical
-  `to_jsonb(:value::text)` and carries the same bug, unexercised because no
-  test calls that fixture yet.
-- **How to apply:** Grep any new raw-SQL migration or test for `:\w+::`
-  before running it. `to_jsonb(CAST(:value AS text))` is the drop-in fix;
-  `param_row`'s copy still needs it, before the first test calls it.
+- **Rule:** Never write `:name::cast_type` inside `sa.text(...)` — write
+  `CAST(:name AS cast_type)`.
+- **Why:** `TextClause`'s regex is `(?<![:\w\x5c]):(\w+)(?!:)`; the trailing lookahead makes
+  `\w+` backtrack one character, registering the param as `valu` instead of `value`, so
+  `.bindparams(value=...)` raises `ArgumentError: ... doesn't define a bound parameter named
+  'value'` (migration 0012, 3.7 t2; caught RED/GREEN).
+- **How to apply:** Grep any new raw-SQL migration or test for `:\w+::` before running it.
+
+## A bare `alembic` CLI command targets the shared dev DB, not your worktree's test DB
+
+- **Rule:** Never run `uv run alembic revision --autogenerate` or `upgrade head` bare in a
+  worktree — export `DATABASE_URL="$DATABASE_URL_TEST"` for that one command first (mirror
+  `tests/conftest.py::_migrated_test_db`).
+- **Why:** `migrations/env.py::_resolve_url()` falls back to the shared dev DB whenever
+  nothing overrides it, and a sibling worktree's not-yet-merged branch may have already
+  advanced ITS `alembic_version` past revisions yours doesn't have — the bare command then
+  fails `Can't locate revision identified by '0013'`, reading like local corruption, not a
+  shared DB ahead of your files (hit building 3.8).
+- **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
+  naming a version you don't have locally means check which DB you connected to first.
+
+---
+
+# DB constraints vs Python
+
+## `\d` is Unicode-aware in Python but ASCII-only in a Postgres CHECK
+
+- **Rule:** In any pattern guarding a column that a DB CHECK also constrains (`pinfl`,
+  `stir`, phone, codes), write the ASCII class explicitly — `^[0-9]{9}$`, never `^\d{9}$`.
+- **Why:** pydantic/Python `\d` matches Arabic-Indic and other Unicode digits, the CHECK
+  does not — a non-ASCII digit string passes validation and 500s at the DB. Hit twice:
+  `organizations.stir` (`527d4e0`) and `users.pinfl` (3.3b).
+- **How to apply:** A schema pattern and a CHECK describing the same field must be the SAME
+  regex dialect — read the migration before writing the pydantic pattern.
+
+## A partial unique index constrains only the rows it covers, and only after a flush
+
+- **Rule:** Re-read the index's `WHERE` clause and ask what happens OUTSIDE it; and in a
+  supersede write, `flush()` between the archive UPDATE and the new INSERT.
+- **Why:** Two faces of one index. The classifier uniqueness index covers `status='active'`
+  only, so superseding an already-archived item inserted a second overlapping row and a
+  historical `on_date` lookup returned two rows for one code (3.3a). And without the flush,
+  UPDATE and INSERT are both still pending when the index is checked, so the insert raises
+  `IntegrityError` on a conflict the flush would have resolved.
+- **How to apply:** Rows a partial index does not cover need a service-layer guard. Every
+  supersede write (classifier items 3.3a, notification templates 3.5) is
+  `old.status = "archived"` → `await db.flush()` → `db.add(new_row)`, in that order.
+
+## An enum-ish column has ONE source of truth: the tuple
+
+- **Rule:** Define the allowed values as a module-level tuple, build the DB CHECK from it
+  (`CheckConstraint(f"col IN {TUPLE}")`), spell the pydantic `Literal` members out by hand,
+  and close the gap with `assert set(get_args(TheLiteral)) == set(THE_TUPLE)`.
+- **Why:** Retyping the literals is two sources of truth — a value added on one side is a
+  422 that should be a 201, or an `IntegrityError` 500 that should be a 422. But
+  `Literal[*TUPLE]` is not the fix: it runs and pydantic accepts it, while pyright reports
+  `reportInvalidTypeForm` ("Variable not allowed in type expression") — a `Literal`'s members
+  must be statically visible (3.7 fix wave, finding I8).
+- **How to apply:** `norms/models.py`'s `LIVESTOCK_GROUPS`/`QUANTITY_UNITS` +
+  `norms/schemas.py`'s `LivestockGroup`/`QuantityUnit` +
+  `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints` are the
+  shape. `admin.models.ORGANIZATION_KINDS` still retypes its CHECK — fix on next touch.
+
+## A service-level pre-check can leave its mirrored DB CHECK permanently unexercised
+
+- **Rule:** When a service pre-checks a rule a CHECK also enforces (our defense-in-depth
+  pattern), write a SEPARATE model-level test inserting through the ORM directly — an
+  API-level test alone never reaches the CHECK.
+- **Why:** `Contour.parent_needs_subcontour` had a test from Task 1, but only through
+  `POST /gis/contours`, which raises `ERR-VAL-001` from the service before a row is even
+  constructed; the CHECK first fired in Task 3's direct-ORM test.
+- **How to apply:** Adding a `CheckConstraint` → grep for a `pytest.raises(IntegrityError)`
+  that actually exercises it, not just the guard in front of it. Two tests, not one.
+
+## `IntegrityError` IS a `DBAPIError` — the narrow `except` must come first
+
+- **Rule:** `except IntegrityError` before `except DBAPIError`, never after, and never one
+  clause inspecting `exc.orig` by hand.
+- **Why:** `gis.service.create_version` had only `except DBAPIError`, mapping every DB
+  failure to `ERR-GIS-001` ("unreadable geometry"); a `uq_contour_version_no` race raises
+  `IntegrityError`, a subclass, so a version-number conflict was reported as a geometry
+  defect (3.6a t3). Task 7's bulk importer drives the same path — the bug was live.
+- **How to apply:** Before adding a second `except` beside an existing `DBAPIError`, check
+  `__mro__`, and verify empirically which exception a real constraint violation raises.
+
+## Recovering from a failed insert to keep writing on the same session needs a SAVEPOINT and `exc.orig.__cause__`
+
+- **Rule:** To catch one specific constraint's `IntegrityError` and still use the same
+  session afterward (write evidence, commit), wrap the risky insert in `async with
+  db.begin_nested():` (a SAVEPOINT), never a bare `db.rollback()`; identify WHICH
+  constraint fired via `getattr(exc.orig.__cause__, "constraint_name", None)`, never
+  `exc.orig` or the formatted message.
+- **Why:** `signatures.service.sign()`'s race path writes an audit entry and commits after
+  recovering. A bare `db.rollback()` undoes the WHOLE transaction, not just the failed
+  statement — it silently discarded a caller's own earlier, uncommitted work on the same
+  session, and the next INSERT then failed on an FK pointing at a just-un-inserted row.
+  Separately, `exc.orig` is SQLAlchemy's asyncpg wrapper and exposes only `pgcode` (generic
+  per SQLSTATE class — every unique violation is `23505` regardless of index);
+  `exc.orig.__cause__` is asyncpg's OWN exception, which alone carries `constraint_name`.
+- **How to apply:** `signatures.service.sign()`'s `try: async with db.begin_nested(): ...
+  except IntegrityError:` block, compared against the ONE literal constraint name the
+  branch cares about, is the template — a savepoint only when the caller keeps using `db`
+  afterward; a bare `except IntegrityError: raise err(...)` needs none.
+
+---
+
+# Values: dates, decimals, precision
+
+## Business dates come from `business_today()`, never `date.today()`
+
+- **Rule:** Anything gating on "today" — validity windows, expiry, seasons, permit terms —
+  uses `app/core/time.py::business_today()` (Asia/Tashkent).
+- **Why:** `date.today()` follows the SERVER's zone; on a UTC container it reports yesterday
+  for ~5 hours a day. An expired fixed-term account could still authenticate 00:00–05:00
+  Tashkent (`527d4e0`); the classifier read path had the same bug.
+- **How to apply:** Grep `date.today()` in review — every hit outside `app/core/time.py` is a
+  bug. Storage stays UTC `timestamptz`; only the *calendar-day decision* is Tashkent.
+
+## The row in memory is not what Postgres stored
+
+- **Rule:** After `flush()`, `await db.refresh(row)` before returning or serializing it,
+  whenever the response reads a column the DB itself decides — an `onupdate=func.now()` after an
+  UPDATE, or a caller-supplied value in a fixed-scale `NUMERIC` after an INSERT.
+- **Why:** SQLAlchemy fetches `onupdate` via `RETURNING` on an INSERT but leaves it expired
+  after a plain UPDATE — reading it outside the session's async context raises
+  `MissingGreenlet` (`notifications.service.archive_template`, on `updated_at`). The INSERT
+  side is the mirror: implicit `RETURNING` covers only what the DB generates
+  (`server_default`, identity), so posting `"1.5"` into `Tariff.coefficient numeric(12,6)`
+  left the in-memory row showing `"1.5"` while Postgres held `"1.500000"` (3.7 t3).
+- **How to apply:** Refresh whenever a service both mutates/creates such a column AND returns
+  that same row — an existing archive-path precedent without a read-back does not cover you.
+- **On the way out:** a `Decimal` field backed by `NUMERIC(p,s)` also needs a
+  `field_serializer` doing `format(value, "f").rstrip("0").rstrip(".")`
+  (`gis.schemas._trim_decimal`) — `declared_area_ha` returns `Decimal('2.6000')` for a posted
+  `"2.6"`. Never `Decimal.normalize()`: `Decimal('100.0000').normalize()` is `Decimal('1E+2')`.
+
+## `Decimal` ordering comparisons raise on NaN, not just construction
+
+- **Rule:** A validator that parses a `Decimal` from user input and then bounds it must keep
+  the comparison INSIDE the same `try`/`except InvalidOperation` as the parse.
+- **Why:** `Decimal("NaN")` parses fine; the ordering operator one line later raises.
+  `InvalidOperation` is an `ArithmeticError`, not a `ValueError`, so pydantic never converts
+  it to a 422 — it escapes as a 500. Hit twice on the same field: I7's fix wrapped only the
+  parse, and the scoped re-review caught `"NaN"` reaching `POST /tariffs` as a 500.
+  `"Infinity"` is unaffected — ordering against infinity never raises — which is why the
+  split reads as "it already works" until tried.
+- **How to apply:** `norms/schemas.py::_benefit_modifiers` is the shape — parse and bound
+  share one `try`. Grep for the same split before adding the next `Decimal`-bounded validator.
+
+---
+
+# JSON boundaries
+
+## Nothing in this app configures a JSON encoder — coerce before every JSON boundary
+
+- **Rule:** Any value that is not a JSON primitive (`Decimal`, `date`, `UUID`, an
+  `UploadFile`) is coerced at the single point where it crosses into JSON — a JSONB bind, an
+  `err(..., details=...)` payload, a persisted request body. Never assume something
+  downstream will encode it.
+- **Why:** Three boundaries, three 500s, one absent encoder:
+  - **JSONB bind** — the engine sets no `json_serializer`, so a `Decimal` `{amount}` or a
+    `date` `{due_date}` in `notifications.params` raises `TypeError: Object of type Decimal
+    is not JSON serializable` at flush, INSIDE the caller's business transaction.
+  - **`DomainError` details** — `app.main`'s handler renders with stock `JSONResponse`,
+    unlike a `response_model` route; `ERR-GIS-003`'s raw `Decimal`/`UUID` raised inside the
+    exception handler itself, turning a blocked publish's clean 422 into a 500 (3.6a t5).
+  - **A parsed form body** — a multipart file part is an `UploadFile`, not a string, so the
+    Eskiz callback's dead-letter payload 500'd on a one-line curl against the anonymous
+    route that exists precisely to survive garbage.
+- **How to apply:** `gis.checks.jsonable` is the template; form dicts get
+  `{k: v if isinstance(v, str) else f"<{type(v).__name__}>" for k, v in form.items()}`.
+  A coercer whose callers need IDENTICAL conversions belongs in ONE function — the gis pair
+  had already diverged (the schemas copy had no `UUID` branch) when review caught it, and
+  `norms.calculator` has since grown a third copy. Only deliberately-different copies are
+  exempt: `_json_safe` for audit snapshots behaves differently per consumer on purpose.
+
+---
+
+# Permissions, roles, transitions
+
+## Zone scoping is not a permission check — a read path needs both
+
+- **Rule:** `require_permission(...)` answers "may this role do this at all"; `zone_filter`
+  answers "on whose rows". Every endpoint returning territory-scoped data needs BOTH,
+  including the small sibling endpoints.
+- **Why:** `GET /admin/users/{id}/permissions` passed the permission gate but was not
+  zone-scoped like the user card next to it, so a regional admin could read another region's
+  user through it (3.3b final review, `aa1d551`).
+- **How to apply:** Adding an endpoint next to a scoped one, copy its scoping, not just its
+  permission code. Add a cross-zone denial test.
+
+## A superuser bypass must be reflected in every path that REPORTS permissions
+
+- **Rule:** `sys_admin` skips the check in `require_permission` (decision #41) — so every
+  endpoint answering "what may I do" must special-case it too.
+- **Why:** `GET /auth/me` reported an empty `permissions[]` for a superuser holding no
+  personal grants: fully privileged in fact, powerless on screen, and the adminka would have
+  hidden every button (3.3a — `MeOut.is_superuser` plus the full registry).
+- **How to apply:** Any new "what can this user do" response gets the superuser branch, not
+  just the enforcement point.
+
+## The rahbar's role code is `leadership`, not `rahbar`
+
+- **Rule:** Before granting a permission to "the raҳbar" (leshoz head) in a migration or a
+  plan, check `roles.code` in `0003_auth` — it is seeded as `leadership`.
+- **Why:** `plans/03.6a-gis-core.md` was written with `rahbar`; an `INSERT … SELECT … WHERE
+  code = 'rahbar'` inserts zero rows silently, so `gis.contours.approve` would have reached
+  nobody and every "the rahbar approves" test would have passed for the wrong reason — a
+  personal grant, not the role (3.6a t1).
+- **How to apply:** Grep `0003_auth.py` before seeding any role-based grant; never trust a
+  role name from spec or plan prose.
+
+## A `_client_for` fixture's permission list must mirror the PRODUCTION role's grants
+
+- **Rule:** When a migration grants a ROLE several codes, a fixture standing in for that role
+  via `_client_for(db, ...)` must list ALL of them — that branch builds the user under
+  `role_code="executor_staff"` with only the personal grants given, inheriting nothing from
+  the real role's `role_permissions` row, whatever the fixture is named.
+- **Why:** `leadership_client` (3.7 t4) was written with `NORMS_APPROVE, NORMS_MANAGE` under
+  the docstring "approves, never publishes" — true of the default `norms_publish_scope=central`
+  OUTCOME, wrong about the GRANT (0011 gives `leadership` `norms.publish` too; ruling 16's
+  point is that the SETTING blocks it). Both brief-verbatim tests failed outright: the one
+  asserting `ERR-ACL-002` got `ERR-ACL-001` — the route's dependency rejecting the request
+  before the service's scope check ever ran.
+- **How to apply:** Check what the role holds in its seeding migration, not the fixture's
+  docstring — a docstring can describe the common-case OUTCOME while omitting a GRANT.
+
+## A maker-checker route needs BOTH roles' permission — the service tells them apart
+
+- **Rule:** When the real gate is "not the same person who did the earlier step", the route
+  takes `require_any_permission(EARLIER_CODE, LATER_CODE)`; the identity check belongs in the
+  service, AFTER the permission gate, not instead of it.
+- **Why:** `norms.service.publish_versioned` refuses a maker publishing their own draft by
+  comparing `created_by` to `actor.id` — which only runs if the dependency lets the request
+  through. Gating `/publish` on `TARIFFS_PUBLISH` alone gave `tariffs_maker_client` a 403
+  `ERR-ACL-001` instead of the service's 409 `not_maker_checker` (3.7 t3).
+- **How to apply:** If a service's refusal is an identity comparison rather than a status
+  check, gate the route across every role that can legitimately reach that step.
+- **The mirror, same task:** widening does NOT extend to siblings sharing the gate.
+  `archive_versioned` has no `created_by` — archiving is single-actor — so the identical
+  `require_any_permission` on `/archive` let any `TARIFFS_MANAGE` holder pull a published row
+  out of force alone: worse than the original bug, a silent 200 instead of a loud wrong
+  status. Fixed by keeping the route wide and adding an in-handler check that fires only when
+  the row is `published` (`gis.service._may_manage_layers`'s two-branch shape). Before
+  widening a gate, check every SIBLING route on it for its own escape hatch.
+
+## A status-transition table is ambiguous wherever two source states share a target
+
+- **Rule:** When a target is reachable from more than one source, EVERY route driving any of
+  those edges must assert the SOURCE state too — the new route and the one already there.
+- **Why:** `return-to-review` (`CONTOURS_APPROVE`) and `submit-review` (`CONTOURS_MANAGE`)
+  both land on `review`. Checking the target alone let the approver drive `draft → review`
+  under the wrong permission. The mirror stayed open after that fix: `submit_review` kept the
+  bare check and drove `approved → review` — the rework edge — auditing it as `submit_review`
+  (3.6a fix wave).
+- **How to apply:** Grep `TRANSITIONS` for the target before adding a route: more than one
+  source means every route reaching it needs `_assert_transition_from(...)`. Fix the siblings
+  in the same commit.
+
+## An existence check is not a validity check
+
+- **Rule:** Verifying that a referenced object EXISTS says nothing about whether it is
+  legitimate. State which one you did, in the docstring, at the call site.
+- **Why:** Power-of-attorney representations validate that the poa file exists, is owned by
+  the caller and is a PDF (3.3b) — none of which is proof of a valid power of attorney. The
+  staff-review ruling is still open, parked before 3.9.
+- **How to apply:** When a check is only structural, say so where it is called, so the next
+  agent does not read it as authorization.
+
+---
+
+# Root fixes: one place, not many
+
+## A precondition shared by several steps belongs in ONE function every step calls
+
+- **Rule:** When several endpoints each perform one step of a shared transition, a
+  precondition belonging to the WHOLE transition — "is this even a valid target for this
+  workflow" — lives in one function all of them call, never only in the step a well-behaved
+  caller reaches first. And a transition whose loop moves zero child rows is refused, not
+  advanced.
+- **Why:** `submit_import_review` alone got the "refuse a non-contour batch" guard;
+  `approve_import`/`publish_import` still gated on `row.status`. Since `CONTOURS_APPROVE` is a
+  DIFFERENT permission from `CONTOURS_MANAGE`, a rahbar-only actor could call `/approve`
+  directly on a freshly-parsed batch — never able to call submit-review at all — and both
+  loops found zero rows and still advanced the status (3.6a t8; reproduced with the fix
+  stashed, 200 instead of 409).
+- **How to apply:** Factor the shared preamble — row lookup, zone check, validity check,
+  status check — into one function. A loop finding nothing is not evidence that nothing
+  needed to happen.
+- **The same discipline on inputs:** before reporting a versioned-row creator done, walk
+  every caller-settable field that is an FK or half of a period pair and confirm EACH has a
+  service guard ahead of `flush()`. Task 4 guarded `contour_id`/`approval_doc_id` while
+  `activity_type_id`, `geobotanic_doc_id` and `effective_to < effective_from` reached
+  `flush()` as `ERR-SYS-001`/500 — and the same gap sat in the SHARED `create_versioned`
+  (`POST /tariffs` with a garbage id was a 500 too). `add_classifier_item`'s
+  `valid_to < valid_from` is the period template, `_assert_doc_active` the FK one — reuse the
+  same helper per meaning, never a near-identical second copy.
+
+## A gate that reads only ONE of the two things it guards is bundling two concerns
+
+- **Rule:** When an `if` guards a block computing several values, check that EVERY value in
+  the block reads something from the condition itself. A value computed without ever touching
+  the condition's subject is gated on the wrong thing, even if it is correct today.
+- **Why:** `calculator.calculate` computed `used_sb` (a REQUEST fact — `request.items` ×
+  `coef_sb:<code>`) inside `if snapshot.norm is not None:` (a NORM fact). Task 7 needed the
+  same number when no norm exists yet — a real, supported case — so a preview for a fresh
+  contour silently returned `used_sb=None` instead of the missing-parameter error. The first
+  fix added a SECOND resolution of the same lookup in the service: two places deciding a
+  limit-relevant number, agreeing only by luck.
+- **How to apply:** Split the gate at the root — `if request.activity_code == GRAZING:` for
+  `used_sb`, `if snapshot.norm is not None:` for `max_sb`/`remaining_sb`. Before adding a
+  caller-side workaround for a gap in a shared function, check whether the gate reads what it
+  claims to gate on: a condition never referenced inside its own block is the tell.
+
+## A reversed date period inverts a range predicate and hides the rows it should find
+
+- **Rule:** Any function that walks a period day by day, iterates its years, or passes both
+  ends into a SQL overlap predicate rejects `period_to < period_from` **at the shared entry
+  point**, fail-closed, before anything runs — never trusting the caller's schema to have
+  ordered them. Same for an unbounded period.
+- **Why:** With the dates swapped, `norms.checks`'s own walks no-op and report `pass` having
+  examined nothing — bad, but visible. The real damage is `gis.service.features_intersecting`,
+  whose predicate `valid_from <= :period_to AND valid_to >= :period_from` then fails BOTH legs,
+  so a fire ban genuinely covering the requested days drops out of the result set and the one
+  blocking check this stage exists for returns a confident `pass` (3.7 t6).
+- **How to apply:** Guard in the module's public entry point (`run_checks` is what 3.9 calls
+  directly), not in each router's schema. `ERR-VAL-001` with `period_reversed`/`period_too_long`;
+  the ceiling is a named constant carrying its domain reason (`MAX_PERIOD_DAYS` — ВМҚ 689
+  redoes the geobotanical survey every five years). `from == to` must still pass.
+
+## A narrow helper without full context signals a refusal back, it does not raise on partial evidence
+
+- **Rule:** When a helper lacks the object/purpose/context a refusal's evidence row would
+  need, don't widen its signature or raise from inside it — leave the affected state
+  caller-detectable (e.g. an unset FK) and let the full-context caller override its own
+  result through the evidence-then-raise tail it already has.
+- **Why:** `signatures.bind_certificate(db, *, info, user)` has no `object_type`/`purpose`,
+  so it cannot itself write a `signatures` row for "certificate owned by someone else"; it
+  leaves the certificate UNBOUND and returns, and `sign()` downgrades its own `Verdict` to
+  `invalid`, reusing the one insert/audit/commit/raise tail every refusal already goes
+  through — zero duplicated evidence-writing code (3.8, fix rounds 1 and 3).
+- **How to apply:** Before widening a helper's parameters so it can raise directly, check
+  whether its caller already has an evidence-then-raise tail the helper could feed via a
+  `replace`-able result object instead.
+
+---
+
+# PostGIS
+
+## `ST_Intersects` alone reports every shared border as an overlap
+
+- **Rule:** A "do these overlap" predicate over real polygons is never plain
+  `ST_Intersects`/`ST_Overlaps` — compute the intersection AREA and compare it to a named,
+  configurable tolerance.
+- **Why:** Two neighbouring published contours sharing a fence line are the NORMAL case on
+  real cadastral data; `ST_Intersects` is `true` for a zero-area shared border exactly as for
+  a genuine double-booking, so the spec's own `ST_Overlaps` check would have refused to
+  publish valid neighbours (decision #24's correction).
+- **How to apply:** `gis.checks._intersections` computes
+  `ST_Area(ST_Intersection(a,b)::geography)` against `gis_overlap_tolerance_m2` (default
+  100 m²), proven by `test_checks.py`'s `draft_version_touching_it` vs
+  `draft_version_overlapping_it`. Norms' own territory checks are the next candidate.
+
+## An empty layer makes a containment check meaningless — decide what "no data" means first
+
+- **Rule:** A topology/containment check against a layer that might still be empty needs a
+  THIRD outcome — `skipped`, never `pass` or `fail` — decided at design time.
+- **Why:** `gis.checks._within_fund` would report every contour as `outside_forest_fund` — a
+  hard fail blocking every publication — for as long as the Agency's fund-boundary delivery
+  is pending (plan ruling 9). Without the `skipped`/`layer_empty` branch (straight from
+  `count(*) == 0` in the same query) not one contour could have published this month; the
+  check turns itself on the day the data lands, with no code change.
+- **How to apply:** Any check whose reference set is a layer this project does not yet control
+  the population of gets an explicit empty-set branch, returned as its own named result.
+
+---
+
+# HTTP layer
+
+## `request.body()` raises inside a dependency on any FORM route
+
+- **Rule:** A dependency needing the raw body (`auth.deps.idempotency_context` is the only
+  one) branches on CONTENT TYPE: for `multipart/form-data` and
+  `application/x-www-form-urlencoded` it reads `await request.form()`, never `request.body()`.
+- **Why:** FastAPI reads the body before solving dependencies and, for a form, parses straight
+  off the stream rather than caching bytes — so `Request.body()` re-enters `Request.stream()`,
+  hits `_stream_consumed` and raises `RuntimeError("Stream consumed")` as an unhandled 500.
+  Hit when `POST /gis/imports` became the idempotency mechanism's first consumer (3.6a).
+- **How to apply:** The fingerprint for a multipart route is the scalar fields plus each
+  file's name/filename/content-type/size, sorted — never the file bytes. **The mirror is a
+  trap:** the branch keys on content type, not route, so a JSON route declaring
+  `idempotency_context` that is SENT multipart takes the form branch and FastAPI's own
+  `request.body()` then raises the same error. Not reachable today; a route accepting both
+  shapes needs the branch reconsidered, not reused.
+
+## A `response_model` mismatch is invisible to ruff and pyright
+
+- **Rule:** After writing any route with `response_model=`, hit it once for real before
+  trusting a brief's snippet verbatim — pyright checks the handler body, never whether the
+  returned value satisfies the declared model at runtime.
+- **Why:** Two defects in the same APPROVED plan (`03.7-norms.md` t3), both past `make check`:
+  `Page[T]` requires `page`/`page_size` but the plan's snippets returned
+  `{"items","total","limit","offset"}` → `ResponseValidationError: Field required` on every
+  call; and `PublishOut.item: Any` held a raw ORM row → `PydanticSerializationError: Unable to
+  serialize unknown type`, because `Any` gets NO from-attributes treatment the way a concrete
+  `BaseModel` field does.
+- **How to apply:** A list endpoint whose repo takes `limit`/`offset` still builds `Page[T]`
+  with explicit `page = offset // limit + 1`, `page_size = limit`. Any envelope with an
+  `Any`-typed field that might hold an ORM row needs `SomeOut.model_validate(row)` at the
+  call site.
+
+## A cap checked after reading the body is not a cap — and an anonymous route must cap what it PERSISTS
+
+- **Rule:** Enforce a size limit from `Content-Length`/`UploadFile.size` FIRST, then
+  chunked-read with a running total. Separately, any column an unauthenticated caller can
+  fill gets an explicit size cap with a truncation marker.
+- **Why:** The 3.3b upload path read the whole body into RAM before comparing it to
+  `max_upload_mb`: enforced, but the memory was already spent (`aa1d551`). And
+  `inbound_dead_letters.payload` stored an arbitrary-size body from the anonymous Eskiz
+  callback while `error` beside it was cut to 1000 chars — there is no body-size middleware
+  and no purge job for dead letters. "Every other JSON endpoint does the same" was the wrong
+  defence: the others do not PERSIST the body.
+- **How to apply:** Every future ingest path (attachments 3.9, geodata import) caps early;
+  `service.DEAD_LETTER_PAYLOAD_MAX_BYTES` is the persisted-cap shape, and the stored row says
+  it was capped. `max_upload_mb` also has to be mirrored by the proxy's `client_max_body_size`.
+
+## `Content-Disposition` filenames must be RFC 6266/5987-encoded
+
+- **Rule:** Emit both `filename="<ascii fallback>"` and `filename*=UTF-8''<pct>` — never
+  interpolate the raw name.
+- **Why:** A Cyrillic or Uzbek-Latin-with-diacritics filename made `GET /files/{id}` return
+  500: the header must be latin-1 encodable (3.3b, `aa1d551`). Our users upload exactly such
+  filenames.
+- **How to apply:** Any new download endpoint reuses the helper in `app/core/files.py`.
+
+## `secrets.compare_digest` raises `TypeError` on non-ASCII strings
+
+- **Rule:** Compare secrets as BYTES — `compare_digest(a.encode(), b.encode())` — whenever
+  either side can come from a URL path, header or query string.
+- **Why:** `POST /api/v1/webhooks/eskiz/%CE%A9` hit the blanket 500 handler instead of the
+  intended 404, on the one route whose stated invariant is that it never 500s on garbage
+  (3.5 final review). The str form accepts ASCII operands only.
+- **How to apply:** Every future provider webhook (Payme 3.10, my.gov.uz later) compares
+  bytes and gets a non-ASCII-path test beside its wrong-secret test.
+
+---
+
+# Outbox and integrations
+
+## An outbox sender's return/raise choice IS the retry decision
+
+- **Rule:** A registered sender RETURNS when a failure is permanent and RAISES only when a
+  retry could plausibly help — `deliver_one` retries on any raised exception and treats a
+  normal return as delivered. Never let one boolean stand for a permanent and a temporary
+  reason at once.
+- **Why:** Raising for an unreachable recipient burns `outbox_max_attempts` and the circuit
+  breaker for the same outcome, holding back every other message on that destination. The
+  mirror bit harder (3.5 final review): one helper answered both "is this recipient reachable"
+  (permanent) and "is the ops kill switch on" (temporary), so flipping
+  `notifications_sms_enabled` off for an hour DESTROYED every queued SMS with a reason blaming
+  the recipient — unrecoverably, since admin requeue only works on `dead` rows.
+- **How to apply:** Before writing `raise` in a sender, ask "would a second attempt with the
+  same input succeed?" If no, set the terminal status yourself and `return`. A condition an
+  operator can reverse must RAISE.
+
+## Senders registered at module import must be imported by the standalone worker too
+
+- **Rule:** A destination registered via `register_sender(...)` at import time exists only in
+  a process that imported that module — add the import to `app/workers/outbox.py` explicitly,
+  with a comment, in the same commit.
+- **Why:** In tests and in the embedded deployment, `app.main` imports the routers, which
+  transitively import `notifications.service`, so registration "just happens". A standalone
+  `python -m app.workers` imports neither, so every notification goes `dead` as
+  `unknown destination` — and no in-process test can catch it.
+- **How to apply:** New destination → grep `app/workers/outbox.py` for the registering import
+  → add it → extend the subprocess registration test.
+
+## Never echo an outbound payload into a raised exception
+
+- **Rule:** A sender may report the transport failure (status code, provider error code) —
+  never the message body it was trying to send.
+- **Why:** `outbox_messages.last_error` is admin-visible via `/admin/integrations/*` AND
+  logged, so a sender formatting the payload into its exception leaks live OTP codes to
+  anyone holding the admin outbox permission.
+- **How to apply:** Every new sender raises with transport metadata only, plus a test
+  asserting the code is NOT in `str(exc)`.
+
+## Never ask a provider for a callback you cannot correlate
+
+- **Rule:** Only request a delivery report for a send that has a stored row to correlate it
+  against; pass an explicit "no callback" flag otherwise.
+- **Why:** `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender` passed a
+  throwaway uuid as the reference, so at `sms_mode=real` EVERY OTP would produce an
+  `inbound_dead_letters` row holding the recipient's phone number, forever — no purge job
+  covers dead letters and the DLQ's triage purpose would drown (3.5 final review).
+- **How to apply:** Wiring a provider callback, ask what the DLQ does with a report matching
+  nothing — and remove the cause rather than filtering it.
+
+## `str.format` on admin-authored text is an attribute-access hole
+
+- **Rule:** Never render user- or admin-authored template text with `str.format` or an
+  f-string; substitute placeholders with a whitelist regex (`\{([a-z][a-z0-9_]*)\}`).
+- **Why:** `"{x.__class__}".format(x=obj)` reaches Python attributes on whatever is passed in,
+  and `.format()` raises `KeyError` on a placeholder the caller forgot — inside a business
+  transaction that turns an admin's typo into a failed application submission.
+- **How to apply:** Anything a non-developer authors and the code renders (templates today;
+  announcements, rejection reasons, report labels tomorrow) goes through
+  `notifications.service.render`'s pattern.
+
+---
+
+# Tests and the shared test DB
+
+## The test DB is shared, persistent, and never empty — including the spot you picked
+
+- **Rule:** A test may only touch rows it created. No unscoped `UPDATE`/`DELETE`, no assuming
+  an empty database, and no assuming an empty *neighbourhood*.
+- **Why:** The DB is shared across worktrees and runs, committing client fixtures leave rows
+  behind forever, and the round-trip test wipes it wholesale (collection order pinned in
+  `tests/conftest.py`). Four consequences paid for already, each with its remedy:
+  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 4 stray contours before
+    3.6a t4 and 11 after, so a "nothing overlaps here" assertion there is flaky from birth
+    → randomise (`random_box_wkt()`, `unique_suffix`, a `storage_key`), unless a sibling
+    deliberately needs proximity (`neighbouring_published_contour`).
+  - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the
+    oldest `pending` import in the DB, not yours, and an interrupted run strands one forever
+    (`test_two_workers…` sees `[1, 1]` not `[0, 1]`) → a package-scoped autouse drain that
+    runs the JOB, bounded by `DRAIN_LIMIT`, never an unscoped DELETE.
+  - **Paging:** page 1 is full of previous runs, so
+    `test_an_applicant_sees_published_contours_only` went red the moment the endpoint was
+    paged → assert `total` plus a scoped filter (a fresh `organization_id`), not membership.
+  - **A refused action leaves its row:** `test_a_maker_cannot_archive_a_published_tariff`
+    succeeds BY being refused, so its `science` tariff stays published forever — breaking
+    `test_science_has_no_tariff` (`count(*) == 0`; archived counts too) and its own next run
+    with `period_overlap` → a yield-fixture teardown with a scoped DELETE.
+- **How to apply:** Scope every assertion by the ids your fixture created. Run any new
+  negative test twice in a row, and as part of the FULL suite — this class is invisible in
+  isolation. Do not reorder the conftest collection hook.
+
+## A `_client_for` client's setup-time commit only covers fixtures listed before it
+
+- **Rule:** Every client fixture built over `_client_for` registers an httpx `request` event
+  hook re-committing `db` before each outgoing call.
+- **Why:** pytest instantiates fixtures in the LEFT-TO-RIGHT order of the parameter list
+  (verified empirically), so in `test_x(gis_client, leshoz, contours_layer)` the client's
+  internal commit runs before `leshoz` even executes — `leshoz`'s `flush()`-only row stays
+  invisible to the app's separate connection and the test FK-fails (confirmed with an
+  independent asyncpg connection finding nothing in `organizations`).
+- **How to apply:** Copy `tests/modules/gis/conftest.py`'s
+  `_commit_pending_before_requests` for any new signed-in-client fixture that will ever be
+  combined with a write fixture; never rely on parameter order.
+
+## A conftest autouse fixture runs before your test — schema checks belong in the gate
+
+- **Rule:** A check about Alembic or the schema itself (single head, revision order) goes into
+  `make check` / CI / pre-commit, never into a pytest test expecting to report the failure.
+- **Why:** `tests/conftest.py::_migrated_test_db` is `scope="session", autouse=True` and runs
+  `alembic upgrade head` before ANY test, so with two heads it raises first and a
+  `test_single_alembic_head` never reaches its own assert — pytest reports alembic's message
+  instead of the actionable one (verified 2026-08-29 by planting a second head).
+- **How to apply:** `make heads` covers this one. Before writing a test about infrastructure
+  the fixtures themselves depend on, ask which runs first.
+
+## A "public surface" task's own end-to-end test can ship the surface untested
+
+- **Rule:** When a task adds functions to a module's public surface FOR a caller that does not
+  exist yet, check whether its end-to-end test actually calls them — an HTTP scenario
+  exercises the ROUTES, not the in-process functions a future module will call.
+- **Why:** Task 8's test drives `preview`/`save_calculation`/`publish_norm` over `httpx`,
+  while `service.effective_norm` and `service.run_checks` — exactly what 3.9/3.11 will call
+  in-process — were reached by nothing: hard-coding `run_checks`'s `used_sb` to a real Decimal
+  left the brief-verbatim test green.
+- **How to apply:** Add a direct in-process call to each NEW function inside the SAME test,
+  reusing its committed fixtures, asserting it agrees with what the HTTP path proved. Never
+  ship a contract function whose only verification is that it type-checks.
+
+## Seeded reference data with future effective dates is a scheduled test failure
+
+- **Rule:** A test asserting an exact money/norm figure computed from `business_today()` must
+  FREEZE the date — patching it in the CALLING module's namespace
+  (`app.modules.norms.service.business_today`), never in `app.core.time` — pinned inside the
+  window of the row it means to exercise.
+- **Why:** `0012` seeds `bhm` as two dated rows (412 000 until 2026-08-31, 440 000 from
+  2026-09-01). 3.7 t7's tests hard-coded amounts derived from 412 000 while `_compute`
+  resolved `on_date=business_today()`, so the suite was green the day it was written and would
+  have gone red on 1 September with nobody touching the repository.
+- **How to apply:** Adding a seed row whose period starts in the future, grep the suite for
+  the currently-in-force figure and for `business_today`. Never "fix" such a test by
+  recomputing the expectation from whatever row is in force — that passes against a WRONG
+  tariff, the opposite of what the test is for.
+
+## A re-exported fixture shadowed by a same-file parameter trips ruff's F811
+
+- **Rule:** When a conftest imports another module's fixture ONLY to re-export it and ALSO
+  uses that name as a parameter on a fixture defined in the SAME file, import it as
+  `from module import name as name` — never rename the parameter, which would break pytest's
+  name-based injection.
+- **Why:** Pyflakes flags a parameter shadowing an "unused" import as F811, even though the
+  identical shape is silent when the earlier binding is a locally-DEFINED fixture:
+  `tests/modules/gis/conftest.py`'s own `published_contour(db, contours_layer, leshoz,
+  approval_doc)` never trips it, while `tests/modules/norms/conftest.py` re-exporting those
+  four and using them as parameters failed `ruff check` on all four (3.7 t1).
+- **How to apply:** Keep `# noqa: F401` for names you only re-export; use `as <same name>` for
+  the ones you also consume locally. `ruff check --fix` will split them into their own
+  `from ... import (...)` — let it.
 
 ## `dict(rows.all())` on a raw `text()` query passes at runtime, fails pyright
 
 - **Rule:** Build a dict from a raw-SQL `Result` with a comprehension —
   `{row[0]: row[1] for row in rows.all()}` — never `dict(rows.all())`.
-- **Why:** A `text()` query's rows are `Row[Any]`; pyright cannot confirm an
-  untyped `Row` is a 2-tuple, so `dict()`'s overload resolution matches the
-  wrong overload (`Iterable[list[bytes]]`) and reports `reportCallIssue` +
-  `reportArgumentType` on code that runs and passes correctly (migration 0012
-  tests, stage 3.7 task 2). The identical `dict(rows.all())` over a TYPED ORM
-  `select(Col.a, Col.b)` result (`tests/modules/gis/test_import_publish.py`)
-  does not trip this, because SQLAlchemy can infer the tuple arity statically
-  there — only the raw-`text()` case is untyped enough to confuse it.
-- **How to apply:** Any new test turning raw-SQL rows into a dict uses the
-  comprehension form; reserve `dict(rows.all())` for a typed `select(...)`
-  result.
+- **Why:** A `text()` query's rows are `Row[Any]`; pyright cannot confirm the 2-tuple arity,
+  matches the wrong `dict()` overload (`Iterable[list[bytes]]`) and reports `reportCallIssue`
+  on code that runs correctly (migration 0012 tests, 3.7 t2). The identical call over a TYPED
+  `select(Col.a, Col.b)` does not trip it — SQLAlchemy infers the arity statically there.
+- **How to apply:** Comprehension for raw SQL; reserve `dict(rows.all())` for a typed
+  `select(...)`.
 
-## A `response_model` mismatch is invisible to ruff and pyright — it only fails when the route actually runs
+## An uncommitted test setup on the same session gets committed for real by an expected refusal
 
-- **Rule:** After writing any route with `response_model=`, hit it once for
-  real (a focused pytest run, or a throwaway two-line `TestClient` script)
-  before trusting a brief/plan's own snippet verbatim — pyright type-checks
-  the handler body, never whether the value it returns actually satisfies
-  the declared `response_model` at runtime.
-- **Why:** Two separate defects in the same APPROVED plan
-  (`docs/plans/03.7-norms.md` Task 3), both invisible to `make check`'s
-  static gates and both raising only when a real request hit the route:
-  (1) `Page[T]` requires `page`/`page_size`, but the plan's own
-  `list_parameters`/`GET /tariffs` snippets return
-  `{"items", "total", "limit", "offset"}` —
-  `fastapi.exceptions.ResponseValidationError: ... Field required` on every
-  call; (2) `PublishOut.item: Any` held a raw ORM row exactly as the plan's
-  own `publish_parameter` snippet built it — `Any` gets NO from-attributes
-  treatment (unlike a concrete `BaseModel` field, which FastAPI/pydantic
-  converts an ORM object into automatically), so
-  `pydantic_core.PydanticSerializationError: Unable to serialize unknown
-  type` fired inside the response encoder. Both confirmed with a throwaway
-  FastAPI app before writing the real router, not guessed from a traceback.
-- **How to apply:** A list endpoint whose repo layer takes `limit`/`offset`
-  (rather than this project's usual `PageParams`) must still build
-  `Page[T]` with an explicit `page`/`page_size` derived from them
-  (`offset // limit + 1`, `limit`) — never return the raw
-  `{"items", "total", "limit", "offset"}` dict some future task's own brief
-  may repeat from the same plan document. Any envelope schema with an
-  `Any`-typed field that might hold an ORM row (`PublishOut.item` here, and
-  anything shaped like it in Task 4/7) needs `SomeOut.model_validate(row)`
-  at the call site, never the bare row.
+- **Rule:** Never leave an uncommitted prerequisite (a settings override via
+  `db.merge`/`flush`) on the SAME session earlier in a test whose next call is expected to
+  raise via the early-commit-before-raise pattern (`CLAUDE.md`) — commit it separately
+  first, or assert against the default instead.
+- **Why:** A signatures test wrote an uncommitted `SystemSetting` override, then called
+  `sign()` expecting `ERR-SIGN-001` — the refusal's own `db.commit()` commits EVERYTHING
+  pending on that session, so the override persisted for real. Invisible alone; surfaced
+  only running the whole file, because an earlier test had already cached the now-wrong
+  default via `settings_store`'s 60-second cache (3.8 t6).
+- **How to apply:** Before combining a settings-override write with a call that could be
+  refused, ask whether that call's whole point IS the refusal — if so, keep the write out of
+  that test entirely.
 
-## A maker-checker route needs BOTH roles' permission — the service tells them apart, not the router
+## A module's first HTTP-driven test file needs its own `_app_on_test_db` guard
 
-- **Rule:** When a lifecycle step's real gate is "not the same person who
-  did the earlier step" (maker != checker), the route dependency must
-  accept `require_any_permission(EARLIER_CODE, LATER_CODE)`, never
-  `require_permission` of just the later role's own code — the identity
-  check belongs in the service, after the permission gate, not instead of it.
-- **Why:** `norms.service.publish_versioned` (plan ruling 10) refuses a
-  maker publishing their own draft by comparing `created_by` to `actor.id`
-  — a check that only runs AFTER the route's permission dependency lets the
-  request through. The plan's own `publish_parameter` snippet gated on
-  `require_permission(TARIFFS_PUBLISH)` alone, so `tariffs_maker_client`
-  (`TARIFFS_MANAGE` only, by design — makers do not hold `TARIFFS_PUBLISH`)
-  got a 403 `ERR-ACL-001` on `/publish` instead of ever reaching the
-  service's 409 `ERR-NORM-005`/`not_maker_checker`:
-  `test_a_maker_creates_a_draft_and_cannot_publish_it` failed on the wrong
-  status code and body shape (stage 3.7 task 3). Migration 0011 grants
-  `central_admin` BOTH `norms.tariffs.manage` AND `norms.tariffs.publish`
-  at once, which only makes sense if a single role is meant to reach
-  `/publish` as EITHER a maker or a checker, never both for the same row.
-- **How to apply:** Task 4's norm lifecycle (`NORMS_MANAGE`/`NORMS_APPROVE`/
-  `NORMS_PUBLISH`) and any future maker-checker-shaped transition: check
-  whether the fixture granting the "earlier" role deliberately withholds
-  the "later" one, and if the service's own refusal is an identity
-  comparison rather than a status check, gate the route on
-  `require_any_permission` across every role that can legitimately reach
-  that step — not the step's own nominal permission alone.
-- **The mirror bug, caught by review in the very same task:** widening
-  `/publish` this way does NOT mean every sibling route sharing its
-  permission pair is safe to widen identically. `archive_versioned` has NO
-  `created_by` to compare — archiving is a single-actor action, not a
-  handoff between two drafts of the same row — so applying the identical
-  `require_any_permission(TARIFFS_PUBLISH, TARIFFS_MANAGE)` to `/archive`
-  with no service-level check let ANY `TARIFFS_MANAGE` holder take ANY
-  published row out of force single-handedly: the exact one-person change
-  maker-checker exists to prevent, and worse than the original bug, since it
-  is a silent 200 rather than a loud, wrong status code. `gis/router.py`'s
-  own precedent was already sitting right there and says otherwise —
-  `approve`/`publish`/`archive`/`return-to-review` all gate on
-  `CONTOURS_APPROVE` alone, with no path in for the manage-level role. Fixed
-  by keeping the route wide (so a maker still gets a domain 403 instead of a
-  bare one) but adding `archive_versioned`'s own in-handler check —
-  `gis.service._may_manage_layers`'s two-branch shape (role-code superuser
-  bypass, then a specific permission code) — that only fires when the row
-  being archived is `published`; archiving a `draft` stays a maker's own
-  call, unchecked, exactly as it was. Before widening a permission gate on
-  ANY route, check every SIBLING route sharing that gate for whether it has
-  its OWN identity-or-status escape hatch — "this other route already
-  refuses the identity case" is a fact about ONE route, never an assumption
-  that extends to its neighbours.
+- **Rule:** The first test file in a module that drives requests through `create_app()`
+  (not direct `service.py` calls) must add an autouse fixture monkeypatching `DATABASE_URL`
+  to `database_url_test` plus `get_settings.cache_clear()` — copy it from any other
+  HTTP-tested module's `conftest.py`, never assume it is inherited.
+- **Why:** Without it, `create_app()`'s lifespan opens the shared dev `DATABASE_URL`, not
+  the test one — every session cookie a fixture wrote is invisible to it, and EVERY request
+  401s (`ERR-AUTH-002`), reading as a blanket auth failure with no hint that the database is
+  the actual bug (hit on `signatures/test_api.py`, 3.8 t7).
+- **How to apply:** Adding a module's first `router.py` test file, grep its own
+  `conftest.py` for `_app_on_test_db` before writing a single `client.get(...)`; add it
+  there (autouse) if missing, rather than per-file.
 
-## A negative test's FAILURE PATH can leave state that poisons a different test's invariant
+## An unannotated test fixture parameter hides a `str | None` argument-type error pyright would catch
 
-- **Rule:** Before writing a test whose whole point is that an action gets
-  REFUSED (a blocked publish, a blocked archive, a blocked approve), ask what
-  state the refused row is left in, and whether ANY other test in the suite
-  asserts something absolute (a `count(*) == 0`, "no row of this kind exists")
-  that a leftover row of that kind — in ANY status — would break, forever,
-  in the shared persistent test DB.
-- **Why:** `test_a_maker_cannot_archive_a_published_tariff` (this task's own
-  archive-permission fix) publishes a tariff for the `science` activity
-  specifically because it is the one key with no seeded row
-  (`ex_tariffs_one_in_force` blocks a fresh publish against every OTHER
-  activity, which are all already published open-ended from 2015-09-30) —
-  but the test's own SUCCESS is that the maker's archive attempt is REFUSED,
-  so the row stays `published` forever once the test passes. That broke two
-  things at once, only visible running the FULL suite (not the two files in
-  isolation, where nothing else touches `science`): Task 2's
-  `test_science_has_no_tariff` (`count(*) == 0`, no status filter — archived
-  counts too, since `tariffs` has no delete-via-API) started failing, and the
-  test's OWN next run failed at its own publish step with `period_overlap`
-  against the row IT left behind the time before.
-- **How to apply:** `tests/modules/norms/conftest.py::science_activity_id` is
-  now a yield-fixture whose teardown runs a scoped
-  `DELETE FROM tariffs WHERE activity_type_id = :id` — chosen over archiving
-  the row because archived still counts toward the OTHER test's zero-row
-  assertion, and chosen over "pick a random key" because a `Tariff`'s
-  identity (`activity_type_id` + `livestock_group`) has no randomizable
-  component the way `unique_suffix` gives `rule_parameters.code` or
-  `random_box_wkt()` gives a contour's geometry — every future test needing a
-  "definitely publishable, definitely repeatable" row for an EXCLUDE-
-  constrained table without one follows this shape, and gets run TWICE in a
-  row (or as part of the full suite, not just its own file) before being
-  trusted, specifically because this class of bug is invisible in isolation.
+- **Rule:** Annotate test function parameters with their real fixture type (`a_user: User`,
+  not bare `a_user`) — pyright then checks attribute access against the actual model,
+  catching a nullable-column mismatch an unannotated (implicit `Any`) parameter silently
+  swallows.
+- **Why:** `tests/modules/signatures/test_sign.py` calls `_pkcs7(a_user.pinfl)` (a
+  `str`-only parameter) with zero pyright errors ONLY because its test functions never type
+  `a_user` — `User.pinfl: Mapped[str | None]` needs narrowing. Adding `a_user: User` in a
+  new file surfaced three real `reportArgumentType` errors for the identical expression
+  (3.8 t5).
+- **How to apply:** Prefer typed test parameters generally; narrow a fixture's nullable
+  attribute explicitly at the call site (`assert a_user.pinfl is not None`) instead of
+  leaving the parameter unannotated to dodge the check.
 
-## A `_client_for` fixture's permission list must mirror the PRODUCTION role's own grants, not just its usual outcome
+---
 
-- **Rule:** When a migration grants a ROLE more than one permission code
-  (e.g. `leadership` gets both `norms.approve` and `norms.publish`), a test
-  fixture standing in for that role via `_client_for(db, ..., organization_id=
-  ...)` needs ALL of them listed explicitly — that branch builds the user
-  under `role_code="executor_staff"` with ONLY the personal grants it is
-  given (`tests/modules/gis/conftest.py::_client_for`), so it inherits
-  NOTHING from the real role's own `role_permissions` row no matter what the
-  fixture's docstring calls it.
-- **Why:** `leadership_client` (stage 3.7 task 4) was written with just
-  `NORMS_APPROVE, NORMS_MANAGE` under the docstring "approves, never
-  publishes" — true of the DEFAULT `norms_publish_scope=central` OUTCOME, but
-  wrong about the GRANT: migration 0011 gives the `leadership` role
-  `norms.publish` too, and ruling 16's whole point is that the SETTING, not
-  the grant, is what blocks it in that mode. Without the grant here, both
-  brief-verbatim tests FAILED OUTRIGHT on first run, not just for the wrong
-  reason: `test_in_central_mode_a_leshoz_actor_cannot_publish` asserts
-  `ERR-ACL-002` specifically and got `ERR-ACL-001` (missing permission, the
-  route's own dependency rejecting the request before the service's scope
-  check ever ran) — an `AssertionError`, not a pass; its sibling
-  `test_in_leshoz_mode_the_same_actor_publishes` got 403 where it asserts 200.
-  Caught immediately by running the two tests the brief itself gives.
-- **How to apply:** Before trusting an existing zone-scoped client fixture's
-  permission list for a new maker-checker-shaped or scope-gated test, check
-  what the REAL role actually holds in its seeding migration, not just the
-  fixture's own docstring — a docstring can accurately describe a common-case
-  OUTCOME while quietly omitting a GRANT the row really has, and the two only
-  diverge once a test specifically targets the grant/outcome split.
+# Tooling and environment
 
-## Every caller-supplied FK and date-ordering pair needs its own pre-flush guard, not just the ones a test happened to exercise
+## Python 3.14: `except A, B:` without parens is VALID — check syntax with the project's Python
 
-- **Rule:** Before reporting a versioned-row creator (`create_norm`,
-  `create_versioned`) done, walk every field its payload lets a caller set
-  that is either an FK or half of a period pair, and confirm EACH one has a
-  service-level guard ahead of `flush()` — an existence check for the FK
-  (reusing an existing helper if the identical check already exists for a
-  sibling field, never a near-identical second copy), a `to < from`
-  comparison for the pair.
-- **Why:** Task 4's first pass validated `contour_id` (via
-  `_assert_norm_zone`) and `approval_doc_id` (via `_assert_doc_active`, but
-  only at approve time) while leaving `activity_type_id`, `geobotanic_doc_id`
-  and `effective_to < effective_from` unguarded on `create_norm`/
-  `update_norm` — each one reaches `flush()` on a garbage or inconsistent
-  value and surfaces as an uncaught `IntegrityError` -> `ERR-SYS-001`/500,
-  the exact defect class this stage's own contract already treats as a
-  blocker for `period_overlap`. The identical `activity_type_id` gap existed
-  in the SHARED `create_versioned` (tariffs/parameters) too — `POST /tariffs`
-  with a garbage `activity_type_id` was a 500 — caught in the same review
-  pass; fixing one sibling creator and leaving the other would have shipped
-  the same bug one call away (final review, stage 3.7 task 4).
-- **How to apply:** `admin.service.add_classifier_item`'s
-  `valid_to < valid_from` pre-check (`ERR-VAL-001`, ahead of the DB CHECK) is
-  the template for a period-pair guard; `_assert_doc_active`/
-  `gis.service._assert_approval_doc_active` is the template for an FK
-  existence guard — reuse the SAME helper for every field that means "does
-  this document exist and is it active" rather than writing a new one per
-  field. Any new versioned-row creator gets a pass down its own payload's
-  field list against this checklist before being reported done, not just
-  the fields the given tests happen to cover.
+- **Rule:** Verify a file with `uv run python -m py_compile <file>`, never the macOS system
+  `python3` (3.9). And do not "fix" `except A, B:` back to parenthesised form.
+- **Why:** PEP 758 makes parenthesis-free multi-except legal and `ruff format` actively STRIPS
+  the parens under `target-version = py314`; an older interpreter rejects it, which reads as a
+  phantom SyntaxError blocker in review. *(from ControlAI, where it cost a PR review round.)*
+- **How to apply:** Trust `uv run` — the venv is CPython 3.14. The formatter will undo a
+  manual "fix".
 
-## A gate that reads only ONE of the two things it guards is bundling two concerns
+## Log `repr(e)`, not `f"{e}"`
 
-- **Rule:** When an `if` condition guards a block computing several values,
-  check that EVERY value in the block actually reads something from the
-  condition itself — a value the block computes without ever touching the
-  condition's own subject is gated on the wrong thing, even if it happens to
-  be correct today. In `calculator.calculate`, `used_sb` (Σ `request.items`
-  count × `coef_sb:<code>`) reads only `request.items`/`snapshot.values` — a
-  REQUEST fact — so it is gated on `request.activity_code == GRAZING`, never
-  on `snapshot.norm`; `max_sb`/`remaining_sb`/the breakdown's `limit` line
-  genuinely ARE a NORM fact (`snapshot.norm.max_sb`, the committed load
-  against it) and stay gated on `snapshot.norm is not None`.
-- **Why:** Task 5 originally computed both under one `if snapshot.norm is not
-  None:` block, since at the time it only needed `used_sb` for that one
-  breakdown line. Task 7 needed the identical number to validate a grazing
-  request's `coef_sb:<code>` for the checks EVEN WHEN NO NORM EXISTS YET (a
-  real, supported case — VMQ 689's norm and a fee preview are drafted
-  independently) — `POST /calculations/preview` for a fresh contour with no
-  norm used to silently return `used_sb=None` (no error at all) for an
-  unpublished `coef_sb:*` code, instead of the missing-parameter error
-  `test_a_grazing_preview_reports_the_missing_coefficient_rather_than_guessing`
-  expects. The first fix (task 7's own review round 1) added a SECOND,
-  service-layer resolution of the identical `coef_sb:<code>` lookup ahead of
-  `calculate` — passing that test, but creating a real two-sources-of-truth
-  risk on a limit-relevant number: two places deciding which coefficient a
-  grazing request needs, agreeing only because they read identical inputs
-  identically.
-- **How to apply:** Fixed at the root instead — split `calculate`'s single
-  `if snapshot.norm is not None:` into its own `if request.activity_code ==
-  GRAZING:` for `used_sb` and a separate `if snapshot.norm is not None:` for
-  `max_sb`/`remaining_sb`/the breakdown line — so ANY caller (3.9's
-  application precheck included) gets the honest `ERR-NORM-004` straight from
-  `calculate` itself, whether or not a norm happens to exist yet, with no
-  caller-side duplication. Before adding a caller-side workaround for a gap
-  in a shared function, check whether the gate actually reads what it claims
-  to gate on — a condition never referenced inside its own guarded block is
-  the tell.
+- **Rule:** In every `except Exception as e:` that produces a log line, log `repr(e)` (or
+  `type(e).__name__` plus the message) and attach the traceback.
+- **Why:** asyncio-flavour `TimeoutError` — `asyncio.wait_for`, an asyncpg pool acquire, an
+  httpx timeout — has an EMPTY `str()`. The line becomes `"delivery failed: "` and the
+  incident is undiagnosable without a redeploy. *(from ControlAI; our outbox worker, MinIO
+  client and HTTP senders are exactly the code that times out.)*
+- **How to apply:** structlog: `log.error("…", error=repr(e), exc_info=True)`.
 
-## A "public surface" task's own end-to-end test can ship the surface untested
+## `.env.example` drifts silently — and an EMPTY value is not ignored
 
-- **Rule:** When a task adds new adapter/pass-through functions to a module's
-  public surface FOR a caller that does not exist yet (3.9/3.10/3.11 here),
-  and also writes an HTTP-driven end-to-end test, check whether that test
-  actually calls the NEW functions — an HTTP-only scenario exercises the
-  ROUTES, not the in-process functions a future module will call directly.
-- **Why:** Task 8's given end-to-end test drives `preview`/`save_calculation`/
-  `publish_norm` entirely over `httpx`; the two new functions the task also
-  adds (`service.effective_norm`, `service.run_checks`) are exactly what
-  3.9/3.11 will call IN-PROCESS once they exist, but nothing in the HTTP
-  scenario reaches either — confirmed empirically by hard-coding
-  `run_checks`'s `used_sb=None` to a real Decimal and watching the
-  brief-verbatim test stay green throughout (it has no assertion that could
-  ever fail from that change).
-- **How to apply:** Any task that "documents the public surface" by adding
-  functions for a not-yet-built caller: add a direct in-process call to each
-  NEW function inside the SAME end-to-end test (reusing its already-committed
-  fixtures/state — no second test file needed), asserting it agrees with what
-  the HTTP path already proved. Never ship a contract function whose only
-  verification is that it type-checks.
+- **Rule:** Adding or renaming a `Settings` field means editing `.env.example` in the same
+  commit and grepping it for the OLD name. Every line there carries a real value or is
+  commented out — never left empty.
+- **Why:** `app/config.py` sets `extra="ignore"`, so an unknown env var is dropped without a
+  warning: the field keeps its default and the operator believes they configured it *(from
+  ControlAI, where `.env.example` shipped `WHISPER_DEVICE` while the code read `STT_DEVICE`)*.
+  The opposite failure is worse: `EMAIL_MODE=`/`SMTP_PORT=` fail validation outright and
+  `ESKIZ_BASE_URL=` silently replaces a working default with `""`, so `cp .env.example .env` —
+  the README's first step — would not start (3.5 final review).
+- **How to apply:** The env name is the field name upper-cased. Prove a var lands with
+  `uv run python -c "from app.config import get_settings; print(get_settings().<field>)"`;
+  `tests/test_config.py::test_env_example_is_a_working_env_file` is the guard.
 
-## A reversed date period does not just skip a check — it inverts a range predicate and hides the rows it should find
+## pre-commit refuses to run while `.pre-commit-config.yaml` is modified-but-unstaged
 
-- **Rule:** Any function that walks a period day by day, iterates its years, or
-  passes both ends into a SQL overlap predicate must reject
-  `period_to < period_from` **at the shared entry point**, fail-closed, before
-  any of that runs — never rely on the caller's schema to have ordered the
-  dates.
-- **Why:** `norms.checks.run_checks` takes `period_from`/`period_to` from a
-  request. With them swapped, `_season_check`'s `while day <= period_to` and
-  `_rotation_check`'s `range(...)` both no-op and report `pass` having
-  examined nothing — bad, but visible. The real damage is
-  `gis.service.features_intersecting`, whose validity predicate
-  (`valid_from <= :period_to AND valid_to >= :period_from`) is written for the
-  normal ordering: with the dates swapped, a fire ban that genuinely covers
-  the requested days fails BOTH legs and drops out of the result set, so the
-  one check this stage exists to make blocking returns a confident `pass`
-  (stage 3.7 task 6). An unbounded period is the same class of problem from
-  the other side: the day-by-day walk is linear in days, on the event loop.
-- **How to apply:** Guard inside the module's own public entry point, not in
-  each router's request schema — `run_checks` is what 3.9 calls directly, and
-  a per-endpoint guard is not a root fix (existing lesson). `ERR-VAL-001` with
-  `reason` `period_reversed` / `period_too_long`; the ceiling is a named
-  constant carrying its domain reason (`MAX_PERIOD_DAYS` — ВМҚ 689 redoes the
-  geobotanical survey every five years), not a tuning knob. A single-day
-  period (`from == to`) must still pass.
-
-## Seeded reference data with future effective dates is a scheduled test failure
-
-- **Rule:** A test that asserts an exact money/norm figure computed from
-  `business_today()` must FREEZE the date — patch `business_today` in the
-  CALLING module's namespace (`app.modules.norms.service.business_today`),
-  never in `app.core.time` — and pin it inside the window of the seeded row it
-  means to exercise. Never "fix" such a test by recomputing the expectation
-  from whatever row happens to be in force.
-- **Why:** migration `0012` seeds `bhm` as two dated rows (412 000 until
-  2026-08-31, 440 000 from 2026-09-01). Stage 3.7 task 7's new tests
-  hard-coded amounts derived from 412 000 while `_compute` resolved
-  `on_date=business_today()`, so the suite was green on the day it was written
-  and would have gone red on 1 September with no code change and nobody
-  touching the repository — demonstrated by moving the frozen date past the
-  boundary and watching the two tests fail with 2 640 000 against an expected
-  2 472 000. Recomputing the expectation instead would have made the test pass
-  even against a WRONG tariff, which is the opposite of what it is for.
-- **How to apply:** When adding a seed row whose effective period starts in
-  the future, sweep the suite for literals derived from the currently-in-force
-  value (`grep` for the figure and for `business_today`) and give every
-  affected module a frozen-date fixture. Tests that pass `on_date` explicitly,
-  build their own parameter dict, or assert the seeded rows' own dates need
-  nothing — only the ones that read the wall clock.
-
-## `Literal[*TUPLE]` is a pyright error — spell the members out and assert them equal
-
-- **Rule:** A pydantic schema bound that must mirror a DB CHECK's allowed values
-  is written as an explicit `Literal["a", "b", ...]`, never `Literal[*TUPLE]`,
-  and the duplication is closed by a test asserting
-  `set(get_args(TheLiteral)) == set(THE_TUPLE)`.
-- **Why:** `Literal[*LIVESTOCK_GROUPS]` runs fine and pydantic accepts it, but
-  pyright reports "Variable not allowed in type expression"
-  (`reportInvalidTypeForm`) — a `Literal`'s members are exactly what a type
-  checker has to see statically, and a module-level tuple is not that. Hit
-  adding the `livestock_group`/`quantity_unit` bounds in stage 3.7's fix wave
-  (finding I8), where the tuples already existed as
-  `norms.models.LIVESTOCK_GROUPS` and `admin.models.QUANTITY_UNITS`. Writing
-  the members out re-creates precisely the "constraint strings duplicated in
-  Python tuples are two sources of truth" problem this file already warns
-  about — a value added on one side and forgotten on the other is a 422 that
-  should have been a 201, or an IntegrityError 500 that should have been a 422.
-- **How to apply:** `norms/schemas.py`'s `LivestockGroup`/`QuantityUnit` plus
-  `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints`
-  are the shape: the `Literal` carries a comment saying WHY it is spelled out
-  and where the guard lives, and the guard is one `get_args` comparison per
-  tuple. Any future enum-ish column gets the same pair, not a bare `str`.
-
-## `Decimal` ordering comparisons raise on NaN, not just construction
-
-- **Rule:** A validator that parses a `Decimal` from user input and then
-  bounds it with an ordering comparison (`<=`/`<`/`>`/`>=`) must keep the
-  comparison INSIDE the same `try`/`except InvalidOperation` as the parse —
-  "it parsed" is not "it is safe to compare".
-- **Why:** `Decimal("NaN")` parses without error; the exception comes one
-  line later, from the ordering operator itself. `InvalidOperation` is an
-  `ArithmeticError`, not a `ValueError`, so pydantic never converts it to a
-  422 — it escapes as a 500. Hit twice on the same field: I7's fix wrapped
-  only the parse in `norms.schemas._benefit_modifiers`, and the scoped
-  re-review of that fix caught `"NaN"` reaching `POST /tariffs` as a 500.
-  `"Infinity"`/`"-Infinity"` were unaffected — ordering against infinity
-  never raises, only NaN does — which is why they read as a plausible "it
-  already works" until actually tried.
-- **How to apply:** `norms/schemas.py::_benefit_modifiers` is the shape now
-  — parse and bound-check share one `try`, one `except InvalidOperation`.
-  Grep for the same split (`Decimal(...)` in a `try`, a bound comparison
-  after the `except`) before adding the next `Decimal`-bounded validator.
+- **Rule:** Never edit `.pre-commit-config.yaml` (or any tooling file) in a working copy
+  another session is committing from — take a worktree. If pre-commit says *"Your pre-commit
+  configuration is unstaged"*, find whose edit it is rather than reaching for `--no-verify`.
+- **Why:** pre-commit refuses to run against a config it cannot trust, so EVERY commit in that
+  tree is blocked — including commits from a session that never touched the file. Hit twice on
+  2026-08-29 in the shared copy; one commit shipped with `--no-verify` to get out.
+- **How to apply:** One worktree per session (root `CLAUDE.md`). If already stuck,
+  `git stash push .pre-commit-config.yaml` in your own tree beats `--no-verify`; if you do use
+  it, run `make check` by hand and say so in the PR.

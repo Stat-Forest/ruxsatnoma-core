@@ -783,6 +783,24 @@ async def add_representation(
     return representation, applicant
 
 
+async def has_effective_representation(db: AsyncSession, *, user_id: uuid.UUID, stir: str) -> bool:
+    """Pass-through to `repo.get_effective_representation`, resolved from a STIR rather
+    than an `applicant_id` — the public entry point another module (`signatures`, proving
+    an organisation certificate belongs to its presenter) needs instead of reaching into
+    `auth.repo` directly, which the module-boundary rule (backend/CLAUDE.md: cross-module
+    calls only via the other module's service) forbids. "Effective" means exactly what
+    `attach_legal`/`add_representation` above already mean by it: `status='active'` and
+    not past `valid_until`, judged against `business_today()`, never `date.today()`
+    (lesson). No `applicants` row for `stir` at all is simply "no representation"."""
+    applicant = await repo.get_applicant_by_stir(db, stir)
+    if applicant is None:
+        return False
+    representation = await repo.get_effective_representation(
+        db, applicant_id=applicant.id, user_id=user_id, today=business_today()
+    )
+    return representation is not None
+
+
 async def update_contact(
     db: AsyncSession,
     user: User,

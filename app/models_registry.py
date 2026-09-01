@@ -13,3 +13,4 @@ import app.modules.integrations.models  # noqa: F401
 from app.modules.gis import models as gis_models  # noqa: F401
 from app.modules.norms import models as norms_models  # noqa: F401
 from app.modules.notifications import models as notifications_models  # noqa: F401
+from app.modules.signatures import models as signatures_models  # noqa: F401
