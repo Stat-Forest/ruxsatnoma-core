@@ -144,6 +144,13 @@ async def test_activity_and_livestock_types(db):
         livestock = await client.get(f"{API}/refs/livestock-types")
     assert [row["code"] for row in activities.json()][:2] == ["grazing", "haymaking"]
     assert activities.json()[0]["quantity_unit"] == "head"
+    # The 0005 seed guessed these three units (ruling 14); migration 0012 (stage
+    # 3.7 Task 2) corrects them to the real VMQ 278 units (ruling 2): haymaking
+    # -> "ha", recreation -> "person_day", deadwood -> "m3".
+    by_code = {row["code"]: row["quantity_unit"] for row in activities.json()}
+    assert by_code["haymaking"] == "ha"
+    assert by_code["recreation"] == "person_day"
+    assert by_code["deadwood"] == "m3"
     assert len(livestock.json()) == 10
 
 
