@@ -1,7 +1,7 @@
 import secrets
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -9,7 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError
-from app.modules.auth.models import User
+from app.core.time import business_today
+from app.modules.auth.models import Applicant, Representation, User
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.signatures import service
 from tests.modules.auth.test_sessions import make_user
@@ -27,6 +28,13 @@ def _pinfl() -> str:
     UNIQUE, and fixtures in this file may run many times against the same
     shared test database."""
     return f"{secrets.randbelow(10**14):014d}"
+
+
+def _stir() -> str:
+    """A fresh, valid-shape (`^[0-9]{9}$`) stir per call — `applicants.stir`
+    is UNIQUE, same reasoning as `_pinfl()`. 9 digits is also exactly what
+    `_owns_certificate` uses to recognise an organisation certificate."""
+    return f"{secrets.randbelow(10**9):09d}"
 
 
 @pytest.fixture
@@ -218,3 +226,98 @@ async def test_signing_with_a_previously_unbound_own_certificate_rebinds_it(db, 
     )
     cert_again = await service.get_certificate(db, first.certificate_id)
     assert cert_again.unbound_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_caller_with_an_effective_representation_signs_with_the_org_certificate(db, a_user):
+    """Fix round 2: the unblocked organisation-certificate half of ownership
+    proof. `_pkcs7`'s `pinfl` argument doubles as `pinfl_or_stir` — a 9-digit
+    value makes `_owns_certificate` read it as an organisation STIR and ask
+    `auth.service.has_effective_representation` instead of matching PINFL."""
+    stir = _stir()
+    applicant = Applicant(kind="legal", stir=stir, name="OOO Represented")
+    db.add(applicant)
+    await db.flush()
+    db.add(
+        Representation(
+            applicant_id=applicant.id,
+            user_id=a_user.id,
+            basis="org_eri",
+            valid_from=business_today(),
+        )
+    )
+    await db.flush()
+
+    row = await service.sign(
+        db,
+        object_type="permit",
+        object_id=OBJ,
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(stir),
+        user=a_user,
+    )
+    assert row.verification_status == "valid"
+    cert = await service.get_certificate(db, row.certificate_id)
+    assert cert.user_id == a_user.id  # bound on first use, same as personal PINFL
+
+
+@pytest.mark.asyncio
+async def test_a_caller_with_no_representation_for_the_org_stir_is_refused(db, a_user):
+    """The negative half: a STIR nobody has ever represented `a_user` for is
+    refused exactly like a stranger's personal PINFL — same evidence-then-
+    raise path, same reason, and the certificate stays unbound."""
+    stir = _stir()  # no Applicant/Representation row at all for this STIR
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=OBJ,
+            purpose="permit_head",
+            document=DOC,
+            pkcs7=_pkcs7(stir),
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "certificate_pinfl_mismatch"
+    rows = await service.get_for_object(db, object_type="permit", object_id=OBJ)
+    assert [r.verification_status for r in rows] == ["invalid"]
+    cert = await service.get_certificate(db, rows[0].certificate_id)
+    assert cert.user_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_caller_whose_representation_has_expired_is_refused(db, a_user):
+    """`business_today()` is what makes this testable (per its own module
+    docstring): `valid_until` in the past relative to it, `status` still
+    'active' (the 3.4 daily expiry job has not run yet) — the read-time
+    effectiveness check itself must catch this, not rely on the job."""
+    stir = _stir()
+    applicant = Applicant(kind="legal", stir=stir, name="OOO Expired")
+    db.add(applicant)
+    await db.flush()
+    db.add(
+        Representation(
+            applicant_id=applicant.id,
+            user_id=a_user.id,
+            basis="org_eri",
+            valid_from=business_today() - timedelta(days=30),
+            valid_until=business_today() - timedelta(days=1),
+        )
+    )
+    await db.flush()
+
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=OBJ,
+            purpose="permit_head",
+            document=DOC,
+            pkcs7=_pkcs7(stir),
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "certificate_pinfl_mismatch"

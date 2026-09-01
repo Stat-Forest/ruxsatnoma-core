@@ -2,9 +2,12 @@
 (permits) call to attach a signature to anything — the rest of this module
 exists to support it.
 
-Level 2 (`models.py`'s own docstring): this module reaches `auth` only
-through the `User` object a caller hands in, never queries `users` itself,
-and reaches E-IMZO only through the `integrations.adapters.eimzo` seam
+Level 2 (`models.py`'s own docstring): this module reaches `auth` through the
+`User` object a caller hands in and, since fix round 2, through
+`auth.service.has_effective_representation` (proving an organisation
+certificate belongs to its presenter) — never queries `users`/
+`representations` itself, only ever through `auth`'s own service. Reaches
+E-IMZO only through the `integrations.adapters.eimzo` seam
 (`get_eimzo_adapter`; real verification arrives at stage 5.2)."""
 
 import hashlib
@@ -16,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.modules.audit import service as audit
+from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.integrations.adapters.eimzo import EimzoCertificateInfo, get_eimzo_adapter
 from app.modules.signatures import repo
@@ -49,31 +53,26 @@ async def bind_certificate(
     """Get-or-create the certificate `info` identifies, bound to `user` once
     ownership is proven — Task 4's own brief only checked the DB `user_id`;
     ruling 4's fuller text additionally requires the PINFL/TIN proof `auth`
-    already applies to legal representations, and fix round 1 (ruling 1)
-    closes that gap here, in the automatic path every `sign()` call takes.
-    Task 7's explicit `POST /certificates` route enforces the same rule on
-    its own, rarer path; leaving the proof there alone would mean an unknown
-    `(serial_number, issuer)` pair is bound to whoever presents it first
-    through THIS path, unchecked.
+    already applies to legal representations. Fix round 1 (ruling 1) closed
+    the personal-PINFL half; fix round 2 closes the organisation-TIN half —
+    both live in `_owns_certificate`, in the automatic path every `sign()`
+    call takes. Task 7's explicit `POST /certificates` route enforces the
+    same rule on its own, rarer path; leaving the proof there alone would
+    mean an unknown `(serial_number, issuer)` pair is bound to whoever
+    presents it first through THIS path, unchecked.
 
     Four outcomes:
-    - unknown, and `info.pinfl_or_stir` is the caller's own PINFL -> create
-      it, bound to `user`.
-    - unknown, but `info.pinfl_or_stir` is NOT the caller's own PINFL ->
-      create it anyway, as evidence that it was presented, but leave it
-      UNBOUND (`user_id` stays `None`). This function has no document,
-      purpose or object to hang a `signatures` row on, so it does not raise
-      here — it returns the unbound row and lets `sign()`, which has that
-      context, read `cert.user_id != user.id` off it and write the invalid
-      signature row itself. An organisation certificate (a TIN rather than a
-      personal PINFL) belongs to this same branch: proving it would need an
-      effective-representation check, and `auth.service` exposes no usable
-      entry point for that today (only `auth.repo.get_effective_representation`
-      does, and reaching a sibling module's repo directly is exactly what
-      "cross-module calls go through the other module's service" forbids) —
-      flagged as BLOCKED rather than guessed at. Until that entry point
-      exists, an organisation certificate is refused the same fail-closed way
-      as any other PINFL mismatch.
+    - unknown, and `_owns_certificate` proves `info` is the caller's own ->
+      create it, bound to `user`.
+    - unknown, but `_owns_certificate` cannot prove it belongs to the caller
+      (a stranger's personal PINFL, or an organisation STIR the caller holds
+      no effective representation for — see that function's own docstring
+      for the two proof shapes) -> create it anyway, as evidence that it was
+      presented, but leave it UNBOUND (`user_id` stays `None`). This
+      function has no document, purpose or object to hang a `signatures` row
+      on, so it does not raise here — it returns the unbound row and lets
+      `sign()`, which has that context, read `cert.user_id != user.id` off
+      it and write the invalid signature row itself.
     - known and not yet claimed by anyone (`user_id IS NULL`) -> the exact
       same first-bind decision as "unknown", by the exact same rule.
     - known and owned by someone else -> refuse. A person presenting a key
@@ -109,7 +108,7 @@ async def bind_certificate(
         await db.commit()
         raise err("ERR-SIGN-001", details={"reason": "certificate_owned_by_another_user"})
     if cert.user_id is None:
-        if info.pinfl_or_stir == user.pinfl:
+        if await _owns_certificate(db, info=info, user=user):
             cert.user_id = user.id
             await db.flush()
         # else: ownership unproven — leave `cert` unbound. `sign()` reads
@@ -119,6 +118,33 @@ async def bind_certificate(
         cert.unbound_at = None
         await db.flush()
     return cert
+
+
+async def _owns_certificate(db: AsyncSession, *, info: EimzoCertificateInfo, user: User) -> bool:
+    """Whether `user` can prove `info` is their own key, on a first bind.
+
+    `EimzoCertificateInfo` carries no explicit personal/org kind flag, so the
+    shape of `pinfl_or_stir` itself is the only signal available: 14 digits is
+    a personal PINFL (`users.pinfl`'s own `^[0-9]{14}$` CHECK), 9 digits is an
+    organisation STIR (`applicants.stir`'s own `^[0-9]{9}$` CHECK) — the two
+    formats never collide, so the length alone disambiguates them.
+
+    - Personal (14 digits): proven exactly as before (fix round 1) — it must
+      equal the caller's own `user.pinfl`.
+    - Organisation (9 digits): proven the way `auth` already proves legal
+      representation — the caller must hold an EFFECTIVE representation for
+      that STIR right now (fix round 2 unblock: this was previously refused
+      outright, fail-closed, for lack of a way to ask `auth`). Closed via
+      `auth.service.has_effective_representation`, a thin door onto
+      `auth.repo.get_effective_representation` added for exactly this call,
+      rather than reaching into `auth.repo` directly (module-boundary rule)
+      or re-deriving its "effective" logic here.
+    """
+    if len(info.pinfl_or_stir) == 9:
+        return await auth_service.has_effective_representation(
+            db, user_id=user.id, stir=info.pinfl_or_stir
+        )
+    return info.pinfl_or_stir == user.pinfl
 
 
 async def _reconcile_status(db: AsyncSession, cert: Certificate, live_status: str) -> None:
@@ -151,8 +177,9 @@ async def sign(
     of what it signed) -> verify -> bind the certificate the envelope names
     (may itself refuse and raise — see `bind_certificate`) -> reconcile its
     live status -> build the verdict -> if `bind_certificate` left the
-    certificate unbound (ownership unproven, fix round 1 ruling 1), override
-    the verdict to invalid with reason="certificate_pinfl_mismatch" — a
+    certificate unbound (ownership unproven — personal PINFL, fix round 1
+    ruling 1, or organisation STIR, fix round 2), override the verdict to
+    invalid with reason="certificate_pinfl_mismatch" — a
     crypto-valid signature from a certificate that is not provably the
     caller's own is still refused -> refuse a repeat of an already-signed
     purpose, checked only once we know this attempt would otherwise have been
@@ -197,7 +224,8 @@ async def sign(
 
     verdict = build_verdict(result, cert_status=cert.status, now=datetime.now(UTC))
     if cert.user_id != user.id:
-        # Ruling 4's fuller ownership proof (fix round 1, ruling 1):
+        # Ruling 4's fuller ownership proof (fix round 1 ruling 1; the
+        # organisation-STIR half closed in fix round 2):
         # `bind_certificate` left this certificate unbound rather than bind
         # it to `user` — see its own docstring for the full reasoning.
         # Ownership is a stronger gate than "the bytes verify", so this
