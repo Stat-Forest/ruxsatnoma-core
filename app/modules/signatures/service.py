@@ -729,33 +729,56 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     refresh in place.
 
     No crypto re-check is possible here: this module never stores the
-    original document bytes, only `doc_hash` (module docstring) — so the only
-    fact that can meaningfully change since the original snapshot is the
-    certificate's OWN current standing (revoked/expired since), fetched fresh
-    from the adapter the same way `sign()` itself does, via
-    `_reconcile_status` — which also means a reverify legitimately updates
-    the CERTIFICATE row's own `status`/`revoked_at` (that is simply the truth
-    becoming known), even though it must never touch the SIGNATURE row it was
-    asked to re-check.
+    original document bytes, only `doc_hash` (module docstring) — the only
+    fact a reverify can learn is the certificate's OWN current standing,
+    fetched fresh via `_reconcile_status` the same way `sign()` does — which
+    also means a reverify legitimately updates the CERTIFICATE row's own
+    `status`/`revoked_at`, even though it must never touch the SIGNATURE row
+    it was asked to re-check.
 
-    `purpose` is written as `f"{original.purpose}:reverify"` (brief,
-    verbatim) so ruling 8's partial unique index — `(object_type, object_id,
-    purpose) WHERE verification_status = 'valid'` — never treats this as a
-    second valid attempt at the ORIGINAL purpose's own slot;
-    `missing_purposes` only ever asks `required_purposes` for the unsuffixed
-    name, so a reverify row can never satisfy a requirement, by construction,
-    with no special case needed there.
+    Fix round 1 (Critical) — confirm or downgrade, NEVER upgrade: a check
+    that can answer only one question ("is the certificate still good?")
+    must never overturn the answer to a different one ("was the original
+    signature itself valid?") that it has no way to re-examine.
 
-    A second reverify of the SAME original signature, while its certificate
-    remains untouched (still `active`), would produce a second `valid` row at
-    the exact same `(object_type, object_id, purpose:reverify)` slot — the
-    one collision the suffix trick does not by itself avoid. Guarded the same
-    way every other conflict in this module is: a SAVEPOINT around the insert
-    (a bare rollback would undo everything else pending on this session, not
-    just this insert — lesson), mapped to `ERR-SIGN-004` (409, already this
-    module's own code for "a certificate or signature state conflict"),
-    reusing rather than a fresh ERR code for one more shape of the same
-    fact."""
+    - `original.verification_status == "invalid"` -> stays `"invalid"`,
+      carrying the ORIGINAL's own `reason` forward verbatim, regardless of
+      what the certificate's live status says today — a broken signature,
+      a stranger's PINFL, or no certificate parsed at all must never read
+      as `"valid"` just because the certificate happens to be fine now.
+    - originally `"valid"` and the certificate is now revoked/expired ->
+      `"invalid"`, with the certificate-standing reason: a genuine
+      downgrade, the one thing a reverify CAN discover.
+    - originally `"valid"` and the certificate is still active -> stays
+      `"valid"`, reason `None`: confirmed, not re-proven.
+
+    `_ri05_extra(reason)` below (Task 5) reads whichever `reason` this
+    lands on, so a downgrade caused by certificate standing is flagged the
+    same way a `sign()`-time one is — no separate marking logic needed.
+
+    The record itself says plainly what it re-checked
+    (`"rechecked": "certificate_status"`) rather than copying the ORIGINAL
+    verification blob wholesale, which would leave its `status_code` (a
+    crypto-check result) sitting next to a reverify verdict, reading as
+    though a cryptographic check had just been re-run. The original's own
+    status/reason travel along for provenance under `original_*` keys,
+    never bare ones a reader could mistake for this check's own.
+
+    Fix round 1 (Important) — the ordinal suffix: `purpose` is written as
+    `f"{original.purpose}:reverify:{n}"`, `n` the next ordinal among
+    EXISTING reverify records for THIS original signature (matched by
+    `original_signature_id` in their own stored record, start at 1).
+    Per-ORIGINAL, not per-purpose: one object can legitimately hold an
+    invalid AND a valid signature under the SAME purpose (ruling 8), and
+    numbering by purpose alone would aim both signatures' re-verifications
+    at the identical slot, blocking whichever is reverified second.
+    Per-original numbering also means a genuine REPEAT reverify of the SAME
+    signature (plan ruling 5: "evidence, not a cache" — oversight must be
+    able to write a second dated "still valid" a year later) lands on its
+    own fresh ordinal instead of colliding with the first — so, unlike
+    this route's own first attempt, there is no guard here forbidding a
+    repeat: `ERR-SIGN-004` stays this module's code for the UNRELATED
+    certificate-identity race in `bind_certificate` (Task 4) alone."""
     original = await repo.get_signature(db, signature_id)
     if original is None:
         raise err("ERR-SYS-003")
@@ -765,54 +788,54 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     await _reconcile_status(db, cert, live_status)
 
     now = datetime.now(UTC)
-    if live_status == "revoked":
+    if original.verification_status == "invalid":
+        new_status = "invalid"
+        reason = original.verification.get("reason")
+    elif live_status == "revoked":
         new_status, reason = "invalid", "certificate_revoked"
     elif live_status == "expired":
         new_status, reason = "invalid", "certificate_expired"
     else:
         new_status, reason = "valid", None
+
     record: dict[str, Any] = {
-        **original.verification,
+        "rechecked": "certificate_status",
+        "original_signature_id": str(original.id),
+        "original_verification_status": original.verification_status,
+        "original_reason": original.verification.get("reason"),
         "certificate_status": live_status,
+        "certificate_serial_number": cert.serial_number,
+        "certificate_issuer": cert.issuer,
         "reverified_at": now.isoformat(),
         "reverified_by": str(user.id),
         "reason": reason,
     }
 
-    try:
-        async with db.begin_nested():
-            new_row = await repo.insert_signature(
-                db,
-                object_type=original.object_type,
-                object_id=original.object_id,
-                purpose=f"{original.purpose}:reverify",
-                signer_user_id=original.signer_user_id,
-                certificate_id=original.certificate_id,
-                doc_hash=original.doc_hash,
-                signature_value=original.signature_value,
-                signed_at=original.signed_at,
-                verification=record,
-                verification_status=new_status,
-            )
-    except IntegrityError as exc:
-        # Same diagnostic as sign()'s own except clause: IntegrityError IS a
-        # DBAPIError, this narrow clause must be checked first, and
-        # exc.orig.__cause__ (not exc.orig) is what actually names the
-        # constraint (lesson).
-        cause = exc.orig.__cause__ if exc.orig is not None else None
-        if getattr(cause, "constraint_name", None) != "uq_signatures_valid_purpose":
-            raise
-        await audit.log(
-            db,
-            action=SIGNATURE_REVERIFY,
-            user_id=user.id,
-            object_type=original.object_type,
-            object_id=original.object_id,
-            result="denied",
-            basis="already_reverified",
-        )
-        await db.commit()
-        raise err("ERR-SIGN-004", details={"reason": "already_reverified"}) from exc
+    # Per-original ordinal (fix round 1): count existing reverify rows that
+    # already name THIS original in their own record — the same unpaged,
+    # whole-object read `missing_purposes` uses, for the same reason (exact
+    # membership matters more than pagination here).
+    existing = await repo.list_for_object(
+        db, object_type=original.object_type, object_id=original.object_id
+    )
+    already_reverified = sum(
+        1 for row in existing if row.verification.get("original_signature_id") == str(original.id)
+    )
+    n = already_reverified + 1
+
+    new_row = await repo.insert_signature(
+        db,
+        object_type=original.object_type,
+        object_id=original.object_id,
+        purpose=f"{original.purpose}:reverify:{n}",
+        signer_user_id=original.signer_user_id,
+        certificate_id=original.certificate_id,
+        doc_hash=original.doc_hash,
+        signature_value=original.signature_value,
+        signed_at=original.signed_at,
+        verification=record,
+        verification_status=new_status,
+    )
 
     await audit.log(
         db,

@@ -21,9 +21,12 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.main import create_app
+from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User, UserPermission
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.signatures import service
@@ -347,6 +350,29 @@ async def test_signature_list_is_paged(client_a, user_a: User, db: AsyncSession)
 # ---------------------------------------------------------------------------
 
 
+async def _latest_reverify_audit_entry(db: AsyncSession, *, object_id: uuid.UUID) -> AuditLog:
+    """The one `signature.reverify` entry for THIS test's own `object_id` --
+    scoped, never the whole table's most-recent row (the test database is
+    shared and persistent -- `.claude/lessons.md`). Mirrors `test_ri05.py`'s
+    own `_latest_signature_create_entry` for the same reason."""
+    entry = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.action == service.SIGNATURE_REVERIFY,
+                    AuditLog.object_id == object_id,
+                )
+                .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert entry is not None
+    return entry
+
+
 @pytest.mark.asyncio
 async def test_reverify_writes_a_new_record_and_never_rewrites_the_original(
     client_oversight, a_signature, db
@@ -365,6 +391,24 @@ async def test_reverify_needs_its_permission(client_a, a_signature):
 
 
 @pytest.mark.asyncio
+async def test_reverify_is_refused_to_a_view_any_holder_without_reverify(
+    db: AsyncSession, a_signature
+):
+    """Fix round 1 (Important): `client_a` above holds NO permission at all,
+    which proves almost nothing about the split this module actually relies
+    on. The property that matters: `signatures.view_any` is read-only at the
+    API level -- a caller who can see every signature is still refused
+    `reverify`, which writes a new evidence row, without its OWN, separately
+    granted permission."""
+    _, token, csrf = await signed_in_with(db, VIEW_ANY)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.post(f"{API}/signatures/{a_signature.id}/reverify")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_reverify_response_is_the_new_row_attached_to_the_object(
     client_oversight, a_signature
 ):
@@ -373,8 +417,67 @@ async def test_reverify_response_is_the_new_row_attached_to_the_object(
     assert body["id"] != str(a_signature.id)
     assert body["object_type"] == a_signature.object_type
     assert body["object_id"] == str(a_signature.object_id)
-    assert body["purpose"] == f"{a_signature.purpose}:reverify"
+    assert body["purpose"] == f"{a_signature.purpose}:reverify:1"
     assert body["verification_status"] == "valid"
+
+
+@pytest.mark.asyncio
+async def test_reverify_never_upgrades_an_invalid_signature_to_valid(
+    client_oversight, db: AsyncSession
+):
+    """Fix round 1 (Critical): this module never stores the signed document's
+    bytes, so a reverify can only re-check the certificate's OWN standing --
+    it has no way to re-run the cryptographic check the ORIGINAL signature
+    failed. An original invalid for a non-certificate reason (a broken
+    signature, here) must stay invalid even once the certificate is healthy,
+    carrying the ORIGINAL's own reason forward -- never upgraded to "valid"
+    just because the certificate happens to be fine right now."""
+    user = await make_user(db, pinfl=_pinfl())
+    obj_id = uuid.uuid4()
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"DIFFERENT-BYTES",
+            pkcs7=_pkcs7(DOC, user.pinfl),
+            user=user,
+        )
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "signature_invalid"
+    rows = await service.get_for_object(db, object_type="permit", object_id=obj_id)
+    assert [r.verification_status for r in rows] == ["invalid"]
+    original = rows[0]
+
+    resp = await client_oversight.post(f"{API}/signatures/{original.id}/reverify")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verification_status"] == "invalid"
+    assert body["verification"]["reason"] == "signature_invalid"
+
+    # the certificate itself is healthy -- proves this isn't accidentally
+    # passing because of a certificate-standing refusal instead
+    entry = await _latest_reverify_audit_entry(db, object_id=obj_id)
+    assert entry.extra is None  # not a certificate-standing reason -- no RI-05
+
+
+@pytest.mark.asyncio
+async def test_reverify_record_states_only_the_certificate_was_rechecked(
+    client_oversight, a_signature
+):
+    """Fix round 1: the record must read as what it actually is -- a
+    certificate-standing recheck -- never as though a cryptographic check
+    had just been re-run (this module cannot re-run one; it does not store
+    the signed bytes). A copied `status_code` sitting unlabeled next to a
+    reverify verdict would read exactly like that re-run."""
+    resp = await client_oversight.post(f"{API}/signatures/{a_signature.id}/reverify")
+    body = resp.json()["verification"]
+    assert body["rechecked"] == "certificate_status"
+    assert "status_code" not in body
+    assert body["original_signature_id"] == str(a_signature.id)
+    assert body["original_verification_status"] == "valid"
+    assert body["original_reason"] is None
 
 
 @pytest.mark.asyncio
@@ -417,15 +520,24 @@ async def test_reverify_reflects_a_certificate_revoked_after_signing(
     await db.refresh(row)
     assert row.verification_status == "valid"  # the original stays untouched
 
+    # a downgrade caused by certificate standing is still RI-05 (Task 5's
+    # marking rules apply to a reverify-time downgrade the same way they
+    # apply to sign()'s own)
+    entry = await _latest_reverify_audit_entry(db, object_id=row.object_id)
+    assert entry.extra == {"risk_indicator": "RI-05", "reason": "certificate_revoked"}
+
 
 @pytest.mark.asyncio
-async def test_a_second_reverify_of_an_unchanged_certificate_is_refused(
+async def test_a_second_reverify_of_an_unchanged_certificate_succeeds_with_the_next_ordinal(
     client_oversight, db: AsyncSession
 ):
-    """The one collision the `:reverify` suffix trick does not avoid by
-    itself: two reverifications of the SAME signature while its certificate
-    stays `active` both land on the identical valid `(object_type,
-    object_id, purpose:reverify)` slot ruling 8's partial index covers."""
+    """Fix round 1 (Important): plan ruling 5, in its own words -- the
+    record is evidence, not a cache, and oversight must be able to write a
+    second dated "still valid" a year later. The `:reverify:<n>` ordinal is
+    what lets a second reverify of the SAME signature land on a fresh slot
+    instead of colliding with the first (the old flat `:reverify` suffix's
+    own bug, fixed together with removing the `ERR-SIGN-004` guard it used
+    to need)."""
     user = await make_user(db, pinfl=_pinfl())
     row = await service.sign(
         db,
@@ -440,10 +552,61 @@ async def test_a_second_reverify_of_an_unchanged_certificate_is_refused(
 
     first = await client_oversight.post(f"{API}/signatures/{row.id}/reverify")
     assert first.status_code == 200
+    assert first.json()["purpose"] == "permit_head:reverify:1"
 
     second = await client_oversight.post(f"{API}/signatures/{row.id}/reverify")
-    assert second.status_code == 409
-    assert second.json()["error"]["code"] == "ERR-SIGN-004"
+    assert second.status_code == 200
+    assert second.json()["purpose"] == "permit_head:reverify:2"
+    assert second.json()["id"] != first.json()["id"]
+    assert second.json()["verification_status"] == "valid"
+
+
+@pytest.mark.asyncio
+async def test_reverifying_two_different_signatures_under_the_same_purpose_does_not_collide(
+    client_oversight, db: AsyncSession
+):
+    """Fix round 1 (Important): the flat `:reverify` scheme's other
+    collision -- one object can legitimately hold an invalid AND a valid
+    signature under the SAME purpose (ruling 8: `sign()` inserts the row
+    ALWAYS, valid or not, and the partial unique index only ever constrains
+    `valid` rows). Numbering per ORIGINAL signature, not per purpose, means
+    reverifying one never blocks reverifying the other -- each gets its own
+    `:reverify:1`."""
+    user = await make_user(db, pinfl=_pinfl())
+    obj_id = uuid.uuid4()
+    valid_row = await service.sign(
+        db,
+        object_type="permit",
+        object_id=obj_id,
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(DOC, user.pinfl),
+        user=user,
+    )
+    await db.commit()
+
+    with pytest.raises(DomainError):
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"SOMETHING-ELSE",
+            pkcs7=_pkcs7(DOC, user.pinfl),
+            user=user,
+        )
+    rows = await service.get_for_object(db, object_type="permit", object_id=obj_id)
+    invalid_row = next(r for r in rows if r.verification_status == "invalid")
+
+    first = await client_oversight.post(f"{API}/signatures/{valid_row.id}/reverify")
+    assert first.status_code == 200
+    assert first.json()["purpose"] == "permit_head:reverify:1"
+    assert first.json()["verification_status"] == "valid"
+
+    second = await client_oversight.post(f"{API}/signatures/{invalid_row.id}/reverify")
+    assert second.status_code == 200
+    assert second.json()["purpose"] == "permit_head:reverify:1"
+    assert second.json()["verification_status"] == "invalid"
 
 
 @pytest.mark.asyncio
