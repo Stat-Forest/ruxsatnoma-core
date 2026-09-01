@@ -24,8 +24,14 @@ Format and budget:
 **A new entry is at most 12 lines.** Only a MERGE — an entry replacing two or more existing
 ones — may go past that, and never past 24. Over 12 while deleting nothing means you are
 writing a story: the incident is evidence, so name the error and the file, and drop the
-retelling of how it was found. A pre-commit hook, `make check` and CI all enforce the
-ceiling; `make lessons-check` is the same check on its own.
+retelling of how it was found.
+
+**The file itself is capped at 60 entries / 900 lines.** Short entries still add up, and
+reading cost is how many times how long. Once the cap is reached a new lesson has to be
+paid for by merging two old ones of the same class, or by deleting one whose trap a check
+has since made impossible — that is the point, not an obstacle. A pre-commit hook,
+`make check` and CI all enforce both limits; `make lessons-check` is the same check on
+its own.
 
 Rules for this file:
 
