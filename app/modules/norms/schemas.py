@@ -234,7 +234,11 @@ class NormOut(BaseModel):
         return str(value) if value is not None else None
 
 
-class Warning(BaseModel):
+class PublishWarning(BaseModel):
+    """Not `Warning` (M9/deferred minor #7): that name shadows the builtin
+    exception class, in a module every other schema in this stage is read
+    beside."""
+
     code: str
     message: str
 
@@ -251,7 +255,7 @@ class PublishOut(BaseModel):
     and a raw ORM instance is not JSON-serializable on its own."""
 
     item: Any
-    warnings: list[Warning] = []
+    warnings: list[PublishWarning] = []
 
 
 class LivestockItemIn(BaseModel):

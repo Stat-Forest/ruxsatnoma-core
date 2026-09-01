@@ -876,9 +876,11 @@ async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calcul
 # --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
 # 3.10, permits 3.11) ---------------------------------------------------------
 #
-# Five entry points, and nothing else: `preview` and `save_calculation` above
-# (Task 7), `LOAD_PROVIDERS`/`committed_load_sb` above (Task 4, ruling 12),
-# and `effective_norm`/`run_checks` right below. A level-4+ caller must NEVER:
+# Six entry points, and nothing else: `preview` and `save_calculation` above
+# (Task 7), `LOAD_PROVIDERS` and `committed_load_sb` above (Task 4, ruling
+# 12 — the seam and the reader over it are two separate things a caller
+# touches, not one), and `effective_norm`/`run_checks` right below. A
+# level-4+ caller must NEVER:
 #   - import `norms.repo` (or any other private module here) directly — every
 #     fact it could read that way is already reachable through one of the
 #     five, the same reason a level-3 module reaches `gis` only through
@@ -922,7 +924,14 @@ async def run_checks(db: AsyncSession, *, payload: CalculationIn) -> list[checks
     (never a manufactured zero load), so the limit check reports `skipped`
     rather than a computed comparison; every other check (norm, season,
     rotation, fire-ban, restrictions) runs exactly as it would inside
-    `preview`/`save_calculation`, off the identical request/snapshot pair."""
+    `preview`/`save_calculation`, off the identical request/snapshot pair.
+
+    Raises before any check runs — this is not a purely reporting call — when
+    `period_to` precedes `period_from` or the period exceeds
+    `checks.MAX_PERIOD_DAYS`: `checks.run_checks` guards both fail-closed for
+    every caller, since a reversed period would otherwise no-op the season
+    walk and invert `features_intersecting`'s validity predicate into a false
+    `pass` on the fire ban."""
     request, snapshot = await _build_request_and_snapshot(db, payload)
     return await checks.run_checks(
         db,
