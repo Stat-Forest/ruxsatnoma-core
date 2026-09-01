@@ -257,6 +257,19 @@ async def other_zone_specialist_client(
 
 
 @pytest.fixture
+async def other_zone_publisher_client(
+    db: AsyncSession, other_leshoz
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Holds `norms.publish` but is zoned to a DIFFERENT leshoz — the shape
+    deferred minor #10 asks for on the publish route. `_assert_norm_zone` runs
+    before `_assert_may_publish`, so this actor is refused for the ZONE, not
+    for ruling 16's central/leshoz scope, and its refusal carries no
+    `reason` (which is exactly what tells the two apart)."""
+    async for client in _client_for(db, NORMS_PUBLISH, organization_id=other_leshoz.id):
+        yield client
+
+
+@pytest.fixture
 async def leadership_client(db: AsyncSession, leshoz) -> AsyncIterator[httpx.AsyncClient]:
     """The raҳbar: approves, and also HOLDS `norms.publish` — migration 0011
     grants both to the `leadership` role in production. Ruling 16's split

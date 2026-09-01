@@ -590,6 +590,18 @@ async def publish_norm(db: AsyncSession, norm_id: uuid.UUID, *, actor: User) -> 
     await _assert_may_publish(db, actor)
     if norm.approval_doc_id is None:
         raise err("ERR-VAL-001", details={"reason": "approval_doc_required"})
+    # I2 (final review): `yield_c_per_ha` is optional on the model and in
+    # `NormIn`, and `max_sb` below is computed only when it is present — so a
+    # GRAZING norm published without it switched the VMQ 689 limit off
+    # entirely: `_norm_check` passed (a norm exists), `_limit_check` reported
+    # `skipped`/`no_limit`, and `save_calculation` accepted any herd size at
+    # all. Ruling 13 (a norm is required only where the law imposes a limit)
+    # and ruling 17 (`max_sb` is frozen at publication) together mean a
+    # PUBLISHED grazing norm must carry its limit. Every other activity is
+    # legitimately yield-free.
+    if await _resolve_activity_code(db, norm.activity_type_id) == calculator.GRAZING:
+        if norm.yield_c_per_ha is None:
+            raise err("ERR-VAL-001", details={"reason": "yield_required"})
     if await repo.published_overlaps(
         db,
         Norm,

@@ -230,3 +230,104 @@ async def test_a_norm_outside_the_actors_zone_is_refused(
     created = await _draft(other_zone_specialist_client, published_contour.id, grazing_activity_id)
     assert created.status_code == 403
     assert created.json()["error"]["code"] == "ERR-ACL-002"
+
+
+async def test_publishing_a_grazing_norm_without_a_yield_is_refused(
+    gis_specialist_client: AsyncClient,
+    leadership_client: AsyncClient,
+    central_admin_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    survey_doc: MediaFile,
+    approval_doc: MediaFile,
+) -> None:
+    """I2 (final review): `yield_c_per_ha` is nullable and optional, and
+    `publish_norm` computed `max_sb` only when it was present. A grazing norm
+    published without it therefore switched the VMQ 689 limit OFF — `_norm_check`
+    passed (a norm exists), `_limit_check` reported `skipped`/`no_limit`, and
+    `save_calculation` accepted any herd size at all, with `max_sb=None`. The one
+    limit the decree exists to impose was removed by omitting an optional field,
+    and the check report said `skipped`, not `fail`."""
+    created = await _draft(
+        gis_specialist_client,
+        published_contour.id,
+        grazing_activity_id,
+        yield_c_per_ha=None,
+        geobotanic_doc_id=str(survey_doc.id),
+    )
+    assert created.status_code == 201, created.text
+    norm_id = created.json()["id"]
+    await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
+    await leadership_client.post(
+        f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
+    )
+
+    refused = await central_admin_client.post(f"/api/v1/norms/{norm_id}/publish")
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["details"]["reason"] == "yield_required"
+
+
+async def test_a_norm_for_a_haymaking_contour_publishes_without_a_yield(
+    gis_specialist_client: AsyncClient,
+    leadership_client: AsyncClient,
+    central_admin_client: AsyncClient,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    survey_doc: MediaFile,
+    approval_doc: MediaFile,
+) -> None:
+    """The other half of I2's rule: VMQ 689's feed-stock limit binds GRAZING
+    and nothing else (ruling 13), so a non-grazing norm with no yield is
+    legitimate and publishes with `max_sb` left NULL."""
+    created = await _draft(
+        gis_specialist_client,
+        published_contour.id,
+        haymaking_activity_id,
+        yield_c_per_ha=None,
+        geobotanic_doc_id=str(survey_doc.id),
+    )
+    norm_id = created.json()["id"]
+    await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
+    await leadership_client.post(
+        f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
+    )
+
+    published = await central_admin_client.post(f"/api/v1/norms/{norm_id}/publish")
+    assert published.status_code == 200, published.text
+    assert published.json()["max_sb"] is None
+
+
+async def test_publishing_a_norm_outside_the_actors_zone_is_refused(
+    gis_specialist_client: AsyncClient,
+    leadership_client: AsyncClient,
+    other_zone_publisher_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    survey_doc: MediaFile,
+    approval_doc: MediaFile,
+) -> None:
+    """Deferred minor #10: zone scoping is a Global Constraint applied on all
+    eight norm write paths, but only `create` had HTTP-level cover — a
+    regression on any of the other seven would have been silent. `publish` is
+    the highest-value edge: it is what puts a limit into force.
+
+    The actor holds `norms.publish` and is refused with no `reason` at all,
+    which is what distinguishes `_assert_norm_zone`'s refusal from
+    `_assert_may_publish`'s own `central_publication_required` (ruling 16),
+    which the same code would otherwise be indistinguishable from."""
+    created = await _draft(
+        gis_specialist_client,
+        published_contour.id,
+        grazing_activity_id,
+        geobotanic_doc_id=str(survey_doc.id),
+    )
+    norm_id = created.json()["id"]
+    await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
+    await leadership_client.post(
+        f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
+    )
+
+    refused = await other_zone_publisher_client.post(f"/api/v1/norms/{norm_id}/publish")
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "ERR-ACL-002"
+    assert refused.json()["error"]["details"] == {}
