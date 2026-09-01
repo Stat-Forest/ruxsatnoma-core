@@ -102,10 +102,17 @@ How you found it is not reusable. What fires it, and what it broke, are.
 make lessons-check
 ```
 
-Fails on a missing bullet or an entry past the ceiling; lists anything over budget.
-Being on that list is fine only if you deleted entries to earn it. The same check runs
-as a pre-commit hook, inside `make check`, and in CI's `lint` job — so a malformed entry
-stops your commit and then the PR. Catch it here instead.
+Fails on a missing bullet, an entry past the 24-line ceiling, or the file past its cap
+of 60 entries / 900 lines; lists anything over the 12-line budget. Being on that list is
+fine only if you deleted entries to earn it. The same check runs as a pre-commit hook,
+inside `make check`, and in CI's `lint` job — so a malformed entry stops your commit and
+then the PR. Catch it here instead.
+
+**If the file is at its cap**, the check names the largest entries as merge candidates.
+Merging two entries of one class is the intended answer, and so is deleting an entry
+whose trap a check has since made impossible — step 1 is what retires a lesson. Raising
+`MAX_ENTRIES`/`MAX_LINES` is a decision to take with Oybek, never a way to unblock a
+commit.
 
 ## Common mistakes
 
