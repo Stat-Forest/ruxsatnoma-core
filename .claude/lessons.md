@@ -1032,31 +1032,9 @@ Rules for this file:
   OUTCOME while quietly omitting a GRANT the row really has, and the two only
   diverge once a test specifically targets the grant/outcome split.
 
-## pyright's possibly-unbound check treats `range(n)` as possibly empty, but not a fixed tuple literal
-
-- **Rule:** A loop variable assigned inside `for _ in range(n):` and read
-  AFTER the loop is `reportPossiblyUnboundVariable` under pyright even when
-  `n` is a positive integer literal; the identical shape over a fixed tuple
-  display (`for _ in (0, 1):`, `for x in (a, b):`) is NOT flagged — pyright's
-  definite-assignment analysis special-cases a literal-arity tuple, never a
-  `range()` call, regardless of how "obviously" non-empty the range is.
-- **Why:** Confirmed empirically with a throwaway repro (`for _ in range(2):
-  x = 1` then `return x` errors; the same shape over `(0, 1)` or over a
-  2-tuple of dicts does not). A stage-3.7 task-4 brief's own verbatim test
-  body used `for _ in range(2):` with `response` read after the loop (two
-  publish attempts, asserting the SECOND one 409s) — copied exactly as given,
-  it failed `make check`'s pyright gate, even though
-  `test_parameters_api.py::test_publishing_an_overlapping_period_is_a_409`
-  (iterating a 2-tuple of payload dicts, same shape otherwise) already passes
-  clean today.
-- **How to apply:** Iterating a fixed small number of times and reading the
-  loop variable afterwards: use a tuple literal of that many placeholders
-  (`for _ in (0, 1):`) instead of `range(n)` — a purely mechanical, same-
-  runtime-behavior substitution, no `Optional`/pre-initialization needed.
-
 ## Every caller-supplied FK and date-ordering pair needs its own pre-flush guard, not just the ones a test happened to exercise
 
-- **Rule:** Before calling a versioned-row creator (`create_norm`,
+- **Rule:** Before reporting a versioned-row creator (`create_norm`,
   `create_versioned`) done, walk every field its payload lets a caller set
   that is either an FK or half of a period pair, and confirm EACH one has a
   service-level guard ahead of `flush()` — an existence check for the FK
@@ -1144,3 +1122,53 @@ Rules for this file:
   fixtures/state — no second test file needed), asserting it agrees with what
   the HTTP path already proved. Never ship a contract function whose only
   verification is that it type-checks.
+
+## A reversed date period does not just skip a check — it inverts a range predicate and hides the rows it should find
+
+- **Rule:** Any function that walks a period day by day, iterates its years, or
+  passes both ends into a SQL overlap predicate must reject
+  `period_to < period_from` **at the shared entry point**, fail-closed, before
+  any of that runs — never rely on the caller's schema to have ordered the
+  dates.
+- **Why:** `norms.checks.run_checks` takes `period_from`/`period_to` from a
+  request. With them swapped, `_season_check`'s `while day <= period_to` and
+  `_rotation_check`'s `range(...)` both no-op and report `pass` having
+  examined nothing — bad, but visible. The real damage is
+  `gis.service.features_intersecting`, whose validity predicate
+  (`valid_from <= :period_to AND valid_to >= :period_from`) is written for the
+  normal ordering: with the dates swapped, a fire ban that genuinely covers
+  the requested days fails BOTH legs and drops out of the result set, so the
+  one check this stage exists to make blocking returns a confident `pass`
+  (stage 3.7 task 6). An unbounded period is the same class of problem from
+  the other side: the day-by-day walk is linear in days, on the event loop.
+- **How to apply:** Guard inside the module's own public entry point, not in
+  each router's request schema — `run_checks` is what 3.9 calls directly, and
+  a per-endpoint guard is not a root fix (existing lesson). `ERR-VAL-001` with
+  `reason` `period_reversed` / `period_too_long`; the ceiling is a named
+  constant carrying its domain reason (`MAX_PERIOD_DAYS` — ВМҚ 689 redoes the
+  geobotanical survey every five years), not a tuning knob. A single-day
+  period (`from == to`) must still pass.
+
+## Seeded reference data with future effective dates is a scheduled test failure
+
+- **Rule:** A test that asserts an exact money/norm figure computed from
+  `business_today()` must FREEZE the date — patch `business_today` in the
+  CALLING module's namespace (`app.modules.norms.service.business_today`),
+  never in `app.core.time` — and pin it inside the window of the seeded row it
+  means to exercise. Never "fix" such a test by recomputing the expectation
+  from whatever row happens to be in force.
+- **Why:** migration `0012` seeds `bhm` as two dated rows (412 000 until
+  2026-08-31, 440 000 from 2026-09-01). Stage 3.7 task 7's new tests
+  hard-coded amounts derived from 412 000 while `_compute` resolved
+  `on_date=business_today()`, so the suite was green on the day it was written
+  and would have gone red on 1 September with no code change and nobody
+  touching the repository — demonstrated by moving the frozen date past the
+  boundary and watching the two tests fail with 2 640 000 against an expected
+  2 472 000. Recomputing the expectation instead would have made the test pass
+  even against a WRONG tariff, which is the opposite of what it is for.
+- **How to apply:** When adding a seed row whose effective period starts in
+  the future, sweep the suite for literals derived from the currently-in-force
+  value (`grep` for the figure and for `business_today`) and give every
+  affected module a frozen-date fixture. Tests that pass `on_date` explicitly,
+  build their own parameter dict, or assert the seeded rows' own dates need
+  nothing — only the ones that read the wall clock.
