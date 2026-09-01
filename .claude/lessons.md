@@ -1358,3 +1358,31 @@ Rules for this file:
   fixture's attribute is a nullable column you know is set by construction
   in that fixture, narrow it explicitly at the call site rather than leaving
   the parameter unannotated to dodge the check.
+
+## A settings override written earlier in a test that then calls `sign()` expecting a refusal gets committed for real
+
+- **Rule:** Never write an uncommitted prerequisite (a `SystemSetting`
+  override via `db.merge`/`flush`, or any other unflushed-but-pending state)
+  on the SAME `db` session earlier in a test whose `sign()` call is expected
+  to raise. If a test needs both, commit the prerequisite's own transaction
+  first (a separate `db` session, or an explicit `db.commit()` before calling
+  `sign()`), or drop the prerequisite and assert on the DEFAULT config
+  instead.
+- **Why:** `sign()`'s own documented transaction contract (`service.py`):
+  every refusal path commits before it raises, and that commit is on the
+  CALLER's session and commits EVERYTHING pending on it, not just what
+  `sign()` itself wrote. Stage 3.8 Task 6's own
+  `test_an_invalid_signature_never_satisfies_a_requirement` first called the
+  `_override` helper (an uncommitted `SystemSetting` merge) and only THEN
+  called `sign()` with a deliberately mismatched document to provoke
+  `ERR-SIGN-001` — the refusal's own `db.commit()` silently persisted the
+  override to the shared, persistent test database. Invisible running the
+  test alone or as the last test in its file; only surfaced running the
+  whole file together, because an EARLIER test in file collection order had
+  already cached the (now wrong) default via `settings_store`'s 60-second
+  cache, exposing the poisoned row's presence as a same-file assertion
+  failure two tests away from the one that wrote it.
+- **How to apply:** Before combining ANY settings-override write with a
+  `sign()` call in the same test, ask whether that `sign()` call could be
+  refused — if a test's whole point IS the refusal, keep the settings write
+  out of that test entirely.

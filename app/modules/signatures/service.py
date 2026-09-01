@@ -18,6 +18,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.errors import err
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
@@ -52,6 +53,16 @@ CERTIFICATE_STANDING_REASONS = frozenset(
     {"certificate_revoked", "certificate_expired", "certificate_invalid_at_signing"}
 )
 
+# Which `system_settings` key configures the required-purposes list for a
+# given object type -- a dict, not an `if`-chain, so a future object type
+# (3.9's own applications, say) is a data change here plus one new
+# `SettingSpec` in settings_store.py, not a new branch of code. No entry
+# means no configured requirement (see `required_purposes` below), not a bug:
+# most object types have no signature requirement at all.
+_REQUIREMENT_SETTINGS: dict[str, str] = {
+    "permit": "permit_required_signatures",
+}
+
 
 def _ri05_extra(reason: str | None) -> dict[str, Any] | None:
     """The `extra=` value for an `audit.log` call reporting `reason` on a
@@ -80,6 +91,60 @@ async def get_for_object(
     db: AsyncSession, *, object_type: str, object_id: uuid.UUID
 ) -> list[Signature]:
     return await repo.list_for_object(db, object_type=object_type, object_id=object_id)
+
+
+async def required_purposes(db: AsyncSession, object_type: str) -> list[str]:
+    """The ordered signature purposes `object_type` needs before it is
+    complete -- read from `system_settings` via `settings_store`, never a
+    literal in code (ruling 7): the Agency's still-unanswered question about
+    exactly which roles must sign a permit is one admin-editable settings
+    row, not an `if` in this module. `[]` for any `object_type` with no
+    entry in `_REQUIREMENT_SETTINGS` -- not an error, since most object
+    types (today: everything but "permit") have no signature requirement
+    configured at all."""
+    key = _REQUIREMENT_SETTINGS.get(object_type)
+    if key is None:
+        return []
+    raw = await settings_store.get_str(db, key)
+    return [purpose.strip() for purpose in raw.split(",") if purpose.strip()]
+
+
+async def missing_purposes(
+    db: AsyncSession, *, object_type: str, object_id: uuid.UUID
+) -> list[str]:
+    """`required_purposes(object_type)` minus whatever purpose already has a
+    `valid` signature on `object_id`, in the configured order -- exactly what
+    `ERR-SIGN-003` reports and what `require_complete` raises on. An
+    `invalid` attempt is kept as evidence (ruling 8) and must never satisfy a
+    requirement, so only `verification_status == "valid"` rows count."""
+    required = await required_purposes(db, object_type)
+    if not required:
+        return []
+    signed = await get_for_object(db, object_type=object_type, object_id=object_id)
+    valid_purposes = {row.purpose for row in signed if row.verification_status == "valid"}
+    return [purpose for purpose in required if purpose not in valid_purposes]
+
+
+async def is_complete(db: AsyncSession, *, object_type: str, object_id: uuid.UUID) -> bool:
+    """True once every required purpose has a valid signature -- and,
+    equally, true for an object type nobody requires a signature on at all
+    (`required_purposes` returns `[]`, so nothing can ever be missing).
+    "Nothing required" and "nothing missing" are the same fact here, so this
+    must always agree with `require_complete`, which reads the same list and
+    never raises on that same empty case."""
+    return not await missing_purposes(db, object_type=object_type, object_id=object_id)
+
+
+async def require_complete(db: AsyncSession, *, object_type: str, object_id: uuid.UUID) -> None:
+    """3.11 calls exactly this before flipping a permit to ACTIVE (C11).
+    Raises `ERR-SIGN-003` with `details.missing` naming every purpose still
+    lacking a valid signature; silent whenever `missing_purposes` is empty,
+    including the "nothing required for this object type" case -- by
+    construction this can never disagree with `is_complete`, since both
+    read the exact same list."""
+    missing = await missing_purposes(db, object_type=object_type, object_id=object_id)
+    if missing:
+        raise err("ERR-SIGN-003", details={"missing": missing})
 
 
 async def bind_certificate(
