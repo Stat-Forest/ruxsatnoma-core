@@ -51,7 +51,11 @@ def _snapshot(**over) -> ParamSnapshot:
         ),
     )
     return ParamSnapshot(
-        values=over.pop("values", {}),
+        # `rounding_heads` is in every real snapshot (`params.BASE_CODES`), and
+        # `_limit_check` needs it to round `remaining_sb` the way ruling 19
+        # requires — an empty `values` here would be a shape production never
+        # produces.
+        values=over.pop("values", {"rounding_heads": {"mode": "floor"}}),
         tariffs=(),
         norm=norm,
         load_sb=over.pop("load_sb", Decimal("0")),
@@ -225,6 +229,29 @@ async def test_the_limit_check_reports_all_three_numbers(
         "remaining_sb": "250",
         "load_source": "none",
     }
+
+
+async def test_the_limit_check_compares_against_the_floored_remainder(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """I1 (final review): MaxSB 250 with 0.5 conditional heads already
+    committed leaves 249.5 — and ruling 19 says a limit is never rounded in
+    the applicant's favour, so the comparison is against 249. A request for
+    249.2 heads used to PASS against the unfloored remainder; it now fails,
+    which is the direction the ruling names. `_limit_check` reads the same
+    `calculator.remaining_sb` the amount does, so the two cannot drift."""
+    request = _request(date(2026, 5, 1), date(2026, 9, 30))
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(load_sb=Decimal("0.5")),
+        used_sb=Decimal("249.2"),
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit["details"]["remaining_sb"] == "249"
+    assert limit["result"] == "fail"
 
 
 async def test_a_missing_norm_blocks_grazing_but_is_skipped_elsewhere(

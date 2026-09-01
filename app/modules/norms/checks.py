@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError, err
 from app.modules.gis import service as gis_service
-from app.modules.norms.calculator import GRAZING, CalcRequest, NormFact, ParamSnapshot, jsonable
+from app.modules.norms import calculator
+from app.modules.norms.calculator import (
+    GRAZING,
+    CalcRequest,
+    NormFact,
+    ParamSnapshot,
+    jsonable,
+)
 
 
 class CheckResult(TypedDict):
@@ -188,9 +195,13 @@ async def _territory_checks(
 def _limit_check(snapshot: ParamSnapshot, used_sb: Decimal | None) -> CheckResult:
     """Open question #1 from Task 5's review: nothing compared `used_sb`
     against `remaining_sb` until this check exists — `remaining_sb` here is
-    computed the SAME way `calculator.calculate` computes it (`max_sb −
-    committed load`, excluding the request's own load), so a caller cannot see
-    two different numbers for the same name.
+    the SAME NUMBER `calculator.calculate` stores, because both call
+    `calculator.remaining_sb` (`max_sb −` committed load, excluding the
+    request's own load, rounded by `rounding_heads`) rather than each
+    subtracting for itself. Until I1 they each recomputed it identically and
+    unrounded, which is how they would have drifted — and the unrounded form
+    compared a request against a fraction of a conditional head that ruling
+    19 says to take away.
 
     `used_sb=None` is the reviewer-facing path — checks without the money —
     and is reported `skipped`, never a manufactured zero load. A norm with no
@@ -202,7 +213,7 @@ def _limit_check(snapshot: ParamSnapshot, used_sb: Decimal | None) -> CheckResul
     if norm is None or norm.max_sb is None:
         return {"check": "limit", "result": "skipped", "details": {"reason": "no_limit"}}
     committed_sb = snapshot.load_sb
-    remaining_sb = Decimal(norm.max_sb) - committed_sb
+    remaining_sb = calculator.remaining_sb(norm.max_sb, committed_sb, snapshot.values)
     details = {
         "used_sb": jsonable(used_sb),
         "max_sb": norm.max_sb,

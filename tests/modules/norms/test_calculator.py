@@ -16,6 +16,7 @@ from app.modules.norms.calculator import (
     TariffFact,
     calculate,
     max_sb,
+    remaining_sb,
 )
 
 PARAMS = {
@@ -624,3 +625,50 @@ def test_input_snapshot_carries_the_load_so_remaining_sb_is_reproducible() -> No
     result = calculate(request, snapshot)
     assert result.input_snapshot["load_sb"] == "3.5"
     assert result.input_snapshot["load_source"] == "permits"
+
+
+def test_remaining_sb_is_floored_like_every_other_limit() -> None:
+    """I1 (final review): ruling 19 names `remaining_sb` alongside `max_sb` —
+    "never round a limit in the applicant's favour" — but only `max_sb` was
+    ever rounded. Invisible today (`LOAD_PROVIDERS` is empty, so `load_sb` is
+    always 0 and `remaining_sb == max_sb` exactly); the moment 3.11 registers
+    a real provider the load turns fractional (the `coef_sb` scale runs down
+    to 0.2 for a lamb) and an unfloored remainder grants the applicant the
+    fraction of a conditional head the ruling says to take away."""
+    assert remaining_sb(27, Decimal("3.5"), PARAMS) == Decimal("23")
+    assert remaining_sb(27, Decimal("0"), PARAMS) == Decimal("27")
+
+
+def test_remaining_sb_reads_the_rounding_mode_like_max_sb_does() -> None:
+    """The MODE is a parameter here too, not a hardcoded floor — the same
+    thing finding 3 of fix round 1 established for `max_sb`."""
+    half_up = PARAMS | {"rounding_heads": {"mode": "half_up"}}
+    assert remaining_sb(27, Decimal("3.4"), half_up) == Decimal("24")
+    assert remaining_sb(27, Decimal("3.4"), PARAMS) == Decimal("23")
+
+
+def test_the_calculated_remaining_sb_is_the_rounded_one() -> None:
+    """One place, one number: `calculate` must store what `remaining_sb`
+    returns, not its own unrounded subtraction (the two used to recompute it
+    identically, which is how they would have drifted)."""
+    request = CalcRequest(
+        activity_code="grazing",
+        on_date=date(2026, 8, 30),
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 9, 30),
+        area_ha=Decimal("10"),
+        items=(LivestockItem("sheep_goat_6m", 5),),
+        quantity=None,
+        benefit_code=None,
+    )
+    snapshot = ParamSnapshot(
+        values=PARAMS,
+        tariffs=GRAZING_TARIFFS,
+        norm=NormFact(id=None, yield_c_per_ha=Decimal("12"), max_sb=27, season=None, rotation=None),
+        load_sb=Decimal("3.5"),
+        load_source="permits",
+    )
+    result = calculate(request, snapshot)
+    assert result.remaining_sb == Decimal("23")
+    limit_line = next(line for line in result.breakdown if line["kind"] == "limit")
+    assert limit_line["remaining_sb"] == "23"

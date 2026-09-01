@@ -9,7 +9,10 @@ Formulas (tz/06, corrected against VMQ 689 by plan 03.7 ruling 5):
                                                               floor, never up, but the MODE itself
                                                               is a parameter like any other)
     UsedSB      = Σ count_i × coef_sb:<code_i>
-    RemainingSB = MaxSB − already-committed load            (LOAD_PROVIDERS, ruling 12)
+    RemainingSB = round_heads(MaxSB − committed load)       (LOAD_PROVIDERS, ruling 12;
+                                                              rounded like MaxSB — ruling 19
+                                                              rounds neither limit in the
+                                                              applicant's favour)
     Amount      = БҲМ × coefficient × quantity              (VMQ 278; the unit is per activity)
 
 `RULE_CODE_VERSION` is the only hard-coded value here, and it is not a quantity:
@@ -305,6 +308,26 @@ def max_sb(*, area_ha: Decimal, yield_c_per_ha: Decimal, params: Mapping[str, An
     return _round_heads(quotient, _rule(params, "rounding_heads"))
 
 
+def remaining_sb(max_sb_value: int, load_sb: Decimal, params: Mapping[str, Any]) -> Decimal:
+    """The limit left on a contour: MaxSB minus the load already committed
+    against it, rounded by `rounding_heads` like every other limit.
+
+    Ruling 19 names `remaining_sb` next to `max_sb` — "never round a limit in
+    the applicant's favour" — but only `max_sb` was ever rounded (I1, final
+    review). Invisible while `LOAD_PROVIDERS` is empty and `load_sb` is
+    always 0; the moment 3.11 registers a real provider the load turns
+    fractional (the `coef_sb` scale runs down to 0.2 for a lamb) and an
+    unfloored remainder hands the applicant the fraction of a conditional
+    head the ruling says to take away.
+
+    THE one place that computes it: `calculate` below and
+    `checks._limit_check` both call this rather than each subtracting for
+    itself, so the number an applicant is refused by and the number stored on
+    the calculation can never drift apart. Returns a `Decimal` (integral in
+    value) because `Calculation.remaining_sb` is a `NUMERIC(12,4)` column."""
+    return Decimal(_round_heads(Decimal(max_sb_value) - load_sb, _rule(params, "rounding_heads")))
+
+
 def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
     """Resolves the tariff (for grazing, one per livestock group via
     `tariff_group:<code>`; otherwise the single row with `livestock_group IS
@@ -421,7 +444,10 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
 
     used_sb: Decimal | None = None
     max_sb_value: int | None = None
-    remaining_sb: Decimal | None = None
+    # Named `..._value` for the same reason `max_sb_value` is: the module-level
+    # `remaining_sb`/`max_sb` functions are the shared formulas, and a local of
+    # the same name would shadow them inside this function.
+    remaining_sb_value: Decimal | None = None
     # `used_sb` depends only on `request.items`/`snapshot.values` — it reads
     # nothing from `snapshot.norm` — so it is gated on the ACTIVITY, not on
     # whether a norm happens to be on record for this contour yet (fix-round
@@ -440,13 +466,13 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
     if snapshot.norm is not None:
         max_sb_value = snapshot.norm.max_sb
         if max_sb_value is not None:
-            remaining_sb = Decimal(max_sb_value) - snapshot.load_sb
+            remaining_sb_value = remaining_sb(max_sb_value, snapshot.load_sb, values)
         breakdown.append(
             {
                 "kind": "limit",
                 "used_sb": jsonable(used_sb),
                 "max_sb": max_sb_value,
-                "remaining_sb": jsonable(remaining_sb),
+                "remaining_sb": jsonable(remaining_sb_value),
                 "load_sb": jsonable(snapshot.load_sb),
                 "load_source": snapshot.load_source,
             }
@@ -469,7 +495,7 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
         amount=amount,
         used_sb=used_sb,
         max_sb=max_sb_value,
-        remaining_sb=remaining_sb,
+        remaining_sb=remaining_sb_value,
         breakdown=breakdown,
         rule_code_version=RULE_CODE_VERSION,
         input_snapshot=input_snapshot,
