@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base, uuid7
+from app.modules.admin.models import QUANTITY_UNITS
 
 PARAM_STATUSES = ("draft", "published", "archived")
 NORM_STATUSES = ("draft", "review", "approved", "published", "archived")
@@ -101,6 +102,13 @@ class Tariff(Base):
             name="livestock_group_valid",
         ),
         CheckConstraint("coefficient >= 0", name="coefficient_non_negative"),
+        # Added by 0013 (review finding I8): `quantity_unit` had no bound at
+        # all on this table, unlike its sibling `activity_types.quantity_unit`
+        # — any string was storable and was copied verbatim into an immutable
+        # calculation's `breakdown`. Derived from `admin.models.QUANTITY_UNITS`
+        # rather than retyped (lesson: constraint strings duplicated in Python
+        # tuples are two sources of truth).
+        CheckConstraint(f"quantity_unit IN {QUANTITY_UNITS}", name="quantity_unit_valid"),
         CheckConstraint(
             "effective_to IS NULL OR effective_to >= effective_from", name="period_valid"
         ),

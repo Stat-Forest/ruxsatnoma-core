@@ -3,12 +3,16 @@ the primary sources on 2026-08-30 (VMQ 278 annex, VMQ 689). These assertions are
 the regression test for a wrong tariff, which is the most expensive kind of bug
 this stage can ship."""
 
+import uuid
 from datetime import date
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import uuid7
 
 pytestmark = pytest.mark.asyncio
 
@@ -47,7 +51,8 @@ async def test_vmq_278_rates_are_seeded(
 async def test_science_has_no_tariff(db: AsyncSession) -> None:
     """VMQ 278's annex has no rate for scientific research — it is contracted
     separately (ruling 1). Seeding a zero-coefficient row would look like a
-    decision; seeding nothing is the fact."""
+    decision; seeding nothing is the fact — which is why the fact is stated
+    separately, by `tariff_exempt:science` below."""
     row = await db.execute(
         text(
             "SELECT count(*) FROM tariffs t JOIN activity_types a ON a.id = t.activity_type_id "
@@ -55,6 +60,40 @@ async def test_science_has_no_tariff(db: AsyncSession) -> None:
         )
     )
     assert row.scalar_one() == 0
+
+
+async def test_only_science_is_published_as_tariff_exempt(db: AsyncSession) -> None:
+    """C2: the un-tariffed activities are named by a published, dated
+    parameter, not inferred from the absence of a tariff row. Migration 0013
+    seeds exactly one — any other flat activity missing its row raises
+    ERR-NORM-004 rather than billing zero."""
+    rows = await db.execute(
+        text(
+            "SELECT code, value #>> '{}' FROM rule_parameters "
+            "WHERE code LIKE 'tariff_exempt:%' AND status = 'published'"
+        )
+    )
+    # Comprehension, not `dict(rows.all())` — a raw `text()` row is `Row[Any]`
+    # and pyright cannot confirm its arity (lesson).
+    assert {row[0]: row[1] for row in rows.all()} == {"tariff_exempt:science": "true"}
+
+
+async def test_a_tariff_with_an_unknown_quantity_unit_is_refused_by_the_database(
+    db: AsyncSession, grazing_activity_id: uuid.UUID
+) -> None:
+    """Finding I8 / deferred minor #2: `tariffs.quantity_unit` had no CHECK at
+    all, so any string was storable and was copied verbatim into an immutable
+    calculation's `breakdown`. The schema `Literal` is the 422; this is the
+    backstop that keeps the two from drifting (migration 0013)."""
+    with pytest.raises(IntegrityError):
+        await db.execute(
+            text(
+                "INSERT INTO tariffs (id, activity_type_id, coefficient, quantity_unit, "
+                "effective_from, basis, status) "
+                "VALUES (:id, :activity, 1.0, 'furlong', DATE '2030-01-01', 't', 'draft')"
+            ).bindparams(id=uuid7(), activity=grazing_activity_id)
+        )
+    await db.rollback()
 
 
 async def test_bhm_has_both_dated_values(db: AsyncSession) -> None:

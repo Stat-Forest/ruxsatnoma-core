@@ -229,6 +229,22 @@ def _resolve_flat_tariff(tariffs: tuple[TariffFact, ...]) -> TariffFact | None:
     return None
 
 
+def _is_tariff_exempt(values: Mapping[str, Any], activity_code: str) -> bool:
+    """Is this activity genuinely UN-TARIFFED by law (`science` today), as
+    opposed to missing a row it ought to have?
+
+    "The law is silent here" is a FACT that has to be stated, not the fallback
+    for "no row found" — and, like every other fact this engine uses, it is a
+    versioned `rule_parameters` row (`tariff_exempt:<activity_code>`, seeded
+    published by migration 0013) rather than a constant in this file, so a new
+    un-tariffed activity is a row with an effective period, not a deploy
+    (ruling 6). Fail-closed on the value: only the literal `true` exempts, so
+    a row left behind as `"false"` once an activity acquires a rate — or a
+    typo — leaves the activity billable and its missing tariff loud."""
+    raw = values.get(f"tariff_exempt:{activity_code}")
+    return raw is not None and str(raw).strip().lower() == "true"
+
+
 def _apply_benefit(
     tariff: TariffFact, benefit_code: str | None
 ) -> tuple[Decimal, dict[str, Any] | None]:
@@ -358,11 +374,21 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
         # code silently.
         _check_benefit_claim(request.benefit_code, [tariff] if tariff is not None else [])
         if tariff is None:
-            # Ruling 1: VMQ 278 genuinely has no rate for `science` (and any
-            # other flat activity with no published row) — contracted
-            # separately. Unlike the grazing branch above, there is no
-            # per-group table to have a GAP in: a missing flat tariff IS the
-            # law being silent, so this is a legitimate zero, not an error.
+            # C2 (final review): "the law is silent here" is an explicit,
+            # versioned FACT, never the fallback for "no row found". VMQ 278
+            # genuinely has no rate for `science` — contracted separately —
+            # but it DOES publish one for haymaking, apiary, deadwood and
+            # recreation, and changing any of those requires
+            # archive-then-republish, so a window with no effective row is
+            # reachable through the documented workflow. Billing zero there
+            # would be exactly the silent under-billing the grazing branch
+            # above refuses, with the audit trail asserting lawfulness, on an
+            # append-only row an invoice (3.10) is later built from.
+            if not _is_tariff_exempt(values, request.activity_code):
+                raise err(
+                    "ERR-NORM-004",
+                    details={"code": f"tariff:{request.activity_code}"},
+                )
             breakdown.append(
                 {
                     "kind": "tariff",

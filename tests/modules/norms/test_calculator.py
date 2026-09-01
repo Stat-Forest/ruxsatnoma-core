@@ -29,6 +29,9 @@ PARAMS = {
     "coef_sb:cattle_adult": "6.0",
     "tariff_group:sheep_goat_6m": "small_adult",
     "tariff_group:cattle_adult": "large_adult",
+    # C2: the ONLY thing that makes a missing flat tariff a lawful zero rather
+    # than a gap in our own table — seeded published by migration 0013.
+    "tariff_exempt:science": "true",
 }
 
 GRAZING_TARIFFS = (
@@ -221,7 +224,12 @@ def test_a_missing_parameter_names_itself() -> None:
 
 
 def test_science_has_no_tariff_and_costs_nothing() -> None:
-    """Ruling 1: VMQ 278 has no rate for research; it is contracted separately."""
+    """Ruling 1: VMQ 278 has no rate for research; it is contracted separately.
+
+    C2: the zero is now reached through the EXPLICIT `tariff_exempt:science`
+    parameter (seeded by 0013), never through the mere absence of a row —
+    `test_a_flat_activity_with_no_exemption_raises_instead_of_billing_zero`
+    below is the other half of that pair."""
     request = CalcRequest(
         activity_code="science",
         on_date=date(2026, 8, 30),
@@ -434,6 +442,61 @@ def test_a_missing_grazing_tariff_row_raises_instead_of_billing_zero() -> None:
         calculate(request, snapshot)
     assert raised.value.code == "ERR-NORM-004"
     assert raised.value.details == {"code": "tariff:grazing:large_adult"}
+
+
+def test_a_flat_activity_with_no_exemption_raises_instead_of_billing_zero() -> None:
+    """C2, the mirror of the grazing test above on the OTHER branch of
+    `calculate`. `haymaking` (like apiary, deadwood and recreation) HAS a
+    published VMQ 278 rate, and changing a rate requires archive-then-publish,
+    so a window with no effective row is reachable through the documented
+    workflow. Billing zero there — with `reason="no_tariff_by_law"` on an
+    append-only row an invoice is later built from — is the silent
+    under-billing this stage's own global constraint forbids."""
+    request = CalcRequest(
+        activity_code="haymaking",
+        on_date=date(2026, 8, 30),
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 9, 30),
+        area_ha=Decimal("10"),
+        items=(),
+        quantity=Decimal("5"),
+        benefit_code=None,
+    )
+    snapshot = ParamSnapshot(
+        values=PARAMS, tariffs=(), norm=None, load_sb=Decimal("0"), load_source="none"
+    )
+    with pytest.raises(DomainError) as raised:
+        calculate(request, snapshot)
+    assert raised.value.code == "ERR-NORM-004"
+    assert raised.value.details == {"code": "tariff:haymaking"}
+
+
+def test_the_exemption_must_say_true_not_merely_exist() -> None:
+    """Fail-closed (ruling 6's own shape): the exemption is a VALUE, so a row
+    published with anything but `true` — a `"false"` left over from an
+    activity that has since acquired a rate, a typo — leaves the activity
+    billable and the missing row loud."""
+    request = CalcRequest(
+        activity_code="science",
+        on_date=date(2026, 8, 30),
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 9, 30),
+        area_ha=Decimal("10"),
+        items=(),
+        quantity=Decimal("1"),
+        benefit_code=None,
+    )
+    snapshot = ParamSnapshot(
+        values=PARAMS | {"tariff_exempt:science": "false"},
+        tariffs=(),
+        norm=None,
+        load_sb=Decimal("0"),
+        load_source="none",
+    )
+    with pytest.raises(DomainError) as raised:
+        calculate(request, snapshot)
+    assert raised.value.code == "ERR-NORM-004"
+    assert raised.value.details == {"code": "tariff:science"}
 
 
 def test_max_sb_reads_rounding_heads_half_up_not_a_hardcoded_floor() -> None:

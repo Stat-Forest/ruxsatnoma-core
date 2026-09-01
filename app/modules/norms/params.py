@@ -35,8 +35,9 @@ async def load_snapshot(
     contour_id: uuid.UUID | None,
     activity_type_id: uuid.UUID,
 ) -> ParamSnapshot:
-    """Base parameters + the `coef_sb:`/`tariff_group:` families + the tariffs in
-    force + the norm in force + the committed load from LOAD_PROVIDERS.
+    """Base parameters + the `coef_sb:`/`tariff_group:`/`tariff_exempt:`
+    families + the tariffs in force + the norm in force + the committed load
+    from LOAD_PROVIDERS.
 
     `contour_id` is optional: a calculation with no contour chosen yet (or for
     an activity with no per-contour norm at all) simply gets `norm=None` and
@@ -46,8 +47,12 @@ async def load_snapshot(
     values: dict[str, Any] = await load_limit_params(db, on_date=request.on_date)
     coef_rows = await repo.effective_parameters_by_prefix(db, "coef_sb:", request.on_date)
     group_rows = await repo.effective_parameters_by_prefix(db, "tariff_group:", request.on_date)
+    # C2: which activities the law genuinely leaves un-tariffed, as a dated
+    # row rather than a constant in `calculator.py` — see `_is_tariff_exempt`.
+    exempt_rows = await repo.effective_parameters_by_prefix(db, "tariff_exempt:", request.on_date)
     values.update({code: row.value for code, row in coef_rows.items()})
     values.update({code: row.value for code, row in group_rows.items()})
+    values.update({code: row.value for code, row in exempt_rows.items()})
 
     tariff_rows = await repo.effective_tariffs(db, activity_type_id, request.on_date)
     tariffs = tuple(
