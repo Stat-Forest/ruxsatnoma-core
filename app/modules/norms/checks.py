@@ -187,7 +187,25 @@ async def _territory_checks(
     the split 3.6a deliberately left open — `gis.checks` never fails on any of
     these three layers); `restrictions`/`protection` only ever warn, exactly as
     they did in 3.6a — the DECISION moved here, the layers' own advisory status
-    did not."""
+    did not.
+
+    Both report `skipped` when the contour has no PUBLISHED geometry (I6,
+    final review). `gis.repo.features_intersecting` inner-joins that version,
+    so a contour whose geometry is still draft returns zero features — and a
+    zero result used to read as `pass`, a BLOCKING safety check asserting a
+    fact it never tested. The state is reachable:
+    `service._build_request_and_snapshot` deliberately tolerates a contour
+    with no published version (`area_ha = 0`), and a non-grazing activity
+    needs no norm either, so nothing else demands one. This is exactly the
+    anti-pattern `_season_check`'s own docstring articulates — "no `windows`
+    configured is not the same as 'always in season'" — applied consistently:
+    nothing verified, nothing asserted."""
+    if await gis_service.published_version(db, contour_id) is None:
+        no_geometry: dict[str, Any] = {"reason": "no_published_geometry"}
+        return (
+            {"check": "fire_ban", "result": "skipped", "details": no_geometry},
+            {"check": "restrictions", "result": "skipped", "details": no_geometry},
+        )
     features = await gis_service.features_intersecting(
         db, contour_id, _TERRITORY_LAYER_CODES, period_from, period_to
     )

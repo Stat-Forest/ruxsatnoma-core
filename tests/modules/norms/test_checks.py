@@ -467,3 +467,37 @@ async def test_a_malformed_window_fails_closed_instead_of_raising(
     )
     season = next(c for c in results if c["check"] == "season")
     assert season["result"] == "fail"
+
+
+async def test_the_territory_checks_are_skipped_with_no_published_geometry(
+    db: AsyncSession, draft_only_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """I6 (final review): `gis.repo.features_intersecting` inner-joins the
+    contour's PUBLISHED version, so a contour whose geometry is still draft
+    returns zero features — and `fire_ban` reported `pass`, a BLOCKING safety
+    check asserting a fact it never tested. The state is reachable:
+    `_build_request_and_snapshot` deliberately tolerates a contour with no
+    published version, and a non-grazing activity needs no norm either.
+
+    This is the anti-pattern `_season_check`'s own docstring articulates — "no
+    windows configured is not the same as always in season" — applied
+    consistently: nothing was verified, so nothing is asserted."""
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 9, 30)),
+        contour_id=draft_only_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(),
+    )
+    fire_ban = next(c for c in results if c["check"] == "fire_ban")
+    restrictions = next(c for c in results if c["check"] == "restrictions")
+    assert fire_ban == {
+        "check": "fire_ban",
+        "result": "skipped",
+        "details": {"reason": "no_published_geometry"},
+    }
+    assert restrictions["result"] == "skipped"
+    assert restrictions["details"] == {"reason": "no_published_geometry"}
+    # `skipped` is not `fail`, so it does not block on its own — but it can no
+    # longer be mistaken for a verified `pass` either.
+    assert checks.is_blocked(results) is False
