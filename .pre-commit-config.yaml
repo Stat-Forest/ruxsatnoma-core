@@ -44,6 +44,15 @@ repos:
         pass_filenames: false
         files: ^migrations/versions/
 
+      # lessons.md is read before every task, so its size is a cost every session
+      # pays. Prose cannot hold a budget; this fails on a malformed or overlong entry.
+      - id: lessons-check
+        name: lessons.md structure and size
+        entry: make lessons-check
+        language: system
+        pass_filenames: false
+        files: ^(\.claude/lessons\.md|scripts/lessons_check\.py)$
+
       - id: pyright
         name: pyright
         entry: uv run pyright

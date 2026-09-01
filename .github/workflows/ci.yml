@@ -15,6 +15,8 @@ jobs:
       - run: uv sync --frozen
       # Cheap and DB-free — fails fast when two branches each added a revision.
       - run: make heads
+      # Structure and size budget of .claude/lessons.md — also cheap and DB-free.
+      - run: make lessons-check
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright
