@@ -57,3 +57,28 @@ def test_the_record_carries_the_whole_chain_for_later_reading():
     assert verdict.record["certificate_status"] == "active"
     assert verdict.record["timestamp_token"] == "TS"
     assert verdict.record["checked_at"] == NOW.isoformat()
+
+
+def test_the_record_carries_the_certificates_own_identity_fields():
+    verdict = build_verdict(_result(), cert_status="active", now=NOW)
+    assert verdict.record["certificate_serial_number"] == "SER-1"
+    assert verdict.record["certificate_issuer"] == "ISS-1"
+    assert verdict.record["certificate_subject"] == "CN=A"
+    assert verdict.record["certificate_valid_from"] == (NOW - timedelta(days=30)).isoformat()
+    assert verdict.record["certificate_valid_to"] == (NOW + timedelta(days=300)).isoformat()
+
+
+def test_the_record_marks_a_missing_certificate_explicitly_rather_than_omitting_the_keys():
+    from app.modules.integrations.adapters.eimzo import EimzoVerification
+
+    # The shape a real verification takes when it fails before a certificate
+    # could even be parsed (mirrors `_unparseable_signature()` in eimzo.py).
+    result = EimzoVerification(
+        status_code=-10, subject_certificate=None, signed_at=None, timestamp_token=None, raw={}
+    )
+    verdict = build_verdict(result, cert_status="active", now=NOW)
+    assert verdict.record["certificate_serial_number"] is None
+    assert verdict.record["certificate_issuer"] is None
+    assert verdict.record["certificate_subject"] is None
+    assert verdict.record["certificate_valid_from"] is None
+    assert verdict.record["certificate_valid_to"] is None
