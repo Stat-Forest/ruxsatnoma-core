@@ -799,3 +799,29 @@ Rules for this file:
 - **How to apply:** Page an endpoint and grep its tests for unfiltered `GET`s in
   the same commit; assert against `total` and an explicitly scoped query, never
   against membership in an unbounded default page.
+
+## A bare `alembic` CLI command targets the shared dev DB, not your worktree's test DB
+
+- **Rule:** Never run `uv run alembic revision --autogenerate` or `uv run
+  alembic upgrade head` bare in a worktree. Override `DATABASE_URL` to
+  `DATABASE_URL_TEST`'s value for that one command (pytest's own
+  `_migrated_test_db` fixture already does this — mirror it by hand for
+  manual Alembic CLI use).
+- **Why:** `migrations/env.py::_resolve_url()` falls back to
+  `get_settings().database_url` — the main `ruxsatnoma` DB, shared by every
+  worktree on the same docker Postgres — whenever `config.attributes` carries
+  no override, which is exactly the case for a bare CLI invocation. In this
+  multi-worktree project a sibling branch may already have run its own
+  migrations against that shared DB, moving its `alembic_version` ahead of
+  revisions your worktree's `migrations/versions/` doesn't have (hit while
+  building 3.8: the shared DB was at `0013` from the not-yet-merged 3.7
+  branch, my worktree only knew revisions through `0010`). Both commands then
+  fail opaquely with `Can't locate revision identified by '0013'` — a message
+  that names a revision that is not missing from Postgres, but from the
+  worktree's own migration files, which reads like local corruption rather
+  than the real cause.
+- **How to apply:** Before any manual `alembic revision`/`upgrade`/`downgrade`,
+  export `DATABASE_URL="$DATABASE_URL_TEST"` for that command (or prefix it
+  inline). If the error names a revision you don't have locally, check which
+  database the bare command actually connected to before suspecting the
+  migration files.
