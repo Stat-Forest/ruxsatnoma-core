@@ -30,6 +30,9 @@ from app.modules.auth.router import router as auth_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
+from app.modules.norms.calc_router import router as norms_calc_router
+from app.modules.norms.refs_router import router as norms_refs_router
+from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
@@ -205,5 +208,8 @@ def create_app() -> FastAPI:
     app.include_router(gis_layers_router, prefix="/api/v1")
     app.include_router(gis_imports_router, prefix="/api/v1")
     app.include_router(gis_router, prefix="/api/v1")
+    app.include_router(norms_refs_router, prefix="/api/v1")
+    app.include_router(norms_router, prefix="/api/v1")
+    app.include_router(norms_calc_router, prefix="/api/v1")
 
     return app

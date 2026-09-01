@@ -18,7 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base, uuid7
 
 ORGANIZATION_KINDS = ("agency", "territorial", "leshoz", "bolim", "aylanma", "bolak")
-QUANTITY_UNITS = ("head", "ton", "hive", "ha", "person", "unit")
+QUANTITY_UNITS = ("head", "ton", "hive", "ha", "person_day", "m3", "unit")
 
 
 class Region(Base):
@@ -155,7 +155,7 @@ class ActivityType(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "quantity_unit IN ('head', 'ton', 'hive', 'ha', 'person', 'unit')",
+            "quantity_unit IN ('head', 'ton', 'hive', 'ha', 'person_day', 'm3', 'unit')",
             name="quantity_unit_valid",
         ),
         CheckConstraint("status IN ('active', 'archived')", name="status_valid"),

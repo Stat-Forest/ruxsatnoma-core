@@ -3,6 +3,7 @@ travels through Python: the repo builds SQL, PostGIS evaluates it."""
 
 import json
 import uuid
+from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.errors import err
 from app.db import uuid7
 
@@ -159,6 +161,13 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
         )
     )
     return result.scalar_one_or_none()
+
+
+async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
+    """The leshoz a contour is filed under, or None if there is no such contour.
+    Identity only — no version, no geometry."""
+    rows = await db.execute(select(Contour.organization_id).where(Contour.id == contour_id))
+    return rows.scalar_one_or_none()
 
 
 # --- Task 6: layer_features (restriction, protection, fire-ban and every
@@ -557,3 +566,44 @@ async def features_geojson(
             for row in rows
         ],
     }
+
+
+# --- Stage 3.7: what norms.checks needs (ruling 15) --------------------------
+
+
+async def features_intersecting(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    layer_codes: Sequence[str],
+    period_from: date,
+    period_to: date,
+) -> list[Any]:
+    """Published features of the named layers that both overlap the contour's
+    published geometry by more than the area tolerance AND are valid during the
+    requested period. Area, not touch: two neighbours share a border and
+    `ST_Intersects` alone calls that an overlap (lesson).
+
+    A feature with no validity dates is always valid — an open-ended protection
+    zone is the normal case; a fire ban is the one that carries a period."""
+    tolerance = await settings_store.get_int(db, "gis_overlap_tolerance_m2")
+    rows = await db.execute(
+        text(
+            "SELECT f.id, l.code AS layer_code, f.name, f.valid_from, f.valid_to, "
+            "       ST_Area(ST_Intersection(f.geom, v.geom)::geography) AS area_m2 "
+            "FROM layer_features f "
+            "JOIN gis_layers l ON l.id = f.layer_id "
+            "JOIN contour_versions v ON v.contour_id = :contour AND v.status = 'published' "
+            "WHERE l.code = ANY(:codes) AND f.status = 'published' "
+            "  AND ST_Intersects(f.geom, v.geom) "
+            "  AND ST_Area(ST_Intersection(f.geom, v.geom)::geography) > :tolerance "
+            "  AND (f.valid_from IS NULL OR f.valid_from <= :period_to) "
+            "  AND (f.valid_to IS NULL OR f.valid_to >= :period_from)"
+        ).bindparams(
+            contour=contour_id,
+            codes=list(layer_codes),
+            tolerance=tolerance,
+            period_from=period_from,
+            period_to=period_to,
+        )
+    )
+    return list(rows.all())
