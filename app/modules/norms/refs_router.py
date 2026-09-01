@@ -4,23 +4,24 @@ the central office (decision #32).
 
 `/publish` and `/archive` both accept anyone holding either `TARIFFS_MANAGE` or
 `TARIFFS_PUBLISH` (migration 0011 grants `central_admin` both at once, on
-purpose) — but the two routes refuse for DIFFERENT reasons, and only one of
-them is enforced by the route dependency:
+purpose). The widened dependency is a ROUTING decision, not the gate: it exists
+so a maker reaches a DOMAIN answer instead of a bare 403 — `TARIFFS_PUBLISH`
+alone would 403 a maker before `service.publish_versioned`'s own
+`not_maker_checker` refusal ever ran, which is not what
+`test_a_maker_creates_a_draft_and_cannot_publish_it` (a `tariffs_maker_client`,
+`TARIFFS_MANAGE` only) exercises. Both routes therefore carry their real gate
+in the SERVICE, and both refuse `ERR-ACL-001` via `_holds_tariffs_publish`:
 
-- `/publish`'s real gate is an IDENTITY check: `service.publish_versioned`
-  refuses a maker publishing their own draft by comparing `created_by` to the
-  actor, not by which permission code let the request through. Gating on
-  `TARIFFS_PUBLISH` alone would 403 a maker before that domain check ever ran,
-  which is not what `test_a_maker_creates_a_draft_and_cannot_publish_it` (a
-  `tariffs_maker_client`, `TARIFFS_MANAGE` only) exercises.
-- `/archive` has no identity to compare — archiving is a single-actor action,
-  not a handoff between a maker's and a checker's own drafts of the same row.
-  Widening the route the same way would let ANY `TARIFFS_MANAGE` holder take a
-  row they never touched out of force, so `service.archive_versioned` carries
-  its OWN `ERR-ACL-001` check for that one case (the row being archived is
-  already `published`), via `_holds_tariffs_publish` — a maker keeps the
-  ability to discard their own DRAFT with no second person involved, which the
-  route dependency alone cannot distinguish from archiving a published row."""
+- `service.publish_versioned` requires it for every publication, after the
+  `not_draft`/`not_maker_checker` refusals. The identity check alone was never
+  the control (C1, final review): two DIFFERENT makers satisfy it, and a
+  migration-seeded row (`created_by IS NULL`) skips it outright.
+- `service.archive_versioned` requires it only when the row being archived is
+  already `published` — archiving is a single-actor action with no identity to
+  compare, and taking a row IN FORCE out of force is the one-person change
+  maker-checker exists to prevent. Discarding one's own DRAFT stays a maker's
+  call with no second person, which the route dependency alone cannot tell
+  apart from archiving a published row."""
 
 import uuid
 from datetime import date

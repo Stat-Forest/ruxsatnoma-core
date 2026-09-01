@@ -135,3 +135,65 @@ async def test_reading_a_parameter_needs_no_special_permission(
     listed = await applicant_client.get("/api/v1/rule-parameters?code=bhm")
     assert listed.status_code == 200
     assert listed.json()["total"] >= 2
+
+
+async def test_a_second_maker_cannot_publish_another_makers_draft(
+    tariffs_maker_client: AsyncClient,
+    second_tariffs_maker_client: AsyncClient,
+    unique_suffix: str,
+) -> None:
+    """C1 (final review): `norms.tariffs.publish` gated nothing. The route
+    accepts either tariff permission on purpose (so a maker reaches a domain
+    answer instead of a bare 403 — `refs_router.py`'s module docstring), and
+    `publish_versioned`'s only identity rule is `created_by != actor`. Two
+    makers, neither a checker, therefore satisfied both and put an arbitrary
+    rate into force: maker B drafts, maker A publishes, and the DB
+    `maker_checker` CHECK passes too. Nothing ever asked whether either of
+    them held the checker's own permission.
+
+    No fixture could catch this before: `tariffs_checker_client` holds BOTH
+    codes, so the two permissions were indistinguishable on this route."""
+    created = await tariffs_maker_client.post(
+        "/api/v1/rule-parameters",
+        json={
+            "code": f"test_param_{unique_suffix}",
+            "value": "0.9",
+            "effective_from": "2030-01-01",
+            "basis": "test",
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    refused = await second_tariffs_maker_client.post(
+        f"/api/v1/rule-parameters/{created.json()['id']}/publish"
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "ERR-ACL-001"
+
+    # And it really is still a draft — the refusal is the state, not just the
+    # status code.
+    listed = await tariffs_maker_client.get(
+        f"/api/v1/rule-parameters?code=test_param_{unique_suffix}"
+    )
+    assert [item["status"] for item in listed.json()["items"]] == ["draft"]
+
+
+async def test_a_maker_cannot_publish_a_migration_seeded_draft(
+    tariffs_maker_client: AsyncClient,
+) -> None:
+    """C1's live half. A migration-seeded row has `created_by IS NULL`, so
+    `publish_versioned`'s identity check is skipped entirely — there is no
+    second person for a seeded row, and the publish permission was the only
+    remaining control. Without it a single `TARIFFS_MANAGE` holder could put
+    the ten provisional `coef_sb:*` drafts into force single-handedly, the
+    exact numbers ruling 8 says must wait for VMQ 689 annex 5 and then be
+    published by a different user than their creator."""
+    listed = await tariffs_maker_client.get(
+        "/api/v1/rule-parameters?code=coef_sb:cattle_adult&status=draft"
+    )
+    seeded = [item for item in listed.json()["items"] if item["created_by"] is None]
+    assert seeded, "migration 0012 seeds coef_sb:cattle_adult as a draft"
+
+    refused = await tariffs_maker_client.post(f"/api/v1/rule-parameters/{seeded[0]['id']}/publish")
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "ERR-ACL-001"

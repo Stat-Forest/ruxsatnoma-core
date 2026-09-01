@@ -173,12 +173,28 @@ async def publish_versioned(
     """Maker-checker publication (ruling 10) with the retroactivity warning
     (ruling 11). Three refusals, all 409 ERR-NORM-005 with a `reason`:
     the row is not a draft, the actor is its own maker, or a published row
-    already covers part of the period."""
+    already covers part of the period — plus one 403 for an actor who is not a
+    checker at all.
+
+    That 403 is the same shape `archive_versioned` below carries, and it is
+    here for the same reason (C1, final review). The route dependency accepts
+    EITHER tariff permission on purpose, so a maker gets the domain
+    `not_maker_checker` answer rather than a bare 403 — but the identity check
+    alone is not the control: two DIFFERENT makers, neither of them a checker,
+    satisfy `created_by != actor` and the DB `maker_checker` CHECK both, and a
+    migration-seeded row (`created_by IS NULL`) skips the identity check
+    outright, so a single `TARIFFS_MANAGE` holder could have put the ten
+    provisional `coef_sb:*` drafts into force alone. Publication is what sets
+    the numbers in force, so it takes the checker's own permission, checked
+    HERE — after the two domain refusals, so a maker publishing their own
+    draft still sees why."""
     row = await _row_or_404(db, kind, row_id)
     if row.status != "draft":
         raise err("ERR-NORM-005", details={"reason": "not_draft"})
     if row.created_by is not None and row.created_by == actor.id:
         raise err("ERR-NORM-005", details={"reason": "not_maker_checker"})
+    if not await _holds_tariffs_publish(db, actor):
+        raise err("ERR-ACL-001")
     if await repo.published_overlaps(db, kind.model, row, kind.key_filters(row)):
         raise err("ERR-NORM-005", details={"reason": "period_overlap"})
 

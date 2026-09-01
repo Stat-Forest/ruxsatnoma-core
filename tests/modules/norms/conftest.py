@@ -288,6 +288,18 @@ async def tariffs_maker_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncCli
 
 
 @pytest.fixture
+async def second_tariffs_maker_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
+    """A SECOND maker, distinct from `tariffs_maker_client` and holding the
+    same `TARIFFS_MANAGE` only. Without it nothing could tell the two tariff
+    permissions apart on `/publish`: `tariffs_checker_client` holds BOTH
+    codes, and a maker publishing their OWN draft is refused by the identity
+    check long before the permission one — so two DIFFERENT makers are the
+    only shape that reaches the gate C1 found missing."""
+    async for client in _client_for(db, TARIFFS_MANAGE):
+        yield client
+
+
+@pytest.fixture
 async def tariffs_checker_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
     async for client in _client_for(db, TARIFFS_PUBLISH, TARIFFS_MANAGE):
         yield client
