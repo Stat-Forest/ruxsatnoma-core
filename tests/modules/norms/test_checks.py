@@ -413,3 +413,57 @@ async def test_a_real_five_calendar_year_period_is_accepted(
     # It gets past the guard and is judged on its merits (this one is out of
     # season, which is a CHECK result, not a refusal to look at all).
     assert {c["check"] for c in results} >= {"norm", "season", "rotation", "limit"}
+
+
+async def test_a_rest_year_stored_as_a_string_still_blocks(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """I5's fail-open half, defended twice. `schemas.Rotation` refuses strings
+    at the edge now, but `norms.rotation` is a JSONB column that was
+    free-form until today — a row written before that validation existed must
+    not silently pass for a resting year, so `_rotation_check` coerces
+    instead of trusting."""
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2027, 5, 1), date(2027, 9, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(
+            norm=NormFact(
+                id=uuid.uuid4(),
+                yield_c_per_ha=Decimal("12"),
+                max_sb=250,
+                season=SUMMER,
+                rotation={"rest_years": ["2027"]},
+            )
+        ),
+    )
+    rotation = next(c for c in results if c["check"] == "rotation")
+    assert rotation["result"] == "fail"
+    assert rotation["details"]["year"] == 2027
+
+
+async def test_a_malformed_window_fails_closed_instead_of_raising(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """The other half of I5: `_in_window` used to do `window["from"]`, so a
+    legacy row missing a bound raised a `KeyError` INSIDE the check — an
+    uncaught 500 on a preview rather than a domain answer. A window that
+    cannot be read does not cover the day, so the season blocks."""
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 6, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(
+            norm=NormFact(
+                id=uuid.uuid4(),
+                yield_c_per_ha=Decimal("12"),
+                max_sb=250,
+                season={"windows": [{"from": "04-01"}]},
+                rotation={"rest_years": []},
+            )
+        ),
+    )
+    season = next(c for c in results if c["check"] == "season")
+    assert season["result"] == "fail"

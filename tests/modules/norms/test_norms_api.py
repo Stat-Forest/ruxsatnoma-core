@@ -236,3 +236,87 @@ async def test_creating_a_norm_with_effective_to_before_effective_from_is_refuse
     )
     assert response.status_code == 422, response.text
     assert response.json()["error"]["details"]["reason"] == "effective_to_before_from"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("season", {"windows": [{"from": "04-01"}]}),  # no `to`
+        ("season", {"windows": [{"from": "04-01", "to": 5}]}),  # not a string
+        ("season", {"windows": [{"from": "april", "to": "10-31"}]}),  # not MM-DD
+        ("rotation", {"rest_years": ["twenty-seven"]}),  # not a year at all
+    ],
+)
+async def test_a_malformed_season_or_rotation_is_refused_at_the_edge(
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    field: str,
+    value: dict,
+) -> None:
+    """I5 (final review): both were free-form JSONB written straight through
+    from the request. A window missing `from`/`to` raised a `KeyError` INSIDE
+    a check — an uncaught 500 on `POST /calculations/preview`, not a domain
+    error — and `{"rest_years": ["2027"]}`, the shape a JSON form happily
+    produces, made `if year in rest_years` compare an `int` against a `str`
+    and pass SILENTLY for a resting year: a fail-open on a blocking check."""
+    payload = {
+        "contour_id": str(published_contour.id),
+        "activity_type_id": str(grazing_activity_id),
+        "yield_c_per_ha": "12.0",
+        "effective_from": "2030-01-01",
+    } | {field: value}
+    response = await gis_specialist_client.post("/api/v1/norms", json=payload)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_a_rest_year_sent_as_a_string_is_stored_as_an_integer(
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """The other half of I5's rotation fix. `rest_years: list[int]` in lax
+    mode — the project's default everywhere — COERCES `"2027"`, the shape a
+    JSON form happily produces, so what lands in the JSONB column is an
+    integer and `if year in rest_years` can no longer compare an `int`
+    against a `str` and pass silently for a resting year. Closing the
+    fail-open at the source is the point; refusing the string as well would
+    only make a benign form value an error."""
+    response = await gis_specialist_client.post(
+        "/api/v1/norms",
+        json={
+            "contour_id": str(published_contour.id),
+            "activity_type_id": str(grazing_activity_id),
+            "yield_c_per_ha": "12.0",
+            "rotation": {"rest_years": ["2027"]},
+            "effective_from": "2030-06-01",
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["rotation"] == {"rest_years": [2027]}
+
+
+async def test_a_valid_season_round_trips_in_the_stored_shape(
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """`SeasonWindow.from_` carries an alias because `from` is a Python
+    keyword — the stored JSONB must stay `{"from": ..., "to": ...}`, which is
+    what `checks._in_window` reads and what every existing row already
+    holds."""
+    response = await gis_specialist_client.post(
+        "/api/v1/norms",
+        json={
+            "contour_id": str(published_contour.id),
+            "activity_type_id": str(grazing_activity_id),
+            "yield_c_per_ha": "12.0",
+            "season": {"windows": [{"from": "04-01", "to": "10-31"}]},
+            "rotation": {"rest_years": [2027]},
+            "effective_from": "2030-05-01",
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["season"] == {"windows": [{"from": "04-01", "to": "10-31"}]}
+    assert response.json()["rotation"] == {"rest_years": [2027]}

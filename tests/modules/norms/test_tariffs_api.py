@@ -83,21 +83,124 @@ async def test_creating_a_tariff_with_an_unknown_activity_type_is_refused(
 
 
 async def test_a_benefit_modifier_round_trips(
-    tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
+    tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID, benefit_category: str
 ) -> None:
+    """The code must resolve against the `benefit_categories` classifier (I7),
+    which is why this now needs a real category rather than a bare string."""
     response = await tariffs_maker_client.post(
         "/api/v1/tariffs",
         json={
             "activity_type_id": str(haymaking_activity_id),
             "coefficient": "1.5",
             "quantity_unit": "ha",
-            "benefit_modifiers": {"veteran": "0.5"},
+            "benefit_modifiers": {benefit_category: "0.5"},
             "effective_from": "2030-01-01",
             "basis": "t",
         },
     )
-    assert response.status_code == 201
-    assert response.json()["benefit_modifiers"] == {"veteran": "0.5"}
+    assert response.status_code == 201, response.text
+    assert response.json()["benefit_modifiers"] == {benefit_category: "0.5"}
+
+
+async def test_an_unknown_benefit_category_is_refused(
+    tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
+) -> None:
+    """I7: ruling 20 defines `benefit_modifiers`' keys as `benefit_categories`
+    classifier item codes, but nothing checked them — a typo created a benefit
+    nobody can claim, or one nobody intended. Same guard as
+    `unknown_activity_type`, one field over."""
+    response = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "coefficient": "1.5",
+            "quantity_unit": "ha",
+            "benefit_modifiers": {"not_a_real_category": "0.5"},
+            "effective_from": "2030-02-01",
+            "basis": "t",
+        },
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]["details"]
+    assert error["reason"] == "unknown_benefit_category"
+    assert error["codes"] == ["not_a_real_category"]
+
+
+async def test_patching_in_an_unknown_benefit_category_is_refused(
+    tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
+) -> None:
+    """The same guard on the other verb: validating only `POST` would leave
+    the hole open one HTTP method over."""
+    created = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "coefficient": "1.5",
+            "quantity_unit": "ha",
+            "effective_from": "2030-03-01",
+            "basis": "t",
+        },
+    )
+    patched = await tariffs_maker_client.patch(
+        f"/api/v1/tariffs/{created.json()['id']}",
+        json={"benefit_modifiers": {"not_a_real_category": "0.5"}},
+    )
+    assert patched.status_code == 422, patched.text
+    assert patched.json()["error"]["details"]["reason"] == "unknown_benefit_category"
+
+
+@pytest.mark.parametrize("modifier", ["abc", "-1", "1.5"])
+async def test_a_benefit_modifier_outside_zero_to_one_is_refused(
+    tariffs_maker_client: AsyncClient,
+    haymaking_activity_id: uuid.UUID,
+    benefit_category: str,
+    modifier: str,
+) -> None:
+    """I7: the values reached `calculator._apply_benefit` as
+    `coefficient * Decimal(modifier)` with no guard. `"abc"` was an uncaught
+    `InvalidOperation` — a 500 — and `"-1"` produced a negative coefficient,
+    hence a negative `amount` that `preview` returned happily and
+    `save_calculation` turned into an `amount >= 0` CHECK violation, another
+    500. Above 1 is refused too: a multiplier that RAISES the fee is not a
+    benefit."""
+    response = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "coefficient": "1.5",
+            "quantity_unit": "ha",
+            "benefit_modifiers": {benefit_category: modifier},
+            "effective_from": "2030-04-01",
+            "basis": "t",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("livestock_group", "large_adults"), ("quantity_unit", "furlong")],
+)
+async def test_an_out_of_range_enum_is_a_422_not_a_500(
+    tariffs_maker_client: AsyncClient, grazing_activity_id: uuid.UUID, field: str, value: str
+) -> None:
+    """I8: neither field had a schema bound. `livestock_group` had a DB CHECK,
+    so a typo flushed into an `IntegrityError` `main.py` does not handle — a
+    500, not a 422 — and `quantity_unit` had no bound on EITHER side, so any
+    string was storable and was copied verbatim into an immutable
+    calculation's `breakdown`. Both are `Literal`s now, built from the same
+    tuples the DB CHECKs are (migration 0013 adds the missing one)."""
+    payload = {
+        "activity_type_id": str(grazing_activity_id),
+        "coefficient": "0.5",
+        "quantity_unit": "head",
+        "effective_from": "2035-01-01",
+        "basis": "t",
+    } | {field: value}
+    response = await tariffs_maker_client.post("/api/v1/tariffs", json=payload)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_patching_a_draft_tariff_updates_only_the_given_fields(

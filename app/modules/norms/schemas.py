@@ -5,10 +5,100 @@ lose the exactness the whole stage is built on."""
 
 import uuid
 from datetime import date, datetime
-from decimal import Decimal
-from typing import Annotated, Any
+from decimal import Decimal, InvalidOperation
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_serializer
+
+
+def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
+    """Ruling 20's multiplier, bounded (I7, final review). The values reach
+    `calculator._apply_benefit` as `tariff.coefficient * Decimal(modifier)`
+    with no guard of their own, so `"abc"` was an uncaught `InvalidOperation`
+    (a 500) and `"-1"` produced a negative coefficient — a negative `amount`
+    that `preview` returned happily and `save_calculation` turned into an
+    `amount >= 0` CHECK violation, i.e. another 500. Every other numeric field
+    on this schema carries a bound; this one carried none.
+
+    `0 <= modifier <= 1`: a benefit reduces a fee. A multiplier above 1 would
+    RAISE it, which is not a benefit under any reading of VMQ 278, so it is
+    refused rather than stored.
+
+    Kept as `dict[str, str]` rather than `dict[str, Decimal]` on purpose: the
+    column is JSONB and the stock `json.dumps` rejects `Decimal` outright
+    (lesson), so the wire and storage form stays the string the calculator
+    already parses.
+
+    NOT validated here, and cannot be at this layer: whether the applicant
+    CLAIMING a benefit is actually entitled to it. That needs the applicant
+    record — stage 3.9's, see `CalculationIn.benefit_code`."""
+    if value is None:
+        return None
+    for code, modifier in value.items():
+        try:
+            parsed = Decimal(modifier)
+        except InvalidOperation as exc:
+            raise ValueError(f"benefit modifier for {code!r} is not a number") from exc
+        if not (Decimal("0") <= parsed <= Decimal("1")):
+            raise ValueError(f"benefit modifier for {code!r} must be between 0 and 1")
+    return value
+
+
+BenefitModifiers = Annotated[dict[str, str] | None, AfterValidator(_benefit_modifiers)]
+
+# The DB CHECKs these mirror live in migrations 0011 (`livestock_group_valid`)
+# and 0013 (`quantity_unit_valid`). Unbounded, a typo flushed into an
+# `IntegrityError` that `main.py` does not handle — a 500 rather than a 422
+# (I8, final review), the same defect class `create_versioned` already guards
+# for `activity_type_id`.
+#
+# Spelled out rather than `Literal[*LIVESTOCK_GROUPS]`: pyright rejects a
+# starred VARIABLE in a type expression ("Variable not allowed in type
+# expression"), and a `Literal` is exactly the place where a type checker has
+# to see the members. That makes these a second copy of the tuples the models
+# build their CHECKs from, so — per the lesson on constraint strings
+# duplicated in Python tuples — the two sides are asserted equal in
+# `tests/modules/norms/test_models.py`, which is the one thing that keeps a
+# value added on one side from becoming a 500 on the other.
+LivestockGroup = Literal["large_adult", "large_young", "small_adult", "small_young"]
+QuantityUnit = Literal["head", "ton", "hive", "ha", "person_day", "m3", "unit"]
+
+# A recurring MM-DD boundary (ruling 14). ASCII class written out rather than
+# `\d`, which is Unicode-aware in Python but not in a Postgres CHECK (lesson)
+# — the same dialect rule this project applies to every stored pattern.
+MonthDay = Annotated[str, Field(pattern=r"^[0-9]{2}-[0-9]{2}$")]
+
+
+class SeasonWindow(BaseModel):
+    """One grazing window. `from` is a Python keyword, so the field is
+    `from_` with an alias — which is why `create_norm`/`update_norm` dump
+    these `by_alias=True`, keeping the STORED JSONB in the `{"from": ...,
+    "to": ...}` shape `checks._in_window` reads."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: MonthDay = Field(alias="from")
+    to: MonthDay
+
+
+class Season(BaseModel):
+    """`season` used to be free-form JSONB written straight through from the
+    request (I5, final review). A window missing `from`/`to` raised a
+    `KeyError` INSIDE a check — an uncaught 500 on `POST
+    /calculations/preview`, not a domain error — and a non-string value was a
+    `TypeError` the same way."""
+
+    windows: list[SeasonWindow] = Field(default_factory=list)
+
+
+class Rotation(BaseModel):
+    """`rest_years` as INTEGERS. Written as strings (`{"rest_years":
+    ["2027"]}` — the shape a JSON form happily produces) the rotation check's
+    `if year in rest_years` compared an `int` against a `str` and passed
+    silently for a resting year: a fail-open on a BLOCKING check from a
+    plausible data-entry mistake, with no error anywhere (I5)."""
+
+    rest_years: list[int] = Field(default_factory=list)
 
 
 class RuleParameterIn(BaseModel):
@@ -46,10 +136,10 @@ class RuleParameterOut(BaseModel):
 
 class TariffIn(BaseModel):
     activity_type_id: uuid.UUID
-    livestock_group: str | None = None
+    livestock_group: LivestockGroup | None = None
     coefficient: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)]
-    quantity_unit: str
-    benefit_modifiers: dict[str, str] | None = None
+    quantity_unit: QuantityUnit
+    benefit_modifiers: BenefitModifiers = None
     effective_from: date
     effective_to: date | None = None
     basis: Annotated[str, Field(min_length=1, max_length=500)]
@@ -61,8 +151,8 @@ class TariffPatch(BaseModel):
     patch for the same reason `RuleParameterPatch` excludes `code`."""
 
     coefficient: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)] | None = None
-    quantity_unit: str | None = None
-    benefit_modifiers: dict[str, str] | None = None
+    quantity_unit: QuantityUnit | None = None
+    benefit_modifiers: BenefitModifiers = None
     effective_from: date | None = None
     effective_to: date | None = None
     basis: str | None = None
@@ -91,8 +181,8 @@ class NormIn(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
-    season: dict[str, Any] | None = None
-    rotation: dict[str, Any] | None = None
+    season: Season | None = None
+    rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
     effective_from: date
     effective_to: date | None = None
@@ -103,8 +193,8 @@ class NormPatch(BaseModel):
     the same way `TariffPatch` excludes its own key fields."""
 
     yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
-    season: dict[str, Any] | None = None
-    rotation: dict[str, Any] | None = None
+    season: Season | None = None
+    rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
     effective_from: date | None = None
     effective_to: date | None = None

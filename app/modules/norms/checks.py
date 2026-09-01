@@ -80,11 +80,25 @@ def first_blocking_error(results: list[CheckResult]) -> DomainError | None:
     return None
 
 
-def _in_window(day: date, window: Mapping[str, str]) -> bool:
+def _in_window(day: date, window: Any) -> bool:
     """A window is a recurring MM-DD range (ruling 14). A window whose `from` is
     later than its `to` wraps the new year — winter pasture — and a day is inside
-    it when it is after `from` OR before `to`, not both."""
-    start, end = window["from"], window["to"]
+    it when it is after `from` OR before `to`, not both.
+
+    Reads defensively, and fails CLOSED (I5, final review). `schemas.Season`
+    now refuses a malformed window at the edge, but `norms.season` is a JSONB
+    column that has been free-form until today, so a row written before that
+    validation existed can still hold anything. This used to be
+    `window["from"]` — a `KeyError` raised INSIDE a check, i.e. an uncaught
+    500 on `POST /calculations/preview` rather than a domain answer, and a
+    `TypeError` the same way for a non-string bound. A window that cannot be
+    read simply does not cover the day, so an unreadable season blocks
+    instead of passing."""
+    if not isinstance(window, Mapping):
+        return False
+    start, end = window.get("from"), window.get("to")
+    if not isinstance(start, str) or not isinstance(end, str):
+        return False
     stamp = day.strftime("%m-%d")
     return start <= stamp <= end if start <= end else stamp >= start or stamp <= end
 
@@ -123,7 +137,14 @@ def _rotation_check(
     `rotation` configured means no rest years at all, which is a confident
     `pass` (unlike an unconfigured season, absence here is a definite fact, not
     an unanswered question)."""
-    rest_years = (rotation or {}).get("rest_years", [])
+    raw_rest_years = (rotation or {}).get("rest_years") or []
+    # Coerced, not trusted (I5, final review). `schemas.Rotation` now types
+    # these as integers, but a row written before that validation existed can
+    # hold `{"rest_years": ["2027"]}` — the shape a JSON form happily produces
+    # — and `if year in rest_years` compared an `int` against a `str`, passing
+    # SILENTLY for a resting year: a fail-open on a blocking check. Anything
+    # that will not convert is dropped rather than crashing a check.
+    rest_years = {int(y) for y in raw_rest_years if str(y).lstrip("-").isdigit()}
     for year in range(period_from.year, period_to.year + 1):
         if year in rest_years:
             return {

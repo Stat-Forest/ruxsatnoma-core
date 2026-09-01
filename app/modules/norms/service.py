@@ -101,6 +101,38 @@ async def _holds_tariffs_publish(db: AsyncSession, actor: User) -> bool:
     return TARIFFS_PUBLISH in await auth_repo.permission_codes(db, actor)
 
 
+async def _assert_benefit_codes(db: AsyncSession, payload: Any) -> None:
+    """Ruling 20 defines `benefit_modifiers`' KEYS as `benefit_categories`
+    classifier item codes, but nothing checked them (I7, final review): a typo
+    created a benefit nobody can claim, or one nobody intended. Validated the
+    same way `activity_type_id` already is here, through `admin.repo` rather
+    than a direct `classifier_items` query (module boundary, 'Reference data').
+
+    `RuleParameterIn` has no such field, so `getattr(..., None)` skips this
+    for a parameter without a per-kind branch — the same shape the
+    `activity_type_id` guard below uses.
+
+    Resolved against the items active TODAY: a tariff dated into the future is
+    still drafted against the benefit list as it stands, and a category that
+    has been withdrawn should not be attachable to a new rate.
+
+    What this does NOT and cannot answer: whether the applicant who later
+    CLAIMS one of these codes is entitled to it. That is the application's
+    fact, not the tariff's — stage 3.9 (see `schemas.CalculationIn`)."""
+    modifiers = getattr(payload, "benefit_modifiers", None)
+    if not modifiers:
+        return
+    classifier = await admin_repo.get_classifier_by_code(db, "benefit_categories")
+    known = (
+        {item.code for item in await admin_repo.list_classifier_items(db, classifier.id)}
+        if classifier is not None
+        else set()
+    )
+    unknown = sorted(set(modifiers) - known)
+    if unknown:
+        raise err("ERR-VAL-001", details={"reason": "unknown_benefit_category", "codes": unknown})
+
+
 async def create_versioned(db: AsyncSession, kind: _Versioned, payload: Any, *, actor: User) -> Any:
     """A fresh draft. No maker-checker or period check yet — those only bind a
     PUBLISHED row (ruling 10), so two drafts (or a draft and a published row)
@@ -116,6 +148,7 @@ async def create_versioned(db: AsyncSession, kind: _Versioned, payload: Any, *, 
         known = await admin_repo.list_activity_types(db)
         if not any(activity.id == activity_type_id for activity in known):
             raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    await _assert_benefit_codes(db, payload)
     row = kind.model(**payload.model_dump(), status="draft", created_by=actor.id)
     db.add(row)
     await db.flush()
@@ -147,6 +180,9 @@ async def update_versioned(
     row = await _row_or_404(db, kind, row_id)
     if row.status != "draft":
         raise err("ERR-NORM-005", details={"reason": "not_draft"})
+    # A PATCH can set `benefit_modifiers` too, so the same guard applies here —
+    # validating only on create would leave the hole open one HTTP verb over.
+    await _assert_benefit_codes(db, patch)
     before = _snapshot(row)
     for field, value in patch.model_dump(exclude_unset=True).items():
         setattr(row, field, value)
@@ -430,7 +466,10 @@ async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm
         # IntegrityError has no handler in main.py and would surface as
         # ERR-SYS-001/500.
         raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
-    norm = Norm(**payload.model_dump(), status="draft", created_by=actor.id)
+    # `by_alias=True` so `SeasonWindow.from_` is stored as `"from"` — the shape
+    # `checks._in_window` reads and every existing row already has (I5). No
+    # other field on this payload carries an alias, so nothing else moves.
+    norm = Norm(**payload.model_dump(by_alias=True), status="draft", created_by=actor.id)
     db.add(norm)
     await db.flush()
     # A caller-supplied fixed-scale NUMERIC (yield_c_per_ha) round-trips at the
@@ -460,7 +499,7 @@ async def update_norm(
     await _assert_norm_zone(db, actor, norm.contour_id)
     if norm.status not in ("draft", "review"):
         raise err("ERR-NORM-005", details={"reason": "not_draft"})
-    fields = patch.model_dump(exclude_unset=True)
+    fields = patch.model_dump(exclude_unset=True, by_alias=True)
     if fields.get("geobotanic_doc_id") is not None:
         await _assert_doc_active(db, fields["geobotanic_doc_id"], reason="geobotanic_doc_required")
     effective_from = fields.get("effective_from", norm.effective_from)

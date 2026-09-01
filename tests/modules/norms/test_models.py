@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import date
+from typing import get_args
 
 import pytest
 from sqlalchemy import text
@@ -9,8 +10,11 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import uuid7
+from app.modules.admin.models import QUANTITY_UNITS
 from app.modules.auth.models import User
 from app.modules.gis.models import Contour
+from app.modules.norms.models import LIVESTOCK_GROUPS
+from app.modules.norms.schemas import LivestockGroup, QuantityUnit
 
 pytestmark = pytest.mark.asyncio
 
@@ -163,3 +167,15 @@ async def test_a_calculation_cannot_be_updated_or_deleted(
             text("DELETE FROM calculations WHERE id = :id").bindparams(id=calculation_id)
         )
     await db.rollback()
+
+
+async def test_the_schema_literals_match_the_tables_own_check_constraints() -> None:
+    """The one guard against `schemas.LivestockGroup`/`QuantityUnit` drifting
+    from the tuples the CHECKs are built from (lesson: constraint strings
+    duplicated in Python tuples are two sources of truth). They have to be
+    written out — pyright rejects a starred variable inside `Literal` — so a
+    value added on one side and forgotten on the other would otherwise be a
+    422 that should have been a 201, or an IntegrityError 500 that should have
+    been a 422."""
+    assert set(get_args(LivestockGroup)) == set(LIVESTOCK_GROUPS)
+    assert set(get_args(QuantityUnit)) == set(QUANTITY_UNITS)

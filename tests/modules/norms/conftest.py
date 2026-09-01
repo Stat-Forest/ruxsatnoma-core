@@ -378,6 +378,41 @@ async def published_coef_sb(engine) -> AsyncIterator[None]:
 
 
 @pytest.fixture
+async def benefit_category(engine) -> AsyncIterator[str]:
+    """One `benefit_categories` classifier item, so a tariff can legitimately
+    carry a `benefit_modifiers` key (I7: the keys are validated against the
+    classifier now, and VMQ 278's real benefit list has NOT arrived from the
+    Agency yet — `tz/12` #2 — so the seeded classifier is empty and no code
+    resolves without this).
+
+    Its own session + teardown, the `published_coef_sb` pattern: a
+    `_client_for` client commits `db` before every request (lesson), so a row
+    added through the test's own session would survive the rollback and
+    accumulate in the shared, persistent test database. The code carries a
+    random suffix as well, so two runs can never collide on
+    `uq_classifier_items_active_code`."""
+    code = f"veteran_{uuid.uuid4().hex[:8]}"
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        await own_db.execute(
+            text(
+                "INSERT INTO classifier_items "
+                "(id, classifier_id, code, name, valid_from, sort_order, status) "
+                "SELECT :id, c.id, :code, CAST(:name AS jsonb), DATE '2020-01-01', 0, 'active' "
+                "FROM classifiers c WHERE c.code = 'benefit_categories'"
+            ).bindparams(id=uuid7(), code=code, name='{"en": "Veteran (test)"}')
+        )
+        await own_db.commit()
+        try:
+            yield code
+        finally:
+            await own_db.execute(
+                text("DELETE FROM classifier_items WHERE code = :code").bindparams(code=code)
+            )
+            await own_db.commit()
+
+
+@pytest.fixture
 def param_row(db: AsyncSession):
     async def _insert(
         code: str,
