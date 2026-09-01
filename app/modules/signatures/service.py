@@ -20,7 +20,7 @@ from app.modules.auth.models import User
 from app.modules.integrations.adapters.eimzo import EimzoCertificateInfo, get_eimzo_adapter
 from app.modules.signatures import repo
 from app.modules.signatures.models import Certificate, Signature
-from app.modules.signatures.verify import build_verdict
+from app.modules.signatures.verify import Verdict, build_verdict
 
 # design/01 rule 6 / CLAUDE.md audit invariant: "<object>.<verb>" in English,
 # the constant lives in the acting module. Every attempt against this action —
@@ -46,37 +46,56 @@ async def get_for_object(
 async def bind_certificate(
     db: AsyncSession, *, info: EimzoCertificateInfo, user: User
 ) -> Certificate:
-    """Get-or-create the certificate `info` identifies, bound to `user`
-    (ruling 4: bound on first use — the DB-only half of it: this is the
-    automatic path a successful `sign()` takes, not the explicit `POST
-    /certificates` registration route, which is where ruling 4's fuller
-    PINFL/TIN ownership proof belongs).
+    """Get-or-create the certificate `info` identifies, bound to `user` once
+    ownership is proven — Task 4's own brief only checked the DB `user_id`;
+    ruling 4's fuller text additionally requires the PINFL/TIN proof `auth`
+    already applies to legal representations, and fix round 1 (ruling 1)
+    closes that gap here, in the automatic path every `sign()` call takes.
+    Task 7's explicit `POST /certificates` route enforces the same rule on
+    its own, rarer path; leaving the proof there alone would mean an unknown
+    `(serial_number, issuer)` pair is bound to whoever presents it first
+    through THIS path, unchecked.
 
-    Three outcomes:
-    - unknown -> create it, bound to `user`.
-    - known and not yet claimed by anyone (`user_id IS NULL`) -> bind it to
-      `user` now.
+    Four outcomes:
+    - unknown, and `info.pinfl_or_stir` is the caller's own PINFL -> create
+      it, bound to `user`.
+    - unknown, but `info.pinfl_or_stir` is NOT the caller's own PINFL ->
+      create it anyway, as evidence that it was presented, but leave it
+      UNBOUND (`user_id` stays `None`). This function has no document,
+      purpose or object to hang a `signatures` row on, so it does not raise
+      here — it returns the unbound row and lets `sign()`, which has that
+      context, read `cert.user_id != user.id` off it and write the invalid
+      signature row itself. An organisation certificate (a TIN rather than a
+      personal PINFL) belongs to this same branch: proving it would need an
+      effective-representation check, and `auth.service` exposes no usable
+      entry point for that today (only `auth.repo.get_effective_representation`
+      does, and reaching a sibling module's repo directly is exactly what
+      "cross-module calls go through the other module's service" forbids) —
+      flagged as BLOCKED rather than guessed at. Until that entry point
+      exists, an organisation certificate is refused the same fail-closed way
+      as any other PINFL mismatch.
+    - known and not yet claimed by anyone (`user_id IS NULL`) -> the exact
+      same first-bind decision as "unknown", by the exact same rule.
     - known and owned by someone else -> refuse. A person presenting a key
-      that is not theirs is exactly as serious as a revoked certificate, so it
-      takes the same evidence-then-raise path — except this function has no
-      document or purpose to hang a `signatures` row on (its own signature
-      carries neither), so its evidence is the audit entry alone: write it,
-      commit, and only THEN raise, or the raise rolls the entry back with it.
+      that is not theirs is exactly as serious as a revoked certificate, so
+      it takes the same evidence-then-raise path — except this function has
+      no document or purpose to hang a `signatures` row on (its own
+      signature carries neither), so its evidence is the audit entry alone:
+      write it, commit, and only THEN raise, or the raise rolls the entry
+      back with it.
 
-    `unbound_at` (Task 7's column) plays no part in any of this. Task 7's own
-    unbind route sets ONLY `unbound_at`, never `user_id` — pre-flight ruling
-    P3 draws that line on purpose (`status` is the certificate's PKI state,
-    `unbound_at` is our own list-membership state, and a certificate a
-    signature references must keep resolving forever). So a certificate the
-    owner unbound still has `user_id` pointing at them, still reaches the
-    "owned by this user" branch below untouched, and signs exactly as before
-    — nothing here "resurrects" a binding, because none was ever cleared.
-    Revocation, the one thing that SHOULD stop a certificate from signing
-    again, is `status`, reconciled separately in `_reconcile_status`.
+    `unbound_at` (Task 7's column) plays a part in exactly one branch here:
+    the signer IS this certificate's already-proven owner, re-signing with a
+    key they had previously unbound from their own cabinet list. Unbinding is
+    a convenience ("stop listing this key"), never a revocation — revocation
+    is `status`, reconciled separately in `_reconcile_status`, and the
+    verdict already refuses on it — so signing again simply re-lists the key
+    (fix round 1, ruling 2). A certificate owned by someone else stays
+    refused above regardless of its own `unbound_at`.
     """
     cert = await repo.get_certificate_by_identity(db, info.serial_number, info.issuer)
     if cert is None:
-        return await repo.insert_certificate(db, info=info, user_id=user.id)
+        cert = await repo.insert_certificate(db, info=info, user_id=None)
     if cert.user_id is not None and cert.user_id != user.id:
         await audit.log(
             db,
@@ -90,7 +109,14 @@ async def bind_certificate(
         await db.commit()
         raise err("ERR-SIGN-001", details={"reason": "certificate_owned_by_another_user"})
     if cert.user_id is None:
-        cert.user_id = user.id
+        if info.pinfl_or_stir == user.pinfl:
+            cert.user_id = user.id
+            await db.flush()
+        # else: ownership unproven — leave `cert` unbound. `sign()` reads
+        # `cert.user_id != user.id` off the return value and refuses there,
+        # where it has the context to record the attempt as evidence.
+    elif cert.unbound_at is not None:
+        cert.unbound_at = None
         await db.flush()
     return cert
 
@@ -124,7 +150,11 @@ async def sign(
     Order: hash the bytes WE were handed (never trust the envelope's own claim
     of what it signed) -> verify -> bind the certificate the envelope names
     (may itself refuse and raise — see `bind_certificate`) -> reconcile its
-    live status -> build the verdict -> refuse a repeat of an already-signed
+    live status -> build the verdict -> if `bind_certificate` left the
+    certificate unbound (ownership unproven, fix round 1 ruling 1), override
+    the verdict to invalid with reason="certificate_pinfl_mismatch" — a
+    crypto-valid signature from a certificate that is not provably the
+    caller's own is still refused -> refuse a repeat of an already-signed
     purpose, checked only once we know this attempt would otherwise have been
     valid (an invalid attempt can never occupy the slot — `uq_signatures_valid_
     purpose` only covers `verification_status = 'valid'` rows, so checking
@@ -166,6 +196,18 @@ async def sign(
     await _reconcile_status(db, cert, live_status)
 
     verdict = build_verdict(result, cert_status=cert.status, now=datetime.now(UTC))
+    if cert.user_id != user.id:
+        # Ruling 4's fuller ownership proof (fix round 1, ruling 1):
+        # `bind_certificate` left this certificate unbound rather than bind
+        # it to `user` — see its own docstring for the full reasoning.
+        # Ownership is a stronger gate than "the bytes verify", so this
+        # overrides whatever `build_verdict` decided, and reuses the exact
+        # same evidence-then-raise tail as every other invalid verdict below.
+        verdict = Verdict(
+            status="invalid",
+            reason="certificate_pinfl_mismatch",
+            record={**verdict.record, "reason": "certificate_pinfl_mismatch"},
+        )
 
     if verdict.status == "valid":
         # Only a would-be-valid insert can conflict with the partial unique

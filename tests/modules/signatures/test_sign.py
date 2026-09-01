@@ -1,6 +1,7 @@
 import secrets
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -140,3 +141,80 @@ async def test_a_signature_over_other_bytes_is_refused_and_still_recorded(db, a_
     # the failed attempt is evidence and is kept (ruling 8)
     rows = await service.get_for_object(db, object_type="permit", object_id=OBJ)
     assert [r.verification_status for r in rows] == ["invalid"]
+
+
+@pytest.mark.asyncio
+async def test_a_certificate_whose_pinfl_differs_from_the_caller_is_refused(db, a_user):
+    """Fix round 1, ruling 1: ownership must be proven before a first bind,
+    not just DB `user_id`. A stranger's PINFL embedded in the envelope is
+    refused even though nothing yet in the DB says the certificate belongs
+    to anyone else."""
+    stranger_pinfl = _pinfl()
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=OBJ,
+            purpose="permit_head",
+            document=DOC,
+            pkcs7=_pkcs7(stranger_pinfl),
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "certificate_pinfl_mismatch"
+    # the attempt is still evidence, same as any other invalid verdict
+    # (ruling 8) — the certificate itself is recorded but stays unbound.
+    rows = await service.get_for_object(db, object_type="permit", object_id=OBJ)
+    assert [r.verification_status for r in rows] == ["invalid"]
+    cert = await service.get_certificate(db, rows[0].certificate_id)
+    assert cert.user_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_certificate_whose_pinfl_matches_the_caller_binds_normally(db, a_user):
+    """The other half of ruling 1: the common case — the certificate's own
+    PINFL is the caller's own — must keep working exactly as before."""
+    row = await service.sign(
+        db,
+        object_type="permit",
+        object_id=OBJ,
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(a_user.pinfl),
+        user=a_user,
+    )
+    assert row.verification_status == "valid"
+    cert = await service.get_certificate(db, row.certificate_id)
+    assert cert.user_id == a_user.id
+
+
+@pytest.mark.asyncio
+async def test_signing_with_a_previously_unbound_own_certificate_rebinds_it(db, a_user):
+    """Fix round 1, ruling 2: unbinding is a cabinet convenience ("stop
+    listing this key"), not a revocation — signing again with a key the
+    caller had unbound from their own list simply re-lists it."""
+    first = await service.sign(
+        db,
+        object_type="permit",
+        object_id=OBJ,
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(a_user.pinfl),
+        user=a_user,
+    )
+    cert = await service.get_certificate(db, first.certificate_id)
+    cert.unbound_at = datetime.now(UTC)
+    await db.flush()
+
+    await service.sign(
+        db,
+        object_type="permit",
+        object_id=uuid.uuid4(),
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(a_user.pinfl),
+        user=a_user,
+    )
+    cert_again = await service.get_certificate(db, first.certificate_id)
+    assert cert_again.unbound_at is None

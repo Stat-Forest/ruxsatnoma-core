@@ -32,11 +32,14 @@ async def get_certificate_by_identity(
 
 
 async def insert_certificate(
-    db: AsyncSession, *, info: EimzoCertificateInfo, user_id: uuid.UUID
+    db: AsyncSession, *, info: EimzoCertificateInfo, user_id: uuid.UUID | None
 ) -> Certificate:
-    """A brand-new certificate is always `active` and bound to whoever first
-    presented it (ruling 4) — the service decides WHETHER to call this;
-    this function only ever writes the happy path."""
+    """A brand-new certificate is always `active`, written with whatever
+    `user_id` the caller passes — the presenting user's id once ownership is
+    proven, `None` when it is not yet (fix round 1, ruling 1: an unproven
+    first bind is still recorded as evidence, just left unbound). The
+    service decides both WHETHER to call this and what `user_id` to pass;
+    this function only ever writes the row it's given."""
     cert = Certificate(
         user_id=user_id,
         serial_number=info.serial_number,

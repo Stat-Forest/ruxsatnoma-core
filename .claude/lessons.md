@@ -1241,3 +1241,31 @@ Rules for this file:
   — parse and bound-check share one `try`, one `except InvalidOperation`.
   Grep for the same split (`Decimal(...)` in a `try`, a bound comparison
   after the `except`) before adding the next `Decimal`-bounded validator.
+
+## A refusal discovered inside a narrow helper still needs full-context evidence — signal it back, don't duplicate the tail
+
+- **Rule:** When a helper that lacks a document/purpose/object cannot itself
+  write the evidence row a refusal needs, don't raise from inside the
+  helper and don't hand it more parameters just so it can — leave the
+  affected row in a state the caller can detect (here: not bound), return
+  normally, and let the full-context caller override its own verdict and
+  fall through the evidence-then-raise tail it already has.
+- **Why:** `signatures.bind_certificate(db, *, info, user)` has no
+  `object_type`/`object_id`/`purpose` — its own fixed signature, unchanged
+  since Task 4 — so it structurally cannot construct a `signatures` row.
+  Ruling 4's fuller PINFL ownership proof (fix round 1, ruling 1) still had
+  to produce one ("a person presenting someone else's key is exactly the
+  event stage 4.2's risk reporting exists to see"), and `signatures` has no
+  `verification_status` value but `'valid'`/`'invalid'` — an audit-only
+  refusal, the shape the *existing* "owned by another user" branch already
+  uses, could never satisfy that. `bind_certificate` instead leaves an
+  unproven certificate row UNBOUND (`user_id` stays `None`) and returns it;
+  `sign()` reads `cert.user_id != user.id` off the result and overrides its
+  own `Verdict` to `invalid`, which reuses the exact insert-row/audit/commit/
+  raise tail every other invalid verdict already goes through — zero
+  duplicated evidence-writing code.
+- **How to apply:** Before widening a helper's signature or making it raise
+  with partial evidence, ask whether its caller already has an
+  evidence-then-raise tail the helper could feed instead — a dataclass
+  `Verdict`/result object with a `replace`-able outcome, read by the caller
+  right after the helper returns, composes better than a second raise site.
