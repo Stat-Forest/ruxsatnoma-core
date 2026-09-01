@@ -16,7 +16,13 @@ lean on. The five `certificate_*` keys are therefore always present, even as
 `None` when `subject_certificate` is `None` (a verification that failed
 before a certificate could be parsed) — a reader must be able to tell "there
 was no certificate" from "this record predates the field", and only a
-consistently shaped record allows that."""
+consistently shaped record allows that.
+
+The same absence of a hard contract on the adapter's output is why
+`build_verdict` fails closed rather than open: a `status_code` of `1` does
+not by itself guarantee a certificate was ever parsed, so a missing
+`subject_certificate` or `signed_at` reads as `"invalid"` /
+`certificate_missing`, never as an unexamined `"valid"`."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,7 +47,7 @@ class Verdict:
 
 
 def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime) -> Verdict:
-    """Three checks, in an order that is itself the ruling, not an accident of
+    """Four checks, in an order that is itself the ruling, not an accident of
     control flow:
 
     1. The adapter's own `status_code` — a cryptographically broken signature
@@ -49,14 +55,25 @@ def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime)
        broken regardless of what the certificate's standing is.
     2. The certificate's current status (`revoked`/`expired`) — looked up by
        the caller, passed in as `cert_status`, never re-derived here.
-    3. The validity window, compared against `result.signed_at` — **never
-       against `now`** (plan ruling 5). A certificate that legitimately expires
-       a year after a permit was signed must not retroactively invalidate that
-       permit; the trusted timestamp is what makes that comparison meaningful.
+    3. Fails closed: nothing in `EimzoVerification` enforces that a
+       `status_code` of `1` came with a certificate actually examined —
+       `subject_certificate` and `signed_at` are each independently `| None`,
+       and `design/04-integrations.md` §2.2 promises only a
+       `subjectCertificateInfo` whose presence is the provider's to control.
+       Either being `None` here is `certificate_missing`, not `"valid"`: a
+       verifier that answers "valid" without ever looking at a certificate is
+       the exact failure this module exists to prevent, and naming the
+       missing piece keeps the failure recoverable in one retry.
+    4. Only once both are in hand: the validity window, compared against
+       `signed_at` — **never against `now`** (plan ruling 5). A certificate
+       that legitimately expires a year after a permit was signed must not
+       retroactively invalidate that permit; the trusted timestamp is what
+       makes that comparison meaningful.
 
     The first check that finds a problem wins; `reason` stays `None` (and
-    `status` is `"valid"`) only if none of the three do."""
+    `status` is `"valid"`) only if none of the four do."""
     cert = result.subject_certificate
+    signed_at = result.signed_at
     reason: str | None = None
     if result.status_code != 1:
         reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")
@@ -64,9 +81,10 @@ def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime)
         reason = "certificate_revoked"
     elif cert_status == "expired":
         reason = "certificate_expired"
-    elif cert is not None and result.signed_at is not None:
-        if not (cert.valid_from <= result.signed_at <= cert.valid_to):
-            reason = "certificate_invalid_at_signing"
+    elif cert is None or signed_at is None:
+        reason = "certificate_missing"
+    elif not (cert.valid_from <= signed_at <= cert.valid_to):
+        reason = "certificate_invalid_at_signing"
 
     record: dict[str, Any] = {
         "status_code": result.status_code,
@@ -77,7 +95,7 @@ def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime)
         "certificate_valid_from": cert.valid_from.isoformat() if cert else None,
         "certificate_valid_to": cert.valid_to.isoformat() if cert else None,
         "timestamp_token": result.timestamp_token,
-        "signed_at": result.signed_at.isoformat() if result.signed_at else None,
+        "signed_at": signed_at.isoformat() if signed_at else None,
         "checked_at": now.isoformat(),
         "reason": reason,
         "raw": result.raw,

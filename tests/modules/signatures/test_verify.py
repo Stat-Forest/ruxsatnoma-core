@@ -19,7 +19,7 @@ def _result(status_code: int = 1, **kw):
     return EimzoVerification(
         status_code=status_code,
         subject_certificate=kw.get("cert", cert),
-        signed_at=NOW,
+        signed_at=kw.get("signed_at", NOW),
         timestamp_token="TS",
         raw={},
     )
@@ -82,3 +82,34 @@ def test_the_record_marks_a_missing_certificate_explicitly_rather_than_omitting_
     assert verdict.record["certificate_subject"] is None
     assert verdict.record["certificate_valid_from"] is None
     assert verdict.record["certificate_valid_to"] is None
+
+
+def test_a_missing_certificate_fails_closed_instead_of_passing_as_valid():
+    # status_code == 1 and an active cert_status must not, by themselves, be
+    # enough to call a signature valid — nothing enforces that the adapter
+    # actually examined a certificate (finding 1, fix round 2).
+    verdict = build_verdict(_result(cert=None), cert_status="active", now=NOW)
+    assert verdict.status == "invalid"
+    assert verdict.reason == "certificate_missing"
+
+
+def test_the_validity_window_is_checked_against_signed_at_not_now():
+    # signed_at falls outside the certificate's window; `now` sits
+    # comfortably inside it. If the code compared the window against `now`
+    # instead of `signed_at`, this would come back valid — the wrong answer.
+    result = _result(signed_at=NOW - timedelta(days=400))
+    verdict = build_verdict(result, cert_status="active", now=NOW)
+    assert verdict.status == "invalid"
+    assert verdict.reason == "certificate_invalid_at_signing"
+
+
+def test_a_certificate_that_expires_after_signing_does_not_invalidate_the_signature():
+    # Mirror of the test above (ruling 5): signed_at is inside the window,
+    # `now` is 400 days later — past valid_to. If the code compared the
+    # window against `now`, this would come back invalid. A permit signed
+    # while the certificate was good stays valid after the certificate
+    # expires.
+    result = _result(signed_at=NOW)
+    verdict = build_verdict(result, cert_status="active", now=NOW + timedelta(days=400))
+    assert verdict.status == "valid"
+    assert verdict.reason is None
