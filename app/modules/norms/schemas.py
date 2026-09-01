@@ -37,10 +37,14 @@ def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
     for code, modifier in value.items():
         try:
             parsed = Decimal(modifier)
+            if not (Decimal("0") <= parsed <= Decimal("1")):
+                raise ValueError(f"benefit modifier for {code!r} must be between 0 and 1")
         except InvalidOperation as exc:
+            # Catches both an unparsable string AND `Decimal("NaN")`, which
+            # parses cleanly but makes the bound comparison above raise
+            # InvalidOperation rather than return a bool (re-review of the
+            # I7 fix wave) — the comparison has to stay inside this `try`.
             raise ValueError(f"benefit modifier for {code!r} is not a number") from exc
-        if not (Decimal("0") <= parsed <= Decimal("1")):
-            raise ValueError(f"benefit modifier for {code!r} must be between 0 and 1")
     return value
 
 

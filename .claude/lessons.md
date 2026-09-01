@@ -1195,3 +1195,23 @@ Rules for this file:
   are the shape: the `Literal` carries a comment saying WHY it is spelled out
   and where the guard lives, and the guard is one `get_args` comparison per
   tuple. Any future enum-ish column gets the same pair, not a bare `str`.
+
+## `Decimal` ordering comparisons raise on NaN, not just construction
+
+- **Rule:** A validator that parses a `Decimal` from user input and then
+  bounds it with an ordering comparison (`<=`/`<`/`>`/`>=`) must keep the
+  comparison INSIDE the same `try`/`except InvalidOperation` as the parse —
+  "it parsed" is not "it is safe to compare".
+- **Why:** `Decimal("NaN")` parses without error; the exception comes one
+  line later, from the ordering operator itself. `InvalidOperation` is an
+  `ArithmeticError`, not a `ValueError`, so pydantic never converts it to a
+  422 — it escapes as a 500. Hit twice on the same field: I7's fix wrapped
+  only the parse in `norms.schemas._benefit_modifiers`, and the scoped
+  re-review of that fix caught `"NaN"` reaching `POST /tariffs` as a 500.
+  `"Infinity"`/`"-Infinity"` were unaffected — ordering against infinity
+  never raises, only NaN does — which is why they read as a plausible "it
+  already works" until actually tried.
+- **How to apply:** `norms/schemas.py::_benefit_modifiers` is the shape now
+  — parse and bound-check share one `try`, one `except InvalidOperation`.
+  Grep for the same split (`Decimal(...)` in a `try`, a bound comparison
+  after the `except`) before adding the next `Decimal`-bounded validator.

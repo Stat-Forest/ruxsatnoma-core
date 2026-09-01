@@ -149,7 +149,7 @@ async def test_patching_in_an_unknown_benefit_category_is_refused(
     assert patched.json()["error"]["details"]["reason"] == "unknown_benefit_category"
 
 
-@pytest.mark.parametrize("modifier", ["abc", "-1", "1.5"])
+@pytest.mark.parametrize("modifier", ["abc", "-1", "1.5", "NaN", "Infinity", "-Infinity"])
 async def test_a_benefit_modifier_outside_zero_to_one_is_refused(
     tariffs_maker_client: AsyncClient,
     haymaking_activity_id: uuid.UUID,
@@ -162,7 +162,16 @@ async def test_a_benefit_modifier_outside_zero_to_one_is_refused(
     hence a negative `amount` that `preview` returned happily and
     `save_calculation` turned into an `amount >= 0` CHECK violation, another
     500. Above 1 is refused too: a multiplier that RAISES the fee is not a
-    benefit."""
+    benefit.
+
+    `"NaN"` is the same defect class as `"abc"`, but slipped past the first
+    fix (re-review of the fix wave): `Decimal("NaN")` parses without error,
+    and the bound comparison then raises `InvalidOperation` — an
+    `ArithmeticError`, not a `ValueError` — which pydantic does not turn into
+    a 422. `"Infinity"`/`"-Infinity"` parse AND compare cleanly (ordering
+    against infinity never raises), so they were already refused correctly
+    through the normal out-of-bounds `ValueError`; kept here to pin that they
+    stay that way."""
     response = await tariffs_maker_client.post(
         "/api/v1/tariffs",
         json={
