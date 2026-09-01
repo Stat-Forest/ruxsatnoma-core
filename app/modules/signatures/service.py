@@ -775,10 +775,25 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     Per-original numbering also means a genuine REPEAT reverify of the SAME
     signature (plan ruling 5: "evidence, not a cache" — oversight must be
     able to write a second dated "still valid" a year later) lands on its
-    own fresh ordinal instead of colliding with the first — so, unlike
-    this route's own first attempt, there is no guard here forbidding a
-    repeat: `ERR-SIGN-004` stays this module's code for the UNRELATED
-    certificate-identity race in `bind_certificate` (Task 4) alone."""
+    own fresh ordinal instead of colliding with the first — a sequential
+    repeat is never refused.
+
+    Fix round 2 — the race, restored: fix round 1 removed the SAVEPOINT +
+    narrow `except IntegrityError` around this insert TOGETHER with the
+    pre-check it had been bundled with, which was one correction too many —
+    the pre-check (refusing a repeat outright) was wrong and stays gone,
+    but the RACE it also happened to guard against is real and separate.
+    Two `reverify()` calls for the SAME original, running concurrently,
+    both read `existing` above before either commits, so both compute the
+    identical `n` and the identical purpose string; when both verdicts land
+    on `"valid"` (the common case — same certificate, same live status),
+    the second flush loses a genuine collision on
+    `uq_signatures_valid_purpose`. Guarded the same SAVEPOINT +
+    narrow-`except` way `sign()` guards its own `ERR-SIGN-002` race, mapped
+    to `ERR-SIGN-004` (409, already this module's code for a certificate-
+    or-signature state conflict — reused, not a new code; `bind_certificate`
+    (Task 4)'s own identity race is the SAME code for a different
+    constraint, not the only thing this code means)."""
     original = await repo.get_signature(db, signature_id)
     if original is None:
         raise err("ERR-SYS-003")
@@ -823,19 +838,62 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     )
     n = already_reverified + 1
 
-    new_row = await repo.insert_signature(
-        db,
-        object_type=original.object_type,
-        object_id=original.object_id,
-        purpose=f"{original.purpose}:reverify:{n}",
-        signer_user_id=original.signer_user_id,
-        certificate_id=original.certificate_id,
-        doc_hash=original.doc_hash,
-        signature_value=original.signature_value,
-        signed_at=original.signed_at,
-        verification=record,
-        verification_status=new_status,
-    )
+    try:
+        # `begin_nested()` (a SAVEPOINT), not a bare call — fix round 2,
+        # restored after fix round 1 removed it TOGETHER with the pre-check
+        # it had been bundled with (see the docstring above). This insert
+        # can lose a genuine race between two concurrent reverify() calls
+        # for the SAME original, and recovering from THAT failure still
+        # needs to write an audit entry and commit on this SAME session
+        # afterward — a bare `db.flush()` caught by `except IntegrityError`
+        # with a plain `db.rollback()` would roll back the WHOLE
+        # transaction, not just this insert's own failed statement (lesson
+        # — `sign()`'s own identical SAVEPOINT carries the full reasoning).
+        async with db.begin_nested():
+            new_row = await repo.insert_signature(
+                db,
+                object_type=original.object_type,
+                object_id=original.object_id,
+                purpose=f"{original.purpose}:reverify:{n}",
+                signer_user_id=original.signer_user_id,
+                certificate_id=original.certificate_id,
+                doc_hash=original.doc_hash,
+                signature_value=original.signature_value,
+                signed_at=original.signed_at,
+                verification=record,
+                verification_status=new_status,
+            )
+    except IntegrityError as exc:
+        # IntegrityError IS a DBAPIError subclass — this narrow clause must
+        # be checked first (lesson). Only `uq_signatures_valid_purpose`'s
+        # own violation means "lost the ordinal race" — the `certificate_id`
+        # FK and the `verification_status` CHECK are integrity violations on
+        # this SAME insert too, and mapping either of THOSE to a conflict
+        # would report an untrue reason for a real defect.
+        # `exc.orig.__cause__` (not `exc.orig`) is what actually names the
+        # constraint (lesson). Anything other than this ONE constraint
+        # surfaces as itself, unmapped — the `begin_nested()` above already
+        # undid the failed insert either way, so a bare `raise` leaves `db`
+        # exactly as it was before this whole `try` started.
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "uq_signatures_valid_purpose":
+            raise
+        # Two concurrent reverify() calls for the SAME original computed the
+        # identical ordinal `n` and both verdicts landed on "valid" — a
+        # genuine race, never a repeat being refused (plan ruling 5: a
+        # repeat is legitimate and, run sequentially, succeeds on the next
+        # ordinal without ever reaching this except).
+        await audit.log(
+            db,
+            action=SIGNATURE_REVERIFY,
+            user_id=user.id,
+            object_type=original.object_type,
+            object_id=original.object_id,
+            result="denied",
+            basis="concurrent_reverify",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-004", details={"reason": "concurrent_reverify"}) from exc
 
     await audit.log(
         db,

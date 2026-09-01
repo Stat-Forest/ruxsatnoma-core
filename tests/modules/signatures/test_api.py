@@ -29,7 +29,7 @@ from app.main import create_app
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User, UserPermission
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
-from app.modules.signatures import service
+from app.modules.signatures import repo, service
 from app.modules.signatures.models import Signature
 from app.modules.signatures.permissions import REVERIFY, VIEW_ANY
 from tests.conftest import make_client
@@ -638,3 +638,77 @@ async def test_reverify_does_not_satisfy_a_missing_purpose(client_oversight, db:
 
     after = await service.missing_purposes(db, object_type="permit", object_id=obj_id)
     assert after == before  # the reverify record changed nothing about completeness
+
+
+@pytest.mark.asyncio
+async def test_reverify_race_maps_to_err_sign_004_but_a_sequential_repeat_still_succeeds(
+    db: AsyncSession, monkeypatch
+):
+    """Fix round 2: fix round 1 rightly removed the pre-check that refused a
+    SECOND reverify of an unchanged certificate outright (plan ruling 5: the
+    record is evidence, not a cache) -- but that pre-check and the SAVEPOINT
+    + narrow `except IntegrityError` guarding the insert were two different
+    things bundled under one guard, and removing the first took the second
+    down with it. The pre-check staying gone is Part 1 below: an ordinary
+    SEQUENTIAL repeat succeeds and lands on the next ordinal, the same
+    property `test_a_second_reverify_of_an_unchanged_certificate_succeeds_
+    with_the_next_ordinal` above already proves -- restated here so this
+    test stands on its own as the fix round 2 regression case. What
+    actually needs the guard back is the RACE: two reverify() calls for the
+    SAME original, running concurrently, both read `existing` before either
+    commits, so both compute the identical ordinal `n` and the identical
+    purpose string -- if both verdicts land on "valid" (the common case,
+    e.g. both re-checking the same untouched certificate), the second flush
+    loses a genuine collision on `uq_signatures_valid_purpose`, which must
+    surface as `ERR-SIGN-004`, never an uncaught 500. Part 2 forces exactly
+    that, the same "stands in for the race" idiom `test_sign.py`'s own
+    `test_a_racing_duplicate_signature_is_also_audited` uses: monkeypatch
+    the ordinal count stale so the real INSERT is what collides."""
+    user = await make_user(db, pinfl=_pinfl())
+    original = await service.sign(
+        db,
+        object_type="permit",
+        object_id=uuid.uuid4(),
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(DOC, user.pinfl),
+        user=user,
+    )
+    await db.commit()
+
+    # Part 1: an ordinary sequential repeat still succeeds -- fix round 1's
+    # own point, untouched by restoring the race guard.
+    first = await service.reverify(db, signature_id=original.id, user=user)
+    assert first.purpose == "permit_head:reverify:1"
+    assert first.verification_status == "valid"
+
+    second = await service.reverify(db, signature_id=original.id, user=user)
+    assert second.purpose == "permit_head:reverify:2"
+    assert second.id != first.id
+    assert second.verification_status == "valid"
+
+    # Part 2: force the race. Two concurrent reverify() calls would both
+    # read `existing` before either commits and compute the SAME ordinal --
+    # stood in for by monkeypatching the count stale, so the THIRD call
+    # recomputes ordinal 1 again and the REAL insert is what collides, on
+    # the slot `first` already occupies.
+    async def _stale_existing(db, *, object_type, object_id):
+        return []
+
+    monkeypatch.setattr(repo, "list_for_object", _stale_existing)
+
+    with pytest.raises(DomainError) as exc:
+        await service.reverify(db, signature_id=original.id, user=user)
+    assert exc.value.code == "ERR-SIGN-004"
+    assert exc.value.details == {"reason": "concurrent_reverify"}
+    # The losing flush aborted the transaction at the database level --
+    # clear it before this file's own autouse cleanup fixture reuses the
+    # same session (test_sign.py's identical race tests do the same).
+    await db.rollback()
+
+    # The stand-in has done its job; undo it before reading back real state,
+    # or this very read would go through it too and see an empty list.
+    monkeypatch.undo()
+    rows = await service.get_for_object(db, object_type="permit", object_id=original.object_id)
+    reverify_rows = [r for r in rows if r.id != original.id]
+    assert len(reverify_rows) == 2  # the race added no THIRD row -- the SAVEPOINT rolled it back
