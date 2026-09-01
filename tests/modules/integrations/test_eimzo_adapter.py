@@ -57,6 +57,37 @@ async def test_verify_attached_recovers_the_document_from_the_envelope():
 
 
 @pytest.mark.asyncio
+async def test_verify_attached_still_matches_after_document_b64_is_dropped_from_raw():
+    # Fix wave: `raw` must no longer carry `document_b64` (it round-tripped
+    # the entire signed document into stored evidence), but the ATTACHED
+    # path still needs it internally to recover the document from the
+    # envelope in the first place -- this proves the fix did not disturb
+    # that recovery, only what ends up in the returned `raw`.
+    adapter = get_eimzo_adapter()
+    pkcs7 = encode_mock_signature(
+        document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
+    )
+    result = await adapter.verify_attached(pkcs7=pkcs7)
+    assert result.status_code == 1  # the sha256 check inside still passed
+    assert "document_b64" not in result.raw
+    assert "document_sha256" in result.raw  # everything else in `raw` survives
+
+
+@pytest.mark.asyncio
+async def test_verify_detached_raw_never_carries_the_document_bytes():
+    # The DETACHED path never needed `document_b64` to begin with (the
+    # caller hands the document in separately) -- confirms the mock's own
+    # envelope construction doesn't leak it here either.
+    adapter = get_eimzo_adapter()
+    pkcs7 = encode_mock_signature(
+        document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
+    )
+    result = await adapter.verify_detached(document=b"the-document", pkcs7=pkcs7)
+    assert result.status_code == 1
+    assert "document_b64" not in result.raw
+
+
+@pytest.mark.asyncio
 async def test_garbage_pkcs7_is_a_verdict_not_an_exception():
     # verify_* reports a status code; it must not raise on malformed input the
     # way verify_signed_challenge does (that EimzoError is the unchanged login

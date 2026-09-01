@@ -129,6 +129,35 @@ async def test_changing_the_setting_changes_the_requirement_with_no_code_change(
     await service.require_complete(db, object_type="permit", object_id=obj)  # no raise
 
 
+async def test_required_purposes_parsing_tolerates_whitespace_and_a_trailing_comma(db):
+    # Task 6 (deferred minor): the comma-split handled these cases correctly
+    # by inspection, but only the clean default value had a test until now.
+    await _override(db, " permit_head , permit_chief_forester ,")
+    assert await service.required_purposes(db, "permit") == [
+        "permit_head",
+        "permit_chief_forester",
+    ]
+
+
+async def test_an_empty_override_is_rejected_and_falls_back_to_the_default(db):
+    """The edge Task 6 flagged as untested, checked directly rather than by
+    inspection: `settings_store.coerce` rejects an empty (or whitespace-
+    only) string as malformed ("expected text"), so `get_setting` logs
+    `system_setting_invalid` and falls back to the code DEFAULT rather than
+    letting `""` through -- `permit_required_signatures` can never actually
+    be switched off via an empty override the way one might expect; the
+    real 3+1 requirement stays in force. The only way `required_purposes`
+    returns `[]` is an object_type with NO entry in `_REQUIREMENT_SETTINGS`
+    at all (`"application"`, above) -- never an override of this key."""
+    await _override(db, "")
+    assert await service.required_purposes(db, "permit") == [
+        "permit_head",
+        "permit_chief_forester",
+        "permit_accountant",
+        "permit_recipient",
+    ]
+
+
 async def test_an_invalid_signature_never_satisfies_a_requirement(db, a_user):
     """RI-05 territory: a bad pkcs7 is stored as evidence (ruling 8) but must
     never count toward completeness -- only `verification_status == "valid"`

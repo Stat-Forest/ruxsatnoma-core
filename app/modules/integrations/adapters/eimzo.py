@@ -5,7 +5,6 @@ A legal-entity certificate carries the org STIR in `tin` (login) or
 `pinfl_or_stir` (documents) alongside the signer's pinfl."""
 
 import base64
-import binascii
 import hashlib
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -156,7 +155,10 @@ def _verify_envelope(pkcs7: str, document: bytes | None) -> EimzoVerification:
             valid_to=datetime.fromisoformat(data["valid_to"]),
         )
         signed_at = datetime.fromisoformat(data["signed_at"])
-    except ValueError, TypeError, KeyError, binascii.Error:
+    # Deliberately parenthesized, not the PEP 758 bare form (see
+    # core.settings_store.coerce for the reasoning). `binascii.Error` is a
+    # `ValueError` subclass already, so it needs no separate entry here.
+    except (ValueError, TypeError, KeyError):  # fmt: skip
         return _unparseable_signature()
     matches = hashlib.sha256(signed_bytes).hexdigest() == data.get("document_sha256")
     return EimzoVerification(
@@ -164,7 +166,20 @@ def _verify_envelope(pkcs7: str, document: bytes | None) -> EimzoVerification:
         subject_certificate=cert,
         signed_at=signed_at,
         timestamp_token=data.get("timestamp_token"),
-        raw=data,
+        # Fix wave: `document_b64` exists so THIS function can recover the
+        # attached document above -- it has no business surviving into the
+        # evidence a caller stores. `signatures.verify.build_verdict` copies
+        # `raw` verbatim into `record["raw"]`, and `service.sign()` stores
+        # that record whole in the append-only `signatures.verification`
+        # column, returned in full to every co-signer through
+        # `GET /signatures` -- so leaving the document's own bytes in here
+        # would silently contradict this module's own contract ("this module
+        # never stores the original document bytes", `verify.py`'s docstring
+        # and `reverify`'s) and roughly 4/3 the size of every future permit
+        # PDF into that table, per signature. Everything else in `data`
+        # (the certificate identity, `document_sha256`, the timestamp token)
+        # stays -- only this one key is adapter-internal plumbing.
+        raw={k: v for k, v in data.items() if k != "document_b64"},
     )
 
 

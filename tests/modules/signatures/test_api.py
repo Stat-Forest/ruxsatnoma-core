@@ -170,7 +170,7 @@ async def test_a_user_sees_only_their_own_certificates(client_a, client_b, bound
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_certificate_archives_it_and_keeps_the_signature_readable(
+async def test_deleting_a_certificate_unbinds_it_and_keeps_the_signature_readable(
     client_a, bound_cert_of_a, a_signature
 ):
     resp = await client_a.delete(f"{API}/certificates/{bound_cert_of_a}")
@@ -252,6 +252,41 @@ async def test_a_non_owner_without_view_any_cannot_read_signatures(client_b, a_s
 
 
 @pytest.mark.asyncio
+async def test_an_invalid_signature_attempt_does_not_earn_read_access(
+    client_b, user_b: User, a_signature: Signature, db: AsyncSession
+):
+    """Fix wave: `signed_by` used to treat holding ANY signature row --
+    valid or invalid -- as ownership. Once 3.9/3.11 expose a real signing
+    route, a stranger could deliberately submit a signature bound to fail
+    just to earn read access to the object's whole signature list -- a
+    doc-hash mismatch (never trusts the envelope's own claim of what it
+    signed) leaves user_b with exactly one INVALID row against `a_signature`'s
+    object (ruling 8: a failed attempt is still evidence), and that must not
+    be enough."""
+    pkcs7 = _pkcs7(DOC, user_b.pinfl)  # envelope signs DOC
+    with pytest.raises(DomainError):
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=a_signature.object_id,
+            purpose="permit_chief_forester",
+            document=b"tampered-bytes",  # mismatches what the envelope actually signed
+            pkcs7=pkcs7,
+            user=user_b,
+        )
+    await db.commit()
+
+    rows = await service.get_for_object(db, object_type="permit", object_id=a_signature.object_id)
+    assert {r.signer_user_id: r.verification_status for r in rows}[user_b.id] == "invalid"
+
+    resp = await client_b.get(
+        f"{API}/signatures?object_type=permit&object_id={a_signature.object_id}"
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+@pytest.mark.asyncio
 async def test_view_any_holder_can_read_signatures_they_did_not_sign(db: AsyncSession, a_signature):
     _, token, csrf = await signed_in_with(db, VIEW_ANY)
     await db.commit()
@@ -287,7 +322,11 @@ async def test_sys_admin_reads_anyones_signatures_without_an_explicit_grant(
 async def test_signature_list_is_ordered_by_signed_at_then_id(client_a, user_a: User, db):
     """Created out of order, with a genuine tie, so the response can only be
     right if the route sorts by `(signed_at, id)` -- without it, `items[0]`
-    depends on Postgres' own row order (pre-flight ruling P6)."""
+    depends on Postgres' own row order (pre-flight ruling P6). Uses four
+    REAL purposes from the default requirement set -- object_type="permit"
+    has one configured (fix wave: `sign()` now refuses any other purpose
+    for it), and a distinct purpose per call is what four VALID signatures
+    on one object needs anyway (`uq_signatures_valid_purpose`)."""
     obj_id = uuid.uuid4()
     base = datetime.now(UTC)
 
@@ -302,10 +341,10 @@ async def test_signature_list_is_ordered_by_signed_at_then_id(client_a, user_a: 
             user=user_a,
         )
 
-    third = await _sign("p3", timedelta(seconds=20))
-    first = await _sign("p1", timedelta(seconds=0))
-    tie_a = await _sign("p2a", timedelta(seconds=10))
-    tie_b = await _sign("p2b", timedelta(seconds=10))
+    third = await _sign("permit_recipient", timedelta(seconds=20))
+    first = await _sign("permit_head", timedelta(seconds=0))
+    tie_a = await _sign("permit_chief_forester", timedelta(seconds=10))
+    tie_b = await _sign("permit_accountant", timedelta(seconds=10))
     await db.commit()
 
     resp = await client_a.get(f"{API}/signatures?object_type=permit&object_id={obj_id}")
@@ -317,13 +356,16 @@ async def test_signature_list_is_ordered_by_signed_at_then_id(client_a, user_a: 
 
 @pytest.mark.asyncio
 async def test_signature_list_is_paged(client_a, user_a: User, db: AsyncSession):
+    # Three REAL purposes from the default requirement set -- object_type=
+    # "permit" has one configured (fix wave: `sign()` now refuses any other
+    # purpose for it); which three is irrelevant, only the count is.
     obj_id = uuid.uuid4()
-    for i in range(3):
+    for purpose in ("permit_head", "permit_chief_forester", "permit_accountant"):
         await service.sign(
             db,
             object_type="permit",
             object_id=obj_id,
-            purpose=f"purpose-{i}",
+            purpose=purpose,
             document=DOC,
             pkcs7=_pkcs7(DOC, user_a.pinfl),
             user=user_a,

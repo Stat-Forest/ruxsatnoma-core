@@ -168,7 +168,20 @@ async def require_complete(db: AsyncSession, *, object_type: str, object_id: uui
     lacking a valid signature; silent whenever `missing_purposes` is empty,
     including the "nothing required for this object type" case -- by
     construction this can never disagree with `is_complete`, since both
-    read the exact same list."""
+    read the exact same list.
+
+    Two limits this does NOT enforce, both left to 3.11 (fix wave), which
+    owns who the signatories actually are:
+    - it matches `purpose` STRINGS only, never the SIGNER's role against
+      that purpose. `sign()` refuses a `purpose` outside
+      `required_purposes(object_type)` when one is configured (below), but
+      nothing here checks that the person who signed "permit_head" actually
+      holds that role -- one user with one certificate can currently sign
+      every required purpose on their own and this still reports complete.
+    - it does not check that the valid signatures all cover the SAME
+      `doc_hash` -- a permit regenerated after being partly signed still
+      reads complete against signatures taken over the OLD bytes.
+    """
     missing = await missing_purposes(db, object_type=object_type, object_id=object_id)
     if missing:
         raise err("ERR-SIGN-003", details={"missing": missing})
@@ -230,23 +243,40 @@ async def bind_certificate(
     cert = await repo.get_certificate_by_identity(db, info.serial_number, info.issuer)
     if cert is None:
         try:
-            cert = await repo.insert_certificate(db, info=info, user_id=None)
+            # `begin_nested()` (a SAVEPOINT), not a bare call (fix wave —
+            # mirrors `sign()`'s own insert race, see its except block for
+            # the full reasoning): a bare `db.flush()` here, caught by
+            # `except IntegrityError` with no savepoint, leaves the WHOLE
+            # transaction aborted at the database level — so a stage-3.11
+            # caller writing `try: sign() ... except DomainError:` would hit
+            # `InFailedSQLTransaction` on its very next statement, where
+            # every OTHER refusal in this module commits (or, here, simply
+            # returns) cleanly. The SAVEPOINT scopes the rollback to just
+            # this failed insert.
+            async with db.begin_nested():
+                cert = await repo.insert_certificate(db, info=info, user_id=None)
         except IntegrityError as exc:
-            # `uq_certificate_identity`: two callers presenting the same
-            # brand-new (serial_number, issuer) at once can both pass the
-            # SELECT above before either commits its own INSERT — the exact
-            # shape create_contour's own number-taken race documents
-            # (gis/service.py). `user_id=None` here is a literal, never a
-            # caller-supplied FK, and `info`'s own fields were already
-            # resolved by the adapter before this call — the ONE violation
-            # left to catch is this identity race (review fix 5). Mapped to a
-            # domain error rather than a 500, same shape as that precedent:
-            # no audit call here (unlike sign()'s own ERR-SIGN-002 paths,
-            # fix 1) — the failed flush already aborted the transaction and
-            # writing evidence would need a rollback first, which this
-            # narrower fix does not take on; raise immediately, no further
-            # `db` use on this path, and get_db's rollback-on-exception
-            # clears the aborted transaction before this becomes a response.
+            # Constraint-CHECKED, not constraint-blind (fix wave — the same
+            # shape `sign()`'s own except already uses, and the same lesson:
+            # IntegrityError IS a DBAPIError, and `exc.orig.__cause__`, not
+            # `exc.orig`, is what actually names the constraint). Only
+            # `uq_certificate_identity`'s own violation — two callers racing
+            # to insert the SAME brand-new (serial_number, issuer) pair, the
+            # exact shape create_contour's own number-taken race documents
+            # (gis/service.py) — means "certificate_conflict". Anything
+            # else on this SAME insert is a real defect, not this race:
+            # `ck_certificates_validity_ordered` is reachable from a
+            # client-crafted envelope with `valid_to < valid_from` and must
+            # surface as itself, unmapped, never mislabeled a certificate
+            # conflict. No audit call here (unlike sign()'s own
+            # ERR-SIGN-002 paths, fix 1) — this is a benign insert race, not
+            # a security event, and there is no document, purpose or object
+            # to hang a `signatures` row on; the SAVEPOINT above already
+            # undid the failed insert either way, so a bare `raise` here
+            # leaves `db` exactly as it was before this whole `try` started.
+            cause = exc.orig.__cause__ if exc.orig is not None else None
+            if getattr(cause, "constraint_name", None) != "uq_certificate_identity":
+                raise
             raise err("ERR-SIGN-004", details={"reason": "certificate_conflict"}) from exc
     if cert.user_id is not None and cert.user_id != user.id:
         await audit.log(
@@ -358,7 +388,13 @@ async def sign(
     your own prerequisite state first and treat `sign()` as its own
     transaction boundary (fix round 3, fix 4).
 
-    Order: hash the bytes WE were handed (never trust the envelope's own claim
+    Order: if `object_type` has a configured requirement set at all
+    (`required_purposes`) and `purpose` is not IN it, refuse immediately
+    (fix wave — closes the sloppier half of `require_complete`'s own two
+    documented limits: this stops a typo'd or made-up purpose from ever
+    reaching storage, but it is still only a STRING check, not a check that
+    THIS signer holds the role the purpose names — that stays 3.11's job)
+    -> hash the bytes WE were handed (never trust the envelope's own claim
     of what it signed) -> verify -> bind the certificate the envelope names
     (may itself refuse and raise — see `bind_certificate`) -> reconcile its
     live status -> build the verdict -> re-prove ownership via
@@ -383,6 +419,33 @@ async def sign(
     if the verdict itself is invalid, commit that evidence and only THEN
     raise.
     """
+    required = await required_purposes(db, object_type)
+    if required and purpose not in required:
+        # Fix wave: closes the sloppier half of `require_complete`'s own
+        # documented gap — a purpose that could never satisfy ANY required
+        # slot for this object type is refused before it reaches storage,
+        # rather than being accepted and quietly never counting toward
+        # completeness. Deliberately a STRING-membership check only: it does
+        # NOT prove the signer holds the role `purpose` names (3.11's job —
+        # see `require_complete`'s own docstring for the limit that remains).
+        # `required == []` only for an object_type with NO entry in
+        # `_REQUIREMENT_SETTINGS` at all — `settings_store.coerce` rejects
+        # an empty-string override as malformed and falls back to the code
+        # default, so an admin cannot reach `[]` this way — and `[]` is
+        # treated as "no restriction", exactly matching `required_purposes`'s
+        # own contract.
+        await audit.log(
+            db,
+            action=SIGNATURE_CREATE,
+            user_id=user.id,
+            object_type=object_type,
+            object_id=object_id,
+            result="denied",
+            basis="purpose_not_required",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": "purpose_not_required"})
+
     doc_hash = hashlib.sha256(document).hexdigest()
     adapter = get_eimzo_adapter()
     result = await adapter.verify_detached(document=document, pkcs7=pkcs7)
@@ -699,9 +762,13 @@ async def list_signatures_page(
 ) -> tuple[list[Signature], int]:
     """`GET /signatures`: the object's OWNER — defined, in a module that owns
     no `permits`/`applications` table of its own to ask (module docstring,
-    Level 2), as anyone holding at least one signature row against this
-    object (valid or invalid: an attempt is still evidence they were
-    involved, ruling 8) — OR `signatures.view_any` (oversight). Checked here,
+    Level 2), as anyone holding at least one VALID signature row against this
+    object (fix wave — narrowed from "valid or invalid": once 3.9/3.11
+    expose a real signing route, deliberately submitting a bad signature
+    against a stranger's object would otherwise earn read access to its
+    whole signature list; an invalid attempt is still evidence, ruling 8,
+    but evidence is not ownership) — OR `signatures.view_any` (oversight).
+    Checked here,
     inside the service, not as a route-level `require_permission` dependency,
     which would reject the object's own signer outright (see
     `_holds_view_any`'s own docstring). `ERR-ACL-001` on denial, matching the

@@ -125,18 +125,23 @@ async def get_signature(db: AsyncSession, signature_id: uuid.UUID) -> Signature 
 async def signed_by(
     db: AsyncSession, *, object_type: str, object_id: uuid.UUID, signer_user_id: uuid.UUID
 ) -> bool:
-    """Whether `signer_user_id` has at least one signature row — valid or
-    invalid, an attempt is still evidence (ruling 8) — against this object.
-    Task 7's own definition of "the object's owner" for `GET /signatures`: the
-    only ownership signal available to a module that owns no
-    `permits`/`applications` table of its own to ask (module docstring,
-    Level 2 — this module never queries another module's tables)."""
+    """Whether `signer_user_id` holds at least one VALID signature row
+    against this object (fix wave — narrowed from "valid or invalid": an
+    attempt is still evidence, ruling 8, but evidence is not ownership, and
+    "holds any row at all" let a stranger earn read access to someone
+    else's object by deliberately submitting a signature that was bound to
+    fail). Task 7's own definition of "the object's owner" for
+    `GET /signatures`: the only ownership signal available to a module that
+    owns no `permits`/`applications` table of its own to ask (module
+    docstring, Level 2 — this module never queries another module's
+    tables)."""
     rows = await db.execute(
         select(Signature.id)
         .where(
             Signature.object_type == object_type,
             Signature.object_id == object_id,
             Signature.signer_user_id == signer_user_id,
+            Signature.verification_status == "valid",
         )
         .limit(1)
     )

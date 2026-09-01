@@ -1,3 +1,4 @@
+import base64
 import secrets
 import uuid
 from collections.abc import AsyncIterator
@@ -116,6 +117,79 @@ async def test_signing_stores_the_row_and_binds_the_certificate(db, a_user):
     assert row.doc_hash == __import__("hashlib").sha256(DOC).hexdigest()
     cert = await service.get_certificate(db, row.certificate_id)
     assert cert.user_id == a_user.id  # bound on first use (ruling 4)
+
+
+@pytest.mark.asyncio
+async def test_the_stored_verification_never_carries_the_signed_document_bytes(db, a_user):
+    """Fix wave: `verification.raw.document_b64` used to round-trip the
+    ENTIRE signed document into this append-only column, contradicting the
+    module's own contract (`verify.py`'s docstring, `reverify`'s: "this
+    module never stores the original document bytes, only `doc_hash`") and
+    ballooning every permit PDF into ~4/3 its size per signature, returned
+    whole to every co-signer through `GET /signatures`. `doc_hash` -- the
+    thing the module is actually supposed to keep -- must still be there."""
+    row = await service.sign(
+        db,
+        object_type="permit",
+        object_id=uuid.uuid4(),
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(a_user.pinfl),
+        user=a_user,
+    )
+    assert row.doc_hash  # the one document-derived fact this module keeps
+    raw = row.verification["raw"]
+    assert "document_b64" not in raw
+    # The base64 the OLD code would have embedded is nowhere in the blob at
+    # all -- not just absent under its old key.
+    assert base64.b64encode(DOC).decode() not in str(row.verification)
+
+
+@pytest.mark.asyncio
+async def test_a_purpose_outside_the_required_set_is_refused(db, a_user):
+    """Fix wave: closes the sloppier half of `require_complete`'s own
+    documented gap. `"permit"` HAS a configured requirement set (the
+    default 3+1), so a made-up purpose must never reach storage -- it could
+    never satisfy any required slot, and accepting it would leave junk in
+    an append-only evidence table for no purpose (STRING check only; it
+    does not prove the SIGNER holds the role a real purpose names -- see
+    `require_complete`'s own docstring)."""
+    own_obj = uuid.uuid4()
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=own_obj,
+            purpose="not_a_real_purpose",
+            document=DOC,
+            pkcs7=_pkcs7(a_user.pinfl),
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "purpose_not_required"
+    # No signature row at all -- refused before the adapter is ever asked.
+    rows = await service.get_for_object(db, object_type="permit", object_id=own_obj)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_an_object_type_with_no_configured_requirement_accepts_any_purpose(db, a_user):
+    """The mirror: `"application"` has NO entry in `_REQUIREMENT_SETTINGS`
+    (`required_purposes` returns `[]`), so the new check must stay OUT of
+    its way entirely -- an object type nobody has configured a requirement
+    for keeps today's fully open behaviour."""
+    own_obj = uuid.uuid4()
+    row = await service.sign(
+        db,
+        object_type="application",
+        object_id=own_obj,
+        purpose="anything_at_all",
+        document=DOC,
+        pkcs7=_pkcs7(a_user.pinfl),
+        user=a_user,
+    )
+    assert row.verification_status == "valid"
 
 
 @pytest.mark.asyncio
@@ -514,7 +588,13 @@ async def test_a_racing_certificate_presentation_is_a_conflict_not_a_500(db, a_u
     then raises `IntegrityError` on `uq_certificate_identity` for the second
     one. Mapped to a domain error the same way `create_contour`'s own
     `number_taken` race is (`gis/service.py`), never an uncaught 500. Stood
-    in the same way that test does: monkeypatch the read stale."""
+    in the same way that test does: monkeypatch the read stale.
+
+    Fix wave: `bind_certificate` now wraps this insert in a SAVEPOINT, the
+    same way `sign()` already wraps its own — so this refusal must leave
+    `db`'s OUTER transaction usable, not aborted at the database level.
+    Proven below WITHOUT any rollback first: the FIRST sign()'s own
+    still-uncommitted row must stay readable on this very session."""
     await service.sign(
         db,
         object_type="permit",
@@ -542,9 +622,45 @@ async def test_a_racing_certificate_presentation_is_a_conflict_not_a_500(db, a_u
         )
     assert exc.value.code == "ERR-SIGN-004"
     assert exc.value.details == {"reason": "certificate_conflict"}
-    # The losing flush left the transaction aborted at the database level
-    # (Postgres, not just SQLAlchemy) — clear it before this file's autouse
-    # cleanup fixture reuses the same session in its own teardown.
+    # The SAVEPOINT contained the failed insert — `db`'s outer transaction
+    # is NOT aborted, so this read succeeds with no rollback first. Before
+    # the fix wave this raised `InFailedSqlTransactionError` here.
+    rows = await service.get_for_object(db, object_type="permit", object_id=OBJ)
+    assert [r.verification_status for r in rows] == ["valid"]  # the FIRST sign(), untouched
+    # Nothing below depends on this session's own pending state; tidy up
+    # before this file's autouse cleanup fixture reuses it in its teardown.
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_certificate_is_not_mislabeled_a_certificate_conflict(db, a_user):
+    """Fix wave: `bind_certificate`'s own `except IntegrityError` used to
+    catch ANY violation on the certificate insert and report it as
+    `certificate_conflict` — constraint-blind. A client-crafted envelope
+    with `valid_to < valid_from` hits `ck_certificates_validity_ordered` on
+    this SAME insert (never `uq_certificate_identity`, since the identity
+    below is brand new) and must surface as itself, unmapped — the same
+    discipline `test_an_unrelated_integrity_violation_is_not_mislabeled_
+    already_signed` below already pins for `sign()`'s own insert."""
+    now = datetime.now(UTC)
+    pkcs7 = encode_mock_signature(
+        document=DOC,
+        serial=f"SER-{uuid.uuid4().hex[:12]}",
+        issuer=f"ISS-{uuid.uuid4().hex[:8]}",
+        pinfl=a_user.pinfl,
+        valid_from=now,
+        valid_to=now - timedelta(days=1),  # valid_to < valid_from
+    )
+    with pytest.raises(IntegrityError):
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=uuid.uuid4(),
+            purpose="permit_head",
+            document=DOC,
+            pkcs7=pkcs7,
+            user=a_user,
+        )
     await db.rollback()
 
 

@@ -37,7 +37,12 @@ class Certificate(Base):
     unbound_at: Mapped[datetime | None]
 
     __table_args__ = (
-        CheckConstraint("status IN ('active', 'revoked', 'expired')", name="status_valid"),
+        # `f"{CERTIFICATE_STATUSES}"` renders as `('active', 'revoked',
+        # 'expired')` -- Python's own tuple-of-str repr already IS valid SQL
+        # `IN (...)` syntax, so the CHECK is derived from the one tuple
+        # rather than retyping its members a second time (lesson: an
+        # enum-ish column has ONE source of truth).
+        CheckConstraint(f"status IN {CERTIFICATE_STATUSES}", name="status_valid"),
         CheckConstraint("valid_to > valid_from", name="validity_ordered"),
         UniqueConstraint("serial_number", "issuer", name="uq_certificate_identity"),
     )
@@ -63,7 +68,7 @@ class Signature(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "verification_status IN ('valid', 'invalid')", name="verification_status_valid"
+            f"verification_status IN {VERIFICATION_STATUSES}", name="verification_status_valid"
         ),
         Index("ix_signatures_object", "object_type", "object_id"),
         Index(
