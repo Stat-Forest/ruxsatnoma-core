@@ -105,6 +105,20 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "bucket, and a throttled delivery report is lost, not retried)",
         ),
         SettingSpec(
+            "ratelimit_public_check_per_minute",
+            int,
+            60,
+            # The ONLY control on the anonymous QR page (plan 03.11a ruling 8):
+            # `?series=&number=` is guessable by construction, so the token's
+            # secrecy protects the QR path alone and enumeration is stopped here.
+            # CAPTCHA belongs to the front end (stage 6). Sized for a person, not
+            # a script — one scan is one request — with room for an inspector
+            # working through a folder. The limiter keys on `request.client.host`,
+            # so a carrier-grade NAT puts a whole region in one bucket: raise this
+            # row, never the code, if that shows up in the field.
+            "Per-IP limit for the anonymous permit check (the only guard on it)",
+        ),
+        SettingSpec(
             "gis_area_mismatch_pct",
             int,
             10,

@@ -105,3 +105,46 @@ class PermitSignatureOut(BaseModel):
 
     status: PermitStatus
     missing_signatures: list[str]
+
+
+# The four words `tz/04` С12 and `design/03` fix for the public page, spelled out
+# by hand for the same reason `PermitStatus` above is: a `Literal`'s members must
+# be statically visible to pyright, so `Literal[*PUBLIC_STATUS_LABELS.values()]`
+# is not an option. `service.PUBLIC_STATUS_LABELS` stays the single source of
+# truth and `test_public_check.py::test_every_permit_status_has_a_decided_public_
+# answer` closes the gap (lesson: an enum-ish value has ONE source of truth).
+PublicStatus = Literal["амалда", "тўхтатилган", "муддати тугаган", "бекор қилинган"]
+
+
+class PublicCheckMiss(BaseModel):
+    """What every lookup with nothing in force to show answers — an unknown
+    token, an unknown series and number, and a permit nobody has signed yet, all
+    the same shape.
+
+    One key, and it is the whole body. A 404 for the unknown and a 200 for the
+    known would let anyone walk the series and learn which numbers exist
+    (ruling 8); so would a miss that carried one extra field the hit does not.
+    """
+
+    found: Literal[False] = False
+
+
+class PublicCheckCard(BaseModel):
+    """`GET /public/permits/check` — what a citizen or an inspector sees.
+
+    Every field is either masked (`holder`), a reference name the permit already
+    prints (`organization`, `activity_type`), or the document's own validity —
+    and the list is closed: `qr_token` is the key to this very page and
+    `holder_pinfl` is requisite 10's identity half, so neither may appear here at
+    any width. `signatures_valid` is the STORED verification verdict of the 3+1
+    signatures; nothing on this path calls E-IMZO.
+    """
+
+    found: Literal[True] = True
+    status: PublicStatus
+    valid_from: date
+    valid_to: date
+    organization: str
+    activity_type: str
+    signatures_valid: bool
+    holder: str

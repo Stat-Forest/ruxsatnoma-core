@@ -41,9 +41,10 @@ from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
 from app.modules.gis.models import GisLayer
+from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
-from app.modules.permits import service
+from app.modules.permits import service, signers
 from app.modules.permits.models import Permit, PermitTemplate
 from app.modules.permits.permissions import PERMITS_ISSUE
 from tests.conftest import make_client
@@ -81,6 +82,12 @@ def unique_pinfl() -> str:
     DB never collide on `uq_users_pinfl`."""
     return f"1{uuid.uuid4().int % 10**13:013d}"
 
+
+# The holder of every fixture application, in the form `tz/13` requisite 10 has:
+# «Фамилия Исм Отасининг исми». The same name `test_render.py` renders, so the two
+# halves of the document — what is printed and what the QR page shows masked —
+# are read off one string. Its mask is С12's own example, «А.***ов А.».
+HOLDER_NAME = "Азизов Азиз Азизович"
 
 # The herd every grazing fixture is priced for, and — since ruling T3-f — the herd
 # its permit PRINTS (`tz/13` requisites 12-15). One code from each of form 1-ilova's
@@ -173,6 +180,13 @@ async def make_paid_application(
     so a row cannot be deleted afterwards — the application has to be built
     without one."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    # `tz/13` requisite 10, and since Task 5 the half of it the public QR card
+    # shows masked. `make_user`'s default is "Test User", which no masking rule
+    # can turn into С12's «А.***ов А.»; `HOLDER_NAME` is the same canonical name
+    # `test_render.py` renders with. Assigned after the call rather than passed
+    # to it: `make_user` already gives `User(...)` a `full_name`, so an override
+    # of that key would raise `TypeError: got multiple values`.
+    user.full_name = HOLDER_NAME
     applicant = Applicant(
         kind="individual",
         pinfl=user.pinfl,
@@ -676,3 +690,74 @@ async def override_required_signatures(db: AsyncSession):
     await db.execute(sa_delete(SystemSetting).where(SystemSetting.key == key))
     await db.commit()
     invalidate(key)
+
+
+async def sign_permit(signer: Signer, permit_id: uuid.UUID, purpose: str, pdf: bytes):
+    """One signature attempt over the stored document, with the signer's own ERI
+    identity (`Signer`'s docstring explains why that identity is not a literal).
+
+    Here rather than in `test_signatures.py`, where it started: Task 5's
+    `active_permit` needs the same four calls to get a permit into force, and two
+    copies of the envelope-building code are two things that can disagree about
+    what a signature covers.
+    """
+    return await signer.client.post(
+        f"/api/v1/permits/{permit_id}/signatures",
+        json={
+            "purpose": purpose,
+            "pkcs7": encode_mock_signature(
+                document=pdf, serial=signer.serial, issuer="ISS-1", pinfl=signer.pinfl
+            ),
+        },
+    )
+
+
+# --- Task 5: the anonymous public check --------------------------------------
+
+
+@pytest.fixture
+async def client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
+    """A client with NO session cookie — the citizen or inspector С12 describes.
+
+    Deliberately not `_client_for(db)`: that builds an `executor_staff` user and
+    signs it in, which would prove nothing about a route whose whole contract is
+    that it works without authentication. The commit hook is still needed —
+    fixtures listed after this one in a test's parameter list are only flushed
+    when the first request fires, and the app reads its own connection.
+    """
+    async with make_client(create_app(), lifespan=True) as anonymous:
+        _commit_pending_before_requests(anonymous, db)
+        yield anonymous
+
+
+@pytest.fixture
+async def active_permit(
+    db: AsyncSession,
+    issued_permit: Permit,
+    permit_pdf: bytes,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    holder_client: Signer,
+) -> Permit:
+    """A permit in force, through the four real signatures.
+
+    `active` is never assigned here by hand: `service._activate` is the ONE
+    writer of that status and it runs only once `missing_purposes` comes back
+    empty (C11), so a fixture that UPDATEd the column would give the public page
+    a permit no signature ever made valid — and `signatures_valid` would then be
+    asserted against a permit whose signatures do not exist.
+    """
+    for signer, purpose in (
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+        (accountant_client, "permit_accountant"),
+        (holder_client, signers.RECIPIENT_PURPOSE),
+    ):
+        result = await sign_permit(signer, issued_permit.id, purpose, permit_pdf)
+        assert result.status_code == 200, result.text
+    # The app moved the row on its own session; `db` holds the object it loaded
+    # before that and `expire_on_commit=False` never expires it (lesson).
+    await db.refresh(issued_permit)
+    assert issued_permit.status == "active"
+    return issued_permit

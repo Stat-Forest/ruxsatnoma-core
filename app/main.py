@@ -42,6 +42,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
 from app.modules.signatures.router import router as signatures_router
 
@@ -222,5 +223,9 @@ def create_app() -> FastAPI:
     app.include_router(norms_calc_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
     app.include_router(permits_router, prefix="/api/v1")
+    # The anonymous QR check (С12). Under `permits` and not a `public` module,
+    # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
+    # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
+    app.include_router(permits_public_router, prefix="/api/v1")
 
     return app

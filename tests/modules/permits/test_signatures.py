@@ -36,23 +36,14 @@ from app.modules.notifications.models import Notification
 from app.modules.permits import events, service, signers
 from app.modules.permits.models import Permit, PermitStatusHistory
 from app.modules.signatures import service as signatures_service
-from tests.modules.permits.conftest import Signer
+from tests.modules.permits.conftest import Signer, sign_permit
 
 API = "/api/v1"
 
-
-async def _sign(signer: Signer, permit_id: uuid.UUID, purpose: str, pdf: bytes):
-    """One signature attempt over the stored document, with the signer's own
-    ERI identity (see this file's docstring for why it is not a literal)."""
-    return await signer.client.post(
-        f"{API}/permits/{permit_id}/signatures",
-        json={
-            "purpose": purpose,
-            "pkcs7": encode_mock_signature(
-                document=pdf, serial=signer.serial, issuer="ISS-1", pinfl=signer.pinfl
-            ),
-        },
-    )
+# Moved to the conftest when Task 5's `active_permit` needed the same four calls
+# to put a permit in force; kept under its old name here so every call site below
+# reads as it did. One envelope builder, two callers.
+_sign = sign_permit
 
 
 async def _reread[T](db: AsyncSession, row: T) -> T:

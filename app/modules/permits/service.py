@@ -45,7 +45,12 @@ from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
 from app.modules.permits import events, render, repo, signers
-from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
+from app.modules.permits.models import (
+    Permit,
+    PermitStatusHistory,
+    PermitTemplate,
+    QrCheckLog,
+)
 from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
@@ -1048,3 +1053,188 @@ async def missing_signatures(db: AsyncSession, permit_id: uuid.UUID) -> list[str
     return await signatures_service.missing_purposes(
         db, object_type=OBJECT_TYPE, object_id=permit_id
     )
+
+
+# --- Task 5: the anonymous public check (С12) --------------------------------
+#
+# No `require_permission`, no `get_current_user`, and — deliberately — no
+# `audit.log`. The audit invariant covers state-changing ACTIONS by an actor;
+# this is a read by nobody, and an `audit_log` row per anonymous check would be
+# precisely the trail `design/02` forbids for `qr_check_log` ("no IP addresses
+# and no personal data"). The `qr_check_log` row IS the record of the call.
+
+# `tz/04` С12 and `design/03`, verbatim and in Uzbek Cyrillic: the four words
+# this page may print, mapped from `permits.status`. 3.11a only ever produces
+# `active` and `expired` — `suspended` and `revoked` are 3.11b's — but the map is
+# complete now, because it is what 3.11b lands on rather than something it has to
+# invent alongside its transitions.
+PUBLIC_STATUS_LABELS: dict[str, str] = {
+    "active": "амалда",
+    "suspended": "тўхтатилган",
+    "expired": "муддати тугаган",
+    "revoked": "бекор қилинган",
+}
+
+# The two statuses that are NOT public, each for its own reason — spelled out
+# rather than left to fall through the map above, so that adding a seventh
+# permit status forces a decision instead of silently answering "no such
+# permit". `test_public_check.py` asserts the two sets together cover
+# `PERMIT_STATUSES` exactly.
+#
+#   * `pending_signatures` — the QR page goes live when the permit does. The
+#     document exists and is already printable, but nobody has signed it (C11),
+#     and a page showing it as a permit would make an unsigned draft read as one
+#     in force.
+#   * `archived` — 4.7's. `tz/05` reaches ARCHIVED from REVOKED **and** from
+#     EXPIRED, so the status column no longer says which of the two words is
+#     true, and this page must not guess: «муддати тугаган» on a permit that was
+#     cancelled for cause is a false statement about a legal ground on a state
+#     verification page. The stage that starts writing `archived` decides — keep
+#     the legal status beside it, or give the page a fifth word — and until then
+#     an archived permit is answered like any other lookup with nothing in force
+#     to show. Noted as a question for that stage rather than settled here.
+NON_PUBLIC_STATUSES: tuple[str, ...] = ("pending_signatures", "archived")
+
+# `qr_check_log.channel` and `.result`. The tuples in `models.py` build the DB
+# CHECKs and stay the single source of truth; these four names are what the code
+# reads, and the test closes the gap with a set equality (lesson).
+CHANNEL_QR = "qr"
+CHANNEL_MANUAL = "manual"
+RESULT_FOUND = "found"
+RESULT_NOT_FOUND = "not_found"
+
+# The masked middle of a name. Fixed width on purpose: a mask as long as what it
+# hides would report the surname's length, which is most of a surname.
+NAME_MASK = "***"
+# Below this, the ending is dropped and only the initial survives: at four
+# characters, first-plus-last-two would hide exactly one letter, and at two it
+# would print the whole name with asterisks in front of it.
+NAME_MASK_MIN_LENGTH = 5
+
+# Bounds on what the query string may carry. Neither is a business rule — they
+# keep an anonymous caller from handing the database a value it cannot compare:
+# `permits.number` is `bigint`, and an integer past that raises out of asyncpg as
+# a 500 rather than a miss (lesson: an anonymous route must cap its inputs).
+MAX_PERMIT_NUMBER = 2**63 - 1
+# `qr_token` is `secrets.token_urlsafe(32)`, 43 characters; the series is one
+# Cyrillic letter today (`'А'`). Both caps are generous and still bounded.
+QR_TOKEN_MAX_LENGTH = 128
+SERIES_MAX_LENGTH = 8
+
+
+def mask_name(full_name: str) -> str:
+    """`tz/04` С12: «Персональные данные — маскированы (ФИО сокращённо)».
+
+    «Азизов Азиз Азизович» becomes «А.***ов А.» — `design/03`'s own example. The
+    surname keeps its initial and its last two letters, which is what lets
+    someone who already knows the holder recognise them; everything between is
+    three asterisks whatever its length. The given name is reduced to an initial
+    and the patronymic is dropped entirely: one initial is enough to confirm, and
+    every further character is one more given away by a page with no login.
+
+    Total by design, never raising and never returning an empty string — it runs
+    on an unauthenticated route, and `str.split()` on a blank name yields no
+    parts at all (answered with `NOT_STATED`, the form's own em dash).
+    """
+    parts = full_name.split()
+    if not parts:
+        return NOT_STATED
+    surname = parts[0]
+    if len(surname) < NAME_MASK_MIN_LENGTH:
+        masked = f"{surname[0]}.{NAME_MASK}"
+    else:
+        masked = f"{surname[0]}.{NAME_MASK}{surname[-2:]}"
+    return f"{masked} {parts[1][0]}." if len(parts) > 1 else masked
+
+
+def _from_snapshot(snapshot: Any, key: str) -> str:
+    """One requisite of the frozen document, or `""` when it holds none.
+
+    A key missing from an issued permit's snapshot is a defect on the ISSUING
+    side (`_snapshot` builds all of them through `_required`), and this route is
+    the wrong place to discover it: a `ResponseValidationError` here would be a
+    500 on the one page a citizen with a paper permit can reach. The caller turns
+    the empty string into the form's em dash, exactly as `_holder_address` does
+    for a registry that holds nothing.
+
+    Empty rather than `NOT_STATED` directly, because one caller masks its value
+    first: `mask_name("—")` would print «—.***», a mask of a placeholder.
+    """
+    value = snapshot.get(key) if isinstance(snapshot, dict) else None
+    return "" if value is None else str(value)
+
+
+async def public_check(
+    db: AsyncSession,
+    *,
+    qr_token: str | None = None,
+    series: str | None = None,
+    number: int | None = None,
+) -> dict[str, Any]:
+    """The anonymous verification card, and the statistics row that counts it.
+
+    **A miss is not an error.** An unknown token, an unknown number and a permit
+    that is not public yet all answer the same `{"found": False}`: an endpoint
+    with no authentication that answered 404 for one and 200 for the other would
+    be a free permit-number oracle, and `?series=&number=` is guessable by
+    construction (ruling 8). The rate limit on the route is what actually bounds
+    enumeration.
+
+    **The card is read off the frozen snapshot**, never off `applicants` or
+    `organizations`. Two reasons, and the second is the load-bearing one: this
+    page verifies a PRINTED document, so it must say what the paper says — a
+    holder who renames themselves tomorrow would otherwise make a genuine permit
+    read as a forgery to the inspector comparing the two. And an anonymous route
+    that joined into `applicants` would be reading personal data live to publish
+    three characters of it. The permit's OWN columns (`status`, the period) come
+    from the row, because they are not copies of anything mutable — `status` is
+    requisite 25, deliberately excluded from the snapshot precisely because it
+    changes over the permit's life.
+
+    **`signatures_valid` is the stored verdict.** `missing_signatures` reads
+    `verification_status` off the rows taken at signing time; nothing here calls
+    E-IMZO, which at 5.2 lives behind a VPN reachable only from inside
+    Uzbekistan. A certificate that expires in 2029 does not retroactively
+    invalidate a permit lawfully signed in 2026.
+
+    **The log records what was ANSWERED**, not what the SELECT found: a permit
+    refused as not-public is logged `not_found` with a null `permit_id`, which
+    keeps `models.py`'s invariant («that null IS the not_found case's whole
+    payload») true and keeps the statistics from recording that somebody looked
+    at a specific unsigned document.
+    """
+    token = (qr_token or "").strip()
+    plate = (series or "").strip()
+    # The token wins when both are given: it is the stronger claim (a scanner
+    # read it off the document) and it decides the `channel` this call is
+    # counted under.
+    if token:
+        channel = CHANNEL_QR
+        permit = await repo.permit_by_qr_token(db, token)
+    elif plate and number is not None:
+        channel = CHANNEL_MANUAL
+        permit = await repo.permit_by_series_number(db, plate, number)
+    else:
+        # Nothing was named, so nothing is checked and nothing is counted. Not an
+        # oracle: the refusal is about the shape of the request, never about
+        # whether a permit exists.
+        raise err("ERR-VAL-001", details={"reason": "qr_or_series_and_number"})
+
+    label = None if permit is None else PUBLIC_STATUS_LABELS.get(permit.status)
+    if permit is None or label is None:
+        await repo.add(db, QrCheckLog(permit_id=None, result=RESULT_NOT_FOUND, channel=channel))
+        return {"found": False}
+
+    await repo.add(db, QrCheckLog(permit_id=permit.id, result=RESULT_FOUND, channel=channel))
+    return {
+        "found": True,
+        "status": label,
+        "valid_from": permit.period_from,
+        "valid_to": permit.period_to,
+        "organization": _from_snapshot(permit.snapshot, "leshoz_name") or NOT_STATED,
+        "activity_type": _from_snapshot(permit.snapshot, "activity_name") or NOT_STATED,
+        "signatures_valid": not await missing_signatures(db, permit.id),
+        # `mask_name` answers `NOT_STATED` on an empty name itself, so there is no
+        # `or` here: a mask applied to the em dash would print «—.***».
+        "holder": mask_name(_from_snapshot(permit.snapshot, "holder_name")),
+    }

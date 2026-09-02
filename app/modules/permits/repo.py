@@ -78,6 +78,33 @@ async def permit_by_application(db: AsyncSession, application_id: uuid.UUID) -> 
     ).scalar_one_or_none()
 
 
+async def permit_by_qr_token(db: AsyncSession, qr_token: str) -> Permit | None:
+    """The permit a printed QR points at, or None (Task 5's public check).
+
+    `permits.qr_token` is unique, so this is `scalar_one_or_none` and never a
+    list. The token is `secrets.token_urlsafe(32)` and is compared here as an
+    indexed equality rather than with `secrets.compare_digest`: the latter
+    raises `TypeError` on a non-ASCII operand, and this argument comes straight
+    off a query string a stranger writes (lesson).
+    """
+    return (
+        await db.execute(select(Permit).where(Permit.qr_token == qr_token))
+    ).scalar_one_or_none()
+
+
+async def permit_by_series_number(db: AsyncSession, series: str, number: int) -> Permit | None:
+    """The permit a citizen holding a paper copy can name — «серия А № 000123».
+
+    `uq_permits_series_number` makes the pair unique, so this too is a 1:1
+    lookup. `number` must already be bounded to `bigint` by the caller: an
+    out-of-range integer reaches asyncpg as a bind parameter and raises, which
+    on an anonymous route is a 500 handed out for free.
+    """
+    return (
+        await db.execute(select(Permit).where(Permit.series == series, Permit.number == number))
+    ).scalar_one_or_none()
+
+
 async def active_template(db: AsyncSession, activity_type_id: uuid.UUID) -> PermitTemplate | None:
     """The one layout in force for an activity type. `uq_permit_templates_active`
     (a partial unique index over `status = 'active'`) is what makes "the one"
