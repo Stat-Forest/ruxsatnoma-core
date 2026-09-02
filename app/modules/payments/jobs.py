@@ -30,7 +30,13 @@ that a successful pass removes the row from:
    already_notified` is the once-only check (no new column, no schema
    change beyond migration `0018`'s seed): looked up BEFORE calling
    `notify()`, keyed on an existing `inapp` row for the same
-   `event_code`/`object_id`.
+   `event_code`/`object_id`. `notify()`'s own `ValueError` (an unresolvable
+   recipient) is caught the same way pass 1 catches `set_status`'s
+   `DomainError` — the ruling's "one malformed row must never abort the
+   whole nightly run" is an outcome for the WHOLE sweep, not a property of
+   pass 1 alone: `app/workers/jobs.py::expire_invoices` commits once, at
+   the very end, so an uncaught exception anywhere in pass 2 would roll
+   back every write pass 1 already made in the same run.
 
 Re-running the whole sweep is a no-op the second time: an expired invoice no
 longer matches pass 1's `status = 'pending'` filter, and a reminder already
@@ -124,22 +130,40 @@ async def _send_due_soon_reminders(db: AsyncSession, *, now: datetime, correlati
             # practice; guarded rather than crashing into None below.
             logger.error("job.expiry_sweep.application_missing", invoice_id=str(invoice.id))
             continue
-        await notifications_service.notify(
-            db,
-            event_code=events.INVOICE_DUE_SOON,
-            recipient_user_id=application.submitted_by_user_id,
-            # Same three placeholder names the `invoice.issued` template
-            # uses (migration 0009) and this stage's own `invoice.due_soon`
-            # seed (migration 0018) — the reminder is the same fact
-            # ("amount X due by date Y for application Z"), read again.
-            params={
-                "application_number": application.number,
-                "amount": invoice.amount,
-                "due_date": invoice.due_at.astimezone(TASHKENT).date(),
-            },
-            object_type="invoice",
-            object_id=invoice.id,
-            correlation_id=correlation_id,
-        )
+        try:
+            await notifications_service.notify(
+                db,
+                event_code=events.INVOICE_DUE_SOON,
+                recipient_user_id=application.submitted_by_user_id,
+                # Same three placeholder names the `invoice.issued` template
+                # uses (migration 0009) and this stage's own `invoice.due_soon`
+                # seed (migration 0018) — the reminder is the same fact
+                # ("amount X due by date Y for application Z"), read again.
+                params={
+                    "application_number": application.number,
+                    "amount": invoice.amount,
+                    "due_date": invoice.due_at.astimezone(TASHKENT).date(),
+                },
+                object_type="invoice",
+                object_id=invoice.id,
+                correlation_id=correlation_id,
+            )
+        except ValueError as exc:
+            # Review finding (task 6): the ruling's "never abort the whole
+            # run" is a property of the WHOLE sweep, not just pass 1 —
+            # `expire_invoices` (app/workers/jobs.py) commits once, at the
+            # end, so an uncaught exception here would roll back every
+            # expiry pass 1 already wrote in this same run. Same guarantee
+            # as the set_status catch above: notify()'s ValueError fires
+            # before any Notification row is constructed, so nothing here
+            # needs undoing (lesson: log repr(e), not f"{e}" — an empty
+            # str() on some exception types is undiagnosable later).
+            logger.error(
+                "job.expiry_sweep.reminder_failed",
+                invoice_id=str(invoice.id),
+                application_id=str(invoice.application_id),
+                error=repr(exc),
+            )
+            continue
         count += 1
     return count

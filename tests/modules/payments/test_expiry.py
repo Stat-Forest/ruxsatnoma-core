@@ -20,8 +20,13 @@ The brief's own four tests, verbatim except for two adaptations:
 
 Plus this module's own copy of the template guard test (3.9a's version
 iterates `applications.events.NOTIFIED_EVENT_CODES` only and will never see
-this module's codes), and a test that a leftover row whose application
-cannot legally transition does not abort the sweep (ruling).
+this module's codes), a test that a leftover row whose application cannot
+legally transition does not abort the sweep, and — added on review — a test
+that a failed reminder does not discard the expire pass's already-successful
+work in the SAME run (both ruling 13: "one malformed row must never abort
+the whole nightly run" is an outcome for the whole sweep, not a property of
+the expire pass alone — `app/workers/jobs.py::expire_invoices` commits once,
+at the very end).
 """
 
 import uuid
@@ -113,6 +118,32 @@ async def non_invoiced_overdue_invoice(
         status="pending",
         issued_at=now - timedelta(days=20),
         due_at=now - timedelta(days=10),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+@pytest.fixture
+async def due_soon_invoice_on_its_own_application(
+    db: AsyncSession, approved_without_calculation: Application
+) -> Invoice:
+    """A `pending` invoice due in 2 days, like `invoice_due_in_two_days`, but
+    on its OWN application built from `approved_without_calculation` rather
+    than `overdue_invoice`'s own base (`pending_invoice` -> `approved_application`).
+    Needed only by `test_a_failed_reminder_does_not_discard_the_expire_passs_work`,
+    which combines this fixture WITH `overdue_invoice` in one test —
+    `invoice_due_in_two_days` shares `pending_invoice` with `overdue_invoice`
+    and would collide onto the same row for the same reason
+    `non_invoiced_overdue_invoice`'s own docstring explains."""
+    now = datetime.now(UTC)
+    row = Invoice(
+        application_id=approved_without_calculation.id,
+        number=_inv_number("due-soon-2nd-app"),
+        amount=Decimal("100.00"),
+        status="pending",
+        issued_at=now - timedelta(days=8),
+        due_at=now + timedelta(days=2),
     )
     db.add(row)
     await db.flush()
@@ -223,3 +254,43 @@ async def test_a_bad_transition_does_not_abort_the_sweep(
 
     await db.refresh(overdue_invoice)
     assert overdue_invoice.status == "expired"  # the well-formed row still processed
+
+
+async def test_a_failed_reminder_does_not_discard_the_expire_passs_work(
+    db, overdue_invoice, due_soon_invoice_on_its_own_application, monkeypatch
+):
+    """Review finding on task 6: `app/workers/jobs.py::expire_invoices` opens
+    a plain session context manager and commits ONCE, at the very end — an
+    uncaught exception anywhere in the reminder pass rolls back EVERYTHING,
+    including every invoice the expire pass already flipped earlier in the
+    SAME run. Forces `notify()` to fail for one due-soon invoice only (a
+    real ValueError, the same one an unresolvable recipient raises) and
+    proves both that the sweep still completes and that the UNRELATED
+    overdue invoice's expiry survives."""
+    from app.modules.notifications import service as notifications_service
+    from app.modules.payments import jobs
+
+    real_notify = notifications_service.notify
+
+    async def _boom(db, *, event_code, object_id=None, **kwargs):
+        if object_id == due_soon_invoice_on_its_own_application.id:
+            raise ValueError("simulated: unresolvable recipient")
+        return await real_notify(db, event_code=event_code, object_id=object_id, **kwargs)
+
+    monkeypatch.setattr(jobs.notifications_service, "notify", _boom)
+
+    await jobs.expiry_sweep(db)  # must not raise
+
+    await db.refresh(overdue_invoice)
+    assert overdue_invoice.status == "expired"  # pass 1's work survived pass 2's failure
+
+    from sqlalchemy import func, select
+
+    from app.modules.notifications.models import Notification
+
+    sent = await db.scalar(
+        select(func.count())
+        .select_from(Notification)
+        .where(Notification.object_id == due_soon_invoice_on_its_own_application.id)
+    )
+    assert sent == 0  # notify() raises before any Notification row is constructed
