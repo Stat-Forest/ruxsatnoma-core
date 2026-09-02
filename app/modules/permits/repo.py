@@ -8,11 +8,13 @@ import uuid
 from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
+from app.modules.admin.models import Organization
 from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
 
 
@@ -106,6 +108,85 @@ async def permit_by_series_number(db: AsyncSession, series: str, number: int) ->
     return (
         await db.execute(select(Permit).where(Permit.series == series, Permit.number == number))
     ).scalar_one_or_none()
+
+
+async def status_history(db: AsyncSession, permit_id: uuid.UUID) -> list[PermitStatusHistory]:
+    """The permit's timeline, oldest first.
+
+    Ordered by `(occurred_at, id)` and never by `occurred_at` alone, exactly as
+    `models.PermitStatusHistory` requires: `occurred_at` defaults to `now()`,
+    which in PostgreSQL is TRANSACTION start time, so the issuance row and any
+    row written in that same transaction share it to the microsecond and the
+    tie-break is the only thing that keeps the timeline in order. `id` is uuid7
+    and therefore time-ordered, and `ix_permit_status_history_timeline` carries
+    all three columns so this ordering is served by the index.
+    """
+    rows = await db.execute(
+        select(PermitStatusHistory)
+        .where(PermitStatusHistory.permit_id == permit_id)
+        .order_by(PermitStatusHistory.occurred_at, PermitStatusHistory.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def list_permits(
+    db: AsyncSession,
+    *,
+    scope: Any,
+    status: str | None,
+    applicant_id: uuid.UUID | None,
+    contour_id: uuid.UUID | None,
+    organization_id: uuid.UUID | None,
+    series: str | None,
+    number: int | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[Permit], int]:
+    """One page of permits matching `scope` and the given filters, with the total.
+
+    `scope` is whatever the service built out of the caller's identity — an
+    `applicant_id IN (...)` for a holder, `abac.zone_filter`'s expression for
+    staff, or the OR of both. It is a required positional-by-keyword argument
+    with no default on purpose: a read of this table with no scope at all is
+    every permit in the country, and a default would make that the easy mistake.
+
+    Joins `organizations` (the shape `gis.repo.list_contours` already uses for
+    the same reason): `permits` carries `organization_id` but no region or
+    district, and `zone_filter` FAILS CLOSED — it raises when a zone axis is set
+    and its column was not supplied — so a region- or district-scoped actor,
+    which `admin.users_service.create_user` can create today, needs those two
+    columns present in the statement.
+
+    Newest first by `id`: it is uuid7 and therefore time-ordered, so this is
+    `created_at DESC` served by the primary key rather than by a second index
+    (the same tie-break reasoning `norms.repo.newest_calculation` uses).
+    """
+    conditions: list[Any] = [scope]
+    for column, value in (
+        (Permit.status, status),
+        (Permit.applicant_id, applicant_id),
+        (Permit.contour_id, contour_id),
+        (Permit.organization_id, organization_id),
+        (Permit.series, series),
+        (Permit.number, number),
+    ):
+        if value is not None:
+            conditions.append(column == value)
+    joined = (
+        select(Permit.id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
+    rows = await db.execute(
+        select(Permit)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .where(*conditions)
+        .order_by(Permit.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars().all()), total
 
 
 async def active_template(db: AsyncSession, activity_type_id: uuid.UUID) -> PermitTemplate | None:

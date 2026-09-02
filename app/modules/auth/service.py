@@ -801,6 +801,33 @@ async def has_effective_representation(db: AsyncSession, *, user_id: uuid.UUID, 
     return representation is not None
 
 
+async def own_applicant_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uuid.UUID]:
+    """Every `applicants` row this user may act for TODAY: their own individual
+    row (`applicants.owner_user_id`) plus every legal entity they hold an
+    EFFECTIVE representation of — exactly the set `GET /auth/me` already reports
+    back to the user as "who I can act for".
+
+    The set-shaped companion of `has_effective_representation` above, and the
+    reason it exists: a caller asking about ONE applicant can ask that one; a
+    caller building a QUERY over somebody's own rows (`GET /api/v1/permits`,
+    3.11a) cannot, and would otherwise have to import `auth.repo` across the
+    module boundary. "Effective" means the same thing here as everywhere else in
+    this file — `status='active'` and not past `valid_until`, judged against
+    `business_today()`, never `date.today()` (lesson).
+
+    No permission and no zone rule, like `get_applicant`/`role_code` above: the
+    caller is another SERVICE inside this process, and the gates live on the
+    routes that reach it.
+    """
+    own = await repo.get_own_applicant(db, user_id)
+    ids = [] if own is None else [own.id]
+    ids.extend(
+        applicant.id
+        for _, applicant in await repo.effective_representations(db, user_id, business_today())
+    )
+    return ids
+
+
 async def update_contact(
     db: AsyncSession,
     user: User,

@@ -29,19 +29,23 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core import files, storage
-from app.core.abac import Zone, zone_of
+from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
+from app.core.schemas import PageParams
 from app.core.time import business_today
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
+from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
@@ -52,6 +56,7 @@ from app.modules.permits.models import (
     PermitTemplate,
     QrCheckLog,
 )
+from app.modules.permits.permissions import PERMITS_VIEW_ANY
 from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
@@ -60,6 +65,13 @@ from app.modules.signatures import service as signatures_service
 # (`permit.issued`) and neither is a bus name; see `permits/events.py`.
 PERMIT_ISSUE = "permit.issue"
 PERMIT_SIGN = "permit.sign"
+# What `set_status` writes — the generic move, named for what it is rather than
+# for any one caller, because 3.11b's suspend/resume/revoke and 4.7's archival
+# all come through it. A flow verb that does MORE than move a status audits
+# under its own name instead (`PERMIT_SIGN`, `PERMIT_EXPIRE`), the same split
+# `applications.service` makes between `APPLICATION_STATUS_CHANGE` and its flow
+# verbs.
+PERMIT_STATUS_CHANGE = "permit.status_change"
 # The two the daily sweeps write (`permits/jobs.py`). `permit.close_application`
 # is named for what it does rather than shortened to `permit.close`: the permit
 # is not closed and never will be — `expired`/`revoked` are terminal until 4.7
@@ -73,6 +85,32 @@ PERMIT_CLOSE_APPLICATION = "permit.close_application"
 # `signatures.service.missing_purposes` has come back empty (C11).
 INITIAL_STATUS = "pending_signatures"
 ACTIVE_STATUS = "active"
+
+# `tz/05`'s permit state machine, verbatim, plus the one row `tz/05` does not
+# have: `pending_signatures`, which this project added because C11 makes a permit
+# legally real only once all 3+1 signatures are on it. Every one of
+# `models.PERMIT_STATUSES` is a key, `archived` is terminal, and no status maps
+# to ITSELF — `tz/05` has no self-loop anywhere, so a repeat move to the status a
+# permit already holds is exactly as illegal as any other jump, which is how a
+# retrying caller tells "already applied, harmless" (`details["from"] ==
+# details["to"]`) from a genuine mistake. Same discipline, same shape, as
+# `applications.service.APPLICATION_TRANSITIONS`.
+#
+# `pending_signatures` has ONE exit and it is `active`. That is deliberate and it
+# is a gap somebody will meet: a permit formed by mistake, or one whose recipient
+# simply never signs, cannot be revoked or expired — the expiry sweep skips it on
+# purpose (a permit that never came into force cannot be «муддати тугаган») and
+# nothing times out a citizen's signature. The plan already records the question
+# for the Agency; whoever answers it adds the edge here WITH the transition that
+# writes it, rather than discovering the table refuses them.
+PERMIT_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending_signatures": frozenset({"active"}),
+    "active": frozenset({"suspended", "revoked", "expired"}),
+    "suspended": frozenset({"active", "revoked", "expired"}),
+    "revoked": frozenset({"archived"}),
+    "expired": frozenset({"archived"}),
+    "archived": frozenset(),
+}
 
 # What `applications` calls the state a signed permit puts it in. `tz/05` defines
 # it as «сформировано **и подписано**», which is why issuance does NOT set it
@@ -144,9 +182,13 @@ def _organization_in_zone(zone: Zone, org: Organization) -> bool:
     return True
 
 
-async def _assert_in_zone(db: AsyncSession, actor: User, contour_id: uuid.UUID) -> uuid.UUID:
-    """Which leshoz issues this permit, refusing an actor whose zone does not
-    cover it. Returns that organization id, so the caller never resolves it twice.
+async def _assert_organization_in_zone(
+    db: AsyncSession, actor: User, organization_id: uuid.UUID
+) -> None:
+    """Refuse an actor whose zone does not cover this organization — the module's
+    ONE territorial rule, shared by the issuance path below and by every read
+    route (Task 8), so the two can never drift into answering differently about
+    the same leshoz.
 
     ALL THREE axes of `app/core/abac.py`'s `Zone`, not `organization_id` alone:
     narrowing it to one was a finding of 3.6a's own final review — an actor with a
@@ -154,19 +196,29 @@ async def _assert_in_zone(db: AsyncSession, actor: User, contour_id: uuid.UUID) 
     the country, and that shape is creatable today
     (`admin.users_service.create_user` sets the three columns independently).
 
-    Separate from the route's `permits.issue` check, which answers whether this
-    role may issue AT ALL (lesson: zone scoping is not a permission check). The
-    organization is resolved through `gis.service` — never `gis.repo`, never a
-    direct query of `contours` — exactly as `norms.service._assert_norm_zone` does.
+    Separate from any permission check, which answers whether this role may act
+    AT ALL (lesson: zone scoping is not a permission check).
+    """
+    zone = zone_of(actor)
+    if zone == Zone(None, None, None):
+        return
+    org = await admin_repo.get_organization(db, organization_id)
+    if org is None or not _organization_in_zone(zone, org):
+        raise err("ERR-ACL-002")
+
+
+async def _assert_in_zone(db: AsyncSession, actor: User, contour_id: uuid.UUID) -> uuid.UUID:
+    """Which leshoz issues this permit, refusing an actor whose zone does not
+    cover it. Returns that organization id, so the caller never resolves it twice.
+
+    The organization is resolved through `gis.service` — never `gis.repo`, never a
+    direct query of `contours` — exactly as `norms.service._assert_norm_zone` does;
+    the zone comparison itself is `_assert_organization_in_zone` above.
     """
     organization_id = await gis_service.contour_organization(db, contour_id)
     if organization_id is None:
         raise err("ERR-SYS-003", details={"contour": str(contour_id)})
-    zone = zone_of(actor)
-    if zone != Zone(None, None, None):
-        org = await admin_repo.get_organization(db, organization_id)
-        if org is None or not _organization_in_zone(zone, org):
-            raise err("ERR-ACL-002")
+    await _assert_organization_in_zone(db, actor, organization_id)
     return organization_id
 
 
@@ -687,9 +739,10 @@ async def _notification_recipient(
 
 # --- the in-process read surface --------------------------------------------
 #
-# Task 8 owns this module's full public surface (`get`, `set_status`) and the
-# comment block describing it. The two below land here because issuance's own
-# tests are their first caller, and both follow the rule every sibling read
+# **The contract these two belong to is the closing comment block at the bottom
+# of this file** — read that one, not this line, before calling anything here
+# from another module. The two land here rather than there because issuance's own
+# code above is their first caller, and both follow the rule every sibling read
 # follows (`gis.service.published_version`, `applications.service.get`): no
 # permission and no zone rule, because the caller is another SERVICE inside this
 # process — the gates live on the routes that reach them.
@@ -762,15 +815,16 @@ async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:
     that the CERTIFICATE is the caller's own by PINFL/STIR, which says nothing
     about whether that caller is the holder of THIS permit. A different citizen
     signing with their own genuine key is crypto-valid and still a stranger.
+
+    **One definition, three uses** (Task 8). The 4th signature line asks about one
+    permit; `GET /permits/{id}` and `GET /permits/{id}/pdf` ask the same question
+    about the same permit; `GET /permits` needs the SET, to build a query out of.
+    A membership test over `auth.service.own_applicant_ids` is the only shape all
+    three can share — a separate per-permit predicate beside a separate list scope
+    is two rules that agree until one of them is edited, and the visible symptom
+    would be a permit readable by id and missing from the list that must carry it.
     """
-    applicant = await auth_service.get_applicant(db, permit.applicant_id)
-    if applicant is None:
-        return False
-    if applicant.owner_user_id is not None and applicant.owner_user_id == user.id:
-        return True
-    if applicant.stir is None:
-        return False
-    return await auth_service.has_effective_representation(db, user_id=user.id, stir=applicant.stir)
+    return permit.applicant_id in await auth_service.own_applicant_ids(db, user.id)
 
 
 async def _signer_refusal(
@@ -1345,3 +1399,346 @@ async def public_check(
         # `or` here: a mask applied to the em dash would print «—.***».
         "holder": mask_name(_from_snapshot(permit.snapshot, "holder_name")),
     }
+
+
+# --- Task 8: the public surface for levels 4+ and stage 4 --------------------
+#
+# **This block is the contract `inspections` (4.1), `oversight` (4.2), `archive`
+# (4.7) and 3.11b build against, and it does not change after this task.**
+#
+# SEVEN entry points, and nothing else:
+#
+# - `get(db, permit_id) -> Permit | None` — the permit row, or None. No
+#   permission and no zone rule: the caller is another SERVICE inside this
+#   process, mirroring `gis.service.published_version`,
+#   `norms.service.effective_norm` and `applications.service.get`. `None` rather
+#   than a raise, because a missing permit means different things to different
+#   callers — an inspection act without one is a defect, an archival sweep's is
+#   simply nothing to do.
+# - `for_application(db, application_id) -> Permit | None` — the 1:1 partner of
+#   an application (`permits.application_id` is unique). This is how a caller
+#   holding an application id reaches its permit; there is no other way, and
+#   there must not be a JOIN of the two tables written anywhere else.
+# - `pdf_bytes(db, permit_id) -> bytes` — the STORED document, never a
+#   re-render (ruling 3). These are the exact bytes `doc_hash` was taken over
+#   and all four ERI signatures cover, so re-rendering would silently produce a
+#   document no signature verifies against. `ERR-SYS-003` when the permit or its
+#   file is missing.
+# - `set_status(db, permit_id, *, to_status, actor=None, reason=None) -> Permit`
+#   — **the ONE way a module OUTSIDE `permits` moves a permit**: 3.11b writes
+#   `suspended`/`revoked` (and `suspended -> active` on resume), 4.7 writes
+#   `archived`. See its own docstring for what it does and does not do.
+# - `occupancy_provider(db, contour_ids) -> Mapping[uuid, Decimal]` and
+#   `load_provider(db, contour_id, period_from, period_to) -> Decimal` (Task 6)
+#   — the two seams `gis` and `norms` registered in `app/event_subscriptions.py`.
+#   Callable directly as well; both count `active` permits and nothing else.
+# - `missing_signatures(db, permit_id) -> list[str]` — which required purposes
+#   still lack a valid signature, in the configured display order. A pass-through
+#   to `signatures.service` on purpose (ruling 7).
+#
+# A caller above this module must NEVER:
+#   - **import `permits.repo` or `permits.models`.** Every fact reachable that
+#     way is already answered above, and the two exceptions the boundary rule
+#     grants — `gis`/`norms` reading permits, and the level-5 readers (reports,
+#     dashboard, search, oversight, archive) — are read-only table access for
+#     AGGREGATES, never a second write path;
+#   - **`UPDATE permits.status` directly.** `set_status` exists so that every
+#     transition in the system has one implementation, one validated edge, one
+#     `permit_status_history` row and one audit entry. A direct UPDATE produces a
+#     permit whose timeline does not explain it — and `permit_status_history` is
+#     append-only at the database level, so the missing row cannot be added
+#     afterwards;
+#   - **re-derive whether a permit is in force.** `status == "active"` is the
+#     whole answer (C11), already decided by `_activate` against
+#     `signatures.service`; counting signature rows in a second place is how a
+#     permit ends up "valid" for one screen and not for another;
+#   - **read `permits.snapshot` as live data.** It is frozen at issuance
+#     (`tz/05` invariant 7) and is what the PDF says. A name or a tariff read
+#     from it is the name and tariff of the day the document was signed, which
+#     is exactly right for verification and exactly wrong for a report.
+#
+# WHY THERE ARE THREE STATUS WRITERS INSIDE THIS MODULE, and only one outside.
+# `_activate` (the fourth signature) and `jobs.expire_permits` (the nightly
+# sweep) write their own transitions, exactly as `applications`' own `submit`
+# does rather than routing through its `set_status` (that module's ruling 25).
+# Both do materially more than move a status — `_activate` stamps `issued_at`,
+# moves the APPLICATION and notifies the holder in the same step, and the sweep
+# audits under `PERMIT_EXPIRE` with the job's `correlation_id`, which this frozen
+# signature cannot express — and both edges are asserted against
+# `PERMIT_TRANSITIONS` in `test_end_to_end.py`, so the table describes the code
+# rather than merely sitting beside it.
+#
+# WHAT 3.11b WILL FIND MISSING, said now rather than discovered then: a
+# suspension's legal ground is `permit_status_history.reason_item_id` (a
+# classifier item) and `doc_file_id` (the order), and this signature carries
+# neither — `reason` lands in `legal_basis` as free text. 3.11b writes its own
+# transition for `suspended`/`revoked` the way `_activate` does, validating
+# through `PERMIT_TRANSITIONS`, and leaves `set_status` as what it is: the move
+# for a caller that has only a status to write (4.7's `archived`).
+#
+# THE THREE READ ROUTES below (`GET /permits`, `/permits/{id}`,
+# `/permits/{id}/pdf`) are the HTTP surface, not part of the in-process
+# contract. Their access rule is "the holder, or staff holding
+# `permits.view_any` within their zone" — BOTH halves, because a permission
+# answers "may this role at all" and a zone answers "on whose rows" (lesson).
+
+
+async def get(db: AsyncSession, permit_id: uuid.UUID) -> Permit | None:
+    """The permit row, or `None`. No permission and no zone rule: the caller is
+    another SERVICE inside this process (see the block above)."""
+    return await repo.permit_by_id(db, permit_id)
+
+
+def _assert_transition(permit: Permit, to_status: str) -> None:
+    """A transition not listed in `PERMIT_TRANSITIONS[permit.status]` is a
+    conflict with the permit's CURRENT state, not a malformed request body —
+    `ERR-PERM-001` (409), never `ERR-VAL-001`. The same shape
+    `applications.service._assert_transition` and `gis.service._assert_transition`
+    already have over their own tables."""
+    if to_status not in PERMIT_TRANSITIONS[permit.status]:
+        raise err(
+            "ERR-PERM-001",
+            details={"reason": "bad_transition", "from": permit.status, "to": to_status},
+        )
+
+
+async def set_status(
+    db: AsyncSession,
+    permit_id: uuid.UUID,
+    *,
+    to_status: str,
+    actor: User | None = None,
+    reason: str | None = None,
+) -> Permit:
+    """Move a permit from one `tz/05` status to another: validate the edge, write
+    the `permit_status_history` row, audit it, return the permit.
+
+    Touches ONLY `permits.status`. `issued_at` belongs to `_activate`, which is
+    the one place a permit comes into force; anything else a future transition
+    needs to write belongs to the flow verb that owns it, never here.
+
+    Enforces NO permission and NO zone rule of its own — the same design as every
+    other function on this page, and for the same reason
+    `applications.service.set_status` gives: the calling module's ROUTE is what
+    holds the permission, and a check here could not span two different modules'
+    permission codes (`permits.manage` for 3.11b's revoke, an archival grant for
+    4.7) without inventing a third.
+
+    **Locks the permit for the length of the call** (`repo.permit_by_id_for_update`
+    — `FOR UPDATE` plus `populate_existing`, which are one mechanism and not two:
+    without the repopulate the loader keeps whatever an already-held instance was
+    carrying and a stale status is validated under a correct lock). This is the
+    single write path several future callers share — 3.11b's revoke and 4.7's
+    archival can genuinely arrive together — and without the lock both would read
+    the same pre-write status, both pass `_assert_transition`, and the second
+    UPDATE would silently overwrite the first, leaving a timeline claiming two
+    transitions out of a status the permit was only in once.
+
+    **Lock order: the permit, and never an application after it here.**
+    `add_signature` takes a permit lock and then an application lock through
+    `applications.service.set_status`, and that is the only lock ordering
+    anywhere in `app/`. This function takes the permit lock alone, so it cannot
+    close a cycle — a future caller that needs to move both must do so in that
+    same order.
+
+    Refuses an illegal jump with `ERR-PERM-001` and
+    `details = {"reason": "bad_transition", "from": ..., "to": ...}`. A repeat
+    call for the status the permit already holds lands there too, with
+    `from == to`, which is how a retrying caller tells "already applied,
+    harmless" from a genuine mistake.
+    """
+    permit = await repo.permit_by_id_for_update(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+
+    _assert_transition(permit, to_status)
+    from_status = permit.status
+    permit.status = to_status
+
+    await repo.add_status_history(
+        db,
+        PermitStatusHistory(
+            permit_id=permit.id,
+            from_status=from_status,
+            to_status=to_status,
+            # Nullable on purpose: `expired` is the nightly sweep's and
+            # `archived` will be 4.7's, and neither has a person behind it.
+            changed_by=actor.id if actor else None,
+            legal_basis=reason,
+        ),
+    )
+    # `updated_at` carries `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
+    # after a plain UPDATE — reading it outside the session's async context then
+    # raises `MissingGreenlet` (lesson: the row in memory is not what Postgres
+    # stored). The caller gets the row back, so it is refreshed here.
+    await db.refresh(permit)
+
+    await audit.log(
+        db,
+        action=PERMIT_STATUS_CHANGE,
+        user_id=actor.id if actor else None,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        old_value={"status": from_status},
+        new_value={"status": to_status},
+        basis=reason,
+    )
+    return permit
+
+
+# --- the three read routes' service side -------------------------------------
+#
+# No `audit.log` on any of them: the audit invariant covers state-changing
+# ACTIONS, and a denied read is not one. That is a deliberate omission and not an
+# oversight — `_assert_organization_in_zone` refuses the ISSUANCE path without a
+# trail too, and auditing a GET would let anyone holding a session write an
+# `audit_log` row per request. `tz/10`'s RI-12 stays what it already is: an
+# indicator raised on the write paths (`_signer_refusal`'s `wrong_organization`).
+
+
+async def _holds_view_any(db: AsyncSession, actor: User) -> bool:
+    """Holds `permits.view_any`, or is the superuser that passes every permission
+    gate (decision #41 ruling 2) — the same two-branch shape
+    `signatures.service._holds_view_any`, `norms.service._holds_tariffs_publish`
+    and `gis.service._may_manage_layers` use for a rule checked INSIDE a handler.
+
+    It cannot be a route-level `require_permission` dependency: these routes also
+    admit the permit's own HOLDER, who holds no such grant, so the dependency
+    would reject a citizen reading their own permit before the ownership check
+    ever ran (the same reason `GET /signatures` puts its check here).
+    """
+    if await auth_service.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return PERMITS_VIEW_ANY in await auth_repo.permission_codes(db, actor)
+
+
+async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) -> Permit:
+    """The permit `actor` is allowed to read, or a refusal.
+
+    Two refusals, on purpose, and the difference is what the caller already
+    knows:
+
+      * a caller who is neither the holder nor a `permits.view_any` holder gets
+        `ERR-SYS-003` (404) — the same answer an id that never existed gets.
+        Anything else is a permit-existence oracle: a citizen could learn which
+        ids are real by which ones answer 403;
+      * a `permits.view_any` holder outside the permit's zone gets `ERR-ACL-002`
+        (403). This one is staff, the refusal IS territorial, and saying so is
+        what `_assert_organization_in_zone` says on the issuance path for the
+        same actor and the same leshoz.
+
+    The holder is checked FIRST so a citizen never depends on the zone: an
+    applicant carries no zone at all, and staff who also happen to hold a permit
+    of their own in another leshoz read it as its holder.
+    """
+    permit = await repo.permit_by_id(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    if await _is_holder(db, permit, actor):
+        return permit
+    if not await _holds_view_any(db, actor):
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    return permit
+
+
+async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
+    """`GET /permits/{id}` — the permit, its signatures and its timeline.
+
+    The signature list comes from `signatures.service`, never from a query of
+    `signatures` here: that module owns the requirement set (ruling 7) and a
+    second reader of its table is a second opinion about what "signed" means.
+    `missing_signatures` rides along so a signing screen needs one request rather
+    than two, and it is what makes the card self-explanatory while a permit is
+    still `pending_signatures`.
+    """
+    permit = await _readable_permit(db, permit_id, actor=actor)
+    return {
+        "permit": permit,
+        "signatures": await signatures_service.get_for_object(
+            db, object_type=OBJECT_TYPE, object_id=permit.id
+        ),
+        "history": await repo.status_history(db, permit.id),
+        "missing_signatures": await missing_signatures(db, permit.id),
+    }
+
+
+async def permit_document(
+    db: AsyncSession, permit_id: uuid.UUID, *, actor: User
+) -> tuple[Permit, bytes]:
+    """`GET /permits/{id}/pdf` — the permit's access rule, then its stored bytes.
+
+    Deliberately NOT `core.files.get_readable`: the file subsystem's own rule is
+    "the uploader, or any non-applicant role", and the uploader here is the
+    issuing hodim — so that rule would refuse the permit's own HOLDER their own
+    permit, the exact opposite of what this document needs (`pdf_bytes`'s own
+    docstring). The permit's rule is applied here instead, and the bytes come
+    back unchanged from storage.
+    """
+    permit = await _readable_permit(db, permit_id, actor=actor)
+    return permit, await pdf_bytes(db, permit.id)
+
+
+async def list_permits(
+    db: AsyncSession,
+    *,
+    actor: User,
+    params: PageParams,
+    status: str | None = None,
+    applicant_id: uuid.UUID | None = None,
+    contour_id: uuid.UUID | None = None,
+    organization_id: uuid.UUID | None = None,
+    series: str | None = None,
+    number: int | None = None,
+) -> tuple[list[Permit], int]:
+    """`GET /permits` — one page of the permits `actor` may see, plus the total.
+
+    The scope is the UNION of the two things `_readable_permit` admits one at a
+    time, so the list can never disagree with the card: the caller's own permits
+    (`auth.service.own_applicant_ids`, the same set `_is_holder` tests membership
+    in), OR — for a `permits.view_any` holder — everything inside their zone. A
+    republic-wide staff member's `zone_filter` is `true()` and they see the lot;
+    a zone-scoped one sees their own leshoz, and a permit outside it is simply
+    absent rather than refused, because a filter has no way to answer 403.
+
+    A caller who is neither gets `([], 0)` and no statement is issued: an empty
+    scope must mean "nothing", and building it as a WHERE clause would leave one
+    editing mistake between here and "every permit in the country".
+
+    All three zone axes are supplied. `Permit` carries `organization_id` only, so
+    `repo.list_permits` joins `organizations` for the other two — `zone_filter`
+    fails closed and RAISES when an axis is set without its column, and a
+    region-scoped, organization-less actor is creatable today
+    (`admin.users_service.create_user` sets the three independently).
+
+    `series` and `number` filter independently and AND together, so `?series=А`
+    alone lists a whole series and the pair — unique by
+    `uq_permits_series_number` — resolves to at most one row.
+    """
+    scope: list[Any] = []
+    holder_ids = await auth_service.own_applicant_ids(db, actor.id)
+    if holder_ids:
+        scope.append(Permit.applicant_id.in_(holder_ids))
+    if await _holds_view_any(db, actor):
+        scope.append(
+            zone_filter(
+                zone_of(actor),
+                region_col=Organization.region_id,
+                district_col=Organization.district_id,
+                organization_col=Permit.organization_id,
+            )
+        )
+    if not scope:
+        return [], 0
+    return await repo.list_permits(
+        db,
+        scope=or_(*scope),
+        status=status,
+        applicant_id=applicant_id,
+        contour_id=contour_id,
+        organization_id=organization_id,
+        series=series,
+        number=number,
+        offset=params.offset,
+        limit=params.page_size,
+    )

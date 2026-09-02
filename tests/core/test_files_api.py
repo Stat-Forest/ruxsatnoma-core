@@ -9,7 +9,6 @@ import pytest
 from fastapi import UploadFile
 from sqlalchemy import select
 
-from app import files_router
 from app.core import files
 from app.core.errors import DomainError
 from app.main import create_app
@@ -208,15 +207,15 @@ async def test_download_cyrillic_filename_roundtrip(db):
 def test_ascii_fallback_filename_pure_non_ascii_collapses_to_file():
     """Unit-ish case for the pure-non-ASCII fallback: no extension at all survives
     either, so there is nothing to append to "file"."""
-    assert files_router._ascii_fallback_filename("доверенность") == "file"
+    assert files._ascii_fallback_filename("доверенность") == "file"
 
 
 def test_ascii_fallback_filename_keeps_a_surviving_extension():
-    assert files_router._ascii_fallback_filename("доверенность.pdf") == "file.pdf"
+    assert files._ascii_fallback_filename("доверенность.pdf") == "file.pdf"
 
 
 def test_ascii_fallback_filename_untouched_for_plain_ascii():
-    assert files_router._ascii_fallback_filename("report.pdf") == "report.pdf"
+    assert files._ascii_fallback_filename("report.pdf") == "report.pdf"
 
 
 def test_sanitize_filename_strips_bare_carriage_return():

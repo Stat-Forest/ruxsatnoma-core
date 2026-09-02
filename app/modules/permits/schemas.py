@@ -13,7 +13,7 @@ Two columns of `permits` are deliberately absent from every response here:
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -43,8 +43,13 @@ def _trim_decimal(value: Decimal | None) -> str | None:
 
 
 class PermitOut(BaseModel):
-    """`POST /applications/{id}/permit` — the permit as it stands the moment it is
-    formed: numbered, rendered, hash-frozen and awaiting four signatures."""
+    """The permit's own columns — what `POST /applications/{id}/permit` answers
+    the moment the document is formed (numbered, rendered, hash-frozen, awaiting
+    four signatures), and what one row of `GET /permits` carries.
+
+    One shape for both, deliberately: every field here has already been judged
+    safe to return by the module docstring's two exclusions, and a second,
+    narrower list item would be a second place to remember them."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -72,6 +77,85 @@ class PermitOut(BaseModel):
     @field_serializer("area_ha", "amount", "sb_load")
     def _serialize_decimal(self, value: Decimal | None) -> str | None:
         return _trim_decimal(value)
+
+
+class PermitSignatureRow(BaseModel):
+    """One of the four ERI signature lines, as the permit card shows it.
+
+    A REDUCED view of a `signatures` row, not `signatures.schemas.SignatureOut`.
+    Two fields are left out on purpose: `signature_value` is the whole PKCS#7
+    envelope (kilobytes per line, four lines, on a screen that only needs to say
+    who signed and whether it verified) and `verification` is the raw provider
+    payload. 3.8's own `GET /signatures?object_type=permit&object_id=…` answers
+    the full row for anyone who needs it, so this card does not have to — and
+    defining the shape here rather than importing that module's schema keeps the
+    two free to change independently.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    purpose: str
+    signer_user_id: uuid.UUID | None
+    certificate_id: uuid.UUID
+    signed_at: datetime
+    verification_status: str
+
+
+class PermitHistoryRow(BaseModel):
+    """One entry of the permit's timeline (`permit_status_history`).
+
+    `reason_item_id`, `legal_basis` and `doc_file_id` are null for everything
+    3.11a writes and are on the shape from day one: they are the legal ground of
+    a suspension or a revocation (С13), and 3.11b fills them in on rows this very
+    response already renders — a front end reading this card must not have to
+    change its parser to see why a permit stopped working.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    from_status: PermitStatus | None
+    to_status: PermitStatus
+    reason_item_id: uuid.UUID | None
+    legal_basis: str | None
+    doc_file_id: uuid.UUID | None
+    changed_by: uuid.UUID | None
+    occurred_at: datetime
+
+
+class PermitCardOut(PermitOut):
+    """`GET /permits/{id}` — the permit's own columns, FLAT, plus the three lists
+    that are not columns of `permits` at all.
+
+    Flat rather than `{"permit": {...}, "signatures": [...]}`: the card and one
+    row of the list are the same object seen at two depths, and nesting would
+    make a client read `body["permit"]["status"]` here and `body["status"]`
+    there for the identical fact.
+    """
+
+    signatures: list[PermitSignatureRow]
+    history: list[PermitHistoryRow]
+    missing_signatures: list[str]
+
+    @classmethod
+    def build(cls, card: dict[str, Any]) -> PermitCardOut:
+        """Assemble the response from `service.permit_card`'s dict.
+
+        `PermitOut.model_fields` is read rather than the twenty names retyped: a
+        column added to `PermitOut` has to appear on the card too, and a
+        hand-copied list is exactly how the two would drift. `model_validate`
+        does the rest — including the nested rows, which arrive as ORM objects
+        and are validated `from_attributes`.
+        """
+        permit = card["permit"]
+        return cls.model_validate(
+            {
+                **{name: getattr(permit, name) for name in PermitOut.model_fields},
+                "signatures": card["signatures"],
+                "history": card["history"],
+                "missing_signatures": card["missing_signatures"],
+            }
+        )
 
 
 class PermitSignIn(BaseModel):
