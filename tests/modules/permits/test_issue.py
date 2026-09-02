@@ -22,6 +22,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
+from app.event_subscriptions import PAYMENT_CONFIRMED
 from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application, ApplicationItem
@@ -442,7 +443,7 @@ async def test_payment_confirmed_tells_the_assigned_executor_and_issues_nothing(
     series number must not appear because a webhook fired — `design/03` makes
     issuance a human act."""
     await publish(
-        db, Event(name="payment_confirmed", payload={"application_id": paid_application.id})
+        db, Event(name=PAYMENT_CONFIRMED, payload={"application_id": paid_application.id})
     )
 
     notified = (
@@ -466,7 +467,7 @@ async def test_payment_confirmed_with_nobody_assigned_notifies_nobody(
     assert paid_application.assigned_user_id is None
 
     await publish(
-        db, Event(name="payment_confirmed", payload={"application_id": paid_application.id})
+        db, Event(name=PAYMENT_CONFIRMED, payload={"application_id": paid_application.id})
     )
 
     notified = (
@@ -489,7 +490,7 @@ async def test_payment_confirmed_reads_the_amount_from_the_calculation_not_the_e
     await publish(
         db,
         Event(
-            name="payment_confirmed",
+            name=PAYMENT_CONFIRMED,
             payload={"application_id": paid_application.id, "amount": "1.00"},
         ),
     )
