@@ -57,16 +57,8 @@ lint:               ## Lint + format check, no changes (CI's `lint` job)
 type:               ## Type-check (CI's `lint` job)
 	uv run pyright
 
-# WeasyPrint (3.11a) dlopens Pango/GLib/HarfBuzz by leaf name. On Linux the loader finds
-# them; on macOS Homebrew's lib dir is not on dyld's default search path, so `import
-# weasyprint` fails there and nowhere else. Set as a command PREFIX, never `export`: SIP
-# strips DYLD_* from the environment of the /bin/sh make spawns, but not from a variable
-# assigned on the command line of the child it launches. Empty on Linux and in CI.
-# A bare `uv run pytest` on macOS needs the same prefix — see README / task-2 report.
-DYLD := $(if $(filter Darwin,$(shell uname -s)),DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:$(HOME)/lib:/usr/lib,)
-
 test:               ## Full test suite (needs `make up`; CI's `test` job)
-	$(DYLD) uv run pytest -q
+	uv run pytest -q
 
 security:           ## Security scan (bandit), same args as CI and pre-commit
 	# Run via uvx: bandit is a linter, not an app dependency, so it stays out of

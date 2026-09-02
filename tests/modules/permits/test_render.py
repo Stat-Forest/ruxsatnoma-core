@@ -1,4 +1,5 @@
 import re
+import zlib
 
 from app.modules.permits import render
 
@@ -77,14 +78,27 @@ def test_the_layout_cannot_execute_anything() -> None:
 def _mapped_codepoints(pdf: bytes) -> set[int]:
     """Every Unicode codepoint the PDF's own ToUnicode CMaps map a glyph to.
 
-    Readable as plain text only because `render.UNCOMPRESSED_PDF` is on; a compressed
-    PDF hides these behind zlib. One set across all CMaps — the page uses a regular
-    and a bold subset, and a letter present in either has reached the document.
+    A ToUnicode CMap is a *stream*, so it is Flate-compressed like any other — PDF/A-1
+    leaves the catalogue and the XMP packet in the clear (PDF 1.4 has no object streams)
+    but not stream bodies. So inflate every stream that inflates and read the CMaps out
+    of the result. `zlib` is the standard library; nothing is added to the lockfile for
+    a test, and nothing here depends on how the renderer chose to compress.
+
+    One set across all CMaps: the page uses a regular and a bold subset, and a letter
+    present in either has reached the document.
     """
+    haystacks = [pdf]
+    for stream in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", pdf, re.S):
+        try:
+            haystacks.append(zlib.decompress(stream.group(1)))
+        except zlib.error:
+            continue  # an image, or a stream using some other filter
+
     mapped: set[int] = set()
-    for block in re.finditer(rb"beginbfchar(.*?)endbfchar", pdf, re.S):
-        for pair in re.finditer(rb"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>", block.group(1)):
-            mapped.add(int(pair.group(2), 16))
+    for haystack in haystacks:
+        for block in re.finditer(rb"beginbfchar(.*?)endbfchar", haystack, re.S):
+            for pair in re.finditer(rb"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>", block.group(1)):
+                mapped.add(int(pair.group(2), 16))
     return mapped
 
 

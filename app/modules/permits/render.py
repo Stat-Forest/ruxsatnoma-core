@@ -29,39 +29,56 @@ else, so an admin-authored layout cannot make the server fetch a URL or read a f
 
 import base64
 import io
+import os
 import re
+import sys
 from collections.abc import Mapping
 from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Any
 
-import segno
-from weasyprint import CSS, HTML
-from weasyprint.text.fonts import FontConfiguration
-from weasyprint.urls import URLFetcher
+# WeasyPrint loads Pango, GLib and HarfBuzz through dlopen BY LEAF NAME. On macOS
+# Homebrew's lib directory is not on dyld's default search path, so `import weasyprint`
+# fails there and nowhere else, with `OSError: cannot load library 'libgobject-2.0-0'` —
+# which reads like a missing package rather than a missing search path, and sends the
+# reader off to reinstall pango.
+#
+# The exec-time environment cannot be reached from here: dyld captures DYLD_* when the
+# process starts. But cffi falls back to `ctypes.util.find_library`, and CPython's macOS
+# implementation of that reads DYLD_FALLBACK_LIBRARY_PATH from os.environ AT CALL TIME
+# (Lib/ctypes/macholib/dyld.py). Setting it before the import below is therefore enough,
+# and it saves every developer on this project from having to know a magic command
+# prefix: `uv run pytest`, `uv run uvicorn` and `python -m app.workers` all just work.
+#
+# setdefault, so an operator who set their own value keeps it. No effect on Linux, in CI
+# or in the container — and none on the rendered bytes on any platform.
+if sys.platform == "darwin":  # pragma: no cover - a developer-machine path
+    os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", "/opt/homebrew/lib:/usr/local/lib:/usr/lib")
 
-from app.core.errors import err
+import segno  # noqa: E402 - must follow the dyld fix-up above
+from weasyprint import CSS, HTML  # noqa: E402 - same
+from weasyprint.text.fonts import FontConfiguration  # noqa: E402 - same
+from weasyprint.urls import URLFetcher  # noqa: E402 - same
+
+from app.core.errors import err  # noqa: E402 - same
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 _DEFAULT_LAYOUT_PATH = ASSETS_DIR / "default_layout.html"
 
-# PDF/A-3b: the archival variant WeasyPrint writes the sRGB output intent and the
-# pdfaid XMP schema for (plan 03.11a ruling 2). -3 rather than -1/-2 because it is the
-# level that permits an embedded attachment, which 3.11b's signed-package export will
-# want; "b" is visual conformance, which is what an unstructured legal form can
-# honestly claim.
-PDF_VARIANT = "pdf/a-3b"
-
-# Compression off, deliberately, at roughly 3x the file size (22 KB -> 66 KB for the
-# bundled layout). At PDF 1.7 pydyf packs the catalogue into a /Type /ObjStm and Flate-
-# compresses the XMP stream, so a stored permit's own conformance declaration — the
-# /OutputIntent and the pdfaid schema — becomes unreadable without a zlib pass. These
-# are the bytes four ERI signatures are taken over and the bytes an archive keeps: what
-# they assert about themselves should be legible in them. It also takes zlib out of the
-# reproduction path for everything except the QR image, which arrives already deflated
-# inside its PNG. The tests assert exactly these two markers.
-UNCOMPRESSED_PDF = True
+# PDF/A-1b (ruling T2-a): the archival variant WeasyPrint writes the sRGB output intent
+# and the pdfaid XMP schema for. -1 rather than -3 because PDF/A-3's one advantage is
+# embedded file attachments, which this document does not use — the four ERI signatures
+# are detached rows in `signatures`, taken over these bytes — while PDF/A-1 is the
+# stricter and more widely mandated profile for a government record. "b" is visual
+# conformance, which is what an unstructured legal form can honestly claim.
+#
+# It also keeps the document honest about itself for free. PDF/A-1 is based on PDF 1.4,
+# which predates object streams and forbids them, so the catalogue, the /OutputIntent
+# and the XMP packet all sit in the raw bytes with WeasyPrint's normal compression left
+# on — the conformance a stored permit declares is readable without a zlib pass, and it
+# costs nothing. At PDF 1.7 the same claim needed compression disabled and 2.5x the size.
+PDF_VARIANT = "pdf/a-1b"
 
 # QR: error correction M (15%) survives a folded, stamped, photographed paper permit;
 # a 4-module quiet zone is what ISO/IEC 18004 requires for a scanner to lock on, and
@@ -221,6 +238,6 @@ def render_permit(snapshot: Mapping[str, Any], layout_html: str, qr_url: str) ->
 
     # `write_pdf` returns None when handed a target to write into; with no target it
     # always returns the bytes. The assert is the narrowing, not a runtime doubt.
-    pdf = document.write_pdf(pdf_variant=PDF_VARIANT, uncompressed_pdf=UNCOMPRESSED_PDF)
+    pdf = document.write_pdf(pdf_variant=PDF_VARIANT)
     assert pdf is not None
     return pdf
