@@ -126,6 +126,48 @@ async def test_cancelling_an_application_cancels_its_invoice(db, approved_applic
     assert cancelled.status == "cancelled"
 
 
+async def test_cancelling_an_application_never_cancels_a_PAID_invoice(db, approved_application):
+    """Whole-branch review: `invoice_for_application` returns `pending` OR
+    `paid` (`repo.IN_FORCE_STATUSES`), so the cancellation handler is handed
+    a settled invoice just as readily as an unpaid one. Cancelling that one
+    destroys a confirmed payment — `is_paid` flips back to `False`, the
+    ledger rows are orphaned against a cancelled invoice, and the citizen
+    who paid gets neither a permit nor a refund record.
+
+    Unreachable through `APPLICATION_TRANSITIONS` today (`PAID` may only go
+    to `PERMIT_ISSUED`), but that guard lives in ANOTHER module and 3.9a-flow
+    already writes one transition outside `set_status` — so the refusal is
+    asserted on the handler itself, by publishing the event directly at a
+    paid invoice, which is exactly what a future `cancel()` would do."""
+    from app.core import events
+    from app.modules.applications import events as app_events
+    from app.modules.payments import service
+
+    await events.publish(
+        db,
+        events.Event(
+            name=app_events.APPLICATION_APPROVED,
+            payload={"application_id": approved_application.id},
+        ),
+    )
+    issued = await service.invoice_for_application(db, approved_application.id)
+    assert issued is not None
+    issued.status = "paid"
+    await db.flush()
+
+    await events.publish(
+        db,
+        events.Event(
+            name=app_events.APPLICATION_CANCELLED,
+            payload={"application_id": approved_application.id},
+        ),
+    )
+
+    await db.refresh(issued)
+    assert issued.status == "paid", "a confirmed payment's invoice is never cancelled here"
+    assert await service.is_paid(db, approved_application.id) is True
+
+
 async def test_a_repeated_event_returns_the_same_invoice_and_does_not_raise(
     db, approved_application
 ):

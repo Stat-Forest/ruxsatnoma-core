@@ -27,6 +27,14 @@ work in the SAME run (both ruling 13: "one malformed row must never abort
 the whole nightly run" is an outcome for the whole sweep, not a property of
 the expire pass alone — `app/workers/jobs.py::expire_invoices` commits once,
 at the very end).
+
+The last two tests are the whole-branch review's own, one per pass, and they
+prove the half a wider `except` cannot: after a DATABASE-level failure the
+session is in `InFailedSQLTransaction` and PostgreSQL silently turns the
+sweep's single `COMMIT` into a `ROLLBACK`, so only the per-row SAVEPOINT
+makes the rest of the night's work survive. Both therefore assert AFTER a
+real `commit()`, against rows re-read from the database — the shape a
+missing savepoint fails whichever order the candidate rows come back in.
 """
 
 import uuid
@@ -294,3 +302,104 @@ async def test_a_failed_reminder_does_not_discard_the_expire_passs_work(
         .where(Notification.object_id == due_soon_invoice_on_its_own_application.id)
     )
     assert sent == 0  # notify() raises before any Notification row is constructed
+
+
+async def test_a_database_failure_on_one_invoice_does_not_abort_the_expire_pass(
+    db, overdue_invoice, non_invoiced_overdue_invoice, monkeypatch
+):
+    """Whole-branch review, half (b) of the deadlock finding. The guard that
+    kept the sweep alive caught `DomainError` only; a DATABASE-level failure
+    — an `IntegrityError`, or the `DeadlockDetected` the old lock order could
+    genuinely produce — is a `DBAPIError` and escaped it, taking the whole
+    nightly run down with it.
+
+    Catching more broadly is only half the fix, which is what this test is
+    built to prove. After a failed statement PostgreSQL refuses every later
+    command in the same transaction, and `COMMIT` on an aborted transaction
+    is silently treated as `ROLLBACK` — so a sweep that merely swallowed the
+    exception would "complete", log nothing alarming, and quietly discard
+    the whole night's expiries. Only the per-row `SAVEPOINT` makes the
+    session usable again.
+
+    Hence the assertion is made AFTER a real `commit()` and against rows
+    re-read from the database: a missing savepoint fails it whichever order
+    the two candidate rows happen to come back in — the bad row first
+    poisons the good row's own writes, the good row first has them thrown
+    away at the commit."""
+    from sqlalchemy import text
+
+    from app.modules.applications import service as applications_service
+    from app.modules.payments import jobs
+
+    real_set_status = applications_service.set_status
+    poisoned = non_invoiced_overdue_invoice.application_id
+
+    async def _fail_at_the_database(db_, application_id, **kwargs):
+        if application_id == poisoned:
+            # A genuine aborted-transaction failure, not a Python-level
+            # raise: after this every later statement on the connection
+            # fails until something rolls back to a savepoint.
+            await db_.execute(text("SELECT 1 / 0"))
+        return await real_set_status(db_, application_id, **kwargs)
+
+    monkeypatch.setattr(jobs.applications_service, "set_status", _fail_at_the_database)
+
+    await jobs.expiry_sweep(db)  # must not raise
+
+    # The proof: the session survived the failure well enough to COMMIT.
+    # (No count assertion — this database is shared and persistent, and other
+    # tests' committed overdue rows are swept alongside these two. Every
+    # assertion below is scoped to a row this test owns.)
+    await db.commit()
+
+    await db.refresh(overdue_invoice)
+    assert overdue_invoice.status == "expired"
+    await db.refresh(non_invoiced_overdue_invoice)
+    assert non_invoiced_overdue_invoice.status == "pending"
+
+    application = await applications_service.get(db, overdue_invoice.application_id)
+    assert application is not None
+    await db.refresh(application)
+    assert application.status == "EXPIRED_UNPAID"
+
+
+async def test_a_database_failure_in_the_reminder_pass_does_not_discard_the_expire_pass(
+    db, overdue_invoice, due_soon_invoice_on_its_own_application, monkeypatch
+):
+    """The same proof for pass 2, which is where it matters most:
+    `app/workers/jobs.py::expire_invoices` commits ONCE, at the very end, so
+    a poisoned session in the reminder pass silently discards every expiry
+    pass 1 already made. `notify()`'s own write path ends in `db.flush()`,
+    so an `IntegrityError`/`DBAPIError` there is the realistic trigger — the
+    `except ValueError` the previous round added never covered it."""
+    from sqlalchemy import func, select, text
+
+    from app.modules.notifications import service as notifications_service
+    from app.modules.notifications.models import Notification
+    from app.modules.payments import jobs
+
+    real_notify = notifications_service.notify
+
+    async def _fail_at_the_database(db_, *, event_code, object_id=None, **kwargs):
+        if object_id == due_soon_invoice_on_its_own_application.id:
+            await db_.execute(text("SELECT 1 / 0"))
+        return await real_notify(db_, event_code=event_code, object_id=object_id, **kwargs)
+
+    monkeypatch.setattr(jobs.notifications_service, "notify", _fail_at_the_database)
+
+    await jobs.expiry_sweep(db)  # must not raise
+
+    # No count assertion: this database is shared and persistent, so other
+    # tests' committed due-soon rows are reminded in the same pass. Both
+    # assertions below are scoped to a row this test owns.
+    await db.commit()
+
+    await db.refresh(overdue_invoice)
+    assert overdue_invoice.status == "expired"  # pass 1's work really reached the database
+
+    sent = await db.scalar(
+        select(func.count())
+        .select_from(Notification)
+        .where(Notification.object_id == due_soon_invoice_on_its_own_application.id)
+    )
+    assert sent == 0

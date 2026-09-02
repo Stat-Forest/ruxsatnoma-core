@@ -16,7 +16,7 @@ Task 2 adds: a saved `Calculation` on `approved_application` (task-2 ruling P4 �
 `approved_without_calculation` for the loud-failure test, and the HTTP client
 fixtures the new `/invoices/*` read routes need (`payments` has no router.py
 before Task 2, so this package's own `_app_on_test_db` guard is new too — lesson:
-'A module's first HTTP-driven test file needs its own `_app_on_test_db` guard').
+"A module's test conftest needs plumbing copied from an existing one").
 
 Task 4 adds: `client` (an ANONYMOUS httpx client for the Payme JSON-RPC endpoint
 — Basic auth via a request header, never a cookie session, mirrors
@@ -206,8 +206,8 @@ async def expired_invoice(db: AsyncSession, approved_application: Application) -
 @pytest.fixture(autouse=True)
 def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
     """The same guard every other HTTP-tested module's conftest carries
-    (lesson: 'A module's first HTTP-driven test file needs its own
-    `_app_on_test_db` guard') — `payments` had none before Task 2, since
+    (lesson: "A module's test conftest needs plumbing copied from an existing
+    one, not just fixtures") — `payments` had none before Task 2, since
     Task 1 drove no HTTP requests at all. Task 4 additionally sets
     `PAYME_CASHBOX_KEY` so `test_payme_rpc.py`'s hardcoded `test-cashbox-key`
     authenticates against something real (ruling K: 'tests need a known key;
@@ -232,8 +232,9 @@ async def client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
     client for the identical shape of route). `_commit_pending_before_requests`
     commits whatever `pending_invoice`/`cancelled_invoice`/etc. staged on
     `db` before every outgoing call, regardless of fixture parameter order
-    (lesson: "A `_client_for` client's setup-time commit only covers
-    fixtures listed before it")."""
+    (same lesson's second half: pytest instantiates fixtures left-to-right,
+    so a client's own setup-time commit only covers the ones listed before
+    it)."""
     async with make_client(create_app(), lifespan=True) as http_client:
         _commit_pending_before_requests(http_client, db)
         yield http_client

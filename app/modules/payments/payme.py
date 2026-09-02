@@ -43,6 +43,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +56,8 @@ from app.modules.integrations.adapters.payme import (
 )
 from app.modules.payments import repo, service
 from app.modules.payments.models import Invoice, ProviderTransaction
+
+logger = structlog.get_logger(__name__)
 
 PROVIDER = "payme"
 
@@ -247,9 +250,9 @@ async def _create_transaction(
         payload=dict(params),
     )
     try:
-        # SAVEPOINT, not a bare flush (lesson: "Recovering from a failed
-        # insert... needs a SAVEPOINT and exc.orig.__cause__" — mirrors
-        # signatures.service.sign()'s identical insert-race template).
+        # SAVEPOINT, not a bare flush (lesson: "A failed DB statement aborts
+        # the whole transaction — catch the right type, recover with a
+        # SAVEPOINT" — mirrors signatures.service.sign()'s insert-race template).
         async with db.begin_nested():
             await repo.add_provider_transaction(db, transaction)
     except IntegrityError as exc:
@@ -342,7 +345,18 @@ async def _cancel_transaction(
     reverses the invoice/ledger for a state-`2` cancellation — that is the
     refund path, 3.10b's `refunds` table, deliberately absent from this
     stage (module docstring); this method's whole job is recording Payme's
-    own state (the brief's method table)."""
+    own state (the brief's method table).
+
+    A state-`2` cancellation is therefore logged at ERROR, not written off
+    as ordinary traffic (whole-branch review). `design/04` §3.5 reason `5`
+    is literally "funds returned", and until 3.10b builds the reversal the
+    system's own books disagree with reality: the invoice stays `paid`, the
+    application stays `PAID`, `allocations` still claims two `payment` rows
+    summing to money that has gone back, and `service.is_paid` — the single
+    gate 3.11 checks before issuing a permit — still answers `True`. That
+    is a manual, human reversal on live money, and the log line is the only
+    thing that tells anyone it happened. See the KNOWN GAP paragraph in
+    `service.py`'s public-surface comment for the whole shape of it."""
     external_id = _external_id(params)
     transaction = (
         await repo.get_provider_transaction_by_external_id_for_update(db, PROVIDER, external_id)
@@ -368,6 +382,19 @@ async def _cancel_transaction(
             old_value={"state": old_state},
             new_value={"state": new_state, "reason": reason},
         )
+        if old_state == STATE_PERFORMED:
+            # Money that was already confirmed is going back, and 3.10a
+            # reverses nothing (see this function's docstring). ERROR, not
+            # info: the invoice, the application and the ledger all still
+            # say "paid" after this returns, and nothing else in the system
+            # will ever mention it.
+            logger.error(
+                "payme.cancel_after_perform",
+                transaction_id=str(transaction.id),
+                invoice_id=str(transaction.invoice_id),
+                external_id=transaction.external_id,
+                reason=reason,
+            )
     elif transaction.state not in (STATE_CANCELLED_BEFORE, STATE_CANCELLED_AFTER):
         # Invariant guard, not a documented Payme trigger: this module only
         # ever writes the four states above, so this branch is unreachable

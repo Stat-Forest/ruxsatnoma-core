@@ -315,3 +315,49 @@ async def test_a_failure_inside_perform_transaction_rolls_back_the_whole_write(
         .where(Allocation.invoice_id == pending_invoice.id)
     )
     assert count == 0
+
+
+async def test_payment_confirmed_carries_both_the_invoice_and_the_application_id(
+    db, client, pending_invoice
+):
+    """Whole-branch review. The frozen public surface takes an
+    `application_id` in both directions (`invoice_for_application`,
+    `is_paid`) and forbids a level-4+ caller from reading `invoices` as a
+    table — so an `invoice_id`-only payload gives a subscriber no way to
+    reach anything at all. 3.11 `permits`'s subscriber reads
+    `application_id` off this event and returns early without it, logging a
+    warning: dropping the key would silently stop every permit from being
+    raised, forever, with nothing failing anywhere.
+
+    Asserts the KEYS as well as the values: an extra key is tolerable, a
+    missing one is the defect."""
+    from app.core import events
+    from app.modules.payments import events as payment_events
+    from tests.modules.payments.test_payme_rpc import _rpc, _tx_id
+
+    seen: list[events.Event] = []
+
+    async def _spy(_db: AsyncSession, event: events.Event) -> None:
+        seen.append(event)
+
+    # Removed for the next test by the root conftest's `_isolate_subscriptions`
+    # (it restores the snapshot taken before this test ran) — the bus is
+    # process-global and a spy left behind would fire three files away.
+    events.subscribe(payment_events.PAYMENT_CONFIRMED, _spy)
+
+    tx_id = _tx_id("payload")
+    params = {
+        "id": tx_id,
+        "time": 1_800_000_000_000,
+        "amount": int(pending_invoice.amount * 100),
+        "account": {"id": pending_invoice.number},
+    }
+    await _rpc(client, "CreateTransaction", params)
+    performed = await _rpc(client, "PerformTransaction", {"id": tx_id})
+    assert performed.json()["result"]["state"] == 2
+
+    assert len(seen) == 1, "confirm_payment publishes payment_confirmed exactly once"
+    payload = seen[0].payload
+    assert set(payload) >= {"invoice_id", "application_id"}
+    assert payload["invoice_id"] == str(pending_invoice.id)
+    assert payload["application_id"] == str(pending_invoice.application_id)

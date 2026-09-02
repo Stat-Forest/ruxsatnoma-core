@@ -27,14 +27,28 @@ async def get_invoice(db: AsyncSession, invoice_id: uuid.UUID) -> Invoice | None
 
 
 async def get_invoice_for_update(db: AsyncSession, invoice_id: uuid.UUID) -> Invoice | None:
-    """`get_invoice`'s locking sibling — `payme._perform_transaction` ONLY
-    (mirrors `applications.repo.get_application_for_update`'s own reasoning).
-    Two different Payme transaction ids could in principle both point at the
-    same invoice and both reach `PerformTransaction` concurrently; without
-    the lock both could read `status == "pending"` before either writes, and
-    both would then confirm the same invoice paid twice. `populate_existing`
-    so a caller who already holds this row from an earlier read in the same
-    session sees the locked, current value, not a stale cached one."""
+    """`get_invoice`'s locking sibling (mirrors `applications.repo.
+    get_application_for_update`'s own reasoning). Two callers, and they are
+    the whole list — everything else on `invoices` reads through
+    `get_invoice`/`get_in_force_invoice`:
+
+    - `payme._perform_transaction`. Two different Payme transaction ids
+      could in principle both point at the same invoice and both reach
+      `PerformTransaction` concurrently; without the lock both could read
+      `status == "pending"` before either writes, and both would then
+      confirm the same invoice paid twice.
+    - `jobs._expire_one_invoice`. Not for a race between two sweeps (only
+      one runs) but for the LOCK ORDER: the sweep and `PerformTransaction`
+      both touch an invoice and its application, and taking them in
+      opposite orders is an ABBA deadlock on an overdue invoice being paid
+      right now. Both take the invoice here first, then the application
+      through `applications.service.set_status` (`jobs.py`'s own module
+      docstring carries the full reasoning). It also gives the sweep the
+      re-read it needs to skip an invoice paid since its unlocked scan.
+
+    `populate_existing` so a caller who already holds this row from an
+    earlier read in the same session sees the locked, current value, not a
+    stale cached one — which is what makes that re-read meaningful."""
     return await db.get(Invoice, invoice_id, with_for_update=True, populate_existing=True)
 
 

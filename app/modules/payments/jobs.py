@@ -12,35 +12,64 @@ that a successful pass removes the row from:
 
 1. **Overdue** (`due_at` already in the past) — flips the invoice to
    `expired` and the application to `EXPIRED_UNPAID` through
-   `applications.service.set_status`, in THAT order: `set_status` fetches
-   and locks the application row and can refuse the transition (a row this
-   job has no business touching — e.g. one already moved on some other
-   path), so only once it succeeds does the invoice itself get written.
-   Reversing the order would risk flushing `invoice.status = 'expired'`
-   before the refusal, leaving exactly the half-applied state ruling 13
-   forbids. Both writes carry the SAME job correlation id and
-   `user_id=None` (`CLAUDE.md`'s job-audit idiom). A refusal is caught,
-   logged with enough identity to chase, and the sweep moves on to the next
-   invoice — one malformed row must never abort the whole nightly run
-   (ruling): in this repo's shared, persistent test database a leftover
-   committed overdue invoice from another test would otherwise fail every
-   payments test that runs after it.
+   `applications.service.set_status`. It takes the **invoice lock first**
+   and the application lock second (see "Lock order" below), re-reads the
+   invoice under that lock, and skips a row that stopped being `pending`
+   between the unlocked scan and the lock — a concurrent
+   `PerformTransaction` that just paid it, say. Both writes carry the SAME
+   job correlation id and `user_id=None` (`CLAUDE.md`'s job-audit idiom).
 2. **Reminder** (`due_at` within `REMINDER_DAYS_BEFORE_DUE` days from now,
    not yet due) — notifies the applicant once. `notifications.service.
    already_notified` is the once-only check (no new column, no schema
    change beyond migration `0018`'s seed): looked up BEFORE calling
    `notify()`, keyed on an existing `inapp` row for the same
-   `event_code`/`object_id`. `notify()`'s own `ValueError` (an unresolvable
-   recipient) is caught the same way pass 1 catches `set_status`'s
-   `DomainError` — the ruling's "one malformed row must never abort the
-   whole nightly run" is an outcome for the WHOLE sweep, not a property of
-   pass 1 alone: `app/workers/jobs.py::expire_invoices` commits once, at
-   the very end, so an uncaught exception anywhere in pass 2 would roll
-   back every write pass 1 already made in the same run.
+   `event_code`/`object_id`. This pass takes no lock at all — it writes
+   nothing on `invoices` or `applications`.
 
 Re-running the whole sweep is a no-op the second time: an expired invoice no
 longer matches pass 1's `status = 'pending'` filter, and a reminder already
 sent no longer passes `already_notified`.
+
+--- Lock order: the INVOICE first, then the application -------------------
+
+`payme._perform_transaction` locks the **invoice** (`repo.get_invoice_for_
+update`) and then, through `service.confirm_payment`, the **application**
+(`applications.service.set_status` locks its own row). Pass 1 originally did
+the opposite — `set_status` first, the invoice at flush — and an overdue
+invoice being paid at the exact moment the sweep reached it was a textbook
+ABBA deadlock. Whichever side Postgres picks to abort raises
+`DeadlockDetected`, which is a `DBAPIError` and NOT a `DomainError`, so it
+would have escaped the per-row guard, escaped `expire_invoices`, and left
+the whole night's work uncommitted.
+
+One consistent order across the codebase is the cure, not a wider `except`:
+every writer here now takes the invoice before the application
+(`issue_invoice` inserts its invoice before calling `set_status`;
+`confirm_payment` is called with the invoice already locked). Adding a new
+writer that touches both means taking them in this order.
+
+--- One savepoint per row --------------------------------------------------
+
+Ruling 13's "one malformed row must never abort the whole nightly run" is an
+outcome for the WHOLE sweep — `app/workers/jobs.py::expire_invoices` commits
+ONCE, at the very end, so an uncaught exception anywhere in either pass rolls
+back every write the sweep has already made.
+
+Catching broadly is only half of that. A failure at the DATABASE level (the
+deadlock above, an `IntegrityError`, a statement error) leaves the session in
+`InFailedSQLTransaction`: every later statement fails too, and `COMMIT` on an
+aborted PostgreSQL transaction is silently treated as `ROLLBACK` — the sweep
+would "complete", log nothing alarming, and quietly discard everything. So
+each row's whole body runs inside its own `db.begin_nested()` SAVEPOINT, and
+the guard around it catches `Exception` (repo lesson: "A failed DB statement
+aborts the whole transaction — catch the right type, recover with a
+SAVEPOINT"). A `ROLLBACK TO SAVEPOINT` is one of the few statements PostgreSQL
+still accepts in an aborted transaction, which is exactly what makes the NEXT
+row's writes possible. The two named exception types keep their own log lines
+because their diagnostics differ, not because the width of the guard depends
+on them; and each loop reads the ids it logs BEFORE entering its savepoint,
+since a rolled-back savepoint expires the objects it restores and an `except`
+branch must not be able to emit a query of its own.
 """
 
 import uuid
@@ -55,6 +84,7 @@ from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, repo
+from app.modules.payments.models import Invoice
 
 logger = structlog.get_logger(__name__)
 
@@ -81,89 +111,160 @@ async def expiry_sweep(db: AsyncSession) -> dict[str, int]:
     return {"expired": expired, "reminded": reminded}
 
 
+async def _expire_one_invoice(
+    db: AsyncSession, invoice_id: uuid.UUID, *, correlation_id: str
+) -> bool:
+    """One overdue invoice's whole body, run by the caller inside a SAVEPOINT.
+    `True` when it was expired, `False` when it was skipped.
+
+    Takes the INVOICE lock first (module docstring, "Lock order") and only
+    then `set_status`, which takes the application's. The re-read under that
+    lock is not ceremony: `list_invoices_past_due` is an unlocked scan, so a
+    `PerformTransaction` may have paid — or an `APPLICATION_CANCELLED`
+    subscriber cancelled — this very row in between, and expiring a paid
+    invoice is the same damage `cancel_invoice_for_application` refuses to
+    do. `get_invoice_for_update` uses `populate_existing`, so the status
+    read here is the locked, current one, never a stale cached value.
+
+    `set_status` before the invoice write, still: it can legitimately refuse
+    the transition, and it raises before writing anything, so a refusal
+    leaves nothing half-applied (ruling 13 forbids exactly that state)."""
+    invoice = await repo.get_invoice_for_update(db, invoice_id)
+    if invoice is None or invoice.status != "pending":
+        return False
+
+    await applications_service.set_status(db, invoice.application_id, to_status="EXPIRED_UNPAID")
+    invoice.status = "expired"
+    await audit.log(
+        db,
+        action=INVOICE_EXPIRE,
+        user_id=None,
+        object_type="invoice",
+        object_id=invoice.id,
+        old_value={"status": "pending"},
+        new_value={"status": "expired"},
+        correlation_id=correlation_id,
+    )
+    return True
+
+
 async def _expire_overdue_invoices(db: AsyncSession, *, now: datetime, correlation_id: str) -> int:
     count = 0
-    for invoice in await repo.list_invoices_past_due(db, now=now):
+    for candidate in await repo.list_invoices_past_due(db, now=now):
+        # Plain strings, read BEFORE the savepoint. A savepoint rollback
+        # expires the objects it restores, so reading `candidate.id` in an
+        # `except` branch would emit a refresh SELECT from inside the error
+        # path — the one place that must not be able to fail.
+        invoice_id, application_id = candidate.id, str(candidate.application_id)
         try:
-            await applications_service.set_status(
-                db, invoice.application_id, to_status="EXPIRED_UNPAID"
-            )
+            async with db.begin_nested():
+                expired = await _expire_one_invoice(db, invoice_id, correlation_id=correlation_id)
         except DomainError as exc:
-            # Never let one row's refusal abort the nightly run (ruling) —
-            # logged with enough identity to chase (invoice/application ids,
-            # the domain error's own code), and `invoice.status` is left
-            # untouched: set_status raises before writing anything, so
-            # nothing here needs undoing.
+            # A transition this job has no business making — e.g. a row
+            # already moved on some other path. Expected and tolerated
+            # (ruling 13), logged with enough identity to chase.
             logger.error(
                 "job.expiry_sweep.bad_transition",
-                invoice_id=str(invoice.id),
-                application_id=str(invoice.application_id),
+                invoice_id=str(invoice_id),
+                application_id=application_id,
                 error_code=exc.code,
             )
             continue
-        invoice.status = "expired"
-        await audit.log(
-            db,
-            action=INVOICE_EXPIRE,
-            user_id=None,
-            object_type="invoice",
-            object_id=invoice.id,
-            old_value={"status": "pending"},
-            new_value={"status": "expired"},
-            correlation_id=correlation_id,
-        )
-        count += 1
+        except Exception as exc:
+            # Everything else, database-level failures included (module
+            # docstring, "One savepoint per row"): the SAVEPOINT above has
+            # already been rolled back by the time this runs, so the session
+            # is usable and the next invoice really can be written.
+            logger.error(
+                "job.expiry_sweep.expire_failed",
+                invoice_id=str(invoice_id),
+                application_id=application_id,
+                error=repr(exc),
+            )
+            continue
+        count += int(expired)
     return count
+
+
+async def _remind_about_one_invoice(
+    db: AsyncSession, invoice: Invoice, *, correlation_id: str
+) -> bool:
+    """One due-soon invoice's whole body, run by the caller inside a
+    SAVEPOINT — the once-only check and the application read included, since
+    either can fail at the database level just as `notify()` can. `True` when
+    a reminder was sent, `False` when it was skipped.
+
+    Takes the invoice object rather than an id, and no lock: this pass writes
+    nothing on `invoices` or `applications`, so it is not part of the lock
+    order pass 1's own helper has to respect."""
+    if await notifications_service.already_notified(
+        db, event_code=events.INVOICE_DUE_SOON, object_id=invoice.id
+    ):
+        return False
+
+    application = await applications_service.get(db, invoice.application_id)
+    if application is None:
+        # invoice.application_id is a NOT NULL FK — unreachable in
+        # practice; guarded rather than crashing into None below.
+        logger.error("job.expiry_sweep.application_missing", invoice_id=str(invoice.id))
+        return False
+
+    await notifications_service.notify(
+        db,
+        event_code=events.INVOICE_DUE_SOON,
+        recipient_user_id=application.submitted_by_user_id,
+        # Same three placeholder names the `invoice.issued` template
+        # uses (migration 0009) and this stage's own `invoice.due_soon`
+        # seed (migration 0018) — the reminder is the same fact
+        # ("amount X due by date Y for application Z"), read again.
+        params={
+            "application_number": application.number,
+            "amount": invoice.amount,
+            "due_date": invoice.due_at.astimezone(TASHKENT).date(),
+        },
+        object_type="invoice",
+        object_id=invoice.id,
+        correlation_id=correlation_id,
+    )
+    return True
 
 
 async def _send_due_soon_reminders(db: AsyncSession, *, now: datetime, correlation_id: str) -> int:
     horizon = now + timedelta(days=REMINDER_DAYS_BEFORE_DUE)
     count = 0
-    for invoice in await repo.list_invoices_due_soon(db, now=now, before=horizon):
-        if await notifications_service.already_notified(
-            db, event_code=events.INVOICE_DUE_SOON, object_id=invoice.id
-        ):
-            continue
-        application = await applications_service.get(db, invoice.application_id)
-        if application is None:
-            # invoice.application_id is a NOT NULL FK — unreachable in
-            # practice; guarded rather than crashing into None below.
-            logger.error("job.expiry_sweep.application_missing", invoice_id=str(invoice.id))
-            continue
+    for candidate in await repo.list_invoices_due_soon(db, now=now, before=horizon):
+        # Read before the savepoint, same reasoning as pass 1's.
+        invoice_id, application_id = str(candidate.id), str(candidate.application_id)
         try:
-            await notifications_service.notify(
-                db,
-                event_code=events.INVOICE_DUE_SOON,
-                recipient_user_id=application.submitted_by_user_id,
-                # Same three placeholder names the `invoice.issued` template
-                # uses (migration 0009) and this stage's own `invoice.due_soon`
-                # seed (migration 0018) — the reminder is the same fact
-                # ("amount X due by date Y for application Z"), read again.
-                params={
-                    "application_number": application.number,
-                    "amount": invoice.amount,
-                    "due_date": invoice.due_at.astimezone(TASHKENT).date(),
-                },
-                object_type="invoice",
-                object_id=invoice.id,
-                correlation_id=correlation_id,
-            )
+            async with db.begin_nested():
+                reminded = await _remind_about_one_invoice(
+                    db, candidate, correlation_id=correlation_id
+                )
         except ValueError as exc:
-            # Review finding (task 6): the ruling's "never abort the whole
-            # run" is a property of the WHOLE sweep, not just pass 1 —
-            # `expire_invoices` (app/workers/jobs.py) commits once, at the
-            # end, so an uncaught exception here would roll back every
-            # expiry pass 1 already wrote in this same run. Same guarantee
-            # as the set_status catch above: notify()'s ValueError fires
-            # before any Notification row is constructed, so nothing here
-            # needs undoing (lesson: log repr(e), not f"{e}" — an empty
-            # str() on some exception types is undiagnosable later).
+            # `notify()`'s own documented failure — an unresolvable
+            # recipient or an unknown channel. Kept apart from the catch-all
+            # below only for its own log line (lesson: log repr(e), not
+            # f"{e}" — an empty str() on some exception types is
+            # undiagnosable later).
             logger.error(
                 "job.expiry_sweep.reminder_failed",
-                invoice_id=str(invoice.id),
-                application_id=str(invoice.application_id),
+                invoice_id=invoice_id,
+                application_id=application_id,
                 error=repr(exc),
             )
             continue
-        count += 1
+        except Exception as exc:
+            # Everything else — above all a database-level failure inside
+            # `notify()`'s own `db.flush()`, which raises `IntegrityError`/
+            # `DBAPIError` and would otherwise poison the session for the
+            # rest of the sweep AND silently discard pass 1's whole night's
+            # work at the single commit (module docstring).
+            logger.error(
+                "job.expiry_sweep.reminder_error",
+                invoice_id=invoice_id,
+                application_id=application_id,
+                error=repr(exc),
+            )
+            continue
+        count += int(reminded)
     return count

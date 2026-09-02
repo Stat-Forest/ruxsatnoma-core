@@ -45,11 +45,19 @@ moment) — and until `payme_rpc` below wrapped `_process` in its own outer
 one outcome this whole route exists to prevent. `payme_rpc` is the
 backstop that makes this module docstring's "never lets ANY exception
 escape" literally true, independent of what `_process` itself does or
-fails to do. It deliberately does not touch `db` itself: whatever
-`_process`'s own commit/rollback already attempted is left for `get_db`'s
-own teardown to resolve, exactly as it does for every other route in this
-codebase — this route's own promise is that ITS response is always 200,
-not that it can override how session teardown behaves after that.
+fails to do.
+
+That backstop makes ONE call on `db` of its own, and only one: a best-effort
+`rollback()` wrapped in its own `try` (whole-branch review). Answering 200
+from the outer guard is not the end of the request — `get_db`
+(`app/core/deps.py`) then takes its own success branch and commits the
+session a SECOND time, and if `_process`'s own commit failed in a way that
+left the transaction needing an explicit rollback, that second commit raises
+outside this route entirely and renders a real 500. Rolling back first
+leaves `get_db` a clean transaction to commit; the nested `try` is what
+stops a failing rollback (a dropped connection) from reopening the very hole
+it is closing. Nothing is lost by it: this branch is only ever reached after
+`_process` has already decided the request failed.
 """
 
 import json
@@ -154,5 +162,19 @@ async def payme_rpc(request: Request, db: Annotated[AsyncSession, Depends(get_db
         # itself be one more thing that can fail) — `null` is valid
         # JSON-RPC for a response whose request could not be identified,
         # the same convention `-32700`/`-32600` above already use.
+        try:
+            # The residual hole the re-reviewer left for the final review:
+            # once we answer 200 here, `get_db` (`app/core/deps.py`) takes
+            # its own `else:` branch and calls `session.commit()` a SECOND
+            # time — and if the failure above left the session needing an
+            # explicit rollback, THAT commit raises past this route
+            # entirely and renders a real 500, the one outcome this module
+            # exists to prevent. Rolling back first leaves `get_db` a clean
+            # transaction to commit. Nested, because a rollback on a
+            # already-dead connection raises too, and reintroducing the
+            # same hole while closing it would be absurd.
+            await db.rollback()
+        except Exception:
+            pass
         logger.error("payme_rpc_commit_failed", error=repr(exc))
         return _error(None, payme.ERR_INTERNAL, "Internal error")

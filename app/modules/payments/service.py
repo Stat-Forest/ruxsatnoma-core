@@ -17,7 +17,9 @@ Public surface for the event bus (`subscribers.py`, registered in
   `invoice_for_application` first.
 - `cancel_invoice_for_application(db, application_id) -> Invoice | None` — the
   business action behind `applications.events.APPLICATION_CANCELLED`.
-  Idempotent and silent when there is no in-force invoice.
+  Idempotent and silent when there is no in-force invoice, and it refuses
+  (loudly logged, `None` returned) to cancel one that is already `paid` —
+  see its own docstring.
 - `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J) —
   the whole business action behind a successful Payme `PerformTransaction`:
   invoice -> paid, the 50/50 ledger written, application -> PAID, the
@@ -35,6 +37,7 @@ unlike the functions above) — not part of the cross-module public surface.
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import numbers
@@ -54,6 +57,8 @@ from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, ledger, repo
 from app.modules.payments.models import Allocation, Invoice, PaymentIntent, ProviderTransaction
 from app.modules.payments.permissions import PAYMENTS_VIEW
+
+logger = structlog.get_logger(__name__)
 
 # CLAUDE.md's audit invariant: action codes are "<object>.<verb>" in English,
 # and the constant lives with the acting module (mirrors
@@ -90,6 +95,24 @@ DUE_PERIOD = timedelta(days=10)
 #   need those distinguished further. A thin wrapper over
 #   `invoice_for_application`, so the two can never disagree about what
 #   "in force" means.
+#
+#   **KNOWN GAP, closed by 3.10b, stated here because 3.11 builds on this
+#   function today.** `is_paid` means "the provider confirmed the money",
+#   not "the money is still ours". Payme's `CancelTransaction` on an
+#   ALREADY-PERFORMED transaction (state `2` -> `-2`; `design/04` §3.5
+#   reason `5` is literally "funds returned") records the reversal on
+#   `provider_transactions` and NOTHING else: 3.10a builds no reversal at
+#   all (`payme._cancel_transaction`'s own docstring — refunds are 3.10b's
+#   `refunds` table). After such a call the invoice is still `paid`, the
+#   application is still `PAID`, `allocations` still carries two `payment`
+#   rows summing to money that has gone back, and **this function still
+#   returns `True`** — so a permit can be issued for a refunded payment.
+#   It is rare and loud (`payme.py` logs a state-`2` cancellation at ERROR:
+#   it is a manual reversal on live money, not routine traffic), and the
+#   fix is 3.10b's reversal path — a `correction` entry in the ledger, the
+#   invoice off `paid`, and whatever 3.11 then owes a permit already
+#   issued. Do not paper over it here by widening `is_paid`: the missing
+#   piece is the WRITE nobody performs, not the read.
 # - `allocations_for(db, invoice_id) -> list[Allocation]` — the whole
 #   ledger for one invoice, oldest first — what 4.3's reports read. Every
 #   row `confirm_payment` ever wrote for this invoice, `entry_type`
@@ -224,9 +247,35 @@ async def cancel_invoice_for_application(
     """The business action behind `APPLICATION_CANCELLED`: move the in-force
     invoice, if any, to `cancelled`. Idempotent and silent when there is
     none — a withdrawal on an application that was never invoiced, or a
-    repeated event, must not raise (ruling 16, half 1)."""
+    repeated event, must not raise (ruling 16, half 1).
+
+    A PAID invoice is never cancelled (whole-branch review). "In force" is
+    `pending` OR `paid` (`repo.IN_FORCE_STATUSES`), so this handler is
+    handed a settled invoice as readily as an unpaid one, and cancelling
+    that one destroys a confirmed payment: `is_paid` — the single gate 3.11
+    checks before issuing a permit — flips back to `False`, the two
+    `allocations` rows are left pointing at a cancelled invoice, and the
+    citizen who paid gets neither a permit nor any record of a refund owed.
+    Reversing money is 3.10b's `refunds`, and it is not something an
+    application-cancelled event may trigger by omission.
+
+    `APPLICATION_TRANSITIONS["PAID"] == {"PERMIT_ISSUED"}` today, so nothing
+    publishes `APPLICATION_CANCELLED` for a paid application — but that
+    guard lives in ANOTHER module, and 3.9a-flow's `submit()` already writes
+    a transition without routing through `set_status` at all, so it is not a
+    guarantee this module may lean on. Refusing here is fail-safe: the
+    application still cancels, and the settled invoice stays settled for
+    3.10b to reverse deliberately."""
     invoice = await invoice_for_application(db, application_id)
     if invoice is None:
+        return None
+    if invoice.status != "pending":
+        logger.error(
+            "payments.cancel_invoice_refused",
+            invoice_id=str(invoice.id),
+            application_id=str(application_id),
+            status=invoice.status,
+        )
         return None
 
     previous_status = invoice.status
@@ -498,4 +547,21 @@ async def confirm_payment(
         object_id=invoice.id,
     )
 
-    await publish(db, Event(name=events.PAYMENT_CONFIRMED, payload={"invoice_id": str(invoice.id)}))
+    # BOTH ids, never `invoice_id` alone (whole-branch review): a subscriber
+    # given only the invoice id has no way back to the application — the
+    # frozen public surface takes an `application_id` in both directions
+    # (`invoice_for_application`, `is_paid`) and forbids a level-4 caller
+    # from reading `invoices` as a table. 3.11's own subscriber reads
+    # `application_id` off this payload. Both values are IDENTIFIERS, so
+    # ruling 15's "no second source of truth for money" — which is why the
+    # `applications` events carry no amount and no number — is untouched.
+    await publish(
+        db,
+        Event(
+            name=events.PAYMENT_CONFIRMED,
+            payload={
+                "invoice_id": str(invoice.id),
+                "application_id": str(invoice.application_id),
+            },
+        ),
+    )

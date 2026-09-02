@@ -26,12 +26,37 @@ this stage append to the tuple, never replace it.
 
 `PAYMENT_CONFIRMED` (task 4, ruling J) is the one event THIS module
 publishes — on a successful Payme `PerformTransaction`
-(`payme.py`/`service.confirm_payment`), payload `{"invoice_id": ...}` only,
-mirroring `applications.events`'s own "nothing but the id" discipline (a
-subscriber reads everything else through this module's public surface). No
-subscriber exists yet in this branch — `app/event_subscriptions.py` notes
-3.11 `permits` as the first one; publishing to an empty bus today is a
-deliberate no-op, not a gap.
+(`payme.py`/`service.confirm_payment`). Its payload is exactly two
+IDENTIFIERS and nothing else:
+
+    {"invoice_id": str(invoice.id), "application_id": str(invoice.application_id)}
+
+`application_id` is not optional decoration (whole-branch review). Ruling
+15's discipline is "no second source of truth for money" — which is why
+`applications.events` carries no amount and no number — NOT "one key per
+payload": a subscriber holding only an `invoice_id` cannot reach anything
+at all, because this module's frozen public surface
+(`service.invoice_for_application`, `service.is_paid`) takes an
+`application_id` in both directions and explicitly forbids a level-4+
+caller from reading `invoices` as a table of its own. 3.11 `permits`'s own
+subscriber reads `application_id` off this payload and returns early
+without it, so dropping the key silently disables permit issuance for
+EVERY payment rather than failing anywhere visible. Both values are ids;
+neither is money.
+
+Both values arrive as STRINGS, not `uuid.UUID` — matching `invoice_id`, which
+has been serialized since task 4. A subscriber may hand either straight to a
+service taking a `uuid.UUID` (`applications.service.get` accepts the string
+form; SQLAlchemy's `Uuid` type coerces it — verified, not assumed), or
+normalize it the way `subscribers.py::_application_id` already does for the
+`applications` events, which occur in both shapes.
+
+A subscriber still reads everything else — the number, and above all the
+amount — through the public surface, never off the event.
+
+No subscriber exists yet in this branch — `app/event_subscriptions.py`
+notes 3.11 `permits` as the first one; publishing to an empty bus today is
+a deliberate no-op, not a gap.
 """
 
 INVOICE_ISSUED = "invoice.issued"
