@@ -64,6 +64,13 @@ class Invoice(Base):
     them) — the real "+10 days" rule design/02 gives `due_at` is Task 2's
     invoice-creation service's job to compute and pass explicitly; the schema
     only guarantees the column is never NULL.
+
+    `calculation_id` (Task 2) is NOT in design/02 and Task 1 did not create it —
+    added so `payments.service.issue_invoice` can freeze exactly which
+    `norms.calculations` row it billed, making a later divergence (3.9b's
+    recalculate writes a new calculation row) a two-column comparison instead of
+    an invisible drift. Nullable: Task 1's own model tests build a bare
+    `Invoice(...)` with no calculation at all.
     """
 
     __tablename__ = "invoices"
@@ -71,6 +78,9 @@ class Invoice(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
     number: Mapped[str] = mapped_column(unique=True)
     application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    calculation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("calculations.id"), index=True
+    )
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     status: Mapped[str] = mapped_column(default="pending")
     issued_at: Mapped[datetime] = mapped_column(server_default=func.now())

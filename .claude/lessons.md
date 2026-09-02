@@ -141,6 +141,18 @@ Tooling and environment.
 - **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
   naming a version you don't have locally means check which DB you connected to first.
 
+## Amending an unmerged migration needs the OLD script to downgrade, the NEW one to upgrade
+
+- **Rule:** Editing an unmerged migration's `upgrade()`/`downgrade()` after your OWN
+  worktree already ran it: `git show HEAD:<file> > <file>` to restore the OLD content,
+  `alembic downgrade -1`, THEN restore your edit and `alembic upgrade head`.
+- **Why:** The installed schema still matches the OLD script; running the EDITED file's
+  `downgrade()` against it fails on whatever the edit added —
+  `UndefinedObjectError: index "ix_invoices_calculation_id" does not exist`, amending 0017
+  to add a column after `_migrated_test_db` had already created the table without it (3.10a t2).
+- **How to apply:** Any "amend this branch's own migration in place" ruling, on a worktree
+  whose test DB already applied it — downgrade with the git-HEAD version, never the edited one.
+
 ## Closing a deferred FK can break a DIFFERENT module's tests, invisibly
 
 - **Rule:** After a migration adds `NOT VALID` + `VALIDATE CONSTRAINT` on a column another

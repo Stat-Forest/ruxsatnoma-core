@@ -801,6 +801,19 @@ async def has_effective_representation(db: AsyncSession, *, user_id: uuid.UUID, 
     return representation is not None
 
 
+async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
+    """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
+    `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not
+    called directly, because the module-boundary rule (backend/CLAUDE.md:
+    cross-module calls only via the other module's service) forbids another
+    module reaching into `auth.repo` itself. First consumer: `payments.service`
+    resolving "is this caller the invoice's own applicant" (3.10a task 2) —
+    matched on `Applicant.id`, never on which user happened to submit a given
+    application, since a legal entity's `Applicant` row is shared by several
+    representatives."""
+    return await repo.get_own_applicant(db, user_id)
+
+
 async def update_contact(
     db: AsyncSession,
     user: User,

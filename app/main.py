@@ -17,10 +17,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 # applications/router.py lands and imports it itself, the way every other
 # module's router does (gis, norms, signatures, ...).
 import app.modules.applications.permissions  # noqa: F401
-
-# Same stand-in as above: Task 1 of 3.10a-payments-core ships no router.py yet
-# either. Stand in until payments/router.py lands (Task 2+) and imports it itself.
-import app.modules.payments.permissions  # noqa: F401
 from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
@@ -46,6 +42,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.payments.router import router as payments_router
 from app.modules.signatures.router import router as signatures_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -224,5 +221,6 @@ def create_app() -> FastAPI:
     app.include_router(norms_router, prefix="/api/v1")
     app.include_router(norms_calc_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
+    app.include_router(payments_router, prefix="/api/v1")
 
     return app

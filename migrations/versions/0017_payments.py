@@ -25,6 +25,11 @@ index — at most one `pending`/`paid` invoice per application at a time) and
 `uq_provider_transactions_external` (ruling 5 — Payme's verbatim retry of a call it
 never got an answer to must not create a second transaction).
 
+Task 2 amends this migration in place (still this branch's own, not yet merged
+anywhere, so no separate revision is burned for one column): `invoices.calculation_id`,
+a nullable FK to `calculations.id` — `payments.service.issue_invoice` freezes which
+calculation it billed, and design/02 never listed the column at all.
+
 Grants the two new permission codes (`payments.view`, `payments.manage`) to
 `accountant` (`roles.code = 'accountant'`, «Бухгалтер» — seeded by 0003_auth.py;
 verified against that migration, not plan prose, per the lesson on role codes).
@@ -63,6 +68,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("number", sa.Text(), nullable=False),
         sa.Column("application_id", sa.Uuid(), nullable=False),
+        sa.Column("calculation_id", sa.Uuid(), nullable=True),
         sa.Column("amount", sa.Numeric(precision=18, scale=2), nullable=False),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column(
@@ -84,11 +90,19 @@ def upgrade() -> None:
             ["applications.id"],
             name=op.f("fk_invoices_application_id_applications"),
         ),
+        sa.ForeignKeyConstraint(
+            ["calculation_id"],
+            ["calculations.id"],
+            name=op.f("fk_invoices_calculation_id_calculations"),
+        ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_invoices")),
         sa.UniqueConstraint("number", name=op.f("uq_invoices_number")),
     )
     op.create_index(
         op.f("ix_invoices_application_id"), "invoices", ["application_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_invoices_calculation_id"), "invoices", ["calculation_id"], unique=False
     )
     op.create_index(
         "uq_invoices_one_in_force",
@@ -250,6 +264,7 @@ def downgrade() -> None:
         table_name="invoices",
         postgresql_where=sa.text("status IN ('pending', 'paid')"),
     )
+    op.drop_index(op.f("ix_invoices_calculation_id"), table_name="invoices")
     op.drop_index(op.f("ix_invoices_application_id"), table_name="invoices")
     op.drop_table("invoices")
     # ### end Alembic commands ###
