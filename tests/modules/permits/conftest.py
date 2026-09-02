@@ -22,28 +22,36 @@ every request 401s with no hint that the database is the bug).
 import hashlib
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
 import httpx
 import pytest
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core import storage
-from app.core.models import MediaFile
+from app.core.models import MediaFile, SystemSetting
+from app.core.settings_store import invalidate
+from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
 from app.modules.gis.models import GisLayer
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
-from app.modules.permits.models import PermitTemplate
+from app.modules.permits import service
+from app.modules.permits.models import Permit, PermitTemplate
 from app.modules.permits.permissions import PERMITS_ISSUE
-from tests.modules.auth.test_sessions import make_user
+from tests.conftest import make_client
+from tests.modules.admin.test_organizations_admin import auth_client
+from tests.modules.auth.test_sessions import make_session, make_user
 from tests.modules.gis.conftest import (
     _client_for,
+    _commit_pending_before_requests,
     applicant_client,  # noqa: F401 — a fixture imported into a conftest IS available
     make_contour,
     make_version,
@@ -169,9 +177,12 @@ async def make_paid_application(
         kind="individual",
         pinfl=user.pinfl,
         name=user.full_name,
-        # `tz/13` requisite 11. Nullable in the registry, and required on the form —
-        # so every fixture that expects an issuance to SUCCEED must carry one, and
-        # the test for the refusal clears it explicitly.
+        # `tz/13` requisite 11. Nullable in the registry and never a blocker
+        # (ruling T3-g): `_holder_address` composes what the registry does hold and
+        # prints `NOT_STATED` when it holds nothing, so an applicant with no address
+        # is still issued a permit. Filled here so the happy-path snapshot carries a
+        # real address; do NOT reinstate a `_required` on it — that would refuse a
+        # citizen who has already paid.
         address="Тошкент вилояти, Бўстонлиқ тумани, Бурчмулла қишлоғи, 1-уй",
         owner_user_id=user.id,
     )
@@ -465,3 +476,178 @@ async def other_zone_hodim_client(
 # and migration 0019 grants `permits.issue` to that very ROLE — the actor would
 # hold the code through `role_permissions` and sail past the route's dependency
 # (lesson: a fixture's permission list must mirror the production role's grants).
+
+
+# --- Task 4: the 3+1 signatories ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class Signer:
+    """A signed-in client PLUS the ERI identity that client signs with.
+
+    The identity travels with the client instead of being written as a literal
+    at each call site, and it is generated fresh per test. Literals cannot
+    survive a second run on this shared, persistent database: these fixtures
+    COMMIT their user, `users.pinfl` is UNIQUE, and `certificates` is unique on
+    `(serial_number, issuer)` — so run two fails on `uq_users_pinfl`, and a
+    certificate already bound to run one's user is refused outright by
+    `bind_certificate` as `certificate_owned_by_another_user` (lesson: the test
+    DB is shared, persistent and never empty — including the spot you picked).
+    """
+
+    client: httpx.AsyncClient
+    user: User
+    pinfl: str
+    serial: str
+
+
+async def _signer_for(
+    db: AsyncSession,
+    *,
+    role_code: str,
+    organization_id: uuid.UUID | None = None,
+    user: User | None = None,
+) -> AsyncIterator[Signer]:
+    """A signed-in `Signer` holding a PRODUCTION role, not `_client_for`'s
+    `executor_staff` stand-in.
+
+    `_client_for` builds every actor as `executor_staff` and hands it personal
+    grants. That is exactly wrong for this task: the check under test reads the
+    actor's ROLE, so an `executor_staff` user with `permits.sign` bolted on
+    would prove something about a role that does not exist. Building the user
+    under the real role also means the grants arrive the way they do in
+    production — migration 0019 gives `permits.sign` to `executor_head`,
+    `chief_forester`, `accountant` and `applicant` — so no fixture below lists a
+    permission at all: it inherits the role's own `role_permissions` rather than
+    restating them (lesson: a fixture's permission list must mirror the
+    PRODUCTION role's grants).
+
+    `user=` reuses an account that already exists (the holder, who must be the
+    applicant of the permit's own application, not a fresh stranger).
+    """
+    if user is None:
+        user = await make_user(
+            db, role_code=role_code, organization_id=organization_id, pinfl=unique_pinfl()
+        )
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    assert user.pinfl is not None
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        _commit_pending_before_requests(client, db)
+        # The serial is derived from the pinfl, so one signer always presents the
+        # same certificate and two never collide on `uq_certificate_identity`.
+        yield Signer(client=client, user=user, pinfl=user.pinfl, serial=f"SER-{user.pinfl}")
+
+
+@pytest.fixture
+async def head_client(db: AsyncSession, leshoz: Organization) -> AsyncIterator[Signer]:
+    """«Раҳбар» — the leshoz head, `executor_head` (never `rahbar`, which is not a
+    `roles.code` at all: lesson). Zoned to `leshoz`, which is the organization
+    every fixture application's contour belongs to, so this is the signatory the
+    permit actually names."""
+    async for signer in _signer_for(db, role_code="executor_head", organization_id=leshoz.id):
+        yield signer
+
+
+@pytest.fixture
+async def chief_forester_client(db: AsyncSession, leshoz: Organization) -> AsyncIterator[Signer]:
+    """The second signature line of `tz/13`. `chief_forester` exists for this and
+    no other purpose (decision #32)."""
+    async for signer in _signer_for(db, role_code="chief_forester", organization_id=leshoz.id):
+        yield signer
+
+
+@pytest.fixture
+async def accountant_client(db: AsyncSession, leshoz: Organization) -> AsyncIterator[Signer]:
+    """The third signature line — «Бухгалтер»."""
+    async for signer in _signer_for(db, role_code="accountant", organization_id=leshoz.id):
+        yield signer
+
+
+@pytest.fixture
+async def other_org_head_client(
+    db: AsyncSession, other_leshoz: Organization
+) -> AsyncIterator[Signer]:
+    """An `executor_head` of a DIFFERENT leshoz: holds the role and the
+    `permits.sign` grant that comes with it, and still may not sign this
+    permit (lesson: zone scoping is not a permission check)."""
+    async for signer in _signer_for(db, role_code="executor_head", organization_id=other_leshoz.id):
+        yield signer
+
+
+@pytest.fixture
+async def sys_admin_client(db: AsyncSession) -> AsyncIterator[Signer]:
+    """The superuser. `require_permission` waves it through every gate
+    (decision #41 ruling 2) — a signatory check must NOT wave it through, because
+    a signature is an identity, not a privilege."""
+    async for signer in _signer_for(db, role_code="sys_admin"):
+        yield signer
+
+
+@pytest.fixture
+async def holder_client(db: AsyncSession, applicant_user: User) -> AsyncIterator[Signer]:
+    """The recipient: the individual applicant who OWNS `paid_application`.
+
+    Deliberately not the re-exported `applicant_client` the brief named — that
+    fixture is a fully registered applicant unrelated to any application here,
+    and `test_issue.py` depends on it staying that way to prove the issuance
+    permission gate. The 4th signature belongs to the permit's own holder, so it
+    needs the account `make_paid_application` already created and linked through
+    `applicants.owner_user_id`.
+    """
+    async for signer in _signer_for(db, role_code="applicant", user=applicant_user):
+        yield signer
+
+
+@pytest.fixture
+async def issued_permit(
+    db: AsyncSession, paid_application: Application, hodim_client: httpx.AsyncClient
+) -> Permit:
+    """A permit in `pending_signatures`, issued through the real route — never
+    inserted by hand, so the document the signatures cover is the one issuance
+    actually rendered and hashed (ruling 3)."""
+    result = await hodim_client.post(f"/api/v1/applications/{paid_application.id}/permit")
+    assert result.status_code == 201, result.text
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+    return permit
+
+
+@pytest.fixture
+async def permit_pdf(db: AsyncSession, issued_permit: Permit) -> bytes:
+    """The stored bytes every signature is taken over — read back from storage,
+    never re-rendered (ruling 3: there is only ever one document)."""
+    return await service.pdf_bytes(db, issued_permit.id)
+
+
+@pytest.fixture
+async def override_required_signatures(db: AsyncSession):
+    """Rewrite `permit_required_signatures` for one test, then take it back.
+
+    `tests/modules/signatures/test_requirements.py::_override`'s idiom (merge the
+    row the way `admin` does, then drop the 60-second per-process cache — the
+    settings store is read-only by design and has getters only), plus the two
+    things an HTTP test needs on top:
+
+      * it COMMITS. The app runs on its own session and connection and cannot see
+        a flush-only write; and every `_client_for`-style client commits `db`
+        before each request anyway, so the row becomes permanent whether or not
+        this fixture asks it to.
+      * it DELETES the row afterwards. A missing row means "use the code
+        default" (`settings_store`: the DB stores only overrides), so the delete
+        is the restore — without it, `permit_required_signatures` would stay
+        rewritten in this shared database and break every later test that reads
+        it, in this run and the next.
+    """
+    key = "permit_required_signatures"
+
+    async def _set(value: str) -> None:
+        await db.merge(SystemSetting(key=key, value=value))
+        await db.commit()
+        invalidate(key)
+
+    yield _set
+    await db.execute(sa_delete(SystemSetting).where(SystemSetting.key == key))
+    await db.commit()
+    invalidate(key)
