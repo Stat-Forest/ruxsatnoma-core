@@ -148,7 +148,9 @@ class ApplicationItem(Base):
     __tablename__ = "application_items"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
-    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    # No index=True here (M1): it would duplicate the leading column of the
+    # unique index behind uq_application_items_livestock below.
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"))
     livestock_type_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("livestock_types.id"), index=True
     )
@@ -194,7 +196,9 @@ class ApplicationStatusHistory(Base):
     __tablename__ = "application_status_history"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
-    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    # No index=True here (M1): it would be a strict prefix of
+    # ix_application_status_history_timeline (application_id, occurred_at) below.
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"))
     from_status: Mapped[str | None]
     to_status: Mapped[str]
     changed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)

@@ -12,6 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+# Branch 1 of 3.9a-applications-core ships no router.py yet, so nothing else
+# imports applications.permissions and register() never runs. Stand in until
+# applications/router.py lands and imports it itself, the way every other
+# module's router does (gis, norms, signatures, ...).
+import app.modules.applications.permissions  # noqa: F401
 from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError

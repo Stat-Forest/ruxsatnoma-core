@@ -13,7 +13,8 @@ btree_gist already installed by 0001), and the append-only trigger on
 (0011) own. Also closes `calculations.application_id`'s deferred FK — `NOT VALID`
 then `VALIDATE CONSTRAINT`, the same way 0003 closed `audit_log.user_id` — now that
 `applications` exists (ruling from the controller's review). Grants the five new
-permission codes (ruling 16) to applicant/executor_staff/leadership/prosecutor/
+permission codes (ruling 16, `applications.decide` corrected by review round 1
+finding I3) to applicant/executor_staff/executor_head+leadership/prosecutor/
 sys_admin. Seeds no notification templates: 0009 already seeds
 `application.submitted`/`.approved`/`.rejected`, and this branch calls `notify()`
 nowhere.
@@ -38,10 +39,15 @@ depends_on: str | Sequence[str] | None = None
 
 # ruling 16: hodim is tz/03 role `executor_staff`, not a real roles.code value —
 # resolved here, not left as the plan's own prose (.claude/lessons.md: "the rahbar's
-# role code is leadership, not rahbar").
+# role code is leadership, not rahbar"). `applications.decide` goes to BOTH
+# executor_head and leadership (review round 1, finding I3 — controller correction
+# overriding ruling 16 on this one point): tz/03's matrix gives "approve/sign" on
+# "Заявка" to Раҳбар = executor_head, not leadership, which holds view+export only;
+# see app/modules/applications/permissions.py's docstring for the full citation.
 ROLE_GRANTS: list[tuple[str, str]] = [
     ("applicant", "applications.create"),
     ("executor_staff", "applications.review"),
+    ("executor_head", "applications.decide"),
     ("leadership", "applications.decide"),
     ("prosecutor", "applications.view_any"),
     ("sys_admin", "applications.assign"),
@@ -463,12 +469,6 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
-        op.f("ix_application_items_application_id"),
-        "application_items",
-        ["application_id"],
-        unique=False,
-    )
-    op.create_index(
         op.f("ix_application_items_livestock_type_id"),
         "application_items",
         ["livestock_type_id"],
@@ -519,12 +519,6 @@ def upgrade() -> None:
             name=op.f("fk_application_status_history_reason_item_id_classifier_items"),
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_application_status_history")),
-    )
-    op.create_index(
-        op.f("ix_application_status_history_application_id"),
-        "application_status_history",
-        ["application_id"],
-        unique=False,
     )
     op.create_index(
         op.f("ix_application_status_history_changed_by"),
@@ -645,7 +639,8 @@ def downgrade() -> None:
         " 'applications.view_any', 'applications.assign')"
     )
     op.execute(
-        "ALTER TABLE calculations DROP CONSTRAINT fk_calculations_application_id_applications"
+        "ALTER TABLE calculations DROP CONSTRAINT IF EXISTS "
+        "fk_calculations_application_id_applications"
     )
     op.execute(
         "DROP TRIGGER IF EXISTS application_status_history_no_truncate "
@@ -670,13 +665,8 @@ def downgrade() -> None:
     op.drop_index(
         op.f("ix_application_status_history_changed_by"), table_name="application_status_history"
     )
-    op.drop_index(
-        op.f("ix_application_status_history_application_id"),
-        table_name="application_status_history",
-    )
     op.drop_table("application_status_history")
     op.drop_index(op.f("ix_application_items_livestock_type_id"), table_name="application_items")
-    op.drop_index(op.f("ix_application_items_application_id"), table_name="application_items")
     op.drop_table("application_items")
     op.drop_index(op.f("ix_application_documents_uploaded_by"), table_name="application_documents")
     op.drop_index(op.f("ix_application_documents_file_id"), table_name="application_documents")
