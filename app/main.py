@@ -17,6 +17,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 # applications/router.py lands and imports it itself, the way every other
 # module's router does (gis, norms, signatures, ...).
 import app.modules.applications.permissions  # noqa: F401
+
+# Same stand-in, same reason: task 1 of 3.11a ships the tables and the permission
+# codes but no permits/router.py yet, and migration 0019 grants those codes to four
+# roles. Without this import `PERMISSIONS` never learns them and
+# tests/test_permissions_registry.py fails on the grant.
+import app.modules.permits.permissions  # noqa: F401
 from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
