@@ -92,6 +92,23 @@ async def add_allocations(db: AsyncSession, allocations: Sequence[Allocation]) -
     await db.flush()
 
 
+async def list_allocations_by_invoice(
+    db: AsyncSession, invoice_id: uuid.UUID
+) -> Sequence[Allocation]:
+    """Every ledger row for one invoice, oldest first (`occurred_at`, then
+    `id` as the tie-break — uuid7 is time-ordered) — `payments.service.
+    allocations_for` (Task 7), what 4.3's reports and a future refund
+    (3.10b) read. Unfiltered by `entry_type`: today `confirm_payment` only
+    ever writes `"payment"` rows, but 3.10b's refunds/corrections land in
+    this SAME table."""
+    stmt = (
+        select(Allocation)
+        .where(Allocation.invoice_id == invoice_id)
+        .order_by(Allocation.occurred_at, Allocation.id)
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
 async def add_payment_intent(db: AsyncSession, intent: PaymentIntent) -> None:
     db.add(intent)
     await db.flush()

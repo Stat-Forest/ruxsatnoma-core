@@ -2,19 +2,19 @@
 answering who may read it (design/02 § payments, plan `03.10a-payments-core`
 task 2).
 
+Public surface for levels 4+ (permits 3.11): `invoice_for_application()`,
+`is_paid()`, `allocations_for()` — frozen by Task 7, see the dedicated
+comment right before their definitions for what a caller may and may not do
+with them.
+
 Public surface for the event bus (`subscribers.py`, registered in
 `app/event_subscriptions.py`):
 
 - `issue_invoice(db, application_id) -> Invoice` — the whole business action
   behind `applications.events.APPLICATION_APPROVED`: freeze the application's
   current calculation into an invoice, move the application to INVOICED, and
-  notify the applicant. Idempotent (see its own docstring).
-- `invoice_for_application(db, application_id) -> Invoice | None` — the
-  in-force (`pending`/`paid`) invoice, or `None`. What `issue_invoice` checks
-  first, and what a later module (3.11 permits: has this application been
-  paid?) may safely call too — no permission or zone rule of its own, the
-  caller is another SERVICE inside this process, mirroring
-  `applications.service.get`/`norms.service.effective_norm`.
+  notify the applicant. Idempotent (see its own docstring). Checks
+  `invoice_for_application` first.
 - `cancel_invoice_for_application(db, application_id) -> Invoice | None` — the
   business action behind `applications.events.APPLICATION_CANCELLED`.
   Idempotent and silent when there is no in-force invoice.
@@ -52,7 +52,7 @@ from app.modules.gis import service as gis_service
 from app.modules.integrations.adapters import payme as payme_adapter
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, ledger, repo
-from app.modules.payments.models import Invoice, PaymentIntent, ProviderTransaction
+from app.modules.payments.models import Allocation, Invoice, PaymentIntent, ProviderTransaction
 from app.modules.payments.permissions import PAYMENTS_VIEW
 
 # CLAUDE.md's audit invariant: action codes are "<object>.<verb>" in English,
@@ -70,11 +70,74 @@ INVOICE_NUMBER_PREFIX = "INV"
 DUE_PERIOD = timedelta(days=10)
 
 
+# --- Task 7: the public surface for 3.11 permits ---------------------------
+#
+# Three entry points, and nothing else a level-4+ caller may use to learn
+# about an invoice or its ledger. The contract below is FROZEN once this
+# task lands — 3.11 builds against it starting now, in a parallel worktree.
+#
+# - `invoice_for_application(db, application_id) -> Invoice | None` — the
+#   in-force (`pending`/`paid`) invoice, or `None` when the application was
+#   never invoiced, or its invoice was cancelled/expired with no new one
+#   issued since. Existed since Task 2 (`issue_invoice`'s own idempotency
+#   check reads it first); this task only freezes its signature.
+# - `is_paid(db, application_id) -> bool` — **3.11 calls exactly this
+#   before building a permit** (tz/04 С11: an unpaid application must never
+#   produce one; an attempt raises RI-10 — 3.11's own job, not enforced
+#   here). `True` only once the in-force invoice's own `status == "paid"`;
+#   `False` for no invoice at all, a `pending` one, or one that expired or
+#   was cancelled — a caller deciding whether to issue a permit does not
+#   need those distinguished further. A thin wrapper over
+#   `invoice_for_application`, so the two can never disagree about what
+#   "in force" means.
+# - `allocations_for(db, invoice_id) -> list[Allocation]` — the whole
+#   ledger for one invoice, oldest first — what 4.3's reports read. Every
+#   row `confirm_payment` ever wrote for this invoice, `entry_type`
+#   unfiltered: today that is only ever `"payment"` (two rows, recipient +
+#   budget), but 3.10b's refunds/corrections land in the SAME table, and a
+#   caller must not assume every row it gets back is a payment.
+#
+# No permission or zone rule on any of the three — the caller is another
+# SERVICE inside this process, not an HTTP actor, mirroring
+# `applications.service.get`/`norms.service.effective_norm`.
+#
+# A level-4+ caller must NEVER:
+#   - read `invoices` or `allocations` as tables of its own — no
+#     `payments.repo` import, no `select(Invoice)`/`select(Allocation)`
+#     against this module's tables from outside it. Every fact reachable
+#     that way is already one of the three functions above (module
+#     boundary, CLAUDE.md — the same reasoning `norms.service`'s own
+#     public-surface comment states for `tariffs`/`rule_parameters`).
+#   - set an invoice's `status` directly. `issue_invoice`,
+#     `cancel_invoice_for_application` and `confirm_payment` (below) are
+#     the only writers, each already wired to the one event that should
+#     trigger it (`applications.events`' APPROVED/CANCELLED, and a
+#     confirmed Payme `PerformTransaction`) — a level-4+ module has no
+#     business of its own moving an invoice between `pending`/`paid`/
+#     `expired`/`cancelled`.
+# -----------------------------------------------------------------------------
+
+
 async def invoice_for_application(db: AsyncSession, application_id: uuid.UUID) -> Invoice | None:
     """The in-force (`pending`/`paid`) invoice for `application_id`, or
     `None`. No permission or zone rule: the caller is another SERVICE inside
     this process, same shape as `applications.service.get`."""
     return await repo.get_in_force_invoice(db, application_id)
+
+
+async def is_paid(db: AsyncSession, application_id: uuid.UUID) -> bool:
+    """`True` once the in-force invoice for `application_id` is `paid`;
+    `False` for no invoice, a `pending` one, or one that expired or was
+    cancelled. See the banner above — this is the guard 3.11 calls before
+    issuing a permit."""
+    invoice = await invoice_for_application(db, application_id)
+    return invoice is not None and invoice.status == "paid"
+
+
+async def allocations_for(db: AsyncSession, invoice_id: uuid.UUID) -> list[Allocation]:
+    """The whole ledger for one invoice, oldest first. See the banner above
+    — no permission or zone rule, the caller is another service."""
+    return list(await repo.list_allocations_by_invoice(db, invoice_id))
 
 
 async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
