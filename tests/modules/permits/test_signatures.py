@@ -136,15 +136,21 @@ async def test_the_last_signature_moves_the_application_to_permit_issued(
     ):
         await _sign(signer, issued_permit.id, purpose, permit_pdf)
 
-    before = await applications_service.get(db, issued_permit.application_id)
-    assert before is not None
-    assert before.status == "PAID"
+    application = await applications_service.get(db, issued_permit.application_id)
+    assert application is not None
+    assert application.status == "PAID"
 
     await _sign(holder_client, issued_permit.id, "permit_recipient", permit_pdf)
 
-    after = await applications_service.get(db, issued_permit.application_id)
-    assert after is not None
-    assert after.status == "PERMIT_ISSUED"
+    # `refresh`, not a second `get`: the read above put the row in this session's
+    # identity map and the session is `expire_on_commit=False`, so `get` would
+    # hand back the cached PAID object rather than what the app's own connection
+    # has since committed (lesson: the row in memory is not what Postgres
+    # stored). Refreshing only THIS row also leaves `issued_permit` loaded —
+    # `expire_all()` makes its next attribute access do sync IO and raise
+    # MissingGreenlet.
+    await db.refresh(application)
+    assert application.status == "PERMIT_ISSUED"
 
 
 async def test_activation_stamps_issued_at_and_leaves_a_timeline_and_a_notice(

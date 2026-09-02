@@ -13,9 +13,9 @@ Two columns of `permits` are deliberately absent from every response here:
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 # Spelled out rather than `Literal[*PERMIT_STATUSES]`: pyright rejects a starred
 # variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal` is exactly
@@ -72,3 +72,36 @@ class PermitOut(BaseModel):
     @field_serializer("area_ha", "amount", "sb_load")
     def _serialize_decimal(self, value: Decimal | None) -> str | None:
         return _trim_decimal(value)
+
+
+class PermitSignIn(BaseModel):
+    """`POST /permits/{id}/signatures`: one of the four ERI signature lines.
+
+    `purpose` is a plain bounded string, deliberately NOT a `Literal` over
+    `signers.PURPOSE_ROLES`. The required set is admin-editable data (ruling 7),
+    so the schema must let an unmapped purpose through to the service, which
+    refuses it with the accurate reason and RECORDS the attempt — a 422 from
+    pydantic would be silent about a typo an operator just made in a settings
+    row. The pattern still bounds it: a purpose is a short snake_case identifier,
+    and this is the one field an unauthenticated-shaped body could stuff.
+
+    There is no `document` field. The bytes signed are the permit's own stored
+    PDF, never anything the client supplies (ruling 3) — a caller who could name
+    the document could sign something other than the permit.
+    """
+
+    purpose: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")]
+    pkcs7: Annotated[str, Field(min_length=1)]
+
+
+class PermitSignatureOut(BaseModel):
+    """What a signing screen needs after each of the four signatures: whether the
+    permit is in force yet, and who has still to sign.
+
+    `missing_signatures` is in the configured order, which is a DISPLAY order —
+    signatures may be taken in any order (plan ruling 5), so a UI must not read
+    the first entry as "whose turn it is".
+    """
+
+    status: PermitStatus
+    missing_signatures: list[str]

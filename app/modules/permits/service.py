@@ -24,7 +24,7 @@ import asyncio
 import hashlib
 import secrets
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -44,8 +44,9 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
-from app.modules.permits import events, render, repo
+from app.modules.permits import events, render, repo, signers
 from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
+from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
 # acting module — audit is level 0 and knows no domain vocabulary (decision #38,
@@ -705,3 +706,284 @@ async def pdf_bytes(db: AsyncSession, permit_id: uuid.UUID) -> bytes:
     if file is None:
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
     return await storage.get_object(file.storage_key)
+
+
+# --- Task 4: the 3+1 signatures ----------------------------------------------
+#
+# `tz/13`'s form carries four signature lines and the permit is legally real only
+# when all four are on it (C11). Three invariants govern everything below.
+#
+# **The required set is data, not an `if`.** It lives in the admin-editable
+# `permit_required_signatures` setting and is read through `signatures.service`
+# (ruling 7) — never re-derived here, never counted here. This module asks that
+# module what is still missing and believes the answer.
+#
+# **The document is never re-rendered.** Every signature is taken over
+# `pdf_bytes` — the exact bytes `doc_hash` was frozen over at issuance (ruling
+# 3) — so all four share one `doc_hash` by construction rather than by a check.
+#
+# **A permit becomes ACTIVE in exactly one place.** `_activate` below, reachable
+# only from `add_signature` and only once `missing_purposes` has come back
+# empty. Nothing else in this codebase may write that status.
+
+OBJECT_TYPE = "permit"
+
+
+async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:
+    """Whether `user` is the permit's own holder — the 4th signature line.
+
+    Two ways, the same two `auth` already recognises everywhere else: the
+    individual applicant's own account (`applicants.owner_user_id`), or an
+    EFFECTIVE representation of a legal-entity applicant, judged against
+    `business_today()` inside `auth.service` so a lapsed power of attorney stops
+    working the day it lapses (decision #9: a legal entity has no account of its
+    own and always acts through a representative).
+
+    This is the half `signatures.sign()` structurally cannot check: it re-proves
+    that the CERTIFICATE is the caller's own by PINFL/STIR, which says nothing
+    about whether that caller is the holder of THIS permit. A different citizen
+    signing with their own genuine key is crypto-valid and still a stranger.
+    """
+    applicant = await auth_service.get_applicant(db, permit.applicant_id)
+    if applicant is None:
+        return False
+    if applicant.owner_user_id is not None and applicant.owner_user_id == user.id:
+        return True
+    if applicant.stir is None:
+        return False
+    return await auth_service.has_effective_representation(db, user_id=user.id, stir=applicant.stir)
+
+
+async def _signer_refusal(
+    db: AsyncSession, permit: Permit, *, purpose: str, user: User
+) -> str | None:
+    """`None` when `user` may sign `purpose` on `permit`; otherwise WHY not.
+
+    One function decides both whether and why, the shape
+    `signatures.service._ownership_reason` already uses — a bool-returning
+    predicate plus a separately-maintained reason picker is two things that can
+    disagree, and this one's reasons are read by stage 4.2's risk report.
+
+    The reason is journal-only. The API answers `signer_not_authorized` and
+    nothing finer: which of the four checks failed tells an attacker whether
+    they guessed a real purpose, hold a signatory role, or merely sit in the
+    wrong leshoz.
+
+    Ruling 4, in order:
+
+    1. **A purpose with no entry in `signers.PURPOSE_ROLES` is refused.** The
+       required set is admin-editable, so a typo must fail closed rather than
+       silently create a slot anybody holding `permits.sign` could fill.
+    2. **The recipient line** is proven by owning the application (`_is_holder`),
+       never by holding a role: `applicant` is held by every citizen.
+    3. **The three official lines** need the role AND the organization. Holding
+       `executor_head` is not enough — `design/03` says users OF THE SAME
+       ORGANIZATION, and a head of another leshoz signing this leshoz's permit
+       is `tz/10`'s RI-12 («попытка доступа вне территориальных полномочий»).
+
+    Strict equality on `users.organization_id`, deliberately NOT the three-axis
+    `Zone` predicate `_assert_in_zone` uses for issuance. A zone answers "whose
+    rows may I see", and a zone-free actor legitimately sees the whole republic;
+    a signature answers "which named official of which named organization
+    attests to this document", and there is no such thing as a republic-wide
+    leshoz head. The same reasoning is why `sys_admin` — which
+    `require_permission` waves through every gate (decision #41 ruling 2) — is
+    refused here: a superuser bypass is about privilege, and this is identity.
+
+    Today `permits.organization_id` is always the contour's leshoz, because
+    nothing populates an organization below leshoz level yet (`organizations`
+    can express `bolim`/`aylanma`/`bolak`, the Agency has delivered no such
+    data). If those rows ever arrive, a head of the parent leshoz signing a
+    sub-unit's permit needs a parent walk here, not a wider zone.
+    """
+    if not signers.is_known(purpose):
+        return "unknown_purpose"
+    if purpose == signers.RECIPIENT_PURPOSE:
+        return None if await _is_holder(db, permit, user) else "not_the_holder"
+    if await auth_service.role_code(db, user) != signers.required_role(purpose):
+        return "wrong_role"
+    if user.organization_id != permit.organization_id:
+        return "wrong_organization"
+    return None
+
+
+async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
+    """The permit comes into force. **Call this from `add_signature` and nowhere
+    else, and only once `signatures.service.missing_purposes` has come back
+    empty** — C11 is that a permit is ACTIVE if and only if every required
+    signature is valid, and a second writer of this status is how that stops
+    being true.
+
+    `issued_at` is stamped HERE, not at issuance. Two things are named alike and
+    they are not the same moment: the date the DOCUMENT bears (`tz/13` §3, in the
+    frozen snapshot) and the timestamp the permit became legally in force. Ruling
+    18 is the same distinction on the application side — `tz/05` defines
+    PERMIT_ISSUED as «сформировано **и подписано**», so the application moves
+    here too, in this same step, and never at issuance.
+    """
+    permit.status = ACTIVE_STATUS
+    permit.issued_at = datetime.now(UTC)
+    await repo.add_status_history(
+        db,
+        PermitStatusHistory(
+            permit_id=permit.id,
+            from_status=INITIAL_STATUS,
+            to_status=ACTIVE_STATUS,
+            changed_by=actor.id,
+        ),
+    )
+    # Ruling 18. `set_status` is the ONE way a level-4 module moves an
+    # application (its own docstring): it validates PAID -> PERMIT_ISSUED against
+    # tz/05, locks the row, writes the history entry and audits it.
+    await applications_service.set_status(
+        db, permit.application_id, to_status=APPLICATION_PERMIT_ISSUED, actor=actor
+    )
+    await notifications.notify(
+        db,
+        event_code=events.PERMIT_ACTIVE,
+        recipient_user_id=await _notification_recipient(
+            db,
+            applicant_id=permit.applicant_id,
+            submitted_by_user_id=await _submitter_of(db, permit),
+        ),
+        params={
+            "permit_number": f"{permit.series} № {permit.number:06d}",
+            "valid_from": permit.period_from,
+            "valid_to": permit.period_to,
+        },
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+    )
+
+
+async def _submitter_of(db: AsyncSession, permit: Permit) -> uuid.UUID:
+    """Who filed the application this permit was issued for — the fallback
+    recipient for a legal-entity applicant, which has no account of its own
+    (decision #9). Read back from `applications` rather than copied onto the
+    permit at issuance: a representation can change between paying and signing,
+    and the person to tell is whoever the application says filed it now."""
+    application = await applications_service.get(db, permit.application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(permit.application_id)})
+    return application.submitted_by_user_id
+
+
+async def add_signature(
+    db: AsyncSession, permit_id: uuid.UUID, *, purpose: str, pkcs7: str, user: User
+) -> Permit:
+    """Attach one of the four ERI signatures, and activate the permit if it was
+    the last one missing.
+
+    The order below is the whole of the task and is load-bearing:
+
+    1. the permit exists and is `pending_signatures`;
+    2. `purpose` is in the configured requirement set;
+    3. **authorization (ruling 4), BEFORE `sign()`;**
+    4. `sign()` over the STORED bytes;
+    5. nothing missing -> active, in one step with the application's own move;
+    6. audit, always.
+
+    **Why step 3 cannot come after step 4.** `uq_signatures_valid_purpose` is
+    unique per `(object_type, object_id, purpose)` over VALID rows, so a wrong
+    signer's valid signature occupies the slot permanently — discovering the
+    mistake afterwards leaves a permit the right person can never sign, and
+    `signatures` rows are evidence and are never deleted. Checking first costs a
+    role lookup; checking last costs the document.
+
+    Signatures may be taken in ANY order (plan ruling 5). `missing_purposes`
+    returns an ordered list, but that is a display order for a signing UI, not a
+    gate: enforcing a sequence would deadlock the ordinary case where the
+    accountant is at their desk and the head is not.
+
+    Nothing of ours is pending when `sign()` is called, deliberately: its
+    transaction contract says every refusal commits the CALLER's whole session
+    before raising, so a half-built change made before it would be committed by
+    somebody else's rejected signature.
+    """
+    permit = await repo.permit_by_id(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+
+    # 1. Only a permit awaiting signatures takes one. Without this the four
+    # slots of an ACTIVE permit are already full, so `sign()` would answer
+    # ERR-SIGN-002 "already signed" — true of the purpose, and the wrong
+    # explanation for the permit; and a suspended or revoked permit would go on
+    # collecting signatures as if nothing had happened (3.11b owns those).
+    if permit.status != INITIAL_STATUS:
+        raise err(
+            "ERR-PERM-001",
+            details={"reason": "not_pending_signatures", "status": permit.status},
+        )
+
+    # 2. A purpose outside the requirement set could never satisfy anything.
+    # `sign()` refuses it too, in the same words — refusing here keeps the reason
+    # accurate, because the check below would otherwise report a made-up purpose
+    # as an unauthorized signer rather than as a purpose nobody asked for.
+    required = await signatures_service.required_purposes(db, OBJECT_TYPE)
+    if purpose not in required:
+        raise err("ERR-SIGN-001", details={"reason": "purpose_not_required"})
+
+    # 3. Ruling 4 — the check stage 3.8 documented and left here. Early commit on
+    # denial (decision #40): the raise would otherwise roll the trail back
+    # together with the very exception it exists to explain.
+    refusal = await _signer_refusal(db, permit, purpose=purpose, user=user)
+    if refusal is not None:
+        await audit.log(
+            db,
+            action=PERMIT_SIGN,
+            user_id=user.id,
+            object_type=OBJECT_TYPE,
+            object_id=permit.id,
+            result="denied",
+            basis="signer_not_authorized",
+            new_value={"purpose": purpose, "reason": refusal},
+            # tz/10 RI-12 is «попытка доступа вне территориальных полномочий» —
+            # High, immediate. The right role in the wrong leshoz is exactly
+            # that; a wrong role in the right leshoz is an ordinary refusal.
+            extra={"risk_indicator": "RI-12"} if refusal == "wrong_organization" else None,
+        )
+        await db.commit()
+        raise err("ERR-ACL-001", details={"reason": "signer_not_authorized"})
+
+    # 4. The stored bytes, never a re-render (ruling 3). This is what makes the
+    # four signatures share one `doc_hash` by construction.
+    document = await pdf_bytes(db, permit.id)
+    await signatures_service.sign(
+        db,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        purpose=purpose,
+        document=document,
+        pkcs7=pkcs7,
+        user=user,
+    )
+
+    # 5. C11: ACTIVE if and only if every required signature is valid — asked of
+    # `signatures`, never counted here.
+    missing = await signatures_service.missing_purposes(
+        db, object_type=OBJECT_TYPE, object_id=permit.id
+    )
+    if not missing:
+        await _activate(db, permit, actor=user)
+
+    # 6. The trail, in the same transaction as the action (the audit invariant).
+    await audit.log(
+        db,
+        action=PERMIT_SIGN,
+        user_id=user.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"purpose": purpose, "status": permit.status, "missing": missing},
+    )
+    return permit
+
+
+async def missing_signatures(db: AsyncSession, permit_id: uuid.UUID) -> list[str]:
+    """Which of the required purposes this permit still lacks a VALID signature
+    for, in the configured order. A pass-through to `signatures.service` on
+    purpose: the requirement set is that module's to own (ruling 7), and a
+    second place deciding it is how a permit ends up ACTIVE with three
+    signatures."""
+    return await signatures_service.missing_purposes(
+        db, object_type=OBJECT_TYPE, object_id=permit_id
+    )
