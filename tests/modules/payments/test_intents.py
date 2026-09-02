@@ -17,9 +17,10 @@ depending on it BY NAME, which this file's own `applicant_client` now
 shadows. A plain renamed import (`owner_client as applicant_client`) was
 tried first and rejected: ruff's F811 flags a test-function parameter
 shadowing an IMPORTED name as a redefinition, even though the identical
-shape is silent for a locally-DEFINED fixture (lesson: 'A re-exported
-conftest needs plumbing copied from an existing one', its F811 half) — the same
-class of trip, just via a rename instead of a same-name re-export."""
+shape is silent for a locally-DEFINED fixture (lesson: "A module's test
+conftest needs plumbing copied from an existing one, not just fixtures",
+its F811 half) — the same class of trip, just via a rename instead of a
+same-name re-export."""
 
 import base64
 import secrets

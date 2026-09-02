@@ -266,7 +266,15 @@ async def cancel_invoice_for_application(
     guarantee this module may lean on. Refusing here is fail-safe: the
     application still cancels, and the settled invoice stays settled for
     3.10b to reverse deliberately."""
-    invoice = await invoice_for_application(db, application_id)
+    # Lock order (this module's invariant): the invoice before the
+    # application — `payme._perform_transaction`/`confirm_payment` and
+    # `jobs._expire_one_invoice` (see its module docstring's "Lock order")
+    # both take it in that order. This handler runs AFTER `set_status` has
+    # already locked the application row (it is the `APPLICATION_CANCELLED`
+    # subscriber, fired from inside that same transaction), so it must take
+    # the invoice lock through the repo's locking helper, never an unlocked
+    # read left to become a blind write at flush — do not reintroduce that.
+    invoice = await repo.get_in_force_invoice_for_update(db, application_id)
     if invoice is None:
         return None
     if invoice.status != "pending":

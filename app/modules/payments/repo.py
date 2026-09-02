@@ -164,6 +164,40 @@ async def get_in_force_invoice(db: AsyncSession, application_id: uuid.UUID) -> I
     ).scalar_one_or_none()
 
 
+async def get_in_force_invoice_for_update(
+    db: AsyncSession, application_id: uuid.UUID
+) -> Invoice | None:
+    """`get_in_force_invoice`'s locking sibling — `payments.service.
+    cancel_invoice_for_application` ONLY (mirrors `get_invoice_for_update`'s
+    own reasoning; shaped like `get_provider_transaction_by_external_id_
+    for_update` rather than that function, since the lookup key here is
+    `application_id`, not the invoice's own primary key, so this has to be a
+    `select()` with `with_for_update()`, not a locking `db.get`).
+
+    That handler is the `APPLICATION_CANCELLED` subscriber, so it runs
+    already inside a transaction that holds the APPLICATION row lock
+    (`applications.service.set_status`, called before the event is
+    published) — this is what gives it the invoice lock too, so its refusal
+    guard (`invoice.status != "pending"`) reads the freshly locked row
+    instead of racing a `PerformTransaction` on an unlocked read that gets
+    overwritten blind at flush.
+
+    `populate_existing` for the same reason `get_invoice_for_update` needs
+    it: a caller who already holds this row from an earlier unlocked read
+    (`invoice_for_application`) must see the locked, current value, not a
+    stale cached one."""
+    stmt = (
+        select(Invoice)
+        .where(
+            Invoice.application_id == application_id,
+            Invoice.status.in_(IN_FORCE_STATUSES),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def list_invoices_past_due(db: AsyncSession, *, now: datetime) -> Sequence[Invoice]:
     """Every `pending` invoice whose 10-day window has already closed —
     `payments.jobs.expiry_sweep`'s candidate set for the INVOICED ->
