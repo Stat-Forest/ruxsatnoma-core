@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
+from app.modules.auth.models import User
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.notifications.models import Notification
 from app.modules.permits import events, service, signers
@@ -431,3 +432,120 @@ async def test_a_refusal_does_not_move_the_application(
     application = await applications_service.get(db, paid_application.id)
     assert application is not None
     assert application.status == "PAID"
+
+
+# --- ruling T4-a: the one reminder this stage sends --------------------------
+
+
+async def test_the_holder_is_told_when_only_their_signature_is_missing(
+    db: AsyncSession,
+    issued_permit: Permit,
+    permit_pdf: bytes,
+    applicant_user: User,
+    holder_client: Signer,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+):
+    """Ruling T4-a. Nothing in 3.11a times out a citizen's signature, so a permit
+    whose holder is never reminded sits in `pending_signatures` until its period
+    passes with the money already paid. This notice is the whole mitigation, and
+    it fires at exactly one moment — when the holder is the last one left."""
+
+    async def reminders() -> list[Notification]:
+        # No `expire_all()`: a `select()` for rows this session has never loaded
+        # issues a real query, and expiring everything would make
+        # `issued_permit`'s next attribute access do sync IO (MissingGreenlet).
+        return list(
+            (
+                await db.scalars(
+                    select(Notification).where(
+                        Notification.object_id == issued_permit.id,
+                        Notification.event_code == events.PERMIT_SIGNED,
+                    )
+                )
+            ).all()
+        )
+
+    await _sign(head_client, issued_permit.id, "permit_head", permit_pdf)
+    assert await reminders() == [], "not on every signature — three officials still to go"
+
+    await _sign(chief_forester_client, issued_permit.id, "permit_chief_forester", permit_pdf)
+    assert await reminders() == [], "still two signatures away from the holder's turn"
+
+    await _sign(accountant_client, issued_permit.id, "permit_accountant", permit_pdf)
+    sent = await reminders()
+    assert [row.channel for row in sent] == ["inapp"], (
+        "in-app always (С19: a legally significant notice reaches the cabinet whatever"
+        " else is off); SMS is skipped only because this fixture's holder has no"
+        " verified phone — `_transport_allowed`, nothing to do with this event"
+    )
+    assert {row.recipient_user_id for row in sent} == {applicant_user.id}
+    assert all(str(issued_permit.number).zfill(6) in row.rendered_text for row in sent)
+    assert all("ваша" in row.rendered_text or "нгиз" in row.rendered_text for row in sent), (
+        "ruling T4-a: it must ask the holder to act, not report that something happened"
+    )
+
+    # And once, not again: the holder's own signature must not re-send it.
+    await _sign(holder_client, issued_permit.id, "permit_recipient", permit_pdf)
+    assert len(await reminders()) == len(sent)
+
+
+async def test_a_holder_who_signs_first_is_never_reminded(
+    db: AsyncSession,
+    issued_permit: Permit,
+    permit_pdf: bytes,
+    holder_client: Signer,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+):
+    """The missing set only shrinks, so a holder who signs first goes straight
+    past the state that triggers the reminder — correctly, since there is
+    nothing left to remind them of (signatures are taken in ANY order, plan
+    ruling 5)."""
+    for signer, purpose in (
+        (holder_client, "permit_recipient"),
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+        (accountant_client, "permit_accountant"),
+    ):
+        assert (await _sign(signer, issued_permit.id, purpose, permit_pdf)).status_code == 200
+
+    sent = (
+        await db.scalars(
+            select(Notification).where(
+                Notification.object_id == issued_permit.id,
+                Notification.event_code == events.PERMIT_SIGNED,
+            )
+        )
+    ).all()
+    assert sent == []
+    await db.refresh(issued_permit)
+    assert issued_permit.status == "active"
+
+
+async def test_the_recipients_reminder_addresses_them_and_fits_one_sms(db: AsyncSession):
+    """Ruling T4-a's two requirements, checked on the seeded rows rather than on
+    the migration's source: the message must tell the holder to ACT, and it must
+    not cost the Agency two SMS parts to say so.
+
+    "Tells them to act" is pinned by the second-person marker — «ваша» in
+    Russian, the `-нгиз` suffix in Uzbek. That is precisely what the original
+    «Разрешение {permit_number} подписано» lacked: it reported an event to
+    somebody rather than asking anybody for anything."""
+    from app.modules.notifications import repo as notifications_repo
+    from app.modules.notifications import service as notifications_service
+
+    number = "А № 000001"
+    for channel in ("inapp", "sms"):
+        template = await notifications_repo.get_active_template(
+            db, event_code=events.PERMIT_SIGNED, channel=channel
+        )
+        assert template is not None, "ruling 17: every code this module sends needs a template"
+        for language, marker in (("ru", "ваша"), ("uz_cyrl", "нгиз")):
+            text = notifications_service.render(template.body, {"permit_number": number}, language)
+            assert marker in text, f"{channel}/{language} does not address the reader"
+            if channel == "sms":
+                # A Cyrillic SMS bills at 70 characters per part (0009 ruling 20).
+                assert len(text) <= 70, f"{language} sms is {len(text)} chars: two parts"

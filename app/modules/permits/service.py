@@ -648,7 +648,7 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
             submitted_by_user_id=application.submitted_by_user_id,
         ),
         params={
-            "permit_number": f"{series} № {number:06d}",
+            "permit_number": _permit_number(series, number),
             "valid_from": period_from,
             "valid_to": period_to,
         },
@@ -727,6 +727,13 @@ async def pdf_bytes(db: AsyncSession, permit_id: uuid.UUID) -> bytes:
 # empty. Nothing else in this codebase may write that status.
 
 OBJECT_TYPE = "permit"
+
+
+def _permit_number(series: str, number: int) -> str:
+    """The permit's number as every notification and the document itself print
+    it. One formatter, three callers — a legal document's identifier must not be
+    spelled two ways because two call sites each carried their own f-string."""
+    return f"{series} № {number:06d}"
 
 
 async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:
@@ -856,10 +863,45 @@ async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
             submitted_by_user_id=await _submitter_of(db, permit),
         ),
         params={
-            "permit_number": f"{permit.series} № {permit.number:06d}",
+            "permit_number": _permit_number(permit.series, permit.number),
             "valid_from": permit.period_from,
             "valid_to": permit.period_to,
         },
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+    )
+
+
+async def _notify_recipient_turn(db: AsyncSession, permit: Permit) -> None:
+    """Ruling T4-a: tell the holder that everyone else has signed and the permit
+    is now waiting on them.
+
+    Sent at exactly one moment — when `missing_purposes` comes back as the
+    recipient purpose ALONE — and therefore exactly once per permit: the missing
+    set only ever shrinks (a `signatures` row is never updated, and `reverify`
+    adds a row rather than removing a valid one), so it passes through that state
+    at most once. Sending `permit.signed` on every signature instead would put
+    four indistinguishable notices in a citizen's cabinet and four SMS parts on
+    their phone, none of them naming an action.
+
+    This is the only reminder 3.11a has. Nothing times out a citizen's signature
+    — the plan leaves that to a later stage — so without it a paid application
+    can sit in `pending_signatures` until its own period runs out, with the money
+    already taken. `0019` seeds the wording to match: second person, and the SMS
+    body carries the demand alone so it stays inside one 70-character part.
+
+    A holder who signs FIRST never sees it, correctly: the missing set goes from
+    four straight past this state, and there is nothing to remind them of.
+    """
+    await notifications.notify(
+        db,
+        event_code=events.PERMIT_SIGNED,
+        recipient_user_id=await _notification_recipient(
+            db,
+            applicant_id=permit.applicant_id,
+            submitted_by_user_id=await _submitter_of(db, permit),
+        ),
+        params={"permit_number": _permit_number(permit.series, permit.number)},
         object_type=OBJECT_TYPE,
         object_id=permit.id,
     )
@@ -974,6 +1016,10 @@ async def add_signature(
     )
     if not missing:
         await _activate(db, permit, actor=user)
+    elif missing == [signers.RECIPIENT_PURPOSE]:
+        # Ruling T4-a — the holder is the only one left, and nothing else in this
+        # stage will ever tell them so. See `_notify_recipient_turn`.
+        await _notify_recipient_turn(db, permit)
 
     # 6. The trail, in the same transaction as the action (the audit invariant).
     await audit.log(

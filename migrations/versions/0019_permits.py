@@ -89,9 +89,27 @@ PERMISSION_CODES: tuple[str, ...] = (
 #
 # SMS bodies stay short: a Cyrillic SMS part bills at 70 characters (0009 ruling 20).
 _BODIES: dict[str, dict[str, str]] = {
+    # Ruling T4-a. This is the ONE template here addressed to a CITIZEN who must
+    # DO something, and it is sent at exactly one moment: when the three
+    # officials have signed and the holder's own signature is the only one still
+    # missing (`permits.service.add_signature`). The original text — «Разрешение
+    # {permit_number} подписано» — was a statement of fact, so a holder reading
+    # it learned that something happened to them and not that the permit is
+    # stuck until they act. Nothing times out a citizen's signature in 3.11a, and
+    # the money is already paid, so this notice is the only thing standing
+    # between a paid application and a permit that expires unsigned.
+    #
+    # Second person is the point («ваша», «-нгиз»), which is what
+    # `test_the_recipients_reminder_addresses_them_and_fits_one_sms` pins.
     "permit.signed": {
-        "uz_cyrl": "{permit_number} рухсатномасига имзо қўйилди.",
-        "ru": "Разрешение {permit_number} подписано.",
+        "uz_cyrl": (
+            "Рухсатнома {permit_number} мансабдор шахслар томонидан имзоланди."
+            " Энди сизнинг электрон имзоингиз керак."
+        ),
+        "ru": (
+            "Разрешение {permit_number} подписано должностными лицами."
+            " Требуется ваша электронная подпись."
+        ),
     },
     "permit.active": {
         "uz_cyrl": "Рухсатнома {permit_number} кучга кирди. Муддати: {valid_from} — {valid_to}.",
@@ -106,8 +124,20 @@ _BODIES: dict[str, dict[str, str]] = {
         "ru": "Срок разрешения {permit_number} истёк.",
     },
 }
+# Per-channel overrides, the split `0020` makes for `permit.due` and for the same
+# reason: `inapp` is a cabinet page with no length limit, while a Cyrillic SMS
+# bills at 70 characters per part (0009 ruling 20). Only `permit.signed` needs
+# one — the other three are already inside one part, and this one carries both
+# the cause and the demand in-app while the SMS keeps only the demand, which is
+# the half a citizen must read.
+_SMS_BODIES: dict[str, dict[str, str]] = {
+    "permit.signed": {
+        "uz_cyrl": "{permit_number} рухсатномасини электрон имзолашингиз керак.",
+        "ru": "Разрешение {permit_number}: требуется ваша электронная подпись.",
+    },
+}
 SEED_TEMPLATES: list[tuple[str, str, dict[str, str]]] = [
-    (event_code, channel, body)
+    (event_code, channel, _SMS_BODIES.get(event_code, body) if channel == "sms" else body)
     for event_code, body in _BODIES.items()
     for channel in ("inapp", "sms")
 ]
