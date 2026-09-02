@@ -192,8 +192,28 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
 
     calculation = await applications_service.current_calculation(db, application_id)
     if calculation is None:
+        # `ERR-VAL-001` (422), NOT `ERR-SYS-003` (404 «Ресурс не найден»), which
+        # is what this raised until 2026-09-03. This function has no HTTP route
+        # of its own: it runs as a bus subscriber INSIDE the publisher's
+        # transaction, so 3.9's `POST /applications/{id}/approve` is what
+        # answers — and it answered 404, indistinguishable from "no such
+        # application", for a request whose application very much exists and
+        # whose id was perfectly good. The approval rolls back either way (the
+        # bus is synchronous and in-transaction, by design); what the reviewer
+        # gets back must at least say WHY.
+        #
+        # The same code and the same `reason` as `permits.service.issue`'s
+        # identical refusal, so one condition — "this application has no priced
+        # calculation" — has one representation on both sides of the seam. A
+        # dedicated `ERR-APP-005` was considered and rejected: it would have to
+        # replace permits' code too to be an improvement, and neither audit
+        # asked for that.
+        #
+        # 3.9 should make this unreachable: an application must not be able to
+        # reach APPROVED without a calculation. Until it does, this is the loud
+        # failure — never a silent zero-amount invoice.
         raise err(
-            "ERR-SYS-003",
+            "ERR-VAL-001",
             details={"reason": "no_calculation", "application": str(application_id)},
         )
 
