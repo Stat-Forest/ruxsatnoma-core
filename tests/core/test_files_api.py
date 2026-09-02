@@ -226,6 +226,24 @@ def test_sanitize_filename_strips_bare_carriage_return():
     assert files.sanitize_filename("evil\rInjected: header") == "evilInjected: header"
 
 
+def test_content_disposition_defends_itself_against_an_unsanitized_name():
+    """Final fix wave, B1. A `"` is printable ASCII, so `_ascii_fallback_filename`
+    keeps it and it closes the `filename="…"` value early: this helper used to emit
+    `filename="a"b.pdf"` for `'a"b.pdf'`. Every caller happened to sanitize at
+    ingest, so it was malformation rather than header injection — but the helper is
+    now shared by three routers and stage 4 adds more, and a precondition stated in
+    a docstring is enforced by nobody. It sanitizes its own input.
+
+    Both halves are checked: exactly two `"` in the whole header (so the value is
+    one token), and the extended parameter still carrying the sanitized name — a
+    newline becomes a space, which percent-encodes to `%20`."""
+    header = files.content_disposition("attachment", 'a"b\r\n.pdf')
+    assert header.count('"') == 2, header
+    assert 'filename="ab.pdf"' in header
+    assert "\r" not in header and "\n" not in header
+    assert "filename*=UTF-8''ab%20.pdf" in header
+
+
 # --- I2 (final review): the size cap must be enforced before the body sits in RAM --
 
 

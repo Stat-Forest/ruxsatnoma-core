@@ -181,7 +181,9 @@ class _AssetFetcher(URLFetcher):
             try:
                 path = Path(_url_to_path(url)).resolve()
                 path.relative_to(ASSETS_DIR.resolve())
-            except OSError, ValueError:
+            # Deliberately parenthesized, not the PEP 758 bare form (see
+            # `core.settings_store.coerce` for the reasoning).
+            except (OSError, ValueError):  # fmt: skip
                 raise err(
                     "ERR-VAL-001",
                     details={"reason": "layout_external_resource", "scheme": url[:16]},

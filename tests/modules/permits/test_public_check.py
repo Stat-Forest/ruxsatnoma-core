@@ -195,6 +195,22 @@ async def test_every_check_is_counted_without_personal_data(
     )
 
 
+def test_the_printed_qr_encodes_the_page_a_human_reads_not_the_json_route() -> None:
+    """Ruling F-1. Requisite 24's whole purpose is that a citizen scanning a printed
+    permit lands on something readable; `{public_base_url}/api/v1/public/permits/check`
+    would hand them the raw JSON this file's other tests assert on. The route stays
+    exactly where `design/03` puts it (ruling 15 is about the ROUTE, not about what the
+    QR ENCODES) — the QR points at the front-end page that CALLS it.
+
+    Pinned rather than left to review, because `qr_url`'s own docstring says it: a
+    permit is printed once and the URL on it cannot be corrected afterwards. Stage 6
+    must serve `/check` before the first production permit is issued (`README.md`)."""
+    url = service.qr_url("tok-123")
+
+    assert url.endswith("/check?qr=tok-123"), url
+    assert "/api/" not in url, url
+
+
 async def test_the_route_is_rate_limited(client: httpx.AsyncClient, active_permit: Permit):
     """Ruling 8: the token is secret, but series+number is guessable, so the
     rate limit is the control. CAPTCHA is stage 6's."""

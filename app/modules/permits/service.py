@@ -388,14 +388,31 @@ async def _holder_address(db: AsyncSession, applicant: Applicant) -> str:
     return ", ".join(filled) if filled else NOT_STATED
 
 
+# The FRONT-END path the printed QR points at, not the JSON API route behind it.
+# Requisite 24's whole purpose is that a citizen scanning a printed permit lands on
+# something readable; `/api/v1/public/permits/check` answers `{"found": true, …}`,
+# which is the page's data source and not the page. Ruling 15 fixes where the ROUTE
+# lives (`design/03`'s own path, implemented in this module rather than in the
+# unbuilt module `public`) and says nothing about what the QR ENCODES.
+#
+# **Stage 6 must serve this path before the first production permit is issued** —
+# until it does the URL 404s, which costs nothing today because no production permit
+# exists, and becomes uncorrectable the day one does (`README.md`, deploy notes).
+QR_CHECK_PATH = "/check"
+
+
 def qr_url(token: str) -> str:
-    """The address the printed QR points at (`design/03` § public). Built from
-    `settings.public_base_url`, which must be the externally reachable origin — a
-    permit is printed once and the URL on it cannot be corrected afterwards.
+    """The address the printed QR points at. Built from `settings.public_base_url`,
+    which must be the externally reachable origin — a permit is printed once and the
+    URL on it cannot be corrected afterwards.
+
+    `{public_base_url}/check?qr=…`, the page a human reads, NOT
+    `/api/v1/public/permits/check`, which answers JSON to that page (see
+    `QR_CHECK_PATH` above).
 
     Kept short on purpose: the QR's module size shrinks as the payload grows, and
     the bundled layout prints the symbol at 28 mm (task 2's inherited caveat)."""
-    return f"{get_settings().public_base_url.rstrip('/')}/api/v1/public/permits/check?qr={token}"
+    return f"{get_settings().public_base_url.rstrip('/')}{QR_CHECK_PATH}?qr={token}"
 
 
 async def _layout_html(db: AsyncSession, template: PermitTemplate) -> str:

@@ -61,6 +61,15 @@ def _ascii_fallback_filename(filename: str) -> str:
     return (f"{base}.{ascii_ext}" if ascii_ext else base) or "file"
 
 
+def sanitize_filename(filename: str) -> str:
+    """Strip characters that would break the Content-Disposition header (quotes end
+    the filename="..." value early, carriage returns/newlines inject headers) —
+    applied once at every ingest point so the stored value is already safe
+    wherever it is later reflected back — and again inside `content_disposition`
+    below, which must not depend on a caller having remembered."""
+    return filename.replace('"', "").replace("\r", "").replace("\n", " ")
+
+
 def content_disposition(disposition: str, filename: str) -> str:
     """RFC 6266 / RFC 5987: the legacy ASCII-only `filename=` alongside
     `filename*=UTF-8''<percent-encoded>`, which carries the exact original name for
@@ -71,18 +80,22 @@ def content_disposition(disposition: str, filename: str) -> str:
     it is now shared: `GET /permits/{id}/pdf` (3.11a t8) serves a name built from
     `permits.series`, which is the CYRILLIC «А» — the exact byte that raises — and
     the lesson's own instruction is that every new download endpoint reuses one
-    helper rather than growing a second, subtly different copy."""
+    helper rather than growing a second, subtly different copy.
+
+    **`sanitize_filename` runs HERE rather than being a precondition on callers.**
+    A `"` is printable ASCII, so `_ascii_fallback_filename` keeps it and it closes
+    the `filename="…"` value early: `'a".pdf'` emitted `filename="a"b.pdf"`. Today
+    every name reaching this function was sanitized at its ingest point, so it is
+    malformation and not header injection (CR/LF are stripped by the same call) —
+    but a precondition stated in a docstring is enforced by nobody, and stage 4
+    adds callers to a helper that is now shared by three routers. Sanitizing is
+    idempotent, so a caller that already did it loses nothing, and `filename*`
+    still carries the exact stored name: `quote(..., safe="")` percent-encodes
+    every one of these characters anyway."""
+    filename = sanitize_filename(filename)
     ascii_name = _ascii_fallback_filename(filename)
     encoded = quote(filename, safe="")
     return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
-
-
-def sanitize_filename(filename: str) -> str:
-    """Strip characters that would break the Content-Disposition header (quotes end
-    the filename="..." value early, carriage returns/newlines inject headers) —
-    applied once at every ingest point so the stored value is already safe
-    wherever it is later reflected back."""
-    return filename.replace('"', "").replace("\r", "").replace("\n", " ")
 
 
 def declared_length(headers: Mapping[str, str]) -> int | None:
