@@ -83,9 +83,25 @@ def _isolate_subscriptions():
     subscribes a spy handler to prove its own wiring — `payments`, `permits`,
     not just `applications` — needs the same teardown, the same reason
     `_reset_ratelimit`/`_reset_breaker` above are here rather than in one
-    module's own conftest."""
-    from app.core import events
+    module's own conftest.
 
+    The production subscriptions are registered FIRST, before the snapshot
+    (final review I2). Snapshot-and-restore alone strips them: a snapshot taken
+    before anything called `register_event_subscriptions()` does not contain
+    them, so the teardown removes whatever `create_app()` wired up during the
+    test, and the next direct-ORM test — one that never builds an app — runs
+    against an EMPTY bus. Once 3.10a subscribes its invoice handler, a test
+    asserting "approving twice does not raise a second invoice" would then pass
+    because no handler was wired at all. Registering here instead gives every
+    test the production wiring, and `register_event_subscriptions()` is
+    idempotent by construction (`core.events.subscribe` dedups the
+    `(name, handler)` pair), so the repeat calls `create_app()` makes are
+    no-ops. The restore still does its original job: a spy subscribed by one
+    test is not in the snapshot and is gone by the next."""
+    from app.core import events
+    from app.event_subscriptions import register_event_subscriptions
+
+    register_event_subscriptions()
     saved = {name: list(handlers) for name, handlers in events._SUBSCRIBERS.items()}
     yield
     events._SUBSCRIBERS.clear()

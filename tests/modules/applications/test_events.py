@@ -95,6 +95,50 @@ def test_register_event_subscriptions_is_idempotent() -> None:
     assert after == before
 
 
+async def test_a_handler_cannot_mutate_what_the_next_handler_sees(db) -> None:
+    """Final review M4: `frozen=True` freezes the three attributes, not the
+    payload's contents, and `publish` runs handlers in sequence inside ONE
+    transaction — so without the `MappingProxyType` wrap, handler 1 could
+    rewrite handler 2's input with no trace. The publisher's own dict is copied
+    too, so mutating it after construction reaches nobody."""
+    seen: list[str] = []
+    source = {"application_id": "one"}
+
+    async def first(session, event) -> None:
+        with pytest.raises(TypeError):
+            event.payload["application_id"] = "rewritten"  # type: ignore[index]
+        source["application_id"] = "mutated after publish"
+
+    async def second(session, event) -> None:
+        seen.append(event.payload["application_id"])
+
+    events.subscribe("t.frozen", first)
+    events.subscribe("t.frozen", second)
+    await events.publish(db, events.Event(name="t.frozen", payload=source))
+
+    assert seen == ["one"]
+
+
+def test_every_test_starts_with_the_production_subscriptions_already_wired() -> None:
+    """Final review I2. `tests/conftest.py::_isolate_subscriptions` snapshots
+    the bus and restores that snapshot afterwards; taken BEFORE anything called
+    `register_event_subscriptions()`, the restore strips whatever `create_app()`
+    wired up during the test, and the next direct-ORM test runs against an empty
+    bus — a "an approval raises no second invoice" test passing because no
+    handler existed at all. The fixture therefore registers first and snapshots
+    after.
+
+    Asserted as an OUTCOME: calling the registration function at the start of a
+    test must change nothing, i.e. it already ran. Vacuous while 3.9a's seam is
+    empty, and it arms itself the moment 3.10a puts a real `subscribe(...)`
+    inside — exactly like `test_register_event_subscriptions_is_idempotent`
+    above, which asks the complementary question."""
+    before = {name: list(handlers) for name, handlers in events._SUBSCRIBERS.items()}
+    register_event_subscriptions()
+    after = {name: list(handlers) for name, handlers in events._SUBSCRIBERS.items()}
+    assert after == before
+
+
 async def test_the_four_constants_are_not_a_notification_event_code(db) -> None:
     """Review round 1, finding I3: the plan's own Task 7 draft already writes
     `notify(event_code="application_submitted", ...)` — the underscore/bus form

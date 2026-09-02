@@ -163,6 +163,13 @@ async def test_current_calculation_ignores_other_applications(
 
 
 # --- service.set_status -------------------------------------------------------
+#
+# These drive whatever legal edge is cheapest to reach from `_draft()` — mostly
+# DRAFT -> SUBMITTED — because what is under test is the MECHANISM: the history
+# row, the audit entry, the refusals, the lock and the re-read. They are not a
+# model of a caller: `service.py`'s public-surface block limits a level-4 module
+# to INVOICED/PAID/EXPIRED_UNPAID/PERMIT_ISSUED/CLOSED (final review I1), and
+# every applicant/staff edge used below belongs to branch 2's flow verbs.
 
 
 async def test_set_status_legal_transition_writes_history_and_audit(
@@ -269,6 +276,12 @@ async def test_set_status_chains_through_several_legal_transitions(
         ("SUBMITTED", "IN_REVIEW"),
         ("IN_REVIEW", "APPROVED"),
     ]
+    # The reason that ORDER BY carries `id` (final review M3): `occurred_at` is
+    # `now()` = TRANSACTION start time, so all three rows share it exactly and
+    # `occurred_at` alone would render them in arbitrary order. Not a corner
+    # case — branch 2's `approve()` and 3.10a's in-transaction invoice handler
+    # write two rows in one transaction by design (ruling 3а).
+    assert len({h.occurred_at for h in history}) == 1
 
 
 async def test_set_status_rejects_an_illegal_jump(db: AsyncSession, applicant: Applicant) -> None:
@@ -316,6 +329,79 @@ async def test_set_status_unknown_application_raises_not_found(db: AsyncSession)
 
 
 # --- service.set_status: the row lock (review C1) ---------------------------
+
+
+async def test_set_status_reads_the_committed_status_not_this_sessions_cached_one(
+    engine: AsyncEngine, db: AsyncSession, applicant: Applicant
+) -> None:
+    """Final review C2, the half the two-session lock test above cannot reach.
+
+    That test opens two BRAND-NEW sessions, so neither holds the row in its
+    identity map and both get a full population — the lock is proven, the
+    re-read is not. The designed level-4 usage is the opposite shape: a caller
+    runs `service.get(...)` to inspect the application and THEN calls
+    `set_status(...)` on the same session. `with_for_update` alone would take
+    the lock, load nothing (the loader refreshes only unloaded attributes for
+    an instance already in the identity map) and validate the transition
+    against the STALE cached status — writing a history row for a transition
+    that never happened and overwriting a committed value.
+
+    The concrete case: 3.10a's payment callback reads INVOICED, the expiry
+    scheduler commits EXPIRED_UNPAID in between, and the callback then asks for
+    PAID. INVOICED -> PAID is legal and EXPIRED_UNPAID -> PAID is not, so a
+    stale read silently loses the scheduler's write; a correct read refuses.
+    """
+    application = await _draft(db, applicant)
+    application.status = "INVOICED"
+    await db.flush()
+    await db.commit()  # a separate connection cannot see uncommitted work
+    # Held as a plain value: `db.rollback()` below expires every instance, and
+    # reading `application.id` off an expired one inside a synchronous SQLAlchemy
+    # expression raises `MissingGreenlet` (lesson: "the row in memory is not what
+    # Postgres stored").
+    application_id = application.id
+
+    # The read that plants the stale copy: `service.get` on THIS session, the
+    # first thing every level-4 caller does.
+    cached = await applications_service.get(db, application_id)
+    assert cached is not None
+    assert cached.status == "INVOICED"
+
+    # Meanwhile, the expiry scheduler commits INVOICED -> EXPIRED_UNPAID on its
+    # own session and finishes, so no lock is held by the time we ask.
+    factory = make_session_factory(engine)
+    async with factory() as scheduler:
+        await applications_service.set_status(scheduler, application_id, to_status="EXPIRED_UNPAID")
+        await scheduler.commit()
+
+    # Still INVOICED in this session's identity map — `expire_on_commit=False`
+    # (app/db.py) never cleared it. This is the trap, asserted so the test says
+    # out loud what it is defending against.
+    assert cached.status == "INVOICED"
+
+    with pytest.raises(DomainError) as exc_info:
+        await applications_service.set_status(db, application_id, to_status="PAID")
+    assert exc_info.value.code == "ERR-APP-004"
+    assert exc_info.value.details == {
+        "reason": "bad_transition",
+        "from": "EXPIRED_UNPAID",  # the committed status, never the cached one
+        "to": "PAID",
+    }
+
+    # And nothing was written: no history row claiming a transition FROM
+    # INVOICED that never happened, and the row is still EXPIRED_UNPAID.
+    await db.rollback()
+    rows = (
+        await db.execute(
+            select(ApplicationStatusHistory).where(
+                ApplicationStatusHistory.application_id == application_id
+            )
+        )
+    ).scalars()
+    assert [row.to_status for row in rows] == ["EXPIRED_UNPAID"]
+    final = await db.get(Application, application_id, populate_existing=True)
+    assert final is not None
+    assert final.status == "EXPIRED_UNPAID"
 
 
 async def test_set_status_locks_the_row_so_a_concurrent_transition_loses(

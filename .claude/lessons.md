@@ -251,11 +251,17 @@ Tooling and environment.
 ## A service meant as THE one write path for future callers locks its row, even with one caller today
 
 - **Rule:** A function documented as "the ONE way" something gets written locks its row
-  (`with_for_update=True`) before checking and writing; a plain read stays lock-free.
+  (`with_for_update=True`, **and `populate_existing=True` with it**) before checking and
+  writing; a plain read stays lock-free.
 - **Why:** `applications.service.set_status` read `Application` unlocked: two READ
   COMMITTED callers moving one row off `INVOICED` (a scheduler job, a payment callback)
   both passed validation and the second UPDATE silently overwrote the first (review C1)
   — the same shape `notifications.service._deliver`'s own `with_for_update` already fixed.
+- **The lock alone is half the fix (3.9a review C2):** the loader populates only
+  *unloaded* attributes of an instance the session already holds, and
+  `expire_on_commit=False` never expires them, so a caller that ran `service.get(...)`
+  first validates the STALE status under a correct lock. Now mechanical —
+  `tests/test_code_conventions.py::test_every_locking_get_also_repopulates_the_row`.
 - **How to apply:** Give the write path a locking repo read distinct from the plain one
   (`get_application_for_update`). A single session cannot prove a lock — open two via
   `make_session_factory(engine)` (`tests/modules/applications/test_public_surface.py`'s
@@ -273,8 +279,11 @@ Tooling and environment.
 - **Why:** `date.today()` follows the SERVER's zone; on a UTC container it reports yesterday
   for ~5 hours a day. An expired fixed-term account could still authenticate 00:00–05:00
   Tashkent (`527d4e0`); the classifier read path had the same bug.
-- **How to apply:** Grep `date.today()` in review — every hit outside `app/core/time.py` is a
-  bug. Storage stays UTC `timestamptz`; only the *calendar-day decision* is Tashkent.
+- **How to apply:** Enforced by
+  `tests/test_code_conventions.py::test_no_module_under_app_calls_date_today`, so the
+  live question is the one it cannot see: a `date` PARAMETER (`numbers.next_public_number`'s
+  `on_date`) must say in its docstring that `business_today()` is where it comes from.
+  Storage stays UTC `timestamptz`; only the *calendar-day decision* is Tashkent.
 
 ## The row in memory is not what Postgres stored
 
@@ -359,16 +368,21 @@ Tooling and environment.
 - **How to apply:** Any new "what can this user do" response gets the superuser branch, not
   just the enforcement point.
 
-## The rahbar's role code is `leadership`, not `rahbar`
+## A role name from spec or plan prose is never a `roles.code` — and `rahbar` maps to two
 
-- **Rule:** Before granting a permission to "the raҳbar" (leshoz head) in a migration or a
-  plan, check `roles.code` in `0003_auth` — it is seeded as `leadership`.
-- **Why:** `plans/03.6a-gis-core.md` was written with `rahbar`; an `INSERT … SELECT … WHERE
-  code = 'rahbar'` inserts zero rows silently, so `gis.contours.approve` would have reached
-  nobody and every "the rahbar approves" test would have passed for the wrong reason — a
-  personal grant, not the role (3.6a t1).
-- **How to apply:** Grep `0003_auth.py` before seeding any role-based grant; never trust a
-  role name from spec or plan prose.
+- **Rule:** Before seeding any role-based grant, read `0003_auth.py` for the actual
+  `roles.code`. There is no `rahbar` code; **which code the word means is DISPUTED**, so
+  a plan saying "the rahbar approves" is a question to settle, not a value to copy.
+- **Why:** `plans/03.6a-gis-core.md` used `rahbar`; `INSERT … SELECT … WHERE code =
+  'rahbar'` inserts zero rows silently, so `gis.contours.approve` reached nobody and every
+  "the rahbar approves" test passed for the wrong reason (3.6a t1). The dispute (3.9a):
+  `0003_auth.py:189` seeds `executor_head` = «Ваколатли шахс», the LESHOZ head, while
+  `leadership` = «Агентлик раҳбарияти» has view+export only in `tz/03` — yet `tz/03` puts
+  «Т» on «Заявка» for «Раҳбар». 3.6a/3.7 read it as `leadership`; 3.9a granted
+  `applications.decide` to BOTH (fail-safe, revocable). Open in `tz/12`.
+- **How to apply:** A grant for "the rahbar" → grant both codes and say why, or ask. Any
+  grant → assert the exact `(role, permission)` set in a test
+  (`test_applications_permission_seeds`): a wrong code inserts zero rows, never an error.
 
 ## A `_client_for` fixture's permission list must mirror the PRODUCTION role's grants
 

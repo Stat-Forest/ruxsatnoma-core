@@ -29,8 +29,21 @@ async def get_application_for_update(
     to prevent for the identical read-check-write shape. The second caller
     here blocks until the first commits or rolls back, then re-reads the
     now-current status, so a genuine conflict surfaces as `ERR-APP-004`
-    instead of a lost write."""
-    return await db.get(Application, application_id, with_for_update=True)
+    instead of a lost write.
+
+    `populate_existing=True` is what makes "re-reads" true (final review C2).
+    `with_for_update` alone does emit a real `SELECT ... FOR UPDATE` — it
+    skips `Session.get`'s identity-map shortcut — but the loader then takes
+    its PARTIAL-population branch for an instance the session already holds
+    and refreshes only the attributes that are unloaded, so a caller who ran
+    `service.get(...)` first keeps its cached `status`; `app/db.py`'s
+    `expire_on_commit=False` means a commit in between does not clear it
+    either. The lock would be taken and the stale value validated: exactly
+    the lost update above, with the lock in place. `app/core/idempotency.py`
+    documents the identical trap on `IdempotencyKey` and fixes it the same
+    way. Autoflush runs before the SELECT, so pending work on this row is
+    written and read back rather than discarded."""
+    return await db.get(Application, application_id, with_for_update=True, populate_existing=True)
 
 
 async def add_status_history(db: AsyncSession, entry: ApplicationStatusHistory) -> None:

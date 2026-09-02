@@ -80,10 +80,17 @@ class IdempotencyKey(Base):
 
 class NumberCounter(Base):
     """One row per (prefix:year) scope — the public-number series (RX/INV/VC/MR/ST/ChT;
-    permit series have their own `permit_counters` in `permits`). Issuing is
-    `UPDATE ... SET last_value = last_value + 1 RETURNING last_value` (race-free);
-    no `id`/`created_at` — `scope` is itself the natural key, the same shape as
-    `SystemSetting` above."""
+    permit series have their own `permit_counters` in `permits`). No `id`/`created_at`
+    — `scope` is itself the natural key, the same shape as `SystemSetting` above.
+
+    `app.core.numbers.next_public_number` is the ONLY writer, and it is not an
+    `UPDATE ... RETURNING`: it does `INSERT ... ON CONFLICT DO NOTHING` to create the
+    year's row, then `SELECT ... FOR UPDATE` and increments in Python, inside the
+    caller's transaction (plan 03.9a ruling 5а). Both shapes are race-free, so the
+    difference is not safety — it is that the lock is held to the caller's COMMIT, so
+    a submission that fails afterwards rolls its number back and the year's numbering
+    has no holes. Do not hand-roll the `UPDATE ... RETURNING` beside it: it would
+    escape the shared scope-key convention and lose that rollback-reuse property."""
 
     __tablename__ = "number_counters"
 

@@ -27,8 +27,9 @@ from app.modules.norms.models import Calculation
 # knows no domain vocabulary. `set_status` is the ONLY writer in this branch,
 # so it is the only constant declared so far; branch 2 adds
 # APPLICATION_SUBMIT/.start_review/.approve/.reject/.cancel/.forward
-# alongside it for the flow verbs that route around `set_status` entirely
-# (see `set_status`'s own docstring for why).
+# alongside it, because a flow verb audits under its own name whether or not
+# it writes its transition through `set_status` — and `submit` cannot write it
+# through `set_status` at all (ruling 25; see `set_status`'s own docstring).
 APPLICATION_STATUS_CHANGE = "application.status_change"
 
 # tz/05's transition table, verbatim (plan 03.9a task 8, the brief's own
@@ -86,8 +87,7 @@ def _assert_transition(application: Application, to_status: str) -> None:
 #   newest calculation for the application. 3.10 builds its invoice from
 #   exactly this.
 # - `set_status(db, application_id, *, to_status, actor=None, reason=None) ->
-#   Application` — the ONE way a level-4 module moves an application: 3.10
-#   writes INVOICED, PAID, EXPIRED_UNPAID; 3.11 writes PERMIT_ISSUED, CLOSED.
+#   Application` — the ONE way a level-4 module moves an application.
 #   It validates the transition against tz/05, writes the history row and
 #   the audit entry, and refuses an illegal jump. Like `get` above, it
 #   enforces NO permission or zone rule of its own — the calling module's
@@ -100,6 +100,45 @@ def _assert_transition(application: Application, to_status: str) -> None:
 #   `details["from"] == details["to"]`, which is how a retrying caller (3.10's
 #   own retry paths) tells "already applied, harmless" from a genuinely
 #   illegal jump.
+#
+#   WHICH TARGETS A LEVEL-4 MODULE MAY DRIVE — a limit, not an example
+#   (final review I1). `APPLICATION_TRANSITIONS` is the FULL tz/05 table
+#   because `_assert_transition` validates against all of it; it is not a
+#   menu. The only targets a module above this one may pass as `to_status`:
+#
+#       3.10 payments — INVOICED, PAID, EXPIRED_UNPAID
+#       3.11 permits  — PERMIT_ISSUED, CLOSED
+#       4.5 archive   — ARCHIVED (nobody's in stage 3)
+#
+#   SUBMITTED, IN_REVIEW, APPROVED, REJECTED, RETURNED, PENDING_INFO and
+#   CANCELLED belong to the applicant/staff flow and are branch 2's own flow
+#   verbs (`submit`, `start_review`, `approve`, `reject`,
+#   `return_to_applicant`, `cancel`, `forward`). Do NOT reach them through
+#   `set_status`, from any module including this one.
+#
+#   Why, concretely: `set_status` moves `status` and nothing else. It does
+#   not know whether the application is COMPLETE, and design/02's "a null
+#   `contour_id` is allowed only in DRAFT" is enforced nowhere in the schema
+#   — the EXCLUDE constraint `ex_applications_no_duplicate` cannot see such a
+#   row either, because its WHERE requires `contour_id`/`period_from`/
+#   `period_to` to be non-null. So
+#   `set_status(db, half_empty_draft, to_status="SUBMITTED")` yields a
+#   SUBMITTED application with no contour, no period and no activity type,
+#   invisible to the one-active-application-per-plot guard and in a state
+#   `tz/05` invariant 1 says cannot exist. The completeness check that makes
+#   SUBMITTED safe lives in branch 2's `submit`, together with the number
+#   allocation, the check rows and the signature — none of which this
+#   function performs.
+#
+#   Deliberately a rule and not a runtime allow-list. Branch 2's flow verbs
+#   may legitimately choose to write their transition through `set_status`
+#   (only `submit` is forced around it, by ruling 25's explicit history-row
+#   id), and 3.9b's RETURNED -> SUBMITTED resubmission has the same freedom;
+#   a whitelist frozen in branch 1 would be unpicked in branch 2, which is
+#   worse than a stated limit. It would also not fix the invariant it looks
+#   like it fixes — a half-empty DRAFT reaching CANCELLED, or a half-empty
+#   application reaching INVOICED, is the same hole, so the fix is
+#   completeness at the flow verb, never a narrower target list here.
 # - The four event names in `applications.events`: APPLICATION_SUBMITTED,
 #   APPLICATION_APPROVED, APPLICATION_REJECTED, APPLICATION_CANCELLED.
 #

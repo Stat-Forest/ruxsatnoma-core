@@ -4,7 +4,12 @@ Schema for stage 3.9a (design/02 § applications, corrected by plan
 03.9a-applications-core): the eight tables the module hangs off, plus
 `number_counters` in `core`. `applications.status` carries all 14 tz/05 statuses
 and `application_checks.check_type` the eleven values of ruling 21 from day one,
-even though this stage only writes a subset of each (see the plan). Two invariants
+even though this stage only writes a subset of each (see the plan).
+`application_checks.result` carries FOUR values, not design/02's three: `skipped`
+is what `gis.checks._within_fund` returns for every contour while the Agency's
+`forest_fund` layer is empty, and what `norms.checks` returns on half a dozen
+ordinary inputs (final review C1 — ruling 21's audit of `check_type` against the
+real emitters, carried to `result`). Two invariants
 SQLAlchemy cannot express and Alembic does not diff: the partial GiST EXCLUDE
 constraint forbidding two active applications for the same (applicant, contour,
 activity) on an overlapping period (`ex_applications_no_duplicate`, ruling 6;
@@ -312,7 +317,8 @@ def upgrade() -> None:
             name=op.f("ck_application_checks_check_type_valid"),
         ),
         sa.CheckConstraint(
-            "result IN ('pass', 'fail', 'warning')", name=op.f("ck_application_checks_result_valid")
+            "result IN ('pass', 'fail', 'warning', 'skipped')",
+            name=op.f("ck_application_checks_result_valid"),
         ),
         sa.CheckConstraint(
             "source IN ('auto', 'external_api', 'manual_fallback')",
@@ -535,7 +541,11 @@ def upgrade() -> None:
     op.create_index(
         "ix_application_status_history_timeline",
         "application_status_history",
-        ["application_id", "occurred_at"],
+        # `id` is part of the KEY, not a payload column (final review M3): a
+        # timeline is ordered by (occurred_at, id) because `now()` is transaction
+        # start time and two rows written in one transaction share it — see
+        # `ApplicationStatusHistory`'s docstring.
+        ["application_id", "occurred_at", "id"],
         unique=False,
     )
     op.create_table(

@@ -7,6 +7,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from app.db import uuid7
 from app.modules.applications.models import (
     APPLICATION_STATUSES,
+    CHECK_RESULTS,
     CHECK_TYPES,
     Application,
     ApplicationCheck,
@@ -140,6 +141,94 @@ async def test_check_type_check_accepts_every_check_type(db, applicant) -> None:
         )
         db.add(check)
         await db.flush()
+
+
+async def test_result_check_rejects_a_bogus_value(db, applicant) -> None:
+    """The negative half: without it the positive test below would still pass
+    against a table carrying no `result` CHECK at all."""
+    app_row = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        channel="portal",
+    )
+    db.add(app_row)
+    await db.flush()
+    check = ApplicationCheck(
+        application_id=app_row.id, check_type="gis_validity", result="unknown", details={}
+    )
+    db.add(check)
+    with pytest.raises(IntegrityError, match="ck_application_checks_result_valid"):
+        await db.flush()
+
+
+async def test_result_check_accepts_every_result(db, applicant) -> None:
+    """Final review C1. `CHECK_RESULTS` was the one enum-ish tuple on this table
+    with no test driving every value through the database — and it was the one
+    tuple actually a value short: both `gis.checks` and `norms.checks` emit
+    `skipped`, and `gis.checks._within_fund` emits it for EVERY contour while the
+    Agency's `forest_fund` layer is empty. Tuple-driven for the same reason as the
+    status and check_type tests above: the CHECK and the tuple cannot drift."""
+    app_row = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        channel="portal",
+    )
+    db.add(app_row)
+    await db.flush()
+    for result in CHECK_RESULTS:
+        check = ApplicationCheck(
+            application_id=app_row.id, check_type="gis_validity", result=result, details={}
+        )
+        db.add(check)
+        await db.flush()
+
+
+def test_check_results_cover_everything_the_check_modules_emit() -> None:
+    """The gap that actually let C1 through, and the reason this is a separate
+    test from the two above: a tuple-driven DB test proves the CHECK matches the
+    tuple, never that the tuple matches its PRODUCERS. `application_checks` rows
+    are written straight from what `gis.checks.run_checks` and
+    `norms.checks.run_checks` returned (ruling 12), so a fifth `result` literal
+    appearing in either module must fail HERE — on the branch that adds it — not
+    as an `IntegrityError` 500 on a live submission, against a migration that is
+    by then permanent.
+
+    Reads the two modules' source instead of calling them: covering every branch
+    for real would need a published contour, a norm and a fixture per outcome,
+    and the source is where a new literal is actually introduced. Two shapes are
+    collected — a literal under a `"result"` key, and a literal assigned to a
+    local named `result` (`norms.checks._limit_check`'s ternary) — which is every
+    emitter in both modules today. A literal reaching `result` through a helper
+    call would escape this scan; there is none, and adding one is the shape to
+    watch for."""
+    import ast
+    import pathlib
+
+    emitted: set[str] = set()
+
+    def collect(node: ast.AST) -> None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            emitted.add(node.value)
+        elif isinstance(node, ast.IfExp):  # `"fail" if ... else "pass"`
+            collect(node.body)
+            collect(node.orelse)
+
+    for module in ("app/modules/gis/checks.py", "app/modules/norms/checks.py"):
+        tree = ast.parse(pathlib.Path(module).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values, strict=True):
+                    if isinstance(key, ast.Constant) and key.value == "result":
+                        collect(value)
+            elif isinstance(node, ast.Assign):
+                if any(isinstance(t, ast.Name) and t.id == "result" for t in node.targets):
+                    collect(node.value)
+
+    assert emitted, "no `result` literals found — did the check modules move?"
+    assert "skipped" in emitted, "C1's own regression guard: `skipped` IS emitted"
+    assert emitted <= set(CHECK_RESULTS), sorted(emitted - set(CHECK_RESULTS))
 
 
 async def test_status_history_cannot_be_updated(

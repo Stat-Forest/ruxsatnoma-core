@@ -19,6 +19,7 @@ not know that `applications` (or any other module) exists.
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +27,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 @dataclass(frozen=True)
 class Event:
+    """An immutable fact. `frozen=True` protects the three attributes; the
+    `__post_init__` below protects the payload's CONTENTS, which `frozen` does
+    not (final review M4) — a plain `dict` handed in stays mutable, and
+    `publish` runs handlers in sequence inside one transaction, so handler 1
+    could silently alter what handler 2 receives, with no trace. It is copied
+    as well as wrapped, so a publisher mutating its own dict afterwards cannot
+    reach a handler either.
+
+    Only the top level is frozen: a nested `dict`/`list` inside the payload is
+    still mutable and must be treated as read-only. Keep payloads flat —
+    today's is `{"application_id": ...}`, and `applications/events.py` says why
+    nothing else belongs in one.
+    """
+
     name: str
     payload: Mapping[str, Any]
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
 
 Handler = Callable[[AsyncSession, Event], Awaitable[None]]

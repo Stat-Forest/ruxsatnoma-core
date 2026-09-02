@@ -63,7 +63,17 @@ CHECK_TYPES = (
     "vet",
     "cadastre",
 )
-CHECK_RESULTS = ("pass", "fail", "warning")
+# The same audit ruling 21 performed for `check_type`, carried to `result` (final
+# review C1): read off every literal `gis.checks` and `norms.checks` can return, not
+# off design/02's prediction, which stops at three. `skipped` is the fourth and it is
+# the COMMON path, not an edge case — `gis.checks._within_fund` returns it for every
+# contour while the Agency's `forest_fund` layer is empty (a designed branch, not a
+# temporary state), and `norms.checks` returns it for a non-grazing activity, a norm
+# with no season window, a contour with no published geometry, and an uncomputed
+# limit. Branch 2 writes back whatever the two modules said (ruling 12: the row is
+# evidence), so a CHECK three values wide is an IntegrityError on the first
+# submission the system ever attempts.
+CHECK_RESULTS = ("pass", "fail", "warning", "skipped")
 CHECK_SOURCES = ("auto", "external_api", "manual_fallback")
 ASSIGNMENT_REASONS = ("auto", "absence", "manual")
 CONCLUSION_KINDS = ("executor", "gis")
@@ -191,13 +201,24 @@ class ApplicationStatusHistory(Base):
     SUBMITTED row: it is the submission id the signature is bound to (ruling 25). No
     column or constraint change follows from that — it is simply a value a later
     task's service passes in instead of leaving to the default.
+
+    **Order the timeline by `(occurred_at, id)`, never `occurred_at` alone** (final
+    review M3). `occurred_at` is `now()`, which in Postgres is TRANSACTION start
+    time, so every row written in one transaction shares it to the microsecond —
+    and that is the normal case, not a rarity: branch 2's `approve()` writes the
+    APPROVED row and publishes `application_approved`, whose 3.10a handler runs in
+    the SAME transaction (ruling 3а) and writes INVOICED beside it. `id` is `uuid7`
+    and therefore time-ordered, so it agrees with insertion order and breaks the tie
+    correctly; `ix_application_status_history_timeline` carries all three columns so
+    the ordering is served by the index. `norms.repo._calculations_query` documents
+    the identical tie-break for `calculations`.
     """
 
     __tablename__ = "application_status_history"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
     # No index=True here (M1): it would be a strict prefix of
-    # ix_application_status_history_timeline (application_id, occurred_at) below.
+    # ix_application_status_history_timeline (application_id, occurred_at, id) below.
     application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"))
     from_status: Mapped[str | None]
     to_status: Mapped[str]
@@ -216,7 +237,7 @@ class ApplicationStatusHistory(Base):
             f"from_status IS NULL OR from_status IN {APPLICATION_STATUSES}",
             name="from_status_valid",
         ),
-        Index("ix_application_status_history_timeline", "application_id", "occurred_at"),
+        Index("ix_application_status_history_timeline", "application_id", "occurred_at", "id"),
     )
 
 
@@ -291,6 +312,10 @@ class ApplicationCheck(Base):
     corrected by ruling 21 — the eleven `check_type` values below, replacing
     design/02's `gis_restrictions` with `norm_restrictions`). A repeat check is a new
     row; the history is preserved (ruling 12) — never an update.
+
+    `result` carries all four values the two check modules emit — `pass`, `fail`,
+    `warning`, `skipped` — see `CHECK_RESULTS` above for why `skipped` is not
+    optional.
 
     3.9a always writes `source='auto'` and leaves `doc_file_id` null; both columns
     exist from day one because 3.9b's manual fallback needs them."""
