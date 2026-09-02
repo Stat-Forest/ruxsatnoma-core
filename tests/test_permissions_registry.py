@@ -25,6 +25,56 @@ async def test_every_granted_permission_code_is_registered(db) -> None:
     assert not missing, f"granted in role_permissions but never registered: {sorted(missing)}"
 
 
+# The six codes that are registered, required by a route, and granted to NO role:
+# reachable only through the `sys_admin` superuser bypass (decision #41 ruling 2).
+#
+# All six predate stages 3.9-3.11 and are believed intentional — configuration of
+# the system itself: who exists, what the classifiers say, what the announcements
+# say, what the settings are, and whose session may be killed. No non-superuser
+# role in `0003_auth` is given that by tz/03's matrix.
+#
+# Written down as an ALLOWLIST rather than left implicit, so that the set is a
+# deliberate statement instead of an accident: a code that is registered and
+# required by a route but reaches nobody is normally a permission whose grant was
+# forgotten in the migration — a role that silently cannot do its job, which is
+# exactly how 3.6a/3.7 gave contour and norm approval to the wrong role for two
+# stages (decision #59). Adding a code here is therefore a decision, not a fix, and
+# the equality below makes GRANTING one of these six a deliberate edit too.
+UNGRANTED_BY_DESIGN = frozenset(
+    {
+        "admin.announcements.manage",
+        "admin.classifiers.manage",
+        "admin.organizations.manage",
+        "admin.settings.manage",
+        "auth.sessions.revoke_any",
+        "auth.users.manage",
+    }
+)
+
+
+async def test_every_registered_permission_code_reaches_some_role(db) -> None:
+    """The reverse of the guard above, which only ever asserted granted ⊆
+    registered — so a code registered by a module and required by its routes
+    could reach no role at all and nothing would say so.
+
+    `user_permissions` is deliberately not consulted: a personal grant is an
+    exception an admin makes for one person, and the question here is whether a
+    ROLE can do its job.
+    """
+    rows = await db.execute(text("SELECT DISTINCT permission_code FROM role_permissions"))
+    granted = {row[0] for row in rows}
+    ungranted = set(PERMISSIONS) - granted
+
+    assert ungranted == set(UNGRANTED_BY_DESIGN), (
+        "the set of permission codes granted to no role has changed. A NEW one means a "
+        "migration registered a code and forgot to grant it — the role silently cannot do "
+        "its job, and only sys_admin's bypass hides it. A MISSING one means one of the six "
+        "superuser-only codes was granted to a role; update the allowlist deliberately. "
+        f"unexpected: {sorted(ungranted - UNGRANTED_BY_DESIGN)}, "
+        f"no longer ungranted: {sorted(UNGRANTED_BY_DESIGN - ungranted)}"
+    )
+
+
 async def test_leadership_holds_no_approval_code(db) -> None:
     """`tz/03`'s permission matrix (4-илова) gives «Т» — утверждение/подпись — to
     «Раҳбар», seeded by `0003_auth` as `executor_head` («Ваколатли шахс», the leshoz
