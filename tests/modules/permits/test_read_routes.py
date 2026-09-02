@@ -18,11 +18,13 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.schemas import PageParams
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
+from app.modules.audit.models import AuditLog
 from app.modules.permits import service
 from app.modules.permits.models import Permit
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
@@ -166,6 +168,96 @@ async def test_staff_outside_the_zone_cannot_download_the_pdf(
 ):
     result = await other_zone_hodim_client.get(f"{API}/permits/{active_permit.id}/pdf")
     assert result.status_code == 403
+
+
+# --- the RI-12 trail on a territorial read denial (ruling T8-a) --------------
+
+
+async def _ri12_entries(db: AsyncSession, permit: Permit) -> list[AuditLog]:
+    """Every denied-read entry against this permit. Scoped by the permit's own id
+    because the database is shared and persistent (lesson)."""
+    rows = await db.scalars(
+        select(AuditLog)
+        .where(
+            AuditLog.object_id == permit.id,
+            AuditLog.action == service.PERMIT_READ,
+        )
+        .order_by(AuditLog.occurred_at)
+    )
+    return list(rows.all())
+
+
+async def test_a_cross_zone_card_read_writes_the_ri12_trail(
+    db: AsyncSession, other_zone_hodim_client: httpx.AsyncClient, active_permit: Permit
+):
+    """`tz/10` RI-12 is «попытка доступа вне территориальных полномочий», High and
+    immediate. This module already records the same actor's attempt to SIGN a
+    permit outside their zone; without this, stage 4.2's risk report would see
+    who tried to sign one and miss who tried to look at one.
+
+    The trail must SURVIVE the refusal — decision #40's early-commit-on-denial —
+    so this asserts it after a 403 that raised, not after a success."""
+    assert await _ri12_entries(db, active_permit) == []
+
+    result = await other_zone_hodim_client.get(f"{API}/permits/{active_permit.id}")
+    assert result.status_code == 403
+    assert result.json()["error"]["code"] == "ERR-ACL-002"
+
+    entries = await _ri12_entries(db, active_permit)
+    assert len(entries) == 1
+    assert entries[0].result == "denied"
+    assert entries[0].basis == "out_of_zone"
+    assert entries[0].extra == {"risk_indicator": "RI-12"}
+    assert entries[0].user_id is not None
+    assert entries[0].object_type == "permit"
+
+
+async def test_a_cross_zone_pdf_read_writes_it_too(
+    db: AsyncSession, other_zone_hodim_client: httpx.AsyncClient, active_permit: Permit
+):
+    """Both direct-access routes reach `_readable_permit`, so both are covered by
+    the one branch — asserted here rather than assumed, since a route that
+    fetched the permit itself would silently skip it."""
+    assert (
+        await other_zone_hodim_client.get(f"{API}/permits/{active_permit.id}/pdf")
+    ).status_code == 403
+    assert len(await _ri12_entries(db, active_permit)) == 1
+
+
+async def test_a_successful_read_writes_no_trail(
+    db: AsyncSession, zone_staff_client: httpx.AsyncClient, active_permit: Permit
+):
+    """A row per GET would let anyone holding a session write `audit_log` at
+    will. `permit.read` exists for the denial and for nothing else."""
+    assert (await zone_staff_client.get(f"{API}/permits/{active_permit.id}")).status_code == 200
+    assert await _ri12_entries(db, active_permit) == []
+
+
+async def test_a_stranger_s_404_writes_no_trail(
+    db: AsyncSession, other_applicant_client: Signer, active_permit: Permit
+):
+    """A caller holding no `permits.view_any` cannot be "outside their zone" —
+    there is no zone claim to exceed — and auditing it would let any signed-in
+    citizen fill the table by guessing uuids."""
+    assert (
+        await other_applicant_client.client.get(f"{API}/permits/{active_permit.id}")
+    ).status_code == 404
+    assert await _ri12_entries(db, active_permit) == []
+
+
+async def test_the_list_cannot_produce_a_territorial_denial(
+    db: AsyncSession, other_zone_hodim_client: httpx.AsyncClient, active_permit: Permit
+):
+    """RI-12 coverage on reads is DIRECT ACCESS ONLY, and this is the test that
+    says so out loud for 4.2: nobody named a target, so `zone_filter` returns
+    fewer rows and there is no attempt to record. A probe that walks the list is
+    the rate limiter's problem, not the audit trail's."""
+    result = await other_zone_hodim_client.get(
+        f"{API}/permits", params={"contour_id": str(active_permit.contour_id)}
+    )
+    assert result.status_code == 200
+    assert result.json()["total"] == 0
+    assert await _ri12_entries(db, active_permit) == []
 
 
 # --- GET /permits — the list -------------------------------------------------

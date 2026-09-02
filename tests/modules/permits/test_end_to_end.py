@@ -41,12 +41,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.errors import DomainError
 from app.db import make_session_factory
+from app.modules.admin.models import ClassifierItem
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
 from app.modules.notifications.models import NotificationTemplate
 from app.modules.permits import events, jobs, service, signers
 from app.modules.permits.models import PERMIT_STATUSES, Permit, PermitStatusHistory
+from app.modules.signatures import service as signatures_service
 from tests.modules.permits.conftest import Signer, sign_permit
 
 API = "/api/v1"
@@ -353,6 +355,49 @@ async def test_set_status_locks_the_permit_so_two_callers_cannot_race(
         await session_b.close()
 
 
+async def test_missing_signatures_answers_in_process_and_empties_as_they_land(
+    db: AsyncSession,
+    issued_permit: Permit,
+    permit_pdf: bytes,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    holder_client: Signer,
+):
+    """Entry point #7 of the frozen block, called as a caller calls it rather
+    than read off a JSON key — the six above got a direct call and this one was
+    reached only through `body["missing_signatures"]`, which is the exact shape
+    the lesson names ("an HTTP scenario exercises the ROUTES, not the in-process
+    functions a future module will call").
+
+    Order matters and is asserted: the list is the CONFIGURED display order, so
+    it must not reorder itself as purposes drop out of it (plan ruling 5 — a UI
+    must not read the first entry as "whose turn it is", but it may rely on the
+    order being stable)."""
+    before = await service.missing_signatures(db, issued_permit.id)
+    assert before == await signatures_service.required_purposes(db, service.OBJECT_TYPE)
+    assert signers.RECIPIENT_PURPOSE in before
+
+    for signer, purpose in (
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+        (accountant_client, "permit_accountant"),
+    ):
+        assert (await sign_permit(signer, issued_permit.id, purpose, permit_pdf)).status_code == 200
+        remaining = await service.missing_signatures(db, issued_permit.id)
+        assert purpose not in remaining
+        assert remaining == [one for one in before if one in remaining]  # order preserved
+
+    assert await service.missing_signatures(db, issued_permit.id) == [signers.RECIPIENT_PURPOSE]
+    assert (
+        await sign_permit(holder_client, issued_permit.id, signers.RECIPIENT_PURPOSE, permit_pdf)
+    ).status_code == 200
+    assert await service.missing_signatures(db, issued_permit.id) == []
+    # An object nobody has ever signed still answers the full requirement set,
+    # never `[]` — "nothing signed" and "nothing required" must not look alike.
+    assert await service.missing_signatures(db, uuid.uuid4()) == before
+
+
 async def test_the_two_provider_seams_answer_in_process(db: AsyncSession, active_permit: Permit):
     """Task 6's functions, called the way `gis` and `norms` call them rather
     than through the seam list — the same "does the contract function actually
@@ -370,6 +415,85 @@ async def test_the_two_provider_seams_answer_in_process(db: AsyncSession, active
     assert await service.load_provider(
         db, active_permit.contour_id, before, active_permit.period_from - timedelta(days=1)
     ) == Decimal("0")
+
+
+async def test_set_status_records_a_suspensions_legal_ground_and_the_run_it_came_from(
+    db: AsyncSession, active_permit: Permit, head_client: Signer
+):
+    """Ruling T8-b: the three arguments past `reason` are what keeps "the ONE way
+    a module moves a permit" from being a rule 3.11b has to break on its first
+    write. `permit_status_history` already HAS the two columns; before this they
+    were unreachable through the only function allowed to write the row.
+
+    `reason_item_id` is a real `classifier_items` row, not a fabricated uuid: the
+    FK is closed, and a made-up id would prove the argument is accepted while
+    hiding that it can never be stored (the shape migration 0015 caught in
+    `norms`' own tests)."""
+    ground = await db.scalar(select(ClassifierItem).limit(1))
+    assert ground is not None, "0005 seeds classifier items; none found"
+
+    moved = await service.set_status(
+        db,
+        active_permit.id,
+        to_status="suspended",
+        actor=head_client.user,
+        reason="ВМҚ 689, 4-банд",
+        reason_item_id=ground.id,
+        correlation_id="job:t8b",
+    )
+    assert moved.status == "suspended"
+
+    row = (
+        await db.scalars(
+            select(PermitStatusHistory)
+            .where(PermitStatusHistory.permit_id == active_permit.id)
+            .order_by(PermitStatusHistory.occurred_at.desc(), PermitStatusHistory.id.desc())
+        )
+    ).first()
+    assert row is not None
+    assert (row.to_status, row.reason_item_id, row.legal_basis) == (
+        "suspended",
+        ground.id,
+        "ВМҚ 689, 4-банд",
+    )
+
+    entry = (
+        await db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.object_id == active_permit.id,
+                AuditLog.action == service.PERMIT_STATUS_CHANGE,
+            )
+            .order_by(AuditLog.occurred_at.desc())
+        )
+    ).first()
+    assert entry is not None
+    assert entry.correlation_id == "job:t8b"
+    # The CODE, so a report can group suspensions by cause — `basis` beside it is
+    # the free text a citizen reads, and the two are not alternatives.
+    assert entry.extra == {"reason_item_id": str(ground.id)}
+
+
+async def test_set_status_defaults_leave_every_new_column_null(
+    db: AsyncSession, active_permit: Permit
+):
+    """The widening must not change the narrow call: 4.7 archives with a status
+    and nothing else, and its history row must not acquire a phantom ground."""
+    await service.set_status(db, active_permit.id, to_status="revoked")
+    row = (
+        await db.scalars(
+            select(PermitStatusHistory)
+            .where(PermitStatusHistory.permit_id == active_permit.id)
+            .order_by(PermitStatusHistory.occurred_at.desc(), PermitStatusHistory.id.desc())
+        )
+    ).first()
+    assert row is not None
+    assert (row.reason_item_id, row.doc_file_id, row.legal_basis, row.changed_by) == (
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 # --- the guard ruling 17 exists for ------------------------------------------

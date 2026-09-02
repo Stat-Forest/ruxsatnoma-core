@@ -49,8 +49,15 @@ async def permit_by_id(db: AsyncSession, permit_id: uuid.UUID) -> Permit | None:
 
 
 async def permit_by_id_for_update(db: AsyncSession, permit_id: uuid.UUID) -> Permit | None:
-    """`permit_by_id`'s locking sibling — `service.add_signature` ONLY, and the
-    same shape as `applications.repo.get_application_for_update` (review C1).
+    """`permit_by_id`'s locking sibling — `service.add_signature` and
+    `service.set_status`, and the same shape as
+    `applications.repo.get_application_for_update` (review C1).
+
+    Both callers are read-check-write over one permit, which is the whole test
+    for using this instead of `permit_by_id`: `add_signature` decides activation
+    from a status it then writes, and `set_status` validates a `tz/05` edge out
+    of a status it then writes. A plain READ stays lock-free — `permit_card`,
+    `list_permits` and the public check all use `permit_by_id`.
 
     `SELECT ... FOR UPDATE` so two signatories landing at the same instant
     serialise instead of racing. Without it, under READ COMMITTED, the third and
@@ -63,6 +70,12 @@ async def permit_by_id_for_update(db: AsyncSession, permit_id: uuid.UUID) -> Per
     then answers `ERR-SIGN-002`, and `_activate` is reachable from nowhere else —
     so it takes a hand-edit of the database. The second caller here blocks until
     the first commits, then reads a `missing_purposes` that includes it.
+
+    `set_status`'s own race is the plainer one: 3.11b's revoke and 4.7's archival
+    can arrive together, and without the lock both would validate against the
+    same pre-write status and the second UPDATE would silently overwrite the
+    first, leaving a timeline claiming two transitions out of a status the permit
+    was only in once.
 
     `populate_existing=True` is what makes that re-read true, and is mechanical:
     `with_for_update` alone does emit a real `SELECT ... FOR UPDATE`, but the

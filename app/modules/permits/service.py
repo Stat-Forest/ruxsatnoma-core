@@ -72,6 +72,14 @@ PERMIT_SIGN = "permit.sign"
 # `applications.service` makes between `APPLICATION_STATUS_CHANGE` and its flow
 # verbs.
 PERMIT_STATUS_CHANGE = "permit.status_change"
+# Written ONLY on a denial, never on a successful read (ruling T8-a). A GET that
+# audits every hit lets anyone holding a session write an `audit_log` row per
+# request; a GET that audits nothing leaves `tz/10`'s RI-12 — «попытка доступа
+# вне территориальных полномочий», High and immediate — with no way to fire on a
+# READ at all, while the same actor's attempt to SIGN outside their zone is
+# already recorded (`_signer_refusal`'s `wrong_organization`). See
+# `_readable_permit`.
+PERMIT_READ = "permit.read"
 # The two the daily sweeps write (`permits/jobs.py`). `permit.close_application`
 # is named for what it does rather than shortened to `permit.close`: the permit
 # is not closed and never will be — `expired`/`revoked` are terminal until 4.7
@@ -182,13 +190,18 @@ def _organization_in_zone(zone: Zone, org: Organization) -> bool:
     return True
 
 
-async def _assert_organization_in_zone(
+async def _organization_in_actor_zone(
     db: AsyncSession, actor: User, organization_id: uuid.UUID
-) -> None:
-    """Refuse an actor whose zone does not cover this organization — the module's
-    ONE territorial rule, shared by the issuance path below and by every read
-    route (Task 8), so the two can never drift into answering differently about
-    the same leshoz.
+) -> bool:
+    """Whether this actor's zone covers this organization — the module's ONE
+    territorial rule, shared by the issuance path and by every read route (Task
+    8), so the two can never drift into answering differently about the same
+    leshoz.
+
+    A predicate rather than only an assertion, because the read path has to WRITE
+    a trail before it refuses (`_readable_permit`, ruling T8-a) and catching the
+    assertion's own exception to do that would make the refusal's cause a thing
+    inferred from an exception type rather than decided here.
 
     ALL THREE axes of `app/core/abac.py`'s `Zone`, not `organization_id` alone:
     narrowing it to one was a finding of 3.6a's own final review — an actor with a
@@ -201,9 +214,19 @@ async def _assert_organization_in_zone(
     """
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
-        return
+        return True
     org = await admin_repo.get_organization(db, organization_id)
-    if org is None or not _organization_in_zone(zone, org):
+    return org is not None and _organization_in_zone(zone, org)
+
+
+async def _assert_organization_in_zone(
+    db: AsyncSession, actor: User, organization_id: uuid.UUID
+) -> None:
+    """`_organization_in_actor_zone` as the write paths use it — refuse, with no
+    trail of its own. The READ path audits before it raises; issuance does not,
+    and that asymmetry is deliberate: an unauthorized ISSUANCE never gets past
+    this point silently, because `issue` audits the whole attempt either way."""
+    if not await _organization_in_actor_zone(db, actor, organization_id):
         raise err("ERR-ACL-002")
 
 
@@ -823,6 +846,17 @@ async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:
     three can share — a separate per-permit predicate beside a separate list scope
     is two rules that agree until one of them is edited, and the visible symptom
     would be a permit readable by id and missing from the list that must carry it.
+
+    **What this delegation rests on.** It replaced an explicit
+    `owner_user_id, else has_effective_representation(applicant.stir)` pair, and
+    the two resolve the same set only because every `representations.applicant_id`
+    points at a `kind='legal'` applicant, which `identity_by_kind` guarantees has
+    a non-null `stir`. `representations` carries no DB CHECK on the target's KIND
+    — the guarantee is the two writers in `auth.service`, `add_representation`
+    (which refuses `kind != "legal"` outright) and `attach_legal`, staying the
+    only ones. A third writer that could name an individual applicant would widen
+    who may sign the recipient line, and this is the sentence that must be read
+    before adding it.
     """
     return permit.applicant_id in await auth_service.own_applicant_ids(db, user.id)
 
@@ -1457,24 +1491,28 @@ async def public_check(
 #     from it is the name and tariff of the day the document was signed, which
 #     is exactly right for verification and exactly wrong for a report.
 #
-# WHY THERE ARE THREE STATUS WRITERS INSIDE THIS MODULE, and only one outside.
-# `_activate` (the fourth signature) and `jobs.expire_permits` (the nightly
-# sweep) write their own transitions, exactly as `applications`' own `submit`
-# does rather than routing through its `set_status` (that module's ruling 25).
-# Both do materially more than move a status — `_activate` stamps `issued_at`,
-# moves the APPLICATION and notifies the holder in the same step, and the sweep
-# audits under `PERMIT_EXPIRE` with the job's `correlation_id`, which this frozen
-# signature cannot express — and both edges are asserted against
-# `PERMIT_TRANSITIONS` in `test_end_to_end.py`, so the table describes the code
-# rather than merely sitting beside it.
+# `set_status` CARRIES EVERY COLUMN `permit_status_history` HAS, so that "the one
+# way" is not immediately contradicted by the caller who needs it most (ruling
+# T8-b). Besides `to_status`, `actor` and `reason` it takes `reason_item_id` and
+# `doc_file_id` — a suspension's legal ground: the classifier item and the order
+# that carries it (С13, 3.11b) — and `correlation_id`, so a sweep's rows all
+# carry the run they came from. All five default to None, so no caller of the
+# narrower form changes. Widening was free exactly once, here, before anything
+# depended on the shape; the freeze exists to stop LATER changes, and a
+# suspension recording its ground writes two more columns of the same history row
+# this function already writes rather than doing different work.
 #
-# WHAT 3.11b WILL FIND MISSING, said now rather than discovered then: a
-# suspension's legal ground is `permit_status_history.reason_item_id` (a
-# classifier item) and `doc_file_id` (the order), and this signature carries
-# neither — `reason` lands in `legal_basis` as free text. 3.11b writes its own
-# transition for `suspended`/`revoked` the way `_activate` does, validating
-# through `PERMIT_TRANSITIONS`, and leaves `set_status` as what it is: the move
-# for a caller that has only a status to write (4.7's `archived`).
+# THE ONE WRITER INSIDE THIS MODULE THAT STILL DOES NOT ROUTE THROUGH IT is
+# `_activate`, exactly as `applications`' own `submit` writes its own transition
+# rather than routing through that module's `set_status` (its ruling 25): it
+# stamps `issued_at`, moves the APPLICATION and notifies the holder in one step,
+# which is a flow verb, not a status move. `jobs.expire_permits` is the second,
+# and for a narrower reason — it drains its candidates in batches, each row
+# inside its own SAVEPOINT so a raising permit costs itself instead of its batch,
+# and that structure owns the write. Both edges are asserted against
+# `PERMIT_TRANSITIONS` in `test_end_to_end.py`, so the table describes the code
+# rather than merely sitting beside it, and neither writer may add an edge the
+# table does not have.
 #
 # WHAT IS PUBLIC IN THIS FILE AND STILL NOT PART OF THE CONTRACT, so that
 # "seven entry points" above means what it says. Everything else here belongs to
@@ -1518,13 +1556,37 @@ async def set_status(
     to_status: str,
     actor: User | None = None,
     reason: str | None = None,
+    reason_item_id: uuid.UUID | None = None,
+    doc_file_id: uuid.UUID | None = None,
+    correlation_id: str | None = None,
 ) -> Permit:
     """Move a permit from one `tz/05` status to another: validate the edge, write
     the `permit_status_history` row, audit it, return the permit.
 
-    Touches ONLY `permits.status`. `issued_at` belongs to `_activate`, which is
-    the one place a permit comes into force; anything else a future transition
-    needs to write belongs to the flow verb that owns it, never here.
+    Touches ONLY `permits.status` on the permit itself. `issued_at` belongs to
+    `_activate`, which is the one place a permit comes into force; anything else
+    a future transition needs to write on the PERMIT belongs to the flow verb
+    that owns it, never here.
+
+    **The three arguments past `reason` are the whole of ruling T8-b**, and they
+    are why "the one way a module outside `permits` moves a permit" is a rule
+    rather than a slogan a caller has to break:
+
+      * `reason_item_id` — the `classifier_items` row naming WHY (С13's grounds
+        for a suspension or a revocation). `reason` beside it is free text and
+        the two are not alternatives: the code is what a report can group by, the
+        text is what a citizen reads.
+      * `doc_file_id` — the order that carries that ground, so the history row
+        points at the document instead of merely asserting it exists.
+      * `correlation_id` — passed straight to `audit.log`, so a sweep's rows
+        carry the run they came from. Absent, `audit.log` picks up the request id
+        the correlation middleware bound; a worker has no request and must pass
+        its own.
+
+    None of the three is validated here, deliberately: an FK does that at the
+    database, and a service-level existence check would be a second opinion that
+    can only ever be more permissive than the constraint. The caller supplying
+    them is inside this module (3.11b) or a level-4 module with its own route.
 
     Enforces NO permission and NO zone rule of its own — the same design as every
     other function on this page, and for the same reason
@@ -1574,6 +1636,8 @@ async def set_status(
             # `archived` will be 4.7's, and neither has a person behind it.
             changed_by=actor.id if actor else None,
             legal_basis=reason,
+            reason_item_id=reason_item_id,
+            doc_file_id=doc_file_id,
         ),
     )
     # `updated_at` carries `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
@@ -1591,18 +1655,22 @@ async def set_status(
         old_value={"status": from_status},
         new_value={"status": to_status},
         basis=reason,
+        correlation_id=correlation_id,
+        # The trail says WHICH ground was cited, not just that one was: `basis`
+        # above is the free text, and a report grouping suspensions by cause
+        # needs the code. `str(...)`, because `audit_log.extra` is JSONB and
+        # nothing in this app configures a JSON encoder for `UUID` (lesson).
+        extra=None if reason_item_id is None else {"reason_item_id": str(reason_item_id)},
     )
     return permit
 
 
 # --- the three read routes' service side -------------------------------------
 #
-# No `audit.log` on any of them: the audit invariant covers state-changing
-# ACTIONS, and a denied read is not one. That is a deliberate omission and not an
-# oversight — `_assert_organization_in_zone` refuses the ISSUANCE path without a
-# trail too, and auditing a GET would let anyone holding a session write an
-# `audit_log` row per request. `tz/10`'s RI-12 stays what it already is: an
-# indicator raised on the write paths (`_signer_refusal`'s `wrong_organization`).
+# A SUCCESSFUL read is not audited: the audit invariant covers state-changing
+# actions, and a row per GET would let anyone holding a session write the trail
+# at will. A read DENIED on territory is audited (ruling T8-a) — see
+# `_readable_permit`, which is the one place both direct-access routes reach it.
 
 
 async def _holds_view_any(db: AsyncSession, actor: User) -> bool:
@@ -1639,6 +1707,28 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
     The holder is checked FIRST so a citizen never depends on the zone: an
     applicant carries no zone at all, and staff who also happen to hold a permit
     of their own in another leshoz read it as its holder.
+
+    **The territorial refusal writes an RI-12 trail before it raises** (ruling
+    T8-a, `tz/10`: «попытка доступа вне территориальных полномочий», High,
+    immediate), through the early-commit-on-denial pattern decision #40 ruling 2
+    fixes for exactly this — the raise would otherwise roll the trail back
+    together with the very exception it exists to explain. The same actor
+    attempting to SIGN a permit outside their zone is already recorded
+    (`_signer_refusal`'s `wrong_organization`); without this, stage 4.2's risk
+    report would see who tried to sign one and miss who tried to look at one.
+
+    **RI-12 coverage on reads is DIRECT ACCESS ONLY, and 4.2 needs to know it.**
+    `GET /permits` cannot produce a territorial denial at all — nobody named a
+    target, so `zone_filter` simply returns fewer rows and there is no attempt to
+    record. This function is the whole of the indicator's read-side surface:
+    `GET /permits/{id}` and `GET /permits/{id}/pdf`, both of which come through
+    here. A probe that walks the LIST is invisible to RI-12 by construction and
+    is the rate limiter's problem, not the audit trail's.
+
+    The other refusal is NOT audited, deliberately: a caller who holds no
+    `permits.view_any` cannot be "outside their zone" — they have no zone claim
+    to exceed — and a row per 404 would let any signed-in citizen fill
+    `audit_log` by guessing uuids.
     """
     permit = await repo.permit_by_id(db, permit_id)
     if permit is None:
@@ -1647,7 +1737,19 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
         return permit
     if not await _holds_view_any(db, actor):
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
-    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    if not await _organization_in_actor_zone(db, actor, permit.organization_id):
+        await audit.log(
+            db,
+            action=PERMIT_READ,
+            user_id=actor.id,
+            object_type=OBJECT_TYPE,
+            object_id=permit.id,
+            result="denied",
+            basis="out_of_zone",
+            extra={"risk_indicator": "RI-12"},
+        )
+        await db.commit()
+        raise err("ERR-ACL-002")
     return permit
 
 
