@@ -169,6 +169,13 @@ def upgrade() -> None:
         ["layout_file_id"],
         unique=False,
     )
+    op.create_index(
+        "uq_permit_templates_active",
+        "permit_templates",
+        ["activity_type_id"],
+        unique=True,
+        postgresql_where=sa.text("status = 'active'"),
+    )
     op.create_table(
         "permits",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -474,7 +481,9 @@ def upgrade() -> None:
         )
     )
 
-    # The default template for grazing. `layout_file_id` stays NULL: a migration cannot
+    # The default template for grazing — and, under `uq_permit_templates_active`, the
+    # ONE active row for that activity type until an administrator supersedes it
+    # (archive, then insert version 2). `layout_file_id` stays NULL: a migration cannot
     # put bytes in MinIO, and a row pointing at a storage key that does not exist would
     # be worse than an honest null — null means "the layout bundled with the module"
     # (app/modules/permits/assets/, Task 2). An administrator uploading a layout fills
@@ -584,6 +593,11 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_permits_applicant_id"), table_name="permits")
     op.drop_index(op.f("ix_permits_activity_type_id"), table_name="permits")
     op.drop_table("permits")
+    op.drop_index(
+        "uq_permit_templates_active",
+        table_name="permit_templates",
+        postgresql_where=sa.text("status = 'active'"),
+    )
     op.drop_index(op.f("ix_permit_templates_layout_file_id"), table_name="permit_templates")
     op.drop_table("permit_templates")
     op.drop_table("permit_counters")

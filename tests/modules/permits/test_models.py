@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from app.modules.permits.models import Permit, PermitStatusHistory
+from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
 
 
 async def _permit(db, application, *, series="А", number=1, status="pending_signatures") -> Permit:
@@ -76,3 +76,45 @@ async def test_the_counter_hands_out_each_number_once(db):
         ).bindparams(s="А")
     )
     assert second == first + 1
+
+
+async def _template(db, activity_type_id, *, version: int, status="active") -> PermitTemplate:
+    row = PermitTemplate(
+        activity_type_id=activity_type_id,
+        version=version,
+        name={"uz_cyrl": f"Шаблон v{version}", "ru": f"Шаблон v{version}"},
+        status=status,
+        valid_from=date(2027, 1, 1),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def test_only_one_template_version_is_active_per_activity_type(db, haymaking_activity_id):
+    """Review round 1: `uq(activity_type_id, version)` alone lets two ACTIVE rows
+    exist, so Task 3's "the active template for this activity" lookup would return
+    whichever row the plan order handed back and freeze the wrong `template_id` into
+    the permit permanently. Every sibling versioned catalogue (notification_templates
+    0009, contour_versions) pins this with the same partial unique index."""
+    await _template(db, haymaking_activity_id, version=1)
+    with pytest.raises(IntegrityError, match="uq_permit_templates_active"):
+        await _template(db, haymaking_activity_id, version=2)
+
+
+async def test_archiving_the_active_template_frees_the_slot_for_the_next_version(
+    db, haymaking_activity_id
+):
+    """The supersede the docstring promises, in the ONE order that works: archive,
+    `flush()`, then insert. Without the flush both statements are still pending when
+    the partial index is checked and the insert raises on a conflict the flush would
+    have resolved (lesson). Archived rows sit outside the index, so the superseded
+    version stays readable — an issued permit's `template_id` still resolves."""
+    first = await _template(db, haymaking_activity_id, version=1)
+
+    first.status = "archived"
+    await db.flush()
+    second = await _template(db, haymaking_activity_id, version=2)
+
+    assert second.status == "active"
+    assert first.status == "archived"

@@ -31,6 +31,7 @@ from sqlalchemy import (
     Numeric,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -219,6 +220,25 @@ class PermitTemplate(Base):
         UniqueConstraint("activity_type_id", "version"),
         CheckConstraint(f"status IN {TEMPLATE_STATUSES}", name="status_valid"),
         CheckConstraint("version > 0", name="version_positive"),
+        # Exactly one active version per activity type — the same partial unique index
+        # every sibling versioned catalogue here carries (`notification_templates`
+        # 0009, the admin and applicant catalogues, `contour_versions … WHERE
+        # status='published'`). Without it the supersede lifecycle this docstring
+        # promises is only a convention: two active grazing rows make "the active
+        # template for this activity" return whichever row the plan order happens to
+        # hand back, and issuance freezes the wrong `permits.template_id` forever
+        # (review round 1, Important finding).
+        #
+        # A partial index constrains only the rows it covers, and only after a flush
+        # (lesson): a supersede is `old.status = "archived"` -> `await db.flush()` ->
+        # `db.add(new_row)`, in that order, and archived rows sit outside the index
+        # so any number of them may coexist.
+        Index(
+            "uq_permit_templates_active",
+            "activity_type_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
     )
 
 

@@ -52,6 +52,15 @@ async def grazing_activity_id(db: AsyncSession) -> uuid.UUID:
     return rows.scalar_one()
 
 
+@pytest.fixture
+async def haymaking_activity_id(db: AsyncSession) -> uuid.UUID:
+    """A second activity type, for the `permit_templates` uniqueness tests: migration
+    0019 already seeds an ACTIVE grazing template, so a test that built its own v1
+    there would collide with the seed rather than with the row it created."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'haymaking'"))
+    return rows.scalar_one()
+
+
 async def make_paid_application(
     db: AsyncSession,
     *,
