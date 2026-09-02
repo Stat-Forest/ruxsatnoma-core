@@ -586,6 +586,31 @@ async def sys_admin_client(db: AsyncSession) -> AsyncIterator[Signer]:
 
 
 @pytest.fixture
+async def other_applicant_client(db: AsyncSession) -> AsyncIterator[Signer]:
+    """A fully registered applicant with nothing to do with this permit — the
+    stranger whose own genuine certificate is crypto-valid and still not the
+    holder's. Registered (its own `Applicant` row) because `get_current_user`
+    gates an applicant-role user without one to a short exempt path list
+    (`ERR-AUTH-008`), which does not include `/permits/*`."""
+    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    db.add(
+        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+    )
+    await db.flush()
+    async for signer in _signer_for(db, role_code="applicant", user=user):
+        yield signer
+
+
+@pytest.fixture
+async def non_signatory_client(db: AsyncSession) -> AsyncIterator[Signer]:
+    """A staff role that is not one of the four signatories at all:
+    `gis_specialist` holds no `permits.sign` grant (migration 0019), so the
+    route's own dependency refuses it before the signatory check ever runs."""
+    async for signer in _signer_for(db, role_code="gis_specialist"):
+        yield signer
+
+
+@pytest.fixture
 async def holder_client(db: AsyncSession, applicant_user: User) -> AsyncIterator[Signer]:
     """The recipient: the individual applicant who OWNS `paid_application`.
 

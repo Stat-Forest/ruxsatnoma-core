@@ -881,6 +881,20 @@ async def get_applicant(db: AsyncSession, applicant_id: uuid.UUID) -> Applicant 
     return await db.get(Applicant, applicant_id)
 
 
+async def role_code(db: AsyncSession, user: User) -> str | None:
+    """This user's `roles.code`, or None if the role row vanished (should not
+    happen: FK). No permission and no zone rule — the same shape as
+    `get_applicant` above: the caller is another SERVICE inside this process.
+
+    `permits` (3.11a) needs it because a permit's four signature lines are
+    role-based (`permits/signers.py`, ruling 4) and `auth.repo` is not reachable
+    across the module boundary (CLAUDE.md: cross-module calls go through the
+    other module's service). `auth.deps._authorize` reads the same fact through
+    `repo.role_code` directly, being inside this module.
+    """
+    return await repo.role_code(db, user)
+
+
 async def list_user_ids_by_role_codes(
     db: AsyncSession, role_codes: Sequence[str]
 ) -> list[uuid.UUID]:

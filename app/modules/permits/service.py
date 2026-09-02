@@ -52,9 +52,19 @@ from app.modules.permits.models import Permit, PermitStatusHistory, PermitTempla
 # ruling 17). The dot is shared with `notification_templates.event_code`
 # (`permit.issued`) and neither is a bus name; see `permits/events.py`.
 PERMIT_ISSUE = "permit.issue"
+PERMIT_SIGN = "permit.sign"
 
-# The permit's initial status. `active` is Task 4's, when the last signature lands.
+# The permit's initial status, and the one it reaches when the last required
+# signature lands. Nothing else in this codebase may write `active` onto a permit:
+# see `_activate`, which is reachable only from `add_signature` and only once
+# `signatures.service.missing_purposes` has come back empty (C11).
 INITIAL_STATUS = "pending_signatures"
+ACTIVE_STATUS = "active"
+
+# What `applications` calls the state a signed permit puts it in. `tz/05` defines
+# it as «сформировано **и подписано**», which is why issuance does NOT set it
+# (ruling 18) — the last signature does.
+APPLICATION_PERMIT_ISSUED = "PERMIT_ISSUED"
 
 # `tz/13` field 19 is «Статус оплаты и дата». The STATUS is what this module can
 # state on its own authority — issuance runs from `PAID` and from nothing else, so
