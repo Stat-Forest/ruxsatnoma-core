@@ -53,13 +53,12 @@ from app.modules.norms.models import Calculation
 from app.modules.payments import payme_router
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import Invoice
-from app.modules.payments.permissions import PAYMENTS_VIEW
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client
 from tests.modules.applications.conftest import applicant as applicant
 from tests.modules.applications.conftest import grazing_activity_id as grazing_activity_id
-from tests.modules.auth.test_sessions import make_session
-from tests.modules.gis.conftest import _client_for, _commit_pending_before_requests
+from tests.modules.auth.test_sessions import make_session, make_user
+from tests.modules.gis.conftest import _commit_pending_before_requests
 from tests.modules.gis.conftest import applicant_client as applicant_client
 
 PAYME_TEST_CASHBOX_KEY = "test-cashbox-key"
@@ -281,9 +280,28 @@ async def owner_client(db: AsyncSession, applicant: Applicant) -> AsyncIterator[
 
 @pytest.fixture
 async def payments_view_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
-    """An accountant-shaped actor: holds `payments.view`, zone-free — sees any
-    invoice regardless of who applied for it."""
-    async for client in _client_for(db, PAYMENTS_VIEW):
+    """THE `accountant`, not an actor shaped like one: the production role
+    migration 0017 grants `payments.view` and `payments.manage` to, signed in
+    with no personal grants of its own.
+
+    It was `_client_for(db, PAYMENTS_VIEW)` until 2026-09-03 — which builds an
+    `executor_staff` user and bolts the code on as a `user_permissions` row.
+    That proves the permission CODE works and says nothing about whether the
+    role delivers it: revoke the grant in 0017 and the fixture sails through,
+    while every real accountant gets a 403. The same shape
+    `tests/modules/permits/conftest.py::_signer_for` uses, and for the same
+    reason (lesson: a fixture's permission list must mirror the PRODUCTION
+    role's grants — a fixture that lists them inherits nothing).
+
+    Zone-free (`organization_id` unset), so an invoice read is not also a zone
+    test.
+    """
+    user = await make_user(db, role_code="accountant")
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        _commit_pending_before_requests(client, db)
         yield client
 
 
