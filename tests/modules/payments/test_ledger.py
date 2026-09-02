@@ -109,3 +109,20 @@ def test_entries_for_tolerates_a_missing_recipient_account():
     by_target = {entry.target: entry for entry in entries}
     assert by_target["recipient"].account is None
     assert by_target["budget"].account == "23402810000000000001"
+
+
+def test_entries_for_refuses_a_transaction_that_belongs_to_a_different_invoice():
+    """A stale object reused across a retry, or a plain copy-paste mix-up in
+    the caller, must never silently produce a ledger row pointing at the
+    wrong invoice — undetectable until manual reconciliation. Both objects
+    are already in memory, so this costs neither I/O nor a session."""
+    invoice = _invoice(amount=Decimal("100.00"))
+    other_invoice_id = uuid.uuid4()
+    transaction = _transaction(invoice_id=other_invoice_id, amount=Decimal("100.00"))
+
+    with pytest.raises(ValueError, match=str(transaction.id)):
+        ledger.entries_for(
+            invoice=invoice,
+            transaction=transaction,
+            recipient_account="20208000900123456789",
+        )

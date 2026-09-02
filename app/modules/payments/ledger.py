@@ -59,7 +59,21 @@ def entries_for(
     never blocks money that has already arrived.
 
     Returns two plain, unattached `Allocation` instances — never added to a
-    session, never flushed. The caller owns the session and the write."""
+    session, never flushed. The caller owns the session and the write.
+
+    Raises `ValueError` if `transaction.invoice_id != invoice.id`: the two
+    arguments must already be a matched pair — a stale object reused across
+    a retry, or a copy-paste mix-up in the caller, would otherwise produce a
+    ledger row pointing at the wrong invoice, silently, with no exception
+    and no log line, undetectable until manual reconciliation. Checking it
+    costs neither I/O nor a session — both objects are already in memory —
+    so it is an internal-consistency check on the caller's own inputs, not a
+    business rule, and does not cost this module its purity."""
+    if transaction.invoice_id != invoice.id:
+        raise ValueError(
+            f"transaction {transaction.id} belongs to invoice {transaction.invoice_id}, "
+            f"not {invoice.id}"
+        )
     recipient_amount, budget_amount = split(transaction.amount)
     return [
         Allocation(
