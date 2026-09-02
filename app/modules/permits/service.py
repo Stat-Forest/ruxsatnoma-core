@@ -60,6 +60,12 @@ from app.modules.signatures import service as signatures_service
 # (`permit.issued`) and neither is a bus name; see `permits/events.py`.
 PERMIT_ISSUE = "permit.issue"
 PERMIT_SIGN = "permit.sign"
+# The two the daily sweeps write (`permits/jobs.py`). `permit.close_application`
+# is named for what it does rather than shortened to `permit.close`: the permit
+# is not closed and never will be — `expired`/`revoked` are terminal until 4.7
+# archives them — it is the APPLICATION that reaches CLOSED (ruling 13).
+PERMIT_EXPIRE = "permit.expire"
+PERMIT_CLOSE_APPLICATION = "permit.close_application"
 
 # The permit's initial status, and the one it reaches when the last required
 # signature lands. Nothing else in this codebase may write `active` onto a permit:
@@ -863,11 +869,7 @@ async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
     await notifications.notify(
         db,
         event_code=events.PERMIT_ACTIVE,
-        recipient_user_id=await _notification_recipient(
-            db,
-            applicant_id=permit.applicant_id,
-            submitted_by_user_id=await _submitter_of(db, permit),
-        ),
+        recipient_user_id=await _holder_recipient(db, permit),
         params={
             "permit_number": _permit_number(permit.series, permit.number),
             "valid_from": permit.period_from,
@@ -902,14 +904,25 @@ async def _notify_recipient_turn(db: AsyncSession, permit: Permit) -> None:
     await notifications.notify(
         db,
         event_code=events.PERMIT_SIGNED,
-        recipient_user_id=await _notification_recipient(
-            db,
-            applicant_id=permit.applicant_id,
-            submitted_by_user_id=await _submitter_of(db, permit),
-        ),
+        recipient_user_id=await _holder_recipient(db, permit),
         params={"permit_number": _permit_number(permit.series, permit.number)},
         object_type=OBJECT_TYPE,
         object_id=permit.id,
+    )
+
+
+async def _holder_recipient(db: AsyncSession, permit: Permit) -> uuid.UUID:
+    """Who hears about this permit — `_notification_recipient` over the pair of
+    facts a permit always carries.
+
+    One function rather than the two-call idiom repeated at each site: three
+    callers now (`_activate`, `_notify_recipient_turn`, `jobs.expire_permits`),
+    and a resolution rule copied three times is a rule that will hold in two
+    places after somebody changes it."""
+    return await _notification_recipient(
+        db,
+        applicant_id=permit.applicant_id,
+        submitted_by_user_id=await _submitter_of(db, permit),
     )
 
 

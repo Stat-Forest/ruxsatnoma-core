@@ -19,6 +19,7 @@ from app.modules.gis import import_service as gis_import_service
 from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
+from app.modules.permits import jobs as permits_jobs
 
 logger = structlog.get_logger(__name__)
 
@@ -200,3 +201,36 @@ async def process_gis_imports(factory: async_sessionmaker[AsyncSession]) -> int:
     if processed:
         logger.info("job.process_gis_imports", processed=processed)
     return processed
+
+
+async def expire_permits(factory: async_sessionmaker[AsyncSession]) -> int:
+    """The nightly permit expiry (plan 03.11a task 7, ruling 16).
+
+    A wrapper, like every job on this page: the decision lives in
+    `permits.jobs.expire_permits`, which takes a session so a test can drive it
+    without a scheduler, and this opens one and commits. The permit's status, its
+    history row, the holder's notification and the audit entry all land in that
+    one transaction.
+    """
+    async with factory() as db:
+        expired = await permits_jobs.expire_permits(db)
+        await db.commit()
+    if expired:
+        logger.info("job.expire_permits", expired=expired)
+    return expired
+
+
+async def close_finished_permits(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Close the application behind every permit that has finished (ruling 13).
+
+    Scheduled AFTER `expire_permits` so a permit that ran out last night has its
+    application closed the same night rather than the next one — the sweep is
+    correct in either order, since it scans every finished permit, but the pair
+    is what a holder sees as one overnight step.
+    """
+    async with factory() as db:
+        closed = await permits_jobs.close_finished(db)
+        await db.commit()
+    if closed:
+        logger.info("job.close_finished_permits", closed=closed)
+    return closed

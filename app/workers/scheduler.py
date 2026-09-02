@@ -64,6 +64,27 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # The nightly permit pair (plan 03.11a task 7), in this order and ten minutes
+    # apart: a permit that ran out last night is expired first, and the closure
+    # sweep right after it then finds the application that permit just freed.
+    # `TIMEZONE` is Asia/Tashkent, the same zone `business_today()` reads, so
+    # "just after midnight" means the same thing to the trigger and to the job.
+    sched.add_job(
+        _wrap(factory, jobs.expire_permits),
+        CronTrigger(hour=0, minute=20, timezone=TIMEZONE),
+        next_run_time=now,
+        id="expire_permits",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    sched.add_job(
+        _wrap(factory, jobs.close_finished_permits),
+        CronTrigger(hour=0, minute=30, timezone=TIMEZONE),
+        next_run_time=now,
+        id="close_finished_permits",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     # Every 10 seconds: an operator who just uploaded a leshoz should not wait
     # a minute for anything to start happening (plan 03.6a ruling 6). Cheap
     # when idle — one indexed SELECT ... FOR UPDATE SKIP LOCKED against
