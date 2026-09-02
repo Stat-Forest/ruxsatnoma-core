@@ -34,10 +34,23 @@ PERMIT_ACTIVE = "permit.active"
 PERMIT_EXPIRING = "permit.expiring"
 PERMIT_EXPIRED = "permit.expired"
 
+# NOT a `permit.*` code, and deliberately so. `subscribers.on_payment_confirmed`
+# (ruling 19) tells the application's assigned executor that money has arrived and
+# a permit is now due — a payment fact, not a permit fact, and `0009_notifications`
+# already seeded exactly that text for both channels («Оплата {amount} сум по
+# заявке {application_number} подтверждена»). Reusing it is why this stage needs no
+# sixth template and no migration of its own: the plan's ruling 17 lists five codes
+# for this module precisely because the sixth notification was expected to reuse
+# `payments`' own. The word is shared with the BUS name `payment_confirmed`
+# (`app/event_subscriptions.py`) and the two are not interchangeable — the dot is
+# the tell, as above.
+PAYMENT_CONFIRMED = "payment.confirmed"
+
 NOTIFIED_EVENT_CODES: tuple[str, ...] = (
     PERMIT_ISSUED,
     PERMIT_SIGNED,
     PERMIT_ACTIVE,
     PERMIT_EXPIRING,
     PERMIT_EXPIRED,
+    PAYMENT_CONFIRMED,
 )

@@ -692,21 +692,22 @@ Tooling and environment.
 - **Why:** The DB is shared across worktrees and runs, committing client fixtures leave rows
   behind forever, and the round-trip test wipes it wholesale (collection order pinned in
   `tests/conftest.py`). Four consequences paid for already, each with its remedy:
-  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 4 stray contours before
-    3.6a t4 and 11 after, so a "nothing overlaps here" assertion there is flaky from birth
-    → randomise (`random_box_wkt()`, `unique_suffix`, a `storage_key`), unless a sibling
+  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 4 stray contours before 3.6a
+    t4 and 11 after, and a hard-coded `permits.number=1` dies once issuance commits one →
+    randomise (`random_box_wkt()`), or take the next value from the counter, unless a sibling
     deliberately needs proximity (`neighbouring_published_contour`).
-  - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the
-    oldest `pending` import in the DB, not yours, and an interrupted run strands one forever
-    (`test_two_workers…` sees `[1, 1]` not `[0, 1]`) → a package-scoped autouse drain that
-    runs the JOB, bounded by `DRAIN_LIMIT`, never an unscoped DELETE.
+  - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the oldest
+    `pending` import in the DB, not yours (`test_two_workers…` sees `[1, 1]` not `[0, 1]`) →
+    a package-scoped autouse drain running the JOB, bounded by `DRAIN_LIMIT`, never a DELETE.
   - **Paging:** page 1 is full of previous runs, so
     `test_an_applicant_sees_published_contours_only` went red the moment the endpoint was
     paged → assert `total` plus a scoped filter (a fresh `organization_id`), not membership.
   - **A refused action leaves its row:** `test_a_maker_cannot_archive_a_published_tariff`
     succeeds BY being refused, so its `science` tariff stays published forever — breaking
-    `test_science_has_no_tariff` (`count(*) == 0`; archived counts too) and its own next run
-    with `period_overlap` → a yield-fixture teardown with a scoped DELETE.
+    `test_science_has_no_tariff` and its own next run → a yield-fixture teardown with a
+    scoped DELETE. And a row the test then REFERENCES cannot be deleted at all
+    (`permits.template_id`'s FK, and an append-only `permit_status_history` blocks deleting
+    the referrer too) → get-or-create with fixed ids, never create-and-clean-up.
 - **How to apply:** Scope every assertion by the ids your fixture created. Run any new
   negative test twice in a row, and as part of the FULL suite — this class is invisible in
   isolation. Do not reorder the conftest collection hook.

@@ -17,7 +17,7 @@ SNAPSHOT = {
     "period_to": "2027-09-30",
     "sb_load": "40.0000",
     "amount": "2060000.00",
-    "paid_at": "2027-04-01",
+    "payment_status": "Тўланган",
 }
 LAYOUT = '<html><body><h1>{{ series }} № {{ number }}</h1><img src="{{ qr }}"></body></html>'
 

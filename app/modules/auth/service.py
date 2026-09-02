@@ -868,6 +868,19 @@ async def get_notification_contact(
     )
 
 
+async def get_applicant(db: AsyncSession, applicant_id: uuid.UUID) -> Applicant | None:
+    """One `applicants` row by id, or None. No permission and no zone rule — the
+    same shape as `get_notification_contact` above: the caller is another SERVICE
+    inside this process, and the gates live on the routes that reach it.
+
+    `applicants` lives in this module, so a level-3/4 caller holding only an
+    `applicant_id` (permits 3.11a copies the holder's name and PINFL/STIR into the
+    immutable permit snapshot; `applications` carries the id and nothing more) has
+    no other lawful way to read it — cross-module calls go through the other
+    module's service, never its repo (CLAUDE.md module boundary)."""
+    return await db.get(Applicant, applicant_id)
+
+
 async def list_user_ids_by_role_codes(
     db: AsyncSession, role_codes: Sequence[str]
 ) -> list[uuid.UUID]:

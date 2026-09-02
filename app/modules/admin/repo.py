@@ -122,6 +122,15 @@ async def list_activity_types(db: AsyncSession) -> list[ActivityType]:
     return list((await db.execute(stmt)).scalars())
 
 
+async def get_activity_type(db: AsyncSession, activity_type_id: uuid.UUID) -> ActivityType | None:
+    """One activity type by id, whatever its status — the sibling of
+    `get_organization`/`get_classifier_item` above, for a module that already
+    holds the id and needs the row's own name (permits 3.11a copies it into the
+    immutable document snapshot). Archived rows are returned deliberately: a
+    permit issued years ago must still resolve the activity it was issued for."""
+    return await db.get(ActivityType, activity_type_id)
+
+
 async def list_livestock_types(db: AsyncSession) -> list[LivestockType]:
     stmt = (
         select(LivestockType)
