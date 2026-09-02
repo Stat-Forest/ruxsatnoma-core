@@ -268,12 +268,25 @@ async def create_pay_intent(
     `_may_act_on_invoices_of`, so the SAME ownership-or-representation rule
     that gates READING an invoice also gates PAYING it.
 
+    A non-`pending` invoice (already `paid`, `cancelled`, or `expired`)
+    refuses with `ERR-PAY-004` (409, this module's own state-conflict code
+    — the sibling `ERR-GIS-005`/`ERR-NORM-005` already have): a settled
+    invoice handing out a working-looking checkout link would persist a
+    `payment_intents` row and an audit entry for an action that can never
+    complete, even though Payme's own `CheckPerformTransaction`/
+    `CreateTransaction`/`PerformTransaction` (task 4) would independently
+    refuse the actual payment with `-31008` — not exploitable, but not
+    correct either. Checked BEFORE `due_at`: an invoice's status is the more
+    fundamental precondition (a non-pending invoice was never going to be
+    payable, regardless of the clock).
+
     An invoice past `due_at` refuses with `ERR-PAY-002`, checked against the
     WALL CLOCK, never `invoice.status`: Task 6's expiry job (not built on
     this branch) is what eventually flips `status` to `'expired'`, so a
     `pending` invoice can already be past its own window before that job
     catches up — relying on `status` alone would leave exactly that gap
-    payable.
+    payable. (A `status='expired'` row is caught by the check above
+    instead, once Task 6 starts writing it.)
 
     `idempotency_key` is the HTTP `Idempotency-Key` header's own value
     (`auth.deps.idempotency_context`, the router's job to resolve) — the
@@ -290,6 +303,8 @@ async def create_pay_intent(
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
     if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
+    if invoice.status != "pending":
+        raise err("ERR-PAY-004", details={"invoice": str(invoice_id), "status": invoice.status})
     if datetime.now(UTC) > invoice.due_at:
         raise err("ERR-PAY-002", details={"invoice": str(invoice_id)})
 

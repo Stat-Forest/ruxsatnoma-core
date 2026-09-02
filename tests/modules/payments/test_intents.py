@@ -118,6 +118,49 @@ async def test_another_applicant_cannot_start_a_payment_for_my_invoice(
     assert result.status_code == 404
 
 
+# --- review finding: a settled invoice must refuse a new intent, not just an
+# expired one. `due_at` alone (ERR-PAY-002) never catches an invoice that was
+# already paid or cancelled WHILE still inside its own window.
+
+
+@pytest.fixture
+async def paid_invoice(db: AsyncSession, pending_invoice: Invoice) -> Invoice:
+    """`pending_invoice` marked paid directly — this fixture exists only to
+    prove `create_pay_intent`'s OWN `ERR-PAY-004` status check, not to
+    re-prove the real `PerformTransaction` path (`test_payme_rpc.py` already
+    does that exhaustively), so a direct field set is legitimate here.
+    `due_at` stays whatever `issue_invoice`'s real "+10 days" rule gave
+    `pending_invoice` — still well inside the window, the exact "settled but
+    not expired" shape the finding is about."""
+    pending_invoice.status = "paid"
+    pending_invoice.paid_at = datetime.now(UTC)
+    await db.flush()
+    return pending_invoice
+
+
+async def test_paying_an_already_paid_invoice_is_refused(applicant_client, paid_invoice):
+    result = await applicant_client.post(
+        f"/api/v1/invoices/{paid_invoice.id}/pay-intents",
+        json={"provider": "payme"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert result.status_code == 409
+    assert result.json()["error"]["code"] == "ERR-PAY-004"
+
+
+async def test_paying_a_cancelled_invoice_is_refused(applicant_client, cancelled_invoice):
+    """`cancelled_invoice` (`conftest.py`) is `pending_invoice` cancelled
+    through the real event path — its `due_at` is likewise still in the
+    future, so this is refused on STATUS, not on the date."""
+    result = await applicant_client.post(
+        f"/api/v1/invoices/{cancelled_invoice.id}/pay-intents",
+        json={"provider": "payme"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert result.status_code == 409
+    assert result.json()["error"]["code"] == "ERR-PAY-004"
+
+
 # --- ownership ruling: an effective representative may act too --------------
 # Task 2 shipped the invoice routes admitting only the applicant's own
 # `owner_user_id`, leaving a legal entity's non-owner representative unable
