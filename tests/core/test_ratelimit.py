@@ -1,5 +1,7 @@
 """Token-bucket per (scope, ip): over-limit → 429 ERR-SYS-006 with retry hint."""
 
+import contextlib
+
 import pytest
 from sqlalchemy import delete
 
@@ -108,3 +110,60 @@ async def test_eimzo_challenge_route_is_rate_limited(db, _low_challenge_limit):
         r = await client.post(f"{API}/auth/eimzo/challenge")
     assert r.status_code == 429
     assert r.json()["error"]["code"] == "ERR-SYS-006"
+
+
+# --- 3.11a ruling T5-e: the trim may not reach across scopes ------------------
+
+
+def _request_from(host: str):
+    """A request from one specific address. `_FakeRequest` above is a single
+    fixed IP; the eviction tests need many, and the bucket key is
+    `(scope, request.client.host)`."""
+
+    class _Request:
+        class _Client:
+            pass
+
+        client = _Client()
+
+    _Request.client.host = host  # type: ignore[attr-defined]
+    return _Request()
+
+
+async def test_a_flood_on_one_scope_cannot_reset_another_scopes_budget(db, monkeypatch):
+    """Task 5 capped `_buckets` to stop an anonymous route minting one dict entry
+    per IPv6 source address, but `_buckets` is ONE dict for every scope and the
+    trim dropped the least recently touched entries wherever they lived. So an
+    attacker who had burned their `/auth/login` budget could get it BACK by
+    flooding the anonymous permit-check route from a /64 — 20,000 addresses fits
+    inside a single sweep window — and a brute-force throttle that resets on
+    demand is not a throttle.
+
+    The per-account `login_max_attempts` lockout in the database is untouched by
+    any of this and still applies; it is a different control, on a different key.
+
+    Both halves are asserted: the login bucket keeps its exhausted state, AND the
+    flooded scope is still capped — a fix that simply stopped trimming would pass
+    the first assertion and reopen the leak the cap exists for.
+    """
+    monkeypatch.setattr(ratelimit, "MAX_BUCKETS", 8)
+    attacker = "198.51.100.9"
+    login = ratelimit.rate_limit("login", "ratelimit_otp_per_minute")  # default 5/minute
+
+    for _ in range(5):
+        await login(_request_from(attacker), db)  # type: ignore[arg-type]
+    with pytest.raises(DomainError):
+        await login(_request_from(attacker), db)  # type: ignore[arg-type]
+
+    # The open door, from a /64 the attacker owns outright.
+    flood = ratelimit.rate_limit("public_permit_qr", "ratelimit_otp_per_minute")
+    for index in range(64):
+        with contextlib.suppress(DomainError):
+            await flood(_request_from(f"2001:db8::{index:x}"), db)  # type: ignore[arg-type]
+
+    with pytest.raises(DomainError) as exc:
+        await login(_request_from(attacker), db)  # type: ignore[arg-type]
+    assert exc.value.code == "ERR-SYS-006"
+
+    flooded = [key for key in ratelimit._buckets if key[0] == "public_permit_qr"]
+    assert len(flooded) <= ratelimit.MAX_BUCKETS, "the flooded scope must still be capped"

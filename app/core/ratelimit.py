@@ -41,6 +41,18 @@ _last_sweep: float = 0.0
 #     That one IS lossy — a dropped bucket's holder gets a fresh budget — but a
 #     bounded, briefly-generous limiter beats an unbounded one, and it takes
 #     `MAX_BUCKETS` distinct addresses within a second to reach.
+#
+# **`MAX_BUCKETS` is PER SCOPE** (ruling T5-e), and that is a security property,
+# not a tuning choice. `_buckets` is one dict for every scope, so a cap enforced
+# across the whole dict let a flood on the open QR route evict a `("login", ip)`
+# bucket sitting at zero tokens — an attacker who had burned their login budget
+# could hand it back to themselves from a /64, and 20,000 addresses fits inside a
+# single sweep window. Before the cap existed nothing could be evicted at all, so
+# that primitive arrived with it. Exempting the "non-public" scopes instead would
+# not do: `/auth/login` is just as reachable by a stranger as the QR page, and
+# leaving it uncapped only restores the leak on the scope that matters most. The
+# DB-backed per-account `login_max_attempts` lockout is a different control on a
+# different key and is untouched either way.
 BUCKET_IDLE_SECONDS = 60.0
 MAX_BUCKETS = 20_000
 SWEEP_EVERY_SECONDS = 1.0
@@ -54,9 +66,24 @@ def reset() -> None:
 
 
 def _sweep(now: float, keep: tuple[str, str]) -> None:
-    """Drop refilled buckets, then trim to `MAX_BUCKETS`. Cheap and amortised:
-    at most once a `SWEEP_EVERY_SECONDS`, or immediately whenever the dict is
-    already over the cap — the one case where waiting is the wrong answer.
+    """Drop refilled buckets, then trim each SCOPE to `MAX_BUCKETS`. Cheap and
+    amortised: at most once a `SWEEP_EVERY_SECONDS`, or immediately whenever the
+    dict is already over the cap — the one case where waiting is the wrong answer.
+
+    The TTL pass stays global, and safely so: a bucket idle for `BUCKET_IDLE_
+    SECONDS` has refilled to full, and deleting a full bucket is exactly
+    equivalent to keeping it. The CAP pass is the lossy one — a dropped bucket's
+    holder gets a fresh budget — which is why it may only ever reach inside the
+    scope that overflowed. Trimming across scopes made the open QR route a reset
+    button for `/auth/login` (ruling T5-e, the comment above `MAX_BUCKETS`).
+
+    The gate stays the ORIGINAL `len(_buckets) > MAX_BUCKETS`, deliberately: it is
+    O(1) and, with per-scope caps, now merely conservative — the dict may legally
+    sit above it (k scopes x `MAX_BUCKETS`) and then sweep more often than once a
+    second. That trade is the right way round. Reading it per scope would need a
+    scan on every request, and loosening it to `MAX_BUCKETS * scopes` would let a
+    single-scope flood mint that many entries before the backstop fires at all —
+    the memory bound is what this gate is for.
 
     `keep` is the caller's OWN bucket, exempt from both passes. It is the newest
     entry and a zero-second-old one, so under the production values neither pass
@@ -72,9 +99,14 @@ def _sweep(now: float, keep: tuple[str, str]) -> None:
         k for k, b in _buckets.items() if k != keep and now - b.updated >= BUCKET_IDLE_SECONDS
     ]:
         del _buckets[key]
-    if len(_buckets) > MAX_BUCKETS:
-        stale = [k for k in sorted(_buckets, key=lambda k: _buckets[k].updated) if k != keep]
-        for key in stale[: len(_buckets) - MAX_BUCKETS]:
+    by_scope: dict[str, list[tuple[str, str]]] = {}
+    for key in _buckets:
+        by_scope.setdefault(key[0], []).append(key)
+    for keys in by_scope.values():
+        if len(keys) <= MAX_BUCKETS:
+            continue
+        stale = [k for k in sorted(keys, key=lambda k: _buckets[k].updated) if k != keep]
+        for key in stale[: len(keys) - MAX_BUCKETS]:
             del _buckets[key]
 
 
