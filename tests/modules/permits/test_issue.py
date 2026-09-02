@@ -553,9 +553,15 @@ async def test_an_activity_that_commits_no_livestock_prints_no_head_counts(
     assert permit is not None
 
     heads = {key: permit.snapshot[key] for key in permit.snapshot if key.startswith("heads_")}
-    assert len(heads) == 4
+    assert set(heads) == {name for name, _ in service.LIVESTOCK_ROWS}, (
+        "form 1-ilova has exactly these four head-count rows, by name"
+    )
     assert set(heads.values()) == {service.NOT_STATED}
-    assert "0" not in "".join(heads.values())
+    # `"0" not in …` was implied by the line above and could never fail on its own.
+    # The claim worth guarding is about NOT_STATED ITSELF: it is what all four rows
+    # print, so a digit in it would turn an apiary permit into a statement about
+    # cattle nobody made (final fix wave).
+    assert not any(char.isdigit() for char in service.NOT_STATED), service.NOT_STATED
 
 
 async def test_a_livestock_code_the_form_has_no_row_for_is_refused(

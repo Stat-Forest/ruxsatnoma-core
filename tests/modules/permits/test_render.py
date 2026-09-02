@@ -78,6 +78,30 @@ def test_the_layout_cannot_execute_anything() -> None:
     assert out.startswith(b"%PDF")
 
 
+def test_a_substituted_value_is_html_escaped_before_it_reaches_the_layout() -> None:
+    """The assertion the test above cannot make. `render_permit` returns PDF bytes,
+    so "a PDF came out" is true whether the markup was escaped or executed — WeasyPrint
+    happily renders an injected `<b>`, an `<img>` that triggers the asset fetcher, or a
+    tag that swallows the rest of the document, and every one of those still starts with
+    `%PDF` (final fix wave).
+
+    So this asserts on `fill`'s own output, which is the HTML string. The layout is an
+    admin-editable database row and the values come from `permits.snapshot`, so escaping
+    is a real control on a legal document, not a formality: an unescaped `<` in a
+    holder's name would silently change what the permit SAYS."""
+    from html import escape
+
+    hostile = '<script>alert("x")</script> & <b>Азизов</b>'
+    filled = render.fill("<html><body>{{ holder_name }}</body></html>", {"holder_name": hostile})
+
+    assert escape(hostile) in filled, filled
+    assert "<script>" not in filled
+    assert "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &lt;b&gt;" in filled
+    # The layout's OWN markup is untouched — escaping applies to the substituted value
+    # and not to the document around it.
+    assert filled.startswith("<html><body>") and filled.endswith("</body></html>")
+
+
 # --- Beyond the brief's five: what a `%PDF` assertion cannot see ---------------------
 
 

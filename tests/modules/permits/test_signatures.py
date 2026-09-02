@@ -35,6 +35,7 @@ from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.notifications.models import Notification
 from app.modules.permits import events, service, signers
 from app.modules.permits.models import Permit, PermitStatusHistory
+from app.modules.permits.permissions import PERMITS_SIGN
 from app.modules.signatures import service as signatures_service
 from tests.modules.permits.conftest import Signer, sign_permit
 
@@ -381,13 +382,30 @@ async def test_a_role_without_the_grant_is_refused_by_the_route_itself(
 ):
     """The route still needs its own `permits.sign` gate: `gis_specialist` holds
     no such grant, so it never reaches the signatory check (lesson: a permission
-    answers "at all", the signatory check answers "which line")."""
+    answers "at all", the signatory check answers "which line").
+
+    **Asserted on `details`, because two mechanisms refuse this actor and both
+    answer 403 `ERR-ACL-001`** (lesson: an outcome-only test cannot tell which one
+    fired). `gis_specialist` is refused by the route's `require_permission`, and
+    ALSO by `_signer_refusal` as `wrong_role` if it ever got that far — so with
+    `status_code`/`code` alone, deleting the dependency from the route left this
+    test green, which is the opposite of what its name claims.
+
+    The two are distinguishable by what they put in `details` and nothing else:
+    `auth.deps._authorize` writes `{"permission": <code>}`, the service writes
+    `{"reason": "signer_not_authorized"}`.
+    """
     result = await non_signatory_client.client.post(
         f"{API}/permits/{issued_permit.id}/signatures",
         json={"purpose": "permit_head", "pkcs7": "irrelevant"},
     )
     assert result.status_code == 403
-    assert result.json()["error"]["code"] == "ERR-ACL-001"
+    error = result.json()["error"]
+    assert error["code"] == "ERR-ACL-001"
+    assert error["details"] == {"permission": PERMITS_SIGN}, (
+        "the ROUTE's permission gate must be what refused this actor, not the"
+        " service's signatory check, which answers {'reason': ...}"
+    )
 
 
 async def test_signing_an_unknown_permit_is_a_404(head_client: Signer):
@@ -411,12 +429,19 @@ async def test_every_signature_covers_the_same_document(
     """3.8's `require_complete` does not check that the signatures share a
     doc_hash, so this stage guarantees there is only ever one document to sign:
     every signature is taken over `service.pdf_bytes`, never a re-render."""
-    await _sign(head_client, issued_permit.id, "permit_head", permit_pdf)
-    await _sign(chief_forester_client, issued_permit.id, "permit_chief_forester", permit_pdf)
+    # Both responses asserted, and the row COUNT with them: "one distinct doc_hash"
+    # is trivially true of one row, so a second signature that was refused for any
+    # reason left this test green while proving nothing about two (final fix wave).
+    head = await _sign(head_client, issued_permit.id, "permit_head", permit_pdf)
+    assert head.status_code == 200
+    assert (
+        await _sign(chief_forester_client, issued_permit.id, "permit_chief_forester", permit_pdf)
+    ).status_code == 200
 
     rows = await signatures_service.get_for_object(
         db, object_type="permit", object_id=issued_permit.id
     )
+    assert len(rows) == 2, "two signatures, or the assertion below is about one row"
     assert len({row.doc_hash for row in rows}) == 1
     assert rows[0].doc_hash == issued_permit.doc_hash
 

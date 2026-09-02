@@ -300,8 +300,13 @@ async def test_set_status_walks_the_whole_tail_of_the_lifecycle(
     function cannot reach is a stage that will have to change a contract this
     task promised would not change. No actor: `changed_by` is nullable exactly
     because `expired`/`archived` are the system's, not a person's."""
-    assert (await service.set_status(db, active_permit.id, to_status="suspended")).status
-    assert (await service.set_status(db, active_permit.id, to_status="revoked")).status
+    # `.status` alone was a truthiness check on a non-empty string: every one of the
+    # six statuses passes it, and so does a function that ignores `to_status`
+    # entirely (final fix wave).
+    assert (
+        await service.set_status(db, active_permit.id, to_status="suspended")
+    ).status == "suspended"
+    assert (await service.set_status(db, active_permit.id, to_status="revoked")).status == "revoked"
     final = await service.set_status(db, active_permit.id, to_status="archived")
     assert final.status == "archived"
     with pytest.raises(DomainError):

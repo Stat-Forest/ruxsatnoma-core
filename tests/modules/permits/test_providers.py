@@ -147,6 +147,52 @@ async def test_a_suspended_permit_occupies_nothing(
     ) == Decimal("0")
 
 
+async def test_occupancy_is_period_blind_and_double_counts_two_seasons(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """The asymmetry between the two seams, pinned so it is a decision and not a
+    surprise. `load_provider` takes a period; `occupancy_provider` takes none, so two
+    permits on ONE contour whose seasons do not overlap AT ALL both count and
+    `gis`'s `s_available_ha` reports less free area than any single day really has.
+
+    That is ruling 11 as written and it is the conservative direction — this seam can
+    only ever under-report free area, never over-book a contour. `test_providers.py`
+    had no period test on the occupancy side at all, so the day someone "fixes" the
+    asymmetry by filtering here, they would do it against a green suite.
+
+    Spring and autumn, sharing not one day: 4 + 5 = 9 hectares held on a contour
+    where no single day holds more than 5."""
+    from app.modules.permits import service
+
+    for area, period in (
+        (Decimal("4.0000"), (date(2027, 3, 1), date(2027, 5, 31))),
+        (Decimal("5.0000"), (date(2027, 9, 1), date(2027, 11, 30))),
+    ):
+        await make_permit_on_contour(
+            db,
+            contour=contour,
+            version_id=version_id,
+            org=leshoz,
+            activity_type_id=grazing_activity_id,
+            status="active",
+            area_ha=area,
+            period_from=period[0],
+            period_to=period[1],
+        )
+
+    assert (await service.occupancy_provider(db, [contour.id]))[contour.id] == Decimal("9.0000")
+
+    # The other seam, on the same two rows, for contrast: asked about spring it
+    # answers for spring alone. Same contour, same statuses, different question.
+    assert await service.load_provider(
+        db, contour.id, date(2027, 4, 1), date(2027, 4, 30)
+    ) == Decimal("40.0000")
+
+
 async def test_occupancy_answers_a_whole_page_in_one_query(
     db: AsyncSession, many_contours: list[Contour]
 ) -> None:

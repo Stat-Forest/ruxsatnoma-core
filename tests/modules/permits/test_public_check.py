@@ -188,7 +188,18 @@ async def test_every_check_is_counted_without_personal_data(
 
     rows = await _rows_since(db, marker)
     assert {row.result for row in rows} == {"found", "not_found"}
-    assert all(not hasattr(row, "ip") for row in rows)
+    # The TABLE's own column set, not `hasattr(row, "ip")` — every row here is the
+    # same class, so that asked one question about one Python attribute and could
+    # not see a `user_agent`, a `session_id` or a `pinfl` added beside it. An
+    # equality over the columns is what design/02's "no IP addresses and no
+    # personal data" actually means, and it fails on ANY new one (final fix wave).
+    assert set(QrCheckLog.__table__.columns.keys()) == {
+        "id",
+        "permit_id",
+        "occurred_at",
+        "result",
+        "channel",
+    }
     assert (
         await db.scalar(select(func.count()).select_from(QrCheckLog).where(QrCheckLog.id > marker))
         == 2

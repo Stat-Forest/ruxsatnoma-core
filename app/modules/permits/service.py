@@ -1197,6 +1197,19 @@ async def occupancy_provider(
     as a zero; the seam's contract is that a key it does not get back counts as
     zero, and `occupancy_map` quantizes whatever it is given to `area_ha`'s own
     NUMERIC(12,4) scale.
+
+    **NO PERIOD, deliberately — and this is the one place the two seams disagree.**
+    `load_provider` below takes `period_from`/`period_to` and counts only permits
+    overlapping them; this one takes none, so two SEASONAL permits on one contour
+    whose periods do not overlap at all both count, and `gis`'s `s_available_ha`
+    reports less free area than a given day actually has. That is ruling 11 as
+    written and it is the conservative direction: the seam can under-report free
+    area, never over-book a contour. It is asymmetric because the SHAPE 3.6a fixed
+    is asymmetric — this one answers a whole page of contours at once, for a list
+    with no period in the request at all, while `norms` asks about one contour for
+    one named period. Do not "fix" the asymmetry by adding a period here: a page
+    of contours has no single period to filter on, and the answer would silently
+    become "free on some unstated day".
     """
     if not contour_ids:
         return {}
@@ -1214,6 +1227,12 @@ async def load_provider(
     from the herd: the permit's own snapshot is the record of what was allowed
     (`tz/05` invariant 7), and re-deriving it here would let a later tariff
     regrouping change how much room a contour has today.
+
+    **PERIOD-AWARE, unlike `occupancy_provider` above**, which counts every active
+    permit on a contour whatever its dates. A reader meeting both seams must not
+    assume symmetry: last summer's expired-in-fact-but-still-`active` grazing
+    permit is excluded here and included there. See that function's own docstring
+    for why the difference is deliberate and which way it errs.
     """
     return await repo.committed_sb_load(
         db, contour_id, period_from, period_to, status=ACTIVE_STATUS

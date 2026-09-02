@@ -1,12 +1,17 @@
+import asyncio
+import re
 import uuid
 from datetime import date
 from decimal import Decimal
 from typing import get_args
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.config import get_settings
+from app.db import make_session_factory
 from app.modules.notifications import repo as notifications_repo
 from app.modules.notifications.service import DEFAULT_CHANNELS
 from app.modules.permits import repo
@@ -82,21 +87,46 @@ async def test_status_history_cannot_be_updated(db, paid_application):
         await db.flush()
 
 
-async def test_the_counter_hands_out_each_number_once(db):
-    """Ruling 9: UPDATE ... RETURNING under the row lock, not SELECT-then-UPDATE."""
-    first = await db.scalar(
-        text(
-            "UPDATE permit_counters SET last_number = last_number + 1"
-            " WHERE series = :s RETURNING last_number"
-        ).bindparams(s="А")
-    )
-    second = await db.scalar(
-        text(
-            "UPDATE permit_counters SET last_number = last_number + 1"
-            " WHERE series = :s RETURNING last_number"
-        ).bindparams(s="А")
-    )
-    assert second == first + 1
+async def test_the_counter_hands_out_each_number_once_under_a_real_race(engine: AsyncEngine):
+    """Ruling 9 and `tz/05` invariant 2: gapless, unique series numbers. `UPDATE …
+    RETURNING` under the row lock, never SELECT-then-UPDATE.
+
+    **Two REAL sessions, actually racing** (`test_signatures.py`'s two-session test is
+    the shape). The version this replaced inlined its own SQL, never called
+    `repo.next_number`, and ran both statements sequentially on ONE session — where a
+    SELECT-then-UPDATE implementation passes identically, because a single session
+    cannot contend with itself. The second caller here blocks on the first's row lock
+    until it commits, which is what makes the assertion discriminate.
+
+    The first allocation COMMITS (there is no other way to release the lock) and the
+    second is rolled back, so this consumes exactly one number from the shared,
+    persistent test database — the same cost an issuance test already pays."""
+    series = get_settings().permit_series
+    factory = make_session_factory(engine)
+
+    async with factory() as first, factory() as second:
+        allocated = await repo.next_number(first, series)
+        assert allocated is not None
+
+        racer = asyncio.create_task(repo.next_number(second, series))
+        await asyncio.sleep(0.5)
+        assert not racer.done(), (
+            "the second allocation must block on the first's row lock — without it"
+            " both read the same last_number and one series number is handed out twice"
+        )
+
+        await first.commit()
+        second_number = await asyncio.wait_for(racer, timeout=10)
+        assert second_number == allocated + 1
+        await second.rollback()
+
+
+async def test_the_counter_refuses_a_series_it_has_no_row_for(db):
+    """`next_number`'s own documented failure: the series is CYRILLIC А (U+0410), and
+    a Latin A (U+0041) matches no row. The statement then reports success and returns
+    nothing, which is how a permit would be written with no number at all — so the
+    caller must be able to SEE it, and `None` is what it sees."""
+    assert await repo.next_number(db, "A") is None  # noqa: RUF001 - Latin A on purpose
 
 
 async def _template(db, activity_type_id, *, version: int, status="active") -> PermitTemplate:
@@ -137,18 +167,57 @@ async def test_archiving_the_active_template_frees_the_slot_for_the_next_version
     await db.flush()
     second = await _template(db, haymaking_activity_id, version=2)
 
-    assert second.status == "active"
-    assert first.status == "archived"
+    # Read back from the DATABASE, not off the two objects this test just set the
+    # status on itself — `expire_on_commit=False` means those attributes are whatever
+    # Python last wrote there, so asserting on them examines nothing (final fix wave).
+    stored = {
+        row.version: row.status
+        for row in (
+            await db.execute(
+                select(PermitTemplate).where(
+                    PermitTemplate.activity_type_id == haymaking_activity_id
+                )
+            )
+        ).scalars()
+    }
+    assert stored == {1: "archived", 2: "active"}
+    assert second.id != first.id, "a supersede inserts a row, it does not rewrite one"
 
 
-async def test_the_schema_literals_match_the_tables_own_check_constraints() -> None:
+async def test_the_schema_literals_match_the_tuple_the_check_is_built_from() -> None:
     """The one guard against `schemas.PermitStatus` drifting from the tuple the
     CHECK is built from (lesson: an enum-ish column has ONE source of truth). The
     members have to be written out — pyright rejects a starred variable inside
     `Literal` — so a status added on one side and forgotten on the other would be
     a 422 that should have been a 201, or an IntegrityError 500 that should have
-    been a 422."""
+    been a 422.
+
+    Renamed: it compares the Literal to the TUPLE, which is one hop short of the
+    table. `test_the_status_check_in_the_database_holds_all_six_statuses` below is
+    the other hop."""
     assert set(get_args(PermitStatus)) == set(PERMIT_STATUSES)
+
+
+async def test_the_status_check_in_the_database_holds_all_six_statuses(db) -> None:
+    """The hop the test above cannot make. `models.py` builds its `CheckConstraint`
+    from `PERMIT_STATUSES` by f-string, but migration `0019` spells the six values
+    out as a literal — and `compare_metadata` does not diff CHECK constraints, so the
+    autogenerate guard test would not notice the two disagreeing.
+
+    Read back from `pg_constraint` on the live database, which is the migration's
+    output and nothing else. The six exist from day one on purpose: `suspended`,
+    `revoked` and `archived` are 3.11b's and 4.7's, and the plan's point is that
+    neither stage needs a migration to widen this."""
+    definition = await db.scalar(
+        text(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+            " WHERE conname = 'ck_permits_status_valid'"
+        )
+    )
+    assert definition is not None, "migration 0019 must have created this CHECK"
+    in_database = set(re.findall(r"'([a-z_]+)'", definition))
+    assert in_database == set(PERMIT_STATUSES)
+    assert len(PERMIT_STATUSES) == 6
 
 
 async def test_every_event_code_this_module_notifies_on_has_an_active_template(db) -> None:
