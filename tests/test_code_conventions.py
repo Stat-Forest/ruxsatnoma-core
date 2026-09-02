@@ -2,7 +2,7 @@
 by a reviewer — the codebase's stated preference (a mechanical check beats a
 lesson beats an instinct; `.claude/skills/writing-lessons`, step 1).
 
-Two rules live here so far, both from the 3.9a final review:
+Four rules live here so far. The first two came from the 3.9a final review:
 
 - `date.today()` must not appear in `app/` — every calendar-day decision goes
   through `app.core.time.business_today()` (backend/CLAUDE.md "Time"). This is
@@ -11,6 +11,13 @@ Two rules live here so far, both from the 3.9a final review:
   in later stages.
 - a locking `db.get(..., with_for_update=True)` must also pass
   `populate_existing=True` (finding C2).
+
+and the other two from 3.11a:
+
+- every integer QUERY parameter carries an upper bound, or it reaches asyncpg
+  as `DataError: value out of int64 range` — a 500 anybody can type (t5).
+- `register_event_subscriptions()` is idempotent for every registry it fills,
+  not only for the event bus the autouse fixture restores (pre-flight P4).
 """
 
 import ast
@@ -160,4 +167,62 @@ def test_every_integer_query_parameter_carries_an_upper_bound() -> None:
     assert not offenders, (
         "an int query parameter needs an upper bound (Query(le=...), PAGING_MAX for "
         "paging) — unbounded, it reaches asyncpg as out of int64 range: " + ", ".join(offenders)
+    )
+
+
+def _registry_sizes() -> dict[str, int]:
+    """The length of every module-level `list`/`dict` in an imported `app.*` module.
+
+    Deliberately not restricted to the registries anyone has thought of: the
+    point of the check below is to catch the registry NOBODY has thought of yet.
+    A constant that is never mutated simply reports the same size twice and
+    costs nothing.
+    """
+    import sys
+
+    sizes: dict[str, int] = {}
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith("app."):
+            continue
+        for attr, value in list(vars(module).items()):
+            if attr.startswith("__") or not isinstance(value, list | dict):
+                continue
+            sizes[f"{name}.{attr}"] = len(value)
+    return sizes
+
+
+def test_registering_the_event_subscriptions_twice_registers_nothing_twice() -> None:
+    """3.11a P4. `register_event_subscriptions()` fills registries that live
+    OUTSIDE the event bus — `gis.service.OCCUPANCY_PROVIDERS` and
+    `norms.service.LOAD_PROVIDERS` since 3.11a — and
+    `tests/conftest.py::_isolate_subscriptions` is autouse, calls that function
+    for EVERY test, and snapshots `app.core.events._SUBSCRIBERS` **and nothing
+    else**. A registration that appends without checking membership therefore
+    adds one copy per test: a provider's answer silently doubles, then triples,
+    the failure lands in whichever file happens to run late, reads as test
+    pollution rather than as a registration bug, and passes when that file is
+    run alone.
+
+    Generic on purpose. `permits/test_providers.py` pins today's two providers
+    by name, which cannot see the THIRD registry a later module adds — and that
+    is the one whose author will not have read this comment.
+    """
+    from app.event_subscriptions import register_event_subscriptions
+
+    register_event_subscriptions()
+    before = _registry_sizes()
+    register_event_subscriptions()
+    after = _registry_sizes()
+
+    grown = {
+        key: (size, after[key])
+        for key, size in before.items()
+        if key in after and after[key] != size
+    }
+    # A walk that examines nothing cannot fail (the lesson the integer-bound
+    # check above paid for), so the population is asserted too.
+    assert len(before) >= 20, f"only {len(before)} registries seen — the walk is wrong"
+    assert not grown, (
+        "registering the event subscriptions twice grew a registry — append only after a "
+        "membership check, the way core.events.subscribe dedups its own pair: " + repr(grown)
     )
