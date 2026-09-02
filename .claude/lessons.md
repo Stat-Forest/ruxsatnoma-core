@@ -140,6 +140,9 @@ Tooling and environment.
   shared DB ahead of your files (hit building 3.8).
 - **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
   naming a version you don't have locally means check which DB you connected to first.
+- **Recovery:** Already ran it bare? Check `alembic_version` on the dev DB immediately; if it
+  now names one of YOUR unmerged revisions, `alembic downgrade` it back to where `dev`
+  actually is before touching anything else (hit and recovered clean in 3.10a t6, back to `0014`).
 
 ## Amending an unmerged migration needs the OLD script to downgrade, the NEW one to upgrade
 
