@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
-from app.modules.auth.models import Applicant
+from app.modules.auth.models import Applicant, User
 from app.modules.gis.models import Contour, GisLayer
 from tests.modules.auth.test_sessions import make_user
 from tests.modules.gis.conftest import approval_doc as approval_doc
@@ -47,6 +47,15 @@ async def applicant(db: AsyncSession) -> Applicant:
     db.add(row)
     await db.flush()
     return row
+
+
+@pytest.fixture
+async def staff_user(db: AsyncSession) -> User:
+    """A plain staff user for `set_status`'s `actor=` — distinct from
+    `applicant`, whose own `owner_user_id` already covers the applicant-actor
+    case. Not permission-bearing: `set_status` enforces no permission of its
+    own (that is the CALLING module's router's job)."""
+    return await make_user(db, role_code="executor_staff")
 
 
 @pytest.fixture

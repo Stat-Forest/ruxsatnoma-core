@@ -9,8 +9,9 @@ carries (approval -> invoice, payment -> status) are exactly the ones that must
 not half-happen, and inside one process and one database a transaction is the
 strongest consistency tool available.
 
-Subscriptions are registered in `app/main.py` and nowhere else, so no module
-imports another for the sake of an event. This module itself imports no domain
+Subscriptions are registered in `app/event_subscriptions.py`'s
+`register_event_subscriptions()` and nowhere else, so no module imports
+another for the sake of an event. This module itself imports no domain
 module and never will: it takes an `AsyncSession` and plain strings, and does
 not know that `applications` (or any other module) exists.
 """
@@ -41,14 +42,15 @@ def subscribe(event_name: str, handler: Handler) -> None:
 
     Idempotent by the `(event_name, handler)` pair: subscribing the exact same
     pair again is a silent no-op rather than a second entry. This is what lets
-    `app.main._register_event_subscriptions` — called once per `create_app()`,
-    and `create_app()` is called by many tests and by the app itself — run more
-    than once per process without a handler firing twice for one event (a bus
-    that registered 3.10a's invoice handler N times would raise N invoices for
-    one approval). It relies on the handler being a stable, module-level
-    function reference, the same idiom the rest of this codebase already uses
-    for registration (`auth.permissions.register`, `integrations.senders`) — a
-    lambda or closure built fresh on every call would defeat it.
+    `app.event_subscriptions.register_event_subscriptions()` — called once per
+    `create_app()`, and `create_app()` is called by many tests and by the app
+    itself — run more than once per process without a handler firing twice for
+    one event (a bus that registered 3.10a's invoice handler N times would
+    raise N invoices for one approval). It relies on the handler being a
+    stable, module-level function reference, the same idiom the rest of this
+    codebase already uses for registration (`auth.permissions.register`,
+    `integrations.senders`) — a lambda or closure built fresh on every call
+    would defeat it.
 
     This differs from `auth.permissions.register`, which *raises* on a repeat
     code: that registry is populated once, as an import-time side effect
