@@ -63,11 +63,15 @@ def test_the_purpose_role_map_is_the_four_of_ruling_4_and_nothing_else():
     # The recipient is not a ROLE: `applicant` is held by every citizen in the
     # country, so the proof is owning the application, not holding a role.
     assert signers.required_role(signers.RECIPIENT_PURPOSE) is None
-    assert signers.is_known(signers.RECIPIENT_PURPOSE) is True
     # Fails closed: `permit_required_signatures` is admin-editable, so a purpose
-    # with no entry here is refused rather than opened to anybody.
+    # with no entry here maps to no role, and no role is a refusal, not a pass.
     assert signers.required_role("permit_typo") is None
-    assert signers.is_known("permit_typo") is False
+    assert set(signers.PURPOSE_ROLES) == {
+        "permit_head",
+        "permit_chief_forester",
+        "permit_accountant",
+        "permit_recipient",
+    }
 
 
 # --- the happy path ----------------------------------------------------------
@@ -246,7 +250,11 @@ async def test_the_superuser_is_not_a_signatory(
 
 
 async def test_a_purpose_with_no_role_mapping_is_refused(
-    override_required_signatures, head_client: Signer, issued_permit: Permit, permit_pdf: bytes
+    db: AsyncSession,
+    override_required_signatures,
+    head_client: Signer,
+    issued_permit: Permit,
+    permit_pdf: bytes,
 ):
     """Ruling 4 fails closed: `permit_required_signatures` is admin-editable, so
     a typo must refuse rather than open a slot anybody can fill.
@@ -261,6 +269,20 @@ async def test_a_purpose_with_no_role_mapping_is_refused(
     result = await _sign(head_client, issued_permit.id, "permit_typo", permit_pdf)
     assert result.status_code == 403
     assert result.json()["error"]["details"]["reason"] == "signer_not_authorized"
+
+    # The journaled reason has to be `unknown_purpose`, not `wrong_role`. The
+    # 403 alone cannot tell the fail-closed guard from its neighbour — an
+    # unmapped purpose reaches the role comparison with `None` on one side and
+    # is refused there too, by accident of no role code being None. Asserting
+    # the reason is what makes the guard's removal visible.
+    entry = (
+        await db.scalars(
+            select(AuditLog).where(
+                AuditLog.object_id == issued_permit.id, AuditLog.action == service.PERMIT_SIGN
+            )
+        )
+    ).one()
+    assert (entry.new_value or {}).get("reason") == "unknown_purpose"
 
 
 async def test_a_refused_signer_is_recorded_before_the_refusal_is_raised(

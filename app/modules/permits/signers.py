@@ -50,15 +50,17 @@ PURPOSE_ROLES: dict[str, str | None] = {
 def required_role(purpose: str) -> str | None:
     """The `roles.code` a signer must hold to produce `purpose`.
 
-    `None` for both the recipient purpose and an unknown one — the two are told
-    apart by `is_known`, which is the question a caller must ask FIRST. One dict
-    answering both keeps them from drifting apart the way a second, separately
-    maintained set of known purposes would.
+    **`None` is a refusal, not a pass** — that is the whole of the fail-closed
+    rule. It is returned both for a purpose absent from the map (an operator's
+    typo in `permit_required_signatures`) and for `RECIPIENT_PURPOSE`, which is
+    known but not role-based; the caller tells them apart by checking the
+    recipient purpose FIRST and treating every remaining `None` as unknown. See
+    `permits.service._signer_refusal`, which is the only caller.
+
+    There is deliberately no companion `is_known` predicate. Any second way to
+    ask "is this a real signature line" is a second thing that can answer
+    differently from this one, and a caller could then reach the role comparison
+    with `None` on both sides — which is the exact fail-OPEN this map exists to
+    prevent.
     """
     return PURPOSE_ROLES.get(purpose)
-
-
-def is_known(purpose: str) -> bool:
-    """Whether this purpose is a signature line of the permit at all. `False`
-    is a refusal, not a pass: see the module docstring on failing closed."""
-    return purpose in PURPOSE_ROLES

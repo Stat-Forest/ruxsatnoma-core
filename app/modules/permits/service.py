@@ -769,13 +769,18 @@ async def _signer_refusal(
     they guessed a real purpose, hold a signatory role, or merely sit in the
     wrong leshoz.
 
-    Ruling 4, in order:
+    Ruling 4, in the order the checks must run:
 
-    1. **A purpose with no entry in `signers.PURPOSE_ROLES` is refused.** The
-       required set is admin-editable, so a typo must fail closed rather than
-       silently create a slot anybody holding `permits.sign` could fill.
-    2. **The recipient line** is proven by owning the application (`_is_holder`),
-       never by holding a role: `applicant` is held by every citizen.
+    1. **The recipient line** is proven by owning the application (`_is_holder`),
+       never by holding a role: `applicant` is held by every citizen. It goes
+       first because it is the one known purpose that maps to no role, so step 2
+       would otherwise reject it as unknown.
+    2. **A purpose that names no role is refused.** `permit_required_signatures`
+       is admin-editable, so a typo must fail closed rather than silently create
+       a slot anybody holding `permits.sign` could fill. This guard is not
+       redundant with step 3: without it an unmapped purpose reaches the role
+       comparison with `None` on one side, and a user whose own role row has
+       gone missing would match it.
     3. **The three official lines** need the role AND the organization. Holding
        `executor_head` is not enough — `design/03` says users OF THE SAME
        ORGANIZATION, and a head of another leshoz signing this leshoz's permit
@@ -796,11 +801,15 @@ async def _signer_refusal(
     data). If those rows ever arrive, a head of the parent leshoz signing a
     sub-unit's permit needs a parent walk here, not a wider zone.
     """
-    if not signers.is_known(purpose):
-        return "unknown_purpose"
     if purpose == signers.RECIPIENT_PURPOSE:
         return None if await _is_holder(db, permit, user) else "not_the_holder"
-    if await auth_service.role_code(db, user) != signers.required_role(purpose):
+    role = signers.required_role(purpose)
+    if role is None:
+        return "unknown_purpose"
+    # Compared against a non-None `role`, so a user whose own role row has
+    # somehow gone missing (`auth.service.role_code` returns None for that) can
+    # never match an unmapped purpose by both sides being None.
+    if await auth_service.role_code(db, user) != role:
         return "wrong_role"
     if user.organization_id != permit.organization_id:
         return "wrong_organization"
