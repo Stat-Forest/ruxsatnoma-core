@@ -157,8 +157,18 @@ class ProviderTransaction(Base):
 class Allocation(Base):
     """The ledger of the 50/50 split and of refunds (design/02 § allocations,
     corrected by ruling P2 — `refund_id` omitted, see the module docstring). The
-    50/50 proportion itself is enforced in code (Task 2+), never here; `amount` may
-    be negative (a refund entry) so it carries no positivity CHECK."""
+    50/50 proportion itself is enforced in code (Task 3's `payments.ledger`,
+    never here); `amount` may be negative (a refund entry) so it carries no
+    positivity CHECK.
+
+    `account` is nullable (Task 3 ruling, amending this same unmerged
+    migration — see `migrations/versions/0017_payments.py`): the state
+    budget's account number is not in the system at all (`tz/08` — the
+    budget half is settled by accounting outside the system), and a
+    leshoz's `requisites` JSONB may legitimately have no `"account"` key
+    (`app/seed/data/organizations.example.json`'s `leshoz-beruniy`). A
+    placeholder string in a financial ledger's account column would be
+    worse than NULL."""
 
     __tablename__ = "allocations"
 
@@ -169,7 +179,7 @@ class Allocation(Base):
     )
     entry_type: Mapped[str]
     target: Mapped[str]
-    account: Mapped[str]
+    account: Mapped[str | None]
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     occurred_at: Mapped[datetime] = mapped_column(server_default=func.now())
     note: Mapped[str | None]

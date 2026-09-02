@@ -30,6 +30,13 @@ anywhere, so no separate revision is burned for one column): `invoices.calculati
 a nullable FK to `calculations.id` — `payments.service.issue_invoice` freezes which
 calculation it billed, and design/02 never listed the column at all.
 
+Task 3 amends it again, same reasoning: `allocations.account` becomes nullable.
+The state budget's account number is not in the system at all (`tz/08` — settled
+by accounting outside the system), and a leshoz's `requisites` JSONB may
+legitimately have no `"account"` key — a placeholder string in a financial
+ledger's account column would be worse than NULL. See
+`app/modules/payments/models.py`'s `Allocation` docstring.
+
 Grants the two new permission codes (`payments.view`, `payments.manage`) to
 `accountant` (`roles.code = 'accountant'`, «Бухгалтер» — seeded by 0003_auth.py;
 verified against that migration, not plan prose, per the lesson on role codes).
@@ -200,7 +207,7 @@ def upgrade() -> None:
         sa.Column("transaction_id", sa.Uuid(), nullable=True),
         sa.Column("entry_type", sa.Text(), nullable=False),
         sa.Column("target", sa.Text(), nullable=False),
-        sa.Column("account", sa.Text(), nullable=False),
+        sa.Column("account", sa.Text(), nullable=True),
         sa.Column("amount", sa.Numeric(precision=18, scale=2), nullable=False),
         sa.Column(
             "occurred_at",
