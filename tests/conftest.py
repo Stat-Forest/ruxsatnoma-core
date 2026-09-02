@@ -74,6 +74,24 @@ def _reset_breaker():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_subscriptions():
+    """The bus is process-global; without this, a handler registered by one
+    test fires inside another and the failure surfaces three files away. Root
+    conftest, not a per-module one (review round 1, finding I1): the bus is
+    `app/core/` state, not `applications` state, and every test package that
+    subscribes a spy handler to prove its own wiring — `payments`, `permits`,
+    not just `applications` — needs the same teardown, the same reason
+    `_reset_ratelimit`/`_reset_breaker` above are here rather than in one
+    module's own conftest."""
+    from app.core import events
+
+    saved = {name: list(handlers) for name, handlers in events._SUBSCRIBERS.items()}
+    yield
+    events._SUBSCRIBERS.clear()
+    events._SUBSCRIBERS.update(saved)
+
+
 @asynccontextmanager
 async def make_client(
     app, *, lifespan: bool = False, raise_app_exceptions: bool = False
