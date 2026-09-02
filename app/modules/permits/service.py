@@ -1191,11 +1191,24 @@ async def public_check(
     requisite 25, deliberately excluded from the snapshot precisely because it
     changes over the permit's life.
 
-    **`signatures_valid` is the stored verdict.** `missing_signatures` reads
-    `verification_status` off the rows taken at signing time; nothing here calls
-    E-IMZO, which at 5.2 lives behind a VPN reachable only from inside
-    Uzbekistan. A certificate that expires in 2029 does not retroactively
-    invalidate a permit lawfully signed in 2026.
+    **`signatures_valid` is the stored verdict, and it is a question about
+    HISTORY** (ruling T5-a). It asks whether every signature this permit was
+    activated with is still recorded valid — never whether the CURRENT
+    `permit_required_signatures` is satisfied. The two differ on purpose and
+    must not be "fixed" to match: the activation gate in `_activate` reads the
+    live setting through `signatures.service` because that is what ruling 6
+    requires of a gate, while this read must not, because the setting is
+    admin-editable and `tz/04` С11's «все три обязательны?» is still open with
+    the Agency. Re-deriving here would mean that the day the Agency answers,
+    every permit issued before it starts telling inspectors its signatures do
+    not check out — the worst thing this page can say about a lawful document.
+
+    Nothing here calls E-IMZO, which at 5.2 lives behind a VPN reachable only
+    from inside Uzbekistan. A certificate that expires in 2029 does not
+    retroactively invalidate a permit lawfully signed in 2026 — but an
+    oversight `reverify` that finds it REVOKED writes an invalid verdict
+    against that signature, and this field then reads false while the permit's
+    own status is untouched. That is 3.11b's to act on.
 
     **The log records what was ANSWERED**, not what the SELECT found: a permit
     refused as not-public is logged `not_found` with a null `permit_id`, which
@@ -1233,7 +1246,9 @@ async def public_check(
         "valid_to": permit.period_to,
         "organization": _from_snapshot(permit.snapshot, "leshoz_name") or NOT_STATED,
         "activity_type": _from_snapshot(permit.snapshot, "activity_name") or NOT_STATED,
-        "signatures_valid": not await missing_signatures(db, permit.id),
+        "signatures_valid": await signatures_service.carried_signatures_valid(
+            db, object_type=OBJECT_TYPE, object_id=permit.id
+        ),
         # `mask_name` answers `NOT_STATED` on an empty name itself, so there is no
         # `or` here: a mask applied to the em dash would print «—.***».
         "holder": mask_name(_from_snapshot(permit.snapshot, "holder_name")),

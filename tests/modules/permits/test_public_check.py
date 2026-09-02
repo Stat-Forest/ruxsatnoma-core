@@ -42,6 +42,8 @@ from app.modules.permits.models import (
     QrCheckLog,
 )
 from app.modules.permits.schemas import PublicStatus
+from app.modules.signatures import service as signatures_service
+from app.modules.signatures.models import Signature
 
 CHECK = "/api/v1/public/permits/check"
 
@@ -368,3 +370,88 @@ async def test_a_permit_whose_snapshot_lost_a_requisite_still_answers(
     # Not «—.***»: a mask applied to a placeholder is a placeholder masked.
     assert card["holder"] == service.NOT_STATED
     assert card["organization"] == service.NOT_STATED
+
+
+# --- ruling T5-a: `signatures_valid` is a question about history --------------
+
+
+async def test_signatures_valid_survives_a_change_to_the_required_set(
+    client: httpx.AsyncClient, active_permit: Permit, override_required_signatures
+):
+    """Ruling T5-a. `permit_required_signatures` is admin-editable and `tz/04`
+    С11's «все три обязательны?» is still open with the Agency, so this row WILL
+    change. Re-deriving the field from it would make every permit issued before
+    that day tell inspectors its signatures do not check out — a lawfully issued
+    document reading as suspect, which is the worst thing this page can say.
+
+    The permit is already ACTIVE, so the set that mattered is the one activation
+    checked; a fifth purpose added afterwards is a rule for permits issued next.
+    """
+    await override_required_signatures(
+        "permit_head,permit_chief_forester,permit_accountant,permit_recipient,permit_inspector"
+    )
+
+    body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
+    assert body["status"] == "амалда"
+    assert body["signatures_valid"] is True
+
+
+async def test_a_signature_later_found_invalid_makes_the_card_say_so(
+    db: AsyncSession, client: httpx.AsyncClient, active_permit: Permit, head_client
+):
+    """The other direction, and the one that keeps the field from being a
+    constant: `reverify` (3.8's own route, oversight's) writes an invalid
+    verdict against a signature whose certificate has since been revoked, and
+    the page must report it — while `permits.status` stays «амалда», because
+    acting on that discovery is 3.11b's, not this page's.
+
+    The certificate is pushed to `revoked` through the mock adapter's own
+    convention (a `REVOKED-` serial prefix), so `reverify` discovers the standing
+    the way it would in production rather than having a verdict planted on it.
+    """
+    signatures = await signatures_service.get_for_object(
+        db, object_type=service.OBJECT_TYPE, object_id=active_permit.id
+    )
+    head = next(row for row in signatures if row.purpose == "permit_head")
+    certificate = await signatures_service.get_certificate(db, head.certificate_id)
+    certificate.serial_number = f"REVOKED-{certificate.serial_number}"
+    await db.flush()
+
+    await signatures_service.reverify(db, signature_id=head.id, user=head_client.user)
+    await db.commit()
+
+    body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
+    assert body["signatures_valid"] is False, "an oversight downgrade must reach the page"
+    assert body["status"] == "амалда", "acting on the downgrade is 3.11b's, not this page's"
+
+
+async def test_a_failed_signing_attempt_is_evidence_and_not_a_broken_document(
+    db: AsyncSession, client: httpx.AsyncClient, active_permit: Permit
+):
+    """3.8 ruling 8 stores a refused envelope as evidence. A signatory who
+    fat-fingers their ERI and retries leaves an invalid row beside their valid
+    one, and that must not make a correctly signed permit read as broken —
+    which is why the field is computed over the signatures the permit CARRIES,
+    not over every row attached to it."""
+    signatures = await signatures_service.get_for_object(
+        db, object_type=service.OBJECT_TYPE, object_id=active_permit.id
+    )
+    head = next(row for row in signatures if row.purpose == "permit_head")
+    db.add(
+        Signature(
+            object_type=service.OBJECT_TYPE,
+            object_id=active_permit.id,
+            purpose="permit_head",
+            signer_user_id=head.signer_user_id,
+            certificate_id=head.certificate_id,
+            doc_hash=head.doc_hash,
+            signature_value="a fat-fingered envelope",
+            signed_at=head.signed_at,
+            verification={"reason": "signature_invalid"},
+            verification_status="invalid",
+        )
+    )
+    await db.commit()
+
+    body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
+    assert body["signatures_valid"] is True

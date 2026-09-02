@@ -162,6 +162,54 @@ async def is_complete(db: AsyncSession, *, object_type: str, object_id: uuid.UUI
     return not await missing_purposes(db, object_type=object_type, object_id=object_id)
 
 
+async def carried_signatures_valid(
+    db: AsyncSession, *, object_type: str, object_id: uuid.UUID
+) -> bool:
+    """Whether every signature this object ALREADY CARRIES is still recorded
+    valid — a question about history, deliberately not about the requirement.
+
+    `missing_purposes` above answers "is the CURRENT required set satisfied",
+    which is the right question for a gate and the wrong one for a historical
+    read: `permit_required_signatures` is admin-editable (ruling 7) and `tz/04`
+    С11's «все три обязательны?» is still unanswered by the Agency, so the day
+    that row grows a purpose, every object signed before it would start
+    reporting its existing signatures as not valid. This answers instead: of
+    the signatures actually taken, is any one of them now recorded invalid?
+
+    Two row kinds are excluded, and both exclusions matter:
+
+    * **An invalid `sign()` attempt is evidence, not a signature** (ruling 8) —
+      a signatory who fat-fingers their ERI and retries leaves a stored invalid
+      row beside their valid one, and that must not read as a broken document.
+      Only rows that verified `valid` are carried.
+    * **A `reverify` record is a verdict ON a row, never a row of its own.** It
+      is written under `"{purpose}:reverify:{n}"` with `original_signature_id`
+      in its record, so it is identified by that key rather than by parsing the
+      purpose string. An invalid one DOWNGRADES the signature it names — which
+      is the whole point: a certificate later found revoked makes this False
+      while the object's own status is untouched. A reverify of an already
+      invalid row names a row that was never carried, so it changes nothing.
+
+    False for an object with no valid signature at all: fail-closed, and for the
+    one caller (a permit's public page) unreachable, since a permit reaches
+    `active` only once every required purpose has one.
+    """
+    rows = await get_for_object(db, object_type=object_type, object_id=object_id)
+    downgraded = {
+        row.verification.get("original_signature_id")
+        for row in rows
+        if row.verification_status == "invalid"
+        and row.verification.get("original_signature_id") is not None
+    }
+    carried = [
+        row
+        for row in rows
+        if row.verification_status == "valid"
+        and row.verification.get("original_signature_id") is None
+    ]
+    return bool(carried) and not any(str(row.id) in downgraded for row in carried)
+
+
 async def require_complete(db: AsyncSession, *, object_type: str, object_id: uuid.UUID) -> None:
     """3.11 calls exactly this before flipping a permit to ACTIVE (C11).
     Raises `ERR-SIGN-003` with `details.missing` naming every purpose still
