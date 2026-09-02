@@ -347,7 +347,7 @@ async def test_payment_confirmed_tells_the_assigned_executor_and_issues_nothing(
         await db.scalars(
             select(Notification).where(
                 Notification.object_id == paid_application.id,
-                Notification.event_code == events.PAYMENT_CONFIRMED,
+                Notification.event_code == events.PERMIT_DUE,
             )
         )
     ).all()

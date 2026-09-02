@@ -7,7 +7,10 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from app.modules.notifications import repo as notifications_repo
+from app.modules.notifications.service import DEFAULT_CHANNELS
 from app.modules.permits import repo
+from app.modules.permits.events import NOTIFIED_EVENT_CODES
 from app.modules.permits.models import (
     PERMIT_STATUSES,
     Permit,
@@ -146,3 +149,22 @@ async def test_the_schema_literals_match_the_tables_own_check_constraints() -> N
     a 422 that should have been a 201, or an IntegrityError 500 that should have
     been a 422."""
     assert set(get_args(PermitStatus)) == set(PERMIT_STATUSES)
+
+
+async def test_every_event_code_this_module_notifies_on_has_an_active_template(db) -> None:
+    """Ruling 17, made mechanical. With no template, `notify()` writes a raw fallback
+    string in-app and **sends nothing at all** by SMS or e-mail, silently, with one log
+    line — while a test asserting "a notification row exists" still passes. So the set
+    the module declares it sends is checked against what the migrations actually seeded,
+    per channel: `permit.issued` from 0009, four from 0019, `permit.due` from 0020.
+
+    `notifications.repo.get_active_template` rather than a raw query, so this asserts
+    exactly what `notify()` will find — including the `status='active'` filter."""
+    missing = [
+        (code, channel)
+        for code in NOTIFIED_EVENT_CODES
+        for channel in DEFAULT_CHANNELS
+        if await notifications_repo.get_active_template(db, event_code=code, channel=channel)
+        is None
+    ]
+    assert missing == []

@@ -57,7 +57,7 @@ async def on_payment_confirmed(db: AsyncSession, event: Event) -> None:
     calculation = await applications_service.current_calculation(db, application_id)
     await notifications.notify(
         db,
-        event_code=events.PAYMENT_CONFIRMED,
+        event_code=events.PERMIT_DUE,
         recipient_user_id=application.assigned_user_id,
         params={
             "application_number": application.number or str(application.id),

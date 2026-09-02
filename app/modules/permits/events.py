@@ -21,9 +21,10 @@ while a test asserting "a notification row exists" still passes (ruling 17). So 
 set below is asserted against the seeded templates by a test, and anything added here
 must be seeded in the same commit.
 
-**Four of the five are seeded by migration 0019; `permit.issued` was already seeded by
-`0009_notifications.py`** (both `inapp` and `sms`, version 1, active) back when
-notifications shipped. `uq_notification_templates_active` is a partial unique index on
+**Four of the six are seeded by migration 0019 and `permit.due` by 0020;
+`permit.issued` was already seeded by `0009_notifications.py`** (both `inapp` and
+`sms`, version 1, active) back when notifications shipped.
+`uq_notification_templates_active` is a partial unique index on
 `(event_code, channel) WHERE status='active'`, so re-seeding it in 0019 would not
 "also work" — it would fail the migration outright. A later text change to that row is
 a supersede (archive + version 2), never a second active insert."""
@@ -34,17 +35,17 @@ PERMIT_ACTIVE = "permit.active"
 PERMIT_EXPIRING = "permit.expiring"
 PERMIT_EXPIRED = "permit.expired"
 
-# NOT a `permit.*` code, and deliberately so. `subscribers.on_payment_confirmed`
-# (ruling 19) tells the application's assigned executor that money has arrived and
-# a permit is now due — a payment fact, not a permit fact, and `0009_notifications`
-# already seeded exactly that text for both channels («Оплата {amount} сум по
-# заявке {application_number} подтверждена»). Reusing it is why this stage needs no
-# sixth template and no migration of its own: the plan's ruling 17 lists five codes
-# for this module precisely because the sixth notification was expected to reuse
-# `payments`' own. The word is shared with the BUS name `payment_confirmed`
-# (`app/event_subscriptions.py`) and the two are not interchangeable — the dot is
-# the tell, as above.
-PAYMENT_CONFIRMED = "payment.confirmed"
+# What `subscribers.on_payment_confirmed` sends (ruling 19): money has arrived and
+# the assigned hodim must now form the permit. Its own code, seeded by migration
+# 0020, rather than `0009`'s `payment.confirmed` — that text is a statement of fact
+# addressed to the PAYER, it neither names what an executor must do nor is true of
+# them, and 3.10a will send it to the applicant from the very same event. A template
+# that exists and says the wrong thing is the failure ruling 17 exists to prevent,
+# with a green test on top.
+#
+# Not to be confused with the BUS name `payment_confirmed` that triggers it
+# (`app/event_subscriptions.py`): flat, no dot. The dot is the tell, as above.
+PERMIT_DUE = "permit.due"
 
 NOTIFIED_EVENT_CODES: tuple[str, ...] = (
     PERMIT_ISSUED,
@@ -52,5 +53,5 @@ NOTIFIED_EVENT_CODES: tuple[str, ...] = (
     PERMIT_ACTIVE,
     PERMIT_EXPIRING,
     PERMIT_EXPIRED,
-    PAYMENT_CONFIRMED,
+    PERMIT_DUE,
 )
