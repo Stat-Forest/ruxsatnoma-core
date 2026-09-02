@@ -179,10 +179,96 @@ def test_a_layout_cannot_make_the_server_fetch_a_url_or_read_a_file() -> None:
     for url in ("http://127.0.0.1:9000/probe.png", "https://example.uz/x.png"):
         with pytest.raises((DomainError, ValueError)):
             fetcher.fetch(url)
-    with pytest.raises(DomainError) as raised:
-        fetcher.fetch("file:///etc/passwd")
-    assert raised.value.code == "ERR-VAL-001"
+
+    assets = render.ASSETS_DIR.as_uri()
+    escapes = {
+        "plain": "file:///etc/hosts",
+        "relative": f"{assets}/../../../../../../etc/hosts",
+        # The one that got through. `..%2F` survives Path.resolve() as a single literal
+        # segment, so the guard saw a path inside assets/ — and urllib's own
+        # url2pathname then decoded it back into `../`. It returned /etc/hosts.
+        "percent-encoded": f"{assets}/{'..%2F' * 16}etc/hosts",
+        "encoded, with a fragment": f"{assets}/..%2Fetc/hosts#DejaVuSerif.ttf",
+        "encoded, with a query": f"{assets}/..%2Fetc/hosts?x=DejaVuSerif.ttf",
+    }
+    for label, url in escapes.items():
+        with pytest.raises((DomainError, OSError)) as escaped:
+            fetcher.fetch(url).read()
+        if isinstance(escaped.value, DomainError):
+            assert escaped.value.code == "ERR-VAL-001", label
 
     # The bundled font is the one thing it must serve, or no document has a face.
     served = fetcher.fetch((render.ASSETS_DIR / "DejaVuSerif.ttf").as_uri())
     assert served.read(4) == b"\x00\x01\x00\x00", "a TrueType file starts with its version tag"
+
+
+def test_a_character_the_bundled_font_cannot_draw_is_refused_at_issuance() -> None:
+    """Review finding I2. Pango falls back per glyph to whatever the host has, whatever
+    the CSS stack says: an emoji in a holder's name embedded Apple Color Emoji and
+    Hiragino Mincho into the PDF on the developer's Mac, and would have produced tofu —
+    and different bytes, so a different `doc_hash` — in the container. The refusal names
+    the character, so the fix is obvious to whoever entered it."""
+    import pytest
+
+    from app.core.errors import DomainError
+
+    with pytest.raises(DomainError) as raised:
+        render.render_permit(
+            {**SNAPSHOT, "holder_name": "Азиз 🌲 森"},
+            '<html><body>{{ holder_name }}<img src="{{ qr }}"></body></html>',
+            "https://example.uz/x",
+        )
+
+    assert raised.value.code == "ERR-VAL-001"
+    assert raised.value.details is not None
+    assert raised.value.details["reason"] == "unrenderable_characters"
+    named = str(raised.value.details["fields"])
+    assert "U+1F332" in named and "U+68EE" in named, named
+
+    # Uzbek Cyrillic and ordinary whitespace must of course still pass.
+    assert render.render_permit(
+        {**SNAPSHOT, "holder_name": f"Азизов\tАзиз\n{UZBEK_CYRILLIC}"},
+        '<html><body>{{ holder_name }}<img src="{{ qr }}"></body></html>',
+        "https://example.uz/x",
+    ).startswith(b"%PDF")
+
+
+def test_no_host_face_reaches_the_document_even_from_the_layout_itself() -> None:
+    """The backstop behind the check above, and the reason it exists: a snapshot is not
+    the only way text gets onto the page. The layout is an admin-editable row, and its
+    own static labels go through the same Pango fallback — invisible to a check that
+    only inspects substituted values."""
+    import pytest
+
+    from app.core.errors import DomainError
+
+    with pytest.raises(DomainError) as raised:
+        render.render_permit(
+            SNAPSHOT,
+            '<html><body>森 {{ series }}<img src="{{ qr }}"></body></html>',
+            "https://example.uz/x",
+        )
+
+    assert raised.value.code == "ERR-VAL-001"
+    assert raised.value.details is not None
+    assert raised.value.details["reason"] == "host_font_substituted"
+
+
+def test_the_pdf_dates_come_from_the_snapshot_and_never_from_the_clock() -> None:
+    """Review finding I3, and the brief's own instruction to assert the pin.
+
+    Deleting the two lines that set `metadata.created`/`modified` left all nine earlier
+    tests green, because WeasyPrint 69's PDF/A path happens to write no date of its own —
+    so the pin was protecting ruling 3's hash against a future release with nothing
+    watching it. `test_the_same_snapshot_renders_the_same_bytes` cannot cover this
+    either: two renders one millisecond apart agree even on a build stamping localtime().
+    """
+    import datetime
+
+    pdf = render.render_permit(
+        {**SNAPSHOT, "issued_at": "1999-12-31"}, render.default_layout(), "https://example.uz/x"
+    )
+
+    assert b"D:19991231" in pdf, "the issue date is not pinned into the document"
+    today = datetime.date.today().strftime("D:%Y%m%d").encode()
+    assert today not in pdf, f"a wall-clock date ({today!r}) reached the PDF"

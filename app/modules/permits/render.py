@@ -32,11 +32,14 @@ import io
 import os
 import re
 import sys
+import zlib
 from collections.abc import Mapping
 from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 # WeasyPrint loads Pango, GLib and HarfBuzz through dlopen BY LEAF NAME. On macOS
 # Homebrew's lib directory is not on dyld's default search path, so `import weasyprint`
@@ -57,6 +60,7 @@ if sys.platform == "darwin":  # pragma: no cover - a developer-machine path
     os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", "/opt/homebrew/lib:/usr/local/lib:/usr/lib")
 
 import segno  # noqa: E402 - must follow the dyld fix-up above
+from fontTools.ttLib import TTFont  # noqa: E402 - same
 from weasyprint import CSS, HTML  # noqa: E402 - same
 from weasyprint.text.fonts import FontConfiguration  # noqa: E402 - same
 from weasyprint.urls import URLFetcher  # noqa: E402 - same
@@ -98,6 +102,10 @@ _FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 QR_FIELD = "qr"
 
 _FONT_FAMILY = "Permit Serif"
+_FONT_FILES = ("DejaVuSerif.ttf", "DejaVuSerif-Bold.ttf")
+
+# `/BaseFont /ABCDEF+Permit-Serif` — the subset tag is six capitals (PDF 32000 9.6.4).
+_EMBEDDED_FACE = re.compile(rb"/BaseFont\s*/[A-Z]{6}\+([A-Za-z0-9\-]+)")
 
 
 def _font_css() -> str:
@@ -127,6 +135,22 @@ def _font_css() -> str:
     """
 
 
+def _url_to_path(url: str) -> str:
+    """The filesystem path urllib will actually open for `url`.
+
+    Computed with urllib's OWN primitives on purpose. A guard that decodes a URL even
+    slightly differently from the code that later opens it is not a guard: this one
+    originally did `url.removeprefix("file://")` with no percent-decoding, so `..%2F`
+    survived `.resolve()` as one literal path segment, passed `relative_to(ASSETS_DIR)`,
+    and was then turned back into `../` by `url2pathname` inside urllib's FileHandler —
+    `fetch(assets + "/" + "..%2F"*16 + "etc/hosts")` returned 213 bytes of /etc/hosts
+    (review finding I1). `urlsplit` drops the query and the fragment exactly as
+    `URLFetcher.fetch` and `urllib.request.Request` do; `url2pathname` percent-decodes
+    exactly as `FileHandler.open_local_file` does.
+    """
+    return url2pathname(urlsplit(url).path)
+
+
 class _AssetFetcher(URLFetcher):
     """Serves the bundled assets and `data:` URIs; refuses every other URL.
 
@@ -145,7 +169,7 @@ class _AssetFetcher(URLFetcher):
         # inline image, and refusing it would silently drop a picture from a permit.
         if not url.lower().startswith("data:"):
             try:
-                path = Path(url.removeprefix("file://").split("?")[0]).resolve()
+                path = Path(_url_to_path(url)).resolve()
                 path.relative_to(ASSETS_DIR.resolve())
             except OSError, ValueError:
                 raise err(
@@ -174,6 +198,78 @@ def default_layout() -> str:
     is NULL — which is what migration 0019's seeded row leaves it as (task 1, decision 2).
     Read once and cached: `render_permit` itself never touches the filesystem."""
     return _DEFAULT_LAYOUT_PATH.read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=1)
+def _renderable_codepoints() -> frozenset[int]:
+    """Every codepoint the bundled faces can draw, read from their own cmaps once.
+
+    Coverage is the cmap alone, not the glyph outline: `U+0020` legitimately maps to a
+    contour-less glyph, and treating "empty outline" as "cannot render" would reject
+    every space. The empty-glyph question is asserted against the shipped files in
+    `test_the_bundled_faces_carry_the_uzbek_cyrillic_letters`, where it belongs.
+    """
+    covered: set[int] = set()
+    for name in _FONT_FILES:
+        covered |= set(TTFont(ASSETS_DIR / name, lazy=True).getBestCmap() or {})
+    return frozenset(covered)
+
+
+def _assert_renderable(values: Mapping[str, Any]) -> None:
+    """Refuse a value carrying a character the bundled faces cannot draw.
+
+    Pango falls back PER GLYPH to whatever the host has, silently and regardless of the
+    CSS font stack. A holder name containing an emoji embedded `Apple-Color-Emoji` and
+    `Hiragino-Mincho-ProN` into the PDF on the developer's Mac (review finding I2) and
+    would have produced tofu — and DIFFERENT BYTES — in the container. That makes
+    `doc_hash` a function of the machine, which is the one thing this module exists to
+    prevent, and it quietly embeds a non-free host face in a government document.
+
+    So a character we cannot draw is a defect at issuance, exactly as an unfilled field
+    is: loud, local, naming the character, and identical on every machine.
+    """
+    renderable = _renderable_codepoints()
+    offenders: dict[str, list[str]] = {}
+    for name, value in values.items():
+        if name == QR_FIELD or value is None:
+            continue
+        bad = sorted({c for c in str(value) if not c.isspace() and ord(c) not in renderable})
+        if bad:
+            offenders[name] = [f"U+{ord(c):04X} {c}" for c in bad]
+    if offenders:
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "unrenderable_characters", "fields": offenders},
+        )
+
+
+def _assert_only_bundled_faces(pdf: bytes) -> None:
+    """The backstop: no face but ours may reach the finished document.
+
+    `_assert_renderable` cannot see the layout's own static text, its CSS `content:`, or
+    anything else an administrator may put in a `permit_templates` row — this can, because
+    it reads what Pango actually did rather than predicting it. Scans the inflated streams
+    too, so it keeps working if `PDF_VARIANT` ever moves to a version that packs the font
+    dictionaries into a `/Type /ObjStm` (at PDF/A-1b's PDF 1.4 they are in the clear).
+    """
+    expected = _FONT_FAMILY.replace(" ", "-").encode()
+    haystacks = [pdf]
+    for stream in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", pdf, re.S):
+        try:
+            haystacks.append(zlib.decompress(stream.group(1)))
+        except zlib.error:
+            continue
+    foreign = {
+        face.decode()
+        for haystack in haystacks
+        for face in _EMBEDDED_FACE.findall(haystack)
+        if not face.startswith(expected)
+    }
+    if foreign:
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "host_font_substituted", "fonts": sorted(foreign)},
+        )
 
 
 def fill(layout_html: str, values: Mapping[str, Any]) -> str:
@@ -217,6 +313,7 @@ def render_permit(snapshot: Mapping[str, Any], layout_html: str, qr_url: str) ->
     `{{ qr }}`, filled with the embedded image rather than from the snapshot.
     """
     values = {**snapshot, QR_FIELD: qr_png_data_uri(qr_url)}
+    _assert_renderable(values)
     html = fill(layout_html, values)
 
     # One FontConfiguration per call, not one per module: `asyncio.to_thread` means
@@ -240,4 +337,5 @@ def render_permit(snapshot: Mapping[str, Any], layout_html: str, qr_url: str) ->
     # always returns the bytes. The assert is the narrowing, not a runtime doubt.
     pdf = document.write_pdf(pdf_variant=PDF_VARIANT)
     assert pdf is not None
+    _assert_only_bundled_faces(pdf)
     return pdf
