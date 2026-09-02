@@ -24,33 +24,97 @@ class _Bucket:
 
 
 _buckets: dict[tuple[str, str], _Bucket] = {}
+_last_sweep: float = 0.0
+
+# Eviction (3.11a t5, review I1/I3). Until the public QR check, every scope here
+# was reached only by a caller who had first found a login form or been sent a
+# webhook secret. That route is advertised on printed documents and needs no
+# credentials at all, so anybody on the internet can mint one dict entry per
+# source address — unbounded over IPv6, and never freed. Two limits, additive:
+#
+#   * a bucket refills at `per_minute/60` tokens a second and is capped at
+#     `per_minute`, so after 60 idle seconds it is FULL whatever its setting is.
+#     Deleting a full bucket is exactly equivalent to keeping it — recreating it
+#     yields the same state — which makes the TTL sweep free of any semantics.
+#   * `MAX_BUCKETS` is the backstop for a burst wide enough to outrun the sweep
+#     window: the least recently touched entries are dropped down to the cap.
+#     That one IS lossy — a dropped bucket's holder gets a fresh budget — but a
+#     bounded, briefly-generous limiter beats an unbounded one, and it takes
+#     `MAX_BUCKETS` distinct addresses within a second to reach.
+BUCKET_IDLE_SECONDS = 60.0
+MAX_BUCKETS = 20_000
+SWEEP_EVERY_SECONDS = 1.0
 
 
 def reset() -> None:
     """Tests only: forget every bucket."""
+    global _last_sweep
     _buckets.clear()
+    _last_sweep = 0.0
+
+
+def _sweep(now: float, keep: tuple[str, str]) -> None:
+    """Drop refilled buckets, then trim to `MAX_BUCKETS`. Cheap and amortised:
+    at most once a `SWEEP_EVERY_SECONDS`, or immediately whenever the dict is
+    already over the cap — the one case where waiting is the wrong answer.
+
+    `keep` is the caller's OWN bucket, exempt from both passes. It is the newest
+    entry and a zero-second-old one, so under the production values neither pass
+    could reach it anyway — but "the limiter cannot evict the budget it is in the
+    middle of charging" is a property worth holding structurally rather than by
+    arithmetic that a smaller configured TTL would quietly break.
+    """
+    global _last_sweep
+    if now - _last_sweep < SWEEP_EVERY_SECONDS and len(_buckets) <= MAX_BUCKETS:
+        return
+    _last_sweep = now
+    for key in [
+        k for k, b in _buckets.items() if k != keep and now - b.updated >= BUCKET_IDLE_SECONDS
+    ]:
+        del _buckets[key]
+    if len(_buckets) > MAX_BUCKETS:
+        stale = [k for k in sorted(_buckets, key=lambda k: _buckets[k].updated) if k != keep]
+        for key in stale[: len(_buckets) - MAX_BUCKETS]:
+            del _buckets[key]
+
+
+async def consume(request: Request, db: AsyncSession, *, scope: str, setting_key: str) -> None:
+    """Take one token from `(scope, client ip)`, or raise `ERR-SYS-006` (429).
+
+    Callable directly, not only through the dependency below, because a route
+    whose budget depends on the REQUEST cannot pick its scope at import time:
+    the public permit check charges the guessable `?series=&number=` path to a
+    different bucket than the scanned `?qr=` one (review I1), and a dependency
+    would have to re-declare and re-parse the query parameters to know which.
+    """
+    per_minute = await settings_store.get_int(db, setting_key)
+    per_minute = max(1, per_minute)  # never divide by zero, whatever the setting holds
+    ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    bucket = _buckets.get((scope, ip))
+    if bucket is None:
+        bucket = _Bucket(tokens=float(per_minute), updated=now)
+        _buckets[(scope, ip)] = bucket
+    else:
+        bucket.tokens = min(
+            float(per_minute), bucket.tokens + (now - bucket.updated) * per_minute / 60.0
+        )
+        bucket.updated = now
+    # After this request's own bucket exists, never before: sweeping first would
+    # trim to the cap and then add one more, leaving `MAX_BUCKETS + 1` behind
+    # every call. It is passed as `keep` so it cannot be swept out from under the
+    # charge about to be made against it.
+    _sweep(now, (scope, ip))
+    if bucket.tokens < 1.0:
+        retry = math.ceil((1.0 - bucket.tokens) * 60.0 / per_minute)
+        raise err("ERR-SYS-006", details={"retry_after_seconds": retry})
+    bucket.tokens -= 1.0
 
 
 def rate_limit(scope: str, setting_key: str):
     """Dependency factory: at most `setting_key` requests per minute per client IP."""
 
     async def dep(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> None:
-        per_minute = await settings_store.get_int(db, setting_key)
-        per_minute = max(1, per_minute)  # never divide by zero, whatever the setting holds
-        ip = request.client.host if request.client else "unknown"
-        now = time.monotonic()
-        bucket = _buckets.get((scope, ip))
-        if bucket is None:
-            bucket = _Bucket(tokens=float(per_minute), updated=now)
-            _buckets[(scope, ip)] = bucket
-        else:
-            bucket.tokens = min(
-                float(per_minute), bucket.tokens + (now - bucket.updated) * per_minute / 60.0
-            )
-            bucket.updated = now
-        if bucket.tokens < 1.0:
-            retry = math.ceil((1.0 - bucket.tokens) * 60.0 / per_minute)
-            raise err("ERR-SYS-006", details={"retry_after_seconds": retry})
-        bucket.tokens -= 1.0
+        await consume(request, db, scope=scope, setting_key=setting_key)
 
     return dep

@@ -1103,6 +1103,14 @@ CHANNEL_MANUAL = "manual"
 RESULT_FOUND = "found"
 RESULT_NOT_FOUND = "not_found"
 
+# Which settings row budgets which channel (review I1). The two live apart
+# because the spaces they defend are not alike: a token is unguessable, a
+# series and number are gapless.
+CHANNEL_RATELIMITS = {
+    CHANNEL_QR: "ratelimit_public_check_qr_per_minute",
+    CHANNEL_MANUAL: "ratelimit_public_check_manual_per_minute",
+}
+
 # The masked middle of a name. Fixed width on purpose: a mask as long as what it
 # hides would report the surname's length, which is most of a surname.
 NAME_MASK = "***"
@@ -1164,6 +1172,29 @@ def _from_snapshot(snapshot: Any, key: str) -> str:
     return "" if value is None else str(value)
 
 
+def check_channel(
+    *, qr_token: str | None = None, series: str | None = None, number: int | None = None
+) -> str:
+    """Which channel a lookup is, decided ONCE for the rate limit and the log.
+
+    The router has to know before the service runs — the two channels have
+    separate budgets (review I1) — and the log has to record the same answer, so
+    a second reading of the same three parameters is a second thing that can
+    disagree. The token wins when both are given: it is the stronger claim (a
+    scanner read it off the document).
+
+    `ERR-VAL-001` when nothing is named. That refusal is deliberately cheap and
+    costs no token: nothing was looked up, so there is nothing to budget, and
+    the refusal is about the shape of the request rather than about whether any
+    permit exists.
+    """
+    if (qr_token or "").strip():
+        return CHANNEL_QR
+    if (series or "").strip() and number is not None:
+        return CHANNEL_MANUAL
+    raise err("ERR-VAL-001", details={"reason": "qr_or_series_and_number"})
+
+
 async def public_check(
     db: AsyncSession,
     *,
@@ -1216,22 +1247,12 @@ async def public_check(
     payload») true and keeps the statistics from recording that somebody looked
     at a specific unsigned document.
     """
-    token = (qr_token or "").strip()
-    plate = (series or "").strip()
-    # The token wins when both are given: it is the stronger claim (a scanner
-    # read it off the document) and it decides the `channel` this call is
-    # counted under.
-    if token:
-        channel = CHANNEL_QR
-        permit = await repo.permit_by_qr_token(db, token)
-    elif plate and number is not None:
-        channel = CHANNEL_MANUAL
-        permit = await repo.permit_by_series_number(db, plate, number)
+    # One decider for the channel, shared with the router's rate limit.
+    channel = check_channel(qr_token=qr_token, series=series, number=number)
+    if channel == CHANNEL_QR:
+        permit = await repo.permit_by_qr_token(db, (qr_token or "").strip())
     else:
-        # Nothing was named, so nothing is checked and nothing is counted. Not an
-        # oracle: the refusal is about the shape of the request, never about
-        # whether a permit exists.
-        raise err("ERR-VAL-001", details={"reason": "qr_or_series_and_number"})
+        permit = await repo.permit_by_series_number(db, (series or "").strip(), number or 0)
 
     label = None if permit is None else PUBLIC_STATUS_LABELS.get(permit.status)
     if permit is None or label is None:

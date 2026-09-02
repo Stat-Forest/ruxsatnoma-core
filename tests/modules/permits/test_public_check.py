@@ -23,6 +23,7 @@ first request: ids are time-ordered and the app generates them in this very
 process, so `id > marker` is exact and owes nothing to the database's clock.
 """
 
+import logging
 import uuid
 from typing import Any, get_args
 
@@ -31,7 +32,10 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import ratelimit
+from app.core.logging import _SilentPathFilter, configure_logging
 from app.db import uuid7
+from app.main import create_app
 from app.modules.auth.models import Applicant
 from app.modules.permits import service
 from app.modules.permits.models import (
@@ -455,3 +459,114 @@ async def test_a_failed_signing_attempt_is_evidence_and_not_a_broken_document(
 
     body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
     assert body["signatures_valid"] is True
+
+
+# --- review round 1: the route is the system's first open door ----------------
+
+
+async def test_the_two_channels_do_not_share_one_budget(db: AsyncSession, active_permit: Permit):
+    """Review I1. `permit_counters` hands out `last_number + 1`, so series+number
+    is a GAPLESS space a script can walk, while `qr_token` is 32 random bytes.
+    With one bucket for both, a scanner exhausting the guessable path also 429s
+    the citizen scanning a printed code off the same egress IP — and a NAT is one
+    egress IP for a whole region. Each direction is asserted: neither channel may
+    starve the other.
+    """
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as anonymous:
+        async with app.router.lifespan_context(app):
+            await db.commit()
+            manual = {"series": active_permit.series, "number": active_permit.number}
+            qr = {"qr": active_permit.qr_token}
+
+            codes = {(await anonymous.get(CHECK, params=manual)).status_code for _ in range(40)}
+            assert 429 in codes, "the typed path is the tighter budget and must run out first"
+            assert (await anonymous.get(CHECK, params=qr)).status_code == 200, (
+                "an exhausted typed budget must not starve a printed QR code"
+            )
+
+            ratelimit.reset()
+            for _ in range(200):
+                if (await anonymous.get(CHECK, params=qr)).status_code == 429:
+                    break
+            else:
+                raise AssertionError("the qr channel is not limited at all")
+            assert (await anonymous.get(CHECK, params=manual)).status_code == 200
+
+
+async def test_the_rate_limiter_does_not_leak_a_bucket_per_visitor(
+    db: AsyncSession, active_permit: Permit, monkeypatch: pytest.MonkeyPatch
+):
+    """Review I3. Until this route, every limited scope was reached only by
+    someone who had found a login form or been handed a webhook secret. A page
+    advertised on printed documents lets anybody on the internet mint one dict
+    entry per source address — unlimited over IPv6, never freed.
+
+    Driven through the real route with real distinct client addresses, not by
+    calling a sweep helper: a cap nothing invokes is not a cap.
+    """
+    monkeypatch.setattr(ratelimit, "MAX_BUCKETS", 8)
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        await db.commit()
+        for octet in range(32):
+            transport = httpx.ASGITransport(
+                app=app, raise_app_exceptions=False, client=(f"10.0.0.{octet}", 5000)
+            )
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as visitor:
+                assert (await visitor.get(CHECK, params={"qr": "nope"})).status_code == 200
+        assert len(ratelimit._buckets) <= ratelimit.MAX_BUCKETS, (
+            "32 visitors must not leave 32 permanent buckets behind"
+        )
+
+        # The other half: a bucket that has refilled is dropped on its own,
+        # without waiting for the cap. Refilled means idle for a full minute,
+        # shortened here rather than slept through.
+        monkeypatch.setattr(ratelimit, "MAX_BUCKETS", 20_000)
+        monkeypatch.setattr(ratelimit, "BUCKET_IDLE_SECONDS", 0.0)
+        monkeypatch.setattr(ratelimit, "SWEEP_EVERY_SECONDS", 0.0)
+        ratelimit.reset()
+        first = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=("10.1.1.1", 1))
+        async with httpx.AsyncClient(transport=first, base_url="http://t") as visitor:
+            await visitor.get(CHECK, params={"qr": "nope"})
+        assert len(ratelimit._buckets) == 1
+        second = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=("10.2.2.2", 1))
+        async with httpx.AsyncClient(transport=second, base_url="http://t") as visitor:
+            await visitor.get(CHECK, params={"qr": "nope"})
+        assert [ip for _, ip in ratelimit._buckets] == ["10.2.2.2"], (
+            "the first visitor's refilled bucket must have been swept, not kept forever"
+        )
+
+
+def test_the_public_checks_access_log_line_is_dropped():
+    """Review I2. `qr_check_log` records no IP and no personal data by
+    `design/02`'s instruction — and uvicorn's access log would undo that from
+    outside the application, writing the visitor's address AND the printed token
+    (`?qr=<43 chars>`) at INFO into a file no purge job covers.
+
+    The record is built the way uvicorn builds one: `args = (client_addr, method,
+    full_path, http_version, status)`.
+    """
+    configure_logging("json")
+    access = logging.getLogger("uvicorn.access")
+    installed = [f for f in access.filters if isinstance(f, _SilentPathFilter)]
+    assert len(installed) == 1, "configure_logging installs it exactly once, however often it runs"
+    configure_logging("json")
+    assert len([f for f in access.filters if isinstance(f, _SilentPathFilter)]) == 1
+
+    def record(path: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=("203.0.113.7:51234", "GET", path, "1.1", 200),
+            exc_info=None,
+        )
+
+    assert installed[0].filter(record(f"{CHECK}?qr=THE-PRINTED-TOKEN")) is False
+    assert installed[0].filter(record(f"{CHECK}?series=A&number=1")) is False
+    assert installed[0].filter(record("/api/v1/permits/x/signatures")) is True
+    assert installed[0].filter(record("/health/ready")) is True

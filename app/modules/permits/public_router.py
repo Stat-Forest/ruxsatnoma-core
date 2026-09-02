@@ -15,11 +15,11 @@ surface — one import away from a reader asking "what can the internet reach".
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
-from app.core.ratelimit import rate_limit
+from app.core.ratelimit import consume
 from app.modules.permits import service
 from app.modules.permits.schemas import PublicCheckCard, PublicCheckMiss
 
@@ -30,12 +30,19 @@ router = APIRouter(prefix="/public", tags=["public"])
 # the same situation): the service's contract is a plain dict, and the union is
 # what FastAPI validates it into. The two members discriminate on `found`, whose
 # `Literal[True]`/`Literal[False]` make the match exact rather than lucky.
+#
+# No `dependencies=[Depends(rate_limit(...))]`, unlike every other limited route
+# here: the scope depends on the REQUEST (review I1), and a dependency picks its
+# scope at import time. Re-declaring the three query parameters on a dependency
+# just to read them again would put their bounds in two places, so the limit is
+# taken in the handler instead — before any lookup, and after nothing but
+# `check_channel`, which does no IO.
 @router.get(
     "/permits/check",
     response_model=PublicCheckCard | PublicCheckMiss,
-    dependencies=[Depends(rate_limit("public_check", "ratelimit_public_check_per_minute"))],
 )
 async def check_permit(
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     qr: Annotated[
         str | None, Query(max_length=service.QR_TOKEN_MAX_LENGTH, description="Printed QR token")
@@ -56,14 +63,25 @@ async def check_permit(
     `bigint`. Neither leaks anything: both are facts about the request's shape,
     fixed and public, never about the data behind it.
 
-    429 `ERR-SYS-006` on the per-IP bucket. That limit is the whole security
-    control here — the token is unguessable, `series`+`number` is not — so the
-    limit belongs on the route rather than on the router: a later public route
-    (4.6's open data, appeals) has its own cost and must choose its own key
-    rather than inherit this one. CAPTCHA is the front end's, at stage 6.
+    429 `ERR-SYS-006` on the per-IP bucket, and **the two channels have their
+    own buckets and their own settings rows** (review I1). That limit is the
+    whole security control here, and the two paths are not equally exposed:
+    `qr_token` is unguessable, while `permit_counters` hands out
+    `last_number + 1`, so series+number is a gapless space anyone can walk. One
+    shared bucket meant the walkable path could not be tightened without also
+    throttling the citizen scanning a printed code — and a scanner behind a NAT
+    starved honest scans coming off that same egress address. CAPTCHA is the
+    front end's, at stage 6.
 
     Behind a proxy, uvicorn needs `--proxy-headers`/`--forwarded-allow-ips`: the
     limiter keys on `request.client.host`, and without them every citizen in the
     country shares one bucket.
     """
+    channel = service.check_channel(qr_token=qr, series=series, number=number)
+    await consume(
+        request,
+        db,
+        scope=f"public_check:{channel}",
+        setting_key=service.CHANNEL_RATELIMITS[channel],
+    )
     return await service.public_check(db, qr_token=qr, series=series, number=number)

@@ -104,19 +104,37 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "Per-IP limit for provider webhooks (a provider's whole IP set shares one "
             "bucket, and a throttled delivery report is lost, not retried)",
         ),
+        # The anonymous QR page has TWO budgets, not one (3.11a t5, review I1).
+        # Its two lookup paths are not equally dangerous and must not share a
+        # bucket: `qr_token` is `secrets.token_urlsafe(32)` and unguessable,
+        # while `permit_counters` hands out `last_number + 1`, so series+number
+        # is a GAPLESS space anyone can walk. One shared bucket meant the
+        # guessable path could not be tightened without also throttling the
+        # citizen scanning a printed code — and, worse, a scanner behind the
+        # same NAT starved honest scans on that egress address.
         SettingSpec(
-            "ratelimit_public_check_per_minute",
+            "ratelimit_public_check_qr_per_minute",
             int,
             60,
-            # The ONLY control on the anonymous QR page (plan 03.11a ruling 8):
-            # `?series=&number=` is guessable by construction, so the token's
-            # secrecy protects the QR path alone and enumeration is stopped here.
-            # CAPTCHA belongs to the front end (stage 6). Sized for a person, not
-            # a script — one scan is one request — with room for an inspector
-            # working through a folder. The limiter keys on `request.client.host`,
-            # so a carrier-grade NAT puts a whole region in one bucket: raise this
+            # The scanned path. One scan is one request; the headroom is for an
+            # inspector working through a folder of permits. Nothing is walkable
+            # here — 60/min against 2^256 tokens is not an attack.
+            "Per-IP limit for the anonymous permit check by QR token",
+        ),
+        SettingSpec(
+            "ratelimit_public_check_manual_per_minute",
+            int,
+            10,
+            # The typed path, deliberately six times tighter and matching
+            # `ratelimit_login_per_minute` — its closest analogue, a human typing
+            # an identifier into a form. A person reading «серия А № 000123» off
+            # paper needs seconds per attempt, so 10/min is generous for them and
+            # cuts a walk of the gapless number space from 86 400 cards a day to
+            # 14 400. It is a floor, not a wall: CAPTCHA is the front end's, at
+            # stage 6. Both keys are per-IP via `request.client.host`, so a
+            # carrier-grade NAT puts a whole region in one bucket — raise the
             # row, never the code, if that shows up in the field.
-            "Per-IP limit for the anonymous permit check (the only guard on it)",
+            "Per-IP limit for the anonymous permit check by series and number",
         ),
         SettingSpec(
             "gis_area_mismatch_pct",
