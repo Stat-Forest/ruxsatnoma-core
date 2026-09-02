@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import secrets
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -1042,6 +1043,63 @@ async def add_signature(
         new_value={"purpose": purpose, "status": permit.status, "missing": missing},
     )
     return permit
+
+
+# --- Task 6: the two provider seams gis (3.6a) and norms (3.7) left open -----
+#
+# Both seams were opened with nothing behind them and an explicit placeholder in
+# front — `occupancy_source: "none"`, `load_source: "none"` — so that no reader
+# could take a zero for a measurement until this module existed. Registering the
+# two functions below (in `app/event_subscriptions.py`, which BOTH entry points
+# call) is what flips them to `"permits"` across the whole system.
+#
+# Neither takes a permission or a zone rule, like every other in-process read
+# here: the caller is another SERVICE, and the gates live on the routes above it.
+#
+# `ACTIVE_STATUS` and nothing else. A `suspended` permit is not in use, so it
+# occupies no hectare and commits no head; `expired`/`revoked` are over and
+# `pending_signatures` has not begun (C11: a permit is in force only once all
+# four signatures are on it). That single word is the whole of ruling 11, and it
+# is passed down to the repo rather than repeated there.
+
+
+async def occupancy_provider(
+    db: AsyncSession, contour_ids: Sequence[uuid.UUID]
+) -> Mapping[uuid.UUID, Decimal]:
+    """How much of each contour's area is taken by permits in force.
+
+    ONE query for the whole page, never one per contour: 3.6a reshaped this seam
+    from per-contour to batch specifically so that this, its first registration,
+    could not turn a page of 20 into 20 round-trips (~13,500 for the
+    whole-country list, by the seam's own comment). An empty page costs no query
+    at all — `gis.service.list_contours` calls the seam for every page including
+    one that matched nothing, and `IN ()` is a statement with no possible answer.
+
+    A contour with nothing on it is absent from the mapping rather than present
+    as a zero; the seam's contract is that a key it does not get back counts as
+    zero, and `occupancy_map` quantizes whatever it is given to `area_ha`'s own
+    NUMERIC(12,4) scale.
+    """
+    if not contour_ids:
+        return {}
+    return await repo.occupied_area_by_contour(db, contour_ids, status=ACTIVE_STATUS)
+
+
+async def load_provider(
+    db: AsyncSession, contour_id: uuid.UUID, period_from: date, period_to: date
+) -> Decimal:
+    """Conditional heads (шартли бош) already committed on this contour for a
+    period overlapping `[period_from, period_to]` — what `norms` subtracts from a
+    contour's `max_sb` before pricing one more herd onto it.
+
+    Sums `permits.sb_load`, the figure frozen at issuance, never a recomputation
+    from the herd: the permit's own snapshot is the record of what was allowed
+    (`tz/05` invariant 7), and re-deriving it here would let a later tariff
+    regrouping change how much room a contour has today.
+    """
+    return await repo.committed_sb_load(
+        db, contour_id, period_from, period_to, status=ACTIVE_STATUS
+    )
 
 
 async def missing_signatures(db: AsyncSession, permit_id: uuid.UUID) -> list[str]:

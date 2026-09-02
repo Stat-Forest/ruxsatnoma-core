@@ -5,8 +5,11 @@ The one statement worth reading twice is `next_number`: it is the whole of
 ruling 9's race-freedom, and its failure mode is silence."""
 
 import uuid
+from collections.abc import Sequence
+from datetime import date
+from decimal import Decimal
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
@@ -125,3 +128,111 @@ async def add_status_history(db: AsyncSession, row: PermitStatusHistory) -> None
     0019's trigger). A correction is a new row, never an UPDATE."""
     db.add(row)
     await db.flush()
+
+
+async def occupied_area_by_contour(
+    db: AsyncSession, contour_ids: Sequence[uuid.UUID], *, status: str
+) -> dict[uuid.UUID, Decimal]:
+    """How many hectares each of these contours has committed, in ONE statement.
+
+    Batch-shaped because 3.6a reshaped `gis.service.OCCUPANCY_PROVIDERS` to be
+    batch-shaped: `list_contours` needs one answer per row, and a per-contour
+    query would make a page of 20 twenty round-trips (the whole-country list
+    ~13,500 — the seam's own comment). `GROUP BY` is what keeps that promise.
+
+    Contours with nothing on them are simply absent from the result; the seam's
+    contract says a key it was not given back counts as zero, so there is no
+    reason to pay for a LEFT JOIN against a list of ids.
+
+    `status` comes from the caller: `service.ACTIVE_STATUS` is the module's one
+    source of truth for that word and importing the service from here would be a
+    cycle.
+    """
+    rows = await db.execute(
+        select(Permit.contour_id, func.sum(Permit.area_ha))
+        .where(Permit.status == status, Permit.contour_id.in_(contour_ids))
+        .group_by(Permit.contour_id)
+    )
+    return {contour_id: total for contour_id, total in rows.all()}
+
+
+async def committed_sb_load(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+    *,
+    status: str,
+) -> Decimal:
+    """The conditional heads already committed on this contour over any part of
+    `[period_from, period_to]`.
+
+    The overlap predicate is `permit.period_from <= :period_to AND
+    permit.period_to >= :period_from` — both ends inclusive, because both ends of
+    a permit's own period are days of use (`period_to` is the last day, not the
+    day after). Two herds sharing a single day share the pasture that day.
+
+    A reversed argument pair inverts this predicate and hides the rows it should
+    find (lesson) — `norms.checks.run_checks`, the shared entry point every
+    caller reaches this through, refuses one fail-closed before any of this runs.
+
+    `sb_load` is null for an activity that commits no conditional-head load at
+    all, and `SUM` skips nulls; `COALESCE` turns the all-null (and the no-row)
+    answer into a real `Decimal("0")` rather than a `None` the caller would have
+    to add to a total.
+    """
+    total = await db.scalar(
+        select(func.coalesce(func.sum(Permit.sb_load), 0)).where(
+            Permit.status == status,
+            Permit.contour_id == contour_id,
+            Permit.period_from <= period_to,
+            Permit.period_to >= period_from,
+        )
+    )
+    return Decimal(total or 0)
+
+
+async def permits_ending_before(db: AsyncSession, day: date, *, status: str) -> list[Permit]:
+    """Permits in `status` whose period has run out before `day`, locked.
+
+    `period_to < day` and never `<=`: `permits.period_to` is INCLUSIVE, so a
+    permit ending today is still in force today (`tz/05`). `day` is the caller's
+    `business_today()` — Asia/Tashkent, never the server's own date.
+
+    `FOR UPDATE` because this is a read-check-write over rows another actor can
+    move at the same time (3.11b's suspend/revoke). Under READ COMMITTED,
+    Postgres re-evaluates the WHERE clause against the row version it finally
+    locks, so a permit revoked while the sweep waited simply drops out of the
+    result instead of being expired on top of the revocation. `populate_existing`
+    is the ORM half of the same guarantee: without it the loader keeps whatever
+    an instance already in the identity map was holding (lesson), and the sweep
+    would decide on a stale status under a correct lock.
+
+    Permits, then applications: `service.add_signature` locks in that order and
+    it is the only lock ordering anywhere in `app/` — a sweep that took an
+    application lock first would close the cycle.
+    """
+    rows = await db.execute(
+        select(Permit)
+        .where(Permit.status == status, Permit.period_to < day)
+        .order_by(Permit.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return list(rows.scalars().all())
+
+
+async def permits_in_statuses(db: AsyncSession, statuses: Sequence[str]) -> list[Permit]:
+    """Every permit that has reached one of `statuses` — the closure sweep's
+    candidate set (`expired`/`revoked`).
+
+    Unlocked and unbounded, both deliberate. Unlocked: the sweep does not write
+    the permit at all, it moves the APPLICATION, and the lock that matters is the
+    one `applications.service.set_status` takes on the row it does write.
+    Unbounded: the set is everything finished and not yet archived, and 4.7's
+    archival (`* -> ARCHIVED`) is what trims it — a LIMIT here would instead cap
+    how many permits may finish in one day, and grazing seasons end on the same
+    date for whole districts at a time.
+    """
+    rows = await db.execute(select(Permit).where(Permit.status.in_(statuses)).order_by(Permit.id))
+    return list(rows.scalars().all())

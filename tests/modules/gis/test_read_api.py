@@ -127,13 +127,23 @@ async def test_the_list_is_filtered_for_a_region_scoped_actor(
     assert str(outside.id) not in ids
 
 
-async def test_the_contour_card_declares_that_occupancy_is_a_placeholder(
+async def test_the_contour_card_reports_a_measured_zero_on_an_untaken_contour(
     applicant_client, published_contour
 ):
-    """Ruling 14: no permits module yet — say so instead of implying a measurement."""
+    """Ruling 14, second half. Until 3.11a this asserted `occupancy_source ==
+    "none"` — the placeholder that said "no permits module yet, do not read this
+    zero as a measurement". `permits.service.occupancy_provider` is now
+    registered (`app/event_subscriptions.py`), so the same three figures mean
+    something different and the test says so: the source is `"permits"`, and the
+    zero is a real answer about a contour nobody holds a permit on rather than an
+    admission that nobody looked. `s_available_ha` still equals `area_ha`, for the
+    opposite reason than before.
+
+    Kept rather than deleted: what a card shows for an UNTAKEN contour is exactly
+    where an off-by-one in the provider's predicate would surface first."""
     resp = await applicant_client.get(f"/api/v1/gis/contours/{published_contour.contour_id}")
     body = resp.json()
-    assert body["occupancy_source"] == "none"
+    assert body["occupancy_source"] == "permits"
     assert body["occupied_ha"] == "0.0000"
     assert body["s_available_ha"] == body["area_ha"]
 

@@ -1,4 +1,5 @@
-"""The one place `core.events.subscribe(...)` is called (design/01 rule 4).
+"""The one place `core.events.subscribe(...)` is called (design/01 rule 4), and
+with it every other CROSS-MODULE registration a process needs before it serves.
 
 Both `app.main.create_app()` (the API process — embedded workers included, since
 it runs `create_app()` before `lifespan()` ever starts them) and
@@ -6,7 +7,10 @@ it runs `create_app()` before `lifespan()` ever starts them) and
 call `register_event_subscriptions()` from here, so the list of subscribers
 exists in exactly one body no matter which of the two processes is running,
 rather than being copied into both entry points and drifting apart (review round
-1, finding I2).
+1, finding I2). 3.11a's two provider registrations (`gis.OCCUPANCY_PROVIDERS`,
+`norms.LOAD_PROVIDERS`) join them for exactly that reason and no other: put in
+`app/main.py` instead, they would be absent from the standalone worker, whose
+own jobs read a contour's committed load.
 
 A plain top-level module, not `app/core/`: `app/core/` may never import a domain
 module (`app/core/events.py`'s own docstring), and a real `subscribe()` call here
@@ -48,3 +52,34 @@ def register_event_subscriptions() -> None:
     from app.modules.permits import subscribers as permits_subscribers
 
     subscribe(PAYMENT_CONFIRMED, permits_subscribers.on_payment_confirmed)
+    _register_providers()
+
+
+def _register_providers() -> None:
+    """The two registered seams `gis` (3.6a) and `norms` (3.7) shipped empty for
+    `permits` to fill: how much of a contour's area is taken, and how many
+    conditional heads are already committed on it.
+
+    Here rather than in `app/main.py` for the same reason the subscriptions are:
+    a `workers_mode=off` deployment runs `app.workers.runner.main()`, which never
+    calls `create_app()`, so a registration in `main.py` would leave that process
+    answering `occupancy_source: "none"` while the API process answers
+    `"permits"` — the same silent split the outbox's sender registry already
+    taught this codebase to avoid.
+
+    **Membership-checked, not appended.** `core.events.subscribe` dedups its own
+    `(name, handler)` pairs; these two lists are plain module globals with no
+    such guard, and `tests/conftest.py`'s autouse `_isolate_subscriptions` calls
+    this function for EVERY test while snapshotting only `events._SUBSCRIBERS`.
+    A bare `.append()` would therefore add one copy per test, occupancy would
+    silently double and then triple, and the failure would read as test pollution
+    rather than as a registration bug — passing whenever a file was run alone.
+    """
+    from app.modules.gis import service as gis_service
+    from app.modules.norms import service as norms_service
+    from app.modules.permits import service as permits_service
+
+    if permits_service.occupancy_provider not in gis_service.OCCUPANCY_PROVIDERS:
+        gis_service.OCCUPANCY_PROVIDERS.append(permits_service.occupancy_provider)
+    if permits_service.load_provider not in norms_service.LOAD_PROVIDERS:
+        norms_service.LOAD_PROVIDERS.append(permits_service.load_provider)

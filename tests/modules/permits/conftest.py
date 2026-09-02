@@ -20,8 +20,10 @@ every request 401s with no hint that the database is the bug).
 """
 
 import hashlib
+import secrets
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -29,7 +31,7 @@ from decimal import Decimal
 import httpx
 import pytest
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -40,11 +42,11 @@ from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
-from app.modules.gis.models import GisLayer
+from app.modules.gis.models import Contour, GisLayer
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
-from app.modules.permits import service, signers
+from app.modules.permits import repo, service, signers
 from app.modules.permits.models import Permit, PermitTemplate
 from app.modules.permits.permissions import PERMITS_ISSUE
 from tests.conftest import make_client
@@ -761,3 +763,125 @@ async def active_permit(
     await db.refresh(issued_permit)
     assert issued_permit.status == "active"
     return issued_permit
+
+
+# --- Task 6: the two provider seams ------------------------------------------
+
+
+class _QueryCounter:
+    """How many statements ran inside a `count_queries` block."""
+
+    def __init__(self) -> None:
+        self.value = 0
+
+
+@asynccontextmanager
+async def count_queries(db: AsyncSession) -> AsyncIterator[_QueryCounter]:
+    """Count the SQL statements a block issues on `db`'s own connection.
+
+    `AsyncSession.get_bind()` hands back the SYNC `Engine` underneath the async
+    one — which is what `before_cursor_execute` is emitted on; there is no async
+    flavour of the event. Nothing else in the suite counts queries, and this one
+    exists for a single property: 3.6a reshaped `OCCUPANCY_PROVIDERS` from
+    per-contour to batch so that registering a real provider could not turn a
+    page of 20 contours into 20 round-trips, and only a count can hold that.
+
+    Flush before entering the block, not inside it: SQLAlchemy's autoflush would
+    otherwise charge a fixture's pending INSERTs to the code under test.
+    """
+    await db.flush()
+    counter = _QueryCounter()
+    engine = db.get_bind()
+
+    def _count(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        counter.value += 1
+
+    event.listen(engine, "before_cursor_execute", _count)
+    try:
+        yield counter
+    finally:
+        event.remove(engine, "before_cursor_execute", _count)
+
+
+async def make_permit_on_contour(
+    db: AsyncSession,
+    *,
+    contour: Contour,
+    version_id: uuid.UUID,
+    org: Organization,
+    activity_type_id: uuid.UUID,
+    status: str,
+    area_ha: Decimal = Decimal("12.5000"),
+    sb_load: Decimal | None = Decimal("40.0000"),
+    period_from: date = date(2027, 5, 1),
+    period_to: date = date(2027, 9, 30),
+) -> Permit:
+    """A permit row on a GIVEN contour, in a GIVEN status, built through the ORM.
+
+    Issuance cannot produce these: `service.issue` always creates its own contour
+    through the application, `_activate` is the only writer of `active` and needs
+    four real ERI signatures, and nothing in 3.11a writes `expired`, `suspended`
+    or `revoked` at all — `suspended`/`revoked` are 3.11b's and `expired` is
+    Task 7's own job, which must not be the fixture for the queries that read it.
+    What the two providers assert is a SQL predicate over `status`, `contour_id`
+    and the period, so the rows are built where the predicate can see them.
+
+    Its own applicant and its own application every time: `permits.application_id`
+    is unique and `ex_applications_no_duplicate` (migration 0015) forbids a second
+    active-status application for the same (applicant, contour, activity) over an
+    overlapping period — several permits on ONE contour is exactly what these
+    tests need, so each gets a fresh applicant.
+
+    The number comes from `permit_counters` through the real statement, never a
+    literal: this database is shared and persistent, and a hard-coded number dies
+    the first time issuance commits one (lesson).
+    """
+    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    user.full_name = HOLDER_NAME
+    applicant = Applicant(
+        kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id
+    )
+    db.add(applicant)
+    await db.flush()
+
+    application = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=user.id,
+        on_behalf="self",
+        activity_type_id=activity_type_id,
+        contour_id=contour.id,
+        contour_version_id=version_id,
+        requested_area_ha=area_ha,
+        period_from=period_from,
+        period_to=period_to,
+        status="PERMIT_ISSUED",
+        channel="portal",
+        assigned_org_id=org.id,
+    )
+    db.add(application)
+    await db.flush()
+
+    series = get_settings().permit_series
+    number = await repo.next_number(db, series)
+    assert number is not None
+    permit = Permit(
+        series=series,
+        number=number,
+        application_id=application.id,
+        applicant_id=applicant.id,
+        activity_type_id=activity_type_id,
+        organization_id=org.id,
+        contour_id=contour.id,
+        contour_version_id=version_id,
+        area_ha=area_ha,
+        period_from=period_from,
+        period_to=period_to,
+        amount=Decimal("2060000.00"),
+        sb_load=sb_load,
+        status=status,
+        qr_token=secrets.token_urlsafe(32),
+        snapshot={"holder_name": HOLDER_NAME},
+    )
+    db.add(permit)
+    await db.flush()
+    return permit
