@@ -43,6 +43,33 @@ async def permit_by_id(db: AsyncSession, permit_id: uuid.UUID) -> Permit | None:
     return await db.get(Permit, permit_id)
 
 
+async def permit_by_id_for_update(db: AsyncSession, permit_id: uuid.UUID) -> Permit | None:
+    """`permit_by_id`'s locking sibling — `service.add_signature` ONLY, and the
+    same shape as `applications.repo.get_application_for_update` (review C1).
+
+    `SELECT ... FOR UPDATE` so two signatories landing at the same instant
+    serialise instead of racing. Without it, under READ COMMITTED, the third and
+    fourth signatories each insert their own `signatures` row — different
+    purposes, so `uq_signatures_valid_purpose` never fires — and then each asks
+    `missing_purposes`, neither seeing the other's UNCOMMITTED row. Both get a
+    non-empty list, neither activates, both commit: a permit carrying four valid
+    signatures, stuck in `pending_signatures`, with its application stuck in
+    `PAID`. There is no recovery path — a retry passes the status check, `sign()`
+    then answers `ERR-SIGN-002`, and `_activate` is reachable from nowhere else —
+    so it takes a hand-edit of the database. The second caller here blocks until
+    the first commits, then reads a `missing_purposes` that includes it.
+
+    `populate_existing=True` is what makes that re-read true, and is mechanical:
+    `with_for_update` alone does emit a real `SELECT ... FOR UPDATE`, but the
+    loader then refreshes only the attributes an already-held instance has NOT
+    loaded, and `app/db.py`'s `expire_on_commit=False` never clears the rest —
+    so the lock would be taken and a stale `status` validated under it.
+    `tests/test_code_conventions.py::test_every_locking_get_also_repopulates_the_row`
+    enforces the pairing.
+    """
+    return await db.get(Permit, permit_id, with_for_update=True, populate_existing=True)
+
+
 async def permit_by_application(db: AsyncSession, application_id: uuid.UUID) -> Permit | None:
     """The permit issued for this application, or None. `permits.application_id`
     is unique (design/02), so this is a 1:1 lookup and never a list."""

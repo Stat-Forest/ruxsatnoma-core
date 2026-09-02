@@ -951,7 +951,13 @@ async def add_signature(
     before raising, so a half-built change made before it would be committed by
     somebody else's rejected signature.
     """
-    permit = await repo.permit_by_id(db, permit_id)
+    # LOCKED, not `permit_by_id` (review, fix round 1). Everything below —
+    # the status check, `sign()`'s insert, `missing_purposes` and the activation
+    # that depends on it — is one read-check-write over this permit, and two
+    # signatories landing together would otherwise each miss the other's
+    # uncommitted signature and leave the permit stuck with four valid
+    # signatures and no activation. See `repo.permit_by_id_for_update`.
+    permit = await repo.permit_by_id_for_update(db, permit_id)
     if permit is None:
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
 

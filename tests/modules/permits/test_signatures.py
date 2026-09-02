@@ -19,12 +19,14 @@ persistent test database (lesson):
     that way. The 4th signature belongs to the permit's OWN holder.
 """
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from app.db import make_session_factory
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
@@ -33,6 +35,7 @@ from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.notifications.models import Notification
 from app.modules.permits import events, service, signers
 from app.modules.permits.models import Permit, PermitStatusHistory
+from app.modules.signatures import service as signatures_service
 from tests.modules.permits.conftest import Signer
 
 API = "/api/v1"
@@ -143,6 +146,13 @@ async def test_the_last_signature_moves_the_application_to_permit_issued(
 
     application = await applications_service.get(db, issued_permit.application_id)
     assert application is not None
+    # Refresh BEFORE this half too, not only after. `paid_application` created
+    # this row on THIS session, so `get` hands back the cached instance and
+    # `expire_on_commit=False` never clears it — without the refresh the "still
+    # PAID" assertion cannot fail, and it did not: under a mutation that
+    # activated on the FIRST signature it stayed green while three sibling tests
+    # went red (review, fix round 1).
+    await db.refresh(application)
     assert application.status == "PAID"
 
     await _sign(holder_client, issued_permit.id, "permit_recipient", permit_pdf)
@@ -404,8 +414,6 @@ async def test_every_signature_covers_the_same_document(
     """3.8's `require_complete` does not check that the signatures share a
     doc_hash, so this stage guarantees there is only ever one document to sign:
     every signature is taken over `service.pdf_bytes`, never a re-render."""
-    from app.modules.signatures import service as signatures_service
-
     await _sign(head_client, issued_permit.id, "permit_head", permit_pdf)
     await _sign(chief_forester_client, issued_permit.id, "permit_chief_forester", permit_pdf)
 
@@ -549,3 +557,104 @@ async def test_the_recipients_reminder_addresses_them_and_fits_one_sms(db: Async
             if channel == "sms":
                 # A Cyrillic SMS bills at 70 characters per part (0009 ruling 20).
                 assert len(text) <= 70, f"{language} sms is {len(text)} chars: two parts"
+
+
+# --- the race on the last signature ------------------------------------------
+
+
+async def test_two_signatories_landing_at_once_cannot_leave_the_permit_stuck(
+    db: AsyncSession,
+    engine: AsyncEngine,
+    issued_permit: Permit,
+    permit_pdf: bytes,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    holder_client: Signer,
+):
+    """Review, fix round 1. Two signatories in flight at once, under READ
+    COMMITTED, each insert their own `signatures` row — different purposes, so
+    `uq_signatures_valid_purpose` never fires — and then each ask
+    `missing_purposes` WITHOUT seeing the other's uncommitted row. Both get a
+    non-empty list, neither activates, both commit: four valid signatures, a
+    permit stuck in `pending_signatures`, an application stuck in `PAID`, and no
+    recovery path short of editing the database by hand.
+
+    A single session cannot prove a lock (lesson), so this drives
+    `service.add_signature` on two REAL sessions against one PostgreSQL, the
+    shape `applications/test_public_surface.py`'s own two-session test uses.
+    Without `repo.permit_by_id_for_update` the second call runs straight through
+    and `not second.done()` is false; with it, the second blocks on the first's
+    row lock until it commits — which is what makes this test discriminate
+    rather than pass either way.
+    """
+    for signer, purpose in (
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+    ):
+        assert (await _sign(signer, issued_permit.id, purpose, permit_pdf)).status_code == 200
+
+    permit_id = issued_permit.id
+    application_id = issued_permit.application_id
+    factory = make_session_factory(engine)
+
+    async with factory() as first, factory() as second:
+        accountant = await first.get(User, accountant_client.user.id)
+        holder = await second.get(User, holder_client.user.id)
+        assert accountant is not None and holder is not None
+
+        # The third signature, left UNCOMMITTED — `add_signature` does not
+        # commit on success (the route's `get_db` does), so this session now
+        # holds both the permit's lock and a signature row nobody else can see.
+        await service.add_signature(
+            first,
+            permit_id,
+            purpose="permit_accountant",
+            pkcs7=encode_mock_signature(
+                document=permit_pdf,
+                serial=accountant_client.serial,
+                issuer="ISS-1",
+                pinfl=accountant_client.pinfl,
+            ),
+            user=accountant,
+        )
+
+        # The fourth signature arrives while the third is still in flight.
+        fourth = asyncio.create_task(
+            service.add_signature(
+                second,
+                permit_id,
+                purpose="permit_recipient",
+                pkcs7=encode_mock_signature(
+                    document=permit_pdf,
+                    serial=holder_client.serial,
+                    issuer="ISS-1",
+                    pinfl=holder_client.pinfl,
+                ),
+                user=holder,
+            )
+        )
+        await asyncio.sleep(0.5)
+        assert not fourth.done(), (
+            "the fourth signatory must block on the third's row lock — without it"
+            " both miss each other's uncommitted signature and neither activates"
+        )
+
+        await first.commit()
+        permit = await asyncio.wait_for(fourth, timeout=10)
+        assert permit.status == "active", "the unblocked caller now sees all four"
+        await second.commit()
+
+    # The durable outcome, read on a third session that saw neither transaction.
+    async with factory() as reader:
+        stored = await reader.get(Permit, permit_id)
+        assert stored is not None
+        assert stored.status == "active"
+        assert stored.issued_at is not None
+        application = await applications_service.get(reader, application_id)
+        assert application is not None
+        assert application.status == "PERMIT_ISSUED"
+        signatures = await signatures_service.get_for_object(
+            reader, object_type="permit", object_id=permit_id
+        )
+        assert len([row for row in signatures if row.verification_status == "valid"]) == 4
