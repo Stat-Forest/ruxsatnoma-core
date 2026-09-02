@@ -6,14 +6,16 @@ now — so an end-to-end/HTTP scenario would exercise nothing here at all
 (lesson: "a 'public surface' task's own end-to-end test can ship the surface
 untested"). Every function gets its own direct call below."""
 
+import asyncio
 import uuid
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.errors import DomainError
+from app.db import make_session_factory
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import (
     APPLICATION_STATUSES,
@@ -311,3 +313,76 @@ async def test_set_status_unknown_application_raises_not_found(db: AsyncSession)
     with pytest.raises(DomainError) as exc_info:
         await applications_service.set_status(db, uuid.uuid4(), to_status="SUBMITTED")
     assert exc_info.value.code == "ERR-SYS-003"
+
+
+# --- service.set_status: the row lock (review C1) ---------------------------
+
+
+async def test_set_status_locks_the_row_so_a_concurrent_transition_loses(
+    engine: AsyncEngine, db: AsyncSession, applicant: Applicant
+) -> None:
+    """The exact pair of writers C1 names: a payment callback moving
+    INVOICED -> PAID and a scheduler job moving INVOICED -> EXPIRED_UNPAID,
+    racing on one application. Two REAL, independent sessions (separate
+    connections, mirroring `tests/workers/test_outbox_worker.py`'s own
+    `make_session_factory(engine)` pattern) — a single session cannot
+    demonstrate a row lock against itself.
+
+    `application` must be COMMITTED, not merely flushed, before the two
+    independent sessions are opened: a different connection cannot see
+    another session's uncommitted work.
+    """
+    application = await _draft(db, applicant)
+    application.status = "INVOICED"
+    await db.flush()
+    await db.commit()
+
+    factory = make_session_factory(engine)
+    session_a = factory()
+    session_b = factory()
+    try:
+        # session_a takes the row lock (`get_application_for_update`'s
+        # `SELECT ... FOR UPDATE`) and writes, but does NOT commit yet — the
+        # lock is held for as long as its transaction stays open.
+        updated_a = await applications_service.set_status(
+            session_a, application.id, to_status="PAID"
+        )
+        assert updated_a.status == "PAID"
+
+        # session_b starts concurrently, BEFORE session_a commits, so its
+        # own `SELECT ... FOR UPDATE` must block on session_a's still-open
+        # lock instead of reading the stale pre-write "INVOICED" and racing
+        # it — the exact failure C1 describes.
+        task = asyncio.create_task(
+            applications_service.set_status(session_b, application.id, to_status="EXPIRED_UNPAID")
+        )
+        await asyncio.sleep(0.3)  # generous headroom for a localhost query
+        assert not task.done(), "session_b should still be blocked on session_a's row lock"
+
+        await session_a.commit()  # releases the lock
+
+        with pytest.raises(DomainError) as exc_info:
+            await asyncio.wait_for(task, timeout=5)
+        # Unblocked, session_b re-reads the now-committed "PAID" — not the
+        # stale "INVOICED" it originally saw — so PAID -> EXPIRED_UNPAID is
+        # correctly refused as illegal, rather than silently overwriting
+        # session_a's write.
+        assert exc_info.value.code == "ERR-APP-004"
+        assert exc_info.value.details == {
+            "reason": "bad_transition",
+            "from": "PAID",
+            "to": "EXPIRED_UNPAID",
+        }
+
+        # The row genuinely ended up PAID, never EXPIRED_UNPAID — the exact
+        # "the applicant paid but the row reads expired" outcome C1 warns of,
+        # which this lock prevents rather than merely detects after the fact.
+        final = await applications_service.get(db, application.id)
+        assert final is not None
+        await db.refresh(final)
+        assert final.status == "PAID"
+    finally:
+        await session_a.rollback()
+        await session_b.rollback()
+        await session_a.close()
+        await session_b.close()

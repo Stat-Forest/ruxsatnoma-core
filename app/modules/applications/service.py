@@ -89,7 +89,17 @@ def _assert_transition(application: Application, to_status: str) -> None:
 #   Application` — the ONE way a level-4 module moves an application: 3.10
 #   writes INVOICED, PAID, EXPIRED_UNPAID; 3.11 writes PERMIT_ISSUED, CLOSED.
 #   It validates the transition against tz/05, writes the history row and
-#   the audit entry, and refuses an illegal jump.
+#   the audit entry, and refuses an illegal jump. Like `get` above, it
+#   enforces NO permission or zone rule of its own — the calling module's
+#   router must (review I1: this is not an oversight, it is the same "the
+#   caller is another service" design as every function on this page, and a
+#   check here could not span, say, `INVOICED`/`PERMIT_ISSUED` across two
+#   different modules' permission codes). A repeat call for a status the
+#   application already holds is a transition to itself, which
+#   `APPLICATION_TRANSITIONS` never contains — it raises `ERR-APP-004` with
+#   `details["from"] == details["to"]`, which is how a retrying caller (3.10's
+#   own retry paths) tells "already applied, harmless" from a genuinely
+#   illegal jump.
 # - The four event names in `applications.events`: APPLICATION_SUBMITTED,
 #   APPLICATION_APPROVED, APPLICATION_REJECTED, APPLICATION_CANCELLED.
 #
@@ -153,8 +163,23 @@ async def set_status(
     routing through here, and stays audited under its own flow-verb constant
     (ruling 17: `APPLICATION_SUBMIT` and siblings), never
     `APPLICATION_STATUS_CHANGE`.
+
+    Locks the row for the duration of the call (review C1): this is the
+    single write path every level-4 module uses for every transition, and
+    two of its callers are already named in the plan — a scheduler job
+    (INVOICED -> EXPIRED_UNPAID) and an HTTP payment callback (INVOICED ->
+    PAID) — that can genuinely race on the same application. Without the
+    lock both read the same pre-write status, both pass `_assert_transition`,
+    and the second UPDATE silently overwrites the first with no error and an
+    `application_status_history` that claims two transitions FROM a status
+    the application was only in once. The second caller here instead blocks
+    until the first commits or rolls back, then re-reads the now-current
+    status, so a genuine conflict surfaces as `ERR-APP-004` — a clean 409 —
+    rather than a lost write.
     """
-    application = await get(db, application_id)
+    # get_application_for_update, never plain `get`/`repo.get_application`:
+    # see the lock note above.
+    application = await repo.get_application_for_update(db, application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
 
@@ -183,5 +208,6 @@ async def set_status(
         object_id=application.id,
         old_value={"status": from_status},
         new_value={"status": to_status},
+        basis=reason,
     )
     return application

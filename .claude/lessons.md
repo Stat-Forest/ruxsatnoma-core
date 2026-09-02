@@ -248,6 +248,20 @@ Tooling and environment.
   branch cares about, is the template — a savepoint only when the caller keeps using `db`
   afterward; a bare `except IntegrityError: raise err(...)` needs none.
 
+## A service meant as THE one write path for future callers locks its row, even with one caller today
+
+- **Rule:** A function documented as "the ONE way" something gets written locks its row
+  (`with_for_update=True`) before checking and writing; a plain read stays lock-free.
+- **Why:** `applications.service.set_status` read `Application` unlocked: two READ
+  COMMITTED callers moving one row off `INVOICED` (a scheduler job, a payment callback)
+  both passed validation and the second UPDATE silently overwrote the first (review C1)
+  — the same shape `notifications.service._deliver`'s own `with_for_update` already fixed.
+- **How to apply:** Give the write path a locking repo read distinct from the plain one
+  (`get_application_for_update`). A single session cannot prove a lock — open two via
+  `make_session_factory(engine)` (`tests/modules/applications/test_public_surface.py`'s
+  own two-session test is the template): `asyncio.create_task` + `not task.done()` while
+  the first stays open, then commit and assert the second raises.
+
 ---
 
 # Values: dates, decimals, precision

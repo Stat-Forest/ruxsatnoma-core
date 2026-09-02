@@ -958,9 +958,8 @@ async def latest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Cal
     delegates here, ruling C6: `applications` may not query `calculations`
     itself, nor import `norms.repo`). Not a permission-checked read: the
     caller is another SERVICE inside this process, same as `effective_norm`.
-    Reuses `repo.list_calculations` (newest-first, `id` tie-break since
-    uuid7 is time-ordered) rather than a second query beside it."""
-    rows, _total = await repo.list_calculations(
-        db, application_id=application_id, limit=1, offset=0
-    )
-    return rows[0] if rows else None
+    `repo.newest_calculation` shares `list_calculations`'s ordering (newest
+    first, `id` tie-break since uuid7 is time-ordered) but skips its
+    `COUNT(*)` (review M3) — this runs once per invoice build and the total
+    is never used here."""
+    return await repo.newest_calculation(db, application_id)

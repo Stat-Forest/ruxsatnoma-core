@@ -164,18 +164,33 @@ async def list_norms(
     return await paginate(db, stmt, limit, offset)
 
 
-async def list_calculations(
-    db: AsyncSession, *, application_id: uuid.UUID | None, limit: int, offset: int
-) -> tuple[list[Calculation], int]:
-    """An append-only table's history, NEWEST first — the one list in this
-    module not ordered by `effective_from`, since a calculation has no period
-    of its own. `id` breaks a `created_at` tie: `uuid7` is time-ordered, so it
-    agrees with insertion order even when two saves land in the same tick."""
+def _calculations_query(application_id: uuid.UUID | None) -> Select:
+    """The WHERE + ORDER BY `list_calculations` and `newest_calculation`
+    share, NEWEST first — the one ordering in this module not by
+    `effective_from`, since a calculation has no period of its own. `id`
+    breaks a `created_at` tie: `uuid7` is time-ordered, so it agrees with
+    insertion order even when two saves land in the same tick."""
     stmt = select(Calculation)
     if application_id is not None:
         stmt = stmt.where(Calculation.application_id == application_id)
-    stmt = stmt.order_by(Calculation.created_at.desc(), Calculation.id.desc())
-    return await paginate(db, stmt, limit, offset)
+    return stmt.order_by(Calculation.created_at.desc(), Calculation.id.desc())
+
+
+async def list_calculations(
+    db: AsyncSession, *, application_id: uuid.UUID | None, limit: int, offset: int
+) -> tuple[list[Calculation], int]:
+    """An append-only table's history, paged, with its total (review M3:
+    the `COUNT(*)` a page needs and `newest_calculation` below does not)."""
+    return await paginate(db, _calculations_query(application_id), limit, offset)
+
+
+async def newest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Calculation | None:
+    """The single newest row for `application_id`, or `None` — `LIMIT 1` off
+    the same ordering as `list_calculations`, without `paginate`'s
+    `COUNT(*)` (review M3: `norms.service.latest_calculation` runs this once
+    per invoice build in 3.10, and the total is never used there)."""
+    stmt = _calculations_query(application_id).limit(1)
+    return (await db.execute(stmt)).scalars().first()
 
 
 async def paginate(db: AsyncSession, stmt: Select, limit: int, offset: int) -> tuple[list, int]:
