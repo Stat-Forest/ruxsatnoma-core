@@ -301,11 +301,17 @@ async def test_status_history_id_can_be_supplied_explicitly(
 
 async def test_applications_permission_seeds(db) -> None:
     """ruling 16: create -> applicant, review -> executor_staff ('hodim' in the
-    plan's prose), decide -> executor_head AND leadership (review round 1 finding
-    I3 — tz/03's matrix gives approve/sign on an application to executor_head, not
-    leadership alone), view_any -> prosecutor, assign -> sys_admin. Wrong role codes
-    in the migration insert zero rows silently (.claude/lessons.md) — this is the
-    guard."""
+    plan's prose), decide -> executor_head, view_any -> prosecutor, assign ->
+    sys_admin. Wrong role codes in the migration insert zero rows silently
+    (.claude/lessons.md) — this is the guard.
+
+    `decide` was granted to executor_head AND leadership by 0015 (review round 1
+    finding I3, which caught that ruling 16's prose named only `leadership` while
+    tz/03's matrix gives «Т» to Раҳбар = `executor_head`). **Migration 0016 revoked
+    leadership's half** once Oybek settled the question — decision #59, option а —
+    so the expected set below is the post-0016 state, not 0015's. The two guards in
+    `tests/test_permissions_registry.py` assert the same alignment across all three
+    stages that grant an approval code."""
     rows = await db.execute(
         text(
             "SELECT r.code, rp.permission_code FROM role_permissions rp"
@@ -317,7 +323,6 @@ async def test_applications_permission_seeds(db) -> None:
         ("applicant", "applications.create"),
         ("executor_staff", "applications.review"),
         ("executor_head", "applications.decide"),
-        ("leadership", "applications.decide"),
         ("prosecutor", "applications.view_any"),
         ("sys_admin", "applications.assign"),
     }

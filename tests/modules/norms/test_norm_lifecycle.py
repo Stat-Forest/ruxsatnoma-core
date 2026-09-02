@@ -31,7 +31,7 @@ async def _draft(client: AsyncClient, contour_id: uuid.UUID, activity_id: uuid.U
 
 async def test_the_full_cycle_publishes_and_freezes_max_sb(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
@@ -50,7 +50,7 @@ async def test_the_full_cycle_publishes_and_freezes_max_sb(
     assert (await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")).json()[
         "status"
     ] == "review"
-    approved = await leadership_client.post(
+    approved = await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
     assert approved.json()["status"] == "approved"
@@ -66,13 +66,13 @@ async def test_the_full_cycle_publishes_and_freezes_max_sb(
 
 
 async def test_the_leshoz_leadership_cannot_skip_the_review(
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     approval_doc: MediaFile,
 ) -> None:
-    created = await _draft(leadership_client, published_contour.id, grazing_activity_id)
-    approved = await leadership_client.post(
+    created = await _draft(executor_head_client, published_contour.id, grazing_activity_id)
+    approved = await executor_head_client.post(
         f"/api/v1/norms/{created.json()['id']}/approve",
         json={"approval_doc_id": str(approval_doc.id)},
     )
@@ -82,14 +82,14 @@ async def test_the_leshoz_leadership_cannot_skip_the_review(
 
 async def test_in_central_mode_a_leshoz_actor_cannot_publish(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     survey_doc: MediaFile,
     approval_doc: MediaFile,
 ) -> None:
     """Ruling 16, default mode: VMQ 689 has forest-pasture norms put in force
-    centrally. `leadership_client` HOLDS `norms.publish` and is still refused —
+    centrally. `executor_head_client` HOLDS `norms.publish` and is still refused —
     the setting, not the grant, is what decides."""
     created = await _draft(
         gis_specialist_client,
@@ -99,10 +99,10 @@ async def test_in_central_mode_a_leshoz_actor_cannot_publish(
     )
     norm_id = created.json()["id"]
     await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-    await leadership_client.post(
+    await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
-    refused = await leadership_client.post(f"/api/v1/norms/{norm_id}/publish")
+    refused = await executor_head_client.post(f"/api/v1/norms/{norm_id}/publish")
     assert refused.status_code == 403
     assert refused.json()["error"]["code"] == "ERR-ACL-002"
     assert refused.json()["error"]["details"]["reason"] == "central_publication_required"
@@ -111,7 +111,7 @@ async def test_in_central_mode_a_leshoz_actor_cannot_publish(
 async def test_in_leshoz_mode_the_same_actor_publishes(
     db: AsyncSession,
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     survey_doc: MediaFile,
@@ -134,10 +134,10 @@ async def test_in_leshoz_mode_the_same_actor_publishes(
         )
         norm_id = created.json()["id"]
         await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-        await leadership_client.post(
+        await executor_head_client.post(
             f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
         )
-        published = await leadership_client.post(f"/api/v1/norms/{norm_id}/publish")
+        published = await executor_head_client.post(f"/api/v1/norms/{norm_id}/publish")
         assert published.status_code == 200
         assert published.json()["status"] == "published"
     finally:
@@ -163,7 +163,7 @@ async def test_submitting_for_review_without_the_survey_file_is_refused(
 
 async def test_a_second_published_norm_for_the_same_period_is_a_409(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
@@ -184,7 +184,7 @@ async def test_a_second_published_norm_for_the_same_period_is_a_409(
         )
         norm_id = created.json()["id"]
         await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-        await leadership_client.post(
+        await executor_head_client.post(
             f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
         )
         response = await central_admin_client.post(f"/api/v1/norms/{norm_id}/publish")
@@ -194,7 +194,7 @@ async def test_a_second_published_norm_for_the_same_period_is_a_409(
 
 async def test_publishing_a_norm_for_a_contour_with_no_published_version_is_refused(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     draft_only_contour: Contour,
     grazing_activity_id: uuid.UUID,
@@ -212,7 +212,7 @@ async def test_publishing_a_norm_for_a_contour_with_no_published_version_is_refu
     )
     norm_id = created.json()["id"]
     await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-    await leadership_client.post(
+    await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
     response = await central_admin_client.post(f"/api/v1/norms/{norm_id}/publish")
@@ -234,7 +234,7 @@ async def test_a_norm_outside_the_actors_zone_is_refused(
 
 async def test_publishing_a_grazing_norm_without_a_yield_is_refused(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
@@ -258,7 +258,7 @@ async def test_publishing_a_grazing_norm_without_a_yield_is_refused(
     assert created.status_code == 201, created.text
     norm_id = created.json()["id"]
     await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-    await leadership_client.post(
+    await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
 
@@ -269,7 +269,7 @@ async def test_publishing_a_grazing_norm_without_a_yield_is_refused(
 
 async def test_a_norm_for_a_haymaking_contour_publishes_without_a_yield(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     published_contour: Contour,
     haymaking_activity_id: uuid.UUID,
@@ -288,7 +288,7 @@ async def test_a_norm_for_a_haymaking_contour_publishes_without_a_yield(
     )
     norm_id = created.json()["id"]
     await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-    await leadership_client.post(
+    await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
 
@@ -299,7 +299,7 @@ async def test_a_norm_for_a_haymaking_contour_publishes_without_a_yield(
 
 async def test_publishing_a_norm_outside_the_actors_zone_is_refused(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     other_zone_publisher_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
@@ -323,7 +323,7 @@ async def test_publishing_a_norm_outside_the_actors_zone_is_refused(
     )
     norm_id = created.json()["id"]
     await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-    await leadership_client.post(
+    await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
 

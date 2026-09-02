@@ -368,21 +368,21 @@ Tooling and environment.
 - **How to apply:** Any new "what can this user do" response gets the superuser branch, not
   just the enforcement point.
 
-## A role name from spec or plan prose is never a `roles.code` — and `rahbar` maps to two
+## A role name from spec or plan prose is never a `roles.code` — «Раҳбар» is `executor_head`
 
 - **Rule:** Before seeding any role-based grant, read `0003_auth.py` for the actual
-  `roles.code`. There is no `rahbar` code; **which code the word means is DISPUTED**, so
-  a plan saying "the rahbar approves" is a question to settle, not a value to copy.
-- **Why:** `plans/03.6a-gis-core.md` used `rahbar`; `INSERT … SELECT … WHERE code =
-  'rahbar'` inserts zero rows silently, so `gis.contours.approve` reached nobody and every
-  "the rahbar approves" test passed for the wrong reason (3.6a t1). The dispute (3.9a):
-  `0003_auth.py:189` seeds `executor_head` = «Ваколатли шахс», the LESHOZ head, while
-  `leadership` = «Агентлик раҳбарияти» has view+export only in `tz/03` — yet `tz/03` puts
-  «Т» on «Заявка» for «Раҳбар». 3.6a/3.7 read it as `leadership`; 3.9a granted
-  `applications.decide` to BOTH (fail-safe, revocable). Open in `tz/12`.
-- **How to apply:** A grant for "the rahbar" → grant both codes and say why, or ask. Any
-  grant → assert the exact `(role, permission)` set in a test
-  (`test_applications_permission_seeds`): a wrong code inserts zero rows, never an error.
+  `roles.code`. There is no `rahbar` code. **«Раҳбар» — the approver «Т» in `tz/03`'s
+  matrix — is `executor_head`** («Ваколатли шахс», the leshoz head); `leadership` is
+  «Агентлик раҳбарияти» and holds view+export, plus `norms.publish` alone (ВМҚ 689).
+- **Why:** two failures, one class. `plans/03.6a-gis-core.md` used `rahbar`; `INSERT …
+  SELECT … WHERE code = 'rahbar'` inserts zero rows silently, so `gis.contours.approve`
+  reached nobody and every "the rahbar approves" test passed for the wrong reason
+  (3.6a t1). Then 3.6a/3.7 resolved the word to `leadership`, so migrations 0010/0011
+  gave approval to agency leadership and the leshoz head could approve neither a contour
+  nor a norm in its own leshoz — invisible for two stages, fixed by 0016 (decision #59).
+- **How to apply:** Any role grant → `tests/test_permissions_registry.py`'s two guards
+  already assert the whole `leadership`/`executor_head` split; extend them rather than
+  re-deriving the matrix. A wrong code inserts zero rows, never an error.
 
 ## A `_client_for` fixture's permission list must mirror the PRODUCTION role's grants
 

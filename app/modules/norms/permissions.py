@@ -14,7 +14,7 @@ TARIFFS_PUBLISH = "norms.tariffs.publish"
 register(
     {
         NORMS_MANAGE: "Create and edit draft norms for a contour (GIS/norms specialist)",
-        NORMS_APPROVE: "Approve a norm submitted for review (leshoz leadership)",
+        NORMS_APPROVE: "Approve a norm submitted for review (executor_head — the leshoz head)",
         NORMS_PUBLISH: "Publish an approved norm (central office, VMQ 689)",
         TARIFFS_MANAGE: "Create and edit draft tariffs and rule parameters (maker)",
         TARIFFS_PUBLISH: "Publish a tariff or rule parameter (checker, central office)",

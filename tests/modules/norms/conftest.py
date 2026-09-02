@@ -270,9 +270,14 @@ async def other_zone_publisher_client(
 
 
 @pytest.fixture
-async def leadership_client(db: AsyncSession, leshoz) -> AsyncIterator[httpx.AsyncClient]:
-    """The raҳbar: approves, and also HOLDS `norms.publish` — migration 0011
-    grants both to the `leadership` role in production. Ruling 16's split
+async def executor_head_client(db: AsyncSession, leshoz) -> AsyncIterator[httpx.AsyncClient]:
+    """The raҳbar — role code `executor_head`, «Ваколатли шахс», the LESHOZ head
+    (renamed from `leadership_client` by decision #59: `leadership` is «Агентлик
+    раҳбарияти» and tz/03 gives it view+export only, so the old name named the
+    wrong actor). Approves, and also HOLDS `norms.publish` — migration 0016
+    grants `norms.approve` to `executor_head`, and `norms.publish` still sits
+    with `leadership`/`central_admin`, which is why this fixture carries it as a
+    personal grant rather than by role. Ruling 16's split
     lives in the SERVICE, on top of that grant, not in what this actor may
     reach: in the default 'central' scope the grant sits unused (a
     zone-scoped actor is refused regardless of holding the permission — the
