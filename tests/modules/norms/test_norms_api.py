@@ -72,7 +72,7 @@ async def test_the_list_filters_by_activity_type_and_status(
 
 async def test_patch_is_allowed_in_draft_and_review_but_refused_once_approved(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     survey_doc,
@@ -103,7 +103,7 @@ async def test_patch_is_allowed_in_draft_and_review_but_refused_once_approved(
     assert patched_review.status_code == 200, patched_review.text
     assert patched_review.json()["yield_c_per_ha"] == "16.0000"
 
-    approved = await leadership_client.post(
+    approved = await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
     assert approved.status_code == 200, approved.text
@@ -123,7 +123,7 @@ async def test_getting_an_unknown_id_is_a_404(gis_specialist_client: AsyncClient
 
 async def test_archiving_a_published_norm_closes_its_effective_to(
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
@@ -139,13 +139,13 @@ async def test_archiving_a_published_norm_closes_its_effective_to(
     norm_id = created.json()["id"]
     assert created.json()["effective_to"] is None
     await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-    await leadership_client.post(
+    await executor_head_client.post(
         f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
     )
     published = await central_admin_client.post(f"/api/v1/norms/{norm_id}/publish")
     assert published.status_code == 200, published.text
 
-    archived = await leadership_client.post(f"/api/v1/norms/{norm_id}/archive")
+    archived = await executor_head_client.post(f"/api/v1/norms/{norm_id}/archive")
     assert archived.status_code == 200, archived.text
     assert archived.json()["status"] == "archived"
     assert archived.json()["effective_to"] is not None

@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     workers_mode: Literal["embedded", "off"] = "embedded"
     oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
     oneid_scope: str = "mock-scope"
+    # Payme JSON-RPC server (stage 3.10a, design/04 §3). "mock" points at
+    # Payme's own SANDBOX cashbox key, not a fake — see
+    # integrations/adapters/payme.py's own docstring.
+    payme_mode: Literal["mock", "real"] = "mock"
+    payme_merchant_id: str | None = None
+    payme_cashbox_key: str | None = None
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:
@@ -57,7 +63,7 @@ class Settings(BaseSettings):
         if self.app_env == "prod":
             mocked = [
                 name
-                for name in ("oneid_mode", "eimzo_mode", "sms_mode", "email_mode")
+                for name in ("oneid_mode", "eimzo_mode", "sms_mode", "email_mode", "payme_mode")
                 if getattr(self, name) == "mock"
             ]
             if mocked:
@@ -83,6 +89,8 @@ class Settings(BaseSettings):
             )
         if self.email_mode == "real" and not all((self.smtp_host, self.smtp_from)):
             raise ValueError("email_mode=real requires smtp_host and smtp_from")
+        if self.payme_mode == "real" and not all((self.payme_merchant_id, self.payme_cashbox_key)):
+            raise ValueError("payme_mode=real requires payme_merchant_id and payme_cashbox_key")
         return self
 
     def resolve_cookie_secure(self) -> bool:

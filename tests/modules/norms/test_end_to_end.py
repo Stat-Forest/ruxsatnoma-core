@@ -25,7 +25,7 @@ async def test_a_leshoz_publishes_a_norm_and_an_applicant_gets_a_priced_answer(
     tariffs_maker_client: AsyncClient,
     tariffs_checker_client: AsyncClient,
     gis_specialist_client: AsyncClient,
-    leadership_client: AsyncClient,
+    executor_head_client: AsyncClient,
     central_admin_client: AsyncClient,
     applicant_client: AsyncClient,
     published_contour: Contour,
@@ -79,7 +79,7 @@ async def test_a_leshoz_publishes_a_norm_and_an_applicant_gets_a_priced_answer(
         )
         norm_id = norm.json()["id"]
         await gis_specialist_client.post(f"/api/v1/norms/{norm_id}/submit-review")
-        await leadership_client.post(
+        await executor_head_client.post(
             f"/api/v1/norms/{norm_id}/approve", json={"approval_doc_id": str(approval_doc.id)}
         )
         in_force = await central_admin_client.post(f"/api/v1/norms/{norm_id}/publish")

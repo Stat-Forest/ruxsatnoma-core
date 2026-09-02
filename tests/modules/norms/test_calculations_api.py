@@ -13,8 +13,11 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.applications.models import Application
+from app.modules.auth.models import Applicant
 from app.modules.gis.models import Contour
 from app.modules.norms.models import Calculation
+from tests.modules.auth.test_sessions import make_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -114,8 +117,29 @@ async def test_the_history_for_an_application_lists_newest_first(
     row for the application"), so the filter and its ordering still need
     cover — but `POST` no longer accepts an `application_id` (I4), so the two
     rows are inserted the way STAGE 3.9 will write them, not through the
-    route. The read side is unchanged by that fix and must keep working."""
-    application_id = uuid.uuid4()
+    route. The read side is unchanged by that fix and must keep working.
+
+    `application_id` now needs a real `applications` row: stage 3.9a's
+    migration 0015 closed `calculations.application_id`'s deferred FK (this
+    test predates `applications` and originally used a bare `uuid.uuid4()`).
+    The listing route filters by `application_id` alone with no ownership
+    check (`norms/repo.py`), so this synthetic applicant need not match
+    `applicant_client`'s own identity."""
+    owner = await make_user(db, role_code="applicant", pinfl=f"1{uuid.uuid4().int % 10**13:013d}")
+    applicant = Applicant(
+        kind="individual", pinfl=owner.pinfl, name=owner.full_name, owner_user_id=owner.id
+    )
+    db.add(applicant)
+    await db.flush()
+    application = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=owner.id,
+        on_behalf="self",
+        channel="portal",
+    )
+    db.add(application)
+    await db.flush()
+    application_id = application.id
     written = []
     for amount in (Decimal("1000"), Decimal("2000")):
         row = Calculation(

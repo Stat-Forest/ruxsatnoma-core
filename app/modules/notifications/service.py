@@ -300,6 +300,21 @@ async def notify(
     return created
 
 
+async def already_notified(
+    db: AsyncSession, *, event_code: str, object_id: uuid.UUID, channel: str = "inapp"
+) -> bool:
+    """Whether `object_id` already has a `channel` notification for `event_code`
+    — the once-only check a periodic job needs before calling `notify()` again
+    for the same object (module boundary: a caller outside `notifications` may
+    not query `Notification` directly). `inapp` (the default) is the right
+    channel to check: `notify()` always writes it, unlike `sms`/`email`, which
+    an unreachable recipient or the kill switch can skip — so it is the one
+    channel guaranteed present after a successful call, no new column needed."""
+    return await repo.notification_exists(
+        db, event_code=event_code, object_id=object_id, channel=channel
+    )
+
+
 async def list_inbox(
     db: AsyncSession, *, user_id: uuid.UUID, unread_only: bool, page: int, page_size: int
 ) -> tuple[list[Notification], int]:
@@ -344,7 +359,19 @@ async def _deliver(db: AsyncSession, payload: dict[str, Any]) -> None:
     and then be overwritten by the `sent` write below — the report silently lost
     rather than dead-lettered. The callback now waits instead.
     """
-    row = await db.get(Notification, uuid.UUID(payload["notification_id"]), with_for_update=True)
+    # populate_existing pairs with EVERY locking `db.get` (final review C2, on
+    # `applications.repo`): the lock is taken, but the loader refreshes only
+    # unloaded attributes on an instance the session already holds, and
+    # `expire_on_commit=False` never expires them — so the lock would be held over
+    # a stale copy. Unreachable here today (the outbox opens one session per
+    # message, so this row is never already cached) and kept uniform anyway;
+    # `tests/test_code_conventions.py` enforces the pairing.
+    row = await db.get(
+        Notification,
+        uuid.UUID(payload["notification_id"]),
+        with_for_update=True,
+        populate_existing=True,
+    )
     if row is None:
         logger.warning("notification.vanished", notification_id=payload["notification_id"])
         return

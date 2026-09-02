@@ -66,4 +66,4 @@ async def test_downgrade_upgrade_roundtrip(engine):
     await asyncio.to_thread(command.upgrade, cfg, "head")
     async with engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-    assert version == "0014"
+    assert version == "0018"

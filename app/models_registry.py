@@ -10,7 +10,9 @@ import app.modules.admin.models  # noqa: F401
 import app.modules.audit.models  # noqa: F401
 import app.modules.auth.models  # noqa: F401
 import app.modules.integrations.models  # noqa: F401
+from app.modules.applications import models as applications_models  # noqa: F401
 from app.modules.gis import models as gis_models  # noqa: F401
 from app.modules.norms import models as norms_models  # noqa: F401
 from app.modules.notifications import models as notifications_models  # noqa: F401
+from app.modules.payments import models as payments_models  # noqa: F401
 from app.modules.signatures import models as signatures_models  # noqa: F401

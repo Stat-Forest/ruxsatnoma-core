@@ -12,6 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+# Branch 1 of 3.9a-applications-core ships no router.py yet, so nothing else
+# imports applications.permissions and register() never runs. Stand in until
+# applications/router.py lands and imports it itself, the way every other
+# module's router does (gis, norms, signatures, ...).
+import app.modules.applications.permissions  # noqa: F401
 from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
@@ -19,6 +24,7 @@ from app.core.health import router as health_router
 from app.core.idempotency import StoredIdempotentResponse
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
 from app.db import make_engine, make_session_factory
+from app.event_subscriptions import register_event_subscriptions
 from app.files_router import router as files_router
 from app.modules.admin.announcements_router import admin_router as announcements_admin_router
 from app.modules.admin.announcements_router import router as announcements_router
@@ -36,6 +42,8 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.payments.payme_router import router as payme_router
+from app.modules.payments.router import router as payments_router
 from app.modules.signatures.router import router as signatures_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -93,6 +101,7 @@ def _error_body(request: Request, code: str, message: str, details: dict | None)
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_format)
+    register_event_subscriptions()
     # API docs/schema are a dev convenience, not something to expose in test/prod
     # (stage 3.3b): app_env=dev is the only state that turns them on.
     docs_enabled = settings.app_env == "dev"
@@ -213,5 +222,7 @@ def create_app() -> FastAPI:
     app.include_router(norms_router, prefix="/api/v1")
     app.include_router(norms_calc_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
+    app.include_router(payments_router, prefix="/api/v1")
+    app.include_router(payme_router, prefix="/api/v1")
 
     return app
