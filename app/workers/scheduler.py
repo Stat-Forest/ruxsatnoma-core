@@ -57,6 +57,14 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         coalesce=True,
     )
     sched.add_job(
+        _wrap(factory, jobs.expire_invoices),
+        CronTrigger(hour=0, minute=25, timezone=TIMEZONE),
+        next_run_time=now,
+        id="expire_invoices",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    sched.add_job(
         _wrap(factory, jobs.alert_dead_outbox),
         IntervalTrigger(minutes=5, timezone=TIMEZONE),
         next_run_time=now,

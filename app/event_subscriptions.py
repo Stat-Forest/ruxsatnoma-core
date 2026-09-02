@@ -20,8 +20,12 @@ otherwise-unrelated entry points both import purely for its registration side
 effect, never for a return value.
 """
 
+from app.core import events
+from app.modules.applications import events as application_events
+from app.modules.payments import subscribers as payments_subscribers
+
 # The bus names this file subscribes to, as literal strings. `payments` (3.10a)
-# will declare `PAYMENT_CONFIRMED = "payment_confirmed"` in its own
+# declares the same `PAYMENT_CONFIRMED = "payment_confirmed"` in its own
 # `events.py` — and importing it from there is exactly what may not happen:
 # `payments` and `permits` are both level 4 and neither may import the other
 # (design/01 rule 3). Matching by string is the whole reason the bus exists.
@@ -34,10 +38,12 @@ PAYMENT_CONFIRMED = "payment_confirmed"
 def register_event_subscriptions() -> None:
     """Every `core.events.subscribe(...)` call in the system lives here and
     nowhere else (design/01 rule 4), so no module imports another for the sake
-    of an event. The publishers land with the application flow; the subscribers
-    are 3.10a `payments` (application_approved -> issue an invoice) and 3.11
-    `permits` (payment_confirmed -> tell the executor a permit is due — it
-    NOTIFIES only, ruling 19: issuance is a human act).
+    of an event. The publishers land with the application flow. 3.10a
+    `payments` is the first subscriber (task 2): `APPLICATION_APPROVED` issues
+    an invoice, `APPLICATION_CANCELLED` cancels any in-force one. 3.11a
+    `permits` is the second (payment_confirmed -> tell the executor a permit is
+    due — it NOTIFIES only, ruling 19: issuance is a human act), and it also
+    fills the two provider seams below.
 
     Safe to call more than once per process — `subscribe` itself is idempotent
     per `(event_name, handler)` pair (`app/core/events.py`) — because both
@@ -51,6 +57,12 @@ def register_event_subscriptions() -> None:
     from app.core.events import subscribe
     from app.modules.permits import subscribers as permits_subscribers
 
+    events.subscribe(
+        application_events.APPLICATION_APPROVED, payments_subscribers.on_application_approved
+    )
+    events.subscribe(
+        application_events.APPLICATION_CANCELLED, payments_subscribers.on_application_cancelled
+    )
     subscribe(PAYMENT_CONFIRMED, permits_subscribers.on_payment_confirmed)
     _register_providers()
 

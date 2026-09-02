@@ -161,6 +161,13 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "permit_head,permit_chief_forester,permit_accountant,permit_recipient",
             "Purposes that must all be signed before a permit may become ACTIVE (C11)",
         ),
+        SettingSpec(
+            "payme_cashbox_key_hash",
+            str,
+            "",
+            "SHA-256 hex digest of the rotated Payme cashbox key (empty means "
+            "PAYME_CASHBOX_KEY is still authoritative)",
+        ),
     )
 }
 
@@ -246,3 +253,27 @@ async def get_bool(db: AsyncSession, key: str) -> bool:
     value = await get_setting(db, key)
     assert isinstance(value, bool)  # SETTING_SPECS guarantees the type
     return value
+
+
+async def set_setting(db: AsyncSession, key: str, raw_value: Any) -> None:
+    """Write an override with NO ACTOR — the level-0 counterpart to
+    `admin.service.update_setting` for a caller that has no `User` at all
+    (first caller: `payments.payme.ChangePassword`, a Payme RPC call).
+    `admin.service` is deliberately left untouched rather than refactored to
+    share this: core imports no domain modules, so audit logging stays the
+    acting module's own job — this function only coerces (the same
+    `coerce()` the admin surface uses) and writes the row; it does NOT
+    invalidate the cache or audit, both of which the caller does itself,
+    explicitly, in its own acting module."""
+    spec = SETTING_SPECS.get(key)
+    if spec is None:
+        raise KeyError(f"unknown setting: {key!r}")  # programming error, not user input
+    value = coerce(spec, raw_value)  # raises ERR-VAL-001 on bad input
+    row = await db.get(SystemSetting, key)
+    if row is None:
+        row = SystemSetting(key=key, value=value, description=spec.description)
+        db.add(row)
+    else:
+        row.value = value
+    row.updated_by = None
+    await db.flush()
