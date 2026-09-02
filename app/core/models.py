@@ -3,7 +3,8 @@
 `system_settings` lives here (stage 3.3a ruling 8) so that level-1 `auth` can read
 session/lockout policy without importing level-1 `admin` (that would be a cycle:
 `admin` already calls `auth`). Writes go through `admin.service.update_setting`.
-Later inhabitants of this file: `number_counters`.
+`number_counters` (stage 3.9a) is the race-free source of the public numbers
+(RX/INV/VC/MR/ST/ChT) — issuing itself is `core/numbers.py`, a later task.
 """
 
 import uuid
@@ -75,3 +76,23 @@ class IdempotencyKey(Base):
     response_status: Mapped[int | None]
     response_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class NumberCounter(Base):
+    """One row per (prefix:year) scope — the public-number series (RX/INV/VC/MR/ST/ChT;
+    permit series have their own `permit_counters` in `permits`). No `id`/`created_at`
+    — `scope` is itself the natural key, the same shape as `SystemSetting` above.
+
+    `app.core.numbers.next_public_number` is the ONLY writer, and it is not an
+    `UPDATE ... RETURNING`: it does `INSERT ... ON CONFLICT DO NOTHING` to create the
+    year's row, then `SELECT ... FOR UPDATE` and increments in Python, inside the
+    caller's transaction (plan 03.9a ruling 5а). Both shapes are race-free, so the
+    difference is not safety — it is that the lock is held to the caller's COMMIT, so
+    a submission that fails afterwards rolls its number back and the year's numbering
+    has no holes. Do not hand-roll the `UPDATE ... RETURNING` beside it: it would
+    escape the shared scope-key convention and lose that rollback-reuse property."""
+
+    __tablename__ = "number_counters"
+
+    scope: Mapped[str] = mapped_column(primary_key=True)
+    last_value: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")

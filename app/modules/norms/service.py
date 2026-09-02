@@ -5,9 +5,10 @@ with maker-checker — so they share one implementation, keyed by a small
 descriptor. Norms have their own five-status lifecycle (Task 4).
 
 Public surface for levels 4+ (applications 3.9, payments 3.10, permits 3.11):
-preview(), save_calculation(), effective_norm(), run_checks(), LOAD_PROVIDERS
-— see the dedicated section near the end of this module for what a caller at
-those levels may and may not do with them."""
+preview(), save_calculation(), effective_norm(), run_checks(),
+latest_calculation(), LOAD_PROVIDERS — see the dedicated section near the end
+of this module for what a caller at those levels may and may not do with
+them."""
 
 import uuid
 from collections.abc import Awaitable, Callable
@@ -876,16 +877,17 @@ async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calcul
 # --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
 # 3.10, permits 3.11) ---------------------------------------------------------
 #
-# Seven entry points, and nothing else: `preview` and `save_calculation`
+# Eight entry points, and nothing else: `preview` and `save_calculation`
 # above (Task 7), `LOAD_PROVIDERS` and `committed_load_sb` above (Task 4,
 # ruling 12 — the seam and the reader over it are two separate things a
-# caller touches, not one), `effective_norm`/`run_checks` right below, and
-# `calculator.from_input_snapshot` (I9) — VERIFICATION only, rebuilding the
-# request/snapshot pair to confirm a stored row still recomputes to the same
-# numbers, never for pricing a new one. A level-4+ caller must NEVER:
+# caller touches, not one), `effective_norm`/`run_checks`/`latest_calculation`
+# right below, and `calculator.from_input_snapshot` (I9) — VERIFICATION only,
+# rebuilding the request/snapshot pair to confirm a stored row still
+# recomputes to the same numbers, never for pricing a new one. A level-4+
+# caller must NEVER:
 #   - import `norms.repo` (or any other private module here) directly — every
 #     fact it could read that way is already reachable through one of the
-#     seven, the same reason a level-3 module reaches `gis` only through
+#     eight, the same reason a level-3 module reaches `gis` only through
 #     `gis.service` (module boundary, CLAUDE.md);
 #   - read `tariffs`/`rule_parameters`/`norms` as tables of its own — a rate
 #     or a limit is only ever correct as of the SNAPSHOT `preview`/
@@ -906,7 +908,12 @@ async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calcul
 # the money" path (`_limit_check`'s docstring) — so a reviewer can see whether
 # a request is admissible at all without ever pricing it, and a missing
 # coefficient can never turn an admissibility screen into an error the way
-# pricing legitimately would.
+# pricing legitimately would. `latest_calculation` (Task 8, applications plan
+# 03.9a ruling C6) is the newest `calculations` row for an application — what
+# 3.10 builds its invoice from, and `applications.service.current_calculation`
+# delegates here rather than querying `calculations` itself. Like
+# `effective_norm`, it is NOT a permission-checked read: the caller is
+# another SERVICE inside this process, not an HTTP actor.
 
 
 async def effective_norm(
@@ -943,3 +950,16 @@ async def run_checks(db: AsyncSession, *, payload: CalculationIn) -> list[checks
         snapshot=snapshot,
         used_sb=None,
     )
+
+
+async def latest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Calculation | None:
+    """The newest `calculations` row for this application, or `None` — what
+    3.10 builds its invoice from (`applications.service.current_calculation`
+    delegates here, ruling C6: `applications` may not query `calculations`
+    itself, nor import `norms.repo`). Not a permission-checked read: the
+    caller is another SERVICE inside this process, same as `effective_norm`.
+    `repo.newest_calculation` shares `list_calculations`'s ordering (newest
+    first, `id` tie-break since uuid7 is time-ordered) but skips its
+    `COUNT(*)` (review M3) — this runs once per invoice build and the total
+    is never used here."""
+    return await repo.newest_calculation(db, application_id)

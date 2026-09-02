@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.db import make_engine, make_session_factory
+from app.event_subscriptions import register_event_subscriptions
 from app.workers.outbox import run_outbox_loop
 from app.workers.scheduler import run_scheduler
 
@@ -44,6 +45,14 @@ async def run_all(
 def main(only: str | None = None) -> None:
     settings = get_settings()
     configure_logging(settings.log_format)
+    # A standalone process never calls app.main.create_app(), so nothing else
+    # wires up the bus's subscribers here — without this, a handler a future
+    # stage adds (3.10a's invoice issuer, 3.11's permit issuer) would silently
+    # never run for an event published from this process (a scheduled job in
+    # app/workers/jobs.py, the outbox loop), even though the embedded
+    # deployment (workers_mode=embedded) fires it correctly, since that path
+    # goes through create_app() first (review round 1, finding I2).
+    register_event_subscriptions()
 
     async def _run() -> None:
         engine = make_engine(settings.database_url)
