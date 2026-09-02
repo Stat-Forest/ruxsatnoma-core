@@ -10,7 +10,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import ColumnElement, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
@@ -273,8 +273,11 @@ async def committed_sb_load(
     return Decimal(total or 0)
 
 
-async def permits_ending_before(db: AsyncSession, day: date, *, status: str) -> list[Permit]:
-    """Permits in `status` whose period has run out before `day`, locked.
+async def permits_ending_before(
+    db: AsyncSession, day: date, *, status: str, limit: int, after_id: uuid.UUID | None = None
+) -> list[Permit]:
+    """One BATCH of permits in `status` whose period has run out before `day`,
+    locked, in id order after `after_id`.
 
     `period_to < day` and never `<=`: `permits.period_to` is INCLUSIVE, so a
     permit ending today is still in force today (`tz/05`). `day` is the caller's
@@ -289,31 +292,51 @@ async def permits_ending_before(db: AsyncSession, day: date, *, status: str) -> 
     an instance already in the identity map was holding (lesson), and the sweep
     would decide on a stale status under a correct lock.
 
+    **`limit` + `after_id` is a keyset cursor, not a page number.** Those
+    `FOR UPDATE` locks are held until the caller commits, so the batch size is
+    what bounds how long a swept permit is unavailable to anything else (review,
+    Important 3) — and the cursor, not `OFFSET`, is what lets the worker resume
+    after a batch it could not finish. A row that has been expired leaves the
+    result set anyway, so ids only ever move forward and nothing is visited twice.
+
     Permits, then applications: `service.add_signature` locks in that order and
     it is the only lock ordering anywhere in `app/` — a sweep that took an
     application lock first would close the cycle.
     """
+    conditions: list[ColumnElement[bool]] = [Permit.status == status, Permit.period_to < day]
+    if after_id is not None:
+        conditions.append(Permit.id > after_id)
     rows = await db.execute(
         select(Permit)
-        .where(Permit.status == status, Permit.period_to < day)
+        .where(*conditions)
         .order_by(Permit.id)
+        .limit(limit)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     return list(rows.scalars().all())
 
 
-async def permits_in_statuses(db: AsyncSession, statuses: Sequence[str]) -> list[Permit]:
-    """Every permit that has reached one of `statuses` — the closure sweep's
-    candidate set (`expired`/`revoked`).
+async def permits_in_statuses(
+    db: AsyncSession, statuses: Sequence[str], *, limit: int, after_id: uuid.UUID | None = None
+) -> list[Permit]:
+    """One BATCH of the permits that have reached one of `statuses` — the closure
+    sweep's candidate set (`expired`/`revoked`) — in id order after `after_id`.
 
-    Unlocked and unbounded, both deliberate. Unlocked: the sweep does not write
-    the permit at all, it moves the APPLICATION, and the lock that matters is the
-    one `applications.service.set_status` takes on the row it does write.
-    Unbounded: the set is everything finished and not yet archived, and 4.7's
-    archival (`* -> ARCHIVED`) is what trims it — a LIMIT here would instead cap
-    how many permits may finish in one day, and grazing seasons end on the same
-    date for whole districts at a time.
+    Unlocked: the sweep does not write the permit at all, it moves the
+    APPLICATION, and the lock that matters is the one
+    `applications.service.set_status` takes on the row it does write.
+
+    `limit` bounds the TRANSACTION, not the day: unlike the expiry sweep this
+    candidate set does NOT shrink as the work is done (a closed application
+    leaves its permit exactly where it was), so the worker keeps asking with the
+    cursor advanced until a short batch says the set is drained. A LIMIT with no
+    cursor would have been the thing worth refusing — it would cap how many
+    permits may finish in one day, and grazing seasons end on the same date for
+    whole districts at a time.
     """
-    rows = await db.execute(select(Permit).where(Permit.status.in_(statuses)).order_by(Permit.id))
+    conditions: list[ColumnElement[bool]] = [Permit.status.in_(statuses)]
+    if after_id is not None:
+        conditions.append(Permit.id > after_id)
+    rows = await db.execute(select(Permit).where(*conditions).order_by(Permit.id).limit(limit))
     return list(rows.scalars().all())

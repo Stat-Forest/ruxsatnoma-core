@@ -24,6 +24,13 @@ class _Bucket:
 
 
 _buckets: dict[tuple[str, str], _Bucket] = {}
+# How many buckets each scope holds. Derivable from `_buckets` — and derived on
+# every request is exactly what it may not be: the sweep gate below has to answer
+# "is any ONE scope over its cap", and scanning the dict for that would put an
+# O(n) walk on the event loop for every rate-limited request. Kept in step by
+# `consume` (the only creator) and `_drop` (the only remover), so the two cannot
+# disagree; `test_the_scope_counts_stay_in_step_with_the_buckets` pins it.
+_scope_counts: dict[str, int] = {}
 _last_sweep: float = 0.0
 
 # Eviction (3.11a t5, review I1/I3). Until the public QR check, every scope here
@@ -53,6 +60,15 @@ _last_sweep: float = 0.0
 # leaving it uncapped only restores the leak on the scope that matters most. The
 # DB-backed per-account `login_max_attempts` lockout is a different control on a
 # different key and is untouched either way.
+#
+# **What this does NOT close.** A flood against `/auth/login` ITSELF still evicts
+# a victim's burned login bucket — same scope, so the cap pass reaches it. The
+# attacker now has to spend `MAX_BUCKETS` distinct addresses on the guarded route
+# instead of the free, unauthenticated QR page, and the per-account
+# `login_max_attempts` lockout in the database still applies to the account they
+# are actually after. That is a real reduction in reach, not a closure, and the
+# only thing that would close it is per-scope state an attacker cannot enlarge —
+# shared storage (Redis), which decision #36 has deferred.
 BUCKET_IDLE_SECONDS = 60.0
 MAX_BUCKETS = 20_000
 SWEEP_EVERY_SECONDS = 1.0
@@ -62,13 +78,26 @@ def reset() -> None:
     """Tests only: forget every bucket."""
     global _last_sweep
     _buckets.clear()
+    _scope_counts.clear()
     _last_sweep = 0.0
+
+
+def _drop(key: tuple[str, str]) -> None:
+    """The ONLY place a bucket is removed, so `_scope_counts` cannot drift from
+    `_buckets`. A scope that falls to zero loses its entry rather than keeping a
+    `0`, which is what lets `max(...)` below read the live maximum."""
+    del _buckets[key]
+    remaining = _scope_counts[key[0]] - 1
+    if remaining:
+        _scope_counts[key[0]] = remaining
+    else:
+        del _scope_counts[key[0]]
 
 
 def _sweep(now: float, keep: tuple[str, str]) -> None:
     """Drop refilled buckets, then trim each SCOPE to `MAX_BUCKETS`. Cheap and
-    amortised: at most once a `SWEEP_EVERY_SECONDS`, or immediately whenever the
-    dict is already over the cap — the one case where waiting is the wrong answer.
+    amortised: at most once a `SWEEP_EVERY_SECONDS`, or immediately whenever some
+    scope is already over its cap — the one case where waiting is the wrong answer.
 
     The TTL pass stays global, and safely so: a bucket idle for `BUCKET_IDLE_
     SECONDS` has refilled to full, and deleting a full bucket is exactly
@@ -77,13 +106,14 @@ def _sweep(now: float, keep: tuple[str, str]) -> None:
     scope that overflowed. Trimming across scopes made the open QR route a reset
     button for `/auth/login` (ruling T5-e, the comment above `MAX_BUCKETS`).
 
-    The gate stays the ORIGINAL `len(_buckets) > MAX_BUCKETS`, deliberately: it is
-    O(1) and, with per-scope caps, now merely conservative — the dict may legally
-    sit above it (k scopes x `MAX_BUCKETS`) and then sweep more often than once a
-    second. That trade is the right way round. Reading it per scope would need a
-    scan on every request, and loosening it to `MAX_BUCKETS * scopes` would let a
-    single-scope flood mint that many entries before the backstop fires at all —
-    the memory bound is what this gate is for.
+    **The gate asks about one scope, not about the dict.** With per-scope caps the
+    dict may legally sit at k scopes x `MAX_BUCKETS`, so the old whole-dict test
+    (`len(_buckets) > MAX_BUCKETS`) would be permanently true in the ordinary
+    post-flood steady state — the QR scope at its cap plus a single login bucket —
+    and every request would then run this whole body, freeing nothing: an O(n) TTL
+    walk plus an O(n) regroup, on the event loop, indefinitely (review, Important
+    2). `max(_scope_counts.values())` is O(number of scopes), a handful, and it is
+    false exactly when there is nothing for the cap pass to do.
 
     `keep` is the caller's OWN bucket, exempt from both passes. It is the newest
     entry and a zero-second-old one, so under the production values neither pass
@@ -92,13 +122,17 @@ def _sweep(now: float, keep: tuple[str, str]) -> None:
     arithmetic that a smaller configured TTL would quietly break.
     """
     global _last_sweep
-    if now - _last_sweep < SWEEP_EVERY_SECONDS and len(_buckets) <= MAX_BUCKETS:
+    if now - _last_sweep < SWEEP_EVERY_SECONDS and not _some_scope_over_cap():
         return
     _last_sweep = now
     for key in [
         k for k, b in _buckets.items() if k != keep and now - b.updated >= BUCKET_IDLE_SECONDS
     ]:
-        del _buckets[key]
+        _drop(key)
+    # The regroup is the expensive half and buys nothing when the TTL pass has
+    # already brought every scope back under its cap — the common case by far.
+    if not _some_scope_over_cap():
+        return
     by_scope: dict[str, list[tuple[str, str]]] = {}
     for key in _buckets:
         by_scope.setdefault(key[0], []).append(key)
@@ -107,7 +141,12 @@ def _sweep(now: float, keep: tuple[str, str]) -> None:
             continue
         stale = [k for k in sorted(keys, key=lambda k: _buckets[k].updated) if k != keep]
         for key in stale[: len(keys) - MAX_BUCKETS]:
-            del _buckets[key]
+            _drop(key)
+
+
+def _some_scope_over_cap() -> bool:
+    """Is any single scope above `MAX_BUCKETS`? O(scopes), not O(buckets)."""
+    return max(_scope_counts.values(), default=0) > MAX_BUCKETS
 
 
 async def consume(request: Request, db: AsyncSession, *, scope: str, setting_key: str) -> None:
@@ -127,6 +166,8 @@ async def consume(request: Request, db: AsyncSession, *, scope: str, setting_key
     if bucket is None:
         bucket = _Bucket(tokens=float(per_minute), updated=now)
         _buckets[(scope, ip)] = bucket
+        # The only place a bucket is created, matching `_drop`'s sole removal.
+        _scope_counts[scope] = _scope_counts.get(scope, 0) + 1
     else:
         bucket.tokens = min(
             float(per_minute), bucket.tokens + (now - bucket.updated) * per_minute / 60.0

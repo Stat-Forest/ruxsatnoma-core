@@ -183,12 +183,16 @@ async def test_load_sums_overlapping_active_permits_only(
     assert apart == Decimal("0")
 
 
-async def test_load_counts_a_period_that_only_touches_at_one_end(
+async def test_load_counts_a_period_that_only_touches_the_permits_last_day(
     db: AsyncSession, contour: Contour, active_permit_on_contour: Permit
 ) -> None:
     """`period_to` is inclusive on both sides of the comparison: a request
     starting on the permit's last day still shares that day with it, and heads
-    grazing the same hectares on the same day are committed twice over."""
+    grazing the same hectares on the same day are committed twice over.
+
+    The RIGHT edge, exercising `Permit.period_to >= :period_from` alone — the
+    permit begins before the request either way, so the other half of the
+    predicate is true in both asserts and cannot be what decides them."""
     from app.modules.permits import service
 
     assert await service.load_provider(
@@ -197,6 +201,30 @@ async def test_load_counts_a_period_that_only_touches_at_one_end(
     assert await service.load_provider(
         db, contour.id, date(2027, 10, 1), date(2027, 12, 31)
     ) == Decimal("0")
+
+
+async def test_load_ignores_a_period_that_ends_before_the_permit_begins(
+    db: AsyncSession, contour: Contour, active_permit_on_contour: Permit
+) -> None:
+    """The LEFT edge, and the half of the predicate nothing else reaches: both
+    asserts here run entirely before the permit's own `period_to`, so
+    `Permit.period_to >= :period_from` is true in each and only
+    `Permit.period_from <= :period_to` can decide them. Deleted, that clause
+    left every other test in this file green (review, Important 1) — a spring
+    request would then have carried the whole summer's committed load, and the
+    limit check would have refused a herd the contour had room for.
+
+    The permit runs 2027-05-01..2027-09-30: a request ending the day before it
+    opens shares nothing with it, and one ending on its first day shares that
+    day."""
+    from app.modules.permits import service
+
+    assert await service.load_provider(
+        db, contour.id, date(2027, 1, 1), date(2027, 4, 30)
+    ) == Decimal("0")
+    assert await service.load_provider(
+        db, contour.id, date(2027, 1, 1), date(2027, 5, 1)
+    ) == Decimal("40.0000")
 
 
 async def test_a_suspended_permit_commits_no_load(

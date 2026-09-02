@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.models import MediaFile
 from app.core.time import business_today
 from app.modules.admin.models import Organization
-from app.modules.applications.models import Application
+from app.modules.applications.models import Application, ApplicationStatusHistory
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.notifications.models import Notification
 from app.modules.permits import events
@@ -390,3 +390,188 @@ async def test_an_expired_permit_frees_the_area_it_held(
 
     after = await service.occupancy_provider(db, [contour.id])
     assert after.get(contour.id, Decimal("0")) == Decimal("0")
+
+
+# --- review, Important 3: batches, cursors and one bad row --------------------
+
+
+async def _expiring(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    activity_type_id: uuid.UUID,
+    count: int,
+) -> list[Permit]:
+    return [
+        await _permit(
+            db,
+            contour=contour,
+            version_id=version_id,
+            org=leshoz,
+            activity_type_id=activity_type_id,
+            status="active",
+            period_to=business_today() - timedelta(days=1),
+        )
+        for _ in range(count)
+    ]
+
+
+@pytest.fixture
+async def sentinel_permit(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+) -> Permit:
+    """A permit created BEFORE the ones a batching test cares about, used only as
+    the `after_id` those tests start from.
+
+    `permits.id` is `uuid7` and therefore time-ordered, so a cursor set here
+    excludes every row that already existed — this database is shared and
+    persistent and a stranger's stale `active` permit would otherwise be the one
+    a `limit=2` batch picked up (lesson). Its own status keeps it out of the
+    candidate set regardless."""
+    return await _permit(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="pending_signatures",
+        period_to=business_today() - timedelta(days=1),
+    )
+
+
+async def test_a_batch_stops_at_its_limit_and_says_where_to_resume(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+    sentinel_permit: Permit,
+) -> None:
+    """The keyset cursor the worker drains with. A batch reports how many
+    CANDIDATES it saw — not how many it acted on — because that is the only
+    number that can say "the queue is drained", and `last_id` is where the next
+    transaction resumes. Without both, the sweep either stops early or holds
+    every swept permit's row lock in one transaction (review, Important 3)."""
+    from app.modules.permits import jobs
+
+    permits = await _expiring(db, contour, version_id, leshoz, grazing_activity_id, 3)
+    ordered = sorted(permits, key=lambda p: p.id)
+    assert sentinel_permit.id < ordered[0].id, "uuid7 ids must be time-ordered for the cursor"
+
+    first = await jobs.expire_permits(db, limit=2, after_id=sentinel_permit.id)
+    assert (first.scanned, first.processed, first.failed) == (2, 2, 0)
+    assert first.last_id == ordered[1].id
+
+    second = await jobs.expire_permits(db, limit=2, after_id=first.last_id)
+    assert (second.scanned, second.processed) == (1, 1), "a short batch means drained"
+    assert second.last_id == ordered[2].id
+
+    for permit in permits:
+        await db.refresh(permit)
+    assert {p.status for p in permits} == {"expired"}
+    await db.refresh(sentinel_permit)
+    assert sentinel_permit.status == "pending_signatures"
+
+
+async def test_one_bad_row_does_not_cost_its_batch(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+    sentinel_permit: Permit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each row runs inside its own SAVEPOINT. A bare failure would poison the
+    transaction for every row after it (lesson: recovering from a failed
+    statement to keep writing on the same session needs a SAVEPOINT), so one
+    permit with, say, no resolvable recipient would cost the whole night's
+    sweep. Here it costs itself: it stays `active` and is a candidate again
+    tomorrow, its neighbours expire, and the batch reports it."""
+    from app.modules.permits import jobs, service
+
+    permits = sorted(
+        await _expiring(db, contour, version_id, leshoz, grazing_activity_id, 3),
+        key=lambda p: p.id,
+    )
+    doomed = permits[1]
+    # `doomed.id`, read now. The stub below runs AFTER the failing row's SAVEPOINT
+    # has rolled back and expired that instance, so a `doomed.id` inside it would
+    # be a lazy reload from a sync context — the next permit would then fail with
+    # `MissingGreenlet` and the test would "prove" the isolation it broke.
+    doomed_id = doomed.id
+    real = service._holder_recipient
+
+    async def flaky(session: AsyncSession, permit: Permit) -> uuid.UUID:
+        if permit.id == doomed_id:
+            raise RuntimeError("no recipient for this permit")
+        return await real(session, permit)
+
+    monkeypatch.setattr(service, "_holder_recipient", flaky)
+
+    batch = await jobs.expire_permits(db, after_id=sentinel_permit.id)
+    assert (batch.scanned, batch.processed, batch.failed) == (3, 2, 1)
+
+    for permit in permits:
+        await db.refresh(permit)
+    assert doomed.status == "active", "the bad row rolled back alone"
+    assert [p.status for p in permits if p.id != doomed.id] == ["expired", "expired"]
+    assert await _expired_history_count(db, doomed) == 0
+
+
+async def test_the_closure_is_audited_as_a_job(db: AsyncSession, expired_permit: Permit) -> None:
+    """The same shape expiry's audit test pins, for the sweep that had none:
+    `user_id=None` and `correlation_id="job:<uuid>"` (CLAUDE.md). The audit row
+    hangs off the PERMIT, while `set_status` writes its own against the
+    application — two objects, two trails, one correlation id."""
+    from app.modules.audit.models import AuditLog
+    from app.modules.permits import jobs, service
+
+    await jobs.close_finished(db)
+    row = (
+        await db.execute(
+            select(AuditLog).where(
+                AuditLog.object_id == expired_permit.id,
+                AuditLog.action == service.PERMIT_CLOSE_APPLICATION,
+            )
+        )
+    ).scalar_one()
+    assert row.user_id is None
+    assert row.correlation_id is not None and row.correlation_id.startswith("job:")
+    assert row.new_value == {"application_status": "CLOSED"}
+
+
+async def test_the_closure_sweep_writes_each_row_exactly_once(
+    db: AsyncSession, expired_permit: Permit
+) -> None:
+    """Idempotence, counted rather than inferred from the end status: the second
+    run must add neither an `application_status_history` entry claiming a
+    transition that never happened nor a second `permit.close_application`."""
+    from app.modules.audit.models import AuditLog
+    from app.modules.permits import jobs, service
+
+    await jobs.close_finished(db)
+    await jobs.close_finished(db)
+
+    history = await db.scalar(
+        select(func.count())
+        .select_from(ApplicationStatusHistory)
+        .where(
+            ApplicationStatusHistory.application_id == expired_permit.application_id,
+            ApplicationStatusHistory.to_status == "CLOSED",
+        )
+    )
+    audits = await db.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.object_id == expired_permit.id,
+            AuditLog.action == service.PERMIT_CLOSE_APPLICATION,
+        )
+    )
+    assert (history, audits) == (1, 1)
