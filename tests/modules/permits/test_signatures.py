@@ -55,6 +55,29 @@ async def _sign(signer: Signer, permit_id: uuid.UUID, purpose: str, pdf: bytes):
     )
 
 
+async def _reread[T](db: AsyncSession, row: T) -> T:
+    """Re-read `row` from the database before asserting anything about it.
+
+    **Every assertion in this file about a row the APP may have changed goes
+    through here.** The fixtures build their rows on the `db` session and nothing
+    rolls it back mid-test, while the requests under test run on the app's own
+    session — and `app/db.py` sets `expire_on_commit=False`, so `db` keeps the
+    values it loaded forever. `applications_service.get(db, ...)` is `db.get`
+    underneath: for a row already in the identity map it emits NO SELECT at all
+    and hands back the stale object, so an assertion on it cannot fail.
+
+    This bit twice in this file — `test_the_last_signature_moves_the_application_
+    to_permit_issued`'s "still PAID" half and `test_a_refusal_does_not_move_the_
+    application` — both of which passed while the application had in fact been
+    moved on another session. A named helper rather than a remembered
+    `db.refresh` call, because the second one was written after the first was
+    fixed (lesson: a precondition shared by several steps belongs in ONE
+    function every step calls).
+    """
+    await db.refresh(row)
+    return row
+
+
 # --- the map itself ----------------------------------------------------------
 
 
@@ -146,26 +169,11 @@ async def test_the_last_signature_moves_the_application_to_permit_issued(
 
     application = await applications_service.get(db, issued_permit.application_id)
     assert application is not None
-    # Refresh BEFORE this half too, not only after. `paid_application` created
-    # this row on THIS session, so `get` hands back the cached instance and
-    # `expire_on_commit=False` never clears it — without the refresh the "still
-    # PAID" assertion cannot fail, and it did not: under a mutation that
-    # activated on the FIRST signature it stayed green while three sibling tests
-    # went red (review, fix round 1).
-    await db.refresh(application)
-    assert application.status == "PAID"
+    assert (await _reread(db, application)).status == "PAID"
 
     await _sign(holder_client, issued_permit.id, "permit_recipient", permit_pdf)
 
-    # `refresh`, not a second `get`: the read above put the row in this session's
-    # identity map and the session is `expire_on_commit=False`, so `get` would
-    # hand back the cached PAID object rather than what the app's own connection
-    # has since committed (lesson: the row in memory is not what Postgres
-    # stored). Refreshing only THIS row also leaves `issued_permit` loaded —
-    # `expire_all()` makes its next attribute access do sync IO and raise
-    # MissingGreenlet.
-    await db.refresh(application)
-    assert application.status == "PERMIT_ISSUED"
+    assert (await _reread(db, application)).status == "PERMIT_ISSUED"
 
 
 async def test_activation_stamps_issued_at_and_leaves_a_timeline_and_a_notice(
@@ -188,8 +196,7 @@ async def test_activation_stamps_issued_at_and_leaves_a_timeline_and_a_notice(
     ):
         assert (await _sign(signer, issued_permit.id, purpose, permit_pdf)).status_code == 200
 
-    await db.refresh(issued_permit)
-    assert issued_permit.status == "active"
+    assert (await _reread(db, issued_permit)).status == "active"
     assert issued_permit.issued_at is not None
     assert issued_permit.issued_at <= datetime.now(UTC)
 
@@ -349,8 +356,7 @@ async def test_an_invalid_signature_leaves_the_permit_pending(
     assert result.status_code == 422
     assert result.json()["error"]["code"] == "ERR-SIGN-001"
 
-    await db.refresh(issued_permit)
-    assert issued_permit.status == "pending_signatures"
+    assert (await _reread(db, issued_permit)).status == "pending_signatures"
     assert issued_permit.issued_at is None
 
 
@@ -439,7 +445,7 @@ async def test_a_refusal_does_not_move_the_application(
 
     application = await applications_service.get(db, paid_application.id)
     assert application is not None
-    assert application.status == "PAID"
+    assert (await _reread(db, application)).status == "PAID"
 
 
 # --- ruling T4-a: the one reminder this stage sends --------------------------
@@ -529,8 +535,7 @@ async def test_a_holder_who_signs_first_is_never_reminded(
         )
     ).all()
     assert sent == []
-    await db.refresh(issued_permit)
-    assert issued_permit.status == "active"
+    assert (await _reread(db, issued_permit)).status == "active"
 
 
 async def test_the_recipients_reminder_addresses_them_and_fits_one_sms(db: AsyncSession):

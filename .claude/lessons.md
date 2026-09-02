@@ -714,18 +714,18 @@ Tooling and environment.
   negative test twice in a row, and as part of the FULL suite — this class is invisible in
   isolation. Do not reorder the conftest collection hook.
 
-## A `_client_for` client's setup-time commit only covers fixtures listed before it
+## The `db` fixture session and the app's session never see each other's current state
 
-- **Rule:** Every client fixture built over `_client_for` registers an httpx `request` event
-  hook re-committing `db` before each outgoing call.
-- **Why:** pytest instantiates fixtures in the LEFT-TO-RIGHT order of the parameter list
-  (verified empirically), so in `test_x(gis_client, leshoz, contours_layer)` the client's
-  internal commit runs before `leshoz` even executes — `leshoz`'s `flush()`-only row stays
-  invisible to the app's separate connection and the test FK-fails (confirmed with an
-  independent asyncpg connection finding nothing in `organizations`).
-- **How to apply:** Copy `tests/modules/gis/conftest.py`'s
-  `_commit_pending_before_requests` for any new signed-in-client fixture that will ever be
-  combined with a write fixture; never rely on parameter order.
+- **Rule:** Writing → every `_client_for`-style client re-commits `db` before each request.
+  Reading → refresh a row before ASSERTING on it if a request may have changed it.
+- **Why:** Both directions shipped bugs. Outward: fixtures build left to right, so the
+  client's commit precedes `leshoz`, whose `flush()`-only row stays invisible and the test
+  FK-fails. Inward, and silent: `service.get(db, id)` is `db.get` — NO SELECT for a row
+  already in the identity map, never expired — so `assert application.status == "PAID"`
+  passed in two permits tests while the app had committed `PERMIT_ISSUED` (3.11a t4).
+- **How to apply:** `_commit_pending_before_requests` for any new client fixture; route
+  every assertion on an app-mutable row through ONE refreshing helper — a remembered
+  `db.refresh` is what failed twice (`permits/test_signatures.py::_reread`).
 
 ## A conftest autouse fixture runs before your test — schema checks belong in the gate
 
