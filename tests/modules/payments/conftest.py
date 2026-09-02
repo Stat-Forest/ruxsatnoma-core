@@ -63,6 +63,10 @@ from tests.modules.gis.conftest import _client_for, _commit_pending_before_reque
 from tests.modules.gis.conftest import applicant_client as applicant_client
 
 PAYME_TEST_CASHBOX_KEY = "test-cashbox-key"
+# Task 5: `build_checkout_url` reads `payme_merchant_id` for real in BOTH
+# modes (ruling — nothing about it is mock-sensitive), so the test config
+# needs one set for `test_intents.py`'s determinism to come from anywhere.
+PAYME_TEST_MERCHANT_ID = "test-merchant-id"
 
 
 async def _new_approved_application(db: AsyncSession, applicant: Applicant) -> Application:
@@ -172,6 +176,30 @@ async def cancelled_invoice(db: AsyncSession, pending_invoice: Invoice) -> Invoi
     return pending_invoice
 
 
+@pytest.fixture
+async def expired_invoice(db: AsyncSession, approved_application: Application) -> Invoice:
+    """A `pending` invoice whose `due_at` is already in the past — task 5's
+    `ERR-PAY-002` refusal checks the WALL CLOCK against `due_at` directly,
+    never `status`: Task 6's expiry job (not on this branch) is what
+    eventually flips `status` to `'expired'`, so a row can be past its own
+    window while still reading `status='pending'` — exactly this shape,
+    built directly (not through `pending_invoice`'s event path) since "past
+    due" is a plain column value, not a distinct business transition of its
+    own."""
+    now = datetime.now(UTC)
+    row = Invoice(
+        application_id=approved_application.id,
+        number=f"INV-2027-{uuid.uuid4().hex[:6]}",
+        amount=Decimal("100.00"),
+        status="pending",
+        issued_at=now - timedelta(days=20),
+        due_at=now - timedelta(days=10),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
 # --- HTTP clients (Task 2 — payments's first router.py; Task 4 adds `client`) -
 
 
@@ -184,9 +212,13 @@ def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
     `PAYME_CASHBOX_KEY` so `test_payme_rpc.py`'s hardcoded `test-cashbox-key`
     authenticates against something real (ruling K: 'tests need a known key;
     set it the way the other modules' tests set their own mode/secret
-    settings' — mirrors `test_eskiz_callback.py`'s `ESKIZ_CALLBACK_SECRET`)."""
+    settings' — mirrors `test_eskiz_callback.py`'s `ESKIZ_CALLBACK_SECRET`).
+    Task 5 additionally sets `PAYME_MERCHANT_ID` — `build_checkout_url`
+    reads it for real in both `payme_mode` values, so `test_intents.py`'s
+    determinism has to come from somewhere."""
     monkeypatch.setenv("DATABASE_URL", get_settings().database_url_test)
     monkeypatch.setenv("PAYME_CASHBOX_KEY", PAYME_TEST_CASHBOX_KEY)
+    monkeypatch.setenv("PAYME_MERCHANT_ID", PAYME_TEST_MERCHANT_ID)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

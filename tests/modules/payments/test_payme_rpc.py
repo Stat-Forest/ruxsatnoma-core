@@ -35,6 +35,8 @@ import uuid
 from datetime import timedelta
 from decimal import Decimal
 
+import pytest
+
 
 def _tx_id(label: str) -> str:
     """A Payme transaction id unique to this test run — see the module
@@ -513,3 +515,110 @@ async def test_check_transaction_does_not_auto_cancel_an_expired_one(
     assert checked.json()["result"]["state"] == 1
     assert checked.json()["result"]["cancel_time"] == 0
     assert checked.json()["result"]["reason"] is None
+
+
+# --- task 5: GetStatement and ChangePassword ---------------------------------
+
+
+async def test_get_statement_returns_only_transactions_in_the_window(
+    db, client, pending_invoice, frozen_clock
+):
+    """`GetStatement` selects on the row's OWN `received_at` (the same clock
+    the 12h timeout uses), never Payme's own `time` param. Two transactions
+    two hours apart, a window that brackets only the second — scoped to the
+    two ids THIS test created (lesson: 'The test DB is shared, persistent,
+    and never empty'), never a bare `len(...)` over the whole response,
+    which every other committed transaction in this shared DB would also
+    answer to."""
+    params = {
+        "amount": int(pending_invoice.amount * 100),
+        "account": {"id": pending_invoice.number},
+    }
+    t0 = frozen_clock.current
+    outside = await _rpc(client, "CreateTransaction", {**params, "id": _tx_id("stmt-outside")})
+    outside_tx = outside.json()["result"]["transaction"]
+
+    frozen_clock.advance(timedelta(hours=2))
+    t2 = frozen_clock.current
+    inside = await _rpc(client, "CreateTransaction", {**params, "id": _tx_id("stmt-inside")})
+    inside_tx = inside.json()["result"]["transaction"]
+
+    frozen_clock.advance(timedelta(hours=2))
+
+    window_from = int((t0 + timedelta(hours=1)).timestamp() * 1000)
+    window_to = int((t2 + timedelta(hours=1)).timestamp() * 1000)
+    statement = await _rpc(client, "GetStatement", {"from": window_from, "to": window_to})
+    transactions = statement.json()["result"]["transactions"]
+
+    ids_in_window = {row["transaction"] for row in transactions}
+    assert inside_tx in ids_in_window
+    assert outside_tx not in ids_in_window
+
+    entry = next(row for row in transactions if row["transaction"] == inside_tx)
+    assert entry["account"] == {"id": pending_invoice.number}
+    assert entry["amount"] == int(pending_invoice.amount * 100)
+    assert entry["state"] == 1
+
+
+async def test_get_statement_never_mutates(db, client, pending_invoice):
+    """The brief's own method table, same invariant as `CheckTransaction`."""
+    tx_id = _tx_id("stmt-no-mutate")
+    await _rpc(
+        client,
+        "CreateTransaction",
+        {
+            "id": tx_id,
+            "amount": int(pending_invoice.amount * 100),
+            "account": {"id": pending_invoice.number},
+        },
+    )
+    await _rpc(client, "GetStatement", {"from": 0, "to": 99_999_999_999_999})
+    checked = await _rpc(client, "CheckTransaction", {"id": tx_id})
+    assert checked.json()["result"]["state"] == 1
+
+
+@pytest.fixture
+async def _reset_cashbox_key_hash(db):
+    """`ChangePassword` writes a system-wide `payme_cashbox_key_hash`
+    override — every OTHER test's `_auth()` (default key
+    'test-cashbox-key') and every FUTURE run against the shared, PERSISTENT
+    test DB depend on that override staying empty (lesson: 'The test DB is
+    shared, persistent, and never empty' — a successful write is the same
+    class of leftover state as the lesson's own 'a refused action leaves
+    its row'). Teardown deletes the row and invalidates the process cache
+    regardless of how the test using it exits, so every sibling test keeps
+    authenticating against `PAYME_CASHBOX_KEY` the old way."""
+    yield
+    from sqlalchemy import delete
+
+    from app.core import settings_store
+    from app.core.models import SystemSetting
+
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == "payme_cashbox_key_hash"))
+    await db.commit()
+    settings_store.invalidate("payme_cashbox_key_hash")
+
+
+async def test_change_password_rotates_the_cashbox_key(db, client, _reset_cashbox_key_hash):
+    """Ruling: `ChangePassword` persists `sha256(new key)` and the OLD key
+    must fail `-32504` immediately afterward while the NEW one succeeds —
+    proven by `CheckTransaction` on a made-up id: `-32504` means auth never
+    even reached the dispatcher, `-31003` means it did (and simply found no
+    such transaction, which is expected for a made-up id)."""
+    new_key = f"rotated-{uuid.uuid4().hex[:16]}"
+
+    rotated = await _rpc(client, "ChangePassword", {"password": new_key})
+    assert rotated.json()["result"] == {"success": True}
+
+    old_key_call = await _rpc(
+        client, "CheckTransaction", {"id": "whatever"}, key="test-cashbox-key"
+    )
+    assert old_key_call.json()["error"]["code"] == -32504
+
+    new_key_call = await _rpc(client, "CheckTransaction", {"id": "whatever"}, key=new_key)
+    assert new_key_call.json()["error"]["code"] == -31003
+
+
+async def test_change_password_without_a_new_password_answers_32504(client):
+    result = await _rpc(client, "ChangePassword", {})
+    assert result.json()["error"]["code"] == -32504

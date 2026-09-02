@@ -801,6 +801,26 @@ async def has_effective_representation(db: AsyncSession, *, user_id: uuid.UUID, 
     return representation is not None
 
 
+async def has_effective_representation_of(
+    db: AsyncSession, *, user_id: uuid.UUID, applicant_id: uuid.UUID
+) -> bool:
+    """Pass-through to `repo.get_effective_representation`, resolved directly
+    from an `applicant_id` — for a caller that already holds it
+    (`payments.service`, deciding whether a representative may see or pay a
+    LEGAL applicant's invoice) and has no STIR to look up the way
+    `has_effective_representation` above does. Same "effective" meaning:
+    `status='active'` and not past `valid_until`, judged against
+    `business_today()`, never `date.today()` (lesson). First consumer:
+    3.10a task 5's ownership ruling — a legal entity's non-owner
+    representative must be able to act on an invoice they filed themselves,
+    not just its `owner_user_id` (which is `None` for `kind='legal'`
+    anyway)."""
+    representation = await repo.get_effective_representation(
+        db, applicant_id=applicant_id, user_id=user_id, today=business_today()
+    )
+    return representation is not None
+
+
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
     """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
     `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not

@@ -5,11 +5,12 @@ service -> repo -> models)."""
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.payments.models import Allocation, Invoice, ProviderTransaction
+from app.modules.payments.models import Allocation, Invoice, PaymentIntent, ProviderTransaction
 
 # What "in force" means for an invoice (mirrors `uq_invoices_one_in_force`,
 # migration 0017): a `cancelled`/`expired` row does not block a new one.
@@ -89,6 +90,33 @@ async def add_allocations(db: AsyncSession, allocations: Sequence[Allocation]) -
     until this call."""
     db.add_all(allocations)
     await db.flush()
+
+
+async def add_payment_intent(db: AsyncSession, intent: PaymentIntent) -> None:
+    db.add(intent)
+    await db.flush()
+
+
+async def list_provider_transactions_in_period(
+    db: AsyncSession, provider: str, since: datetime, until: datetime
+) -> list[tuple[ProviderTransaction, str]]:
+    """`GetStatement`'s own reader (`payme._get_statement` ONLY) — every
+    transaction whose OWN `received_at` (never Payme's own `time` param, the
+    same clock the 12h timeout uses) falls within `[since, until]`, joined
+    to its invoice for the `account.id` the wire response carries alongside
+    it. Plain (unlocked): `GetStatement` never mutates."""
+    stmt = (
+        select(ProviderTransaction, Invoice.number)
+        .join(Invoice, ProviderTransaction.invoice_id == Invoice.id)
+        .where(
+            ProviderTransaction.provider == provider,
+            ProviderTransaction.received_at >= since,
+            ProviderTransaction.received_at <= until,
+        )
+        .order_by(ProviderTransaction.received_at)
+    )
+    rows = await db.execute(stmt)
+    return [(transaction, number) for transaction, number in rows.all()]
 
 
 async def get_in_force_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice | None:

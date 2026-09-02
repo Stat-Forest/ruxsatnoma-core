@@ -27,9 +27,9 @@ Public surface for the event bus (`subscribers.py`, registered in
   function performs no check of its own beyond resolving the recipient
   account.
 
-`get_invoice_for_actor`/`list_invoices_for_actor` are this module's OWN
-router-facing functions (they take an HTTP `actor: User`, unlike the
-functions above) — not part of the cross-module public surface.
+`get_invoice_for_actor`/`list_invoices_for_actor`/`create_pay_intent` are
+this module's OWN router-facing functions (they take an HTTP `actor: User`,
+unlike the functions above) — not part of the cross-module public surface.
 """
 
 import uuid
@@ -49,9 +49,10 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
+from app.modules.integrations.adapters import payme as payme_adapter
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, ledger, repo
-from app.modules.payments.models import Invoice, ProviderTransaction
+from app.modules.payments.models import Invoice, PaymentIntent, ProviderTransaction
 from app.modules.payments.permissions import PAYMENTS_VIEW
 
 # CLAUDE.md's audit invariant: action codes are "<object>.<verb>" in English,
@@ -60,6 +61,7 @@ from app.modules.payments.permissions import PAYMENTS_VIEW
 INVOICE_ISSUE = "invoice.issue"
 INVOICE_CANCEL = "invoice.cancel"
 INVOICE_PAY = "invoice.pay"
+PAY_INTENT_CREATE = "payment_intent.create"
 
 # design/03 §"Public numbers": every invoice number starts with this prefix.
 INVOICE_NUMBER_PREFIX = "INV"
@@ -190,17 +192,28 @@ async def _holds_payments_view(db: AsyncSession, actor: User) -> bool:
     return PAYMENTS_VIEW in await auth_repo.permission_codes(db, actor)
 
 
-async def _may_view_invoices_of(db: AsyncSession, applicant_id: uuid.UUID, *, actor: User) -> bool:
-    """`payments.view` (or sys_admin) sees any invoice; otherwise the actor
-    must OWN the same applicant identity the invoice's application belongs
-    to — matched on `applicant_id`, never `submitted_by_user_id`: a legal
-    entity has several representatives, and the one who happens to have
-    submitted THIS particular application is not the only one entitled to
-    see its invoice."""
+async def _may_act_on_invoices_of(
+    db: AsyncSession, applicant_id: uuid.UUID, *, actor: User
+) -> bool:
+    """`payments.view` (or sys_admin) sees or pays any invoice; otherwise the
+    actor must OWN the same applicant identity the invoice's application
+    belongs to, OR hold an EFFECTIVE REPRESENTATION of it (task 5's
+    ownership ruling) — matched on `applicant_id`, never
+    `submitted_by_user_id`: a legal entity has several representatives, and
+    the one who happens to have submitted THIS particular application is
+    not the only one entitled to see or pay its invoice. Shared by the two
+    read routes (`get_invoice_for_actor`/`list_invoices_for_actor`) and the
+    pay-intent route (`create_pay_intent`) — one rule, three callers, so the
+    representation gap Task 2 deliberately carried to this task is closed
+    for reads too, not just for paying."""
     if await _holds_payments_view(db, actor):
         return True
     own_applicant = await auth_service.get_own_applicant(db, actor.id)
-    return own_applicant is not None and own_applicant.id == applicant_id
+    if own_applicant is not None and own_applicant.id == applicant_id:
+        return True
+    return await auth_service.has_effective_representation_of(
+        db, user_id=actor.id, applicant_id=applicant_id
+    )
 
 
 async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, actor: User) -> Invoice:
@@ -214,7 +227,7 @@ async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, acto
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
-    if not await _may_view_invoices_of(db, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
     return invoice
 
@@ -230,9 +243,76 @@ async def list_invoices_for_actor(
     application = await applications_service.get(db, application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if not await _may_view_invoices_of(db, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     return await repo.list_invoices_by_application(db, application_id, limit=limit, offset=offset)
+
+
+async def create_pay_intent(
+    db: AsyncSession,
+    invoice_id: uuid.UUID,
+    *,
+    provider: str,
+    actor: User,
+    idempotency_key: uuid.UUID,
+) -> tuple[PaymentIntent, str]:
+    """`POST /invoices/{id}/pay-intents` — the applicant's (or an effective
+    representative's) own side of starting a payment (design/03 §payments,
+    design/04 §3.8). Returns the new `payment_intents` row and the
+    checkout-redirect URL (`integrations.adapters.payme.build_checkout_url`
+    — pure string construction, no network call, so `PAYME_MODE` never
+    branches this path, ruling).
+
+    404, never 403, both when the invoice does not exist and when the actor
+    may not act on it (same reasoning as `get_invoice_for_actor`) — reuses
+    `_may_act_on_invoices_of`, so the SAME ownership-or-representation rule
+    that gates READING an invoice also gates PAYING it.
+
+    An invoice past `due_at` refuses with `ERR-PAY-002`, checked against the
+    WALL CLOCK, never `invoice.status`: Task 6's expiry job (not built on
+    this branch) is what eventually flips `status` to `'expired'`, so a
+    `pending` invoice can already be past its own window before that job
+    catches up — relying on `status` alone would leave exactly that gap
+    payable.
+
+    `idempotency_key` is the HTTP `Idempotency-Key` header's own value
+    (`auth.deps.idempotency_context`, the router's job to resolve) — the
+    value a client repeats to avoid opening two intents for one click
+    (`PaymentIntent`'s own docstring). The column carries no DB unique
+    constraint by design; `app/core/idempotency.py`'s own table is what
+    de-duplicates the HTTP request itself.
+    """
+    invoice = await repo.get_invoice(db, invoice_id)
+    if invoice is None:
+        raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
+    application = await applications_service.get(db, invoice.application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
+    if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
+        raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
+    if datetime.now(UTC) > invoice.due_at:
+        raise err("ERR-PAY-002", details={"invoice": str(invoice_id)})
+
+    payment_url = payme_adapter.build_checkout_url(
+        invoice_number=invoice.number, amount=invoice.amount
+    )
+    intent = PaymentIntent(
+        invoice_id=invoice.id,
+        provider=provider,
+        amount=invoice.amount,
+        status="created",
+        idempotency_key=idempotency_key,
+    )
+    await repo.add_payment_intent(db, intent)
+    await audit.log(
+        db,
+        action=PAY_INTENT_CREATE,
+        user_id=actor.id,
+        object_type="payment_intent",
+        object_id=intent.id,
+        new_value={"invoice_id": str(invoice.id), "provider": provider},
+    )
+    return intent, payment_url
 
 
 async def _resolve_recipient_account(

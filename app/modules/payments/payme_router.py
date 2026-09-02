@@ -119,7 +119,7 @@ async def _process(request: Request, db: AsyncSession) -> JSONResponse:
     # so their relative order below does not matter; both must still precede
     # the catch-all.
     try:
-        get_payme_adapter().verify(request.headers.get("Authorization"))
+        await get_payme_adapter().verify(db, request.headers.get("Authorization"))
         result = await payme.handle(db, method, params, now=_now())
     except PaymeAuthError:
         return _error(rpc_id, payme.ERR_INSUFFICIENT_PRIVILEGE, "Insufficient privileges")

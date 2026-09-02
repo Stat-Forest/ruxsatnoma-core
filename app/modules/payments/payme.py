@@ -1,6 +1,8 @@
-"""The Payme JSON-RPC dispatcher — the five transactional methods (design/02
-§ payments, plan `03.10a-payments-core` task 4, `design/04-integrations.md`
-§3 end to end).
+"""The Payme JSON-RPC dispatcher — all seven methods design/04 §3.2 lists
+(design/02 § payments, plan `03.10a-payments-core` tasks 4-5,
+`design/04-integrations.md` §3 end to end). Task 4 shipped the five
+transactional methods; task 5 adds the two reporting/maintenance ones,
+`GetStatement` and `ChangePassword`.
 
 `handle(db, method, params, *, now)` is the ONLY public name: **no HTTP, no
 auth, no framework** — every state and every error code here is
@@ -36,15 +38,21 @@ payable" under `-31050`):
   which is reserved for "this account does not exist at all".
 """
 
+import hashlib
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.modules.audit import service as audit
+from app.modules.integrations.adapters.payme import (
+    CASHBOX_KEY_HASH_SETTING,
+    from_tiyin,
+    to_tiyin,
+)
 from app.modules.payments import repo, service
 from app.modules.payments.models import Invoice, ProviderTransaction
 
@@ -83,8 +91,7 @@ ERR_ACCOUNT = -31050  # brief's own range is -31050..-31099; this module always 
 # confirmed payment (see `service.confirm_payment`).
 TRANSACTION_CREATE = "transaction.create"
 TRANSACTION_CANCEL = "transaction.cancel"
-
-_TIYIN = Decimal("0.01")
+CASHBOX_KEY_ROTATE = "payme_cashbox_key.rotate"
 
 
 class PaymeError(Exception):
@@ -100,19 +107,12 @@ class PaymeError(Exception):
         self.data = data or {}
 
 
-def to_tiyin(amount: Decimal) -> int:
-    """so'm -> tiyin (design/04 §3.8: Payme amounts are integers, x100)."""
-    return int((amount * 100).to_integral_exact(rounding=ROUND_HALF_UP))
-
-
-def from_tiyin(tiyin: int) -> Decimal:
-    """tiyin -> so'm, quantized to the same 2-decimal scale as
-    `invoices.amount`/`provider_transactions.amount` (`Numeric(18, 2)`)."""
-    return (Decimal(tiyin) / 100).quantize(_TIYIN)
-
-
 def _to_millis(value: datetime) -> int:
     return int(value.timestamp() * 1000)
+
+
+def _from_millis(value: int) -> datetime:
+    return datetime.fromtimestamp(value / 1000, tz=UTC)
 
 
 def _account_number(params: dict[str, Any]) -> str | None:
@@ -402,6 +402,88 @@ async def _check_transaction(
     }
 
 
+def _millis_param(params: dict[str, Any], key: str, default: int) -> int:
+    """Same "malformed non-critical field -> safe default, never raise"
+    idiom as `_cancel_reason` above — `GetStatement` is a REPORT, not a
+    protected write, so a missing/malformed bound widens the window rather
+    than failing the always-200 route."""
+    value = params.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return value
+
+
+async def _get_statement(db: AsyncSession, params: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """`GetStatement` (design/04 §3.2): the transactions whose OWN
+    `received_at` falls within `[from, to]` (millisecond epochs, §3.8's
+    convention for time on this wire) — NEVER Payme's own `time` param,
+    the same clock the 12h timeout is measured from. Missing/malformed
+    bounds default to "everything up to `now`" rather than raising (see
+    `_millis_param`). Each entry carries the same fields `CheckTransaction`
+    reports plus `account`/`amount` (ruling); never mutates — the brief's
+    own method table."""
+    since = _from_millis(_millis_param(params, "from", 0))
+    until = _from_millis(_millis_param(params, "to", _to_millis(now)))
+    rows = await repo.list_provider_transactions_in_period(db, PROVIDER, since, until)
+    return {
+        "transactions": [
+            {
+                "create_time": _to_millis(transaction.received_at),
+                "perform_time": (
+                    _to_millis(transaction.performed_at) if transaction.performed_at else 0
+                ),
+                "cancel_time": (
+                    _to_millis(transaction.cancelled_at) if transaction.cancelled_at else 0
+                ),
+                "transaction": str(transaction.id),
+                "state": int(transaction.state),
+                "reason": transaction.cancel_reason,
+                "account": {"id": invoice_number},
+                "amount": to_tiyin(transaction.amount),
+            }
+            for transaction, invoice_number in rows
+        ]
+    }
+
+
+def _new_cashbox_key(params: dict[str, Any]) -> str | None:
+    value = params.get("password")
+    return value if isinstance(value, str) and value else None
+
+
+async def _change_password(
+    db: AsyncSession, params: dict[str, Any], now: datetime
+) -> dict[str, Any]:
+    """`ChangePassword` (design/04 §3.2): rotates the cashbox key
+    `integrations.adapters.payme._CashboxKeyAdapter.verify` authenticates
+    future calls against. Persists `sha256(new key)` in `settings_store`'s
+    `payme_cashbox_key_hash` override — NEVER the plaintext (ruling): a live
+    payment secret has no business sitting in an admin-readable table, and
+    returning success while dropping the key would silently kill every
+    later call with `-32504`. `set_setting` writes with no actor
+    (`settings_store` is level 0 — a Payme call has no `User`); this module
+    is the acting code, so IT invalidates the cache and audits, with
+    `user_id=None` (the job idiom — there is no HTTP actor on this route
+    either). The stored-hash cache is per-PROCESS and expires after 60s
+    (`settings_store` module docstring), so a rotation reaches every uvicorn
+    worker within a minute; Payme retries on a wrong-credentials response,
+    so this self-heals rather than needing a broadcast."""
+    new_key = _new_cashbox_key(params)
+    if new_key is None:
+        raise PaymeError(ERR_INSUFFICIENT_PRIVILEGE, "New password is required")
+    new_hash = hashlib.sha256(new_key.encode("utf-8")).hexdigest()
+    await settings_store.set_setting(db, CASHBOX_KEY_HASH_SETTING, new_hash)
+    settings_store.invalidate(CASHBOX_KEY_HASH_SETTING)
+    await audit.log(
+        db,
+        action=CASHBOX_KEY_ROTATE,
+        object_type="payme_cashbox_key",
+        user_id=None,
+        new_value={"rotated_at": _to_millis(now)},
+    )
+    return {"success": True}
+
+
 _METHODS: dict[
     str, Callable[[AsyncSession, dict[str, Any], datetime], Awaitable[dict[str, Any]]]
 ] = {
@@ -410,17 +492,16 @@ _METHODS: dict[
     "PerformTransaction": _perform_transaction,
     "CancelTransaction": _cancel_transaction,
     "CheckTransaction": _check_transaction,
+    "GetStatement": _get_statement,
+    "ChangePassword": _change_password,
 }
 
 
 async def handle(
     db: AsyncSession, method: str, params: dict[str, Any], *, now: datetime
 ) -> dict[str, Any]:
-    """The Payme JSON-RPC dispatcher (design/04 §3): the five transactional
-    methods this task implements; `GetStatement`/`ChangePassword` are Task
-    5's and are not in `_METHODS` yet, so calling either here answers
-    `-32601` exactly like any other unrecognised name, until Task 5 extends
-    the table. No HTTP, no auth, no framework — `payme_router.py` is the
+    """The Payme JSON-RPC dispatcher (design/04 §3): all seven methods
+    §3.2 lists. No HTTP, no auth, no framework — `payme_router.py` is the
     only caller."""
     handler = _METHODS.get(method)
     if handler is None:
