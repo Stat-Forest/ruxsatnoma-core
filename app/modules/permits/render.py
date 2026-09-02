@@ -104,8 +104,18 @@ QR_FIELD = "qr"
 _FONT_FAMILY = "Permit Serif"
 _FONT_FILES = ("DejaVuSerif.ttf", "DejaVuSerif-Bold.ttf")
 
-# `/BaseFont /ABCDEF+Permit-Serif` — the subset tag is six capitals (PDF 32000 9.6.4).
-_EMBEDDED_FACE = re.compile(rb"/BaseFont\s*/[A-Z]{6}\+([A-Za-z0-9\-]+)")
+# `/BaseFont /ABCDEF+Permit-Serif`: an optional six-capital subset tag (PDF 32000 9.6.4)
+# in front of a PDF name, which runs to the next delimiter (7.2.2) and MAY START WITH A
+# DOT — which is exactly the shape of macOS's own fallback faces (`.SFNS-Regular`,
+# `.Zither-India`, `.LastResort`). The first version of this pattern demanded
+# `[A-Za-z0-9-]` at the capture position, so those names did not match AT ALL and
+# `findall` reported them as absent rather than suspect: a Devanagari character in a
+# layout embedded `ZJBCPL+.Zither-India` and `render_permit` returned the document
+# happily (re-review of I2). Hence two patterns — one to find every declaration, one to
+# parse it — so a name we cannot parse can be counted and refused instead of vanishing.
+_BASE_FONT_KEY = re.compile(rb"/BaseFont\b")
+_BASE_FONT_NAME = re.compile(rb"/BaseFont\s*/([^\s/<>\[\]{}()%]+)")
+_SUBSET_TAG = re.compile(rb"^[A-Z]{6}\+")
 
 
 def _font_css() -> str:
@@ -252,23 +262,37 @@ def _assert_only_bundled_faces(pdf: bytes) -> None:
     too, so it keeps working if `PDF_VARIANT` ever moves to a version that packs the font
     dictionaries into a `/Type /ObjStm` (at PDF/A-1b's PDF 1.4 they are in the clear).
     """
-    expected = _FONT_FAMILY.replace(" ", "-").encode()
+    family = _FONT_FAMILY.replace(" ", "-").encode()
     haystacks = [pdf]
     for stream in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", pdf, re.S):
         try:
             haystacks.append(zlib.decompress(stream.group(1)))
         except zlib.error:
             continue
-    foreign = {
-        face.decode()
-        for haystack in haystacks
-        for face in _EMBEDDED_FACE.findall(haystack)
-        if not face.startswith(expected)
-    }
-    if foreign:
+
+    foreign: set[str] = set()
+    unparsable = 0
+    for haystack in haystacks:
+        names = _BASE_FONT_NAME.findall(haystack)
+        # Fail CLOSED on anything we could not read. A `/BaseFont` we cannot parse is
+        # suspect, never absent — the same principle `_url_to_path` applies to I1.
+        unparsable += len(_BASE_FONT_KEY.findall(haystack)) - len(names)
+        for name in names:
+            bare = _SUBSET_TAG.sub(b"", name)
+            # Exact family, or the family plus a style suffix Pango appended
+            # (`-Bold`, `-Oblique`). `startswith(family)` alone would admit a host
+            # face called `Permit-SerifSomething` (deferred minor, closed here).
+            if bare != family and not bare.startswith(family + b"-"):
+                foreign.add(name.decode("latin-1"))
+
+    if foreign or unparsable:
         raise err(
             "ERR-VAL-001",
-            details={"reason": "host_font_substituted", "fonts": sorted(foreign)},
+            details={
+                "reason": "host_font_substituted",
+                "fonts": sorted(foreign),
+                "unparsable_base_font_entries": unparsable,
+            },
         )
 
 

@@ -144,7 +144,7 @@ def test_no_system_font_is_substituted_for_the_uzbek_letters() -> None:
 
     assert b"/FontFile2" in pdf, "PDF/A requires the face embedded, not merely referenced"
     expected = render._FONT_FAMILY.replace(" ", "-").encode()
-    faces = set(re.findall(rb"/BaseFont\s*/[A-Z]{6}\+([A-Za-z0-9\-]+)", pdf))
+    faces = set(re.findall(rb"/BaseFont\s*/(?:[A-Z]{6}\+)?([^\s/<>\[\]{}()%]+)", pdf))
     assert faces, "no embedded font at all"
     assert all(face.startswith(expected) for face in faces), (
         f"a font other than the bundled {expected!r} was used: {sorted(faces)}"
@@ -272,3 +272,66 @@ def test_the_pdf_dates_come_from_the_snapshot_and_never_from_the_clock() -> None
     assert b"D:19991231" in pdf, "the issue date is not pinned into the document"
     today = datetime.date.today().strftime("D:%Y%m%d").encode()
     assert today not in pdf, f"a wall-clock date ({today!r}) reached the PDF"
+
+
+def test_a_host_face_whose_name_begins_with_a_dot_is_still_caught() -> None:
+    """Re-review of I2: the backstop failed OPEN on a whole class of faces.
+
+    macOS names its own fallback faces with a leading dot — `.SFNS-Regular`,
+    `.Zither-India`, `.LastResort` — and the first scanner pattern required
+    `[A-Za-z0-9-]` where the dot sits, so those names did not match at all and were
+    counted as ABSENT rather than SUSPECT. A Devanagari character in an admin-editable
+    layout embedded `ZJBCPL+.Zither-India` into a government document and
+    `render_permit` returned it happily. Reachable through the layout only: a codepoint
+    that triggers fallback is by construction missing from the bundled cmap, so
+    `_assert_renderable` catches it first for anything coming from the snapshot.
+    """
+    import pytest
+
+    from app.core.errors import DomainError
+
+    for script in ("क्ष", "ཀ", "森", "🌲", "ก", "א"):
+        with pytest.raises(DomainError) as raised:
+            render.render_permit(
+                SNAPSHOT,
+                f'<html><body>{script} {{{{ series }}}}<img src="{{{{ qr }}}}"></body></html>',
+                "https://example.uz/x",
+            )
+        assert raised.value.details is not None
+        assert raised.value.details["reason"] == "host_font_substituted", script
+
+    # Armenian is the control: DejaVu genuinely covers it, so it must NOT be refused —
+    # otherwise this test would pass by rejecting everything non-Cyrillic.
+    assert render.render_permit(
+        SNAPSHOT,
+        '<html><body>Ա {{ series }}<img src="{{ qr }}"></body></html>',
+        "https://example.uz/x",
+    ).startswith(b"%PDF")
+
+
+def test_a_base_font_entry_the_scanner_cannot_parse_is_suspect_not_absent() -> None:
+    """The principle the I1 fix already established, applied here: an input you cannot
+    interpret is suspect, never absent. Asserted directly against the scanner, because
+    WeasyPrint does not emit these shapes — but a future variant, or a font WeasyPrint
+    does not name the way we expect, must fail closed rather than slip through."""
+    import pytest
+
+    from app.core.errors import DomainError
+
+    for label, blob in (
+        ("an indirect reference", b"<</Type/Font/BaseFont 12 0 R>>"),
+        ("a truncated dictionary", b"<</BaseFont"),
+        ("no name at all", b"/BaseFont  <</x 1>>"),
+    ):
+        with pytest.raises(DomainError) as raised:
+            render._assert_only_bundled_faces(blob)
+        assert raised.value.details is not None
+        assert raised.value.details["unparsable_base_font_entries"] == 1, label
+
+    # The family comparison is exact: a host face merely PREFIXED by ours is foreign.
+    with pytest.raises(DomainError):
+        render._assert_only_bundled_faces(b"/BaseFont /AAAAAA+Permit-SerifSomething")
+
+    # ...while our own faces, with and without the style suffix Pango appends, pass.
+    for ours in (b"/BaseFont /Permit-Serif", b"/BaseFont /AAAAAA+Permit-Serif-Bold"):
+        render._assert_only_bundled_faces(ours)
