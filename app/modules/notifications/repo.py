@@ -96,6 +96,24 @@ async def get_by_provider_message_id(
     ).scalar_one_or_none()
 
 
+async def notification_exists(
+    db: AsyncSession, *, event_code: str, object_id: uuid.UUID, channel: str
+) -> bool:
+    """Whether at least one `channel` notification for `event_code`/`object_id`
+    already exists — a periodic job's own once-only check before calling
+    `notify()` again for the same object (payments.jobs.expiry_sweep, task 6)."""
+    stmt = (
+        select(Notification.id)
+        .where(
+            Notification.event_code == event_code,
+            Notification.object_id == object_id,
+            Notification.channel == channel,
+        )
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
 def _inbox_stmt(user_id: uuid.UUID, unread_only: bool):
     stmt = select(Notification).where(
         Notification.recipient_user_id == user_id, Notification.channel == "inapp"

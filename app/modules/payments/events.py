@@ -16,9 +16,11 @@ listening on the bus never fires.
 
 `NOTIFIED_EVENT_CODES` is the registry of every code this module's service
 layer may pass to `notify(...)`: `invoice.issued` (Task 2, seeded by
-migration `0009_notifications.py` for both `inapp` and `sms`) and
-`payment.confirmed` (Task 4, same migration, same two channels). Later tasks
-of this stage append to the tuple, never replace it.
+migration `0009_notifications.py` for both `inapp` and `sms`),
+`payment.confirmed` (Task 4, same migration, same two channels) and
+`invoice.due_soon` (Task 6, seeded by migration `0018` for both channels —
+`0009` predates this module and could not have seeded it). Later tasks of
+this stage append to the tuple, never replace it.
 
 --- Bus event name — `core.events.publish`/`subscribe` --------------------
 
@@ -34,7 +36,8 @@ deliberate no-op, not a gap.
 
 INVOICE_ISSUED = "invoice.issued"
 PAYMENT_CONFIRMED_NOTIFICATION_CODE = "payment.confirmed"
+INVOICE_DUE_SOON = "invoice.due_soon"
 
-NOTIFIED_EVENT_CODES = (INVOICE_ISSUED, PAYMENT_CONFIRMED_NOTIFICATION_CODE)
+NOTIFIED_EVENT_CODES = (INVOICE_ISSUED, PAYMENT_CONFIRMED_NOTIFICATION_CODE, INVOICE_DUE_SOON)
 
 PAYMENT_CONFIRMED = "payment_confirmed"

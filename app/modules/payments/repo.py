@@ -133,6 +133,28 @@ async def get_in_force_invoice(db: AsyncSession, application_id: uuid.UUID) -> I
     ).scalar_one_or_none()
 
 
+async def list_invoices_past_due(db: AsyncSession, *, now: datetime) -> Sequence[Invoice]:
+    """Every `pending` invoice whose 10-day window has already closed —
+    `payments.jobs.expiry_sweep`'s candidate set for the INVOICED ->
+    EXPIRED_UNPAID transition. A `paid`/`cancelled`/already-`expired` row is
+    excluded by the status filter alone, which is also what makes a second
+    sweep run a no-op for a row the first run already closed."""
+    stmt = select(Invoice).where(Invoice.status == "pending", Invoice.due_at < now)
+    return (await db.execute(stmt)).scalars().all()
+
+
+async def list_invoices_due_soon(
+    db: AsyncSession, *, now: datetime, before: datetime
+) -> Sequence[Invoice]:
+    """Every `pending` invoice due in `[now, before]` — not yet overdue (that
+    is `list_invoices_past_due`'s own set) but inside the reminder window
+    `payments.jobs.expiry_sweep` notifies on."""
+    stmt = select(Invoice).where(
+        Invoice.status == "pending", Invoice.due_at >= now, Invoice.due_at <= before
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
 async def list_invoices_by_application(
     db: AsyncSession, application_id: uuid.UUID, *, limit: int, offset: int
 ) -> tuple[list[Invoice], int]:
