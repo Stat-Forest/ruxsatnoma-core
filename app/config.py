@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = ""
     smtp_starttls: bool = True
+    # The permit series (design/02 § permit_counters): CYRILLIC CAPITAL А
+    # (U+0410), NOT Latin A (U+0041). The two are indistinguishable on screen and
+    # different bytes to Postgres — migration 0019 seeds the counter row under the
+    # Cyrillic letter, so a Latin A here makes `UPDATE permit_counters ... WHERE
+    # series = :s RETURNING last_number` match zero rows and return None.
+    # `permits.repo.next_number` refuses rather than carrying on, so the
+    # misconfiguration surfaces as a loud 500 naming the series instead of a
+    # permit with no number. A second series is a second counter row, not a
+    # migration — this setting is what points issuance at it.
+    permit_series: str = "А"
     workers_mode: Literal["embedded", "off"] = "embedded"
     oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
     oneid_scope: str = "mock-scope"

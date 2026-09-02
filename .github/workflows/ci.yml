@@ -46,7 +46,16 @@ jobs:
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=ruxsatnoma -e MINIO_ROOT_PASSWORD=ruxsatnoma-secret \
             minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
-      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      # postgresql-client creates the test DB below. The three pango/harfbuzz packages are
+      # WeasyPrint's own documented Debian/Ubuntu requirement (they carry gobject, pango,
+      # pangoft2, harfbuzz and fontconfig, which it dlopens at import time): without them
+      # `import weasyprint` raises and the whole job dies at collection, not at a test.
+      # libharfbuzz-subset0 is nominally optional — WeasyPrint falls back to fontTools for
+      # subsetting — but the fallback embeds DIFFERENT font bytes, so leaving it out would
+      # make CI's PDFs disagree with a developer's for no visible reason (3.11a ruling 3).
+      - run: |
+          sudo apt-get update && sudo apt-get install -y \
+            postgresql-client libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0
       - run: |
           PGPASSWORD=ruxsatnoma psql -h localhost -U ruxsatnoma -d ruxsatnoma \
             -c "CREATE DATABASE ruxsatnoma_test OWNER ruxsatnoma"

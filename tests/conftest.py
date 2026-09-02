@@ -97,7 +97,18 @@ def _isolate_subscriptions():
     idempotent by construction (`core.events.subscribe` dedups the
     `(name, handler)` pair), so the repeat calls `create_app()` makes are
     no-ops. The restore still does its original job: a spy subscribed by one
-    test is not in the snapshot and is gone by the next."""
+    test is not in the snapshot and is gone by the next.
+
+    **It snapshots `events._SUBSCRIBERS` and NOTHING ELSE.**
+    `register_event_subscriptions()` also fills registries that live outside the
+    bus — `gis.service.OCCUPANCY_PROVIDERS` and `norms.service.LOAD_PROVIDERS`
+    since 3.11a — and this fixture neither snapshots nor restores those. Anything
+    registered into such a global must check membership before appending, the way
+    `core.events.subscribe` dedups its own `(name, handler)` pairs: a bare
+    `.append()` here adds one copy per TEST, so occupancy silently doubles and
+    then triples, and the failure reads as pollution in whatever file happens to
+    run late rather than as a registration bug — passing whenever that file is
+    run alone."""
     from app.core import events
     from app.event_subscriptions import register_event_subscriptions
 

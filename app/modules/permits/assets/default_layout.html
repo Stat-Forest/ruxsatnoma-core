@@ -1,0 +1,183 @@
+<!--
+  The layout bundled with the module: form 1-ilova (tz/13) for grazing.
+
+  Used when a permit_templates row leaves layout_file_id NULL, which is what
+  migration 0019's seeded grazing row does (task 1, decision 2) — an administrator
+  who uploads a real layout fills that column and their row wins from then on.
+
+  Two rules bind whoever edits this file or uploads a replacement:
+
+  1. Every placeholder must exist in the snapshot the issuing service builds, with a
+     non-null value. render.fill refuses the whole document otherwise: on a legal
+     permit an unfilled field is a defect, not a cosmetic gap. The fields below are
+     exactly the ones app/modules/permits/service.py freezes into permits.snapshot.
+     A comment is not an exemption — the substitution runs over the whole file, so
+     naming a field here in brace syntax would demand a value for it too.
+  2. No external resource — no <link>, no remote <img>, no web font. The document must
+     render on an inspector's offline device, PDF/A requires every face embedded, and
+     _AssetFetcher refuses anything outside app/modules/permits/assets/ anyway.
+
+  The bundled DejaVu Serif face is applied by render._font_css(), not from here, so a
+  layout cannot accidentally lose the one font that carries ў / қ / ғ / ҳ.
+
+  Requisites 20-23 (the four ERI signatures) carry no signer names, and this is not an
+  omission to correct: the signatures are detached rows in `signatures`, taken over sha256
+  of these very bytes, and ruling 3 renders the document exactly ONCE — at issuance, before
+  any of them exists — and refuses a re-render while a signature exists. Printing signer
+  names would mean re-rendering after signing, which would invalidate every signature
+  already taken. The way a reader confirms them is the QR page (requisite 24), which reads
+  the stored verification verdict. Requisite 25, the document status, is deliberately absent
+  for the same reason — it changes over the permit's life and must not be frozen into an
+  immutable document; the QR page reports it too.
+
+  Requisites 5-7 (ўрмон бўлими / айланма / бўлак) have no data source yet: `organizations`
+  can express those levels but nothing populates them, and the Agency has delivered neither
+  the leshoz boundary nor the contour layer (tz/12 open question #10). They arrive as data.
+-->
+<html lang="uz-Cyrl">
+<head>
+  <meta charset="utf-8">
+  <title>Рухсатнома {{ series }} № {{ number }}</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 16mm 15mm 14mm 20mm;
+    }
+    body {
+      font-size: 10.5pt;
+      line-height: 1.35;
+      color: #000;
+    }
+    .agency {
+      text-align: center;
+      font-size: 10pt;
+      text-transform: uppercase;
+      letter-spacing: 0.4pt;
+    }
+    .rule {
+      border-top: 1.2pt solid #000;
+      margin: 3mm 0 5mm;
+    }
+    h1 {
+      text-align: center;
+      font-size: 17pt;
+      letter-spacing: 2pt;
+      margin: 0;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 10.5pt;
+      margin: 1.5mm 0 5mm;
+    }
+    .identity {
+      display: flex;
+      justify-content: space-between;
+      font-weight: bold;
+      margin-bottom: 5mm;
+    }
+    table.fields {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    table.fields th,
+    table.fields td {
+      border: 0.6pt solid #000;
+      padding: 1.6mm 2mm;
+      vertical-align: top;
+      text-align: left;
+    }
+    table.fields th {
+      width: 42%;
+      font-weight: normal;
+    }
+    table.fields td {
+      font-weight: bold;
+    }
+    .signatures {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 6mm;
+      font-size: 9.5pt;
+    }
+    .signatures td {
+      padding: 2.2mm 2mm;
+      border-bottom: 0.6pt dotted #000;
+    }
+    /* No italic: only the regular and bold faces ship in assets/, and a font-style
+       Pango has to synthesise would embed a third subset for decoration alone. */
+    .eri {
+      text-align: right;
+      color: #333;
+    }
+    .seal {
+      margin-top: 7mm;
+      text-align: center;
+    }
+    .seal img {
+      width: 28mm;
+      height: 28mm;
+    }
+    .seal .caption {
+      font-size: 8.5pt;
+      margin-top: 1.5mm;
+    }
+  </style>
+</head>
+<body>
+  <!-- Requisite 1, «Название уполномоченного органа»: the agency row, not a string
+       baked in here — a rename in the classifier must reach every permit issued after
+       it, and nobody would think to look in a bundled HTML file for the old one. -->
+  <div class="agency">{{ authority_name }}</div>
+  <div class="rule"></div>
+
+  <h1>РУХСАТНОМА</h1>
+  <div class="subtitle">Ўрмон фонди ерларидан фойдаланиш учун</div>
+
+  <div class="identity">
+    <span>{{ series }} серия № {{ number }}</span>
+    <span>Берилган сана: {{ issued_at }}</span>
+  </div>
+
+  <table class="fields">
+    <tr><th>Ўрмон хўжалиги</th><td>{{ leshoz_name }}</td></tr>
+    <tr><th>Фойдаланиш тури</th><td>{{ activity_name }}</td></tr>
+    <tr><th>Фойдаланувчи (Ф.И.Ш.)</th><td>{{ holder_name }}</td></tr>
+    <tr><th>ЖШШИР</th><td>{{ holder_pinfl }}</td></tr>
+    <!-- tz/13 requisite 11. «—» when the registry holds no address (ruling T3-g):
+         the column is nullable by design and a citizen who has already paid is not
+         held back over it. A chosen value, not a blank. -->
+    <tr><th>Фойдаланувчи манзили</th><td>{{ holder_address }}</td></tr>
+    <tr><th>Контур / субконтур рақами</th><td>{{ contour_number }}</td></tr>
+    <tr><th>Ажратилган майдон, га</th><td>{{ area_ha }}</td></tr>
+    <!-- tz/13 requisites 12-15, one row each. «—» where this permit commits no
+         animals of that group, never «0»: for a non-grazing activity the herd is
+         not zero, it is not applicable. -->
+    <tr><th>Катта мол (катта ёшдаги): қорамол, от, туя, эшак</th><td>{{ heads_large_adult }}</td></tr>
+    <tr><th>Катта мол (2 ёшгача): қорамол, от, туя, эшак</th><td>{{ heads_large_young }}</td></tr>
+    <tr><th>Майда мол (6 ойдан катта): қўй, эчки</th><td>{{ heads_small_adult }}</td></tr>
+    <tr><th>Майда мол (6 ойгача): қўзи, улоқ</th><td>{{ heads_small_young }}</td></tr>
+    <tr><th>Шартли бош (СБ) юкламаси</th><td>{{ sb_load }}</td></tr>
+    <tr><th>Фойдаланиш муддати</th><td>{{ period_from }} — {{ period_to }}</td></tr>
+    <tr><th>Рухсатнома суммаси, сўм</th><td>{{ amount }}</td></tr>
+    <!-- tz/13 requisite 19 is «Статус оплаты и дата». Only the STATUS half is
+         printed: the payment DATE lives in `payments`, which `permits` may not
+         read (design/01 rule 3 — both are level 4), and `applications.service`
+         exposes no paid-at. Printing the issuance date in its place would put a
+         wrong date on a legal document. Add the date here and to the snapshot
+         together, the day a lawful source for it exists. -->
+    <tr><th>Тўлов ҳолати</th><td>{{ payment_status }}</td></tr>
+  </table>
+
+  <table class="signatures">
+    <tr><td>Ўрмон хўжалиги раҳбари</td><td class="eri">электрон рақамли имзо</td></tr>
+    <tr><td>Бош ўрмонбеги</td><td class="eri">электрон рақамли имзо</td></tr>
+    <tr><td>Бош ҳисобчи</td><td class="eri">электрон рақамли имзо</td></tr>
+    <tr><td>Фойдаланувчи</td><td class="eri">электрон рақамли имзо</td></tr>
+  </table>
+
+  <div class="seal">
+    <img src="{{ qr }}" alt="QR">
+    <div class="caption">Ҳужжат ҳақиқийлигини текшириш учун QR-кодни сканерланг</div>
+  </div>
+</body>
+</html>

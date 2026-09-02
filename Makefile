@@ -41,6 +41,9 @@ seed:               ## Import reference data — make seed KIND=organizations FI
 	uv run python -m app.seed "$(KIND)" "$(FILE)"
 
 api:                ## Run the API on the host (after `make up`) — http://localhost:8000
+	@# Behind a proxy add --proxy-headers --forwarded-allow-ips (the rate limiter keys
+	@# on request.client.host). The public QR check's access-log line is dropped by
+	@# app/core/logging.py — a proxy in front must exclude that path itself (CLAUDE.md).
 	uv run uvicorn app.main:create_app --factory --reload
 
 workers:            ## Run the workers standalone (WORKERS_MODE=off deployments)

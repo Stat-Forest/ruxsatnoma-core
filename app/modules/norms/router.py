@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
-from app.core.schemas import Page
+from app.core.schemas import PAGING_MAX, Page
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.norms import repo, service
@@ -36,7 +36,7 @@ async def list_norms(
     activity_type_id: uuid.UUID | None = None,
     status: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
     items, total = await repo.list_norms(
         db,

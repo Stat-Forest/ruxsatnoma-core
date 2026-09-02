@@ -3,6 +3,7 @@ session, audits with user_id=None, and commits. Failures raise to the caller
 (the scheduler wrapper logs and swallows)."""
 
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -20,6 +21,7 @@ from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
 from app.modules.payments import jobs as payments_jobs
+from app.modules.permits import jobs as permits_jobs
 
 logger = structlog.get_logger(__name__)
 
@@ -218,3 +220,74 @@ async def expire_invoices(factory: async_sessionmaker[AsyncSession]) -> dict[str
     if counts["expired"] or counts["reminded"]:
         logger.info("job.expire_invoices", **counts)
     return counts
+
+
+async def _drain_batches(
+    factory: async_sessionmaker[AsyncSession],
+    sweep: Callable[[AsyncSession, uuid.UUID | None], Awaitable[permits_jobs.SweepBatch]],
+    *,
+    name: str,
+) -> int:
+    """Run one permits sweep to exhaustion, ONE TRANSACTION PER BATCH.
+
+    The batch bounds the transaction, the loop keeps the day unbounded (review,
+    Important 3): a batch commits before the next is read, so a season ending for
+    a whole district is still swept in full while no single transaction holds
+    thousands of `FOR UPDATE` locks. `after_id` is a keyset cursor over
+    `permits.id`, so the next batch resumes exactly where this one stopped and no
+    permit is visited twice — including the rows a batch skipped or whose own
+    SAVEPOINT rolled back.
+
+    A short batch — fewer candidates than the batch size — is the only stop
+    condition, and the cursor advancing monotonically is what guarantees it is
+    reached. `failed` rows are logged individually by the sweep and reported once
+    more here at error level: `_wrap` only sees raised exceptions, and nothing
+    here raises, so this line is the signal that a permit is stuck.
+    """
+    total = failed = 0
+    after_id: uuid.UUID | None = None
+    while True:
+        async with factory() as db:
+            batch = await sweep(db, after_id)
+            await db.commit()
+        total += batch.processed
+        failed += batch.failed
+        after_id = batch.last_id
+        if batch.scanned < permits_jobs.BATCH_SIZE:
+            break
+    if failed:
+        logger.error(f"job.{name}.rows_failed", failed=failed, processed=total)
+    elif total:
+        logger.info(f"job.{name}", processed=total)
+    return total
+
+
+async def expire_permits(factory: async_sessionmaker[AsyncSession]) -> int:
+    """The nightly permit expiry (plan 03.11a task 7, ruling 16).
+
+    A wrapper, like every job on this page: the decision lives in
+    `permits.jobs.expire_permits`, which takes a session so a test can drive it
+    without a scheduler, and this drains it batch by batch. A permit's status,
+    its history row, the holder's notification and its audit entry always share
+    one transaction.
+    """
+    return await _drain_batches(
+        factory,
+        lambda db, after_id: permits_jobs.expire_permits(db, after_id=after_id),
+        name="expire_permits",
+    )
+
+
+async def close_finished_permits(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Close the application behind every permit that has finished (ruling 13).
+
+    Scheduled AFTER `expire_permits` so a permit that ran out last night has its
+    application closed the same night rather than the next one — the sweep is
+    correct in either order, since it scans every finished permit, but the pair
+    is what a holder sees as one overnight step.
+    """
+    return await _drain_batches(
+        factory,
+        lambda db, after_id: permits_jobs.close_finished(db, after_id=after_id),
+        name="close_finished_permits",
+    )

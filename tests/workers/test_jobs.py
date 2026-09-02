@@ -2,8 +2,10 @@
 
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from typing import cast
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import make_session_factory
 from app.modules.auth.models import Applicant
@@ -103,3 +105,84 @@ async def test_expire_representations_flips_and_audits(engine, db):
         )
     ).scalar_one()
     assert audited >= 1
+
+
+# --- 3.11a task 7: the permit sweeps drain in batches -------------------------
+
+
+class _StubSession:
+    """Just enough session for `_drain_batches`: an async context manager that
+    records its commits. No database — the loop under test is pure control flow
+    (advance the cursor, stop on a short batch, commit between batches), and the
+    sweeps' own SQL is covered against real rows in
+    tests/modules/permits/test_jobs.py."""
+
+    def __init__(self, commits: list[int]) -> None:
+        self._commits = commits
+
+    async def __aenter__(self) -> _StubSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def commit(self) -> None:
+        self._commits.append(1)
+
+
+def _stub_factory(commits: list[int]) -> async_sessionmaker[AsyncSession]:
+    """`_drain_batches` only ever calls its factory and `async with`es the
+    result, so a callable returning `_StubSession` satisfies it at runtime; the
+    cast is what tells pyright that, since `async_sessionmaker` is a concrete
+    class rather than a protocol."""
+    return cast("async_sessionmaker[AsyncSession]", lambda: _StubSession(commits))
+
+
+async def test_a_permit_sweep_commits_every_batch_and_resumes_where_it_stopped():
+    """Review, Important 3. The whole point of batching is that the transaction
+    ends between batches — an unbounded sweep held a `FOR UPDATE` lock on every
+    candidate until the night was over, and one raising row rolled all of it
+    back. The loop must therefore commit per batch, carry `last_id` forward as
+    the cursor, and keep going until a SHORT batch says the queue is drained —
+    `processed` cannot be the stop condition, since the closure sweep skips
+    candidates whose application is already CLOSED."""
+    from app.modules.permits import jobs as permits_jobs
+    from app.workers.jobs import _drain_batches
+
+    full = permits_jobs.BATCH_SIZE
+    ids = [uuid.uuid4() for _ in range(3)]
+    batches = [
+        permits_jobs.SweepBatch(scanned=full, processed=2, failed=0, last_id=ids[0]),
+        permits_jobs.SweepBatch(scanned=full, processed=3, failed=1, last_id=ids[1]),
+        permits_jobs.SweepBatch(scanned=1, processed=1, failed=0, last_id=ids[2]),
+    ]
+    cursors: list[uuid.UUID | None] = []
+    commits: list[int] = []
+
+    async def sweep(db, after_id):
+        cursors.append(after_id)
+        return batches[len(cursors) - 1]
+
+    total = await _drain_batches(_stub_factory(commits), sweep, name="stub_sweep")
+
+    assert total == 6, "every batch's processed rows count, the failed one does not"
+    assert cursors == [None, ids[0], ids[1]], "each batch resumes after the last one"
+    assert len(commits) == 3, "one transaction per batch, not one for the night"
+
+
+async def test_an_empty_permit_sweep_opens_one_transaction_and_stops():
+    """The ordinary night: nothing expired, so the first batch is short and the
+    loop must not ask again."""
+    from app.modules.permits import jobs as permits_jobs
+    from app.workers.jobs import _drain_batches
+
+    commits: list[int] = []
+    calls = 0
+
+    async def sweep(db, after_id):
+        nonlocal calls
+        calls += 1
+        return permits_jobs.SweepBatch(scanned=0, processed=0, failed=0, last_id=None)
+
+    assert await _drain_batches(_stub_factory(commits), sweep, name="stub_sweep") == 0
+    assert (calls, len(commits)) == (1, 1)

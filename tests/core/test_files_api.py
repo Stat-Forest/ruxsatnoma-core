@@ -9,7 +9,6 @@ import pytest
 from fastapi import UploadFile
 from sqlalchemy import select
 
-from app import files_router
 from app.core import files
 from app.core.errors import DomainError
 from app.main import create_app
@@ -208,15 +207,15 @@ async def test_download_cyrillic_filename_roundtrip(db):
 def test_ascii_fallback_filename_pure_non_ascii_collapses_to_file():
     """Unit-ish case for the pure-non-ASCII fallback: no extension at all survives
     either, so there is nothing to append to "file"."""
-    assert files_router._ascii_fallback_filename("доверенность") == "file"
+    assert files._ascii_fallback_filename("доверенность") == "file"
 
 
 def test_ascii_fallback_filename_keeps_a_surviving_extension():
-    assert files_router._ascii_fallback_filename("доверенность.pdf") == "file.pdf"
+    assert files._ascii_fallback_filename("доверенность.pdf") == "file.pdf"
 
 
 def test_ascii_fallback_filename_untouched_for_plain_ascii():
-    assert files_router._ascii_fallback_filename("report.pdf") == "report.pdf"
+    assert files._ascii_fallback_filename("report.pdf") == "report.pdf"
 
 
 def test_sanitize_filename_strips_bare_carriage_return():
@@ -225,6 +224,24 @@ def test_sanitize_filename_strips_bare_carriage_return():
     untouched — still a header-injection seam on clients that treat lone CR as a
     line terminator."""
     assert files.sanitize_filename("evil\rInjected: header") == "evilInjected: header"
+
+
+def test_content_disposition_defends_itself_against_an_unsanitized_name():
+    """Final fix wave, B1. A `"` is printable ASCII, so `_ascii_fallback_filename`
+    keeps it and it closes the `filename="…"` value early: this helper used to emit
+    `filename="a"b.pdf"` for `'a"b.pdf'`. Every caller happened to sanitize at
+    ingest, so it was malformation rather than header injection — but the helper is
+    now shared by three routers and stage 4 adds more, and a precondition stated in
+    a docstring is enforced by nobody. It sanitizes its own input.
+
+    Both halves are checked: exactly two `"` in the whole header (so the value is
+    one token), and the extended parameter still carrying the sanitized name — a
+    newline becomes a space, which percent-encodes to `%20`."""
+    header = files.content_disposition("attachment", 'a"b\r\n.pdf')
+    assert header.count('"') == 2, header
+    assert 'filename="ab.pdf"' in header
+    assert "\r" not in header and "\n" not in header
+    assert "filename*=UTF-8''ab%20.pdf" in header
 
 
 # --- I2 (final review): the size cap must be enforced before the body sits in RAM --
