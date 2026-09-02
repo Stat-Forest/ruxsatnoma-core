@@ -16,13 +16,18 @@ otherwise-unrelated entry points both import purely for its registration side
 effect, never for a return value.
 """
 
+from app.core import events
+from app.modules.applications import events as application_events
+from app.modules.payments import subscribers as payments_subscribers
+
 
 def register_event_subscriptions() -> None:
     """Every `core.events.subscribe(...)` call in the system lives here and
     nowhere else (design/01 rule 4), so no module imports another for the sake
-    of an event. Empty in 3.9a: the publishers land with the application flow,
-    and the first subscribers are 3.10a `payments` (application_approved ->
-    issue an invoice) and 3.11 `permits` (payment_confirmed -> issue a permit).
+    of an event. 3.10a `payments` is the first subscriber (task 2):
+    `APPLICATION_APPROVED` issues an invoice, `APPLICATION_CANCELLED` cancels
+    any in-force one. 3.11 `permits` (payment_confirmed -> issue a permit) is
+    next.
 
     Safe to call more than once per process — `subscribe` itself is idempotent
     per `(event_name, handler)` pair (`app/core/events.py`) — because both
@@ -31,3 +36,9 @@ def register_event_subscriptions() -> None:
     (`app.workers.runner.main`) calls it again on its own, since it never calls
     `create_app()` at all.
     """
+    events.subscribe(
+        application_events.APPLICATION_APPROVED, payments_subscribers.on_application_approved
+    )
+    events.subscribe(
+        application_events.APPLICATION_CANCELLED, payments_subscribers.on_application_cancelled
+    )

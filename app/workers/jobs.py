@@ -19,6 +19,7 @@ from app.modules.gis import import_service as gis_import_service
 from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
+from app.modules.payments import jobs as payments_jobs
 
 logger = structlog.get_logger(__name__)
 
@@ -200,3 +201,20 @@ async def process_gis_imports(factory: async_sessionmaker[AsyncSession]) -> int:
     if processed:
         logger.info("job.process_gis_imports", processed=processed)
     return processed
+
+
+async def expire_invoices(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
+    """Close an unpaid invoice's 10-day window and remind the applicant before
+    it closes (plan 03.10a-payments-core task 6, ruling 13).
+
+    Thin wrapper only — `payments.jobs.expiry_sweep(db)` holds the actual
+    logic (both DB passes, the audit trail, the reminder), the same split
+    `process_gis_imports` above has from `gis_import_service.process_pending`.
+    This function's own job is the one every other job in this file already
+    does: open a session, run it, commit."""
+    async with factory() as db:
+        counts = await payments_jobs.expiry_sweep(db)
+        await db.commit()
+    if counts["expired"] or counts["reminded"]:
+        logger.info("job.expire_invoices", **counts)
+    return counts

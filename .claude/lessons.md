@@ -140,6 +140,21 @@ Tooling and environment.
   shared DB ahead of your files (hit building 3.8).
 - **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
   naming a version you don't have locally means check which DB you connected to first.
+- **Recovery:** Already ran it bare? Check `alembic_version` on the dev DB immediately; if it
+  now names one of YOUR unmerged revisions, `alembic downgrade` it back to where `dev`
+  actually is before touching anything else (hit and recovered clean in 3.10a t6, back to `0014`).
+
+## Amending an unmerged migration needs the OLD script to downgrade, the NEW one to upgrade
+
+- **Rule:** Editing an unmerged migration's `upgrade()`/`downgrade()` after your OWN
+  worktree already ran it: `git show HEAD:<file> > <file>` to restore the OLD content,
+  `alembic downgrade -1`, THEN restore your edit and `alembic upgrade head`.
+- **Why:** The installed schema still matches the OLD script; running the EDITED file's
+  `downgrade()` against it fails on whatever the edit added —
+  `UndefinedObjectError: index "ix_invoices_calculation_id" does not exist`, amending 0017
+  to add a column after `_migrated_test_db` had already created the table without it (3.10a t2).
+- **How to apply:** Any "amend this branch's own migration in place" ruling, on a worktree
+  whose test DB already applied it — downgrade with the git-HEAD version, never the edited one.
 
 ## Closing a deferred FK can break a DIFFERENT module's tests, invisibly
 
@@ -209,44 +224,32 @@ Tooling and environment.
 - **How to apply:** Adding a `CheckConstraint` → grep for a `pytest.raises(IntegrityError)`
   that actually exercises it, not just the guard in front of it. Two tests, not one.
 
-## `IntegrityError` IS a `DBAPIError` — never assume which one a DB failure raises
+## A failed DB statement aborts the whole transaction — catch the right type, recover with a SAVEPOINT
 
-- **Rule:** `except IntegrityError` before `except DBAPIError`, never after, and never one
-  clause inspecting `exc.orig` by hand. The same discipline applies to `pytest.raises(...)`:
-  verify empirically which class a given failure raises, never assume from its category.
-- **Why:** `gis.service.create_version` had only `except DBAPIError`, mapping every DB
-  failure to `ERR-GIS-001` ("unreadable geometry"); a `uq_contour_version_no` race raises
-  `IntegrityError`, a subclass, so a version-number conflict was reported as a geometry
-  defect (3.6a t3). Task 7's bulk importer drives the same path — the bug was live.
-- **The mirror, in a test:** an append-only trigger's plain `RAISE EXCEPTION` (audit_log,
-  calculations, application_status_history) carries SQLSTATE `P0001`, outside the `23xxx`
-  integrity-violation class its name suggests — it surfaces as `DBAPIError`, not
-  `IntegrityError`. A 3.9a-applications-core plan's own verbatim
-  `pytest.raises(IntegrityError, match="append-only")` against exactly this idiom could
-  never pass; `tests/modules/audit/test_audit_log.py` and `tests/modules/norms/test_models.py`
-  already assert `DBAPIError` for the identical trigger shape.
-- **How to apply:** Before adding a second `except` beside an existing `DBAPIError`, OR
-  writing `pytest.raises` against any DB failure — a trigger's RAISE included — check
-  `__mro__` and verify empirically which exception a real run actually raises.
-
-## Recovering from a failed insert to keep writing on the same session needs a SAVEPOINT and `exc.orig.__cause__`
-
-- **Rule:** To catch one specific constraint's `IntegrityError` and still use the same
-  session afterward (write evidence, commit), wrap the risky insert in `async with
-  db.begin_nested():` (a SAVEPOINT), never a bare `db.rollback()`; identify WHICH
-  constraint fired via `getattr(exc.orig.__cause__, "constraint_name", None)`, never
-  `exc.orig` or the formatted message.
-- **Why:** `signatures.service.sign()`'s race path writes an audit entry and commits after
-  recovering. A bare `db.rollback()` undoes the WHOLE transaction, not just the failed
-  statement — it silently discarded a caller's own earlier, uncommitted work on the same
-  session, and the next INSERT then failed on an FK pointing at a just-un-inserted row.
-  Separately, `exc.orig` is SQLAlchemy's asyncpg wrapper and exposes only `pgcode` (generic
-  per SQLSTATE class — every unique violation is `23505` regardless of index);
-  `exc.orig.__cause__` is asyncpg's OWN exception, which alone carries `constraint_name`.
-- **How to apply:** `signatures.service.sign()`'s `try: async with db.begin_nested(): ...
-  except IntegrityError:` block, compared against the ONE literal constraint name the
-  branch cares about, is the template — a savepoint only when the caller keeps using `db`
-  afterward; a bare `except IntegrityError: raise err(...)` needs none.
+- **Rule:** `except IntegrityError` before `except DBAPIError`, never after; name the
+  constraint via `getattr(exc.orig.__cause__, "constraint_name", None)`, never `exc.orig` or
+  the message. To keep writing on the same session after ANY failed statement, wrap the
+  risky work in `async with db.begin_nested():` (a SAVEPOINT), never a bare `db.rollback()`.
+- **Why:** `gis.service.create_version` caught only `DBAPIError`, mapping every DB failure
+  to `ERR-GIS-001` ("unreadable geometry") — a `uq_contour_version_no` race raises
+  `IntegrityError`, a subclass, so a version conflict read as a geometry defect (3.6a t3).
+  Never judge from the name: an append-only trigger's plain `RAISE EXCEPTION` (audit_log,
+  calculations, application_status_history) is SQLSTATE `P0001`, outside the `23xxx` class,
+  and surfaces as `DBAPIError` — and so does `DeadlockDetected`, which no `except
+  DomainError` can contain (3.10a's sweep, deadlocking against `PerformTransaction`).
+- **The recovery half:** a bare `db.rollback()` undoes the WHOLE transaction, not just the
+  failed statement — `signatures.service.sign()`'s race path silently discarded a caller's
+  earlier uncommitted work. Worse in a loop: Postgres then refuses every later statement AND
+  turns the final `COMMIT` into a silent `ROLLBACK`, so a broad `except` without a savepoint
+  lets a job "complete" while throwing its whole night away — one savepoint PER ROW is what
+  makes the next row writable. `exc.orig` (SQLAlchemy's asyncpg wrapper) exposes only
+  `pgcode`; `exc.orig.__cause__` alone carries `constraint_name`.
+- **Your handler is not the end of the transaction:** `get_db` commits AGAIN after it
+  returns, so a route that swallows a DB failure and answers anyway (`payme_router.py`,
+  always-200) must `await db.rollback()` in its own try, or that second commit 500s.
+- **How to apply:** `signatures.service.sign()` is the template; a savepoint only when the
+  caller keeps using `db` afterward. Before `pytest.raises` against any DB failure — a
+  trigger's own RAISE included — check `__mro__` and run it once for real.
 
 ## A service meant as THE one write path for future callers locks its row, even with one caller today
 
@@ -711,18 +714,45 @@ Tooling and environment.
   negative test twice in a row, and as part of the FULL suite — this class is invisible in
   isolation. Do not reorder the conftest collection hook.
 
-## A `_client_for` client's setup-time commit only covers fixtures listed before it
+## A module's test conftest needs plumbing copied from an existing one, not just fixtures
 
-- **Rule:** Every client fixture built over `_client_for` registers an httpx `request` event
-  hook re-committing `db` before each outgoing call.
-- **Why:** pytest instantiates fixtures in the LEFT-TO-RIGHT order of the parameter list
-  (verified empirically), so in `test_x(gis_client, leshoz, contours_layer)` the client's
-  internal commit runs before `leshoz` even executes — `leshoz`'s `flush()`-only row stays
-  invisible to the app's separate connection and the test FK-fails (confirmed with an
-  independent asyncpg connection finding nothing in `organizations`).
-- **How to apply:** Copy `tests/modules/gis/conftest.py`'s
-  `_commit_pending_before_requests` for any new signed-in-client fixture that will ever be
-  combined with a write fixture; never rely on parameter order.
+- **Rule:** Writing a module's first HTTP-driven test file, copy three things from an
+  already-HTTP-tested package before the first `client.get(...)`: the autouse
+  `_app_on_test_db` guard, `_commit_pending_before_requests` on every client fixture, and
+  `from module import name as name` for a fixture re-exported AND consumed locally.
+- **Why:** each one fails for a reason with nothing to do with the assertion under test.
+  - **No `_app_on_test_db`** (monkeypatch `DATABASE_URL` to `database_url_test` +
+    `get_settings.cache_clear()`, never inherited from another package): `create_app()`'s
+    lifespan opens the shared DEV database, every session cookie a fixture wrote is
+    invisible to it, and EVERY request 401s — reading as a blanket auth failure with no
+    hint the database is the bug (`signatures/test_api.py`, 3.8 t7).
+  - **No commit hook:** pytest instantiates fixtures LEFT-TO-RIGHT (verified), so in
+    `test_x(gis_client, leshoz, ...)` the client's own setup-time commit runs before
+    `leshoz` executes — its `flush()`-only row stays invisible to the app's separate
+    connection and the test FK-fails. Never rely on parameter order.
+  - **Plain re-export:** pyflakes flags a parameter shadowing an "unused" import as F811,
+    while the identical shape is silent when the earlier binding is a locally-DEFINED
+    fixture — `norms/conftest.py` re-exporting gis's four failed on all four (3.7 t1).
+    `# noqa: F401` for names only re-exported, `as <same name>` for ones also consumed;
+    renaming the parameter instead would break pytest's name-based injection.
+- **How to apply:** `tests/modules/gis/conftest.py` is the template for all three. Grep a
+  new package's own `conftest.py` for `_app_on_test_db` and `_commit_pending_before_requests`
+  and add them there (autouse for the first), never per-file.
+
+## Build a fixture's precondition through the real transition, never by assigning the status
+
+- **Rule:** A fixture that needs a row in some state reaches it by running the code that
+  produces that state — publish the event, call the service — never by writing
+  `status="X"` on a freshly constructed row.
+- **Why:** 3.10a's `pending_invoice` hand-set the application to `APPROVED` while an
+  application holding an invoice is already `INVOICED`. `APPROVED -> PAID` is not a legal
+  jump, so `PerformTransaction` was refused with `ERR-APP-004` and three tests failed
+  pointing at the payment code — the FIXTURE was wrong. The mirror is worse: had the
+  transition itself regressed, a hand-set status would have hidden it and every test
+  stayed green. Same reason `cancelled_invoice` cancels through the real subscriber.
+- **How to apply:** Writing a fixture whose docstring says "an application already in X",
+  ask which call puts it there and make the fixture do that; `tests/modules/payments/
+  conftest.py`'s `pending_invoice`/`cancelled_invoice` are the template.
 
 ## A conftest autouse fixture runs before your test — schema checks belong in the gate
 
@@ -763,21 +793,6 @@ Tooling and environment.
   recomputing the expectation from whatever row is in force — that passes against a WRONG
   tariff, the opposite of what the test is for.
 
-## A re-exported fixture shadowed by a same-file parameter trips ruff's F811
-
-- **Rule:** When a conftest imports another module's fixture ONLY to re-export it and ALSO
-  uses that name as a parameter on a fixture defined in the SAME file, import it as
-  `from module import name as name` — never rename the parameter, which would break pytest's
-  name-based injection.
-- **Why:** Pyflakes flags a parameter shadowing an "unused" import as F811, even though the
-  identical shape is silent when the earlier binding is a locally-DEFINED fixture:
-  `tests/modules/gis/conftest.py`'s own `published_contour(db, contours_layer, leshoz,
-  approval_doc)` never trips it, while `tests/modules/norms/conftest.py` re-exporting those
-  four and using them as parameters failed `ruff check` on all four (3.7 t1).
-- **How to apply:** Keep `# noqa: F401` for names you only re-export; use `as <same name>` for
-  the ones you also consume locally. `ruff check --fix` will split them into their own
-  `from ... import (...)` — let it.
-
 ## `dict(rows.all())` on a raw `text()` query passes at runtime, fails pyright
 
 - **Rule:** Build a dict from a raw-SQL `Result` with a comprehension —
@@ -803,20 +818,6 @@ Tooling and environment.
 - **How to apply:** Before combining a settings-override write with a call that could be
   refused, ask whether that call's whole point IS the refusal — if so, keep the write out of
   that test entirely.
-
-## A module's first HTTP-driven test file needs its own `_app_on_test_db` guard
-
-- **Rule:** The first test file in a module that drives requests through `create_app()`
-  (not direct `service.py` calls) must add an autouse fixture monkeypatching `DATABASE_URL`
-  to `database_url_test` plus `get_settings.cache_clear()` — copy it from any other
-  HTTP-tested module's `conftest.py`, never assume it is inherited.
-- **Why:** Without it, `create_app()`'s lifespan opens the shared dev `DATABASE_URL`, not
-  the test one — every session cookie a fixture wrote is invisible to it, and EVERY request
-  401s (`ERR-AUTH-002`), reading as a blanket auth failure with no hint that the database is
-  the actual bug (hit on `signatures/test_api.py`, 3.8 t7).
-- **How to apply:** Adding a module's first `router.py` test file, grep its own
-  `conftest.py` for `_app_on_test_db` before writing a single `client.get(...)`; add it
-  there (autouse) if missing, rather than per-file.
 
 ## An unannotated test fixture parameter hides a `str | None` argument-type error pyright would catch
 

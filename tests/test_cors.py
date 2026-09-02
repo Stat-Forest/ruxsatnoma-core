@@ -56,6 +56,7 @@ def test_samesite_follows_the_cross_origin_setup():
         eimzo_mode="real",
         sms_mode="real",
         email_mode="real",
+        payme_mode="real",
         eskiz_email="bot@example.uz",
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
@@ -63,6 +64,8 @@ def test_samesite_follows_the_cross_origin_setup():
         public_base_url="https://ruxsatnoma.example.uz",
         smtp_host="smtp.example.uz",
         smtp_from="noreply@example.uz",
+        payme_merchant_id="a-real-merchant-id",
+        payme_cashbox_key="a-real-cashbox-key",
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert cross_origin_prod.resolve_cookie_samesite() == "none"
