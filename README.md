@@ -60,6 +60,23 @@ docker compose down -v && rm -rf pg-data
 docker compose up -d
 ```
 
+⚠️ **Стадия 3.11a: миграция `0019_permits` правилась после того, как её уже
+применили** (один коммит добавил partial unique index `uq_permit_templates_active`,
+другой переписал seed шаблона `permit.signed`). Любая база, накатившая эту ветку
+**раньше 2026-09-02 18:51**, сообщает `version_num = 0020`, но индекса у неё нет — а
+на него опирается `scalar_one_or_none()` в `repo.active_template`, так что вторая
+активная версия шаблона проходит молча и в разрешение навсегда вмерзает не тот
+`template_id`. Лечение — только полный прогон заново:
+
+```bash
+DATABASE_URL="$DATABASE_URL_TEST" uv run alembic downgrade 0016
+DATABASE_URL="$DATABASE_URL_TEST" uv run alembic upgrade head
+```
+
+Правка применённой миграции допустима ровно потому, что `0019`/`0020` не смёржены и
+не применены нигде, кроме рабочих копий этой ветки. Как только ветка уедет в `dev`,
+любое изменение — только новой ревизией.
+
 ## Структура
 
 `app/core` — обвязка (конфиг, БД, ошибки ERR-*, логи, healthcheck), без бизнес-логики.
