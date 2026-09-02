@@ -198,16 +198,18 @@ Tooling and environment.
   `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints` are the
   shape. `admin.models.ORGANIZATION_KINDS` still retypes its CHECK — fix on next touch.
 
-## A service-level pre-check can leave its mirrored DB CHECK permanently unexercised
+## Two mechanisms refusing one thing: an outcome-only test cannot tell which one fired
 
-- **Rule:** When a service pre-checks a rule a CHECK also enforces (our defense-in-depth
-  pattern), write a SEPARATE model-level test inserting through the ORM directly — an
-  API-level test alone never reaches the CHECK.
-- **Why:** `Contour.parent_needs_subcontour` had a test from Task 1, but only through
-  `POST /gis/contours`, which raises `ERR-VAL-001` from the service before a row is even
-  constructed; the CHECK first fired in Task 3's direct-ORM test.
-- **How to apply:** Adding a `CheckConstraint` → grep for a `pytest.raises(IntegrityError)`
-  that actually exercises it, not just the guard in front of it. Two tests, not one.
+- **Rule:** When something else also refuses what your guard refuses — a DB CHECK behind a
+  service pre-check, a later guard in the same function — assert the RECORDED reason, not
+  just the status code, and revert the guard to prove that test goes red.
+- **Why:** Twice, one class. `parent_needs_subcontour`'s only test went through
+  `POST /gis/contours`, which raises `ERR-VAL-001` before a row exists, so the CHECK never
+  ran (3.6a t3). `permits.signers.is_known` was redundant — an unmapped purpose fell
+  through to the role comparison as `wrong_role`, so deleting the guard left it green.
+- **How to apply:** Adding a guard in front of an existing refusal → one test per
+  mechanism, each asserting its OWN reason (a direct-ORM `pytest.raises` for a CHECK). A
+  negative control that stays green means the guard is redundant, not that it works.
 
 ## `IntegrityError` IS a `DBAPIError` — never assume which one a DB failure raises
 
