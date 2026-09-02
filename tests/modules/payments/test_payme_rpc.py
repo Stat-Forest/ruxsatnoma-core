@@ -98,6 +98,43 @@ async def test_a_missing_authorization_header_answers_32504(client):
     assert result.json()["error"]["code"] == -32504
 
 
+async def test_a_commit_failure_never_escapes_as_a_500(db, client, pending_invoice, monkeypatch):
+    """Review finding I1: `payme_router._process`'s own `db.commit()` calls
+    can themselves raise (a genuine DB-level failure at exactly that
+    moment) — `payme_rpc`'s outer guard must still answer 200 `-32400`,
+    never let it escape past `get_db` into `app.main`'s generic 500.
+
+    Patches `AsyncSession.commit` to raise on its FIRST call against any
+    session OTHER than this test's own `db` fixture — `db` must keep
+    committing normally throughout, or `_commit_pending_before_requests`'s
+    own pre-request commit (needed for `pending_invoice` to be visible to
+    the app's separate connection at all) would itself trip this same
+    patch. The APP's per-request session's first commit, for a plain
+    `CheckPerformTransaction` call, is `_process`'s own success-path one —
+    exactly one of the three sites review finding I1 named."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    real_commit = AsyncSession.commit
+    tripped = {"done": False}
+
+    async def _flaky_commit(self: AsyncSession) -> None:
+        if self is not db and not tripped["done"]:
+            tripped["done"] = True
+            raise RuntimeError("simulated commit failure")
+        await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", _flaky_commit)
+
+    result = await _rpc(
+        client,
+        "CheckPerformTransaction",
+        {"amount": int(pending_invoice.amount * 100), "account": {"id": pending_invoice.number}},
+    )
+    assert result.status_code == 200
+    assert result.json()["error"]["code"] == -32400
+    assert tripped["done"] is True  # the patch actually fired — not a vacuous pass
+
+
 async def test_check_perform_rejects_a_wrong_amount(client, pending_invoice):
     result = await _rpc(
         client, "CheckPerformTransaction", {"amount": 1, "account": {"id": pending_invoice.number}}
@@ -271,11 +308,18 @@ async def test_performing_against_a_cancelled_invoice_answers_31008(db, client, 
 async def test_creating_a_transaction_against_a_cancelled_invoice_is_refused(
     client, cancelled_invoice
 ):
-    """Ruling F's second half: `CreateTransaction` against an invoice that is
-    ALREADY cancelled (never one this call itself just raced against) is
-    refused as an account error — the invoice is not payable / not found as
-    a payable account — never `-31008`, which this module reserves for an
-    EXISTING transaction row that can no longer be performed."""
+    """Ruling F's second half, corrected by whole-branch review finding I2
+    (my ruling F was too narrow, not the reviewer's instinct — see
+    `payme.py`'s own module docstring): `CreateTransaction` against an
+    invoice that is ALREADY cancelled (never one this call itself just
+    raced against) is `-31008` ("cannot perform"), because
+    `CheckPerformTransaction`/`CreateTransaction` share one check and a
+    FOUND-but-not-`pending` invoice is a "cannot perform" answer, not an
+    "unknown account" one — telling a citizen whose invoice is already
+    settled that the ACCOUNT NUMBER is wrong would send them back to
+    re-enter a number that was never the problem. The plan's own original
+    text already accepted either code here (`in (-31008, -31050)`), so this
+    is inside the plan, not a deviation from it."""
     result = await _rpc(
         client,
         "CreateTransaction",
@@ -284,6 +328,24 @@ async def test_creating_a_transaction_against_a_cancelled_invoice_is_refused(
             "time": 1_800_000_000_000,
             "amount": int(cancelled_invoice.amount * 100),
             "account": {"id": cancelled_invoice.number},
+        },
+    )
+    assert result.json()["error"]["code"] == -31008
+
+
+async def test_creating_a_transaction_against_an_unknown_invoice_is_an_account_error(client):
+    """The other half of finding I2's split: an invoice number that resolves
+    to NOTHING is still `-31050…-31099` from `CreateTransaction`, exactly as
+    it already is from `CheckPerformTransaction` — only "found but not
+    payable" moved to `-31008`, "not found at all" did not."""
+    result = await _rpc(
+        client,
+        "CreateTransaction",
+        {
+            "id": _tx_id("unknown-account"),
+            "time": 1_800_000_000_000,
+            "amount": 10_000_000,
+            "account": {"id": "INV-2027-999999"},
         },
     )
     assert -31099 <= result.json()["error"]["code"] <= -31050

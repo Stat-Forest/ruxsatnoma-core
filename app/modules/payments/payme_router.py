@@ -27,21 +27,29 @@ THIS name directly, never `app.core.time`, which this route has no reason to
 use at all: `payme.handle`'s `now` is a plain UTC instant, not a business
 calendar day.
 
-Commit discipline (why every branch below ends with an explicit `db.commit()`
-or `db.rollback()` rather than trusting `get_db`'s commit-on-success): this
-function NEVER raises past itself, so `get_db` (`app/core/deps.py`) always
-takes its "no exception propagated" branch and calls `session.commit()` on
-return, REGARDLESS of which branch below produced the response. A
-`payme.PaymeError` can carry a legitimate mutation that must survive it — the
-12h-timeout auto-cancel (ruling 4) is exactly `-31008` WITH a state change
-that has to reach the database, or `CheckTransaction` right after would not
-see `reason: 4` — so that branch commits explicitly before returning. An
-UNEXPECTED exception is the opposite: whatever the failed statement left
-pending must never reach the database, so that branch rolls back explicitly
-before returning, which also protects `get_db`'s own final commit from
-retrying a half-aborted transaction (a `PendingRollbackError` there would
-escape as a real 500 — the one outcome this whole route exists to prevent).
-Both explicit calls make `get_db`'s own commit a harmless no-op afterward.
+Commit discipline (why `_process` below ends most of its branches with an
+explicit `db.commit()` or `db.rollback()` rather than trusting `get_db`'s
+own commit-on-success): a `payme.PaymeError` can carry a legitimate
+mutation that must survive it — the 12h-timeout auto-cancel (ruling 4) is
+exactly `-31008` WITH a state change that has to reach the database, or
+`CheckTransaction` right after would not see `reason: 4` — so that branch
+commits explicitly before returning. An UNEXPECTED exception is the
+opposite: whatever the failed statement left pending must never reach the
+database, so that branch rolls back explicitly before returning.
+
+Whole-branch review finding I1: those explicit `db.commit()`/`db.rollback()`
+calls can themselves raise (a genuine DB-level failure at exactly that
+moment) — and until `payme_rpc` below wrapped `_process` in its own outer
+`try`, such a failure would leave `_process`, past `get_db`
+(`app/core/deps.py`), into `app.main`'s generic handler as a real 500, the
+one outcome this whole route exists to prevent. `payme_rpc` is the
+backstop that makes this module docstring's "never lets ANY exception
+escape" literally true, independent of what `_process` itself does or
+fails to do. It deliberately does not touch `db` itself: whatever
+`_process`'s own commit/rollback already attempted is left for `get_db`'s
+own teardown to resolve, exactly as it does for every other route in this
+codebase — this route's own promise is that ITS response is always 200,
+not that it can override how session teardown behaves after that.
 """
 
 import json
@@ -80,8 +88,12 @@ def _error(
     return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": rpc_id, "error": error})
 
 
-@router.post("/payme")
-async def payme_rpc(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> JSONResponse:
+async def _process(request: Request, db: AsyncSession) -> JSONResponse:
+    """Everything `payme_rpc` used to do directly (unchanged): parse the
+    envelope, verify credentials, dispatch, respond. Split out so
+    `payme_rpc` can wrap ALL of it — envelope parsing included — in one
+    outer guard (review finding I1) without that guard itself needing to
+    know which branch below is currently running."""
     try:
         body = json.loads(await request.body())
     except Exception:
@@ -126,3 +138,21 @@ async def payme_rpc(request: Request, db: Annotated[AsyncSession, Depends(get_db
 
     await db.commit()
     return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": rpc_id, "result": result})
+
+
+@router.post("/payme")
+async def payme_rpc(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> JSONResponse:
+    try:
+        return await _process(request, db)
+    except Exception as exc:
+        # Review finding I1's own backstop — see the module docstring's
+        # "Commit discipline" section for the full reasoning. Reachable only
+        # when one of `_process`'s own `db.commit()`/`db.rollback()` calls
+        # itself raises; every OTHER failure is already handled, and
+        # answered 200, inside `_process`. `rpc_id` is unknown at this
+        # level by design (re-parsing the body here to recover it would
+        # itself be one more thing that can fail) — `null` is valid
+        # JSON-RPC for a response whose request could not be identified,
+        # the same convention `-32700`/`-32600` above already use.
+        logger.error("payme_rpc_commit_failed", error=repr(exc))
+        return _error(None, payme.ERR_INTERNAL, "Internal error")

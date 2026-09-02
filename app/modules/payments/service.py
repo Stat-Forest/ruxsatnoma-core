@@ -43,7 +43,6 @@ from app.core.events import Event, publish
 from app.core.time import TASHKENT, business_today
 from app.modules.admin import repo as admin_repo
 from app.modules.applications import service as applications_service
-from app.modules.applications.models import Application
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -236,20 +235,30 @@ async def list_invoices_for_actor(
     return await repo.list_invoices_by_application(db, application_id, limit=limit, offset=offset)
 
 
-async def _resolve_recipient_account(db: AsyncSession, application: Application) -> str | None:
+async def _resolve_recipient_account(
+    db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
+) -> str | None:
     """Ruling H: the leshoz's own bank account for the 50/50 recipient half —
-    `application.contour_id` -> `gis.service.contour_organization` ->
+    `contour_id` -> `gis.service.contour_organization` ->
     `admin.repo.get_organization` -> `organization.requisites.get("account")`,
-    falling back to `application.assigned_org_id` when there is no contour.
-    `None` (never a placeholder string) whenever any step comes up empty: a
-    leshoz without bank details, or without even an assigned organization,
-    must never block money that has already arrived — `allocations.account`
-    is nullable for exactly this (Task 3 ruling)."""
+    falling back to `assigned_org_id` when there is no contour. `None`
+    (never a placeholder string) whenever any step comes up empty: a leshoz
+    without bank details, or without even an assigned organization, must
+    never block money that has already arrived — `allocations.account` is
+    nullable for exactly this (Task 3 ruling).
+
+    Takes the two fields it actually reads, not the whole `Application`
+    (review finding I3): `payments` may not import `applications.models` —
+    CLAUDE.md's module boundary, and the ONLY import of it anywhere in
+    `app/` outside `applications` itself and `models_registry.py` before
+    this fix. `confirm_payment` (the caller) already holds the row via
+    `applications.service.get`, itself the sanctioned cross-module surface —
+    only the TYPE import for this helper's own signature was the violation."""
     org_id: uuid.UUID | None
-    if application.contour_id is not None:
-        org_id = await gis_service.contour_organization(db, application.contour_id)
+    if contour_id is not None:
+        org_id = await gis_service.contour_organization(db, contour_id)
     else:
-        org_id = application.assigned_org_id
+        org_id = assigned_org_id
     if org_id is None:
         return None
     organization = await admin_repo.get_organization(db, org_id)
@@ -287,7 +296,9 @@ async def confirm_payment(
         # by payme_router.py's generic handler and answered -32400.
         raise err("ERR-SYS-003", details={"invoice": str(invoice.id)})
 
-    recipient_account = await _resolve_recipient_account(db, application)
+    recipient_account = await _resolve_recipient_account(
+        db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
+    )
     entries = ledger.entries_for(
         invoice=invoice,
         transaction=transaction,

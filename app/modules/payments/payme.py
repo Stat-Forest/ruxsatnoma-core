@@ -11,23 +11,29 @@ itself, so the 12h timeout is provably measured from `received_at` alone,
 not from a call to `datetime.now()` buried three functions deep.
 
 Two error-code families this module uses, per `design/04-integrations.md`
-§3.6 and ruling F's worked example:
+§3.6 (corrected by the whole-branch review, finding I2 — this supersedes
+ruling F's own narrower split, which put BOTH "unknown" and "found but not
+payable" under `-31050`):
 
 - `-31050` ("account error") is what `CheckPerformTransaction` and
-  `CreateTransaction` answer when the ACCOUNT (the invoice, found by number)
-  is the problem — unknown, or found but not currently payable
-  (paid/cancelled/expired). `CreateTransaction` reuses the exact same check
-  `CheckPerformTransaction` runs, so the two must never disagree about which
-  code an unpayable invoice gets (ruling F's own
-  `test_creating_a_transaction_against_a_cancelled_invoice_is_refused`).
-- `-31008` ("cannot perform") is reserved for an EXISTING `provider_transactions`
+  `CreateTransaction` answer when the invoice NUMBER itself does not
+  resolve to a row at all.
+- `-31008` ("cannot perform") is what BOTH methods answer when the invoice
+  IS found but `status != "pending"` (already paid, cancelled, expired) —
+  real Payme semantics are that `CreateTransaction` re-runs
+  `CheckPerformTransaction`'s own check and must return the identical
+  error for the identical invoice; two callers disagreeing about the same
+  row is the exact bug class this review finding closed. `-31008` is ALSO
+  what `PerformTransaction` answers for an EXISTING `provider_transactions`
   row that can no longer be acted on — expired past the 12h timeout
   (`CreateTransaction`'s idempotent-replay branch, `PerformTransaction`), or
   whose invoice left `pending` AFTER the transaction was created
   (`PerformTransaction` only — ruling F's restructured
-  `test_performing_against_a_cancelled_invoice_answers_31008`, the real race:
-  the applicant withdrew between `CreateTransaction` and now). It never
-  fires against an account that was never turned into a transaction at all.
+  `test_performing_against_a_cancelled_invoice_answers_31008`, the real
+  race: the applicant withdrew between `CreateTransaction` and now). One
+  code, two related but distinct triggers — "this account cannot be paid"
+  and "this transaction cannot proceed" — never conflated with `-31050`,
+  which is reserved for "this account does not exist at all".
 """
 
 from collections.abc import Awaitable, Callable
@@ -140,12 +146,17 @@ async def _check_invoice_for_payment(db: AsyncSession, params: dict[str, Any]) -
     """`CheckPerformTransaction`'s own rule, reused VERBATIM by
     `CreateTransaction` — the two must agree, or a caller could be told
     "yes, payable" by one and refused by the other for the identical
-    request. See the module docstring for why an unpayable-but-existing
-    invoice is an account error here, never `-31008`."""
+    request. Review finding I2: "not found" and "found but not payable"
+    are DIFFERENT codes (see the module docstring) — collapsing them into
+    one account error told a citizen whose invoice was already paid or
+    expired that the ACCOUNT NUMBER was wrong, prompting them to re-enter
+    it, instead of that the payment cannot be performed."""
     number = _account_number(params)
     invoice = await repo.get_invoice_by_number(db, number) if number is not None else None
-    if invoice is None or invoice.status != "pending":
-        raise PaymeError(ERR_ACCOUNT, "Invoice not found or not payable")
+    if invoice is None:
+        raise PaymeError(ERR_ACCOUNT, "Invoice not found")
+    if invoice.status != "pending":
+        raise PaymeError(ERR_CANNOT_PERFORM, "Invoice is not payable")
     amount = _amount_tiyin(params)
     if amount is None or amount != to_tiyin(invoice.amount):
         raise PaymeError(ERR_INVALID_AMOUNT, "Incorrect amount")
