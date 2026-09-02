@@ -296,6 +296,21 @@ class CalculationIn(BaseModel):
     # the moment `applications` exists. Nothing in this stage can validate the
     # id and no legitimate caller has one yet, so it fails closed at the edge
     # rather than staying an undocumented open write.
+    #
+    # THIS ACCIDENT IS THE ONLY THING CLOSING A LIVE MONEY HOLE, and 3.9 opens
+    # it. `payments.issue_invoice` and `permits.issue` each read "the newest
+    # calculation for this application" and, being both level 4, cannot compare
+    # notes: an audit probe that inserted a newer calculation between invoicing
+    # and issuance had the citizen billed 2 060 000,00 while the permit printed
+    # 9 999 999,00, with different `calculation_id`s on the invoice and in the
+    # permit's immutable snapshot. `service.save_calculation` has NO
+    # application-status guard of any kind, and `POST /calculations` reaches it
+    # directly with nothing but `get_current_user` — so 3.9b's ruling 17 on
+    # `POST /recalculate` does not cover this path. Whoever widens this type
+    # lands the guard in `save_calculation` itself, in the same commit.
+    # `tests/test_cross_module_journey.py::
+    # test_a_calculation_cannot_be_attached_to_an_application_through_the_write_path`
+    # is the test that says so; it fails the moment this annotation changes.
     application_id: None = None
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID

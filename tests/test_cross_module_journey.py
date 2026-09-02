@@ -45,7 +45,8 @@ and fails on the second run of the suite.
 """
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -57,6 +58,8 @@ from app.modules.applications import service as applications_service
 from app.modules.applications.events import APPLICATION_APPROVED
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
+from app.modules.norms.calculator import RULE_CODE_VERSION
+from app.modules.norms.models import Calculation
 from app.modules.notifications.models import Notification
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import ProviderTransaction
@@ -81,7 +84,7 @@ from tests.modules.permits.conftest import (
 )
 from tests.modules.permits.conftest import client as client  # noqa: F401
 from tests.modules.permits.conftest import contours_layer as contours_layer  # noqa: F401
-from tests.modules.permits.conftest import grazing_activity_id as grazing_activity_id  # noqa: F401
+from tests.modules.permits.conftest import grazing_activity_id as grazing_activity_id
 from tests.modules.permits.conftest import head_client as head_client  # noqa: F401
 from tests.modules.permits.conftest import hodim_client as hodim_client  # noqa: F401
 from tests.modules.permits.conftest import leshoz as leshoz
@@ -261,4 +264,135 @@ async def test_the_journey_from_approval_to_the_public_qr_page(
     assert str(permit.snapshot["calculation_id"]) == str(billed_calculation_id), (
         "the invoice and the permit's frozen snapshot name different calculations, "
         "so a paid invoice cannot be reconciled with the document it paid for"
+    )
+
+
+async def test_the_permit_is_priced_from_the_calculation_the_invoice_froze(
+    db: AsyncSession,
+    hodim_client: httpx.AsyncClient,
+    approved_application: Application,
+    grazing_activity_id: uuid.UUID,
+):
+    """A NEWER calculation lands between invoicing and issuance: the permit must
+    still print what the citizen was billed.
+
+    This is the audit's own probe, kept: it inserted a 9 999 999,00 calculation
+    after a 2 060 000,00 invoice had been paid and the permit printed the new
+    number, with a different `calculation_id` on the invoice and in the
+    snapshot. It is unreachable through any HTTP route today — see
+    `test_a_calculation_cannot_be_attached_to_an_application_through_the_write_path`
+    below for the accident that closes it, and `permits.service.issue` for the
+    half `permits` can refuse on its own.
+    """
+    from tests.modules.permits.conftest import GRAZING_HERD, calculation_input_snapshot
+
+    app_id = approved_application.id
+    await publish(db, Event(name=APPLICATION_APPROVED, payload={"application_id": app_id}))
+    await db.commit()
+
+    invoice = await payments_service.invoice_for_application(db, app_id)
+    assert invoice is not None
+    await db.refresh(invoice)
+    billed_amount = invoice.amount
+    billed_calculation_id = invoice.calculation_id
+
+    # The recalculation. `decided_at` is what makes it refusable from inside
+    # `permits`: a price computed after the decision is not the price that was
+    # billed. 3.9b's flow sets it on approval; 3.9a branch 1 has no decision
+    # verb, so the two timestamps are set explicitly here — `created_at`
+    # included, because Postgres' `now()` is the TRANSACTION's clock and every
+    # row written by this test would otherwise share one instant.
+    approved_at = datetime.now(UTC)
+    application = await applications_service.get(db, app_id)
+    assert application is not None
+    application.decided_at = approved_at
+    await db.flush()
+    db.add(
+        Calculation(
+            application_id=app_id,
+            contour_id=approved_application.contour_id,
+            activity_type_id=grazing_activity_id,
+            rule_code_version=RULE_CODE_VERSION,
+            input_snapshot=calculation_input_snapshot(GRAZING_HERD),
+            used_sb=Decimal("40.0000"),
+            amount=Decimal("9999999.00"),
+            breakdown={"total": "9999999.00"},
+            created_at=approved_at + timedelta(minutes=5),
+        )
+    )
+    await db.flush()
+
+    transaction = ProviderTransaction(
+        invoice_id=invoice.id,
+        provider="payme",
+        external_id=f"journey-{uuid.uuid4().hex[:12]}",
+        amount=invoice.amount,
+        state="2",
+        performed_at=datetime.now(UTC),
+        payload={},
+    )
+    db.add(transaction)
+    await db.flush()
+    await payments_service.confirm_payment(db, invoice=invoice, transaction=transaction)
+    await db.commit()
+
+    issued = await hodim_client.post(f"{API}/applications/{app_id}/permit")
+    assert issued.status_code == 422, issued.text
+    assert issued.json()["error"]["details"]["reason"] == "calculation_after_decision"
+
+    # And nothing was formed: a permit printing 9 999 999,00 against a paid
+    # 2 060 000,00 invoice must not exist at all.
+    permit = await permits_service.for_application(db, app_id)
+    assert permit is None, (
+        f"a permit was issued for {billed_amount} billed under calculation {billed_calculation_id}"
+    )
+
+
+async def test_a_calculation_cannot_be_attached_to_an_application_through_the_write_path(
+    db: AsyncSession,
+    hodim_client: httpx.AsyncClient,
+    approved_application: Application,
+    grazing_activity_id: uuid.UUID,
+):
+    """**This test stands in for a guard that does not exist yet.**
+
+    `payments.issue_invoice` and `permits.issue` each read "the newest
+    calculation for this application" independently. Nothing compares the two,
+    and being both level 4 they cannot. If a newer calculation could be attached
+    to an application after it was invoiced, the citizen would be billed
+    2 060 000,00 and the permit would print 9 999 999,00 — demonstrated by the
+    test above, which has to reach past the API to build that state.
+
+    It is unreachable through the public write path TODAY only because
+    `norms.schemas.CalculationIn.application_id` is typed `None = None`, so
+    `POST /norms/calculations` cannot bind a calculation to an application at
+    all — an accident of 3.7's fail-closed edge (I4), not a designed guard.
+    `norms.save_calculation` itself has no application-status check of any kind.
+
+    **Stage 3.9 opens that field.** Whoever does must land, in the same commit,
+    the guard that refuses a calculation for an application at APPROVED or
+    beyond (3.9b's own ruling already says so) — and then rewrite this test to
+    assert THAT refusal. Deleting it because the field now accepts a value is
+    exactly the failure it exists to catch.
+    """
+    from app.modules.norms.schemas import CalculationIn
+
+    # The schema field, not the route: `CalculationIn` is what the write route
+    # validates against, and pydantic refuses anything but None for it.
+    period_from, period_to = approved_application.period_from, approved_application.period_to
+    assert period_from is not None and period_to is not None
+    with pytest.raises(ValueError):
+        CalculationIn(
+            application_id=approved_application.id,  # type: ignore[arg-type]
+            contour_id=uuid.uuid4(),
+            activity_type_id=grazing_activity_id,
+            period_from=period_from,
+            period_to=period_to,
+        )
+
+    assert CalculationIn.model_fields["application_id"].annotation is type(None), (
+        "CalculationIn.application_id has been opened up — see this test's docstring: "
+        "payments and permits each read the NEWEST calculation and cannot compare notes, "
+        "so an application-status guard must land in `applications`/`norms` in the same "
+        "commit, and this test must be rewritten to assert it"
     )
