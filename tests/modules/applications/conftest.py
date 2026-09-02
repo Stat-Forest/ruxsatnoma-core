@@ -69,3 +69,15 @@ async def published_contour(
     )
     await db.flush()
     return contour
+
+
+@pytest.fixture(autouse=True)
+def _isolate_subscriptions():
+    """The bus is process-global; without this, a handler registered by one
+    test fires inside another and the failure surfaces three files away."""
+    from app.core import events
+
+    saved = {name: list(handlers) for name, handlers in events._SUBSCRIBERS.items()}
+    yield
+    events._SUBSCRIBERS.clear()
+    events._SUBSCRIBERS.update(saved)
