@@ -1,3 +1,4 @@
+import functools
 import re
 import zlib
 
@@ -156,6 +157,92 @@ def test_the_bundled_faces_carry_the_uzbek_cyrillic_letters() -> None:
             )
 
 
+# --- Is there a host face on this platform for Pango to substitute at all? ------------
+
+
+def _faces_in(pdf: bytes) -> set[bytes]:
+    """Every `/BaseFont` name in the PDF, subset tag stripped.
+
+    A deliberately INDEPENDENT parse of the shapes `render._BASE_FONT_NAME` reads, so a
+    bug in one cannot hide itself in the other. Raw bytes only: PDF/A-1 is based on PDF
+    1.4, which has no object streams, so the font dictionaries are in the clear.
+    """
+    return set(re.findall(rb"/BaseFont\s*/(?:[A-Z]{6}\+)?([^\s/<>\[\]{}()%]+)", pdf))
+
+
+FALLBACK_SCRIPTS = ("क्ष", "ཀ", "森", "🌲", "ก", "א")
+"""Scripts the bundled DejaVu faces do not cover, so Pango must look elsewhere for them.
+Reachable through the LAYOUT only: a codepoint that triggers fallback is by construction
+missing from the bundled cmap, so `_assert_renderable` catches anything coming from the
+snapshot first."""
+
+
+def _no_backstop(pdf: bytes) -> None:
+    """A stand-in for `_assert_only_bundled_faces` that refuses nothing."""
+    return None
+
+
+def _pdf_without_the_backstop(layout: str) -> bytes:
+    """`render_permit`'s own output with the backstop neutralised.
+
+    The production pipeline rather than a copy of it, so the probe below cannot drift
+    from what the renderer really does — and with the guard REPLACED by a no-op rather
+    than consulted, so a broken scanner cannot quietly turn the test it gates into a skip.
+    """
+    original = render._assert_only_bundled_faces
+    render._assert_only_bundled_faces = _no_backstop
+    try:
+        return render.render_permit(SNAPSHOT, layout, "https://example.uz/x")
+    finally:
+        render._assert_only_bundled_faces = original
+
+
+@functools.cache
+def _scripts_with_a_host_face() -> tuple[str, ...]:
+    """Which of `FALLBACK_SCRIPTS` actually pull a foreign face into the document HERE.
+
+    None of them do on a machine with no system fonts, which is what CI is: `ci.yml`
+    installs the Pango/HarfBuzz libraries and no font package at all, so the only face
+    fontconfig knows is the one WeasyPrint registered from our own `@font-face` — and
+    Pango draws every unbundled script as tofu IN THAT FACE. Nothing foreign is embedded
+    and the backstop correctly has nothing to refuse. Reproduced locally by pointing
+    `FONTCONFIG_FILE` at a config declaring no font directories.
+    """
+    ours = render._FONT_FAMILY.replace(" ", "-").encode()
+    layout = '<html><body>{script} {{{{ series }}}}<img src="{{{{ qr }}}}"></body></html>'
+    return tuple(
+        script
+        for script in FALLBACK_SCRIPTS
+        if any(
+            not face.startswith(ours)
+            for face in _faces_in(_pdf_without_the_backstop(layout.format(script=script)))
+        )
+    )
+
+
+def _substituting_scripts_or_skip() -> tuple[str, ...]:
+    """The scripts the test below can use, or a skip that states the detected reason.
+
+    The scanner itself is pinned identically on every platform by
+    `test_the_scanner_refuses_a_foreign_face_in_every_shape_and_fails_closed_on_the_rest`,
+    which feeds it crafted bytes. What no crafted byte can pin is the end-to-end claim
+    that Pango's substitution reaches the finished PDF and is caught there — and on a
+    fontless runner there is no substitution to observe. So this skips for a reason
+    detected at runtime rather than for a platform name, and switches itself back on the
+    day a runner has fonts.
+    """
+    import pytest
+
+    scripts = _scripts_with_a_host_face()
+    if not scripts:
+        pytest.skip(
+            "no substitutable host face on this platform: Pango draws every script the "
+            "bundled faces lack in the bundled face itself, so nothing foreign can reach "
+            "the PDF. The scanner is covered directly, against crafted bytes, either way."
+        )
+    return scripts
+
+
 def test_no_system_font_is_substituted_for_the_uzbek_letters() -> None:
     """The bundled face must be the ONLY face in the document.
 
@@ -165,6 +252,14 @@ def test_no_system_font_is_substituted_for_the_uzbek_letters() -> None:
     silently fell back to the host's Times New Roman. That fallback exists on a
     developer's macOS and not in a container with no Cyrillic system font, so the weak
     assertion is green exactly where it does not matter and green where it lies.
+
+    Which is also the limit of what this test proves ON that container, measured rather
+    than assumed: with no system font there is nothing to substitute, so the negative
+    control above (a Latin-only `@font-face`) now passes BOTH halves — the ToUnicode CMap
+    records the codepoints Pango was asked to draw, not the ones it could actually draw.
+    The substantive claim therefore rests on
+    `test_the_bundled_faces_carry_the_uzbek_cyrillic_letters`, which reads the shipped
+    `.ttf` files directly and is the same on every machine.
     """
     pdf = render.render_permit(
         {**SNAPSHOT, "holder_name": UZBEK_CYRILLIC},
@@ -174,7 +269,7 @@ def test_no_system_font_is_substituted_for_the_uzbek_letters() -> None:
 
     assert b"/FontFile2" in pdf, "PDF/A requires the face embedded, not merely referenced"
     expected = render._FONT_FAMILY.replace(" ", "-").encode()
-    faces = set(re.findall(rb"/BaseFont\s*/(?:[A-Z]{6}\+)?([^\s/<>\[\]{}()%]+)", pdf))
+    faces = _faces_in(pdf)
     assert faces, "no embedded font at all"
     assert all(face.startswith(expected) for face in faces), (
         f"a font other than the bundled {expected!r} was used: {sorted(faces)}"
@@ -264,24 +359,53 @@ def test_a_character_the_bundled_font_cannot_draw_is_refused_at_issuance() -> No
 
 
 def test_no_host_face_reaches_the_document_even_from_the_layout_itself() -> None:
-    """The backstop behind the check above, and the reason it exists: a snapshot is not
-    the only way text gets onto the page. The layout is an admin-editable row, and its
-    own static labels go through the same Pango fallback — invisible to a check that
-    only inspects substituted values."""
+    """The end-to-end half of the backstop: Pango really does substitute a host face, and
+    the guard really does catch it in the finished document.
+
+    A snapshot is not the only way text gets onto the page. The layout is an
+    admin-editable row, and its own static labels go through the same per-glyph Pango
+    fallback — invisible to `_assert_renderable`, which only inspects substituted values.
+
+    This is the ONLY assertion in the file that depends on the machine having a font we
+    do not ship, so it skips for a runtime-detected reason (see
+    `_substituting_scripts_or_skip`) rather than for a platform name. The scanner's own
+    logic is pinned from crafted bytes below, on every machine, either way.
+    """
     import pytest
 
     from app.core.errors import DomainError
 
-    with pytest.raises(DomainError) as raised:
-        render.render_permit(
-            SNAPSHOT,
-            '<html><body>森 {{ series }}<img src="{{ qr }}"></body></html>',
-            "https://example.uz/x",
-        )
+    for script in _substituting_scripts_or_skip():
+        with pytest.raises(DomainError) as raised:
+            render.render_permit(
+                SNAPSHOT,
+                f'<html><body>{script} {{{{ series }}}}<img src="{{{{ qr }}}}"></body></html>',
+                "https://example.uz/x",
+            )
+        assert raised.value.code == "ERR-VAL-001", script
+        assert raised.value.details is not None
+        assert raised.value.details["reason"] == "host_font_substituted", script
 
-    assert raised.value.code == "ERR-VAL-001"
-    assert raised.value.details is not None
-    assert raised.value.details["reason"] == "host_font_substituted"
+
+def test_a_script_the_bundled_faces_do_cover_is_not_refused() -> None:
+    """The control for the test above, and it must run where that one cannot.
+
+    Without it the backstop could "pass" by refusing every layout that is not Cyrillic.
+    `U+0531` is genuinely in DejaVu's cmap, so this page renders with our face and
+    nothing else — on a machine with a full font set and on a fontless runner alike,
+    which is why it carries no skip.
+    """
+    pdf = render.render_permit(
+        SNAPSHOT,
+        '<html><body>Ա {{ series }}<img src="{{ qr }}"></body></html>',
+        "https://example.uz/x",
+    )
+
+    ours = render._FONT_FAMILY.replace(" ", "-").encode()
+    faces = _faces_in(pdf)
+    assert pdf.startswith(b"%PDF")
+    assert faces, "no embedded font at all"
+    assert all(face.startswith(ours) for face in faces), sorted(faces)
 
 
 def test_the_pdf_dates_come_from_the_snapshot_and_never_from_the_clock() -> None:
@@ -304,50 +428,53 @@ def test_the_pdf_dates_come_from_the_snapshot_and_never_from_the_clock() -> None
     assert today not in pdf, f"a wall-clock date ({today!r}) reached the PDF"
 
 
-def test_a_host_face_whose_name_begins_with_a_dot_is_still_caught() -> None:
-    """Re-review of I2: the backstop failed OPEN on a whole class of faces.
+def test_the_scanner_refuses_a_foreign_face_in_every_shape_and_fails_closed_on_the_rest() -> None:
+    """The backstop pinned where it can be pinned identically on every machine: against
+    crafted bytes, rather than against whatever Pango happened to do here.
 
-    macOS names its own fallback faces with a leading dot — `.SFNS-Regular`,
-    `.Zither-India`, `.LastResort` — and the first scanner pattern required
-    `[A-Za-z0-9-]` where the dot sits, so those names did not match at all and were
-    counted as ABSENT rather than SUSPECT. A Devanagari character in an admin-editable
-    layout embedded `ZJBCPL+.Zither-India` into a government document and
-    `render_permit` returned it happily. Reachable through the layout only: a codepoint
-    that triggers fallback is by construction missing from the bundled cmap, so
-    `_assert_renderable` catches it first for anything coming from the snapshot.
+    It has failed OPEN twice. First by not existing — a host face substituted per glyph
+    reached the document unremarked. Then, after it was added, on a PostScript name
+    beginning with a DOT: `[A-Za-z0-9-]` at the capture position matched no such name at
+    all, so `.Zither-India` was counted as absent rather than suspect and
+    `ZJBCPL+.Zither-India` was embedded in a government document. Both were caught by a
+    render-driven test on a developer's Mac — and a render-driven test is exactly what a
+    container with no system fonts cannot run: with nothing to substitute FROM, Pango
+    draws the tofu in our own face and there is no foreign name to find. So every shape a
+    foreign `/BaseFont` can take is asserted here, from bytes, where the machine's font
+    set cannot change the answer.
     """
     import pytest
 
     from app.core.errors import DomainError
 
-    for script in ("क्ष", "ཀ", "森", "🌲", "ก", "א"):
+    for label, blob, expected in (
+        ("a plain name", b"/BaseFont /Times-New-Roman", "Times-New-Roman"),
+        ("a subset tag", b"/BaseFont /ESSOFH+Times-New-Roman", "ESSOFH+Times-New-Roman"),
+        # The two dotted shapes are the re-review's regression and the reason this test
+        # exists: a leading dot is how macOS names its own fallback faces.
+        ("a leading dot", b"/BaseFont /.LastResort", ".LastResort"),
+        ("a dot behind a tag", b"/BaseFont /ZJBCPL+.Zither-India", "ZJBCPL+.Zither-India"),
+        # Observed verbatim on the developer's Mac: the comma is part of the PDF name,
+        # and an `[A-Za-z0-9-]+` class truncates it rather than reporting it.
+        ("a trailing comma", b"/BaseFont /ESSOFH+Times-New-Roman,", "ESSOFH+Times-New-Roman,"),
+        # Inflated as well as raw, so the guard keeps working if `PDF_VARIANT` ever moves
+        # to a version that packs the font dictionaries into a `/Type /ObjStm`.
+        (
+            "hidden in a Flate stream",
+            b"stream\n" + zlib.compress(b"<</BaseFont /AAAAAA+.SFNS-Regular>>") + b"\nendstream",
+            "AAAAAA+.SFNS-Regular",
+        ),
+    ):
         with pytest.raises(DomainError) as raised:
-            render.render_permit(
-                SNAPSHOT,
-                f'<html><body>{script} {{{{ series }}}}<img src="{{{{ qr }}}}"></body></html>',
-                "https://example.uz/x",
-            )
-        assert raised.value.details is not None
-        assert raised.value.details["reason"] == "host_font_substituted", script
+            render._assert_only_bundled_faces(blob)
+        assert raised.value.code == "ERR-VAL-001", label
+        assert raised.value.details is not None, label
+        assert raised.value.details["reason"] == "host_font_substituted", label
+        assert raised.value.details["fonts"] == [expected], label
 
-    # Armenian is the control: DejaVu genuinely covers it, so it must NOT be refused —
-    # otherwise this test would pass by rejecting everything non-Cyrillic.
-    assert render.render_permit(
-        SNAPSHOT,
-        '<html><body>Ա {{ series }}<img src="{{ qr }}"></body></html>',
-        "https://example.uz/x",
-    ).startswith(b"%PDF")
-
-
-def test_a_base_font_entry_the_scanner_cannot_parse_is_suspect_not_absent() -> None:
-    """The principle the I1 fix already established, applied here: an input you cannot
-    interpret is suspect, never absent. Asserted directly against the scanner, because
-    WeasyPrint does not emit these shapes — but a future variant, or a font WeasyPrint
-    does not name the way we expect, must fail closed rather than slip through."""
-    import pytest
-
-    from app.core.errors import DomainError
-
+    # An entry we cannot READ is suspect, never absent — the principle the `_url_to_path`
+    # fix already established, applied here. WeasyPrint does not emit these shapes, but a
+    # future variant, or a font it does not name the way we expect, must fail closed.
     for label, blob in (
         ("an indirect reference", b"<</Type/Font/BaseFont 12 0 R>>"),
         ("a truncated dictionary", b"<</BaseFont"),
