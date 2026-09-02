@@ -1,6 +1,7 @@
 """admin repository: reference-data reads and writes. No business rules here."""
 
 import uuid
+from collections.abc import Iterable
 from datetime import date
 
 from sqlalchemy import Select, and_, delete, exists, func, or_, select, text
@@ -129,6 +130,26 @@ async def get_activity_type(db: AsyncSession, activity_type_id: uuid.UUID) -> Ac
     immutable document snapshot). Archived rows are returned deliberately: a
     permit issued years ago must still resolve the activity it was issued for."""
     return await db.get(ActivityType, activity_type_id)
+
+
+async def get_livestock_types_by_code(
+    db: AsyncSession, codes: Iterable[str]
+) -> dict[str, LivestockType]:
+    """The named livestock types, keyed by code, whatever their status — the bulk
+    sibling of `get_activity_type` above and for the same reason: permits 3.11a
+    copies these names into an immutable document snapshot (`tz/13` requisites
+    12-15), and a permit issued years ago must still resolve the species it was
+    issued for. `list_livestock_types` below filters to `active` because it answers
+    a different question — what may be CHOSEN today.
+
+    A code with no row is simply absent from the result; the caller decides what a
+    missing one means, since only it knows whether the code came from a form or from
+    a frozen calculation."""
+    codes = list(codes)
+    if not codes:
+        return {}
+    stmt = select(LivestockType).where(LivestockType.code.in_(codes))
+    return {row.code: row for row in (await db.execute(stmt)).scalars()}
 
 
 async def list_livestock_types(db: AsyncSession) -> list[LivestockType]:

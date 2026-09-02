@@ -74,6 +74,41 @@ def unique_pinfl() -> str:
     return f"1{uuid.uuid4().int % 10**13:013d}"
 
 
+# The herd every grazing fixture is priced for, and — since ruling T3-f — the herd
+# its permit PRINTS (`tz/13` requisites 12-15). One code from each of form 1-ilova's
+# four rows, so a single issuance exercises all four; the conditional-head load adds
+# up to the `used_sb=40.0000` the fixture carries (5x6.0 + 2x3.5 + 2x1.0 + 5x0.2),
+# because a permit whose printed heads and printed SB load disagreed would be the
+# very defect the frozen-snapshot ruling exists to prevent.
+GRAZING_HERD: tuple[tuple[str, int], ...] = (
+    ("cattle_adult", 5),
+    ("horse_young", 2),
+    ("sheep_goat_6m", 2),
+    ("lamb_kid_under_6m", 5),
+)
+
+
+def calculation_input_snapshot(items: tuple[tuple[str, int], ...]) -> dict[str, object]:
+    """The shape `norms.calculator.calculate` freezes into `calculations.input_snapshot`,
+    reduced to the part issuance reads (`input_snapshot["request"]["items"]`, ruling
+    T3-f). Built here rather than by running the real calculator: these fixtures insert
+    `Calculation` rows directly, and a stub whose SHAPE drifts from the calculator's
+    would let issuance pass against a snapshot no real calculation ever looks like —
+    `calculator.from_input_snapshot` is the contract this mirrors.
+
+    `items` is empty for every activity but grazing, where `quantity` carries the
+    amount instead — which is why the four head-count rows must have a not-applicable
+    form rather than four zeros."""
+    return {
+        "request": {
+            "activity_code": "grazing" if items else "apiary",
+            "items": [{"livestock_code": code, "count": count} for code, count in items],
+            "quantity": None if items else "10",
+        },
+        "rule_code_version": RULE_CODE_VERSION,
+    }
+
+
 @pytest.fixture
 async def grazing_activity_id(db: AsyncSession) -> uuid.UUID:
     rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'grazing'"))
@@ -109,6 +144,7 @@ async def make_paid_application(
     status: str = "PAID",
     used_sb: Decimal | None = Decimal("40.0000"),
     with_calculation: bool = True,
+    items: tuple[tuple[str, int], ...] = GRAZING_HERD,
 ) -> Application:
     """An application in `PAID` — the only status this module issues a permit
     from (ruling 10) — with its own applicant, contour and published version, at
@@ -117,9 +153,12 @@ async def make_paid_application(
 
     It also gets a `Calculation`, because issuance reads the priced amount out of
     `applications.service.current_calculation` and refuses without one (`tz/13`
-    field 18 is not optional on a permit). `used_sb=None` is the shape of an
-    activity that commits no conditional-head load at all — haymaking, apiaries —
-    where the permit's `sb_load` stays null (task 1, decision 3).
+    field 18 is not optional on a permit) — and, since ruling T3-f, the HERD too:
+    `tz/13`'s head-count rows come from that same frozen `input_snapshot`, so the
+    printed heads and the printed amount can never belong to different moments.
+    `used_sb=None` with `items=()` is the shape of an activity that commits no
+    conditional-head load at all — haymaking, apiaries — where the permit's
+    `sb_load` stays null (task 1, decision 3).
 
     `with_calculation=False` is how a test reaches the "no calculation" refusal:
     `calculations` is append-only at the database level (migration 0011's trigger),
@@ -127,7 +166,14 @@ async def make_paid_application(
     without one."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
     applicant = Applicant(
-        kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id
+        kind="individual",
+        pinfl=user.pinfl,
+        name=user.full_name,
+        # `tz/13` requisite 11. Nullable in the registry, and required on the form —
+        # so every fixture that expects an issuance to SUCCEED must carry one, and
+        # the test for the refusal clears it explicitly.
+        address="Тошкент вилояти, Бўстонлиқ тумани, Бурчмулла қишлоғи, 1-уй",
+        owner_user_id=user.id,
     )
     db.add(applicant)
     await db.flush()
@@ -163,7 +209,7 @@ async def make_paid_application(
             contour_id=contour.id,
             activity_type_id=activity_type_id,
             rule_code_version=RULE_CODE_VERSION,
-            input_snapshot={"source": "test fixture"},
+            input_snapshot=calculation_input_snapshot(items),
             used_sb=used_sb,
             amount=Decimal("2060000.00"),
             breakdown={"total": "2060000.00"},
@@ -274,6 +320,7 @@ async def apiary_paid_application(
         approval_doc=approval_doc,
         activity_type_id=apiary_activity_id,
         used_sb=None,
+        items=(),
     )
 
 

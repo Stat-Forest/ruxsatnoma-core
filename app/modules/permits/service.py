@@ -62,12 +62,44 @@ INITIAL_STATUS = "pending_signatures"
 # is not on the document: it lives in `payments`, which this module may not read
 # (design/01 rule 3), and `applications.service` exposes no paid-at. Printing the
 # issuance date in its place would put a wrong date on a legal document.
+#
+# Ruling T3-b, and the part that needs saying out loud: because the snapshot is
+# immutable and is never re-derived, every permit issued BEFORE a lawful source for
+# that date exists carries «Тўланган» with no date PERMANENTLY. Adding the accessor
+# later fixes the permits issued after it, and none of the ones issued before.
 PAYMENT_STATUS_PAID = "Тўланган"
 
 # The document's language. `tz/13`'s note: «на государственном языке» — the permit
 # is issued in Uzbek Cyrillic, whatever language the holder reads the cabinet in.
 # `organizations.name`/`activity_types.name` are JSONB with this key.
 DOCUMENT_LANGUAGE = "uz_cyrl"
+
+# What a head-count row prints when this permit commits no animals of that group —
+# an em dash, the form convention for "not applicable". Never "0": `CalcRequest.items`
+# is empty for every activity but grazing (`quantity` carries those), and an apiary
+# permit reading «Қорамол — 0» would be a statement about cattle that nobody made.
+NO_HEADS = "—"
+
+# `tz/13` requisites 12-15: form 1-ilova's four head-count rows, and which
+# `livestock_types.code` (migration 0005) belongs to each.
+#
+#   12 «Скот, взрослые: КРС, лошади, верблюды, ослы»
+#   13 «Скот, молодняк до 2 лет: КРС, лошади, верблюды, ослы»
+#   14 «Старше 6 мес: овцы, козы»
+#   15 «До 6 мес: ягнята, козлята»
+#
+# Written down here rather than derived from `rule_parameters`' `tariff_group:<code>`,
+# which draws the identical partition today: that one answers which VMQ 278 RATE a
+# species is charged at, and this one answers which line of the FORM it is printed on.
+# They agree by law, not by construction, and a tariff regrouping must not silently
+# redraw a state document. A code in neither row is refused, never dropped — see
+# `_livestock_rows`.
+LIVESTOCK_ROWS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("heads_large_adult", ("cattle_adult", "horse_adult", "camel_adult", "donkey_adult")),
+    ("heads_large_young", ("cattle_young", "horse_young", "camel_young", "donkey_young")),
+    ("heads_small_adult", ("sheep_goat_6m",)),
+    ("heads_small_young", ("lamb_kid_under_6m",)),
+)
 
 
 def _organization_in_zone(zone: Zone, org: Organization) -> bool:
@@ -141,6 +173,73 @@ def _money(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
 
 
+def _frozen_herd(input_snapshot: Any) -> dict[str, int]:
+    """The head counts the permit is PRICED for, out of the calculation's own
+    `input_snapshot` (ruling T3-f) — `{livestock_code: heads}`, summed per code.
+
+    NOT a query on `application_items`. That table is live: 3.9b's recalculation
+    path may edit it after the money was fixed, and a permit whose printed herd and
+    printed amount came from different moments would be exactly the disagreement an
+    immutable snapshot exists to rule out. `input_snapshot["request"]["items"]` is
+    the herd `norms.calculator.calculate` actually charged for, frozen in the same
+    row as `amount` — `calculator.from_input_snapshot` reads the identical path.
+
+    An `input_snapshot` this cannot read is a refusal, not an empty herd: every
+    calculation the calculator writes carries `request.items` (empty for a
+    non-grazing activity, where `quantity` carries the amount instead), so a missing
+    path means a row written by something else — and a permit must not print a
+    silently empty herd on that evidence.
+    """
+    request = input_snapshot.get("request") if isinstance(input_snapshot, dict) else None
+    items = request.get("items") if isinstance(request, dict) else None
+    if not isinstance(items, list):
+        raise err("ERR-VAL-001", details={"reason": "calculation_snapshot_unreadable"})
+    herd: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict) or "livestock_code" not in item or "count" not in item:
+            raise err("ERR-VAL-001", details={"reason": "calculation_snapshot_unreadable"})
+        herd[str(item["livestock_code"])] = herd.get(str(item["livestock_code"]), 0) + int(
+            item["count"]
+        )
+    return herd
+
+
+async def _livestock_rows(db: AsyncSession, input_snapshot: Any) -> dict[str, str]:
+    """`tz/13` requisites 12-15, ready to print: one string per row of form 1-ilova,
+    naming each species from the classifier and its head count.
+
+    Species order follows `LIVESTOCK_ROWS`, never the order the applicant happened to
+    enter them in — two permits for the same herd must render the same bytes, which is
+    what `doc_hash` and every signature over it depend on (ruling 3).
+
+    A code belonging to no row is a REFUSAL. `livestock_types` is an admin catalogue
+    and an eleventh species can be added without anyone touching this module; dropping
+    it here would understate the herd on a legal permit while the fee — computed from
+    the very same list — still charged for it.
+    """
+    herd = _frozen_herd(input_snapshot)
+    known = {code for _, codes in LIVESTOCK_ROWS for code in codes}
+    for code in herd:
+        if code not in known:
+            raise err("ERR-VAL-001", details={"reason": "unknown_livestock_code", "code": code})
+    types = await admin_repo.get_livestock_types_by_code(db, herd)
+    rows: dict[str, str] = {}
+    for field, codes in LIVESTOCK_ROWS:
+        printed = []
+        for code in codes:
+            if herd.get(code):
+                livestock = types.get(code)
+                if livestock is None:
+                    raise err(
+                        "ERR-VAL-001",
+                        details={"reason": "unknown_livestock_code", "code": code},
+                    )
+                name = _localized(livestock.name, field=field)
+                printed.append(f"{name} — {herd[code]}")
+        rows[field] = ", ".join(printed) if printed else NO_HEADS
+    return rows
+
+
 def qr_url(token: str) -> str:
     """The address the printed QR points at (`design/03` § public). Built from
     `settings.public_base_url`, which must be the externally reachable origin — a
@@ -187,6 +286,7 @@ async def _snapshot(
     amount: Decimal,
     sb_load: Decimal | None,
     calculation_id: uuid.UUID,
+    calculation_input: Any,
 ) -> dict[str, Any]:
     """Form 1-ilova's requisites (`tz/13` § 1-илова, ruling 14), gathered once and
     never read from their sources again.
@@ -194,10 +294,38 @@ async def _snapshot(
     Everything is already a string: the snapshot is what the renderer receives, so
     the PDF and the stored record cannot disagree, and JSONB has no `Decimal` or
     `date` (lesson: nothing in this app configures a JSON encoder — coerce at the
-    boundary). Two of `tz/13`'s 25 are deliberately absent: №24 «печать
-    подлинности» IS the QR, and №25 «статус документа» is `permits.status`, which
-    changes over the permit's life and must not be frozen into an immutable
-    snapshot.
+    boundary).
+
+    **Which of `tz/13`'s 25 requisites are here, and why the rest are not.** The
+    table has three kinds of gap and they must not be confused, because a reader
+    comparing this against the form will otherwise "fix" the wrong one:
+
+    - **1-4, 8-19 are here.** Requisites 1 and 4 are two DIFFERENT organizations —
+      the authorising agency and the leshoz whose ground the contour is on; the
+      chain `agency → territorial → leshoz → …` is `organizations.kind`, with a
+      single-agency partial unique index, and `contours.organization_id` is the
+      leshoz. Requisites 12-15 come from the frozen calculation, not from
+      `application_items` (ruling T3-f — see `_livestock_rows`). Requisite 19 ships
+      as the payment STATUS with no date (ruling T3-b): there is no lawful source
+      for the date, so a permit issued before one exists carries «Тўланган» with no
+      date PERMANENTLY — the snapshot is immutable and is never re-derived.
+    - **5-7 (ўрмон бўлими / айланма / бўлак) have no data source.** `organizations`
+      can EXPRESS them — `kind` runs down to `bolim`, `aylanma`, `bolak` — but
+      nothing populates those rows and every contour hangs off its leshoz, because
+      the Agency has delivered neither the leshoz boundary nor the contour layer
+      (`tz/12` open question #10). They arrive as data, not as code.
+    - **20-23 (the four ERI signature lines) are structurally absent BY DESIGN,
+      and this is not a gap to close.** Ruling 3 renders the document exactly once,
+      at issuance, before anybody has signed, and refuses any re-render while a
+      signature exists — that is what makes `sha256` of these bytes a stable thing
+      to sign. The four signatures are detached rows in `signatures`; the way a
+      reader confirms them is the QR page (requisite 24), which reads the stored
+      verification verdict. Printing signer names would require re-rendering after
+      signing, which would invalidate every signature already taken.
+    - **24 and 25 are deliberately absent too.** №24 «печать подлинности» IS the QR,
+      which the renderer fills itself; №25 «статус документа» is `permits.status`,
+      which changes over the permit's life and must not be frozen into an immutable
+      snapshot.
 
     `calculation_id` is not printed. It is here so the permit can be compared
     against the invoice that was actually paid (ruling 19): 3.9b's `recalculate`
@@ -221,10 +349,17 @@ async def _snapshot(
     if activity is None:
         raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": "activity_type"})
     contour_number = await gis_service.contour_number(db, contour_id)
+    # Requisite 1. The single root of the organization tree — `root_is_agency`
+    # makes `parent_id IS NULL` and `kind = 'agency'` the same row, so an agency
+    # necessarily exists wherever a contour has an organization at all.
+    agency = await admin_repo.get_agency(db)
+    if agency is None:
+        raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": "authority"})
+    heads = await _livestock_rows(db, calculation_input)
 
     return {
-        # 1-2: the issuing body, the series and the number
-        "organization_name": _localized(organization.name, field="organization_name"),
+        # 1-2: the authorising body, the series and the number
+        "authority_name": _localized(agency.name, field="authority_name"),
         "series": series,
         # Six digits — `design/03`'s «серия А № 000123», and the reason the API
         # returns the integer while the document shows the padded form.
@@ -235,14 +370,26 @@ async def _snapshot(
         # `permits.issued_at`, the timestamp Task 4 sets when the last signature
         # makes the permit legally in force.
         "issued_at": business_today().isoformat(),
-        # 8-10: the plot, the holder
+        # 4: «Ўрмон хўжалиги» — the leshoz the contour belongs to, and NOT the
+        # authority above. `contours.organization_id` is that leshoz: the GIS
+        # import and the operator seed both attach a contour to one, and no row
+        # below leshoz level exists to attach it to (requisites 5-7, docstring).
+        "leshoz_name": _localized(organization.name, field="leshoz_name"),
+        # 8-11: the plot, the holder
         "activity_name": _localized(activity.name, field="activity_name"),
         "holder_name": str(_required(applicant.name, field="holder_name")),
         # An individual is identified by PINFL, a legal entity by STIR —
         # `identity_by_kind` (migration 0003) guarantees exactly one is set.
         "holder_pinfl": str(_required(applicant.pinfl or applicant.stir, field="holder_pinfl")),
+        # 11: «Адрес пользователя», from the registry. Nullable there —
+        # `complete_registration` accepts an applicant with no address — so this is
+        # the requisite most likely to refuse an issuance, by design: a form the law
+        # demands an address on must not reach a citizen with a blank line.
+        "holder_address": str(_required(applicant.address, field="holder_address")),
         "contour_number": str(_required(contour_number, field="contour_number")),
         "area_ha": _money(area_ha),
+        # 12-15: the herd, per form row, out of the frozen calculation (ruling T3-f)
+        **heads,
         # 16-19: the load, the term, the money, the payment
         "sb_load": _money(sb_load),
         "period_from": period_from.isoformat(),
@@ -349,6 +496,7 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         amount=calculation.amount,
         sb_load=calculation.used_sb,
         calculation_id=calculation.id,
+        calculation_input=calculation.input_snapshot,
     )
 
     # 5. The QR token is a SECRET, not an identifier (ruling 8): never derived

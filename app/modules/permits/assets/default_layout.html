@@ -20,11 +20,19 @@
   The bundled DejaVu Serif face is applied by render._font_css(), not from here, so a
   layout cannot accidentally lose the one font that carries ў / қ / ғ / ҳ.
 
-  Requisites 20-23 (the four ERI signatures) carry no signer names: the signatures are
-  detached, held in the `signatures` table against sha256 of these very bytes, and the
-  document is rendered once, before any of them exists (ruling 3). Requisite 25, the
-  document status, is deliberately absent for the same reason — it changes over the
-  permit's life and must not be frozen into an immutable document; the QR page reports it.
+  Requisites 20-23 (the four ERI signatures) carry no signer names, and this is not an
+  omission to correct: the signatures are detached rows in `signatures`, taken over sha256
+  of these very bytes, and ruling 3 renders the document exactly ONCE — at issuance, before
+  any of them exists — and refuses a re-render while a signature exists. Printing signer
+  names would mean re-rendering after signing, which would invalidate every signature
+  already taken. The way a reader confirms them is the QR page (requisite 24), which reads
+  the stored verification verdict. Requisite 25, the document status, is deliberately absent
+  for the same reason — it changes over the permit's life and must not be frozen into an
+  immutable document; the QR page reports it too.
+
+  Requisites 5-7 (ўрмон бўлими / айланма / бўлак) have no data source yet: `organizations`
+  can express those levels but nothing populates them, and the Agency has delivered neither
+  the leshoz boundary nor the contour layer (tz/12 open question #10). They arrive as data.
 -->
 <html lang="uz-Cyrl">
 <head>
@@ -116,7 +124,10 @@
   </style>
 </head>
 <body>
-  <div class="agency">Ўзбекистон Республикаси Ўрмон хўжалиги агентлиги</div>
+  <!-- Requisite 1, «Название уполномоченного органа»: the agency row, not a string
+       baked in here — a rename in the classifier must reach every permit issued after
+       it, and nobody would think to look in a bundled HTML file for the old one. -->
+  <div class="agency">{{ authority_name }}</div>
   <div class="rule"></div>
 
   <h1>РУХСАТНОМА</h1>
@@ -128,12 +139,20 @@
   </div>
 
   <table class="fields">
-    <tr><th>Ўрмон хўжалиги</th><td>{{ organization_name }}</td></tr>
+    <tr><th>Ўрмон хўжалиги</th><td>{{ leshoz_name }}</td></tr>
     <tr><th>Фойдаланиш тури</th><td>{{ activity_name }}</td></tr>
     <tr><th>Фойдаланувчи (Ф.И.Ш.)</th><td>{{ holder_name }}</td></tr>
     <tr><th>ЖШШИР</th><td>{{ holder_pinfl }}</td></tr>
+    <tr><th>Фойдаланувчи манзили</th><td>{{ holder_address }}</td></tr>
     <tr><th>Контур / субконтур рақами</th><td>{{ contour_number }}</td></tr>
     <tr><th>Ажратилган майдон, га</th><td>{{ area_ha }}</td></tr>
+    <!-- tz/13 requisites 12-15, one row each. «—» where this permit commits no
+         animals of that group, never «0»: for a non-grazing activity the herd is
+         not zero, it is not applicable. -->
+    <tr><th>Катта мол (катта ёшдаги): қорамол, от, туя, эшак</th><td>{{ heads_large_adult }}</td></tr>
+    <tr><th>Катта мол (2 ёшгача): қорамол, от, туя, эшак</th><td>{{ heads_large_young }}</td></tr>
+    <tr><th>Майда мол (6 ойдан катта): қўй, эчки</th><td>{{ heads_small_adult }}</td></tr>
+    <tr><th>Майда мол (6 ойгача): қўзи, улоқ</th><td>{{ heads_small_young }}</td></tr>
     <tr><th>Шартли бош (СБ) юкламаси</th><td>{{ sb_load }}</td></tr>
     <tr><th>Фойдаланиш муддати</th><td>{{ period_from }} — {{ period_to }}</td></tr>
     <tr><th>Рухсатнома суммаси, сўм</th><td>{{ amount }}</td></tr>

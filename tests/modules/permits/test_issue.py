@@ -20,15 +20,16 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
+from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
-from app.modules.applications.models import Application
+from app.modules.applications.models import Application, ApplicationItem
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Applicant, User
 from app.modules.norms.models import Calculation
 from app.modules.notifications.models import Notification
 from app.modules.permits import events, render, repo, service
 from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
-from tests.modules.permits.conftest import STORED_LAYOUT
+from tests.modules.permits.conftest import STORED_LAYOUT, make_paid_application
 
 API = "/api/v1"
 
@@ -397,3 +398,180 @@ async def test_payment_confirmed_reads_the_amount_from_the_calculation_not_the_e
     ).all()
     assert notified
     assert all(n.params["amount"] == str(calculation.amount) for n in notified)
+
+
+# --- form 1-ilova's remaining reachable requisites (ruling T3-c) ---------------
+
+
+async def test_the_authority_and_the_leshoz_are_two_different_requisites(
+    db: AsyncSession, hodim_client, paid_application: Application, leshoz: Organization
+):
+    """`tz/13` requisite 1 is «Название уполномоченного органа» and requisite 4 is
+    «Ўрмон хўжалиги» — the agency that authorises the permit and the leshoz whose
+    ground it covers. They are genuinely different rows here: `organizations.kind`
+    is the chain `agency → territorial → leshoz → …` with a single-agency partial
+    unique index, and the contour's own `organization_id` is the leshoz.
+
+    One `organization_name` key used to serve both, with the agency's name hard-coded
+    into the bundled layout's letterhead — so an agency rename would have left every
+    permit printing the old name from a file nobody would think to look in."""
+    agency = (
+        await db.execute(select(Organization).where(Organization.kind == "agency"))
+    ).scalar_one_or_none()
+    assert agency is not None
+    assert leshoz.parent_id == agency.id, "the fixture leshoz hangs off the single agency"
+
+    await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+
+    assert permit.snapshot["authority_name"] == agency.name["uz_cyrl"]
+    assert permit.snapshot["leshoz_name"] == leshoz.name["uz_cyrl"]
+    assert permit.snapshot["authority_name"] != permit.snapshot["leshoz_name"]
+
+
+async def test_the_snapshot_carries_the_holders_address(
+    db: AsyncSession, hodim_client, paid_application: Application, applicant_row: Applicant
+):
+    """`tz/13` requisite 11, «Адрес пользователя» — from the registry
+    (`applicants.address`), frozen like every other requisite."""
+    applicant_row.address = "Тошкент вилояти, Бўстонлиқ тумани, Бурчмулла қишлоғи, 12-уй"
+    await db.flush()
+
+    await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+
+    assert permit.snapshot["holder_address"] == applicant_row.address
+
+
+async def test_a_holder_with_no_address_on_record_cannot_be_issued_a_permit(
+    db: AsyncSession, hodim_client, paid_application: Application, applicant_row: Applicant
+):
+    """`applicants.address` is nullable — registration accepts an applicant without
+    one (`complete_registration`'s `address: str | None`). A requisite the form
+    demands and the registry does not have is a defect that must fail at issuance,
+    NAMING its source, rather than reach a citizen as a blank line: `_required` says
+    which column was empty, which the renderer's own refusal could not."""
+    applicant_row.address = None
+    await db.flush()
+    before = await counter(db)
+
+    result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+
+    assert result.status_code == 422
+    assert result.json()["error"]["code"] == "ERR-VAL-001"
+    assert result.json()["error"]["details"]["field"] == "holder_address"
+    assert await counter(db) == before, "a refused issuance must not burn a series number"
+
+
+async def test_the_printed_head_counts_come_from_the_frozen_calculation(
+    db: AsyncSession, hodim_client, paid_application: Application, grazing_activity_id: uuid.UUID
+):
+    """Ruling T3-f. `tz/13` requisites 12-15 are read out of the `input_snapshot` of
+    the calculation the permit is PRICED from, never out of `application_items` —
+    which is a live table 3.9b's recalculation path may edit. The herd and the money
+    are then frozen at the same moment and cannot disagree on a legal document.
+
+    Proven by contradiction: an `application_items` row saying something else is
+    planted before issuance, and the permit ignores it."""
+    livestock_id = await db.scalar(
+        text("SELECT id FROM livestock_types WHERE code = 'camel_adult'")
+    )
+    db.add(
+        ApplicationItem(
+            application_id=paid_application.id, livestock_type_id=livestock_id, head_count=999
+        )
+    )
+    await db.flush()
+
+    await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+
+    # One row per tz/13 requisite, each naming its species from the classifier.
+    assert permit.snapshot["heads_large_adult"] == "Қорамол (катта) — 5"
+    assert permit.snapshot["heads_large_young"] == "От (2 ёшгача) — 2"
+    assert permit.snapshot["heads_small_adult"] == "Қўй ва эчки (6 ойдан катта) — 2"
+    assert permit.snapshot["heads_small_young"] == "Қўзи ва улоқ (6 ойгача) — 5"
+    assert "999" not in "".join(
+        str(permit.snapshot[key]) for key in permit.snapshot if key.startswith("heads_")
+    ), "the live application_items row must not reach the document"
+
+
+async def test_an_activity_that_commits_no_livestock_prints_no_head_counts(
+    db: AsyncSession,
+    hodim_client,
+    apiary_paid_application: Application,
+    apiary_template: PermitTemplate,
+):
+    """`CalcRequest.items` is empty for every activity but grazing — `quantity`
+    carries those. The four head-count rows are then NOT APPLICABLE, and must say so
+    rather than claim a herd of zero animals: an apiary permit reading «Қорамол — 0»
+    would be a statement about cattle that nobody made."""
+    await hodim_client.post(f"{API}/applications/{apiary_paid_application.id}/permit")
+    permit = await service.for_application(db, apiary_paid_application.id)
+    assert permit is not None
+
+    heads = {key: permit.snapshot[key] for key in permit.snapshot if key.startswith("heads_")}
+    assert len(heads) == 4
+    assert set(heads.values()) == {service.NO_HEADS}
+    assert "0" not in "".join(heads.values())
+
+
+async def test_a_livestock_code_the_form_has_no_row_for_is_refused(
+    db: AsyncSession,
+    contours_layer,
+    leshoz: Organization,
+    approval_doc,
+    grazing_activity_id: uuid.UUID,
+    hodim_client,
+):
+    """`livestock_types` is an admin catalogue: an eleventh species can be added
+    without anyone touching this module. Form 1-ilova has exactly four head-count
+    rows, so a code belonging to none of them cannot be printed — and silently
+    DROPPING it would understate the herd on a legal permit while the fee, computed
+    from the same list, still charged for it. Loud, naming the code."""
+    application = await make_paid_application(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=grazing_activity_id,
+        items=(("cattle_adult", 3), ("yak_adult", 1)),
+    )
+    before = await counter(db)
+
+    result = await hodim_client.post(f"{API}/applications/{application.id}/permit")
+
+    assert result.status_code == 422
+    assert result.json()["error"]["code"] == "ERR-VAL-001"
+    details = result.json()["error"]["details"]
+    assert details["reason"] == "unknown_livestock_code"
+    assert details["code"] == "yak_adult"
+    # The snapshot is assembled AFTER `next_number` (it needs the number), so unlike
+    # the no-calculation refusal above this one does take a number — and gives it
+    # back, because the raise rolls the whole transaction out. Asserted, not assumed:
+    # a gap in a legal register is unexplainable years later either way.
+    assert await counter(db) == before
+
+
+async def test_every_snapshot_key_is_printed_by_the_bundled_layout(
+    db: AsyncSession, hodim_client, paid_application: Application
+):
+    """A key nobody prints is dead weight in an immutable record, and a placeholder
+    with no key is `ERR-VAL-001` at the first real issuance. The bundled layout and
+    `service._snapshot` therefore have to be kept in step BOTH ways — mechanically,
+    because `tz/13` is a 25-row table and drift here is invisible until a permit is
+    refused or a requisite quietly stops being printed.
+
+    `calculation_id` is the one documented exception: it is the link back to the
+    invoice that was actually paid (ruling 19), deliberately not on the form."""
+    await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+
+    printed = {m.group(1).strip() for m in render._PLACEHOLDER.finditer(render.default_layout())}
+    printed.discard(render.QR_FIELD)  # the renderer fills it, not the snapshot
+
+    assert printed == set(permit.snapshot) - {"calculation_id"}
