@@ -1476,11 +1476,20 @@ async def public_check(
 # through `PERMIT_TRANSITIONS`, and leaves `set_status` as what it is: the move
 # for a caller that has only a status to write (4.7's `archived`).
 #
+# WHAT IS PUBLIC IN THIS FILE AND STILL NOT PART OF THE CONTRACT, so that
+# "seven entry points" above means what it says. Everything else here belongs to
+# one of this module's OWN entry points and takes an HTTP actor or a scheduler,
+# not a sibling service: `issue` and `add_signature` (its two write routes),
+# `permit_card`/`list_permits`/`permit_document` (its three read routes, below)
+# and `public_check`/`check_channel`/`mask_name` (the anonymous QR page). Calling
+# any of them from another module would import that module's actor semantics
+# along with the data; `jobs.py`'s two sweeps are likewise the scheduler's alone.
+#
 # THE THREE READ ROUTES below (`GET /permits`, `/permits/{id}`,
-# `/permits/{id}/pdf`) are the HTTP surface, not part of the in-process
-# contract. Their access rule is "the holder, or staff holding
-# `permits.view_any` within their zone" — BOTH halves, because a permission
-# answers "may this role at all" and a zone answers "on whose rows" (lesson).
+# `/permits/{id}/pdf`) are that HTTP surface. Their access rule is "the holder,
+# or staff holding `permits.view_any` within their zone" — BOTH halves, because
+# a permission answers "may this role at all" and a zone answers "on whose rows"
+# (lesson).
 
 
 async def get(db: AsyncSession, permit_id: uuid.UUID) -> Permit | None:
