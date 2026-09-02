@@ -17,6 +17,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 # applications/router.py lands and imports it itself, the way every other
 # module's router does (gis, norms, signatures, ...).
 import app.modules.applications.permissions  # noqa: F401
+
+# Same stand-in as above: Task 1 of 3.10a-payments-core ships no router.py yet
+# either. Stand in until payments/router.py lands (Task 2+) and imports it itself.
+import app.modules.payments.permissions  # noqa: F401
 from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
