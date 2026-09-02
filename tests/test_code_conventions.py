@@ -105,3 +105,59 @@ def test_every_locking_get_also_repopulates_the_row() -> None:
     assert not offenders, "a locking get() must also pass populate_existing=True: " + ", ".join(
         offenders
     )
+
+
+def _integer_schemas(schema: dict) -> list[dict]:
+    """Every `{"type": "integer"}` inside one parameter's JSON schema.
+
+    A parameter typed `int | None` is not `{"type": "integer"}` but an `anyOf`
+    over integer and null, so a flat read misses exactly the optional parameters
+    a query string most often carries.
+    """
+    found = [schema] if schema.get("type") == "integer" else []
+    for key in ("anyOf", "oneOf", "allOf"):
+        for member in schema.get(key, []):
+            found.extend(_integer_schemas(member))
+    return found
+
+
+def test_every_integer_query_parameter_carries_an_upper_bound() -> None:
+    """3.11a t5. An `int` query parameter is bound into SQL as a bigint, and a
+    value past that range reaches asyncpg as `DataError: value out of int64
+    range` — an unhandled 500 for a query string anybody can type. It was found
+    on `?number=` of `GET /public/permits/check`, the one anonymous route whose
+    whole contract is that garbage produces an answer rather than a stack trace,
+    and the same hole was open on every `?page=`/`?offset=` in the app (`page` is
+    multiplied by `page_size` into an OFFSET, so it overflows sooner).
+
+    Read off the OpenAPI schema rather than `app.routes`: since FastAPI 0.141
+    `include_router` nests an `_IncludedRouter` instead of flattening `APIRoute`s
+    into `app.routes`, so the obvious walk matches nothing and the check passes
+    by examining zero parameters — which is how the first version of this test
+    stayed green with the bound deliberately removed.
+    """
+    import os
+
+    os.environ.setdefault("WORKERS_MODE", "off")
+    from app.main import create_app
+
+    schema = create_app().openapi()
+    checked, offenders = 0, []
+    for path, operations in schema["paths"].items():
+        for operation in operations.values():
+            for parameter in operation.get("parameters", []):
+                if parameter.get("in") != "query":
+                    continue
+                integers = _integer_schemas(parameter.get("schema", {}))
+                if not integers:
+                    continue
+                checked += 1
+                if not all("maximum" in one or "exclusiveMaximum" in one for one in integers):
+                    offenders.append(f"{path}?{parameter['name']}")
+    # The negative control the first version lacked: a walk that matches nothing
+    # cannot fail, so the count itself is asserted.
+    assert checked >= 20, f"only {checked} integer query parameters seen — the walk is wrong"
+    assert not offenders, (
+        "an int query parameter needs an upper bound (Query(le=...), PAGING_MAX for "
+        "paging) — unbounded, it reaches asyncpg as out of int64 range: " + ", ".join(offenders)
+    )
