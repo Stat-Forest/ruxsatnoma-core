@@ -3,7 +3,8 @@
 `system_settings` lives here (stage 3.3a ruling 8) so that level-1 `auth` can read
 session/lockout policy without importing level-1 `admin` (that would be a cycle:
 `admin` already calls `auth`). Writes go through `admin.service.update_setting`.
-Later inhabitants of this file: `number_counters`.
+`number_counters` (stage 3.9a) is the race-free source of the public numbers
+(RX/INV/VC/MR/ST/ChT) — issuing itself is `core/numbers.py`, a later task.
 """
 
 import uuid
@@ -75,3 +76,16 @@ class IdempotencyKey(Base):
     response_status: Mapped[int | None]
     response_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class NumberCounter(Base):
+    """One row per (prefix:year) scope — the public-number series (RX/INV/VC/MR/ST/ChT;
+    permit series have their own `permit_counters` in `permits`). Issuing is
+    `UPDATE ... SET last_value = last_value + 1 RETURNING last_value` (race-free);
+    no `id`/`created_at` — `scope` is itself the natural key, the same shape as
+    `SystemSetting` above."""
+
+    __tablename__ = "number_counters"
+
+    scope: Mapped[str] = mapped_column(primary_key=True)
+    last_value: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")

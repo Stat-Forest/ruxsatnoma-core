@@ -166,13 +166,14 @@ class Norm(Base):
 
 class Calculation(Base):
     """An immutable calculation (ruling 21 — migration 0011 adds the
-    BEFORE UPDATE/DELETE/TRUNCATE trigger). `application_id` has no FK until
-    stage 3.9 creates `applications` (ruling 4)."""
+    BEFORE UPDATE/DELETE/TRUNCATE trigger). `application_id`'s FK to `applications`
+    is added by migration 0015, `NOT VALID` then `VALIDATE CONSTRAINT` (the table
+    already has rows), the same way 3.2a closed `audit_log.user_id`."""
 
     __tablename__ = "calculations"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
-    application_id: Mapped[uuid.UUID | None]
+    application_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("applications.id"))
     contour_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("contours.id"))
     activity_type_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("activity_types.id"))
     rule_code_version: Mapped[str]

@@ -1,0 +1,309 @@
+"""Applications — the entity every other module hangs off (design/02 § applications,
+corrected by plan `03.9a-applications-core`).
+
+Two invariants live in migration 0015 rather than here, because SQLAlchemy's metadata
+cannot express them and Alembic does not diff them: the EXCLUDE constraint forbidding
+two active applications for the same (applicant, contour, activity) on an overlapping
+period (`ex_applications_no_duplicate`, ruling 6), and the append-only trigger on
+`application_status_history` (mirroring `audit_log`'s, migration 0002, and
+`calculations`'s, migration 0011). Both are documented on their class below.
+
+Every enum-ish column has exactly one source of truth — the module-level tuples below,
+each turned into a `CheckConstraint` — so a later branch-2 task can build its pydantic
+`Literal`s from them by hand; no schemas live in this branch."""
+
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, UniqueConstraint, func, text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db import Base, uuid7
+
+# tz/05's full state machine, all 14 statuses from day one (ruling 2) even though
+# 3.9a only ever writes DRAFT/SUBMITTED/IN_REVIEW/APPROVED/REJECTED/CANCELLED — the
+# rest belong to 3.9b/3.10/3.11/archive (see the plan's ruling 2 for who writes each).
+APPLICATION_STATUSES = (
+    "DRAFT",
+    "SUBMITTED",
+    "IN_REVIEW",
+    "PENDING_INFO",
+    "RETURNED",
+    "APPROVED",
+    "INVOICED",
+    "PAID",
+    "PERMIT_ISSUED",
+    "REJECTED",
+    "CANCELLED",
+    "EXPIRED_UNPAID",
+    "CLOSED",
+    "ARCHIVED",
+)
+ON_BEHALF_VALUES = ("self", "legal")
+CHANNELS = ("portal", "mygov")
+APPLICATION_KINDS = ("new", "extension")
+
+# ruling 21: what gis.checks and norms.checks actually emit. gis's own `restrictions`
+# is dropped (a strictly weaker duplicate of norm_restrictions over the same three
+# layers); vet/cadastre are 3.9b's, kept here for the same reason as the unused
+# statuses above — a known future writer.
+CHECK_TYPES = (
+    "gis_validity",
+    "gis_within_fund",
+    "gis_overlap",
+    "norm_available",
+    "norm_season",
+    "norm_rotation",
+    "norm_fire_ban",
+    "norm_restrictions",
+    "norm_limit",
+    "vet",
+    "cadastre",
+)
+CHECK_RESULTS = ("pass", "fail", "warning")
+CHECK_SOURCES = ("auto", "external_api", "manual_fallback")
+ASSIGNMENT_REASONS = ("auto", "absence", "manual")
+CONCLUSION_KINDS = ("executor", "gis")
+CONCLUSION_RECOMMENDATIONS = ("approve", "reject")
+
+
+class Application(Base):
+    """The application (design/02 § applications). `activity_type_id`, `contour_id`,
+    `contour_version_id`, `period_from`/`period_to` and `requested_area_ha` are all
+    nullable (ruling 7): a DRAFT is autosaved field by field (tz/04 С3) and must be
+    storable half-empty. Full validation runs later, in precheck and submit — not
+    here. `requested_area_ha` is frozen at submission from the contour version's own
+    `area_ha` (ruling 22); it is not a caller-settable field.
+
+    Migration 0015 adds, and this class cannot express:
+      EXCLUDE USING gist (applicant_id WITH =, contour_id WITH =, activity_type_id WITH =,
+                          daterange(period_from, period_to, '[]') WITH &&)
+      WHERE (status IN ('SUBMITTED','IN_REVIEW','PENDING_INFO','RETURNED','APPROVED',
+                        'INVOICED','PAID','PERMIT_ISSUED')
+             AND contour_id IS NOT NULL AND period_from IS NOT NULL AND period_to IS NOT NULL)
+    named `ex_applications_no_duplicate` (ruling 6) — the service matches on that name.
+    DRAFT sits outside the WHERE clause on purpose: a duplicate is caught at
+    submission, not while the applicant is still typing.
+    """
+
+    __tablename__ = "applications"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    number: Mapped[str | None] = mapped_column(unique=True)
+    applicant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applicants.id"), index=True)
+    submitted_by_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    on_behalf: Mapped[str]
+    representation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("representations.id"), index=True
+    )
+    activity_type_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("activity_types.id"), index=True
+    )
+    contour_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("contours.id"), index=True)
+    contour_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("contour_versions.id"), index=True
+    )
+    requested_area_ha: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    period_from: Mapped[date | None]
+    period_to: Mapped[date | None]
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    status: Mapped[str] = mapped_column(default="DRAFT")
+    channel: Mapped[str]
+    mygov_reference: Mapped[str | None] = mapped_column(unique=True)
+    sla_deadline_at: Mapped[datetime | None]
+    assigned_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
+    parent_application_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("applications.id"), index=True
+    )
+    kind: Mapped[str] = mapped_column(default="new")
+    rejection_reason_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("classifier_items.id"), index=True
+    )
+    benefit_category_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("classifier_items.id"), index=True
+    )
+    decision_basis: Mapped[str | None]
+    submitted_at: Mapped[datetime | None]
+    decided_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(f"status IN {APPLICATION_STATUSES}", name="status_valid"),
+        CheckConstraint(f"on_behalf IN {ON_BEHALF_VALUES}", name="on_behalf_valid"),
+        CheckConstraint(f"channel IN {CHANNELS}", name="channel_valid"),
+        CheckConstraint(f"kind IN {APPLICATION_KINDS}", name="kind_valid"),
+    )
+
+
+class ApplicationItem(Base):
+    """Livestock by kind and age group (design/02 § application_items)."""
+
+    __tablename__ = "application_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    livestock_type_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("livestock_types.id"), index=True
+    )
+    head_count: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("head_count > 0", name="head_count_positive"),
+        UniqueConstraint(
+            "application_id", "livestock_type_id", name="uq_application_items_livestock"
+        ),
+    )
+
+
+class ApplicationDocument(Base):
+    """A document attached to an application (design/02 § application_documents)."""
+
+    __tablename__ = "application_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    doc_type_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("classifier_items.id"), index=True
+    )
+    file_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("media_files.id"), index=True)
+    uploaded_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    note: Mapped[str | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ApplicationStatusHistory(Base):
+    """The timeline (design/02 § application_status_history). Append-only via
+    migration 0015's BEFORE UPDATE/DELETE/TRUNCATE trigger, mirroring `audit_log`'s
+    (0002) and `calculations`'s (0011) own — autogenerate cannot see either, so the
+    trigger and its function live only in the migration.
+
+    `id` keeps its `uuid7` default here, but `submit` supplies it explicitly for the
+    SUBMITTED row: it is the submission id the signature is bound to (ruling 25). No
+    column or constraint change follows from that — it is simply a value a later
+    task's service passes in instead of leaving to the default.
+    """
+
+    __tablename__ = "application_status_history"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    from_status: Mapped[str | None]
+    to_status: Mapped[str]
+    changed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
+    reason_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("classifier_items.id"), index=True
+    )
+    reason_text: Mapped[str | None]
+    legal_basis: Mapped[str | None]
+    fields_to_fix: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    occurred_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(f"to_status IN {APPLICATION_STATUSES}", name="to_status_valid"),
+        CheckConstraint(
+            f"from_status IS NULL OR from_status IN {APPLICATION_STATUSES}",
+            name="from_status_valid",
+        ),
+        Index("ix_application_status_history_timeline", "application_id", "occurred_at"),
+    )
+
+
+class ApplicationAssignment(Base):
+    """The assignment history (design/02 § application_assignments, C4). At most one
+    active assignment per application — the partial unique index below."""
+
+    __tablename__ = "application_assignments"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id"), index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
+    assigned_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
+    reason: Mapped[str]
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(f"reason IN {ASSIGNMENT_REASONS}", name="reason_valid"),
+        Index(
+            "uq_application_assignments_active",
+            "application_id",
+            unique=True,
+            postgresql_where=text("is_active"),
+        ),
+    )
+
+
+class InfoRequest(Base):
+    """A request for additional information — PENDING_INFO, SLA paused (design/02 §
+    info_requests). The SLA pause is the sum of the `requested_at` -> `responded_at`
+    intervals, computed in code, not here."""
+
+    __tablename__ = "info_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    message: Mapped[str]
+    requested_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    responded_at: Mapped[datetime | None]
+    response_text: Mapped[str | None]
+
+
+class ApplicationConclusion(Base):
+    """A conclusion on an application (design/02 § application_conclusions, C5/C8:
+    "the GIS conclusion, the executor's finding"). A repeat conclusion after rework
+    is a new row, never an update."""
+
+    __tablename__ = "application_conclusions"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    author_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str]
+    text: Mapped[str]
+    recommendation: Mapped[str | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(f"kind IN {CONCLUSION_KINDS}", name="kind_valid"),
+        CheckConstraint(
+            f"recommendation IS NULL OR recommendation IN {CONCLUSION_RECOMMENDATIONS}",
+            name="recommendation_valid",
+        ),
+    )
+
+
+class ApplicationCheck(Base):
+    """Results of automatic and external checks (design/02 § application_checks,
+    corrected by ruling 21 — the eleven `check_type` values below, replacing
+    design/02's `gis_restrictions` with `norm_restrictions`). A repeat check is a new
+    row; the history is preserved (ruling 12) — never an update.
+
+    3.9a always writes `source='auto'` and leaves `doc_file_id` null; both columns
+    exist from day one because 3.9b's manual fallback needs them."""
+
+    __tablename__ = "application_checks"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    check_type: Mapped[str]
+    result: Mapped[str]
+    details: Mapped[Any] = mapped_column(JSONB)
+    source: Mapped[str] = mapped_column(default="auto")
+    doc_file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"), index=True)
+    checked_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(f"check_type IN {CHECK_TYPES}", name="check_type_valid"),
+        CheckConstraint(f"result IN {CHECK_RESULTS}", name="result_valid"),
+        CheckConstraint(f"source IN {CHECK_SOURCES}", name="source_valid"),
+    )

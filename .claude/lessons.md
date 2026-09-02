@@ -141,6 +141,21 @@ Tooling and environment.
 - **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
   naming a version you don't have locally means check which DB you connected to first.
 
+## Closing a deferred FK can break a DIFFERENT module's tests, invisibly
+
+- **Rule:** After a migration adds `NOT VALID` + `VALIDATE CONSTRAINT` on a column another
+  module already writes to, `grep -rn '<column>' tests/` across the WHOLE suite before
+  reporting done — not just the tests your own file list names.
+- **Why:** Migration 0015 closed `calculations.application_id`'s FK, absent since 3.7
+  because `applications` didn't exist yet. `tests/modules/norms/test_calculations_api.py`
+  inserted `Calculation(application_id=uuid.uuid4())` directly — a deliberately fabricated
+  id, by its own docstring, since no real table existed to reference at the time — and it
+  started raising `ForeignKeyViolationError`. `make heads` and the autogenerate-diff test
+  saw nothing wrong; only a full `pytest -q` surfaced it (3.9a t1), in a file the task's own
+  file list never mentioned.
+- **How to apply:** Closing any deferred FK (grep migration history for `NOT VALID` to find
+  the others), grep the column name suite-wide first, then run `make check` in full.
+
 ---
 
 # DB constraints vs Python
@@ -194,16 +209,25 @@ Tooling and environment.
 - **How to apply:** Adding a `CheckConstraint` → grep for a `pytest.raises(IntegrityError)`
   that actually exercises it, not just the guard in front of it. Two tests, not one.
 
-## `IntegrityError` IS a `DBAPIError` — the narrow `except` must come first
+## `IntegrityError` IS a `DBAPIError` — never assume which one a DB failure raises
 
 - **Rule:** `except IntegrityError` before `except DBAPIError`, never after, and never one
-  clause inspecting `exc.orig` by hand.
+  clause inspecting `exc.orig` by hand. The same discipline applies to `pytest.raises(...)`:
+  verify empirically which class a given failure raises, never assume from its category.
 - **Why:** `gis.service.create_version` had only `except DBAPIError`, mapping every DB
   failure to `ERR-GIS-001` ("unreadable geometry"); a `uq_contour_version_no` race raises
   `IntegrityError`, a subclass, so a version-number conflict was reported as a geometry
   defect (3.6a t3). Task 7's bulk importer drives the same path — the bug was live.
-- **How to apply:** Before adding a second `except` beside an existing `DBAPIError`, check
-  `__mro__`, and verify empirically which exception a real constraint violation raises.
+- **The mirror, in a test:** an append-only trigger's plain `RAISE EXCEPTION` (audit_log,
+  calculations, application_status_history) carries SQLSTATE `P0001`, outside the `23xxx`
+  integrity-violation class its name suggests — it surfaces as `DBAPIError`, not
+  `IntegrityError`. A 3.9a-applications-core plan's own verbatim
+  `pytest.raises(IntegrityError, match="append-only")` against exactly this idiom could
+  never pass; `tests/modules/audit/test_audit_log.py` and `tests/modules/norms/test_models.py`
+  already assert `DBAPIError` for the identical trigger shape.
+- **How to apply:** Before adding a second `except` beside an existing `DBAPIError`, OR
+  writing `pytest.raises` against any DB failure — a trigger's RAISE included — check
+  `__mro__` and verify empirically which exception a real run actually raises.
 
 ## Recovering from a failed insert to keep writing on the same session needs a SAVEPOINT and `exc.orig.__cause__`
 
