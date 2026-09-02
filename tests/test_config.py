@@ -39,6 +39,7 @@ def test_prod_accepts_custom_secret_key():
         eimzo_mode="real",
         sms_mode="real",
         email_mode="real",
+        payme_mode="real",
         eskiz_email="bot@example.uz",
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
@@ -46,6 +47,8 @@ def test_prod_accepts_custom_secret_key():
         public_base_url="https://ruxsatnoma.example.uz",
         smtp_host="smtp.example.uz",
         smtp_from="noreply@example.uz",
+        payme_merchant_id="a-real-merchant-id",
+        payme_cashbox_key="a-real-cashbox-key",
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert s.secret_key == "a-real-secret-value"
@@ -88,7 +91,7 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("SECRET_KEY", "real-secret-for-prod-guard-test")
     monkeypatch.setenv("S3_SECRET_KEY", "real-s3-secret-for-prod-guard-test")
-    for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE", "EMAIL_MODE"):
+    for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE", "EMAIL_MODE", "PAYME_MODE"):
         monkeypatch.setenv(name, "real")
     monkeypatch.setenv("ESKIZ_EMAIL", "bot@example.uz")
     monkeypatch.setenv("ESKIZ_PASSWORD", "real-eskiz-password-for-prod-guard-test")
@@ -97,6 +100,8 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ruxsatnoma.example.uz")
     monkeypatch.setenv("SMTP_HOST", "smtp.example.uz")
     monkeypatch.setenv("SMTP_FROM", "noreply@example.uz")
+    monkeypatch.setenv("PAYME_MERCHANT_ID", "real-merchant-id-for-prod-guard-test")
+    monkeypatch.setenv("PAYME_CASHBOX_KEY", "real-cashbox-key-for-prod-guard-test")
     settings = Settings()
     assert settings.oneid_mode == "real"
 

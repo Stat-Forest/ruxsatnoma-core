@@ -18,10 +18,18 @@ Public surface for the event bus (`subscribers.py`, registered in
 - `cancel_invoice_for_application(db, application_id) -> Invoice | None` — the
   business action behind `applications.events.APPLICATION_CANCELLED`.
   Idempotent and silent when there is no in-force invoice.
+- `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J) —
+  the whole business action behind a successful Payme `PerformTransaction`:
+  invoice -> paid, the 50/50 ledger written, application -> PAID, the
+  applicant notified, `payment_confirmed` published on the bus. Called from
+  `payme.py` ONLY, already inside the caller's own transaction and already
+  past every Payme-protocol check (idempotency, amount, payability) — this
+  function performs no check of its own beyond resolving the recipient
+  account.
 
 `get_invoice_for_actor`/`list_invoices_for_actor` are this module's OWN
-router-facing functions (they take an HTTP `actor: User`, unlike the three
-above) — not part of the cross-module public surface.
+router-facing functions (they take an HTTP `actor: User`, unlike the
+functions above) — not part of the cross-module public surface.
 """
 
 import uuid
@@ -31,16 +39,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import numbers
 from app.core.errors import err
+from app.core.events import Event, publish
 from app.core.time import TASHKENT, business_today
+from app.modules.admin import repo as admin_repo
 from app.modules.applications import service as applications_service
+from app.modules.applications.models import Application
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
+from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications_service
-from app.modules.payments import events, repo
-from app.modules.payments.models import Invoice
+from app.modules.payments import events, ledger, repo
+from app.modules.payments.models import Invoice, ProviderTransaction
 from app.modules.payments.permissions import PAYMENTS_VIEW
 
 # CLAUDE.md's audit invariant: action codes are "<object>.<verb>" in English,
@@ -48,6 +60,7 @@ from app.modules.payments.permissions import PAYMENTS_VIEW
 # applications.service.APPLICATION_STATUS_CHANGE's own idiom).
 INVOICE_ISSUE = "invoice.issue"
 INVOICE_CANCEL = "invoice.cancel"
+INVOICE_PAY = "invoice.pay"
 
 # design/03 §"Public numbers": every invoice number starts with this prefix.
 INVOICE_NUMBER_PREFIX = "INV"
@@ -221,3 +234,99 @@ async def list_invoices_for_actor(
     if not await _may_view_invoices_of(db, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     return await repo.list_invoices_by_application(db, application_id, limit=limit, offset=offset)
+
+
+async def _resolve_recipient_account(db: AsyncSession, application: Application) -> str | None:
+    """Ruling H: the leshoz's own bank account for the 50/50 recipient half —
+    `application.contour_id` -> `gis.service.contour_organization` ->
+    `admin.repo.get_organization` -> `organization.requisites.get("account")`,
+    falling back to `application.assigned_org_id` when there is no contour.
+    `None` (never a placeholder string) whenever any step comes up empty: a
+    leshoz without bank details, or without even an assigned organization,
+    must never block money that has already arrived — `allocations.account`
+    is nullable for exactly this (Task 3 ruling)."""
+    org_id: uuid.UUID | None
+    if application.contour_id is not None:
+        org_id = await gis_service.contour_organization(db, application.contour_id)
+    else:
+        org_id = application.assigned_org_id
+    if org_id is None:
+        return None
+    organization = await admin_repo.get_organization(db, org_id)
+    if organization is None:
+        return None
+    account = organization.requisites.get("account")
+    return account if isinstance(account, str) else None
+
+
+async def confirm_payment(
+    db: AsyncSession, *, invoice: Invoice, transaction: ProviderTransaction
+) -> None:
+    """The whole business action behind a successful Payme `PerformTransaction`
+    (`payme.py` task 4, ruling J) — invoice -> paid, the 50/50 ledger written,
+    application -> PAID, the applicant notified, `payment_confirmed`
+    published — all inside the CALLER's transaction: `payme.py` owns the
+    session (via `payme_router.py`'s `get_db`), and this function neither
+    commits nor is meant to be called from anywhere but a just-confirmed
+    `PerformTransaction`, which has already run every Payme-protocol check
+    (idempotency, amount, payability) this function does not repeat.
+
+    Ruling I: the amount split is `transaction.amount` — the money that
+    actually arrived — never `invoice.amount`. The two are equal by
+    construction (`CheckPerformTransaction`/`CreateTransaction` refuse a
+    mismatch with `-31001`), and Task 3's own tests already prove the
+    sourcing rule this function relies on (`ledger.entries_for`).
+    """
+    invoice.status = "paid"
+    invoice.paid_at = transaction.performed_at
+
+    application = await applications_service.get(db, invoice.application_id)
+    if application is None:
+        # invoice.application_id is a NOT NULL FK — unreachable in practice;
+        # guarded rather than crashing into `None.contour_id` below. Caught
+        # by payme_router.py's generic handler and answered -32400.
+        raise err("ERR-SYS-003", details={"invoice": str(invoice.id)})
+
+    recipient_account = await _resolve_recipient_account(db, application)
+    entries = ledger.entries_for(
+        invoice=invoice,
+        transaction=transaction,
+        recipient_account=recipient_account,
+        # Ruling H: the state budget's account number is not in the system
+        # at all in 3.10a — never a placeholder string.
+        budget_account=None,
+    )
+    await repo.add_allocations(db, entries)
+
+    await audit.log(
+        db,
+        action=INVOICE_PAY,
+        object_type="invoice",
+        object_id=invoice.id,
+        old_value={"status": "pending"},
+        new_value={
+            "status": "paid",
+            "transaction_id": str(transaction.id),
+            "amount": str(transaction.amount),
+        },
+    )
+
+    # set_status re-fetches and locks the row itself (applications.repo.
+    # get_application_for_update) — the `application` read above is only
+    # for the ledger's account resolution, never mutated directly here
+    # (module boundary: a level-4 caller never writes applications.status
+    # by hand).
+    application = await applications_service.set_status(
+        db, invoice.application_id, to_status="PAID"
+    )
+
+    await notifications_service.notify(
+        db,
+        event_code=events.PAYMENT_CONFIRMED_NOTIFICATION_CODE,
+        recipient_user_id=application.submitted_by_user_id,
+        params={"application_number": application.number, "amount": transaction.amount},
+        object_type="invoice",
+        object_id=invoice.id,
+    )
+
+    await publish(db, Event(name=events.PAYMENT_CONFIRMED, payload={"invoice_id": str(invoice.id)}))

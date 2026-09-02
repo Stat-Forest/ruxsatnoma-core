@@ -24,6 +24,9 @@ creates `refunds`. `allocations.transaction_id` (nullable FK to
 `other`) ship from day one too, the same way 0015 shipped all fourteen application
 statuses for writers that do not exist yet.
 
+Task 4 (`payme.py`) amends this branch's own migration a third time — see
+`ProviderTransaction`'s own docstring, ruling A, for the three columns.
+
 Every enum-ish column has exactly one source of truth — the module-level tuples
 below, each turned into a `CheckConstraint` — mirroring
 `app/modules/applications/models.py`. No schemas, service or router in this
@@ -130,9 +133,26 @@ class ProviderTransaction(Base):
     `04-integrations.md` §3), both free text since a provider's own vocabulary is
     not this module's to constrain.
 
-    `performed_at`/`payload`/`received_at` all default at the schema level (this
-    task's own model test never sets them); a real webhook handler (Task 2+) always
-    overrides `performed_at`/`payload` from the provider's own payload."""
+    `payload`/`received_at` default at the schema level (this task's own model
+    test never sets them); Task 4's `payme.py` always overrides `payload` from
+    Payme's own params and `received_at` from its OWN injected clock (ruling G),
+    never the schema default — the 12h timeout is measured from it, and a test
+    that froze time would otherwise be measured against the real wall clock the
+    server default reads.
+
+    Task 4 ruling A amends this branch's own unmerged migration (0017) with three
+    columns design/02 lists none of (Task 8 records the correction there, not
+    here):
+
+    - `performed_at` is nullable with NO server default (unlike Task 1's
+      original `func.now()`) — a transaction sitting in state `1` must report
+      `perform_time: 0` to `CheckTransaction`, not the moment the row was
+      created.
+    - `cancelled_at` (nullable) — `CheckTransaction`'s `cancel_time`.
+    - `cancel_reason` (nullable) — design/04 §3.5's reasons 1-5/10;
+      `CancelTransaction` and the 12h-timeout auto-cancel (reason `4`) both
+      write it, `CheckTransaction` reads it back unchanged.
+    """
 
     __tablename__ = "provider_transactions"
 
@@ -145,9 +165,11 @@ class ProviderTransaction(Base):
     external_id: Mapped[str]
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     state: Mapped[str]
-    performed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    performed_at: Mapped[datetime | None]
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
     received_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    cancelled_at: Mapped[datetime | None]
+    cancel_reason: Mapped[int | None]
 
     __table_args__ = (
         UniqueConstraint("provider", "external_id", name="uq_provider_transactions_external"),

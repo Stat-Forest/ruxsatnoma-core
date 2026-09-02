@@ -37,6 +37,14 @@ legitimately have no `"account"` key — a placeholder string in a financial
 ledger's account column would be worse than NULL. See
 `app/modules/payments/models.py`'s `Allocation` docstring.
 
+Task 4 amends it a third time (ruling A): `provider_transactions.performed_at`
+loses both its `NOT NULL` and its `server_default=now()` — a transaction sitting
+in state `1` must report `perform_time: 0` to Payme's `CheckTransaction`, not the
+moment the row was created — and gains two siblings design/02 lists neither of,
+`cancelled_at` (nullable timestamptz) and `cancel_reason` (nullable integer,
+design/04 §3.5's reasons 1-5/10). See
+`app/modules/payments/models.py`'s `ProviderTransaction` docstring.
+
 Grants the two new permission codes (`payments.view`, `payments.manage`) to
 `accountant` (`roles.code = 'accountant'`, «Бухгалтер» — seeded by 0003_auth.py;
 verified against that migration, not plan prose, per the lesson on role codes).
@@ -160,8 +168,7 @@ def upgrade() -> None:
         sa.Column(
             "performed_at",
             sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
+            nullable=True,
         ),
         sa.Column(
             "payload",
@@ -175,6 +182,8 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        sa.Column("cancelled_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("cancel_reason", sa.Integer(), nullable=True),
         sa.ForeignKeyConstraint(
             ["intent_id"],
             ["payment_intents.id"],
