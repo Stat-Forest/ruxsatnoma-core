@@ -46,6 +46,7 @@ from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
 from app.modules.notifications.models import NotificationTemplate
+from app.modules.notifications.service import DEFAULT_CHANNELS
 from app.modules.permits import events, jobs, service, signers
 from app.modules.permits.models import PERMIT_STATUSES, Permit, PermitStatusHistory
 from app.modules.signatures import service as signatures_service
@@ -507,16 +508,29 @@ async def test_set_status_defaults_leave_every_new_column_null(
 async def test_every_event_this_module_notifies_on_has_a_template(db: AsyncSession):
     """Ruling 17: with no template, `notify()` writes a raw fallback string
     in-app and sends NOTHING by SMS or e-mail — silently, with a green test on
-    top asserting "a notification row exists"."""
+    top asserting "a notification row exists".
+
+    EVERY default channel, not just `inapp`. This checked `inapp` alone until
+    2026-09-03, which is precisely the half that fails LOUDLY (a visible
+    fallback string in the cabinet): an unseeded `sms` row is the silent one —
+    the message is simply never sent — and it would have walked straight past
+    the guard written to catch it. The channels come from
+    `notifications.service.DEFAULT_CHANNELS`, so a third one added there is
+    covered here without anybody remembering to."""
+    missing = []
     for event_code in events.NOTIFIED_EVENT_CODES:
-        row = await db.scalar(
-            select(NotificationTemplate).where(
-                NotificationTemplate.event_code == event_code,
-                NotificationTemplate.channel == "inapp",
-                NotificationTemplate.status == "active",
+        for channel in DEFAULT_CHANNELS:
+            row = await db.scalar(
+                select(NotificationTemplate).where(
+                    NotificationTemplate.event_code == event_code,
+                    NotificationTemplate.channel == channel,
+                    NotificationTemplate.status == "active",
+                )
             )
-        )
-        assert row is not None, f"no active inapp template for {event_code}"
+            if row is None:
+                missing.append(f"{event_code}/{channel}")
+    assert DEFAULT_CHANNELS, "no default channels — the loop would assert nothing"
+    assert not missing, f"no active notification template for: {missing}"
 
 
 def test_the_notified_set_is_exactly_what_this_module_can_send() -> None:

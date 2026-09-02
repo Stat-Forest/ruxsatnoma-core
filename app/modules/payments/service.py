@@ -86,33 +86,42 @@ DUE_PERIOD = timedelta(days=10)
 #   never invoiced, or its invoice was cancelled/expired with no new one
 #   issued since. Existed since Task 2 (`issue_invoice`'s own idempotency
 #   check reads it first); this task only freezes its signature.
-# - `is_paid(db, application_id) -> bool` — **3.11 calls exactly this
-#   before building a permit** (tz/04 С11: an unpaid application must never
-#   produce one; an attempt raises RI-10 — 3.11's own job, not enforced
-#   here). `True` only once the in-force invoice's own `status == "paid"`;
-#   `False` for no invoice at all, a `pending` one, or one that expired or
-#   was cancelled — a caller deciding whether to issue a permit does not
-#   need those distinguished further. A thin wrapper over
-#   `invoice_for_application`, so the two can never disagree about what
-#   "in force" means.
+# - `is_paid(db, application_id) -> bool` — "did the provider confirm the
+#   money for this application". `True` only once the in-force invoice's own
+#   `status == "paid"`; `False` for no invoice at all, a `pending` one, or
+#   one that expired or was cancelled — a caller weighing up whether an
+#   application is settled does not need those distinguished further. A thin
+#   wrapper over `invoice_for_application`, so the two can never disagree
+#   about what "in force" means.
 #
-#   **KNOWN GAP, closed by 3.10b, stated here because 3.11 builds on this
-#   function today.** `is_paid` means "the provider confirmed the money",
-#   not "the money is still ours". Payme's `CancelTransaction` on an
-#   ALREADY-PERFORMED transaction (state `2` -> `-2`; `design/04` §3.5
-#   reason `5` is literally "funds returned") records the reversal on
-#   `provider_transactions` and NOTHING else: 3.10a builds no reversal at
-#   all (`payme._cancel_transaction`'s own docstring — refunds are 3.10b's
+#   **NOTHING OUTSIDE THIS MODULE CALLS IT.** This bullet said "3.11 calls
+#   exactly this before building a permit" until 2026-09-03, and 3.11 does
+#   not: `permits.service.issue` reads the APPLICATION's own status
+#   (`!= "PAID"` -> `ERR-PAY-001` and an RI-10 audit row), because `permits`
+#   may not read `payments` at all — both are level 4 (`design/01` rule 3).
+#   `applications.status` reaching PAID is this module's own write, through
+#   `applications.service.set_status` in `confirm_payment`, so the two agree
+#   by construction rather than by anyone checking. Kept on the surface for
+#   the callers that legitimately want the invoice-side answer (3.10b's
+#   refunds, 4.3's reports), not as a guard anybody depends on today.
+#
+#   **KNOWN GAP, closed by 3.10b**, and it belongs to the STATUS, not to
+#   this function. Payme's `CancelTransaction` on an ALREADY-PERFORMED
+#   transaction (state `2` -> `-2`; `design/04` §3.5 reason `5` is literally
+#   "funds returned") records the reversal on `provider_transactions` and
+#   NOTHING else: 3.10a builds no reversal at all
+#   (`payme._cancel_transaction`'s own docstring — refunds are 3.10b's
 #   `refunds` table). After such a call the invoice is still `paid`, the
 #   application is still `PAID`, `allocations` still carries two `payment`
-#   rows summing to money that has gone back, and **this function still
-#   returns `True`** — so a permit can be issued for a refunded payment.
-#   It is rare and loud (`payme.py` logs a state-`2` cancellation at ERROR:
-#   it is a manual reversal on live money, not routine traffic), and the
-#   fix is 3.10b's reversal path — a `correction` entry in the ledger, the
-#   invoice off `paid`, and whatever 3.11 then owes a permit already
-#   issued. Do not paper over it here by widening `is_paid`: the missing
-#   piece is the WRITE nobody performs, not the read.
+#   rows summing to money that has gone back, this function still returns
+#   `True` — and, because issuance gates on the application's status, **a
+#   permit can be issued for a refunded payment**. It is rare and loud
+#   (`payme.py` logs a state-`2` cancellation at ERROR: a manual reversal on
+#   live money, not routine traffic), and the fix is 3.10b's reversal path —
+#   a `correction` entry in the ledger, the invoice off `paid`, the
+#   application off PAID, and whatever 3.11 then owes a permit already
+#   issued. Do not paper over it by widening `is_paid`: the missing piece is
+#   the WRITE nobody performs, not the read.
 # - `allocations_for(db, invoice_id) -> list[Allocation]` — the whole
 #   ledger for one invoice, oldest first — what 4.3's reports read. Every
 #   row `confirm_payment` ever wrote for this invoice, `entry_type`
@@ -151,8 +160,13 @@ async def invoice_for_application(db: AsyncSession, application_id: uuid.UUID) -
 async def is_paid(db: AsyncSession, application_id: uuid.UUID) -> bool:
     """`True` once the in-force invoice for `application_id` is `paid`;
     `False` for no invoice, a `pending` one, or one that expired or was
-    cancelled. See the banner above — this is the guard 3.11 calls before
-    issuing a permit."""
+    cancelled.
+
+    Called by NOTHING outside this module. This docstring called itself "the
+    guard 3.11 calls before issuing a permit" until 2026-09-03; `permits`
+    may not read `payments` (`design/01` rule 3 — both level 4) and
+    `permits.service.issue` checks the application's own status instead.
+    See the banner above for what that means for the refund gap."""
     invoice = await invoice_for_application(db, application_id)
     return invoice is not None and invoice.status == "paid"
 
@@ -272,10 +286,12 @@ async def cancel_invoice_for_application(
     A PAID invoice is never cancelled (whole-branch review). "In force" is
     `pending` OR `paid` (`repo.IN_FORCE_STATUSES`), so this handler is
     handed a settled invoice as readily as an unpaid one, and cancelling
-    that one destroys a confirmed payment: `is_paid` — the single gate 3.11
-    checks before issuing a permit — flips back to `False`, the two
-    `allocations` rows are left pointing at a cancelled invoice, and the
-    citizen who paid gets neither a permit nor any record of a refund owed.
+    that one destroys a confirmed payment: `is_paid` flips back to `False`,
+    the two `allocations` rows are left pointing at a cancelled invoice, and
+    the citizen who paid gets neither a permit nor any record of a refund
+    owed. (`is_paid` is not what gates issuance — `permits.service.issue`
+    reads the application's own status, which this module also writes — but
+    the invoice-side books are wrong either way.)
     Reversing money is 3.10b's `refunds`, and it is not something an
     application-cancelled event may trigger by omission.
 
