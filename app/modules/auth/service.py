@@ -914,9 +914,15 @@ async def role_code(db: AsyncSession, user: User) -> str | None:
     `get_applicant` above: the caller is another SERVICE inside this process.
 
     `permits` (3.11a) needs it because a permit's four signature lines are
-    role-based (`permits/signers.py`, ruling 4) and `auth.repo` is not reachable
-    across the module boundary (CLAUDE.md: cross-module calls go through the
-    other module's service). `auth.deps._authorize` reads the same fact through
+    role-based (`permits/signers.py`, ruling 4), and it reads the fact through
+    this service because that is the boundary rule's default (CLAUDE.md:
+    cross-module calls go through the other module's service). It is not the only
+    way: `signatures.service`'s own module docstring documents a NARROW exception
+    for `auth.repo.role_code`/`permission_codes` read directly, and
+    `norms.service`, `gis.service`, `admin.users_service` and
+    `permits.service._holds_view_any` all use it for an in-handler permission
+    check. This wrapper is the plain read; reach past it only for that shape, and
+    say so where you do. `auth.deps._authorize` reads the same fact through
     `repo.role_code` directly, being inside this module.
     """
     return await repo.role_code(db, user)

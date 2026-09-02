@@ -32,6 +32,12 @@ a supersede (archive + version 2), never a second active insert."""
 PERMIT_ISSUED = "permit.issued"
 PERMIT_SIGNED = "permit.signed"
 PERMIT_ACTIVE = "permit.active"
+# Seeded by 0019, listed below, and SENT BY NOTHING in 3.11a: the reminder job that
+# would fire it ("your permit runs out in N days") is a later stage's. Listed anyway,
+# because this tuple is what a template must exist FOR, not what fired last night —
+# dropping the unsent one would let that job ship with no text at all, which `notify()`
+# answers with a raw fallback string in-app and silence by SMS (ruling 17). Pinned by
+# `test_end_to_end.py::test_the_notified_set_is_exactly_what_this_module_can_send`.
 PERMIT_EXPIRING = "permit.expiring"
 PERMIT_EXPIRED = "permit.expired"
 

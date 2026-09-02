@@ -12,7 +12,9 @@ so reusing it would fire one sentence at two audiences from one event. Ruling 17
 point is that a template must exist for what is actually sent; a template that
 exists and says the wrong thing is the same failure with a green test on top.
 
-**The two channels carry different bodies**, unlike `0019`'s four templates. `inapp`
+**The two channels carry different bodies**, as three of `0019`'s four templates do not
+(its `permit.signed` has since grown the same per-channel split, for this same reason —
+commit `30f2257`, ruling T4-a). `inapp`
 is the cabinet the hodim already works in and has no length limit, so it carries the
 amount; a Cyrillic SMS bills at 70 characters per part (0009 ruling 20), so the SMS
 body states the application and the action and stops. Both are addressed to a hodim

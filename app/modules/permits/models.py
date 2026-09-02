@@ -69,8 +69,15 @@ class Permit(Base):
     `doc_hash` is the sha256 of the stored PDF bytes and is a column `design/02` does
     not have (ruling 3). It is null until the document is rendered, set once, and never
     rewritten: every one of the 3+1 signatures is taken over exactly those bytes, which
-    is what makes `signatures.service.require_complete` mean what it says. Re-rendering
-    a permit that already carries a signature is refused with `ERR-PERM-002`.
+    is what makes `signatures.service.require_complete` mean what it says.
+
+    **Nothing re-renders a permit, because 3.11a exposes no entry point that could**:
+    `service.issue` renders once and `GET /permits/{id}/pdf` serves the stored file.
+    That is stronger than a guard, and it is why `ERR-PERM-002` ("документ уже
+    подписан и не может быть перевыпущен") is registered in `app/core/errors.py` and
+    raised by nothing. It is reserved, not dead: 3.11b's duplicate register (нусха)
+    must copy these same bytes rather than re-render them, and the day any path can
+    reach the renderer with an already-signed permit, that path raises this code.
 
     `status` is never set from anywhere but the one function that asks
     `signatures.service` whether the required set is complete — `active` means every

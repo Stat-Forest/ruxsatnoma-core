@@ -1458,7 +1458,8 @@ async def public_check(
 #   and all four ERI signatures cover, so re-rendering would silently produce a
 #   document no signature verifies against. `ERR-SYS-003` when the permit or its
 #   file is missing.
-# - `set_status(db, permit_id, *, to_status, actor=None, reason=None) -> Permit`
+# - `set_status(db, permit_id, *, to_status, actor=None, reason=None,
+#   reason_item_id=None, doc_file_id=None, correlation_id=None) -> Permit`
 #   — **the ONE way a module OUTSIDE `permits` moves a permit**: 3.11b writes
 #   `suspended`/`revoked` (and `suspended -> active` on resume), 4.7 writes
 #   `archived`. See its own docstring for what it does and does not do.
@@ -1502,7 +1503,7 @@ async def public_check(
 # suspension recording its ground writes two more columns of the same history row
 # this function already writes rather than doing different work.
 #
-# THE ONE WRITER INSIDE THIS MODULE THAT STILL DOES NOT ROUTE THROUGH IT is
+# THE FIRST WRITER INSIDE THIS MODULE THAT STILL DOES NOT ROUTE THROUGH IT is
 # `_activate`, exactly as `applications`' own `submit` writes its own transition
 # rather than routing through that module's `set_status` (its ruling 25): it
 # stamps `issued_at`, moves the APPLICATION and notifies the holder in one step,
