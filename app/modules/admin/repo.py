@@ -40,6 +40,19 @@ async def list_districts(db: AsyncSession, region_id: uuid.UUID | None) -> list[
     return list((await db.execute(stmt)).scalars())
 
 
+async def get_region(db: AsyncSession, region_id: uuid.UUID) -> Region | None:
+    """One region by id — the sibling of `get_organization` below, for a caller that
+    already holds the id and needs the row's own name (permits 3.11a composes the
+    holder's address for `tz/13` requisite 11). `list_regions` above answers the
+    different question of what may be CHOSEN."""
+    return await db.get(Region, region_id)
+
+
+async def get_district(db: AsyncSession, district_id: uuid.UUID) -> District | None:
+    """One district by id. See `get_region` above."""
+    return await db.get(District, district_id)
+
+
 def _organizations_query(
     *,
     parent_id: uuid.UUID | None,

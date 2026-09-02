@@ -143,6 +143,9 @@
     <tr><th>Фойдаланиш тури</th><td>{{ activity_name }}</td></tr>
     <tr><th>Фойдаланувчи (Ф.И.Ш.)</th><td>{{ holder_name }}</td></tr>
     <tr><th>ЖШШИР</th><td>{{ holder_pinfl }}</td></tr>
+    <!-- tz/13 requisite 11. «—» when the registry holds no address (ruling T3-g):
+         the column is nullable by design and a citizen who has already paid is not
+         held back over it. A chosen value, not a blank. -->
     <tr><th>Фойдаланувчи манзили</th><td>{{ holder_address }}</td></tr>
     <tr><th>Контур / субконтур рақами</th><td>{{ contour_number }}</td></tr>
     <tr><th>Ажратилган майдон, га</th><td>{{ area_ha }}</td></tr>

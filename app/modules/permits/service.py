@@ -41,7 +41,7 @@ from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
-from app.modules.auth.models import User
+from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
 from app.modules.permits import events, render, repo
@@ -74,11 +74,15 @@ PAYMENT_STATUS_PAID = "Тўланган"
 # `organizations.name`/`activity_types.name` are JSONB with this key.
 DOCUMENT_LANGUAGE = "uz_cyrl"
 
-# What a head-count row prints when this permit commits no animals of that group —
-# an em dash, the form convention for "not applicable". Never "0": `CalcRequest.items`
-# is empty for every activity but grazing (`quantity` carries those), and an apiary
-# permit reading «Қорамол — 0» would be a statement about cattle that nobody made.
-NO_HEADS = "—"
+# What a field prints when the form has nothing to state there — an em dash, the form
+# convention. It is a chosen VALUE, not a missing one, and it is never a blank.
+#
+# Two requisites use it, for two different reasons. A head-count row (12-15): never
+# "0", because `CalcRequest.items` is empty for every activity but grazing (`quantity`
+# carries those) and an apiary permit reading «Қорамол — 0» would be a statement about
+# cattle that nobody made. The holder's address (11, ruling T3-g): the registry
+# genuinely may not hold one, and "not on file" is the truthful thing to print.
+NOT_STATED = "—"
 
 # `tz/13` requisites 12-15: form 1-ilova's four head-count rows, and which
 # `livestock_types.code` (migration 0005) belongs to each.
@@ -236,8 +240,54 @@ async def _livestock_rows(db: AsyncSession, input_snapshot: Any) -> dict[str, st
                     )
                 name = _localized(livestock.name, field=field)
                 printed.append(f"{name} — {herd[code]}")
-        rows[field] = ", ".join(printed) if printed else NO_HEADS
+        rows[field] = ", ".join(printed) if printed else NOT_STATED
     return rows
+
+
+def _reference_name(name: Any) -> str | None:
+    """A JSONB reference name in the document's language, or None — the non-raising
+    twin of `_localized`, for the one place where a missing name must degrade rather
+    than refuse (the address parts of ruling T3-g). Everywhere else a classifier gap
+    IS a defect and `_localized` says so."""
+    if not isinstance(name, dict):
+        return None
+    value = name.get(DOCUMENT_LANGUAGE)
+    return None if value is None or value == "" else str(value)
+
+
+async def _holder_address(db: AsyncSession, applicant: Applicant) -> str:
+    """`tz/13` requisite 11, composed from whatever the registry actually holds:
+    region, district and free-text address, widest first, joined by commas.
+
+    **Ruling T3-g: this never refuses an issuance.** `applicants.address` is nullable
+    by 3.2b's design — `CompleteRegistrationIn.address` is `str | None`, the citizen
+    supplies it and many will not — and blocking here would strand someone who has
+    ALREADY PAID behind a profile edit only they can make, over a field that does not
+    identify them. Requisite 10 (name plus PINFL/STIR) is the identity, and those
+    columns really are non-null; this one is descriptive.
+
+    That is not a softening of "an unfilled field is a defect", which is about a
+    placeholder the LAYOUT declares and the snapshot fails to fill — a programming
+    error the renderer must never paper over. A nullable source column recorded as
+    `NOT_STATED` is a deliberate value; the em dash is chosen, not missing.
+
+    If the Agency wants the address mandatory, the place for it is registration
+    (3.2b), where the rule reaches every future applicant — refusing at issuance
+    would only reach the ones who already paid.
+    """
+    parts: list[str] = []
+    if applicant.region_id is not None:
+        region = await admin_repo.get_region(db, applicant.region_id)
+        if region is not None:
+            parts.append(_reference_name(region.name) or "")
+    if applicant.district_id is not None:
+        district = await admin_repo.get_district(db, applicant.district_id)
+        if district is not None:
+            parts.append(_reference_name(district.name) or "")
+    if applicant.address:
+        parts.append(applicant.address)
+    filled = [part for part in parts if part]
+    return ", ".join(filled) if filled else NOT_STATED
 
 
 def qr_url(token: str) -> str:
@@ -305,7 +355,10 @@ async def _snapshot(
       chain `agency → territorial → leshoz → …` is `organizations.kind`, with a
       single-agency partial unique index, and `contours.organization_id` is the
       leshoz. Requisites 12-15 come from the frozen calculation, not from
-      `application_items` (ruling T3-f — see `_livestock_rows`). Requisite 19 ships
+      `application_items` (ruling T3-f — see `_livestock_rows`). Requisite 11 is
+      composed from the registry and prints `NOT_STATED` when it holds nothing,
+      never refusing an issuance (ruling T3-g — see `_holder_address`).
+      Requisite 19 ships
       as the payment STATUS with no date (ruling T3-b): there is no lawful source
       for the date, so a permit issued before one exists carries «Тўланган» with no
       date PERMANENTLY — the snapshot is immutable and is never re-derived.
@@ -381,11 +434,9 @@ async def _snapshot(
         # An individual is identified by PINFL, a legal entity by STIR —
         # `identity_by_kind` (migration 0003) guarantees exactly one is set.
         "holder_pinfl": str(_required(applicant.pinfl or applicant.stir, field="holder_pinfl")),
-        # 11: «Адрес пользователя», from the registry. Nullable there —
-        # `complete_registration` accepts an applicant with no address — so this is
-        # the requisite most likely to refuse an issuance, by design: a form the law
-        # demands an address on must not reach a citizen with a blank line.
-        "holder_address": str(_required(applicant.address, field="holder_address")),
+        # 11: «Адрес пользователя» — composed from the registry, and «—» when it
+        # holds nothing. Never a refusal (ruling T3-g); see `_holder_address`.
+        "holder_address": await _holder_address(db, applicant),
         "contour_number": str(_required(contour_number, field="contour_number")),
         "area_ha": _money(area_ha),
         # 12-15: the herd, per form row, out of the frozen calculation (ruling T3-f)

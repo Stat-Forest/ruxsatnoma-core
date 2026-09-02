@@ -20,7 +20,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
-from app.modules.admin.models import Organization
+from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application, ApplicationItem
 from app.modules.audit.models import AuditLog
@@ -445,24 +445,63 @@ async def test_the_snapshot_carries_the_holders_address(
     assert permit.snapshot["holder_address"] == applicant_row.address
 
 
-async def test_a_holder_with_no_address_on_record_cannot_be_issued_a_permit(
+async def test_a_holder_with_no_address_on_record_is_still_issued_a_permit(
     db: AsyncSession, hodim_client, paid_application: Application, applicant_row: Applicant
 ):
-    """`applicants.address` is nullable — registration accepts an applicant without
-    one (`complete_registration`'s `address: str | None`). A requisite the form
-    demands and the registry does not have is a defect that must fail at issuance,
-    NAMING its source, rather than reach a citizen as a blank line: `_required` says
-    which column was empty, which the renderer's own refusal could not."""
+    """Ruling T3-g. `applicants.address` is nullable by 3.2b's design —
+    `CompleteRegistrationIn.address` is `str | None`, the citizen supplies it and many
+    will not — so refusing here would strand somebody who has ALREADY PAID behind a
+    profile edit only they can make, over a field that does not identify them
+    (requisite 10, name plus PINFL/STIR, is the identity, and those are non-null).
+
+    The form states «—» instead, the same way an empty head-count row does: a chosen
+    value, not a blank. If the Agency wants the address mandatory the place for it is
+    registration, where the rule would reach every future applicant."""
     applicant_row.address = None
+    applicant_row.region_id = None
+    applicant_row.district_id = None
     await db.flush()
-    before = await counter(db)
 
     result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
 
-    assert result.status_code == 422
-    assert result.json()["error"]["code"] == "ERR-VAL-001"
-    assert result.json()["error"]["details"]["field"] == "holder_address"
-    assert await counter(db) == before, "a refused issuance must not burn a series number"
+    assert result.status_code == 201, result.text
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+    assert permit.snapshot["holder_address"] == service.NOT_STATED
+
+
+async def test_the_holders_address_falls_back_to_what_the_registry_does_hold(
+    db: AsyncSession, hodim_client, paid_application: Application, applicant_row: Applicant
+):
+    """The middle case, and why `_holder_address` composes rather than reading one
+    column: an applicant who chose a region and district at registration but typed no
+    street still has a real, printable address. Widest first."""
+    region = (await db.execute(select(Region).order_by(Region.sort_order))).scalars().first()
+    assert region is not None
+    # Built here, with a unique code: migration 0005 seeds the 14 regions but the ~208
+    # districts arrive through the seed CLI, so a migrated test DB has none — and a
+    # fixed literal would collide on `uq_districts_code` once the client's own commit
+    # hook makes this row permanent (the shared-test-DB lesson).
+    district = District(
+        code=f"d-{uuid.uuid4().hex[:8]}",
+        name={"uz_cyrl": "Синов тумани", "ru": "Тестовый район"},
+        region_id=region.id,
+    )
+    db.add(district)
+    await db.flush()
+
+    applicant_row.address = None
+    applicant_row.region_id = region.id
+    applicant_row.district_id = district.id
+    await db.flush()
+
+    await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+
+    assert permit.snapshot["holder_address"] == (
+        f"{region.name['uz_cyrl']}, {district.name['uz_cyrl']}"
+    )
 
 
 async def test_the_printed_head_counts_come_from_the_frozen_calculation(
@@ -515,7 +554,7 @@ async def test_an_activity_that_commits_no_livestock_prints_no_head_counts(
 
     heads = {key: permit.snapshot[key] for key in permit.snapshot if key.startswith("heads_")}
     assert len(heads) == 4
-    assert set(heads.values()) == {service.NO_HEADS}
+    assert set(heads.values()) == {service.NOT_STATED}
     assert "0" not in "".join(heads.values())
 
 
