@@ -326,3 +326,27 @@ async def test_applications_permission_seeds(db) -> None:
         ("prosecutor", "applications.view_any"),
         ("sys_admin", "applications.assign"),
     }
+
+
+def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> None:
+    """The one guard against `schemas.ApplicationStatus` and its three siblings
+    drifting from the tuples `models.py` builds its CHECK constraints from
+    (lesson: an enum-ish column has ONE source of truth). The members have to be
+    written out — pyright rejects a starred variable inside `Literal` — so a
+    value added on one side and forgotten on the other would be a 422 that
+    should have been a 200, or an `IntegrityError` 500 that should have been a
+    422. `permits/test_models.py` carries the identical guard."""
+    from typing import get_args
+
+    from app.modules.applications.models import APPLICATION_KINDS, CHANNELS, ON_BEHALF_VALUES
+    from app.modules.applications.schemas import (
+        ApplicationKind,
+        ApplicationStatus,
+        Channel,
+        OnBehalf,
+    )
+
+    assert set(get_args(ApplicationStatus)) == set(APPLICATION_STATUSES)
+    assert set(get_args(OnBehalf)) == set(ON_BEHALF_VALUES)
+    assert set(get_args(Channel)) == set(CHANNELS)
+    assert set(get_args(ApplicationKind)) == set(APPLICATION_KINDS)

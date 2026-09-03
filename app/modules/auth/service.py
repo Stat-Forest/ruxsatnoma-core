@@ -821,6 +821,24 @@ async def has_effective_representation_of(
     return representation is not None
 
 
+async def effective_representation_of(
+    db: AsyncSession, *, user_id: uuid.UUID, applicant_id: uuid.UUID
+) -> Representation | None:
+    """The ROW behind `has_effective_representation_of` above, for a caller that
+    has to STORE which power of attorney it acted under rather than merely check
+    that one exists — `applications.service.create_draft` fills
+    `applications.representation_id`, the column that says on whose authority a
+    representative filed for a legal entity.
+
+    Same "effective" meaning as every sibling here: `status='active'` and not
+    past `valid_until`, judged against `business_today()`, never `date.today()`
+    (lesson). Same repo call as the boolean sibling, so the two can never
+    disagree about which representation is the effective one."""
+    return await repo.get_effective_representation(
+        db, applicant_id=applicant_id, user_id=user_id, today=business_today()
+    )
+
+
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
     """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
     `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not
