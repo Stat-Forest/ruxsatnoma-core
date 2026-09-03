@@ -1,11 +1,30 @@
 """The accountant's back office (plan `03.10b-payments-reconciliation`). Its
 first two routes are the bank-statement import: the multipart upload and the
-status read the accountant polls afterwards.
+status read the accountant polls afterwards. Task 5 adds the discrepancy
+register itself: `GET /payments/reconciliations` and `POST
+/payments/reconciliations/{id}/resolve`.
 
-Both are permission-gated and neither is zone-scoped — a bank statement belongs
-to the accounting department and carries no `organization_id` there would be
-anything to scope on. The upload is `payments.manage` (the accountant's own
-action) and the read is `payments.view`.
+All four are permission-gated and none is zone-scoped — a bank statement, and
+the register built from it, belong to the accounting department and carry no
+`organization_id` there would be anything to scope on. The upload and a
+resolution are `payments.manage` (the accountant's own actions); the two reads
+are `payments.view`.
+
+**There is no task table, and this stage creates none.** `tz/08` asks for "a
+task for the accountant" beside the register — an OPEN `reconciliations` row
+with `assigned_to` set IS that task, exactly what `design/02` gives the
+column for. Do not build a second worklist on top of this one.
+
+**What this register answers, and what it never can.** It answers "did the
+money arrive against an invoice" — a `matched`/`discrepancy`/`unknown` row per
+bank line, or one period row per provider settlement. It can never answer
+"did each half of the 50/50 split reach its own account", because the state
+budget's account number is stored nowhere in this system (`tz/12` #15) and a
+leshoz's own `requisites` may legitimately carry no `"account"` key — so at
+least half of every `allocations` row has `account = NULL`. `matcher.py`'s
+module docstring states the same limitation for the matching side; this is
+the same fact, read from the accountant's own register rather than from the
+code that filled it in.
 
 `POST /payments/bank-statements` requires an `Idempotency-Key`: without it a
 double-clicked or retried upload files a SECOND statement, whose lines then
@@ -34,21 +53,28 @@ from app.core import files, settings_store
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
-from app.core.schemas import PAGING_MAX
+from app.core.schemas import PAGING_MAX, Page
 from app.modules.auth.deps import idempotency_context, require_permission
 from app.modules.auth.models import User
-from app.modules.payments import statement_service
+from app.modules.payments import backoffice_service, statement_service
 from app.modules.payments.backoffice_schemas import (
+    ReconciliationOut,
+    ReconciliationResolveIn,
     StatementAccepted,
     StatementLineOut,
     StatementOut,
 )
+from app.modules.payments.models import RECONCILIATION_STATUSES
 from app.modules.payments.permissions import PAYMENTS_MANAGE, PAYMENTS_VIEW
 from app.modules.payments.statement_parser import OPTIONAL_FIELDS, REQUIRED_FIELDS
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
 _KNOWN_FIELDS = frozenset(REQUIRED_FIELDS) | frozenset(OPTIONAL_FIELDS)
+# Derived from the model's own tuple, never retyped: a status added to
+# `RECONCILIATION_STATUSES` widens what this query parameter accepts with no
+# second edit required here.
+_STATUS_PATTERN = "^(" + "|".join(RECONCILIATION_STATUSES) + ")$"
 
 
 def _parse_column_map(raw: str) -> dict[str, str]:
@@ -166,3 +192,71 @@ async def get_bank_statement(
         lines=[StatementLineOut.model_validate(line) for line in lines],
         lines_total=total,
     )
+
+
+# --- Task 5: the discrepancy register ----------------------------------------
+
+
+@router.get("/reconciliations", response_model=Page[ReconciliationOut])
+async def list_reconciliations(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    status: Annotated[str, Query(pattern=_STATUS_PATTERN)] = RECONCILIATION_STATUSES[0],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
+) -> Any:
+    """The accountant's own worklist: every `open` row by default, oldest
+    first — `ix_reconciliations_open`'s own query — or `?status=resolved` for
+    what has already been closed. A row is either a per-line comparison
+    (`statement_line_id` set) or one statement-wide provider-settlement
+    period row (`statement_line_id` and `transaction_id` both `None`, both
+    totals named in `comment` — `statement_service._period_reconciliation`).
+
+    This register answers ONE question: did the money arrive against an
+    invoice. It never answers whether each half of the 50/50 split reached
+    its own account — the budget's account number is in no table at all
+    (`tz/12` #15), so at least half of every `allocations` row has
+    `account = NULL`; `matcher.py`'s module docstring gives the same
+    limitation for the matching side, and this is the same fact seen from
+    the register a human actually reads.
+    """
+    rows, total = await backoffice_service.list_reconciliations(
+        db, status=status, limit=limit, offset=offset, actor=actor
+    )
+    return Page[ReconciliationOut](
+        items=[ReconciliationOut.model_validate(row) for row in rows],
+        total=total,
+        page=offset // limit + 1,
+        page_size=limit,
+    )
+
+
+@router.post(
+    "/reconciliations/{reconciliation_id}/resolve",
+    response_model=ReconciliationOut,
+)
+async def resolve_reconciliation(
+    reconciliation_id: uuid.UUID,
+    body: ReconciliationResolveIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_MANAGE))],
+) -> Any:
+    """Close one register row — `tz/08`: with a comment, or with a
+    correcting document (`resolution_doc_id`, which must name an ACTIVE
+    `media_files` row). This is the accountant's own action, never an
+    automatic one: nothing in this module ever resolves a row on its own,
+    which is also why an open row with `assigned_to` set needs no separate
+    task table (this file's own module docstring).
+
+    An empty/whitespace-only comment is `ERR-VAL-001`; a row already
+    `resolved` is `ERR-PAY-005` (409) rather than a silent second closure
+    that would overwrite the first accountant's own comment.
+    """
+    row = await backoffice_service.resolve_reconciliation(
+        db,
+        reconciliation_id,
+        comment=body.comment,
+        resolution_doc_id=body.resolution_doc_id,
+        actor=actor,
+    )
+    return ReconciliationOut.model_validate(row)

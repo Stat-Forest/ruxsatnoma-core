@@ -334,3 +334,39 @@ async def list_invoice_candidates(
         .limit(limit)
     )
     return list((await db.execute(stmt)).scalars().all())
+
+
+# --- 3.10b task 5: the discrepancy register -----------------------------------
+
+
+async def get_reconciliation(
+    db: AsyncSession, reconciliation_id: uuid.UUID
+) -> Reconciliation | None:
+    return await db.get(Reconciliation, reconciliation_id)
+
+
+async def get_reconciliation_for_update(
+    db: AsyncSession, reconciliation_id: uuid.UUID
+) -> Reconciliation | None:
+    """`resolve_reconciliation`'s own locking read — the one writer this table
+    has: two accountants (or an accidental double-click) closing the same row
+    at once must serialize instead of both succeeding, one of them silently
+    overwriting the other's comment (mirrors `get_invoice_for_update`)."""
+    return await db.get(
+        Reconciliation, reconciliation_id, with_for_update=True, populate_existing=True
+    )
+
+
+async def list_reconciliations(
+    db: AsyncSession, *, status: str, limit: int, offset: int
+) -> tuple[list[Reconciliation], int]:
+    """The register itself, oldest first — `ix_reconciliations_open`
+    (`status`, `occurred_at`) is exactly this query's own index."""
+    stmt = select(Reconciliation).where(Reconciliation.status == status)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Reconciliation.occurred_at, Reconciliation.id).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total

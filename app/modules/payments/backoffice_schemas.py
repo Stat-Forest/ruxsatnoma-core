@@ -73,3 +73,45 @@ class StatementOut(BaseModel):
     created_at: datetime
     lines: list[StatementLineOut]
     lines_total: int
+
+
+class ReconciliationOut(BaseModel):
+    """One row of the discrepancy register (`GET /payments/reconciliations`) —
+    either a per-line comparison (`statement_line_id` set) or a whole
+    statement's provider-settlement period row (`statement_line_id` and
+    `transaction_id` both `None`, both totals named in `comment` —
+    `statement_service._period_reconciliation`)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    statement_line_id: uuid.UUID | None
+    transaction_id: uuid.UUID | None
+    invoice_id: uuid.UUID | None
+    result: str
+    difference: Decimal | None
+    status: str
+    assigned_to: uuid.UUID | None
+    comment: str | None
+    resolution_doc_id: uuid.UUID | None
+    resolved_by: uuid.UUID | None
+    resolved_at: datetime | None
+    occurred_at: datetime
+
+    @field_serializer("difference")
+    def _difference(self, value: Decimal | None) -> str | None:
+        return None if value is None else str(value)
+
+
+class ReconciliationResolveIn(BaseModel):
+    """`POST /payments/reconciliations/{id}/resolve` — `tz/08`: close a
+    discrepancy with a comment or with a correcting document.
+
+    `comment` is required by the SCHEMA (its absence is `ERR-VAL-001` from
+    FastAPI's own validation, before the service ever runs); a comment that
+    is present but blank (`""`, `"   "`) is a service-level check instead
+    (`backoffice_service.resolve_reconciliation`), because a Pydantic length
+    check cannot see past whitespace the way `str.strip()` can."""
+
+    comment: str
+    resolution_doc_id: uuid.UUID | None = None
