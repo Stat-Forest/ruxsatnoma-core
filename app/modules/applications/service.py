@@ -117,10 +117,17 @@ BENEFIT_CLASSIFIER_CODE = "benefit_categories"
 DOC_TYPE_CLASSIFIER_CODE = "doc_types"
 # The ONE `doc_types` item a benefit claim is proven with (ruling 10а, made
 # fail-closed by review round 2's important 5). Named here so a reader can see
-# WHAT the submission looks for; migration 0005 seeds the classifier but none
-# of its items — they are the Agency's to supply — so until this code exists
-# and is active, `_assert_benefit_documents` refuses every benefit claim rather
-# than accepting an unchecked attachment as proof.
+# WHAT the submission looks for.
+#
+# **Migration `0024` seeds it**, and had to: this code is OURS, not the
+# Agency's — no `tz/` document prescribes a doc-type code list — so a missing
+# row would have refused every benefit claim with a message about
+# configuration, making "the Agency has not answered" indistinguishable from
+# "we forgot a row". The other `doc_types` items are still the Agency's, added
+# through the admin CRUD. While no ACTIVE item carries this code (somebody
+# archived it; reference data is superseded, never deleted),
+# `_assert_benefit_documents` refuses every benefit claim rather than accepting
+# an unchecked attachment as proof.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
 
 # tz/05's transition table (plan 03.9a task 8, the brief's own copy). All
@@ -1368,22 +1375,22 @@ async def _assert_benefit_documents(db: AsyncSession, application: Application) 
     benefits is fail-closed everywhere else — `ERR-NORM-004` refuses a grazing
     fee outright rather than guessing a missing `coef_sb:*`, and
     `benefit_categories` ships EMPTY so no benefit can be claimed at all today
-    — and this now matches it:
+    — and this matches it:
 
       * the document must be of the `doc_types` item whose code is
         `BENEFIT_DOC_TYPE_CODE` below; a document of any other type does not
         satisfy the claim;
-      * if that classifier item does not exist or is not active — which is the
-        state of a fresh database, since migration 0005 seeds the `doc_types`
-        CLASSIFIER but none of its ITEMS, those being the Agency's to supply —
-        the claim is REFUSED with `benefit_doc_type_not_configured`, never
-        accepted. An unconfigurable rule refuses; it does not wave things
-        through.
+      * if that classifier item does not exist or is not active, the claim is
+        REFUSED with `benefit_doc_type_not_configured`, never accepted. An
+        unconfigurable rule refuses; it does not wave things through.
 
-    The consequence, stated plainly: until the Agency seeds `benefit_proof` in
-    `doc_types`, no benefit can be claimed on a submission. That is the same
-    fail-closed state `tz/12` #2 already describes for the benefit list itself,
-    and the controller is recording it as an open question.
+    Since migration `0024` a fresh database is NOT in that state — it seeds
+    `benefit_proof`, because the code is ours rather than the Agency's — so
+    `benefit_doc_type_not_configured` in production now means somebody archived
+    the item, not that the Agency has yet to answer. The claim is nonetheless
+    still fail-closed on its OTHER half: `benefit_categories` ships empty until
+    VMQ 278's list arrives (`tz/12` #2/#13), so there is no category to claim
+    in the first place.
 
     The claim is separately validated against the benefit classifier at PATCH
     time (`_assert_references`) and against the tariff rows it must resolve at

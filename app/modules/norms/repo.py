@@ -164,7 +164,9 @@ async def list_norms(
     return await paginate(db, stmt, limit, offset)
 
 
-def _calculations_query(application_id: uuid.UUID | None, created_by: uuid.UUID | None) -> Select:
+def _calculations_query(
+    application_id: uuid.UUID | None, created_by: uuid.UUID | None, unbound_only: bool
+) -> Select:
     """The WHERE + ORDER BY `list_calculations` and `newest_calculation`
     share, NEWEST first — the one ordering in this module not by
     `effective_from`, since a calculation has no period of its own. `id`
@@ -175,6 +177,8 @@ def _calculations_query(application_id: uuid.UUID | None, created_by: uuid.UUID 
         stmt = stmt.where(Calculation.application_id == application_id)
     if created_by is not None:
         stmt = stmt.where(Calculation.created_by == created_by)
+    if unbound_only:
+        stmt = stmt.where(Calculation.application_id.is_(None))
     return stmt.order_by(Calculation.created_at.desc(), Calculation.id.desc())
 
 
@@ -183,20 +187,28 @@ async def list_calculations(
     *,
     application_id: uuid.UUID | None,
     created_by: uuid.UUID | None,
+    unbound_only: bool,
     limit: int,
     offset: int,
 ) -> tuple[list[Calculation], int]:
     """An append-only table's history, paged, with its total (review M3:
     the `COUNT(*)` a page needs and `newest_calculation` below does not).
 
-    `created_by` is ruling 11's own-rows scope, and it is keyword-only with NO
-    default on purpose: this table holds every fee the system has ever quoted,
-    and an unscoped read of it is the defect this stage exists to close. The
-    caller — `service.list_calculations`, the only one — has to say `None`
-    deliberately, which it does exactly twice: for a named application whose
-    entitlement it already checked, and for the superuser.
+    `created_by` and `unbound_only` are ruling 11's two scopes, and BOTH are
+    keyword-only with NO default on purpose: this table holds every fee the
+    system has ever quoted, and an unscoped read of it is the defect this stage
+    exists to close. The caller — `service.list_calculations`, the only one —
+    has to state each one deliberately.
+
+    They are applied as SQL rather than as a post-filter over the page, which
+    is not a style choice: `paginate` computes `total` from the same statement,
+    so a predicate applied in Python after the window would return a page of
+    N-1 items claiming a total of N, and would additionally cost one
+    `application_facts` round trip per row on every listing.
     """
-    return await paginate(db, _calculations_query(application_id, created_by), limit, offset)
+    return await paginate(
+        db, _calculations_query(application_id, created_by, unbound_only), limit, offset
+    )
 
 
 async def newest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Calculation | None:
@@ -209,7 +221,7 @@ async def newest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Cal
     read 3.10a builds an invoice from, where the caller is another service and
     ruling 11's scope — an HTTP rule about a signed-in human — does not
     apply."""
-    stmt = _calculations_query(application_id, created_by=None).limit(1)
+    stmt = _calculations_query(application_id, created_by=None, unbound_only=False).limit(1)
     return (await db.execute(stmt)).scalars().first()
 
 
@@ -227,7 +239,17 @@ async def paginate(db: AsyncSession, stmt: Select, limit: int, offset: int) -> t
 # `norms` is level 2 and `applications` is level 3, so `norms` may NOT call
 # `applications.service` to ask whose application a calculation belongs to.
 # **Ruling 20 grants `norms` a read-only right on the `applications` table for
-# this one predicate, in THIS FILE and nowhere else.**
+# this ONE OWNERSHIP PREDICATE, in THIS FILE and nowhere else.**
+#
+# One predicate, both directions. It was written for the WRITE guard (task 5,
+# "may this actor bind a calculation to this application"); stage 3.9a task 8
+# reuses the identical five columns for ruling 11's READ rule ("may this actor
+# see a calculation bound to this application"), and deliberately adds NO
+# second query — reuse is the whole point of the grant being one predicate.
+# Three service functions now share it (`_assert_application_open_for_
+# calculation`, `_may_read_calculation`, `list_calculations`); a fourth wanting
+# a SIXTH COLUMN is what would need the ruling amended again, not a fourth
+# caller of these five.
 #
 # This is a NEW exception that AMENDS design/01 rule 5 — it is not an instance
 # of it. Rule 5's targeted addition reads, verbatim: "`gis` and `norms` get the
@@ -240,8 +262,10 @@ async def paginate(db: AsyncSession, stmt: Select, limit: int, offset: int) -> t
 # `assigned_org_id`, `contour_id` (ruling 20's own four) plus `status`
 # (controller ruling R15, added when the status guard below became this
 # stage's obligation — ruling 20's column list was written for the ownership
-# predicate alone, and the guard cannot be written without it). Any WRITE, and
-# any read from `norms/service.py`, is still forbidden.
+# predicate alone, and the guard cannot be written without it). Ruling 11's
+# read rule needed nothing further: it asks about ownership and the zone, which
+# is `applicant_id` and `assigned_org_id`/`contour_id`. Any WRITE, and any read
+# from `norms/service.py`, is still forbidden.
 #
 # Raw SQL naming the five columns rather than an ORM query: importing
 # `applications.models` here would be a level-3 import from a level-2 module —
@@ -258,9 +282,13 @@ async def application_facts(db: AsyncSession, application_id: uuid.UUID) -> RowM
     or `None` when no such application exists.
 
     Read-only, and the only place in `norms` that touches this table.
-    `norms.service._assert_application_open_for_calculation` is its only
-    caller; a second caller wanting a sixth column is a sign the ruling needs
-    amending again, not that this query does.
+
+    THREE callers, all in `norms.service` and all asking the same ownership
+    question of the same five columns: `_assert_application_open_for_
+    calculation` (task 5's write guard), `_may_read_calculation` and
+    `list_calculations` (task 8's ruling-11 read rule). A caller wanting a
+    SIXTH COLUMN is a sign the ruling needs amending again; another caller of
+    these five is the grant working as intended.
     """
     rows = await db.execute(_APPLICATION_FACTS_SQL, {"application_id": application_id})
     return rows.mappings().first()

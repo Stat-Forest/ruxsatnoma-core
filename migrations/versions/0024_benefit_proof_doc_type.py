@@ -55,23 +55,64 @@ ITEM_CODE = "benefit_proof"
 
 
 def upgrade() -> None:
-    op.execute(
+    """Seed the item, and say so out loud in both directions it could go quiet.
+
+    A plain `INSERT ... SELECT FROM classifiers WHERE code = 'doc_types'` has
+    two silent modes, and this project has a lesson about exactly the first:
+    with the classifier absent the SELECT yields no row, the INSERT writes
+    nothing, and the migration reports success — the "empty migration, no
+    error, no warning" shape. And against a database where a central admin has
+    already created an active `benefit_proof` item through the admin CRUD, the
+    partial index `uq_classifier_items_active_code` turns the seed into a hard
+    crash mid-deploy over a row that is exactly what we wanted there.
+
+    So: the classifier is resolved first and its absence RAISES with a sentence
+    naming it; the insert is `ON CONFLICT DO NOTHING` against that index, so an
+    admin-created row is left alone rather than colliding; and the outcome is
+    verified, so "nothing was inserted and nothing exists" can never pass for
+    "already seeded".
+    """
+    conn = op.get_bind()
+    classifier_id = conn.execute(
+        sa.text("SELECT id FROM classifiers WHERE code = :code").bindparams(code=CLASSIFIER_CODE)
+    ).scalar()
+    if classifier_id is None:
+        raise RuntimeError(
+            f"classifier {CLASSIFIER_CODE!r} is missing — 0005_admin_seeds.py seeds it, so this "
+            "database did not run the chain this revision depends on; seeding nothing here would "
+            "leave every benefit claim refused as 'benefit_doc_type_not_configured'"
+        )
+    conn.execute(
         sa.text(
             "INSERT INTO classifier_items "
-            "(id, classifier_id, code, name, valid_from, sort_order, status) "
-            "SELECT CAST(:id AS uuid), c.id, :code, "
+            "(id, classifier_id, code, name, valid_from, sort_order, status) VALUES "
+            "(CAST(:id AS uuid), CAST(:classifier_id AS uuid), :code, "
             "jsonb_build_object('uz_cyrl', :cyr, 'ru', :ru, 'en', :en), "
-            "DATE '2026-01-01', 10, 'active' "
-            "FROM classifiers c WHERE c.code = :classifier"
+            "DATE '2026-01-01', 10, 'active') "
+            # The index is PARTIAL, so the conflict target must repeat its own
+            # WHERE clause or Postgres cannot infer it.
+            "ON CONFLICT (classifier_id, code) WHERE status = 'active' DO NOTHING"
         ).bindparams(
             id=ITEM_ID,
+            classifier_id=classifier_id,
             code=ITEM_CODE,
-            classifier=CLASSIFIER_CODE,
             cyr="Имтиёзни тасдиқловчи ҳужжат",
             ru="Документ, подтверждающий льготу",
             en="Benefit proof",
         )
     )
+    seeded = conn.execute(
+        sa.text(
+            "SELECT count(*) FROM classifier_items "
+            "WHERE classifier_id = CAST(:classifier_id AS uuid) "
+            "AND code = :code AND status = 'active'"
+        ).bindparams(classifier_id=classifier_id, code=ITEM_CODE)
+    ).scalar()
+    if not seeded:
+        raise RuntimeError(
+            f"no active {ITEM_CODE!r} item exists after this migration — the insert was skipped "
+            "by ON CONFLICT and nothing was there to conflict with, which cannot both be true"
+        )
 
 
 def downgrade() -> None:
@@ -87,6 +128,9 @@ def downgrade() -> None:
             "DELETE FROM application_documents WHERE doc_type_item_id = CAST(:id AS uuid)"
         ).bindparams(id=ITEM_ID)
     )
+    # By ID, never by code: on a database where the upgrade's ON CONFLICT left
+    # an ADMIN-created row alone, this migration inserted nothing and owns
+    # nothing, so a delete by code would remove somebody else's row.
     op.execute(
         sa.text("DELETE FROM classifier_items WHERE id = CAST(:id AS uuid)").bindparams(id=ITEM_ID)
     )

@@ -1164,10 +1164,15 @@ async def _may_read_calculation(db: AsyncSession, actor: User, row: Calculation)
     is deliberate. Down the bound branch it is already covered, and covered the
     RIGHT way: `_may_read_application` -> `_holds_one_of` gives `sys_admin`
     `require_permission`'s own bypass, which skips the CODE and not the zone
-    (decision #41 ruling 2), so this predicate agrees exactly with what
-    `applications.service._readable_application` would answer about the same
-    application. A blanket bypass here would make a zone-scoped `sys_admin` able
-    to read the PRICE of an application whose card it cannot open.
+    (decision #41 ruling 2), so this predicate answers a BOUND row exactly as
+    `applications.service._readable_application` would answer about the
+    application it belongs to. A blanket bypass here would make a zone-scoped
+    `sys_admin` able to read the PRICE of an application whose card it cannot
+    open.
+
+    `list_calculations` below is held to this function row for row, in both
+    branches — that equivalence is what review round 1's Important 1 broke and
+    what the `application_id IS NULL` scope restores.
 
     The unbound branch has no permission code to bypass and no application to
     zone by — the whole rule there is "you made it" — so the superuser needs
@@ -1205,30 +1210,49 @@ async def list_calculations(
 ) -> tuple[list[Calculation], int]:
     """`GET /calculations`, narrowed by ruling 11 — a FILTER, never a refusal.
 
-    Two scopes, because only one of them can be expressed in SQL with the read
-    ruling 20 grants:
+    **Two DISJOINT branches, split on whether a row is BOUND to an
+    application**, because a bound row's rule and an unbound row's rule are
+    two different questions and only the second can be answered without asking
+    about an application:
 
-      * **an `application_id` is named** — the entitlement question is asked
-        ONCE, about that application, through the same `repo.application_facts`
-        the write guard uses, and the answer decides between the application's
-        page and an empty one. No per-row predicate is needed: every row in the
-        page belongs to that one application.
-      * **no `application_id`** — `created_by = actor.id`, which is every row
-        this actor made: their bare price checks and the calculation their own
-        submission stored (`applications.service.submit` passes the applicant
-        as `actor`). The superuser sees the lot.
+      * **an `application_id` is named** — the only branch that returns bound
+        rows. The entitlement question is asked ONCE, about that application,
+        through the same `repo.application_facts` the write guard uses, and
+        the answer decides between the application's page and an empty one. No
+        per-row predicate is needed: every row in the page belongs to that one
+        application, so one question settles the whole page.
+      * **no `application_id`** — UNBOUND rows only (`application_id IS
+        NULL`), scoped to `created_by = actor.id`; the superuser sees every
+        unbound row. That is exactly `_may_read_calculation`'s unbound branch,
+        restated as SQL, so the two agree row for row.
 
-    The second scope is deliberately NOT "every calculation on every
-    application I could read". Expressing that needs a second read of
-    `applications` — a subquery over `applicant_id`, plus a join to
-    `organizations` for the zone — and ruling 20's grant is one predicate on
-    five columns, not a licence to build `applications.repo.list_applications`
-    a second time inside `norms`. Nothing needs it either: 3.10a reads the
-    newest row in process through `latest_calculation`, the application card
-    carries the current price, and a reviewer looking at a filing names its
-    `application_id`. The narrow scope fails CLOSED — it shows too little,
-    never too much — and the day a screen genuinely needs the wider one, it is
-    ruling 20 that gets amended, in daylight, rather than this function.
+    **The `application_id IS NULL` half of the second branch is a fix, not a
+    decoration (review round 1, Important 1).** Without it the branch returned
+    bound rows on `created_by` alone, with no per-row predicate — so a
+    calculation the actor CREATED came back in the list, full `CalculationOut`
+    and all (`input_snapshot`, `amount`, `breakdown`), after they had lost the
+    right to read it. Two paths reach that state and both are live in this
+    branch: `decision._forward` moves `assigned_org_id` away from the head who
+    escalated, whose own docstring records that they can no longer see the
+    application afterwards; and `own_applicant_ids` is effective-dated, with a
+    daily job flipping a representation to `expired`, so a representative who
+    priced an application during a valid representation keeps the row. In both
+    the card and `GET /calculations/{id}` answer 404 while the list did not.
+    Pinned by `tests/modules/applications/test_end_to_end.py::
+    test_a_head_who_forwards_an_application_loses_its_calculation_from_the_list`.
+
+    The scope is deliberately NOT "every calculation on every application I
+    could read". Expressing that needs a second read of `applications` — a
+    subquery over `applicant_id`, plus a join to `organizations` for the zone —
+    and ruling 20's grant is a five-column ownership predicate, not a licence
+    to build `applications.repo.list_applications` a second time inside
+    `norms`. Nothing needs it either: 3.10a reads the newest row in process
+    through `latest_calculation`, the application card carries the current
+    price, and a reviewer looking at a filing names its `application_id`. So
+    this route UNDER-shows bound rows and never over-shows them — which is what
+    a filter is allowed to do and a refusal is not — and the day a screen
+    genuinely needs the wider scope, it is ruling 20 that gets amended, in
+    daylight, rather than this function.
     """
     if application_id is not None:
         # `_may_read_application` carries the superuser's bypass already, and
@@ -1238,14 +1262,24 @@ async def list_calculations(
         if facts is None or not await _may_read_application(db, actor, facts):
             return [], 0
         return await repo.list_calculations(
-            db, application_id=application_id, created_by=None, limit=limit, offset=offset
+            db,
+            application_id=application_id,
+            created_by=None,
+            unbound_only=False,
+            limit=limit,
+            offset=offset,
         )
-    # Unfiltered: no application to zone by, so the superuser gets its own
-    # clause here, exactly as the unbound branch of `_may_read_calculation`
-    # does and for the same reason.
+    # Unbound rows only, and hence no application to zone by: the superuser
+    # gets its own clause here, exactly as the unbound branch of
+    # `_may_read_calculation` does and for the same reason.
     created_by = None if await auth_service.role_code(db, actor) == SUPERUSER_ROLE else actor.id
     return await repo.list_calculations(
-        db, application_id=None, created_by=created_by, limit=limit, offset=offset
+        db,
+        application_id=None,
+        created_by=created_by,
+        unbound_only=True,
+        limit=limit,
+        offset=offset,
     )
 
 

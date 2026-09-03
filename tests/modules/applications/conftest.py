@@ -501,52 +501,6 @@ async def benefit_doc_type_item_id(engine) -> AsyncIterator[uuid.UUID]:
 
 
 @pytest.fixture
-async def benefit_doc_type_unseeded(engine) -> AsyncIterator[None]:
-    """The mirror of `benefit_doc_type_item_id`: for the length of one test,
-    the `doc_types` classifier holds NO active `benefit_proof` item.
-
-    Migration `0024` seeds that item (the code is ours, not the Agency's — see
-    the migration's own docstring), so "unconfigured" stopped being the state a
-    fresh database is in. It is still a state a database can REACH — a central
-    admin archives the row, as the admin CRUD lets them, and reference data is
-    superseded rather than deleted — and it is the state ruling 10а's
-    fail-closed branch exists for, so it needs a way to be reached in a test.
-
-    Archived, never deleted: `application_documents.doc_type_item_id` holds an
-    FK on it, `uq_classifier_items_active_code` is partial on `status =
-    'active'` so archiving frees the code without touching the row, and the id
-    the test DB's other rows point at survives. Own session and its own
-    restore, the `doc_type_item_id` pattern, because a client commits `db`
-    before every request (lesson).
-    """
-    from app.modules.applications.service import BENEFIT_DOC_TYPE_CODE
-
-    factory = make_session_factory(engine)
-    async with factory() as own_db:
-        rows = await own_db.execute(
-            text(
-                "UPDATE classifier_items i SET status = 'archived' "
-                "FROM classifiers c "
-                "WHERE c.id = i.classifier_id AND c.code = 'doc_types' "
-                "AND i.code = :code AND i.status = 'active' "
-                "RETURNING i.id"
-            ).bindparams(code=BENEFIT_DOC_TYPE_CODE)
-        )
-        archived = [row[0] for row in rows.all()]
-        await own_db.commit()
-        try:
-            yield None
-        finally:
-            for item_id in archived:
-                await own_db.execute(
-                    text("UPDATE classifier_items SET status = 'active' WHERE id = :id").bindparams(
-                        id=item_id
-                    )
-                )
-            await own_db.commit()
-
-
-@pytest.fixture
 async def benefit_category_item_id(engine) -> AsyncIterator[uuid.UUID]:
     """One `benefit_categories` classifier item, by ID.
 

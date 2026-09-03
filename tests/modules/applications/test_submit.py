@@ -16,6 +16,8 @@ first and asserts the DELTA, which is the property ruling 5а actually promises.
 import uuid
 from datetime import date
 
+import pytest
+
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 
 
@@ -436,7 +438,7 @@ async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfig
     applicant_client,
     draft_ready_for_submission,
     benefit_category_item_id,
-    benefit_doc_type_unseeded,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ruling 10а, FAIL-CLOSED (review round 2, important 5). With no active
     `benefit_proof` item in the `doc_types` classifier, a benefit claim cannot
@@ -444,14 +446,28 @@ async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfig
     the claim on whatever happens to be attached, because a benefit REDUCES the
     fee.
 
-    **The state is now reached by a fixture, not by the empty database.** Task
-    8's migration `0024` seeds that item, because the code is ours rather than
-    the Agency's and a citizen with a real benefit must not be refused for a
-    row we forgot. Archiving it is how a database still reaches this state —
-    the admin CRUD supersedes reference data by archiving — and it is the only
-    thing that changed here: the refusal, its code and its reason are the ones
-    review round 2 asked for, unaltered.
+    **The state is reached by moving the CODE, not the database.** Task 8's
+    migration `0024` seeds `benefit_proof`, because the code is ours rather
+    than the Agency's and a citizen with a real benefit must not be refused
+    for a row we forgot — so "no such item" is no longer where a fresh
+    database starts. `monkeypatch` points the guard at a code nothing carries,
+    which is the same lookup failing for the same reason, and it writes
+    NOTHING: the app under test runs in this very process, so the patched
+    module global is the one the route reads, and the shared, persistent test
+    database is untouched.
+
+    An earlier draft archived the seeded row on a committed session and
+    restored it in `finally` (review round 1): a hard interrupt in between
+    would have left `benefit_proof` archived for every later run and every
+    other worktree, and combining it with `benefit_doc_type_item_id` in one
+    test would have made the restore collide with
+    `uq_classifier_items_active_code`. The refusal, its code and its reason are
+    the ones review round 2 asked for, unaltered.
     """
+    from app.modules.applications import service
+
+    absent_code = f"benefit_proof_absent_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(service, "BENEFIT_DOC_TYPE_CODE", absent_code)
     app_id = draft_ready_for_submission
     patched = await applicant_client.patch(
         f"/api/v1/applications/{app_id}",
@@ -468,7 +484,11 @@ async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfig
     error = refused.json()["error"]
     assert error["code"] == "ERR-APP-003"
     assert error["details"]["reason"] == "benefit_doc_type_not_configured"
-    assert error["details"]["doc_type_code"] == "benefit_proof"
+    # The patched code, because the error body names the code the guard
+    # actually looked for — which is the useful thing for an operator to see.
+    # That it is `"benefit_proof"` in production is asserted by
+    # `test_documents.py::test_the_benefit_proof_doc_type_is_seeded_and_active`.
+    assert error["details"]["doc_type_code"] == absent_code
 
 
 async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other(
