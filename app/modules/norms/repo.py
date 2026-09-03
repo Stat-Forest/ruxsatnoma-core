@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import date
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import RowMapping, Select, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
@@ -200,3 +200,47 @@ async def paginate(db: AsyncSession, stmt: Select, limit: int, offset: int) -> t
     ).scalar_one()
     rows = await db.execute(stmt.limit(limit).offset(offset))
     return list(rows.scalars()), total
+
+
+# --- Ruling 20 (plan 03.9a): the ONE read of another module's table ----------
+#
+# `norms` is level 2 and `applications` is level 3, so `norms` may NOT call
+# `applications.service` to ask whose application a calculation belongs to.
+# **Ruling 20 grants `norms` a read-only right on the `applications` table for
+# this one predicate, in THIS FILE and nowhere else.**
+#
+# This is a NEW exception that AMENDS design/01 rule 5 — it is not an instance
+# of it. Rule 5's targeted addition reads, verbatim: "`gis` and `norms` get the
+# same read-only right on the `permits` table **(and only on it)**". The
+# parenthesis is the whole point of that sentence: it exists to stop the
+# exception spreading. Extending it to `applications` therefore had to be
+# recorded as its own ruling, and Task 9 edits design/01 to say so.
+#
+# The scope is a HARD LIMIT, not an example: `id`, `applicant_id`,
+# `assigned_org_id`, `contour_id` (ruling 20's own four) plus `status`
+# (controller ruling R15, added when the status guard below became this
+# stage's obligation — ruling 20's column list was written for the ownership
+# predicate alone, and the guard cannot be written without it). Any WRITE, and
+# any read from `norms/service.py`, is still forbidden.
+#
+# Raw SQL naming the five columns rather than an ORM query: importing
+# `applications.models` here would be a level-3 import from a level-2 module —
+# the very thing the ruling was needed to avoid — and the explicit column list
+# is the limit above, written where it is enforced rather than only promised.
+_APPLICATION_FACTS_SQL = text(
+    "SELECT id, applicant_id, assigned_org_id, contour_id, status "
+    "FROM applications WHERE id = :application_id"
+)
+
+
+async def application_facts(db: AsyncSession, application_id: uuid.UUID) -> RowMapping | None:
+    """The five columns of ruling 20 (as amended by R15) for one application,
+    or `None` when no such application exists.
+
+    Read-only, and the only place in `norms` that touches this table.
+    `norms.service._assert_application_open_for_calculation` is its only
+    caller; a second caller wanting a sixth column is a sign the ruling needs
+    amending again, not that this query does.
+    """
+    rows = await db.execute(_APPLICATION_FACTS_SQL, {"application_id": application_id})
+    return rows.mappings().first()

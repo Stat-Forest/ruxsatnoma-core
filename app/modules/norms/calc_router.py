@@ -58,11 +58,17 @@ async def create_calculation(
 # routes below to the application's owner and its reviewers once that
 # ownership exists (carried over in the stage plan).
 #
-# The WRITE path is closed rather than carried over (I4, final review):
-# `CalculationIn.application_id` refuses a non-null value outright, because a
+# The WRITE path was closed rather than carried over (I4, final review):
+# `CalculationIn.application_id` refused a non-null value outright, because a
 # route that persists an unvalidated id into an append-only table is a
-# permanent fact nobody can correct. 3.9 opens the field and adds the
-# ownership check in the same change — see that field's own comment.
+# permanent fact nobody can correct. **Stage 3.9a (task 5) opened the field and
+# landed the guards in the same commit** — but in `service.save_calculation`,
+# NOT here: `applications.service.submit` is the other caller of that function
+# and would walk straight past anything written in this router. So this route
+# stays `get_current_user`-only by design, and an applicant who names somebody
+# else's application is told 404 by the service, an application at APPROVED or
+# beyond 409 `ERR-NORM-005`. See `CalculationIn.application_id`'s own comment
+# and the block above `save_calculation`.
 
 
 @router.get("/calculations", response_model=Page[CalculationOut])

@@ -273,3 +273,68 @@ async def list_applications(
         .limit(limit)
     )
     return list(rows.scalars().all()), total
+
+
+# tz/05 invariant 1, and the WHERE clause of migration 0015's
+# `ex_applications_no_duplicate` verbatim: the statuses in which an application
+# OCCUPIES its (applicant, contour, activity, period) slot. DRAFT is outside it
+# on purpose — a duplicate is caught at submission, not while the applicant is
+# still typing — and so is every terminal status, since a rejected or cancelled
+# filing blocks nothing. The tuple and the constraint must move together.
+ACTIVE_STATUSES = (
+    "SUBMITTED",
+    "IN_REVIEW",
+    "PENDING_INFO",
+    "RETURNED",
+    "APPROVED",
+    "INVOICED",
+    "PAID",
+    "PERMIT_ISSUED",
+)
+
+
+async def active_overlapping(
+    db: AsyncSession,
+    *,
+    applicant_id: uuid.UUID,
+    contour_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date | None,
+    period_to: date | None,
+    exclude_id: uuid.UUID,
+) -> Application | None:
+    """The application already occupying this slot — the EXCLUDE constraint's
+    own predicate, re-run as a SELECT.
+
+    **It exists ONLY to NAME the colliding application in `ERR-APP-002`, never
+    to pre-empt the insert** (ruling 6). The database is the only detector: a
+    "check then insert" is a race that two clicks a millisecond apart both win,
+    which is exactly why `tz/05` invariant 1 says «на уровне БД». So this runs
+    AFTER the `IntegrityError`, inside `service.submit`'s savepoint recovery,
+    and its answer is a message rather than a decision.
+
+    The overlap test is `daterange(period_from, period_to, '[]') &&` written
+    out: two INCLUSIVE ranges intersect exactly when each starts no later than
+    the other ends. `exclude_id` keeps the row being submitted out of its own
+    answer — it is already SUBMITTED in this transaction when the constraint
+    fires.
+    """
+    if contour_id is None or activity_type_id is None or period_from is None or period_to is None:
+        # The constraint's WHERE requires all three to be non-null, so a row
+        # with any of them missing cannot have collided in the first place.
+        return None
+    rows = await db.execute(
+        select(Application)
+        .where(
+            Application.id != exclude_id,
+            Application.applicant_id == applicant_id,
+            Application.contour_id == contour_id,
+            Application.activity_type_id == activity_type_id,
+            Application.status.in_(ACTIVE_STATUSES),
+            Application.period_from <= period_to,
+            Application.period_to >= period_from,
+        )
+        .order_by(Application.id)
+        .limit(1)
+    )
+    return rows.scalars().first()

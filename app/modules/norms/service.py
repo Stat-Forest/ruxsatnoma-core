@@ -28,6 +28,7 @@ from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
+from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
@@ -826,13 +827,163 @@ async def preview(db: AsyncSession, *, payload: CalculationIn, actor: User) -> d
     )
 
 
+# --- The application guard on a stored calculation (plan 03.9a task 5) -------
+#
+# `POST /api/v1/calculations` reaches `save_calculation` behind
+# `get_current_user` and NO permission code at all — an applicant prices their
+# own permit there (`tz/04` С3), which is why the route is open. For the whole
+# of 3.7 that was harmless: `CalculationIn.application_id` was typed `None` and
+# pydantic refused any value, so nothing written through that route could ever
+# bind itself to an application. 3.9a opens the field, and the accident that
+# closed a live money hole goes with it.
+#
+# What the hole is, concretely. `payments.issue_invoice` and `permits.issue`
+# each read *the newest calculation for the application*
+# (`applications.service.current_calculation`) independently, and being both
+# level 4 they cannot compare notes. An audit probe that inserted one newer row
+# between invoicing and issuance had the citizen billed 2 060 000,00 while the
+# permit printed 9 999 999,00, with different `calculation_id`s on the invoice
+# and in the permit's immutable snapshot. `calculations` is append-only
+# (migration 0011), so such a row can never be deleted or corrected.
+#
+# The guard therefore lives HERE, in the service, and never in one router:
+# BOTH write paths go through this function — `POST /calculations` and
+# `applications.service.submit` — and a router-level check would miss the
+# other one. 3.9b's ruling 17 says the same thing for `POST /recalculate`,
+# which is a third path this one already covers.
+
+# `applications`' own read permission codes, as STRINGS. `norms` is level 2 and
+# may not import `applications.permissions`; ruling 20 bought this module a
+# read of one TABLE, not an import. Re-declared rather than imported, the same
+# trade `applications.checks.GRAZING_ACTIVITY_CODE` makes in the other
+# direction — and `tests/modules/norms/test_calculations_api.py` asserts the
+# three strings against `applications.permissions` so a rename cannot silently
+# open this gate.
+_APPLICATION_READ_CODES = frozenset(
+    {"applications.view_any", "applications.review", "applications.decide"}
+)
+
+# Which application statuses may still receive a calculation, and which may not.
+#
+# OPEN — the application is still being assembled or decided, so a (re)price is
+# the normal course of events: `DRAFT` is what `applications.service.submit`
+# writes its one calculation against (ruling 8, at step 9, while the row is
+# still a draft); `SUBMITTED`/`IN_REVIEW`/`PENDING_INFO`/`RETURNED` are the
+# review states 3.9b recalculates in, after a reviewer corrects a herd or a
+# period. Nothing downstream has read a price yet in any of them.
+#
+# CLOSED — "APPROVED or beyond", enumerated rather than compared by ordering
+# (an ordering test over a 14-member state machine is a claim about the shape
+# of the machine, which `APPLICATION_TRANSITIONS` does not actually make).
+# `APPROVED` is the line because 3.10a's `application_approved` subscriber
+# issues the invoice inside the approval's own transaction: from that instant
+# a price has been billed, and a newer row would be the under-billing above.
+# The four terminal states (`REJECTED`, `CANCELLED`, `EXPIRED_UNPAID`,
+# `CLOSED`) and `ARCHIVED` are in the closed set too — pricing an application
+# that is over is meaningless, and meaningless writes to an append-only table
+# are not free.
+#
+# The two sets together are exactly `applications.models.APPLICATION_STATUSES`
+# (asserted by `tests/modules/norms/test_calculations_api.py`, which may import
+# it — a TEST is not bound by the module boundary), and the CHECK below reads
+# the OPEN one so that a status added later fails closed rather than slipping
+# through an enumeration nobody remembered to extend.
+_APPLICATION_OPEN_FOR_CALCULATION = frozenset(
+    {"DRAFT", "SUBMITTED", "IN_REVIEW", "PENDING_INFO", "RETURNED"}
+)
+_APPLICATION_CLOSED_FOR_CALCULATION = frozenset(
+    {
+        "APPROVED",
+        "INVOICED",
+        "PAID",
+        "PERMIT_ISSUED",
+        "REJECTED",
+        "CANCELLED",
+        "EXPIRED_UNPAID",
+        "CLOSED",
+        "ARCHIVED",
+    }
+)
+
+
+async def _may_calculate_for(db: AsyncSession, actor: User, facts: Any) -> bool:
+    """Whether `actor` may attach a calculation to the application `facts`
+    describes: its own applicant, the superuser, or staff holding one of
+    `applications`' three read codes whose ZONE covers it.
+
+    Both halves are needed, and neither is a substitute for the other (lesson:
+    zone scoping is not a permission check). The zone is resolved from
+    `assigned_org_id` while the application has one and from the contour's
+    owner before a reviewer takes it into work — the same rule
+    `applications.service._effective_organization` applies, restated here
+    because a private helper of another module is not part of its surface.
+    """
+    if facts["applicant_id"] in await auth_service.own_applicant_ids(db, actor.id):
+        return True
+    if await auth_service.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    held = await auth_repo.permission_codes(db, actor)
+    if held.isdisjoint(_APPLICATION_READ_CODES):
+        return False
+    zone = zone_of(actor)
+    if zone == Zone(None, None, None):
+        return True
+    organization_id = facts["assigned_org_id"]
+    if organization_id is None and facts["contour_id"] is not None:
+        organization_id = await gis_service.contour_organization(db, facts["contour_id"])
+    if organization_id is None:
+        return False
+    org = await admin_repo.get_organization(db, organization_id)
+    return org is not None and _organization_in_zone(zone, org)
+
+
+async def _assert_application_open_for_calculation(
+    db: AsyncSession, *, application_id: uuid.UUID, actor: User
+) -> None:
+    """The two refusals that must land with the widened
+    `CalculationIn.application_id` — see the block comment above.
+
+    Ownership first, status second, and the order matters: a stranger is told
+    404 `ERR-SYS-003` — the same answer an id that never existed gets, exactly
+    as `applications.service._readable_application` answers, because an
+    application carries a citizen's name, plot and herd and a 403 would make
+    this route an application-existence oracle. Answering the STATUS refusal
+    first would leak that existence to anyone who could guess a uuid.
+
+    A closed application is `ERR-NORM-005` (409) — this module's own
+    state-conflict code, beside `not_draft`/`bad_transition`/`period_overlap`.
+    """
+    facts = await repo.application_facts(db, application_id)
+    if facts is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if not await _may_calculate_for(db, actor, facts):
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if facts["status"] not in _APPLICATION_OPEN_FOR_CALCULATION:
+        raise err(
+            "ERR-NORM-005",
+            details={"reason": "application_closed_for_calculation", "status": facts["status"]},
+        )
+
+
 async def save_calculation(db: AsyncSession, *, payload: CalculationIn, actor: User) -> Calculation:
     """The same arithmetic, persisted. Here a blocking check DOES refuse:
     `first_blocking_error` raises ERR-NORM-001/002/003 with the whole check
     list in `details`. A saved calculation is what an invoice is built from
     (3.10) — always a NEW row (`calculations` is append-only, migration 0011):
     a recalculation for the same `application_id` is a second insert, never
-    an UPDATE (ruling 21)."""
+    an UPDATE (ruling 21).
+
+    **`payload.application_id`, when set, is checked BEFORE anything is
+    computed** — ownership and the application's status, per the block comment
+    above. It is checked here rather than in `calc_router` because
+    `applications.service.submit` is the other caller and would bypass a
+    router-level gate; and it is checked before `_compute` because refusing a
+    request nobody was entitled to make should not first spend a full pricing
+    run on it."""
+    if payload.application_id is not None:
+        await _assert_application_open_for_calculation(
+            db, application_id=payload.application_id, actor=actor
+        )
     _, _, result, check_results = await _compute(db, payload)
     blocking = checks.first_blocking_error(check_results)
     if blocking is not None:

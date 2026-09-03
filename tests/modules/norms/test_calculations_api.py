@@ -189,34 +189,103 @@ async def test_get_calculation_missing_id_is_404(applicant_client: AsyncClient) 
     assert response.json()["error"]["code"] == "ERR-SYS-003"
 
 
-async def test_a_calculation_cannot_be_bound_to_an_application_yet(
+async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_touch(
     applicant_client: AsyncClient,
+    db: AsyncSession,
     published_contour: Contour,
     haymaking_activity_id: uuid.UUID,
+    frozen_on_date: date,
 ) -> None:
-    """I4 (final review): `POST /calculations` persisted `application_id`
-    verbatim — no FK (ruling 4 defers it to 3.9), no ownership check, and
-    `calculations` is append-only, so a row bound to ANY application id could
-    be inserted by any authenticated user and could never be deleted or
-    corrected. 3.10 builds an invoice from "the newest row for the
-    application", which makes a pre-seeded row a live under-billing vector the
-    moment `applications` exists.
+    """**Rewritten by stage 3.9a task 5, not deleted** — this is the same
+    concern the 3.7 version pinned, now asserting the real guard instead of the
+    accident that stood in for it.
 
-    Nothing in THIS stage can validate that id, and no legitimate caller has
-    one yet, so it is refused at the schema edge until 3.9 opens it."""
-    response = await applicant_client.post(
-        "/api/v1/calculations",
-        json={
-            "application_id": str(uuid.uuid4()),
-            "contour_id": str(published_contour.id),
-            "activity_type_id": str(haymaking_activity_id),
-            "period_from": "2026-06-01",
-            "period_to": "2026-09-30",
-            "quantity": "3",
-        },
+    3.7 (finding I4) typed `CalculationIn.application_id` as `None` so that
+    `POST /calculations` — `get_current_user` and NO permission code — could
+    not persist an unvalidated application id into an append-only table. 3.9a
+    opened the field, because `applications.service.submit` needs it (ruling
+    8), and landed two refusals in `service.save_calculation` in the same
+    commit: the caller must OWN the application (or be staff entitled to review
+    it), and the application must not be APPROVED or beyond.
+
+    Both are asserted end to end in
+    `tests/test_cross_module_journey.py::test_a_calculation_cannot_be_attached_
+    to_an_application_through_the_write_path`, which has the paid/approved
+    fixtures. What THIS module owns is the two ends of the range: an id that
+    names nothing at all is 404 and never an `IntegrityError`/500 from the FK
+    migration 0015 added, and an application the caller does own is saved and
+    bound.
+    """
+    body = {
+        "contour_id": str(published_contour.id),
+        "activity_type_id": str(haymaking_activity_id),
+        "period_from": "2026-06-01",
+        "period_to": "2026-09-30",
+        "quantity": "3",
+    }
+
+    unknown = await applicant_client.post(
+        "/api/v1/calculations", json={**body, "application_id": str(uuid.uuid4())}
     )
-    assert response.status_code == 422, response.text
-    assert response.json()["error"]["code"] == "ERR-VAL-001"
+    assert unknown.status_code == 404, unknown.text
+    assert unknown.json()["error"]["code"] == "ERR-SYS-003"
+
+    # The caller's own DRAFT: allowed, and the binding is what is stored.
+    me = (await applicant_client.get("/api/v1/auth/me")).json()
+    application = Application(
+        applicant_id=uuid.UUID(me["applicant"]["id"]),
+        submitted_by_user_id=uuid.UUID(me["user"]["id"]),
+        on_behalf="self",
+        channel="portal",
+        status="DRAFT",
+    )
+    db.add(application)
+    await db.flush()
+
+    mine = await applicant_client.post(
+        "/api/v1/calculations", json={**body, "application_id": str(application.id)}
+    )
+    assert mine.status_code == 201, mine.text
+    assert mine.json()["application_id"] == str(application.id)
+
+
+async def test_the_calculation_guard_agrees_with_applications_own_vocabulary() -> None:
+    """`norms` is level 2 and may not import `applications`, so
+    `norms.service` re-declares two things that BELONG to `applications`: its
+    three read permission codes, and which statuses may still receive a
+    calculation. A test is not bound by the module boundary, so this is where
+    the copies are held to the originals.
+
+    Without it a rename in `applications.permissions` would silently widen the
+    money guard (an unknown code is held by nobody, so the staff branch would
+    simply stop admitting anyone — or, worse, a code REMOVED from the frozenset
+    would admit staff who should not be there), and a fifteenth application
+    status would land in neither set with nobody to notice.
+    """
+    from app.modules.applications.models import APPLICATION_STATUSES
+    from app.modules.applications.permissions import (
+        APPLICATIONS_DECIDE,
+        APPLICATIONS_REVIEW,
+        APPLICATIONS_VIEW_ANY,
+    )
+    from app.modules.norms import service
+
+    assert service._APPLICATION_READ_CODES == {
+        APPLICATIONS_VIEW_ANY,
+        APPLICATIONS_REVIEW,
+        APPLICATIONS_DECIDE,
+    }
+
+    open_, closed = (
+        service._APPLICATION_OPEN_FOR_CALCULATION,
+        service._APPLICATION_CLOSED_FOR_CALCULATION,
+    )
+    assert open_ & closed == frozenset()
+    assert open_ | closed == set(APPLICATION_STATUSES)
+    # The line itself: APPROVED is where a price has been billed (3.10a's
+    # subscriber invoices inside the approval's own transaction), so it and
+    # everything after it are closed.
+    assert "APPROVED" in closed and "RETURNED" in open_
 
 
 async def test_a_calculation_with_no_application_id_is_still_saved(

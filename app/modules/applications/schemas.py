@@ -394,3 +394,23 @@ class PrecheckOut(BaseModel):
 
     checks: list[ApplicationCheckOut]
     calculation: PrecheckCalculationOut | None
+
+
+# --- Task 5: the submission ---------------------------------------------------
+
+
+class ApplicationSubmitIn(BaseModel):
+    """`POST /applications/{id}/submit` — the detached PKCS#7 the client
+    produced over the bytes `GET /applications/{id}/package` served, and
+    nothing else.
+
+    The package itself is deliberately NOT echoed back in the body: the server
+    signs what IT computes (`service._package_bytes`), and a client-supplied
+    copy would only give an attacker a second thing to disagree with. What the
+    client signed is proven by the signature verifying, not by it being
+    re-sent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pkcs7: str

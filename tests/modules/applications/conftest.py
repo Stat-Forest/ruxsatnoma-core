@@ -271,6 +271,40 @@ async def representative_client(db: AsyncSession, legal_applicant: Applicant):
         yield client
 
 
+async def _ready_draft(
+    applicant_client,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    livestock_type_id: uuid.UUID,
+    *,
+    period_from: str,
+    period_to: str,
+) -> str:
+    """One complete grazing draft, built through the REAL routes (`POST
+    /applications` + `PATCH`), never by inserting an `Application` row (lesson:
+    build a fixture's precondition through the real transition).
+
+    Shared by the three draft fixtures below so that "complete" means the same
+    thing in all of them: a second hand-written body is how two fixtures that
+    are supposed to differ only in their period end up differing in more.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    assert created.status_code == 201, created.text
+    application_id = created.json()["id"]
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_id}",
+        json={
+            "contour_id": str(contour_id),
+            "activity_type_id": str(activity_type_id),
+            "period_from": period_from,
+            "period_to": period_to,
+            "items": [{"livestock_type_id": str(livestock_type_id), "head_count": 40}],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    return application_id
+
+
 @pytest.fixture
 async def draft_ready_for_submission(
     applicant_client,
@@ -278,6 +312,7 @@ async def draft_ready_for_submission(
     grazing_activity_id: uuid.UUID,
     sheep_type_id: uuid.UUID,
     published_coef_sb: None,
+    published_grazing_norm: uuid.UUID,
 ) -> str:
     """A DRAFT carrying everything a submission needs: the contour, grazing, a
     May-September 2027 period and a 40-head sheep herd.
@@ -295,21 +330,70 @@ async def draft_ready_for_submission(
     Returns the id as a STRING: every consumer interpolates it into a URL, and
     task 5's own tests re-parse it with `uuid.UUID(...)`.
     """
-    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
-    assert created.status_code == 201, created.text
-    application_id = created.json()["id"]
-    patched = await applicant_client.patch(
-        f"/api/v1/applications/{application_id}",
-        json={
-            "contour_id": str(published_contour.id),
-            "activity_type_id": str(grazing_activity_id),
-            "period_from": "2027-05-01",
-            "period_to": "2027-09-30",
-            "items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}],
-        },
+    return await _ready_draft(
+        applicant_client,
+        published_contour.id,
+        grazing_activity_id,
+        sheep_type_id,
+        period_from="2027-05-01",
+        period_to="2027-09-30",
     )
-    assert patched.status_code == 200, patched.text
-    return application_id
+
+
+@pytest.fixture
+async def second_draft_same_contour(
+    applicant_client,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    sheep_type_id: uuid.UUID,
+    published_coef_sb: None,
+    published_grazing_norm: uuid.UUID,
+) -> str:
+    """The SAME applicant, contour and activity as `draft_ready_for_submission`,
+    over a period that OVERLAPS its 2027-05-01..2027-09-30 — the four columns
+    `ex_applications_no_duplicate` keys on (ruling 6, `tz/05` invariant 1).
+
+    Submitting this one after the first must be refused by the DATABASE, never
+    by a pre-SELECT: a "check then insert" is a race that lets two clicks a
+    millisecond apart both succeed.
+    """
+    return await _ready_draft(
+        applicant_client,
+        published_contour.id,
+        grazing_activity_id,
+        sheep_type_id,
+        period_from="2027-06-01",
+        period_to="2027-08-31",
+    )
+
+
+@pytest.fixture
+async def another_ready_draft(
+    applicant_client,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    sheep_type_id: uuid.UUID,
+    published_coef_sb: None,
+    published_grazing_norm: uuid.UUID,
+) -> str:
+    """A second submittable draft for the same applicant that CANNOT collide
+    with `draft_ready_for_submission`: the same contour and activity, a season a
+    year later, so `daterange(period_from, period_to, '[]') &&` is false and the
+    EXCLUDE constraint has nothing to say about the pair.
+
+    Deliberately not a second contour: `published_grazing_norm` is defined for
+    `published_contour` alone, and a draft on a contour with no published norm
+    would be refused `ERR-NORM-001` before it ever reached the number allocator
+    this fixture exists to observe.
+    """
+    return await _ready_draft(
+        applicant_client,
+        published_contour.id,
+        grazing_activity_id,
+        sheep_type_id,
+        period_from="2028-05-01",
+        period_to="2028-09-30",
+    )
 
 
 @pytest.fixture
@@ -350,6 +434,52 @@ async def doc_type_item_id(engine) -> AsyncIterator[uuid.UUID]:
                 text("DELETE FROM application_documents WHERE doc_type_item_id = :id").bindparams(
                     id=item_id
                 )
+            )
+            await own_db.execute(
+                text("DELETE FROM classifier_items WHERE id = :id").bindparams(id=item_id)
+            )
+            await own_db.commit()
+
+
+@pytest.fixture
+async def benefit_category_item_id(engine) -> AsyncIterator[uuid.UUID]:
+    """One `benefit_categories` classifier item, by ID.
+
+    `tests/modules/norms/conftest.py::benefit_category` yields the CODE, which
+    is what `norms` speaks; `applications.benefit_category_item_id` is an FK to
+    `classifier_items`, so this package needs the id. Same own-session +
+    teardown pattern as `doc_type_item_id` above and for the same reason: an
+    HTTP-driven test commits, so a row added through the test's own session
+    would survive that session's rollback and accumulate in the shared,
+    persistent test database.
+
+    VMQ 278's real benefit list has not arrived (`tz/12` #2), so the seeded
+    classifier is empty and nothing can claim a benefit without this.
+    """
+    item_id = uuid7()
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        await own_db.execute(
+            text(
+                "INSERT INTO classifier_items "
+                "(id, classifier_id, code, name, valid_from, sort_order, status) "
+                "SELECT :id, c.id, :code, CAST(:name AS jsonb), DATE '2020-01-01', 0, 'active' "
+                "FROM classifiers c WHERE c.code = 'benefit_categories'"
+            ).bindparams(
+                id=item_id,
+                code=f"veteran_{uuid.uuid4().hex[:8]}",
+                name='{"en": "Veteran (test)"}',
+            )
+        )
+        await own_db.commit()
+        try:
+            yield item_id
+        finally:
+            await own_db.execute(
+                text(
+                    "UPDATE applications SET benefit_category_item_id = NULL "
+                    "WHERE benefit_category_item_id = :id"
+                ).bindparams(id=item_id)
             )
             await own_db.execute(
                 text("DELETE FROM classifier_items WHERE id = :id").bindparams(id=item_id)

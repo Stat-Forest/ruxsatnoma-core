@@ -12,21 +12,29 @@ after it `submit`, the duplicate guard and the full decision flow
 "Task 8 public surface" comment below for the contract this file promises
 levels 4+ (payments 3.10, permits 3.11) today."""
 
+import json
 import uuid
-from datetime import date
+from collections.abc import Mapping
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
+from app.core.events import Event, publish
 from app.core.models import MediaFile
+from app.core.numbers import next_public_number
 from app.core.schemas import PageParams
+from app.core.time import business_today
+from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import checks, repo
+from app.modules.applications.events import APPLICATION_SUBMITTED
 from app.modules.applications.models import (
     Application,
     ApplicationDocument,
@@ -51,6 +59,9 @@ from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.norms import service as norms_service
 from app.modules.norms.models import Calculation
+from app.modules.norms.schemas import CalculationIn
+from app.modules.notifications import service as notifications_service
+from app.modules.signatures import service as signatures_service
 
 # Ruling 17 (decision #38): audit action codes are "<object>.<verb>" in
 # English, and the constant lives with the acting module — audit (level 0)
@@ -1041,3 +1052,473 @@ async def precheck(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
         },
     )
     return {"checks": results, "calculation": priced}
+
+
+# --- Task 5: the submission ---------------------------------------------------
+#
+# Fourteen steps, ONE transaction, and the ORDER is the design — not a style.
+# `signatures.service.sign()` COMMITS this session on every refusal path (its
+# own TRANSACTION CONTRACT docstring, and plan ruling 19), and that commit
+# takes everything pending with it. So "the transaction rolls back" is not what
+# protects anything here; the ordering is:
+#
+#   0 mint `submission_id`   8 sign          (the first thing that can commit)
+#   1 DRAFT only             9 save_calculation  (only once the ERI is good)
+#   2 completeness          10 the public number (never reached by a refusal)
+#   3 the benefit document  11 SUBMITTED + the history row `id=submission_id`
+#   4 freeze the version    12 audit
+#   7 price (preview)       13 notify
+#   5 record the checks     14 publish
+#   6 refuse on a blocker
+#
+# Steps 7 and 5 run in that order deliberately (controller ruling R12, and
+# `checks.run_all`'s own docstring): `norms.service.run_checks` resolves
+# `used_sb=None`, so its `limit` check is permanently `skipped` — an over-limit
+# herd would be RECORDED AS UNCHECKED and step 6 would let it through. Handing
+# `preview`'s checks in is what makes step 6 mean anything.
+#
+# What may legitimately be pending when step 8 commits: the `application_checks`
+# rows from step 5 and the frozen `contour_version_id`/`requested_area_ha` from
+# step 4. Both are the record of a genuine submission attempt (rulings 12 and
+# 19). A stored calculation is NOT — hence step 9's position.
+
+# Ruling 25: a SUBMISSION is signed against the ATTEMPT, never against the
+# application. `uq_signatures_valid_purpose` is UNIQUE on
+# `(object_type, object_id, purpose)` where the row is valid, so signing
+# `("application", <application id>, ...)` would let an application be
+# submitted exactly once EVER and dead-end 3.9b's return-for-correction on
+# `ERR-SIGN-002`. Each attempt is its own `object_id`, so each may hold one
+# valid signature and a resubmission collides with nothing.
+SUBMISSION_OBJECT_TYPE = "application_submission"
+SUBMISSION_PURPOSE = "application_submit"
+# Ruling 17, beside the constants above: a flow verb audits under its own name.
+APPLICATION_SUBMIT = "application.submit"
+# `notification_templates.event_code`, seeded by migration 0009 — DOTTED, and a
+# THIRD vocabulary beside the audit action above and `events.APPLICATION_
+# SUBMITTED` (flat) below. `applications/events.py` carries the table. Passing
+# the bus name here would find no template, and `notify()` answers that by
+# writing a raw fallback string in-app and sending NOTHING by SMS or e-mail,
+# silently, on every single submission.
+NOTIFY_APPLICATION_SUBMITTED = "application.submitted"
+SUBMITTED_STATUS = "SUBMITTED"
+# Ruling 5а: `RX-<year>-<seq>` out of `number_counters`, scope `RX:<year>`.
+NUMBER_PREFIX = "RX"
+# Ruling 13: `sla_deadline_at = submitted_at + 15 days`, stored at submission
+# because it is part of the submission's record. The reminders, the RI-07
+# escalation and the pause arithmetic across `info_requests` are all 3.9b's,
+# which owns PENDING_INFO.
+SLA_DAYS = 15
+
+
+def _canonical_decimal(value: Decimal | str) -> str:
+    """One rendering of a decimal for the signed package, and the reason
+    `_package_bytes` can take either shape of price (controller ruling R2).
+
+    A fixed-scale NUMERIC round-trips at the COLUMN's own scale, not the
+    calculator's (lesson): the same money is `"2060000.00"` out of
+    `norms.service.preview` and `Decimal('2060000.0000')` off the stored
+    `calculations` row. Trailing zeros are stripped so the two are one string.
+
+    `format(..., "f")` first, never `Decimal.normalize()`: normalize renders a
+    whole number in scientific notation (`Decimal('100.0000').normalize()` is
+    `Decimal('1E+2')`), which would change the signed bytes for round amounts
+    only — the worst possible failure to notice.
+    """
+    text = format(Decimal(str(value)), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _package_bytes(
+    application: Application,
+    priced: Any,
+    *,
+    contour_version_id: uuid.UUID | None = None,
+) -> bytes:
+    """The canonical bytes an applicant signs: applicant, activity, contour
+    version, period, items, quantity, the priced amount and the rule version.
+    Sorted keys, no whitespace, UTF-8, ONE function.
+
+    This is what a verifier re-derives years later from the stored row. A
+    change to key order, to which fields are included, or to how a `Decimal` is
+    rendered silently invalidates every signature ever produced — which is why
+    `test_submit.py` pins the exact byte string rather than merely round-
+    tripping it.
+
+    **`priced` is EITHER `norms.service.preview`'s dict OR a stored
+    `Calculation` row, and the two MUST produce identical bytes** (controller
+    ruling R2). They are not interchangeable by accident: ruling 19 forces
+    `submit` to sign the dict, because nothing is stored yet at signing time,
+    while a verifier has only the row. Both are normalised here — the amount
+    through `_canonical_decimal`, everything else out of `input_snapshot`,
+    which both carry in the same shape.
+
+    **RULING 23 — a stale package is an accepted 3.9a exposure, and this is the
+    function it starts in.** The amount comes from `norms.service.preview`,
+    which prices at `business_today()` against whatever tariffs and БҲМ are
+    effective right then. So a tariff or `rule_parameter` published between the
+    `GET /package` and the `POST /submit`, a norm published or archived, or
+    plain midnight in Tashkent, changes these bytes — and the applicant then
+    meets `ERR-SIGN-001` for something they did not do. Oybek chose option (в)
+    on 2026-09-02: leave it, and fix it in 3.9b with the whole review flow in
+    view. Do NOT "fix" it here by caching the package or by dropping the
+    amount from it; both are 3.9b's call to make.
+
+    `contour_version_id` is supplied by `GET /package`, whose application is
+    still a DRAFT and has not frozen the column yet (step 4 does that, at
+    submission). It must be the SAME published version the submission will
+    freeze, or the two calls produce different bytes; both resolve it through
+    `gis.service.published_version`.
+    """
+    version_id = contour_version_id or application.contour_version_id
+    assert version_id is not None, "the caller resolves the published version first"
+    if isinstance(priced, Mapping):
+        amount = priced["amount"]
+        rule_version = priced["rule_code_version"]
+        snapshot = priced["input_snapshot"]
+    else:
+        amount = priced.amount
+        rule_version = priced.rule_code_version
+        snapshot = priced.input_snapshot
+    request = snapshot["request"]
+    package = {
+        "activity_type_code": request["activity_code"],
+        "amount": _canonical_decimal(amount),
+        "applicant_id": str(application.applicant_id),
+        "contour_version_id": str(version_id),
+        # Sorted by code, never in the order the rows happened to arrive: a herd
+        # re-sent in a different order is the same herd, and the bytes have to
+        # say so.
+        "items": sorted(
+            (
+                {"livestock_code": item["livestock_code"], "count": item["count"]}
+                for item in request["items"]
+            ),
+            key=lambda item: item["livestock_code"],
+        ),
+        "period_from": None
+        if application.period_from is None
+        else application.period_from.isoformat(),
+        "period_to": None if application.period_to is None else application.period_to.isoformat(),
+        "quantity": None
+        if application.quantity is None
+        else _canonical_decimal(application.quantity),
+        "rule_version": rule_version,
+    }
+    return json.dumps(package, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+async def _assert_complete(db: AsyncSession, application: Application) -> None:
+    """Step 2. Every field a submission needs, or 400 `ERR-APP-001` NAMING the
+    ones that are missing.
+
+    **400, not 422** — the catalogue, `tz/10` and the original spec all say so
+    for `ERR-APP-001`, and it is the honest status: the request body is fine,
+    the application is not finished.
+
+    `checks.missing_for_pricing` is the one definition, shared with the
+    pre-check so the two can never disagree about what "ready to file" means —
+    a pre-check that said "ready" and a submission that then refused would make
+    that route useless at the one thing it exists for. `applicant_id` is absent
+    from the list because the column is NOT NULL and cannot be missing.
+    """
+    missing = await checks.missing_for_pricing(db, application)
+    if missing:
+        raise err("ERR-APP-001", details={"missing": missing})
+
+
+async def _assert_benefit_documents(db: AsyncSession, application: Application) -> None:
+    """Step 3, ruling 10а: a claimed benefit needs a supporting document
+    (`tz/06` § Льготы — «Реестр льготных категорий + подтверждающие
+    документы»; `tz/04` С3 item 9). 422 `ERR-APP-003`, «неполный комплект
+    документов», which is exactly what this is.
+
+    **What is checked is that a document is attached at all, not that it is of
+    the benefit TYPE, and that is the honest limit of 3.9a.** The `doc_types`
+    classifier is seeded EMPTY by migration 0005 — its items are the Agency's
+    to supply — so there is no code this module could compare against, and
+    inventing one here would be a product decision made in a service. Ruling
+    10а's second half already covers the gap: the reviewer confirms the
+    document is the right kind, and that confirmation is recorded as its own
+    `application_checks` row (3.9b, which owns the review screen). The claim
+    itself is validated against the benefit classifier at PATCH time
+    (`_assert_references`) and against the tariff rows it must resolve at
+    pricing time (decision #50), so an invented category never gets this far.
+    """
+    if application.benefit_category_item_id is None:
+        return
+    if not await repo.list_documents(db, application.id):
+        raise err(
+            "ERR-APP-003",
+            details={
+                "reason": "benefit_claim_needs_a_document",
+                "benefit_category_item_id": str(application.benefit_category_item_id),
+            },
+        )
+
+
+async def _published_version_or_refuse(db: AsyncSession, application: Application) -> Any:
+    """Step 4's half that can fail: the contour's version currently in force.
+
+    A contour whose geometry is still a draft has nothing to submit against —
+    no geometry to check, and no `area_ha` to freeze. 409 `ERR-GIS-005`, gis's
+    own state-conflict code: the contour exists, its GEOMETRY is in the wrong
+    state. `checks._gis_results` reports the same situation as `skipped` rows
+    on the pre-check path, which is why it cannot be left to `first_blocking_
+    error` — a `skipped` check blocks nothing.
+    """
+    assert application.contour_id is not None  # `_assert_complete` ran first
+    version = await gis_service.published_version(db, application.contour_id)
+    if version is None:
+        raise err(
+            "ERR-GIS-005",
+            details={"reason": "no_published_version", "contour_id": str(application.contour_id)},
+        )
+    return version
+
+
+async def _price(
+    db: AsyncSession, application: Application, *, actor: User
+) -> tuple[CalculationIn, dict[str, Any]]:
+    """The `norms` request this application describes, and what `preview` says
+    it costs — WRITTEN NOWHERE (ruling 19).
+
+    The request is returned alongside the price so `submit` can hand the SAME
+    object to `save_calculation` at step 9 instead of rebuilding it: two builds
+    are two chances for the amount that was signed and the amount that is
+    stored to describe different requests, and `checks.calculation_payload`
+    reads the database each time.
+
+    `preview` and `save_calculation` share one `norms.service._compute` by
+    construction, so within one transaction the two cannot disagree.
+    """
+    payload = await checks.calculation_payload(db, application)
+    return payload, await norms_service.preview(db, payload=payload, actor=actor)
+
+
+async def _notification_recipient(db: AsyncSession, application: Application) -> uuid.UUID:
+    """Who hears that this application was filed: the individual applicant's
+    own account when there is one, otherwise whoever filed it. A legal entity
+    has no `owner_user_id` (decision #9) and is reached through the
+    representative who acted for it — which is also the fallback for an
+    applicant row that has somehow lost its account, since `notify` RAISES on a
+    recipient it cannot resolve and a submission must not fail over a message.
+    Same shape as `permits.service._notification_recipient`."""
+    applicant = await auth_service.get_applicant(db, application.applicant_id)
+    if applicant is not None and applicant.owner_user_id is not None:
+        return applicant.owner_user_id
+    return application.submitted_by_user_id
+
+
+async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> bytes:
+    """`GET /applications/{id}/package` — the canonical bytes to be signed.
+
+    The client signs exactly these and nothing else: a detached PKCS#7 cannot
+    be produced over bytes the client has never seen, which is why this route
+    exists at all (design/03 missed it; task 9 adds it there).
+
+    Owner or staff in zone, through `_readable_application` — so a stranger is
+    told 404, never 403: this response carries the applicant, the plot and the
+    price.
+
+    **RULING 23 applies here, in full.** This route prices through
+    `norms.service.preview` at `business_today()`, exactly as `submit` does a
+    moment later, and NOTHING freezes the answer in between. A tariff or
+    `rule_parameter` published between the two calls, a norm published or
+    archived, or midnight in Tashkent, changes the bytes — and the applicant
+    signs one package while the server verifies against another, meeting
+    `ERR-SIGN-001` for something they did not do. Accepted for 3.9a (Oybek's
+    choice, option в, 2026-09-02) and 3.9b's to fix; do not cache the package
+    or drop the amount from it here.
+    """
+    application = await _readable_application(db, application_id, actor=actor)
+    await _assert_complete(db, application)
+    version = await _published_version_or_refuse(db, application)
+    _, priced = await _price(db, application, actor=actor)
+    return _package_bytes(application, priced, contour_version_id=version.id)
+
+
+async def submit(
+    db: AsyncSession, application_id: uuid.UUID, *, pkcs7: str, actor: User
+) -> Application:
+    """`POST /applications/{id}/submit` — the fourteen steps of the block
+    comment above, in one transaction.
+
+    **RULING 23, restated at the third of its three required places.** The
+    package is priced afresh HERE, and the bytes the client signed came from a
+    separate `GET /package` call priced at its own moment. A tariff, a
+    `rule_parameter`, a norm or the Tashkent date moving in between makes the
+    two disagree and the applicant meets `ERR-SIGN-001` for something they did
+    not do. Accepted for 3.9a; 3.9b decides between freezing the package and
+    dropping the amount from it.
+    """
+    # Step 0. Minted before anything is written, because it is what step 8
+    # signs and what step 11 stores as the history row's primary key (ruling
+    # 25) — and minting it first is what lets a signature exist for a REFUSED
+    # attempt whose history row is never written. That orphan is the evidence
+    # trail working, not a leak: `sign()` commits its refusal, nothing else is
+    # written, and the row says "an attempt was made against submission X and
+    # it was rejected".
+    submission_id = uuid7()
+    # Step 1. The owner's own DRAFT, locked: 404 for a stranger, 409
+    # `ERR-APP-004` for an application that has moved on. 3.9b adds RETURNED.
+    application = await _own_draft_for_update(db, application_id, actor=actor)
+    await _assert_complete(db, application)  # step 2
+    await _assert_benefit_documents(db, application)  # step 3
+    # Step 4, ruling 22: the geometry decided upon AND its area, frozen
+    # together because they are one fact. Without the second,
+    # `max_approve_area` (decision #29) compares against NULL for the rest of
+    # this application's life and never fires once.
+    version = await _published_version_or_refuse(db, application)
+    application.contour_version_id = version.id
+    application.requested_area_ha = version.area_ha
+
+    payload, priced = await _price(db, application, actor=actor)  # step 7, BEFORE step 5 (R12)
+    results = await checks.run_all(db, application, norm_results=priced["checks"])  # step 5
+    blocking = checks.first_blocking_error(results)  # step 6
+    if blocking is not None:
+        # Here, unlike the pre-check, a blocking result IS an error — the whole
+        # difference between the two routes, and the reason they share
+        # `run_all`. The rows are kept either way (ruling 12).
+        raise blocking
+
+    # Step 8. The first thing on this page that can commit — see ruling 19 and
+    # `sign()`'s own TRANSACTION CONTRACT. Everything pending right now is
+    # evidence of a genuine attempt and is right to keep; nothing else may be.
+    await signatures_service.sign(
+        db,
+        object_type=SUBMISSION_OBJECT_TYPE,
+        object_id=submission_id,
+        purpose=SUBMISSION_PURPOSE,
+        document=_package_bytes(application, priced, contour_version_id=version.id),
+        pkcs7=pkcs7,
+        user=actor,
+    )
+
+    # Step 9, ruling 8: EXACTLY ONE calculation per application, written here
+    # and nowhere earlier — 3.10 builds its invoice from the newest row, so a
+    # speculative one written before the signature was known good would be a
+    # live under-billing row in an append-only table.
+    calculation = await norms_service.save_calculation(
+        db,
+        # The SAME request that was priced and signed a moment ago, with the
+        # binding added — `model_copy` rather than a second
+        # `calculation_payload` build, so the stored row and the signed package
+        # cannot describe two different herds.
+        payload=payload.model_copy(update={"application_id": application.id}),
+        actor=actor,
+    )
+    # Step 10, ruling 5а. AFTER the signature, so a refused ERI never reaches
+    # the counter at all; inside the transaction, so a failure later than this
+    # rolls the counter back with it and the year's numbering has no holes.
+    number = await next_public_number(db, NUMBER_PREFIX, business_today())
+
+    submitted_at = datetime.now(UTC)
+    # The duplicate's key, read BEFORE the savepoint and never after it. A
+    # `begin_nested()` ROLLBACK expires every instance that was dirty inside the
+    # savepoint (`SessionTransaction._restore_snapshot`), so `application.
+    # applicant_id` in the `except` below would be a lazy reload — which on an
+    # async session raises `MissingGreenlet` from inside an exception handler,
+    # turning this clean 409 into a 500. The brief's snippet read them off the
+    # row in the handler; it cannot.
+    clash_applicant_id = application.applicant_id
+    clash_contour_id = application.contour_id
+    clash_activity_type_id = application.activity_type_id
+    clash_period_from = application.period_from
+    clash_period_to = application.period_to
+    clash_exclude_id = application.id
+    try:
+        # Step 11. `begin_nested()` (a SAVEPOINT), not a bare flush: the
+        # duplicate surfaces as an `IntegrityError` on THIS update, and the
+        # session has to stay usable afterwards to look the clash up and answer
+        # cleanly. A bare flush caught by `except IntegrityError` rolls back the
+        # WHOLE transaction — every check row and the frozen version with it.
+        async with db.begin_nested():
+            application.status = SUBMITTED_STATUS
+            application.number = number
+            application.submitted_at = submitted_at
+            application.sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)
+            await db.flush()
+    except IntegrityError as exc:
+        # `IntegrityError` IS a `DBAPIError` subclass and this narrow clause
+        # must come first; and the constraint is named through
+        # `exc.orig.__cause__` (asyncpg's own exception), never by matching the
+        # message — SQLAlchemy's `exc.orig` is only a thin DBAPI wrapper and
+        # exposes `pgcode`/`sqlstate` alone (lesson). A bare `except
+        # IntegrityError` would swallow `applications.number`'s UNIQUE index
+        # and every FK on this table and report all of them as "duplicate".
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "ex_applications_no_duplicate":
+            raise
+        # Ruling 6: the EXCLUDE constraint is the only detector — a "check then
+        # insert" is a race two clicks a millisecond apart both win.
+        # `active_overlapping` re-runs the constraint's own predicate as a
+        # SELECT for the sole purpose of NAMING the colliding application, so
+        # the applicant is told WHICH filing already covers this period.
+        clash = await repo.active_overlapping(
+            db,
+            applicant_id=clash_applicant_id,
+            contour_id=clash_contour_id,
+            activity_type_id=clash_activity_type_id,
+            period_from=clash_period_from,
+            period_to=clash_period_to,
+            exclude_id=clash_exclude_id,
+        )
+        if clash is None:
+            # The constraint fired and the predicate finds nothing: whatever
+            # that is, it is not the duplicate this branch explains. Surface it
+            # as itself rather than inventing a number for the error body.
+            raise
+        raise err("ERR-APP-002", details={"existing_number": clash.number}) from exc
+
+    # The history row carries `id = submission_id` (ruling 25) so the step-8
+    # signature resolves to the exact transition it belongs to, with no join
+    # table. This is also why `submit` writes its own transition instead of
+    # routing through `set_status`, whose frozen signature cannot express it.
+    await repo.add_status_history(
+        db,
+        ApplicationStatusHistory(
+            id=submission_id,
+            application_id=application.id,
+            from_status=INITIAL_STATUS,
+            to_status=SUBMITTED_STATUS,
+            changed_by=actor.id,
+        ),
+    )
+    # `updated_at` is `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
+    # after a plain UPDATE, and `requested_area_ha` round-trips at
+    # NUMERIC(12,4)'s own scale rather than the version's (lesson) — both are
+    # in this response.
+    await db.refresh(application)
+
+    await audit.log(  # step 12, ruling 17: the flow verb's own constant
+        db,
+        action=APPLICATION_SUBMIT,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        old_value={"status": INITIAL_STATUS},
+        new_value={
+            "status": SUBMITTED_STATUS,
+            "number": number,
+            "submission_id": str(submission_id),
+            "contour_version_id": str(version.id),
+            "requested_area_ha": _json_safe(application.requested_area_ha),
+            "calculation_id": str(calculation.id),
+        },
+    )
+    await notifications_service.notify(  # step 13 — DOTTED, see the constant
+        db,
+        event_code=NOTIFY_APPLICATION_SUBMITTED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": number},
+        object_type="application",
+        object_id=application.id,
+    )
+    # Step 14. `application_id` and NOTHING else — not `number`, however
+    # convenient: `applications/events.py`'s payload contract is frozen, and a
+    # subscriber reads everything else through `service.get` /
+    # `current_calculation`. Handlers run synchronously, in THIS transaction.
+    await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
+    return application

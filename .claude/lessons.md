@@ -232,20 +232,20 @@ Tooling and environment.
   constraint via `getattr(exc.orig.__cause__, "constraint_name", None)`, never `exc.orig` or
   the message. To keep writing on the same session after ANY failed statement, wrap the
   risky work in `async with db.begin_nested():` (a SAVEPOINT), never a bare `db.rollback()`.
-- **Why:** `gis.service.create_version` caught only `DBAPIError`, mapping every DB failure
-  to `ERR-GIS-001` ("unreadable geometry") — a `uq_contour_version_no` race raises
-  `IntegrityError`, a subclass, so a version conflict read as a geometry defect (3.6a t3).
-  Never judge from the name: an append-only trigger's plain `RAISE EXCEPTION` (audit_log,
-  calculations, application_status_history) is SQLSTATE `P0001`, outside the `23xxx` class,
-  and surfaces as `DBAPIError` — and so does `DeadlockDetected`, which no `except
-  DomainError` can contain (3.10a's sweep, deadlocking against `PerformTransaction`).
+- **Why:** `gis.service.create_version` caught only `DBAPIError`, so a `uq_contour_version_no`
+  race — `IntegrityError`, a subclass — was reported as `ERR-GIS-001` "unreadable geometry"
+  (3.6a t3). Never judge from the name: an append-only trigger's plain `RAISE EXCEPTION`
+  (audit_log, calculations, application_status_history) is SQLSTATE `P0001`, outside `23xxx`,
+  and surfaces as `DBAPIError` — as does `DeadlockDetected`, which `except DomainError` misses.
 - **The recovery half:** a bare `db.rollback()` undoes the WHOLE transaction, not just the
-  failed statement — `signatures.service.sign()`'s race path silently discarded a caller's
-  earlier uncommitted work. Worse in a loop: Postgres then refuses every later statement AND
-  turns the final `COMMIT` into a silent `ROLLBACK`, so a broad `except` without a savepoint
-  lets a job "complete" while throwing its whole night away — one savepoint PER ROW is what
-  makes the next row writable. `exc.orig` (SQLAlchemy's asyncpg wrapper) exposes only
-  `pgcode`; `exc.orig.__cause__` alone carries `constraint_name`.
+  failed statement — `sign()`'s race path silently discarded a caller's earlier uncommitted
+  work. Worse in a loop: Postgres then refuses every later statement AND turns the final
+  `COMMIT` into a silent `ROLLBACK`, so a job "completes" while throwing its whole night
+  away — one savepoint PER ROW is what makes the next row writable.
+- **The savepoint's own trap:** its ROLLBACK EXPIRES every instance dirty inside it, so
+  reading `row.applicant_id` in the `except` is a lazy reload — `MissingGreenlet` from inside
+  the handler, a 500 where the clean 409 was (3.9a t5, the duplicate guard). Copy what the
+  handler needs into locals BEFORE the `async with`.
 - **Your handler is not the end of the transaction:** `get_db` commits AGAIN after it
   returns, so a route that swallows a DB failure and answers anyway (`payme_router.py`,
   always-200) must `await db.rollback()` in its own try, or that second commit 500s.

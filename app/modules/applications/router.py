@@ -28,10 +28,11 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
 from app.modules.applications import service
 from app.modules.applications.permissions import APPLICATIONS_CREATE
@@ -44,10 +45,11 @@ from app.modules.applications.schemas import (
     ApplicationOut,
     ApplicationPatch,
     ApplicationStatus,
+    ApplicationSubmitIn,
     PrecheckCalculationOut,
     PrecheckOut,
 )
-from app.modules.auth.deps import get_current_user, require_permission
+from app.modules.auth.deps import get_current_user, idempotency_context, require_permission
 from app.modules.auth.models import User
 
 # `applications.number` is `RX-<yyyy>-<seq>` (plan ruling 5а). Bounded because
@@ -243,3 +245,84 @@ async def precheck_application(
         checks=[ApplicationCheckOut.model_validate(row) for row in card["checks"]],
         calculation=None if priced is None else PrecheckCalculationOut.build(priced),
     )
+
+
+# --- Task 5: the package and the submission -----------------------------------
+#
+# `GET /package` is NOT in design/03 — it was missed there, and every ERI flow
+# needs it: a client cannot produce a detached PKCS#7 over bytes it has never
+# seen. Task 9 adds it to the contracts.
+#
+# `POST /submit` is the ONE route in this module that carries an
+# `Idempotency-Key`, and the mechanism (3.4's `auth.deps.idempotency_context`)
+# lands here rather than on `POST /applications` or the pre-check for a
+# concrete reason: a replayed submission would mint a SECOND public number for
+# one filing, out of a counter design/03 requires to be continuous within a
+# year. A replayed create makes a second empty draft, which costs a row; a
+# replayed pre-check writes a second set of check rows, which ruling 12 says is
+# the SPECIFIED behaviour.
+
+
+@router.get("/applications/{application_id}/package")
+async def get_application_package(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> Response:
+    """The canonical bytes to be signed, `application/octet-stream`. The client
+    signs exactly these and posts the detached PKCS#7 to `/submit`.
+
+    `Depends(get_current_user)` and not `require_permission`, like the two
+    other read routes and for the same reason: this also admits staff in zone,
+    who hold no `applications.create`. Both halves of the read rule live in the
+    service, and a stranger is told 404 — never 403, which would confirm the
+    application exists.
+
+    400 `ERR-APP-001` naming the fields still to fill; 409 `ERR-GIS-005` when
+    the contour's geometry is still a draft; 422 `ERR-NORM-004` when a rule
+    parameter is not published (on a fresh database, the ten `coef_sb:*` rows).
+
+    **RULING 23:** these bytes are priced afresh on every call, at
+    `business_today()` and against whatever tariffs and БҲМ are effective right
+    then. A tariff, a `rule_parameter`, a norm or midnight in Tashkent moving
+    between this call and the POST changes them, and the applicant then meets
+    `ERR-SIGN-001` for something they did not do. Accepted for 3.9a (Oybek's
+    choice, option в) and 3.9b's to fix — do not cache the package here.
+    """
+    return Response(
+        content=await service.package(db, application_id, actor=user),
+        media_type="application/octet-stream",
+    )
+
+
+@router.post("/applications/{application_id}/submit")
+async def submit_application(
+    application_id: uuid.UUID,
+    payload: ApplicationSubmitIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+    ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
+) -> ApplicationOut:
+    """DRAFT -> SUBMITTED, with the public number, in one transaction.
+
+    `Idempotency-Key` is MANDATORY (422 `ERR-VAL-001`
+    `idempotency_key_required` without one, 409 `ERR-SYS-005` on a conflicting
+    replay). `ctx` is declared AFTER `actor` — mirroring
+    `gis/imports_router.py::create_import` and `payments/router.py::
+    create_pay_intent` — so the single `get_current_user` both depend on is
+    resolved once; `ctx.save()` runs before the response so a replay returns
+    the stored 200 rather than allocating a second number.
+
+    400 `ERR-APP-001` (missing fields, NAMED); 409 `ERR-APP-004` in any status
+    but DRAFT; 422 `ERR-APP-003` for a benefit claim with no supporting
+    document; 409 `ERR-GIS-005` for a contour with no published version;
+    `ERR-GIS-001/002/005` or `ERR-NORM-001/002/003/006` when a BLOCKING check
+    fails — the difference from the pre-check, which reports the identical
+    result as data; 422 `ERR-SIGN-001` for an invalid signature; 409
+    `ERR-APP-002` with the existing number when another active application
+    already covers this plot and period.
+    """
+    application = await service.submit(db, application_id, pkcs7=payload.pkcs7, actor=actor)
+    out = ApplicationOut.model_validate(application)
+    await ctx.save(db, status_code=200, body=out.model_dump(mode="json"))
+    return out
