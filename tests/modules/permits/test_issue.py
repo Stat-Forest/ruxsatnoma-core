@@ -14,12 +14,15 @@ shared, persistent and never empty — including the spot you picked).
 
 import hashlib
 import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
+from app.event_subscriptions import PAYMENT_CONFIRMED
 from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application, ApplicationItem
@@ -236,6 +239,105 @@ async def test_issuance_without_a_calculation_is_refused_before_a_number_is_take
     assert await counter(db) == before
 
 
+# --- what this module can verify about the price on its own -------------------
+# `payments.issue_invoice` and `service.issue` each read "the newest calculation
+# for this application" and, being both level 4, cannot compare notes: an audit
+# probe had the permit print 9 999 999,00 against a paid 2 060 000,00 invoice.
+# "The printed amount is the billed amount" is NOT answerable from here — the
+# invoice lives in `payments`, which this module may not read — so the two checks
+# below are what is local. `tests/test_cross_module_journey.py` carries the
+# money-level story and the pin on the accident that keeps the hole unreachable.
+
+
+async def test_a_calculation_priced_for_another_plot_is_refused(
+    db: AsyncSession,
+    hodim_client,
+    paid_application: Application,
+    second_paid_application: Application,
+):
+    """The permit prints the contour, the activity and the money side by side —
+    the first two off the APPLICATION, the last off the CALCULATION. A newer
+    calculation priced for a different plot would make the document contradict
+    itself, so issuance refuses rather than printing it."""
+    before = await counter(db)
+    other = await applications_service.current_calculation(db, second_paid_application.id)
+    assert other is not None and other.contour_id != paid_application.contour_id
+    db.add(
+        Calculation(
+            application_id=paid_application.id,
+            contour_id=other.contour_id,
+            activity_type_id=other.activity_type_id,
+            rule_code_version=other.rule_code_version,
+            input_snapshot=other.input_snapshot,
+            used_sb=other.used_sb,
+            amount=other.amount,
+            breakdown=other.breakdown,
+        )
+    )
+    await db.flush()
+
+    result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+
+    assert result.status_code == 422, result.text
+    assert result.json()["error"]["details"]["reason"] == "calculation_for_another_subject"
+    assert await counter(db) == before
+
+
+async def test_a_calculation_made_after_the_decision_is_refused(
+    db: AsyncSession, hodim_client, paid_application: Application
+):
+    """The decision is what froze the price, so a calculation created after it
+    cannot be the one that was invoiced — 3.9b's own ruling ("no recalculation
+    from APPROVED onwards") enforced a second time at the point the number
+    becomes a printed document.
+
+    Both timestamps are explicit: Postgres' `now()` is the TRANSACTION's clock,
+    so every row this test writes would otherwise share one instant and the
+    comparison would prove nothing."""
+    before = await counter(db)
+    priced = await applications_service.current_calculation(db, paid_application.id)
+    assert priced is not None
+    decided_at = datetime.now(UTC)
+    paid_application.decided_at = decided_at
+    db.add(
+        Calculation(
+            application_id=paid_application.id,
+            contour_id=priced.contour_id,
+            activity_type_id=priced.activity_type_id,
+            rule_code_version=priced.rule_code_version,
+            input_snapshot=priced.input_snapshot,
+            used_sb=priced.used_sb,
+            amount=Decimal("9999999.00"),
+            breakdown={"total": "9999999.00"},
+            created_at=decided_at + timedelta(minutes=5),
+        )
+    )
+    await db.flush()
+
+    result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+
+    assert result.status_code == 422, result.text
+    assert result.json()["error"]["details"]["reason"] == "calculation_after_decision"
+    assert await counter(db) == before
+
+
+async def test_a_calculation_made_before_the_decision_still_issues(
+    db: AsyncSession, hodim_client, paid_application: Application
+):
+    """The negative control for the check above: a decided application whose
+    price predates the decision is the NORMAL case and must issue. Without this,
+    "refuse whenever `decided_at` is set" would pass the test above just as
+    well."""
+    priced = await applications_service.current_calculation(db, paid_application.id)
+    assert priced is not None
+    paid_application.decided_at = priced.created_at + timedelta(minutes=5)
+    await db.flush()
+
+    result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+
+    assert result.status_code == 201, result.text
+
+
 async def test_a_hodim_from_another_leshoz_cannot_issue(
     other_zone_hodim_client, paid_application: Application
 ):
@@ -341,7 +443,7 @@ async def test_payment_confirmed_tells_the_assigned_executor_and_issues_nothing(
     series number must not appear because a webhook fired — `design/03` makes
     issuance a human act."""
     await publish(
-        db, Event(name="payment_confirmed", payload={"application_id": paid_application.id})
+        db, Event(name=PAYMENT_CONFIRMED, payload={"application_id": paid_application.id})
     )
 
     notified = (
@@ -365,7 +467,7 @@ async def test_payment_confirmed_with_nobody_assigned_notifies_nobody(
     assert paid_application.assigned_user_id is None
 
     await publish(
-        db, Event(name="payment_confirmed", payload={"application_id": paid_application.id})
+        db, Event(name=PAYMENT_CONFIRMED, payload={"application_id": paid_application.id})
     )
 
     notified = (
@@ -388,7 +490,7 @@ async def test_payment_confirmed_reads_the_amount_from_the_calculation_not_the_e
     await publish(
         db,
         Event(
-            name="payment_confirmed",
+            name=PAYMENT_CONFIRMED,
             payload={"application_id": paid_application.id, "amount": "1.00"},
         ),
     )

@@ -628,6 +628,64 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
     calculation = await applications_service.current_calculation(db, application_id)
     if calculation is None:
         raise err("ERR-VAL-001", details={"reason": "no_calculation"})
+
+    # WHAT THIS MODULE CAN AND CANNOT SAY ABOUT THE PRICE IT IS ABOUT TO PRINT.
+    #
+    # `current_calculation` returns the NEWEST calculation for the application.
+    # `payments.issue_invoice` calls the very same function when it freezes the
+    # invoice, and the two calls happen days apart. Being both level 4, neither
+    # may read the other (`design/01` rule 3), so **"the amount printed here is
+    # the amount the citizen was billed" is not verifiable from this module** —
+    # do not add a read of `invoices` to make it so. An audit probe inserting a
+    # newer calculation between invoicing and issuance had the permit print
+    # 9 999 999,00 against a paid 2 060 000,00 invoice, with different
+    # `calculation_id`s on the invoice and in this snapshot. The guard that
+    # actually closes that belongs to `applications`, which owns both the status
+    # and the link (3.9b's ruling refusing a recalculation from APPROVED
+    # onwards); today the hole is merely unreachable, because
+    # `norms.schemas.CalculationIn.application_id` is typed `None = None` and no
+    # write path can attach a calculation to an application at all.
+    # `tests/test_cross_module_journey.py` pins both halves.
+    #
+    # These two checks are what IS local, and they are worth having on their own:
+    #
+    # 1. The permit prints the contour, the activity and the money side by side.
+    #    The first two come from the APPLICATION and the last from the
+    #    CALCULATION, and nothing so far has asked whether they describe the same
+    #    thing. A calculation priced for another plot or another activity would
+    #    be an internally contradictory legal document.
+    # 2. A calculation created AFTER the application was decided cannot be the
+    #    one that was invoiced — the decision is what froze the price. `tz/05`'s
+    #    flow has no legitimate recalculation past APPROVED, which is exactly
+    #    3.9b's own ruling, so this is that ruling enforced a second time at the
+    #    point where the number becomes a printed document. `decided_at` is
+    #    3.9b's to write and is null for the whole of 3.9a, so this check reports
+    #    nothing until that stage lands — the same "turns itself on when the data
+    #    arrives" shape `gis.checks._within_fund` already uses, not a check that
+    #    cannot fail (`test_cross_module_journey.py` drives it with the column
+    #    set). Should 3.9b ever stamp `decided_at` for a NON-final decision, this
+    #    check must be revisited with it.
+    if calculation.contour_id != contour_id or calculation.activity_type_id != activity_type_id:
+        raise err(
+            "ERR-VAL-001",
+            details={
+                "reason": "calculation_for_another_subject",
+                "calculation_id": str(calculation.id),
+                "calculation_contour_id": str(calculation.contour_id),
+                "calculation_activity_type_id": str(calculation.activity_type_id),
+            },
+        )
+    if application.decided_at is not None and calculation.created_at > application.decided_at:
+        raise err(
+            "ERR-VAL-001",
+            details={
+                "reason": "calculation_after_decision",
+                "calculation_id": str(calculation.id),
+                "created_at": calculation.created_at.isoformat(),
+                "decided_at": application.decided_at.isoformat(),
+            },
+        )
+
     template = await repo.active_template(db, activity_type_id)
     if template is None:
         raise err(

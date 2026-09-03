@@ -195,12 +195,26 @@ async def test_a_repeated_event_returns_the_same_invoice_and_does_not_raise(
 
 
 async def test_an_application_with_no_calculation_fails_loudly(db, approved_without_calculation):
-    """A silent zero-amount invoice is the failure mode this must not have."""
+    """A silent zero-amount invoice is the failure mode this must not have.
+
+    And the refusal must SAY SO. `issue_invoice` has no HTTP route of its own —
+    it runs as a bus subscriber inside the publisher's transaction — so 3.9's
+    `POST /applications/{id}/approve` is what answers the reviewer. It answered
+    `ERR-SYS-003`, 404 «Ресурс не найден», until 2026-09-03: the approval rolled
+    back and the reviewer could not tell that from "no such application". Same
+    code and same reason as `permits.service.issue`'s identical refusal, so one
+    condition has one representation on both sides of the seam.
+    """
     from app.core.errors import DomainError
     from app.modules.payments import service
 
-    with pytest.raises(DomainError):
+    with pytest.raises(DomainError) as excinfo:
         await service.issue_invoice(db, approved_without_calculation.id)
+
+    assert excinfo.value.code == "ERR-VAL-001"
+    assert excinfo.value.http_status == 422, "a 404 here reads as 'application not found'"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["reason"] == "no_calculation"
 
 
 # --- read-route authorization -------------------------------------------------

@@ -22,17 +22,37 @@ effect, never for a return value.
 
 from app.core import events
 from app.modules.applications import events as application_events
+from app.modules.payments import events as payments_events
 from app.modules.payments import subscribers as payments_subscribers
 
-# The bus names this file subscribes to, as literal strings. `payments` (3.10a)
-# declares the same `PAYMENT_CONFIRMED = "payment_confirmed"` in its own
-# `events.py` — and importing it from there is exactly what may not happen:
-# `payments` and `permits` are both level 4 and neither may import the other
-# (design/01 rule 3). Matching by string is the whole reason the bus exists.
+# The bus name this file subscribes `permits` to, TAKEN FROM ITS PUBLISHER —
+# never retyped.
+#
+# It was a second literal here until 2026-09-03, justified by "payments and
+# permits are both level 4 and cannot import each other" (design/01 rule 3).
+# True of those two modules, and irrelevant to THIS file: this is the seam
+# module, the one place allowed to know both sides — three lines above it
+# already imports `payments.subscribers` and `applications.events` for the same
+# purpose. Matching by string is what keeps `permits` from importing `payments`;
+# it is not a reason for the SEAM to guess at the string.
+#
+# What the second literal cost: rename `payments.events.PAYMENT_CONFIRMED` and
+# the publish goes out under the new name while this subscription stays on the
+# old one — and NOTHING fails, because `core.events.publish` on a name with no
+# subscribers is a legal no-op. In production the assigned executor then simply
+# never learns that a permit is due, on every single payment, silently.
+#
+# Re-exported under this module's own name because it is this file's answer to
+# "what does the seam listen on", and the tests on both sides now read it from
+# here or from `payments.events` — the same object either way.
+# `tests/test_code_conventions.py::
+# test_the_payment_confirmed_bus_name_is_written_down_exactly_once` keeps it
+# that way; `tests/test_cross_module_journey.py` proves the hop still lands.
+#
 # Flat snake_case, no dot: a dotted `payment.confirmed` is a
 # `notification_templates.event_code`, never a bus name (permits/events.py has
 # the three-vocabularies table).
-PAYMENT_CONFIRMED = "payment_confirmed"
+PAYMENT_CONFIRMED = payments_events.PAYMENT_CONFIRMED
 
 
 def register_event_subscriptions() -> None:

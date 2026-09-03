@@ -226,3 +226,44 @@ def test_registering_the_event_subscriptions_twice_registers_nothing_twice() -> 
         "registering the event subscriptions twice grew a registry — append only after a "
         "membership check, the way core.events.subscribe dedups its own pair: " + repr(grown)
     )
+
+
+def test_the_payment_confirmed_bus_name_is_written_down_exactly_once() -> None:
+    """The 3.10a/3.11a seam. `payments` publishes on the bus name
+    `payment_confirmed` and `permits` subscribes to it, and the two may not
+    import each other (design/01 rule 3) — so the name is matched by STRING and
+    a rename that misses one side breaks the seam in complete silence:
+    `core.events.publish` on a name nothing subscribes to is a legal no-op, so
+    the assigned executor simply stops being told a permit is due, on every
+    payment, with nothing failing anywhere.
+
+    `app/event_subscriptions.py` re-declared the literal until 2026-09-03 and
+    `tests/modules/permits/test_issue.py` published a third copy of it, while
+    `tests/modules/payments/test_end_to_end.py` subscribed through the constant
+    — so publish and subscribe could genuinely part company with a green suite.
+    Both now read `app.event_subscriptions.PAYMENT_CONFIRMED` (the seam's own
+    re-export of the publisher's constant) or the publisher's constant itself.
+
+    The check is textual because that is the failure: the SEAM is allowed to
+    know both sides, and the identity assertion below would pass just as well
+    with three literals that happen to agree today.
+    """
+    from app.event_subscriptions import PAYMENT_CONFIRMED
+    from app.modules.payments.events import PAYMENT_CONFIRMED as PUBLISHED_NAME
+
+    assert PAYMENT_CONFIRMED is PUBLISHED_NAME
+
+    needle = f'"{PUBLISHED_NAME}"'
+    owner = pathlib.Path("app/modules/payments/events.py")
+    searched = sorted([*pathlib.Path("app").rglob("*.py"), *pathlib.Path("tests").rglob("*.py")])
+    assert len(searched) >= 100, f"only {len(searched)} files walked — the walk is wrong"
+    offenders = [
+        str(path)
+        for path in searched
+        if path != owner and needle in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, (
+        f"{needle} is written down outside {owner} — import "
+        "`app.modules.payments.events.PAYMENT_CONFIRMED` (or the seam's re-export, "
+        f"`app.event_subscriptions.PAYMENT_CONFIRMED`) instead: {offenders}"
+    )
