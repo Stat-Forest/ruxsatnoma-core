@@ -42,6 +42,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
 from app.modules.payments.router import router as payments_router
 from app.modules.permits.public_router import router as permits_public_router
@@ -225,6 +226,7 @@ def create_app() -> FastAPI:
     app.include_router(norms_calc_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
+    app.include_router(payments_backoffice_router, prefix="/api/v1")
     app.include_router(payme_router, prefix="/api/v1")
     app.include_router(permits_router, prefix="/api/v1")
     # The anonymous QR check (С12). Under `permits` and not a `public` module,

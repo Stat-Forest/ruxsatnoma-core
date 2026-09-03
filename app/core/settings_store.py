@@ -170,6 +170,13 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec("bank_statement_max_mb", int, 10, "Upload cap for a bank statement file"),
         SettingSpec(
+            "provider_settlement_payer_fragment",
+            str,
+            "payme",
+            "Case-insensitive fragment of a statement line's payer name that marks it "
+            "an aggregated provider payout rather than one applicant's payment",
+        ),
+        SettingSpec(
             "refund_control_working_days",
             int,
             20,

@@ -105,6 +105,18 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # Every 30 seconds: a statement is uploaded by hand, a few times a month,
+    # so an accountant waiting half a minute for the parse to start is fine —
+    # and the poll is one indexed `SELECT ... FOR UPDATE SKIP LOCKED` when the
+    # queue is empty, which it almost always is.
+    sched.add_job(
+        _wrap(factory, jobs.process_bank_statements),
+        IntervalTrigger(seconds=30, timezone=TIMEZONE),
+        next_run_time=now,
+        id="process_bank_statements",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     return sched
 
 

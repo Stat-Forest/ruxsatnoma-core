@@ -21,6 +21,7 @@ from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
 from app.modules.payments import jobs as payments_jobs
+from app.modules.payments import statement_service as payments_statement_service
 from app.modules.permits import jobs as permits_jobs
 
 logger = structlog.get_logger(__name__)
@@ -202,6 +203,24 @@ async def process_gis_imports(factory: async_sessionmaker[AsyncSession]) -> int:
     processed = await gis_import_service.process_pending(factory)
     if processed:
         logger.info("job.process_gis_imports", processed=processed)
+    return processed
+
+
+async def process_bank_statements(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Parse and match at most one queued bank statement (plan 03.10b task 4).
+
+    Thin wrapper only — `payments.statement_service.process_pending(db)` holds
+    the claim, the state machine and its own failure records, the same split
+    `process_gis_imports` has from `gis_import_service.process_pending` and
+    `expire_invoices` has from `payments.jobs.expiry_sweep`. One statement per
+    tick, not a loop: a backlog drains steadily while a single month-long file
+    can never hold the scheduler's thread.
+    """
+    async with factory() as db:
+        processed = await payments_statement_service.process_pending(db)
+        await db.commit()
+    if processed:
+        logger.info("job.process_bank_statements", processed=processed)
     return processed
 
 

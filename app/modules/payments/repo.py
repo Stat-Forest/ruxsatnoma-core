@@ -10,7 +10,15 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.payments.models import Allocation, Invoice, PaymentIntent, ProviderTransaction
+from app.modules.payments.models import (
+    Allocation,
+    BankStatement,
+    BankStatementLine,
+    Invoice,
+    PaymentIntent,
+    ProviderTransaction,
+    Reconciliation,
+)
 
 # What "in force" means for an invoice (mirrors `uq_invoices_one_in_force`,
 # migration 0017): a `cancelled`/`expired` row does not block a new one.
@@ -232,5 +240,64 @@ async def list_invoices_by_application(
         await db.execute(
             stmt.order_by(Invoice.issued_at.desc(), Invoice.id.desc()).offset(offset).limit(limit)
         )
+    ).scalars()
+    return list(rows), total
+
+
+# --- 3.10b: bank statements, their lines and the reconciliation register ------
+
+
+async def add_statement(db: AsyncSession, statement: BankStatement) -> None:
+    db.add(statement)
+    await db.flush()
+
+
+async def get_statement(db: AsyncSession, statement_id: uuid.UUID) -> BankStatement | None:
+    return await db.get(BankStatement, statement_id)
+
+
+async def claim_pending_statement(db: AsyncSession) -> BankStatement | None:
+    """Claim the oldest `pending` statement; the row lock is held until the
+    caller commits or rolls back.
+
+    The same idiom as `gis.repo.claim_pending_import` and
+    `integrations.repo.pick_due`: `FOR UPDATE SKIP LOCKED` lets any number of
+    worker processes drain the queue without two of them ever taking the same
+    statement. Deliberately NOT the outbox — the outbox carries messages
+    LEAVING the system, an imported statement is inbound work."""
+    return (
+        await db.execute(
+            select(BankStatement)
+            .where(BankStatement.status == "pending")
+            .order_by(BankStatement.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+    ).scalar_one_or_none()
+
+
+async def add_statement_lines(db: AsyncSession, lines: Sequence[BankStatementLine]) -> None:
+    """Insert a whole statement's lines in one flush — which also populates
+    every row's `id`, so the reconciliation rows that point at them can be
+    built afterwards without a flush per line."""
+    db.add_all(lines)
+    await db.flush()
+
+
+async def add_reconciliations(db: AsyncSession, rows: Sequence[Reconciliation]) -> None:
+    db.add_all(rows)
+    await db.flush()
+
+
+async def list_statement_lines(
+    db: AsyncSession, statement_id: uuid.UUID, *, limit: int, offset: int
+) -> tuple[list[BankStatementLine], int]:
+    """One statement's lines in file order — `GET /payments/bank-statements/{id}`.
+    Ordered by `line_no`, which `uq_bank_statement_lines_statement_line` makes
+    unique within a statement, so the paging is stable."""
+    stmt = select(BankStatementLine).where(BankStatementLine.statement_id == statement_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(stmt.order_by(BankStatementLine.line_no).offset(offset).limit(limit))
     ).scalars()
     return list(rows), total
