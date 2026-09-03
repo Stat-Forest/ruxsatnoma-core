@@ -445,10 +445,21 @@ async def get_application_timeline(
 # scarce. A replayed approve or reject finds the application no longer
 # IN_REVIEW and answers 409 (`APPLICATION_TRANSITIONS` has no self-loop), and
 # the invoice 3.10a raises off the approval is idempotent by construction on its
-# own side. A replayed FORWARD is the one case that would write a second
-# assignment row — but the first forward has already moved the application into
-# the parent organization's zone, so the same caller is told 404 by the zone
-# rule before it gets there.
+# own side.
+#
+# **A replayed FORWARD is the one case the transition table cannot answer**, and
+# the zone does NOT answer it either — an earlier draft of this comment claimed
+# it did, and was wrong for exactly the actor a forward exists for.
+# `service._assert_in_actor_zone` returns immediately for an actor whose `Zone`
+# is empty on all three axes, so an agency- or republic-level head is
+# unrestricted nationwide: the first forward moving the application into the
+# parent's zone stops a LESHOZ-scoped head from clicking again, and stops nobody
+# else. What answers it is `decision._forward`'s own guard — an application
+# nobody has taken into work at its current level cannot be escalated from it
+# (`assigned_user_id IS NULL` after a forward) — which refuses the second click
+# with a 409 instead of walking one rung up the ladder per click. See that
+# function's docstring for why the guard is the right shape and not merely a
+# replay check.
 
 
 @router.post("/applications/{application_id}/approve")

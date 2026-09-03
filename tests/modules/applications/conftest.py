@@ -21,6 +21,7 @@ re-exported AND consumed here."""
 import secrets
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal
 
@@ -659,17 +660,25 @@ LIMITED_HEAD_ROLES = {
 
 
 async def _limited_head_role(db: AsyncSession, code: str) -> uuid.UUID:
+    """One of the three named roles above, by code — see `_upsert_head_role`."""
+    max_amount, max_area = LIMITED_HEAD_ROLES[code]
+    return await _upsert_head_role(db, code, max_amount=max_amount, max_area=max_area)
+
+
+async def _upsert_head_role(
+    db: AsyncSession, code: str, *, max_amount: Decimal | None, max_area: Decimal | None
+) -> uuid.UUID:
     """Get-or-create the non-system role `code`, carrying EXACTLY the grants
-    migration 0015/0016 give `executor_head` plus the approval limits above.
+    migration 0015/0016 give `executor_head` plus the approval limits asked for.
 
     The grants are COPIED from `role_permissions` rather than listed here — a
     fixture's permission list must mirror the PRODUCTION role's (lesson), and a
     hand-written list would go stale the day another migration grants
-    `executor_head` something new. The limits are re-applied on every call so
-    that editing `LIMITED_HEAD_ROLES` takes effect against a database a previous
-    run already seeded.
+    `executor_head` something new. The limits are re-applied on every call, so
+    a role a previous run already seeded takes the CURRENT values — which is
+    also what lets `head_with_exact_limits` set a ceiling it can only compute
+    once the application's own price is known.
     """
-    max_amount, max_area = LIMITED_HEAD_ROLES[code]
     role = (await db.execute(select(Role).where(Role.code == code))).scalar_one_or_none()
     if role is None:
         role = Role(
@@ -991,3 +1000,58 @@ async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
             )
         )
     ).scalar_one()
+
+
+@pytest.fixture
+async def zoned_limited_executor_head_client(db: AsyncSession, leshoz: Organization):
+    """The PRODUCTION shape of an over-limit head: `executor_head`'s own grants,
+    an approval ceiling, and `organization_id` set to the leshoz that owns
+    `published_contour` — which is what migration 0015 assumes and what every
+    real leshoz head looks like.
+
+    Its sibling `limited_executor_head_client` is zone-free so that the brief's
+    own test can read `GET /timeline` straight after forwarding; this one cannot
+    (a forward moves the application into the parent's zone, and a leshoz-scoped
+    head is then told 404), so a test using it asserts through `db` instead.
+    """
+    user = await make_user(
+        db,
+        role_code="executor_staff",  # replaced below; make_user resolves by code
+        organization_id=leshoz.id,
+        pinfl=unique_pinfl(),
+    )
+    user.role_id = await _limited_head_role(db, "test_head_limit_both")
+    await db.flush()
+    async for client in _head_client(db, user):
+        yield client
+
+
+@pytest.fixture
+async def head_with_exact_limits(db: AsyncSession):
+    """A FACTORY, not a client: an over-limit test can name its ceilings up
+    front, but the `>` boundary cannot — «a ceiling EQUAL to the amount must not
+    forward» needs the application's own price, which only the norms engine
+    knows and only after the application exists.
+
+    Used as `async with head_with_exact_limits(max_amount=…, max_area=…) as
+    client:`. The role is a single reused row (`test_head_limit_exact`) whose
+    limits are rewritten per call, so it accumulates no more than the three
+    named roles above do.
+    """
+
+    @asynccontextmanager
+    async def _make(*, max_amount: Decimal | None, max_area: Decimal | None):
+        role_id = await _upsert_head_role(
+            db, "test_head_limit_exact", max_amount=max_amount, max_area=max_area
+        )
+        user = await make_user(
+            db,
+            role_code="executor_staff",  # replaced below; make_user resolves by code
+            pinfl=unique_pinfl(),
+        )
+        user.role_id = role_id
+        await db.flush()
+        async for client in _head_client(db, user):
+            yield client
+
+    return _make

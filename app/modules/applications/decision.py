@@ -97,6 +97,16 @@ REJECTION_CLASSIFIER_CODE = "rejection_reasons"
 # translation of the reason.
 FALLBACK_LANGUAGE = "uz_cyrl"
 
+# What a forward writes into the bounce row's `reason_text` (controller minor 4).
+# A STABLE TOKEN, never a sentence: `reason_text` surfaces on the
+# citizen-visible timeline, and this project keeps user-facing wording in
+# versioned `notification_templates` rows an admin owns, never in code — an
+# English sentence in an Uzbek/Russian government UI is a defect the front end
+# cannot fix. WHICH ceilings were exceeded, and by how much, live in the audit
+# entry's `new_value`, which is where that detail belongs. 3.9b's return and
+# request-info reasons inherit the same convention.
+FORWARD_REASON = "role_limit_exceeded"
+
 
 def _over_limit(
     *,
@@ -238,7 +248,39 @@ async def _forward(
     parent organization can only see and decide the application once it points
     at them. The cost is real and deliberate: the forwarding head, if zoned to
     the leshoz, no longer sees the application they escalated.
+
+    **AN APPLICATION NOBODY HAS TAKEN INTO WORK AT ITS CURRENT LEVEL CANNOT BE
+    ESCALATED FROM IT** — the guard below, and the one that stops a head walking
+    the whole ladder alone. The zone does NOT stop them:
+    `service._assert_in_actor_zone` returns immediately for an actor whose
+    `Zone` is empty on all three axes, so an agency- or republic-level head is
+    unrestricted nationwide, and a second `POST /approve` would re-read
+    `_effective_organization` (now the parent), escalate to the GRANDPARENT,
+    write a third assignment row and a second bogus bounce entry — one level per
+    click, until the agency answers 422, with the leshoz that filed it no longer
+    able to see it.
+
+    `assigned_user_id` is the honest test for "somebody here is working on
+    this": `start_review` sets it to the reviewer who took the application into
+    work, and this function clears it, so it is non-null exactly once per level
+    and only after a human at that level has claimed the file. A LEGITIMATE
+    second escalation therefore needs somebody at the parent organization to
+    claim it first — which in 3.9a nothing can do (`start-review` requires
+    SUBMITTED, and `applications.assign` is 3.9b's route). So a two-level
+    escalation is refused with a 409 naming the fact, rather than performed
+    silently by whoever clicked twice; 3.9b, which owns assignment, is what
+    makes it reachable.
     """
+    if application.assigned_user_id is None:
+        raise err(
+            "ERR-APP-004",
+            details={
+                "reason": "not_claimed_at_this_level",
+                "assigned_org_id": None
+                if application.assigned_org_id is None
+                else str(application.assigned_org_id),
+            },
+        )
     organization_id = await flow._effective_organization(db, application)
     if organization_id is None:
         # `application_assignments.org_id` is NOT NULL and there is nothing to
@@ -260,9 +302,6 @@ async def _forward(
             },
         )
 
-    reason_text = (
-        f"Escalated to a higher organization: {', '.join(over)} above the role's approval limit"
-    )
     await flow._claim_assignment(
         db,
         application,
@@ -282,7 +321,8 @@ async def _forward(
     # still owed: the bounce has to be visible on the timeline WITH its reason,
     # and `application_assignments.reason` is CHECK-constrained to
     # auto/absence/manual and carries no free text, so `reason_text` here is the
-    # only place the reason can live. A reader must not mistake this row for a
+    # only place the reason can live — as `FORWARD_REASON`, a stable token, for
+    # the reason that constant states. A reader must not mistake this row for a
     # transition; the equal statuses are the tell.
     await repo.add_status_history(
         db,
@@ -291,7 +331,7 @@ async def _forward(
             from_status=application.status,
             to_status=application.status,
             changed_by=actor.id,
-            reason_text=reason_text,
+            reason_text=FORWARD_REASON,
         ),
     )
     await db.refresh(application)
@@ -314,7 +354,7 @@ async def _forward(
             "amount": flow._json_safe(amount),
             "requested_area_ha": flow._json_safe(area),
         },
-        basis=reason_text,
+        basis=FORWARD_REASON,
     )
     return parent.id
 
