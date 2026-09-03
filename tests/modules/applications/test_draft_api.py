@@ -211,3 +211,170 @@ async def test_a_draft_that_has_moved_on_can_no_longer_be_patched(db, applicant_
     assert refused.status_code == 409
     assert refused.json()["error"]["code"] == "ERR-APP-004"
     assert refused.json()["error"]["details"]["reason"] == "not_draft"
+
+
+async def test_a_representative_files_for_the_legal_entity_they_represent(
+    db, representative_client, legal_applicant
+) -> None:
+    """`on_behalf="legal"` (decision #9: a legal entity has no account of its
+    own). The assertion that matters is `representation_id`: it records WHICH
+    power of attorney the filing was made under, and it is the legal basis of
+    the application — an application filed for a company by nobody in
+    particular is not a document anyone can stand behind."""
+    from sqlalchemy import select
+
+    from app.modules.auth.models import Representation
+
+    created = await representative_client.post(
+        "/api/v1/applications",
+        json={"on_behalf": "legal", "applicant_id": str(legal_applicant.id)},
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["applicant_id"] == str(legal_applicant.id)
+    assert body["on_behalf"] == "legal"
+
+    representation_id = await db.scalar(
+        select(Representation.id).where(Representation.applicant_id == legal_applicant.id)
+    )
+    assert body["representation_id"] == str(representation_id), (
+        "the stored representation is the one the caller actually holds, not just any non-null id"
+    )
+
+
+async def test_filing_for_a_legal_entity_you_do_not_represent_is_refused(
+    applicant_client, legal_applicant
+) -> None:
+    """403 `ERR-ACL-001`, not 404: the caller NAMED the applicant, so there is
+    no existence to hide — and unlike an application, an `applicants` row for a
+    company is public information (its STIR is on every invoice it issues).
+    Without this guard anyone could file in any company's name."""
+    refused = await applicant_client.post(
+        "/api/v1/applications",
+        json={"on_behalf": "legal", "applicant_id": str(legal_applicant.id)},
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"]["code"] == "ERR-ACL-001"
+    assert refused.json()["error"]["details"]["reason"] == "no_effective_representation"
+
+
+async def test_on_behalf_legal_needs_an_applicant_id(applicant_client) -> None:
+    """`applicant_id` is optional in the schema because `on_behalf="self"` must
+    not need it — so the pairing rule is the service's, and it says so."""
+    refused = await applicant_client.post("/api/v1/applications", json={"on_behalf": "legal"})
+    assert refused.status_code == 422
+    assert refused.json()["error"]["details"]["reason"] == "applicant_id_required"
+
+
+async def test_naming_someone_elses_applicant_on_behalf_of_self_is_refused(
+    applicant_client, legal_applicant
+) -> None:
+    """Refused rather than IGNORED: silently overriding the field is how a
+    client ends up believing it filed for the person it named."""
+    refused = await applicant_client.post(
+        "/api/v1/applications",
+        json={"on_behalf": "self", "applicant_id": str(legal_applicant.id)},
+    )
+    assert refused.status_code == 422
+    assert refused.json()["error"]["details"]["reason"] == "applicant_is_not_the_caller"
+
+
+async def test_an_unknown_reference_id_is_a_422_and_not_a_500(
+    applicant_client, sheep_type_id
+) -> None:
+    """`_assert_references`' whole purpose: an unknown FK reaching `flush()` is
+    an `IntegrityError`, which has no handler in `app/main.py` and surfaces as
+    `ERR-SYS-001`/500 for what is only ever a typo. One case per guard, each
+    asserting its OWN reason — an outcome-only test could not tell the four
+    apart (lesson)."""
+    import uuid as _uuid
+
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    stranger = str(_uuid.uuid4())
+
+    for body, reason in (
+        ({"activity_type_id": stranger}, "unknown_activity_type"),
+        ({"contour_id": stranger}, "unknown_contour"),
+        ({"benefit_category_item_id": stranger}, "unknown_benefit_category"),
+        (
+            {
+                "items": [
+                    {"livestock_type_id": str(sheep_type_id), "head_count": 10},
+                    {"livestock_type_id": str(sheep_type_id), "head_count": 20},
+                ]
+            },
+            "duplicate_livestock_type",
+        ),
+        ({"items": [{"livestock_type_id": stranger, "head_count": 10}]}, "unknown_livestock_type"),
+    ):
+        refused = await applicant_client.patch(f"/api/v1/applications/{app_id}", json=body)
+        assert refused.status_code == 422, (body, refused.text)
+        assert refused.json()["error"]["code"] == "ERR-VAL-001"
+        assert refused.json()["error"]["details"]["reason"] == reason
+
+
+async def test_a_benefit_item_from_another_classifier_is_refused(db, applicant_client) -> None:
+    """The membership half of the benefit guard: an id that IS a real
+    `classifier_items` row but belongs to the rejection-reason classifier must
+    not pass as a benefit category. An existence-only check would let it."""
+    from sqlalchemy import text as sa_text
+
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    rejection_item_id = await db.scalar(
+        sa_text(
+            "SELECT ci.id FROM classifier_items ci JOIN classifiers c ON c.id = ci.classifier_id"
+            " WHERE c.code = 'rejection_reasons' LIMIT 1"
+        )
+    )
+
+    refused = await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={"benefit_category_item_id": str(rejection_item_id)},
+    )
+    assert refused.status_code == 422
+    assert refused.json()["error"]["details"]["reason"] == "unknown_benefit_category"
+
+
+async def test_the_audit_trail_records_the_herd_that_changed(
+    db, applicant_client, sheep_type_id
+) -> None:
+    """Review I1: `items` is the field on this table that drives the fee, the
+    norm check and the printed permit, so an `application.update` row that
+    cannot show it changed is worse than no row — a `prosecutor` reading
+    `audit_log` would be told nothing happened."""
+    import uuid as _uuid
+
+    from sqlalchemy import select
+
+    from app.modules.audit.models import AuditLog
+
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={"items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}]},
+    )
+    await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={"items": [{"livestock_type_id": str(sheep_type_id), "head_count": 4000}]},
+    )
+
+    rows = (
+        await db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.action == "application.update",
+                AuditLog.object_id == _uuid.UUID(app_id),
+            )
+            .order_by(AuditLog.id)
+        )
+    ).scalars()
+    entries = list(rows)
+    assert len(entries) == 2
+    herd_before = entries[-1].old_value["items"]
+    herd_after = entries[-1].new_value["items"]
+    assert [line["head_count"] for line in herd_before] == [40]
+    assert [line["head_count"] for line in herd_after] == [4000]
+    assert entries[0].old_value["items"] == [], "the first PATCH started from an empty herd"

@@ -323,11 +323,24 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _snapshot(application: Application) -> dict[str, Any]:
-    """What an audit entry records about a draft: the fields a PATCH can move,
+def _snapshot(application: Application, items: list[ApplicationItem]) -> dict[str, Any]:
+    """What an audit entry records about a draft: everything a PATCH can move,
     and nothing else. `status` is absent on purpose — `set_status` is the only
-    thing that moves it and it audits that move itself, under its own action."""
-    return {
+    thing that moves it and it audits that move itself, under its own action.
+
+    **`items` is part of the snapshot, not an afterthought** (review I1). The
+    herd is the field on this table that matters most: it drives the fee, the
+    norm's SB limit and the printed permit. A snapshot of the six scalar
+    columns alone answers a `prosecutor` reading `audit_log` that a PATCH
+    taking 40 head to 4000 changed NOTHING — an entry asserting that is worse
+    than no entry at all.
+
+    Sorted by `livestock_type_id`, because `repo.replace_items` re-inserts the
+    whole list and `list_items`' own order is insertion order: unsorted, the
+    same herd re-sent in a different order would read as a change, and this
+    trail's one job is that a difference means a difference.
+    """
+    snapshot: dict[str, Any] = {
         name: _json_safe(getattr(application, name))
         for name in (
             "activity_type_id",
@@ -338,6 +351,11 @@ def _snapshot(application: Application) -> dict[str, Any]:
             "benefit_category_item_id",
         )
     }
+    snapshot["items"] = [
+        {"livestock_type_id": str(item.livestock_type_id), "head_count": item.head_count}
+        for item in sorted(items, key=lambda row: str(row.livestock_type_id))
+    ]
+    return snapshot
 
 
 async def _holds_staff_read(db: AsyncSession, actor: User) -> bool:
@@ -695,7 +713,9 @@ async def patch_draft(
     application = await _own_draft_for_update(db, application_id, actor=actor)
     fields = patch.model_dump(exclude_unset=True)
     await _assert_references(db, fields)
-    before = _snapshot(application)
+    # Read BEFORE the replacement: `repo.replace_items` deletes the old rows,
+    # so afterwards there is nothing left to snapshot them from.
+    before = _snapshot(application, await repo.list_items(db, application.id))
     items = fields.pop("items", None)
     for name, value in fields.items():
         setattr(application, name, value)
@@ -725,7 +745,7 @@ async def patch_draft(
         object_type="application",
         object_id=application.id,
         old_value=before,
-        new_value=_snapshot(application),
+        new_value=_snapshot(application, await repo.list_items(db, application.id)),
     )
     return application
 
@@ -792,6 +812,12 @@ async def list_applications(
     `Application.assigned_org_id`, because the row joined is the EFFECTIVE
     organization — assigned, or the contour's owner while the application is
     still unassigned (`repo._zone_join_target`, `_effective_organization`).
+
+    The contour half of that join is `gis.service.contour_organization_column`,
+    called HERE and handed to the repo as an expression: cross-module calls
+    live in the service layer, and a repo calling another module's service
+    inverts the layering even where the boundary rule itself is satisfied
+    (review I2).
     """
     scope: list[Any] = []
     holder_ids = await _own_applicant_ids(db, actor)
@@ -811,6 +837,8 @@ async def list_applications(
     return await repo.list_applications(
         db,
         scope=or_(*scope),
+        # Built here and passed down, exactly as `scope` above is (review I2).
+        contour_organization_col=gis_service.contour_organization_column(Application.contour_id),
         status=status,
         activity_type_id=activity_type_id,
         contour_id=contour_id,

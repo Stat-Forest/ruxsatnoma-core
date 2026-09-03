@@ -11,8 +11,10 @@ JOINs it so a region- or district-scoped actor's zone can be enforced.
 `applications` carries an organization id and no region or district, and
 `abac.zone_filter` FAILS CLOSED — it raises when a zone axis is set and its
 column was not supplied. Reference data is read-only to every module
-(CLAUDE.md); the CONTOUR half of that same JOIN is not ours to build, so it
-comes from `gis.service.contour_organization_column`."""
+(CLAUDE.md); the CONTOUR half of that same JOIN is not ours to build and is not
+ours to FETCH either, so `service.list_applications` obtains it from
+`gis.service.contour_organization_column` and passes it in as an expression —
+this file imports no other module's service (review I2)."""
 
 import uuid
 from datetime import date
@@ -29,7 +31,6 @@ from app.modules.applications.models import (
     ApplicationItem,
     ApplicationStatusHistory,
 )
-from app.modules.gis import service as gis_service
 
 
 async def get_application(db: AsyncSession, application_id: uuid.UUID) -> Application | None:
@@ -39,7 +40,11 @@ async def get_application(db: AsyncSession, application_id: uuid.UUID) -> Applic
 async def get_application_for_update(
     db: AsyncSession, application_id: uuid.UUID
 ) -> Application | None:
-    """`service.get`'s locking sibling — `set_status` ONLY (review C1).
+    """`service.get`'s locking sibling — for a WRITE path only, never a read
+    (review C1). Branch 1 said "`set_status` ONLY", true while `set_status` was
+    the only write path in the module; branch 2's `patch_draft` takes the same
+    lock through `service._own_draft_for_update`, for the same reason and with
+    the same read-check-write shape over `status`.
     `SELECT ... FOR UPDATE` so two concurrent transitions on the same
     application serialise instead of racing: without it, two callers who
     both read the same pre-write status (a scheduler job and an HTTP
@@ -131,7 +136,7 @@ async def list_checks(db: AsyncSession, application_id: uuid.UUID) -> list[Appli
     return list(rows.scalars().all())
 
 
-def _zone_join_target() -> Any:
+def _zone_join_target(contour_organization_col: Any) -> Any:
     """The organization an application's zone rule compares against:
     `assigned_org_id` while it has one, the contour's owner before a reviewer
     takes it into work.
@@ -140,19 +145,21 @@ def _zone_join_target() -> Any:
     until `start-review` writes the assignment (plan ruling 14), so a zone rule
     reading that column alone would show a hodim an EMPTY work queue — the
     applications they are supposed to pick up are precisely the unassigned ones.
-    The contour half is built by `gis.service.contour_organization_column`, not
-    here: `contours` is gis's table, and design/01 rule 5 does not extend to
-    this module."""
-    return func.coalesce(
-        Application.assigned_org_id,
-        gis_service.contour_organization_column(Application.contour_id),
-    )
+
+    The contour half arrives as an ARGUMENT, built by
+    `gis.service.contour_organization_column` in `service.list_applications`.
+    `contours` is gis's table, design/01 rule 5 does not extend to this module,
+    and a repo calling another module's service inverts the layering even
+    though the boundary rule allows the call — so the call is made a layer up
+    and only its expression comes down here (review I2)."""
+    return func.coalesce(Application.assigned_org_id, contour_organization_col)
 
 
 async def list_applications(
     db: AsyncSession,
     *,
     scope: Any,
+    contour_organization_col: Any,
     status: str | None,
     activity_type_id: uuid.UUID | None,
     contour_id: uuid.UUID | None,
@@ -166,7 +173,10 @@ async def list_applications(
     """One page of applications matching `scope` and the given filters, with the
     total.
 
-    `scope` is whatever the service built out of the caller's identity — an
+    `scope` and `contour_organization_col` are both built by the service and
+    passed in: the first out of the caller's identity, the second by
+    `gis.service.contour_organization_column`. `scope` is whatever the service
+    built out of the caller's identity — an
     `applicant_id IN (...)` for an applicant, `abac.zone_filter`'s expression
     for staff, or the OR of both. Keyword-only with no default on purpose: a
     read of this table with no scope at all is every application in the country,
@@ -204,7 +214,7 @@ async def list_applications(
     if period_to is not None:
         conditions.append(Application.period_from <= period_to)
 
-    join_target = _zone_join_target()
+    join_target = _zone_join_target(contour_organization_col)
     counted = (
         select(Application.id)
         .outerjoin(Organization, Organization.id == join_target)

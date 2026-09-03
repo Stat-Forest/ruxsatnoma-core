@@ -18,6 +18,7 @@ autouse `_app_on_test_db` guard below, `_commit_pending_before_requests` on
 every client fixture, and `from ... import name as name` for the gis fixtures
 re-exported AND consumed here."""
 
+import secrets
 import uuid
 
 import pytest
@@ -26,10 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.models import MediaFile
+from app.core.time import business_today
 from app.main import create_app
 from app.modules.admin.models import Organization
-from app.modules.applications.permissions import APPLICATIONS_REVIEW, APPLICATIONS_VIEW_ANY
-from app.modules.auth.models import Applicant, User
+from app.modules.applications.permissions import APPLICATIONS_REVIEW
+from app.modules.auth.models import Applicant, Representation, User
 from app.modules.gis.models import Contour, GisLayer
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client
@@ -175,27 +177,78 @@ async def hodim_client(db: AsyncSession, leshoz: Organization):
     owns `published_contour` — the two share the `leshoz` fixture, which pytest
     caches per test, so "the same zone" is a fact rather than a coincidence.
 
-    Two permissions, and only one of them is the production role's: migration
-    0015 grants `executor_staff` `applications.review` and grants
-    `applications.view_any` to `prosecutor` alone. `view_any` is added here
-    because later tasks drive this same client through routes that need it, and
-    because the read rule accepts EITHER code (`service._holds_view_any`) —
-    a hodim who may take an application into work must be able to read it.
+    ONE permission, and it is exactly what migration 0015 grants
+    `executor_staff`: `applications.review`. `applications.view_any` goes to
+    `prosecutor` alone, so a fixture holding it would prove that a role nobody
+    has can read an application (lesson: "A `_client_for` fixture's permission
+    list must mirror the PRODUCTION role's grants" — a `_client_for` user
+    inherits nothing from the real role's `role_permissions` row, whatever the
+    fixture is named). What makes a real hodim able to READ what they review is
+    `service._holds_staff_read`, which accepts `applications.review` or
+    `.decide` or `.view_any` — this fixture is what proves that.
     """
-    async for client in _client_for(
-        db, APPLICATIONS_REVIEW, APPLICATIONS_VIEW_ANY, organization_id=leshoz.id
-    ):
+    async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=leshoz.id):
         yield client
 
 
 @pytest.fixture
 async def other_zone_hodim_client(db: AsyncSession, other_leshoz: Organization):
     """The same reviewer shape, zoned to a DIFFERENT leshoz — the actor every
-    territorial refusal is proven against. Same grants as `hodim_client` on
-    purpose: what differs between the two is the zone and nothing else, so a
-    test that passes for one and fails for the other can only be about
-    territory."""
-    async for client in _client_for(
-        db, APPLICATIONS_REVIEW, APPLICATIONS_VIEW_ANY, organization_id=other_leshoz.id
-    ):
+    territorial refusal is proven against. The same single grant as
+    `hodim_client` on purpose: what differs between the two is the zone and
+    nothing else, so a test that passes for one and fails for the other can
+    only be about territory."""
+    async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=other_leshoz.id):
+        yield client
+
+
+def unique_stir() -> str:
+    """A fresh, valid-shape (`^[0-9]{9}$`) STIR per call — `applicants.stir` is
+    UNIQUE and this test DB is shared and persistent. ASCII digits written out,
+    never `\\d`: the column's CHECK is ASCII-only while Python's `\\d` is not
+    (lesson)."""
+    return f"{secrets.randbelow(10**9):09d}"
+
+
+@pytest.fixture
+async def legal_applicant(db: AsyncSession) -> Applicant:
+    """A legal entity — `kind='legal'`, a STIR and NO `owner_user_id`: decision
+    #9 gives a legal applicant no account of its own, so every application for
+    it is filed by a representative."""
+    row = Applicant(kind="legal", stir=unique_stir(), name="ООО Тест")
+    db.add(row)
+    await db.flush()
+    return row
+
+
+@pytest.fixture
+async def representative_client(db: AsyncSession, legal_applicant: Applicant):
+    """A user who is themselves a registered individual applicant — required by
+    `get_current_user`'s `ERR-AUTH-008` gate on any `applicant`-role account
+    with no `Applicant` row of its own — AND holds an ACTIVE `Representation`
+    over `legal_applicant`.
+
+    The `Representation` row is built directly, the same way
+    `tests/modules/payments/test_intents.py::representative_client` builds its
+    own: the production path (`auth.service.attach_legal` /
+    `add_representation`) needs a verified organisation ERI challenge and an
+    existing director-or-org_eri representation to bootstrap from, none of
+    which this module's rules depend on. `basis='org_eri'` needs no
+    `poa_file_id`/`valid_until` — the DB CHECK requires those for
+    `basis='poa'` only.
+    """
+    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    db.add(
+        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+    )
+    db.add(
+        Representation(
+            applicant_id=legal_applicant.id,
+            user_id=user.id,
+            basis="org_eri",
+            valid_from=business_today(),
+        )
+    )
+    await db.flush()
+    async for client in _client_for_applicant(db, user):
         yield client
