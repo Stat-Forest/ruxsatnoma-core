@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.payments.models import (
@@ -122,16 +122,46 @@ async def list_allocations_by_invoice(
 ) -> Sequence[Allocation]:
     """Every ledger row for one invoice, oldest first (`occurred_at`, then
     `id` as the tie-break — uuid7 is time-ordered) — `payments.service.
-    allocations_for` (Task 7), what 4.3's reports and a future refund
-    (3.10b) read. Unfiltered by `entry_type`: today `confirm_payment` only
-    ever writes `"payment"` rows, but 3.10b's refunds/corrections land in
-    this SAME table."""
+    allocations_for` (Task 7), what 4.3's reports and 3.10b's refunds read.
+    Unfiltered by `entry_type`: `confirm_payment` writes `"payment"` rows,
+    `service.record_reversal` writes the negating `"correction"` rows, and
+    the refund register writes `"refund"` rows — all into this SAME table,
+    and `record_reversal` itself reads them back through here."""
     stmt = (
         select(Allocation)
         .where(Allocation.invoice_id == invoice_id)
         .order_by(Allocation.occurred_at, Allocation.id)
     )
     return (await db.execute(stmt)).scalars().all()
+
+
+# --- The one read this module makes outside its own tables (3.10b task 8) ----
+#
+# `permits` and `payments` are BOTH level 4, and `design/01` rule 3 forbids one
+# calling the other — obeyed in the other direction too (`permits.service.issue`
+# reads the APPLICATION's status rather than asking `payments` whether it was
+# paid). This is not a call: it is a read-only COUNT on one table, taken for a
+# RISK CHECK — "does a permit already exist for the application whose payment
+# just came back", which is `tz/10`'s RI-10 verbatim. It moves nothing, decides
+# nothing about a permit, and imports nothing from that module: raw SQL by the
+# table name, never `permits.models`.
+#
+# The alternative was a registered provider seam (the `OCCUPANCY_PROVIDERS`
+# shape 3.11a fills for `gis`/`norms`) built for a single boolean read on a rare
+# path — more machinery, and one more thing a `workers_mode=off` process can be
+# missing, than the fact it would deliver. If that trade is ever re-decided,
+# the RI-10 half of `service.record_reversal` is what drops; nothing else here
+# depends on this function.
+
+
+async def count_permits_for_application(db: AsyncSession, application_id: uuid.UUID) -> int:
+    """How many `permits` rows exist for `application_id` — read-only, see the
+    comment above for why this module may ask. `permits.application_id` is
+    unique, so the answer is only ever 0 or 1; a count rather than an
+    `EXISTS` so a future duplicate register (3.11b's нусха) still reads
+    correctly here without this function having to be revisited."""
+    stmt = text("SELECT count(*) FROM permits WHERE application_id = :application_id")
+    return (await db.execute(stmt, {"application_id": application_id})).scalar_one()
 
 
 async def add_payment_intent(db: AsyncSession, intent: PaymentIntent) -> None:

@@ -168,7 +168,12 @@ MANUAL_REJECT_ACTION = "payment.manual_confirm_reject"
 # legal, and the indicator only says a human should look. This is the
 # OPPOSITE of 3.11a's RI-10, which IS a denial and therefore uses decision
 # #40's early-commit-then-raise pattern — do not copy that shape here.
-RISK_INDICATOR_MANUAL_PAID = "RI-01"
+RISK_INDICATOR_MANUAL_PAID = payments_service.RISK_INDICATOR_UNCONFIRMED_PAID
+"""Aliased, not a second literal (3.10b task 8): `service.record_reversal`
+raises the SAME `tz/10` code for the other way an invoice can be `paid`
+without a standing provider confirmation — a post-perform reversal. Two
+literals would let one door's code be renamed while the other kept the old
+one, and `oversight` (4.2) harvests them by string."""
 
 # The invoice status a manual confirmation may be filed against and checked
 # on, spelled once and DERIVED from the model's own tuple (`INVOICE_STATUSES`

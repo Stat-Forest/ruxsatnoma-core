@@ -28,6 +28,14 @@ Public surface for the event bus (`subscribers.py`, registered in
   past every Payme-protocol check (idempotency, amount, payability) — this
   function performs no check of its own beyond resolving the recipient
   account.
+- `record_reversal(db, *, invoice, transaction, reason) -> None` (3.10b task
+  8, ruling 15) — the mirror of `confirm_payment` for money that came BACK:
+  Payme cancelled an already-performed transaction. It RECORDS the reversal
+  (negating `correction` entries, an open `reconciliations` row, RI-01 and,
+  when a permit exists, RI-10) and deliberately moves neither the invoice nor
+  the application. Called from `payme.py`'s state-`2` branch ONLY. See the
+  KNOWN GAP paragraph in the public-surface comment below for the whole shape
+  of what shipped and what stays open.
 
 `get_invoice_for_actor`/`list_invoices_for_actor`/`create_pay_intent` are
 this module's OWN router-facing functions (they take an HTTP `actor: User`,
@@ -36,6 +44,7 @@ unlike the functions above) — not part of the cross-module public surface.
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,7 +64,15 @@ from app.modules.gis import service as gis_service
 from app.modules.integrations.adapters import payme as payme_adapter
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, ledger, repo
-from app.modules.payments.models import Allocation, Invoice, PaymentIntent, ProviderTransaction
+from app.modules.payments.models import (
+    RECONCILIATION_RESULTS,
+    RECONCILIATION_STATUSES,
+    Allocation,
+    Invoice,
+    PaymentIntent,
+    ProviderTransaction,
+    Reconciliation,
+)
 from app.modules.payments.permissions import PAYMENTS_VIEW
 
 logger = structlog.get_logger(__name__)
@@ -67,12 +84,36 @@ INVOICE_ISSUE = "invoice.issue"
 INVOICE_CANCEL = "invoice.cancel"
 INVOICE_PAY = "invoice.pay"
 PAY_INTENT_CREATE = "payment_intent.create"
+# 3.10b task 8: money that was already confirmed going back (`record_reversal`).
+# "record", not "reverse": the money moved outside the system and this action
+# only writes down that it did — nothing here undoes a payment.
+REVERSAL_RECORD = "payment.reversal_record"
+
+# `tz/10`'s two indicators this module can raise, spelled once each (ruling 2:
+# an RI is an `audit.service.log` row with `extra={"risk_indicator": ...}` —
+# there is no `risk_indicators` table and 4.2 `oversight` harvests these rows).
+#
+# RI-01 «PAID без подтверждения провайдера/банка» — raised by BOTH doors that
+# can produce one: the maker-checker manual PAID (`backoffice_service`, which
+# imports this constant rather than keeping a second literal) and a post-perform
+# reversal, where the provider withdraws a confirmation the invoice still bears.
+# RI-10 «Разрешение активировано без оплаты» — 3.11a raises it on a REFUSED
+# issuance; here it is a permit that already exists over money that came back.
+RISK_INDICATOR_UNCONFIRMED_PAID = "RI-01"
+RISK_INDICATOR_PERMIT_WITHOUT_PAYMENT = "RI-10"
 
 # design/03 §"Public numbers": every invoice number starts with this prefix.
 INVOICE_NUMBER_PREFIX = "INV"
 
 # design/02: an invoice is payable for 10 calendar days from issuance.
 DUE_PERIOD = timedelta(days=10)
+
+# Derived from the model's own tuples — what `result_valid`/`status_valid` are
+# built from — rather than retyped, the idiom `backoffice_service`'s own
+# `_INVOICE_PAYABLE` uses: a reordering goes red in the tests rather than
+# silently changing which row the register shows.
+RECONCILIATION_RESULT_DISCREPANCY = RECONCILIATION_RESULTS[1]
+RECONCILIATION_STATUS_OPEN = RECONCILIATION_STATUSES[0]
 
 
 # --- Task 7: the public surface for 3.11 permits ---------------------------
@@ -105,29 +146,53 @@ DUE_PERIOD = timedelta(days=10)
 #   the callers that legitimately want the invoice-side answer (3.10b's
 #   refunds, 4.3's reports), not as a guard anybody depends on today.
 #
-#   **KNOWN GAP, closed by 3.10b**, and it belongs to the STATUS, not to
-#   this function. Payme's `CancelTransaction` on an ALREADY-PERFORMED
-#   transaction (state `2` -> `-2`; `design/04` §3.5 reason `5` is literally
-#   "funds returned") records the reversal on `provider_transactions` and
-#   NOTHING else: 3.10a builds no reversal at all
-#   (`payme._cancel_transaction`'s own docstring — refunds are 3.10b's
-#   `refunds` table). After such a call the invoice is still `paid`, the
-#   application is still `PAID`, `allocations` still carries two `payment`
-#   rows summing to money that has gone back, this function still returns
-#   `True` — and, because issuance gates on the application's status, **a
-#   permit can be issued for a refunded payment**. It is rare and loud
-#   (`payme.py` logs a state-`2` cancellation at ERROR: a manual reversal on
-#   live money, not routine traffic), and the fix is 3.10b's reversal path —
-#   a `correction` entry in the ledger, the invoice off `paid`, the
-#   application off PAID, and whatever 3.11 then owes a permit already
-#   issued. Do not paper over it by widening `is_paid`: the missing piece is
-#   the WRITE nobody performs, not the read.
+#   **THE KNOWN GAP 3.10a NAMED HERE, and what 3.10b actually did with it.**
+#   Kept rather than deleted: a reader needs the history more than the tidy
+#   version. 3.10a wrote that Payme's `CancelTransaction` on an
+#   ALREADY-PERFORMED transaction (state `2` -> `-2`; `design/04` §3.5 reason
+#   `5` is literally "funds returned") recorded the reversal on
+#   `provider_transactions` and NOTHING else — the invoice still `paid`, the
+#   application still `PAID`, `allocations` still carrying two `payment` rows
+#   summing to money that had gone back, this function still answering `True`,
+#   and, because issuance gates on the application's status, a permit issuable
+#   for a refunded payment. It expected 3.10b to move the application off PAID.
+#
+#   **3.10b did not, and could not** (ruling 15).
+#   `applications.service.APPLICATION_TRANSITIONS["PAID"]` is
+#   `frozenset({"PERMIT_ISSUED"})`, and `tz/05` gives PAID no other exit.
+#   Adding one is a change to the application state machine — level 3, owned
+#   by stage 3.9, read by 3.11's issuance gate and by 3.11b's revoke — so
+#   making it from a `payments` branch would have shipped a silent
+#   cross-module break in place of a fix. `design/02` says the same of the
+#   invoice: its status is not rewritten, the history stays intact.
+#
+#   **What DID ship, in `record_reversal` (below), called from
+#   `payme._cancel_transaction`'s state-`2` branch:** the ledger stays
+#   arithmetically true (one `correction` entry per `payment` row, so the
+#   invoice's whole ledger sums to `0.00` instead of claiming money that is
+#   gone); the discrepancy register carries an OPEN row whose `difference` is
+#   the reversed amount — the operator's handle, and a case only a human can
+#   finish; RI-01 is raised («PAID без подтверждения провайдера/банка» — the
+#   provider withdrew a confirmation the invoice still bears); and RI-10 too
+#   («Разрешение активировано без оплаты») when a permit already exists for
+#   that application.
+#
+#   **What is STILL OPEN, and is not a defect in the code below.** The invoice
+#   stays `paid` and the application stays `PAID`, so this function still
+#   answers `True` after a reversal, and between the reversal and an operator
+#   acting on the register row `permits.service.issue` will still issue
+#   against that application. The remedy for an already-issued permit is
+#   3.11b's revoke; the question of what SHOULD happen to a permit whose
+#   payment was reversed is filed for the Agency in `tz/12`, next to #16.
+#   Do not paper over any of it by widening `is_paid`: the answer is a
+#   `tz/05` transition somebody must decide, not a read that lies differently.
 # - `allocations_for(db, invoice_id) -> list[Allocation]` — the whole
 #   ledger for one invoice, oldest first — what 4.3's reports read. Every
-#   row `confirm_payment` ever wrote for this invoice, `entry_type`
-#   unfiltered: today that is only ever `"payment"` (two rows, recipient +
-#   budget), but 3.10b's refunds/corrections land in the SAME table, and a
-#   caller must not assume every row it gets back is a payment.
+#   row this module ever wrote for this invoice, `entry_type` unfiltered:
+#   `"payment"` (two rows, recipient + budget) from `confirm_payment`,
+#   `"correction"` from `record_reversal` and `"refund"` from 3.10b's refund
+#   register — a caller must not assume every row it gets back is a payment,
+#   and must not assume they are all positive.
 #
 # No permission or zone rule on any of the three — the caller is another
 # SERVICE inside this process, not an HTTP actor, mirroring
@@ -628,3 +693,156 @@ async def confirm_payment(
             },
         ),
     )
+
+
+async def record_reversal(
+    db: AsyncSession,
+    *,
+    invoice: Invoice,
+    transaction: ProviderTransaction,
+    reason: int | None,
+) -> None:
+    """Money that was already confirmed has gone back: Payme cancelled an
+    ALREADY-PERFORMED transaction (state `2` -> `-2`; `design/04` §3.5 reason
+    `5` is literally "funds returned"). One caller,
+    `payme._cancel_transaction`'s state-`2` branch, already inside its
+    transaction — this function neither commits nor checks the state it is
+    called for.
+
+    **It RECORDS the reversal; it does not propagate it** (ruling 15, 3.10b).
+    Three writes, and deliberately no fourth:
+
+    1. one `correction` allocation per `payment` row this transaction wrote,
+       with the sign flipped — the ledger is append-only (ruling 4), so the
+       reversal is new rows and the invoice's whole ledger then sums to
+       `0.00` rather than claiming money that is gone;
+    2. one `reconciliations` row, `result='discrepancy'`, `status='open'` —
+       the register a human reads every morning, and the operator's handle on
+       a case only a human can finish;
+    3. an audit row carrying **RI-01** (`tz/10`: «PAID без подтверждения
+       провайдера/банка» — the provider has withdrawn its confirmation and
+       the invoice is still `paid`), plus a second one carrying **RI-10**
+       («Разрешение активировано без оплаты», critical) when a permit already
+       exists for this application.
+
+    **What it does NOT do, and why.** It does not move the invoice off `paid`
+    and it does not move the application off `PAID`.
+    `applications.service.APPLICATION_TRANSITIONS["PAID"]` is
+    `frozenset({"PERMIT_ISSUED"})` and `tz/05` gives PAID no other exit;
+    inventing one is a change to the application state machine, owned by
+    stage 3.9, which 3.11's issuance gate and 3.11b's revoke both read.
+    `design/02` says the same of the invoice — its status is not rewritten,
+    the history stays intact. See the public-surface banner at the top of
+    this file for the residual window that leaves.
+
+    `reason` is Payme's own cancel reason, carried through into the ledger
+    note and the audit row: outside `provider_transactions` this is the only
+    place it survives, and it is what tells an accountant "funds returned"
+    (`5`) from any other ground.
+
+    Idempotent by inspection, not by a constraint: a `correction` row already
+    written against this transaction means this ran before, and a second run
+    would negate the ledger twice. `payme`'s own state machine reaches the
+    state-`2` branch once per transaction, so this guard is a backstop for a
+    manual re-run, never the primary mechanism.
+    """
+    entries = await repo.list_allocations_by_invoice(db, invoice.id)
+    mine = [row for row in entries if row.transaction_id == transaction.id]
+    if any(row.entry_type == "correction" for row in mine):
+        logger.warning(
+            "payments.reversal_already_recorded",
+            invoice_id=str(invoice.id),
+            transaction_id=str(transaction.id),
+        )
+        return
+
+    # The rows THIS transaction wrote, not every `payment` row on the invoice:
+    # only this transaction's money came back, and negating another
+    # transaction's entries would put the ledger further from the truth, not
+    # closer. On today's paths the two sets are the same — an invoice is
+    # `pending` for exactly one performing transaction — so the invoice's whole
+    # ledger does sum back to `0.00`, which is what the test asserts.
+    paid_rows = [row for row in mine if row.entry_type == "payment"]
+    note = f"reversal of {transaction.provider} transaction {transaction.external_id}"
+    if reason is not None:
+        note = f"{note} (cancel reason {reason})"
+    await repo.add_allocations(
+        db,
+        [
+            Allocation(
+                invoice_id=invoice.id,
+                transaction_id=transaction.id,
+                entry_type="correction",
+                target=row.target,
+                account=row.account,
+                amount=-row.amount,
+                note=note,
+            )
+            for row in paid_rows
+        ],
+    )
+
+    reversed_amount = sum((row.amount for row in paid_rows), Decimal("0.00"))
+    # `difference` here is the money that went back, positive — NOT
+    # `matcher.py`'s paid-minus-invoiced convention, which describes a bank
+    # line against an invoice and has no bank line to describe on this path.
+    # The comment says which of the two a reader is looking at.
+    reconciliation = Reconciliation(
+        transaction_id=transaction.id,
+        invoice_id=invoice.id,
+        result=RECONCILIATION_RESULT_DISCREPANCY,
+        difference=reversed_amount,
+        status=RECONCILIATION_STATUS_OPEN,
+        comment=(
+            f"{transaction.provider} reversed a confirmed payment of {reversed_amount} "
+            f"on invoice {invoice.number} (cancel reason {reason}); the invoice stays "
+            f"'{invoice.status}' and the application stays PAID — see payments/service.py"
+        ),
+    )
+    await repo.add_reconciliations(db, [reconciliation])
+
+    # `user_id=None`: there is no HTTP actor on the Payme webhook, the same
+    # idiom `payme._change_password` and the scheduled jobs use. `result`
+    # stays "success" — the recording succeeded and is legal; the indicator
+    # only says a human must look (the shape 3.10b's manual PAID uses, NOT
+    # 3.11a's RI-10-on-denial, which is a refusal and commits before raising).
+    await audit.log(
+        db,
+        action=REVERSAL_RECORD,
+        user_id=None,
+        object_type="invoice",
+        object_id=invoice.id,
+        old_value={"status": invoice.status},
+        new_value={
+            "status": invoice.status,
+            "transaction_id": str(transaction.id),
+            "external_id": transaction.external_id,
+            "reason": reason,
+            "reversed_amount": str(reversed_amount),
+            "reconciliation_id": str(reconciliation.id),
+        },
+        basis=f"{transaction.provider} cancelled a performed transaction",
+        extra={"risk_indicator": RISK_INDICATOR_UNCONFIRMED_PAID},
+    )
+
+    # A permit for this application means money has gone back from something
+    # already issued — `tz/10`'s RI-10 verbatim. A read-only COUNT, never a
+    # call into `permits` (both modules are level 4): see
+    # `repo.count_permits_for_application`'s own comment for the boundary
+    # argument and for what drops if it is ever re-decided.
+    if await repo.count_permits_for_application(db, invoice.application_id) > 0:
+        await audit.log(
+            db,
+            action=REVERSAL_RECORD,
+            user_id=None,
+            object_type="application",
+            object_id=invoice.application_id,
+            new_value={
+                "invoice_id": str(invoice.id),
+                "transaction_id": str(transaction.id),
+                "reversed_amount": str(reversed_amount),
+                "reconciliation_id": str(reconciliation.id),
+            },
+            basis="a permit exists for an application whose payment was reversed",
+            extra={"risk_indicator": RISK_INDICATOR_PERMIT_WITHOUT_PAYMENT},
+        )
