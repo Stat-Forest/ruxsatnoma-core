@@ -58,6 +58,10 @@ from app.modules.auth.deps import idempotency_context, require_permission
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service, statement_service
 from app.modules.payments.backoffice_schemas import (
+    FiledManualConfirmationOut,
+    ManualConfirmationIn,
+    ManualConfirmationOut,
+    ManualConfirmationRejectIn,
     ReconciliationOut,
     ReconciliationResolveIn,
     StatementAccepted,
@@ -65,7 +69,7 @@ from app.modules.payments.backoffice_schemas import (
     StatementOut,
 )
 from app.modules.payments.models import RECONCILIATION_STATUSES
-from app.modules.payments.permissions import PAYMENTS_MANAGE, PAYMENTS_VIEW
+from app.modules.payments.permissions import PAYMENTS_CONFIRM, PAYMENTS_MANAGE, PAYMENTS_VIEW
 from app.modules.payments.statement_parser import OPTIONAL_FIELDS, REQUIRED_FIELDS
 
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -260,3 +264,106 @@ async def resolve_reconciliation(
         actor=actor,
     )
     return ReconciliationOut.model_validate(row)
+
+
+# --- Tasks 6-7: the maker-checker manual PAID --------------------------------
+#
+# `tz/08` §4's ONE exception to `tz/05` invariant 3, split across two
+# permissions on purpose: the accountant (`payments.manage`) FILES, the
+# leshoz head (`payments.confirm`, granted to `executor_head` by migration
+# 0022) DECIDES. One person can never do both — `backoffice_service.
+# check_manual_confirmation` refuses `actor.id == maker_id` before any write,
+# including for `sys_admin`, whom `require_permission` lets past the code as
+# a superuser: whose two pairs of eyes saw this money is not a permission
+# question.
+#
+# **No `Idempotency-Key` on any of the three.** A replayed filing is refused
+# by the "one `pending_check` at a time" guard (`ERR-PAY-004`), and a
+# replayed decision by the status check plus
+# `uq_provider_transactions_external` — the same reasoning
+# `permits.service.issue` gives for answering `ERR-PERM-001` instead of
+# minting a marker row. The routes that DO need one are those whose replay
+# would create a second row nothing refuses (`POST /payments/bank-statements`
+# above, `POST /invoices/{id}/pay-intents`).
+
+
+@router.post("/manual-confirmations", status_code=201, response_model=FiledManualConfirmationOut)
+async def file_manual_confirmation(
+    body: ManualConfirmationIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_MANAGE))],
+) -> Any:
+    """The MAKER's half: an accountant files that money arrived by bank
+    transfer, with the payment order behind it.
+
+    **201 means filed, not paid** (ruling 4). The invoice is untouched, no
+    ledger row is written and no risk indicator is raised — RI-01 fires when
+    the invoice actually becomes PAID, which is the checker's step below.
+
+    `amount_matches_invoice: false` on the response means the bank document's
+    amount disagrees with the invoice's; the filing is still accepted (ruling
+    5 — an underpayment is a real thing an accountant confirms and then
+    reconciles) and an OPEN `reconciliations` row now carries the difference
+    in the same register `GET /payments/reconciliations` serves.
+    """
+    filed = await backoffice_service.file_manual_confirmation(
+        db,
+        invoice_id=body.invoice_id,
+        amount=body.amount,
+        paid_at=body.paid_at,
+        bank_doc_file_id=body.bank_doc_file_id,
+        actor=actor,
+    )
+    return FiledManualConfirmationOut(
+        **ManualConfirmationOut.model_validate(filed.confirmation).model_dump(),
+        amount_matches_invoice=filed.amount_matches_invoice,
+    )
+
+
+@router.post(
+    "/manual-confirmations/{confirmation_id}/confirm", response_model=ManualConfirmationOut
+)
+async def confirm_manual_confirmation(
+    confirmation_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_CONFIRM))],
+) -> Any:
+    """The CHECKER's approval — the only place in this system where an
+    invoice becomes `paid` without a payment provider saying so.
+
+    It pays through `payments.service.confirm_payment`, unchanged: a
+    synthetic `provider="manual"` transaction goes into the very function the
+    Payme webhook calls, so the ledger, the application's move to PAID, the
+    applicant's notification and the `payment_confirmed` bus hop all happen
+    exactly once and exactly the same way (ruling 14). RI-01 is written to
+    the audit journal as a `result="success"` row.
+
+    `ERR-ACL-001` if the caller filed this confirmation; `ERR-PAY-004` if it
+    was already decided, or if the invoice stopped being `pending` while it
+    waited (a Payme payment may have landed meanwhile).
+    """
+    row = await backoffice_service.check_manual_confirmation(
+        db, confirmation_id, approve=True, reason=None, actor=actor
+    )
+    return ManualConfirmationOut.model_validate(row)
+
+
+@router.post("/manual-confirmations/{confirmation_id}/reject", response_model=ManualConfirmationOut)
+async def reject_manual_confirmation(
+    confirmation_id: uuid.UUID,
+    body: ManualConfirmationRejectIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_CONFIRM))],
+) -> Any:
+    """The CHECKER's refusal (ruling 7): the invoice stays `pending`, no
+    allocation and no synthetic transaction are written, and no RI-01 is
+    raised — nothing became PAID.
+
+    A `reason` is mandatory and must not be blank (`ERR-VAL-001`): a
+    rejection is what the accountant reads to file a corrected one, and the
+    invoice is free to receive a fresh filing afterwards.
+    """
+    row = await backoffice_service.check_manual_confirmation(
+        db, confirmation_id, approve=False, reason=body.reason, actor=actor
+    )
+    return ManualConfirmationOut.model_validate(row)

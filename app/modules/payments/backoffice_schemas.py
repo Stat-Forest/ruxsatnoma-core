@@ -115,3 +115,74 @@ class ReconciliationResolveIn(BaseModel):
 
     comment: str
     resolution_doc_id: uuid.UUID | None = None
+
+
+class ManualConfirmationIn(BaseModel):
+    """`POST /payments/manual-confirmations` — `tz/08` §4's one exception to
+    `tz/05` invariant 3.
+
+    `bank_doc_file_id` is REQUIRED and has no default: ruling 1 makes the
+    stored bank document what makes the exception legal, so an omitted one is
+    `ERR-VAL-001` from FastAPI's own validation, before the service runs —
+    the same unrepresentability `manual_payment_confirmations.bank_doc_file_id`
+    enforces as a NOT NULL FK.
+
+    `amount` is the amount the BANK DOCUMENT says arrived, which may
+    legitimately disagree with `invoices.amount` (ruling 5): an underpayment
+    is a real thing an accountant confirms and then reconciles. It is
+    accepted, recorded and flagged — never refused."""
+
+    invoice_id: uuid.UUID
+    amount: Decimal
+    paid_at: datetime
+    bank_doc_file_id: uuid.UUID
+
+
+class ManualConfirmationRejectIn(BaseModel):
+    """`POST /payments/manual-confirmations/{id}/reject` — a rejection must
+    say why (ruling 7). A missing field is FastAPI's own `ERR-VAL-001`; a
+    present-but-blank one is the service's own check, since a Pydantic `str`
+    requirement cannot see past whitespace the way `str.strip()` can (same
+    split as `ReconciliationResolveIn.comment`)."""
+
+    reason: str
+
+
+class ManualConfirmationOut(BaseModel):
+    """One `manual_payment_confirmations` row — the maker's filing, and what
+    the checker's confirm/reject answers with.
+
+    `bank_doc_file_id` is on the wire on purpose: the document is the whole
+    legal basis of a manual PAID, so a checker asked to approve one must be
+    able to reach it from this response alone."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    invoice_id: uuid.UUID
+    amount: Decimal
+    paid_at: datetime
+    bank_doc_file_id: uuid.UUID
+    maker_id: uuid.UUID
+    checker_id: uuid.UUID | None
+    status: str
+    reason: str | None
+    checked_at: datetime | None
+    created_at: datetime
+
+    @field_serializer("amount")
+    def _amount(self, value: Decimal) -> str:
+        return str(value)
+
+
+class FiledManualConfirmationOut(ManualConfirmationOut):
+    """The filing's own response, with the one fact that is NOT a column:
+    whether the bank document's amount equals the invoice's (ruling 5).
+
+    A subclass rather than a nullable field on the parent, because only the
+    filing path reads the invoice to compare — `reject` never locks it, so a
+    flag on every response would be a value the checker's own routes could
+    not honestly fill in. `false` here always comes with an OPEN
+    `reconciliations` row for the difference."""
+
+    amount_matches_invoice: bool

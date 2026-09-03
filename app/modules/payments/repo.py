@@ -12,10 +12,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.payments.models import (
+    MANUAL_CONFIRMATION_STATUSES,
     Allocation,
     BankStatement,
     BankStatementLine,
     Invoice,
+    ManualPaymentConfirmation,
     PaymentIntent,
     ProviderTransaction,
     Reconciliation,
@@ -370,3 +372,54 @@ async def list_reconciliations(
         )
     ).scalars()
     return list(rows), total
+
+
+# --- 3.10b tasks 6-7: the maker-checker manual payment confirmation ----------
+
+# What "still awaiting a decision" means for a manual confirmation. Unpacked
+# from the model's own tuple rather than retyped, the same way
+# `backoffice_service` unpacks `RECONCILIATION_STATUSES`.
+PENDING_CHECK_STATUS = MANUAL_CONFIRMATION_STATUSES[0]
+
+
+async def add_manual_confirmation(
+    db: AsyncSession, confirmation: ManualPaymentConfirmation
+) -> None:
+    db.add(confirmation)
+    await db.flush()
+
+
+async def get_manual_confirmation_for_update(
+    db: AsyncSession, confirmation_id: uuid.UUID
+) -> ManualPaymentConfirmation | None:
+    """The checker's own locking read: two `payments.confirm` holders (or one
+    double-clicked button) deciding the same filing at once must serialize,
+    or both could read `pending_check` and both go on to synthesize a
+    transaction for the same invoice. `uq_provider_transactions_external`
+    would then abort the second with an IntegrityError 500 rather than the
+    `ERR-PAY-004` a human can read — the lock is what makes the status check
+    above it mean anything (mirrors `get_invoice_for_update`)."""
+    return await db.get(
+        ManualPaymentConfirmation, confirmation_id, with_for_update=True, populate_existing=True
+    )
+
+
+async def get_pending_manual_confirmation(
+    db: AsyncSession, invoice_id: uuid.UUID
+) -> ManualPaymentConfirmation | None:
+    """The one `pending_check` filing standing against `invoice_id`, if any —
+    the maker's "no second filing while one awaits a decision" guard. A
+    `confirmed`/`rejected` row is terminal and does not block a fresh
+    filing, which is why this filters on the status rather than counting
+    rows."""
+    return (
+        await db.scalars(
+            select(ManualPaymentConfirmation)
+            .where(
+                ManualPaymentConfirmation.invoice_id == invoice_id,
+                ManualPaymentConfirmation.status == PENDING_CHECK_STATUS,
+            )
+            .order_by(ManualPaymentConfirmation.created_at)
+            .limit(1)
+        )
+    ).first()
