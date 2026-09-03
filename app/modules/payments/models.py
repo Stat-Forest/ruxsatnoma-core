@@ -352,8 +352,18 @@ class BankStatementLine(Base):
     matched_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("invoices.id"), index=True
     )
+    # Explicit, shortened FK name: the naming convention's default
+    # (`fk_bank_statement_lines_matched_transaction_id_provider_transactions`,
+    # 68 bytes) exceeds Postgres's 63-byte identifier limit, which silently
+    # truncates and hashes it on CREATE — the same trap already fixed for
+    # `ManualPaymentConfirmation`'s CHECK. "provider_tx" here is short for
+    # `provider_transactions`, this table's only other FK to it.
     matched_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("provider_transactions.id"), index=True
+        ForeignKey(
+            "provider_transactions.id",
+            name="fk_bank_statement_lines_matched_transaction_id_provider_tx",
+        ),
+        index=True,
     )
 
     __table_args__ = (

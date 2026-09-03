@@ -35,6 +35,9 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-PAY-002": (422, "Срок оплаты истёк"),
     "ERR-PAY-003": (422, "Сумма оплаты не совпадает с инвойсом"),
     "ERR-PAY-004": (409, "Инвойс не может быть оплачен в текущем статусе"),
+    # Registered by 3.10b task 1, raised by nobody yet — reserved for Task 5
+    # of this stage (closing a reconciliations row), the same "registered,
+    # not dead" pattern as ERR-PERM-002.
     "ERR-PAY-005": (409, "Расхождение уже закрыто"),
     "ERR-PERM-001": (409, "Недопустимый переход статуса разрешения"),
     "ERR-PERM-002": (409, "Документ уже подписан и не может быть перевыпущен"),
