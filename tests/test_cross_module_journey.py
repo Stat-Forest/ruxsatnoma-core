@@ -267,14 +267,20 @@ async def test_the_journey_from_approval_to_the_public_qr_page(
     )
 
 
-async def test_the_permit_is_priced_from_the_calculation_the_invoice_froze(
+async def test_a_calculation_made_after_the_decision_refuses_issuance(
     db: AsyncSession,
     hodim_client: httpx.AsyncClient,
     approved_application: Application,
     grazing_activity_id: uuid.UUID,
 ):
-    """A NEWER calculation lands between invoicing and issuance: the permit must
-    still print what the citizen was billed.
+    """A NEWER calculation lands between invoicing and issuance, and issuance
+    is REFUSED rather than priced.
+
+    Note what this does and does not prove. It asserts the refusal
+    (`calculation_after_decision`), not a price — and it only fires because the
+    test sets `decided_at` itself. Through all of 3.9a that column is NULL, so
+    the divergence this describes is still uncaught today; the guard becomes
+    live when 3.9b starts writing it.
 
     This is the audit's own probe, kept: it inserted a 9 999 999,00 calculation
     after a 2 060 000,00 invoice had been paid and the permit printed the new
@@ -365,7 +371,7 @@ async def test_a_calculation_cannot_be_attached_to_an_application_through_the_wr
 
     It is unreachable through the public write path TODAY only because
     `norms.schemas.CalculationIn.application_id` is typed `None = None`, so
-    `POST /norms/calculations` cannot bind a calculation to an application at
+    `POST /api/v1/calculations` cannot bind a calculation to an application at
     all — an accident of 3.7's fail-closed edge (I4), not a designed guard.
     `norms.save_calculation` itself has no application-status check of any kind.
 
