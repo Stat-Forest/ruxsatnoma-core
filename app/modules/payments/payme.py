@@ -352,10 +352,11 @@ async def _cancel_transaction(
     is literally "funds returned", and until 3.10b builds the reversal the
     system's own books disagree with reality: the invoice stays `paid`, the
     application stays `PAID`, `allocations` still claims two `payment` rows
-    summing to money that has gone back, and `service.is_paid` — the single
-    gate 3.11 checks before issuing a permit — still answers `True`. That
-    is a manual, human reversal on live money, and the log line is the only
-    thing that tells anyone it happened. See the KNOWN GAP paragraph in
+    summing to money that has gone back, `service.is_paid` still answers
+    `True`, and — because `permits.service.issue` gates on the APPLICATION's
+    own status, which nothing moves off PAID — a permit can still be issued
+    for it. That is a manual, human reversal on live money, and the log line
+    is the only thing that tells anyone it happened. See the KNOWN GAP paragraph in
     `service.py`'s public-surface comment for the whole shape of it."""
     external_id = _external_id(params)
     transaction = (

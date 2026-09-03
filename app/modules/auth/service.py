@@ -821,6 +821,24 @@ async def has_effective_representation_of(
     return representation is not None
 
 
+async def effective_representation_of(
+    db: AsyncSession, *, user_id: uuid.UUID, applicant_id: uuid.UUID
+) -> Representation | None:
+    """The ROW behind `has_effective_representation_of` above, for a caller that
+    has to STORE which power of attorney it acted under rather than merely check
+    that one exists — `applications.service.create_draft` fills
+    `applications.representation_id`, the column that says on whose authority a
+    representative filed for a legal entity.
+
+    Same "effective" meaning as every sibling here: `status='active'` and not
+    past `valid_until`, judged against `business_today()`, never `date.today()`
+    (lesson). Same repo call as the boolean sibling, so the two can never
+    disagree about which representation is the effective one."""
+    return await repo.get_effective_representation(
+        db, applicant_id=applicant_id, user_id=user_id, today=business_today()
+    )
+
+
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
     """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
     `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not
@@ -832,6 +850,33 @@ async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant |
     application, since a legal entity's `Applicant` row is shared by several
     representatives."""
     return await repo.get_own_applicant(db, user_id)
+
+
+async def own_applicant_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uuid.UUID]:
+    """Every `applicants` row this user may act for TODAY: their own individual
+    row (`applicants.owner_user_id`) plus every legal entity they hold an
+    EFFECTIVE representation of — exactly the set `GET /auth/me` already reports
+    back to the user as "who I can act for".
+
+    The set-shaped companion of `has_effective_representation` above, and the
+    reason it exists: a caller asking about ONE applicant can ask that one; a
+    caller building a QUERY over somebody's own rows (`GET /api/v1/permits`,
+    3.11a) cannot, and would otherwise have to import `auth.repo` across the
+    module boundary. "Effective" means the same thing here as everywhere else in
+    this file — `status='active'` and not past `valid_until`, judged against
+    `business_today()`, never `date.today()` (lesson).
+
+    No permission and no zone rule, like `get_applicant`/`role_code` above: the
+    caller is another SERVICE inside this process, and the gates live on the
+    routes that reach it.
+    """
+    own = await repo.get_own_applicant(db, user_id)
+    ids = [] if own is None else [own.id]
+    ids.extend(
+        applicant.id
+        for _, applicant in await repo.effective_representations(db, user_id, business_today())
+    )
+    return ids
 
 
 async def update_contact(
@@ -899,6 +944,55 @@ async def get_notification_contact(
         email=user.email,
         email_verified=user.email_verified_at is not None,
     )
+
+
+async def get_applicant(db: AsyncSession, applicant_id: uuid.UUID) -> Applicant | None:
+    """One `applicants` row by id, or None. No permission and no zone rule — the
+    same shape as `get_notification_contact` above: the caller is another SERVICE
+    inside this process, and the gates live on the routes that reach it.
+
+    `applicants` lives in this module, so a level-3/4 caller holding only an
+    `applicant_id` (permits 3.11a copies the holder's name and PINFL/STIR into the
+    immutable permit snapshot; `applications` carries the id and nothing more) has
+    no other lawful way to read it — cross-module calls go through the other
+    module's service, never its repo (CLAUDE.md module boundary)."""
+    return await db.get(Applicant, applicant_id)
+
+
+async def role_code(db: AsyncSession, user: User) -> str | None:
+    """This user's `roles.code`, or None if the role row vanished (should not
+    happen: FK). No permission and no zone rule — the same shape as
+    `get_applicant` above: the caller is another SERVICE inside this process.
+
+    `permits` (3.11a) needs it because a permit's four signature lines are
+    role-based (`permits/signers.py`, ruling 4), and it reads the fact through
+    this service because that is the boundary rule's default (CLAUDE.md:
+    cross-module calls go through the other module's service). It is not the only
+    way: `signatures.service`'s own module docstring documents a NARROW exception
+    for `auth.repo.role_code`/`permission_codes` read directly, and
+    `norms.service`, `gis.service`, `admin.users_service` and
+    `permits.service._holds_view_any` all use it for an in-handler permission
+    check. This wrapper is the plain read; reach past it only for that shape, and
+    say so where you do. `auth.deps._authorize` reads the same fact through
+    `repo.role_code` directly, being inside this module.
+    """
+    return await repo.role_code(db, user)
+
+
+async def role_of(db: AsyncSession, user: User) -> Role | None:
+    """This user's whole `roles` row, or None if it vanished (should not
+    happen: FK). `role_code` above's sibling, and the same shape: no permission
+    and no zone rule, because the caller is another SERVICE in this process.
+
+    `applications` (3.9a) needs the ROW rather than the code because decision
+    #29's approval ceilings — `max_approve_amount` and `max_approve_area` — are
+    columns of `roles`, and reading them through `auth.repo` from another module
+    would reach past this module's declared surface for two attributes.
+    Comparing them against an application's amount and area is the CALLER's
+    business rule, not this module's, so what comes back is the row and not a
+    verdict.
+    """
+    return await repo.get_role(db, user.role_id)
 
 
 async def list_user_ids_by_role_codes(

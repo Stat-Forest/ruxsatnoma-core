@@ -1321,6 +1321,36 @@ async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.
     return await repo.contour_organization(db, contour_id)
 
 
+def contour_organization_column(contour_id_col: Any) -> Any:
+    """`contour_organization` above, shaped as a SQL expression for a caller
+    whose zone rule has to run INSIDE a paged query.
+
+    First consumer: `applications` (level 3, so it reaches this module only
+    through this service). An application carries `assigned_org_id`, which is
+    null until a reviewer takes it into work, so the organization its zone rule
+    must compare against is `coalesce(assigned_org_id, <the contour's owner>)` —
+    a per-row resolution the card can do with `contour_organization` above and
+    `GET /applications` cannot, because a filter applied after paging is not a
+    filter. Returning the correlated subquery keeps every statement over
+    `contours` built here, in the module that owns the table.
+    """
+    return repo.contour_organization_column(contour_id_col)
+
+
+async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
+    """This contour's own number (`tz/13` § 1-илова requisite 9, «ID контура/
+    субконтура»), or None if there is no such contour. Identity only, like
+    `contour_organization` beside it — no version, no geometry, no occupancy.
+
+    A string rather than the `Contour` row on purpose: 3.11a copies it into an
+    immutable permit snapshot and needs nothing else, and a row handed out here
+    would be a second, ungated way to read this module's state. `contour_card`
+    is not the answer to this question — it requires a published version, needs
+    an HTTP actor, and calls back into `OCCUPANCY_PROVIDERS`, which permits
+    itself registers."""
+    return await repo.contour_number(db, contour_id)
+
+
 async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.CheckResult]:
     """The four topology checks against one version, with no actor and no
     contour id — what a norm or an application pre-check needs.

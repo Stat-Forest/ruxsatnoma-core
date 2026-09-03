@@ -51,6 +51,32 @@ async def organization_or_404(db: AsyncSession, org_id: uuid.UUID) -> Organizati
     return org
 
 
+async def parent_organization(db: AsyncSession, org_id: uuid.UUID) -> Organization | None:
+    """One step up ruling 6's chain (agency -> territorial -> leshoz -> bolim ->
+    aylanma -> bolak), or `None` at the top.
+
+    Written for 3.9a's over-limit forward (decision #29: «эскалируется
+    ваколатли шахсу вышестоящей организации»). It lives here rather than in the
+    calling module because reference data is read through `admin`'s own service
+    (CLAUDE.md) — a private `SELECT parent_id` in `applications.repo` would be a
+    boundary violation however small it looks, and the next caller that needs
+    the same step would write a second one.
+
+    **`None` means "this is the root", and nothing else.** An unknown id raises
+    404 through `organization_or_404` rather than answering `None`, so a caller
+    refusing an escalation with «no parent organization» can never be answering
+    a typo instead.
+
+    No archived-parent branch, and that is a fact about the data rather than an
+    omission: `archive_organization` refuses to archive a node that still has
+    active children, so an active organization cannot have an archived parent.
+    """
+    org = await organization_or_404(db, org_id)
+    if org.parent_id is None:
+        return None
+    return await repo.get_organization(db, org.parent_id)
+
+
 # Which parent kind each kind may hang off (ruling 6). `leshoz` accepts both because
 # republic-subordinated leshozes report to the agency directly (old system's
 # Department.management flag).

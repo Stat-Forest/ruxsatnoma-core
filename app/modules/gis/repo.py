@@ -170,6 +170,30 @@ async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.
     return rows.scalar_one_or_none()
 
 
+def contour_organization_column(contour_id_col: Any) -> Any:
+    """`contour_organization` above as a SQL EXPRESSION rather than a value: a
+    correlated scalar subquery resolving whatever `contour_id_col` holds, row by
+    row, to the organization that owns that contour.
+
+    Exists for a caller that has to apply a zone rule inside a PAGED query and
+    therefore cannot resolve one id at a time — `applications.repo.list_
+    applications`, whose `assigned_org_id` is null until a reviewer takes the
+    application into work, so the effective organization is
+    `coalesce(assigned_org_id, <this>)`. Handed out through `gis.service`, never
+    imported from here: the module boundary is about who may build SQL over
+    `contours`, and this keeps that answer "gis" even when the surrounding
+    SELECT belongs to somebody else.
+    """
+    return select(Contour.organization_id).where(Contour.id == contour_id_col).scalar_subquery()
+
+
+async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
+    """The contour's own number, or None if there is no such contour. Identity
+    only, exactly like `contour_organization` above."""
+    rows = await db.execute(select(Contour.number).where(Contour.id == contour_id))
+    return rows.scalar_one_or_none()
+
+
 # --- Task 6: layer_features (restriction, protection, fire-ban and every
 # other non-contour layer object) --------------------------------------------
 #

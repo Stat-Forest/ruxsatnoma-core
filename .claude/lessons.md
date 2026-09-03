@@ -213,16 +213,18 @@ Tooling and environment.
   `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints` are the
   shape. `admin.models.ORGANIZATION_KINDS` still retypes its CHECK — fix on next touch.
 
-## A service-level pre-check can leave its mirrored DB CHECK permanently unexercised
+## Two mechanisms refusing one thing: an outcome-only test cannot tell which one fired
 
-- **Rule:** When a service pre-checks a rule a CHECK also enforces (our defense-in-depth
-  pattern), write a SEPARATE model-level test inserting through the ORM directly — an
-  API-level test alone never reaches the CHECK.
-- **Why:** `Contour.parent_needs_subcontour` had a test from Task 1, but only through
-  `POST /gis/contours`, which raises `ERR-VAL-001` from the service before a row is even
-  constructed; the CHECK first fired in Task 3's direct-ORM test.
-- **How to apply:** Adding a `CheckConstraint` → grep for a `pytest.raises(IntegrityError)`
-  that actually exercises it, not just the guard in front of it. Two tests, not one.
+- **Rule:** When something else also refuses what your guard refuses — a DB CHECK behind a
+  service pre-check, a later guard in the same function — assert the RECORDED reason, not
+  just the status code, and revert the guard to prove that test goes red.
+- **Why:** Twice, one class. `parent_needs_subcontour`'s only test went through
+  `POST /gis/contours`, which raises `ERR-VAL-001` before a row exists, so the CHECK never
+  ran (3.6a t3). `permits.signers.is_known` was redundant — an unmapped purpose fell
+  through to the role comparison as `wrong_role`, so deleting the guard left it green.
+- **How to apply:** Adding a guard in front of an existing refusal → one test per
+  mechanism, each asserting its OWN reason (a direct-ORM `pytest.raises` for a CHECK). A
+  negative control that stays green means the guard is redundant, not that it works.
 
 ## A failed DB statement aborts the whole transaction — catch the right type, recover with a SAVEPOINT
 
@@ -230,20 +232,20 @@ Tooling and environment.
   constraint via `getattr(exc.orig.__cause__, "constraint_name", None)`, never `exc.orig` or
   the message. To keep writing on the same session after ANY failed statement, wrap the
   risky work in `async with db.begin_nested():` (a SAVEPOINT), never a bare `db.rollback()`.
-- **Why:** `gis.service.create_version` caught only `DBAPIError`, mapping every DB failure
-  to `ERR-GIS-001` ("unreadable geometry") — a `uq_contour_version_no` race raises
-  `IntegrityError`, a subclass, so a version conflict read as a geometry defect (3.6a t3).
-  Never judge from the name: an append-only trigger's plain `RAISE EXCEPTION` (audit_log,
-  calculations, application_status_history) is SQLSTATE `P0001`, outside the `23xxx` class,
-  and surfaces as `DBAPIError` — and so does `DeadlockDetected`, which no `except
-  DomainError` can contain (3.10a's sweep, deadlocking against `PerformTransaction`).
+- **Why:** `gis.service.create_version` caught only `DBAPIError`, so a `uq_contour_version_no`
+  race — `IntegrityError`, a subclass — was reported as `ERR-GIS-001` "unreadable geometry"
+  (3.6a t3). Never judge from the name: an append-only trigger's plain `RAISE EXCEPTION`
+  (audit_log, calculations, application_status_history) is SQLSTATE `P0001`, outside `23xxx`,
+  and surfaces as `DBAPIError` — as does `DeadlockDetected`, which `except DomainError` misses.
 - **The recovery half:** a bare `db.rollback()` undoes the WHOLE transaction, not just the
-  failed statement — `signatures.service.sign()`'s race path silently discarded a caller's
-  earlier uncommitted work. Worse in a loop: Postgres then refuses every later statement AND
-  turns the final `COMMIT` into a silent `ROLLBACK`, so a broad `except` without a savepoint
-  lets a job "complete" while throwing its whole night away — one savepoint PER ROW is what
-  makes the next row writable. `exc.orig` (SQLAlchemy's asyncpg wrapper) exposes only
-  `pgcode`; `exc.orig.__cause__` alone carries `constraint_name`.
+  failed statement — `sign()`'s race path silently discarded a caller's earlier uncommitted
+  work. Worse in a loop: Postgres then refuses every later statement AND turns the final
+  `COMMIT` into a silent `ROLLBACK`, so a job "completes" while throwing its whole night
+  away — one savepoint PER ROW is what makes the next row writable.
+- **The savepoint's own trap:** its ROLLBACK EXPIRES every instance dirty inside it, so
+  reading `row.applicant_id` in the `except` is a lazy reload — `MissingGreenlet` from inside
+  the handler, a 500 where the clean 409 was (3.9a t5, the duplicate guard). Copy what the
+  handler needs into locals BEFORE the `async with`.
 - **Your handler is not the end of the transaction:** `get_db` commits AGAIN after it
   returns, so a route that swallows a DB failure and answers anyway (`payme_router.py`,
   always-200) must `await db.rollback()` in its own try, or that second commit 500s.
@@ -695,24 +697,35 @@ Tooling and environment.
 - **Why:** The DB is shared across worktrees and runs, committing client fixtures leave rows
   behind forever, and the round-trip test wipes it wholesale (collection order pinned in
   `tests/conftest.py`). Four consequences paid for already, each with its remedy:
-  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 4 stray contours before
-    3.6a t4 and 11 after, so a "nothing overlaps here" assertion there is flaky from birth
-    → randomise (`random_box_wkt()`, `unique_suffix`, a `storage_key`), unless a sibling
+  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 4 stray contours before 3.6a
+    t4 and 11 after, and a hard-coded `permits.number=1` dies once issuance commits one →
+    randomise (`random_box_wkt()`), or take the next value from the counter, unless a sibling
     deliberately needs proximity (`neighbouring_published_contour`).
-  - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the
-    oldest `pending` import in the DB, not yours, and an interrupted run strands one forever
-    (`test_two_workers…` sees `[1, 1]` not `[0, 1]`) → a package-scoped autouse drain that
-    runs the JOB, bounded by `DRAIN_LIMIT`, never an unscoped DELETE.
+  - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the oldest
+    `pending` import in the DB, not yours (`test_two_workers…` sees `[1, 1]` not `[0, 1]`) →
+    a package-scoped autouse drain running the JOB, bounded by `DRAIN_LIMIT`, never a DELETE.
   - **Paging:** page 1 is full of previous runs, so
     `test_an_applicant_sees_published_contours_only` went red the moment the endpoint was
     paged → assert `total` plus a scoped filter (a fresh `organization_id`), not membership.
   - **A refused action leaves its row:** `test_a_maker_cannot_archive_a_published_tariff`
     succeeds BY being refused, so its `science` tariff stays published forever — breaking
-    `test_science_has_no_tariff` (`count(*) == 0`; archived counts too) and its own next run
-    with `period_overlap` → a yield-fixture teardown with a scoped DELETE.
+    `test_science_has_no_tariff` and its own next run → a yield-fixture teardown with a
+    scoped DELETE. And a row the test then REFERENCES cannot be deleted at all
+    (`permits.template_id`'s FK, and an append-only `permit_status_history` blocks deleting
+    the referrer too) → get-or-create with fixed ids, never create-and-clean-up.
 - **How to apply:** Scope every assertion by the ids your fixture created. Run any new
   negative test twice in a row, and as part of the FULL suite — this class is invisible in
   isolation. Do not reorder the conftest collection hook.
+
+## The `db` fixture session and the app's session never see each other's current state
+
+- **Rule:** Refresh a row before ASSERTING on it if a request may have changed it; the write
+  direction (`_commit_pending_before_requests`) is the conftest-plumbing entry below.
+- **Why:** Silent — `service.get(db, id)` is `db.get`, NO SELECT for a row already in the identity
+  map — so two permits tests asserted `status == "PAID"` after the app wrote `PERMIT_ISSUED` (3.11a t4).
+- **How to apply:** Route every assertion on an app-mutable row through ONE refreshing helper —
+  a remembered `db.refresh` is what failed twice (`permits/test_signatures.py::_reread`).
+
 
 ## A module's test conftest needs plumbing copied from an existing one, not just fixtures
 
@@ -753,6 +766,7 @@ Tooling and environment.
 - **How to apply:** Writing a fixture whose docstring says "an application already in X",
   ask which call puts it there and make the fixture do that; `tests/modules/payments/
   conftest.py`'s `pending_invoice`/`cancelled_invoice` are the template.
+
 
 ## A conftest autouse fixture runs before your test — schema checks belong in the gate
 

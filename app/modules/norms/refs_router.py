@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.core.errors import err
-from app.core.schemas import Page
+from app.core.schemas import PAGING_MAX, Page
 from app.core.time import business_today
 from app.modules.admin import repo as admin_repo
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
@@ -67,7 +67,7 @@ async def list_parameters(
     code: str | None = None,
     status: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
     items, total = await repo.list_parameters(
         db, code=code, status=status, limit=limit, offset=offset
@@ -151,7 +151,7 @@ async def list_tariffs(
     on_date: date | None = None,
     status: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
     resolved_activity_type_id = await _resolve_activity_type_id(
         db, activity_code=activity_code, activity_type_id=activity_type_id

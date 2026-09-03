@@ -285,18 +285,38 @@ class CalculationIn(BaseModel):
     `input_snapshot` from the contour's own published area, never a
     client-declared figure — see `service._compute`)."""
 
-    # REFUSED for the whole of 3.7 (I4, final review), and opened by STAGE 3.9
-    # — the stage that creates `applications` and with them the ownership this
-    # request cannot ask about. `POST /calculations` used to persist whatever
-    # arrived here: no FK (ruling 4 defers it), no ownership check, and
-    # `calculations` is append-only, so a row bound to ANY application id
-    # could be written by any authenticated user and never deleted or
-    # corrected. 3.10 builds an invoice from "the newest row for the
-    # application", which makes a pre-seeded row a live under-billing vector
-    # the moment `applications` exists. Nothing in this stage can validate the
-    # id and no legitimate caller has one yet, so it fails closed at the edge
-    # rather than staying an undocumented open write.
-    application_id: None = None
+    # OPENED BY STAGE 3.9a (task 5), together — in the same commit — with the
+    # two guards that make it safe. It was typed `None` for the whole of 3.7
+    # (finding I4, final review) because `POST /calculations` persisted
+    # whatever arrived here: no FK, no ownership check, no status check, and
+    # `calculations` is append-only, so a row bound to ANY application id could
+    # be written by any authenticated user and never deleted or corrected.
+    #
+    # The three things that had to land with the wider type, and did:
+    #
+    #   * the FOREIGN KEY — `fk_calculations_application_id_applications`,
+    #     shipped by migration 0015 (NOT VALID, then VALIDATE CONSTRAINT, the
+    #     way 3.2a closed `audit_log.user_id`), so an id that names nothing is
+    #     refused by the database;
+    #   * the OWNERSHIP check — the caller must own the target application or
+    #     be staff entitled to review it;
+    #   * the STATUS check — an application at APPROVED or beyond may not
+    #     receive a calculation at all.
+    #
+    # Both checks live in `service.save_calculation` and NOT in `calc_router`,
+    # because `applications.service.submit` is the other caller and would walk
+    # straight past a router-level gate. Read the block comment above
+    # `save_calculation` for why the status half is a money question rather
+    # than a tidiness one: `payments.issue_invoice` and `permits.issue` each
+    # read the NEWEST calculation independently and cannot compare notes, and
+    # an audit probe on the merged 3.9a/3.10a/3.11a branch had a citizen billed
+    # 2 060 000,00 while the permit printed 9 999 999,00.
+    #
+    # `submit` is still the only path that SHOULD be setting this in 3.9a
+    # (ruling 8: exactly one calculation, written at submission); the guards
+    # exist because "should" is not a mechanism on a route open to every
+    # authenticated user.
+    application_id: uuid.UUID | None = None
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     period_from: date

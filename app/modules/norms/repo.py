@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import date
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import RowMapping, Select, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
@@ -164,7 +164,9 @@ async def list_norms(
     return await paginate(db, stmt, limit, offset)
 
 
-def _calculations_query(application_id: uuid.UUID | None) -> Select:
+def _calculations_query(
+    application_id: uuid.UUID | None, created_by: uuid.UUID | None, unbound_only: bool
+) -> Select:
     """The WHERE + ORDER BY `list_calculations` and `newest_calculation`
     share, NEWEST first — the one ordering in this module not by
     `effective_from`, since a calculation has no period of its own. `id`
@@ -173,23 +175,53 @@ def _calculations_query(application_id: uuid.UUID | None) -> Select:
     stmt = select(Calculation)
     if application_id is not None:
         stmt = stmt.where(Calculation.application_id == application_id)
+    if created_by is not None:
+        stmt = stmt.where(Calculation.created_by == created_by)
+    if unbound_only:
+        stmt = stmt.where(Calculation.application_id.is_(None))
     return stmt.order_by(Calculation.created_at.desc(), Calculation.id.desc())
 
 
 async def list_calculations(
-    db: AsyncSession, *, application_id: uuid.UUID | None, limit: int, offset: int
+    db: AsyncSession,
+    *,
+    application_id: uuid.UUID | None,
+    created_by: uuid.UUID | None,
+    unbound_only: bool,
+    limit: int,
+    offset: int,
 ) -> tuple[list[Calculation], int]:
     """An append-only table's history, paged, with its total (review M3:
-    the `COUNT(*)` a page needs and `newest_calculation` below does not)."""
-    return await paginate(db, _calculations_query(application_id), limit, offset)
+    the `COUNT(*)` a page needs and `newest_calculation` below does not).
+
+    `created_by` and `unbound_only` are ruling 11's two scopes, and BOTH are
+    keyword-only with NO default on purpose: this table holds every fee the
+    system has ever quoted, and an unscoped read of it is the defect this stage
+    exists to close. The caller — `service.list_calculations`, the only one —
+    has to state each one deliberately.
+
+    They are applied as SQL rather than as a post-filter over the page, which
+    is not a style choice: `paginate` computes `total` from the same statement,
+    so a predicate applied in Python after the window would return a page of
+    N-1 items claiming a total of N, and would additionally cost one
+    `application_facts` round trip per row on every listing.
+    """
+    return await paginate(
+        db, _calculations_query(application_id, created_by, unbound_only), limit, offset
+    )
 
 
 async def newest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Calculation | None:
     """The single newest row for `application_id`, or `None` — `LIMIT 1` off
     the same ordering as `list_calculations`, without `paginate`'s
     `COUNT(*)` (review M3: `norms.service.latest_calculation` runs this once
-    per invoice build in 3.10, and the total is never used there)."""
-    stmt = _calculations_query(application_id).limit(1)
+    per invoice build in 3.10, and the total is never used there).
+
+    `created_by=None` on purpose and not by default: this is the IN-PROCESS
+    read 3.10a builds an invoice from, where the caller is another service and
+    ruling 11's scope — an HTTP rule about a signed-in human — does not
+    apply."""
+    stmt = _calculations_query(application_id, created_by=None, unbound_only=False).limit(1)
     return (await db.execute(stmt)).scalars().first()
 
 
@@ -200,3 +232,63 @@ async def paginate(db: AsyncSession, stmt: Select, limit: int, offset: int) -> t
     ).scalar_one()
     rows = await db.execute(stmt.limit(limit).offset(offset))
     return list(rows.scalars()), total
+
+
+# --- Ruling 20 (plan 03.9a): the ONE read of another module's table ----------
+#
+# `norms` is level 2 and `applications` is level 3, so `norms` may NOT call
+# `applications.service` to ask whose application a calculation belongs to.
+# **Ruling 20 grants `norms` a read-only right on the `applications` table for
+# this ONE OWNERSHIP PREDICATE, in THIS FILE and nowhere else.**
+#
+# One predicate, both directions. It was written for the WRITE guard (task 5,
+# "may this actor bind a calculation to this application"); stage 3.9a task 8
+# reuses the identical five columns for ruling 11's READ rule ("may this actor
+# see a calculation bound to this application"), and deliberately adds NO
+# second query — reuse is the whole point of the grant being one predicate.
+# Three service functions now share it (`_assert_application_open_for_
+# calculation`, `_may_read_calculation`, `list_calculations`); a fourth wanting
+# a SIXTH COLUMN is what would need the ruling amended again, not a fourth
+# caller of these five.
+#
+# This is a NEW exception that AMENDS design/01 rule 5 — it is not an instance
+# of it. Rule 5's targeted addition reads, verbatim: "`gis` and `norms` get the
+# same read-only right on the `permits` table **(and only on it)**". The
+# parenthesis is the whole point of that sentence: it exists to stop the
+# exception spreading. Extending it to `applications` therefore had to be
+# recorded as its own ruling, and Task 9 edits design/01 to say so.
+#
+# The scope is a HARD LIMIT, not an example: `id`, `applicant_id`,
+# `assigned_org_id`, `contour_id` (ruling 20's own four) plus `status`
+# (controller ruling R15, added when the status guard below became this
+# stage's obligation — ruling 20's column list was written for the ownership
+# predicate alone, and the guard cannot be written without it). Ruling 11's
+# read rule needed nothing further: it asks about ownership and the zone, which
+# is `applicant_id` and `assigned_org_id`/`contour_id`. Any WRITE, and any read
+# from `norms/service.py`, is still forbidden.
+#
+# Raw SQL naming the five columns rather than an ORM query: importing
+# `applications.models` here would be a level-3 import from a level-2 module —
+# the very thing the ruling was needed to avoid — and the explicit column list
+# is the limit above, written where it is enforced rather than only promised.
+_APPLICATION_FACTS_SQL = text(
+    "SELECT id, applicant_id, assigned_org_id, contour_id, status "
+    "FROM applications WHERE id = :application_id"
+)
+
+
+async def application_facts(db: AsyncSession, application_id: uuid.UUID) -> RowMapping | None:
+    """The five columns of ruling 20 (as amended by R15) for one application,
+    or `None` when no such application exists.
+
+    Read-only, and the only place in `norms` that touches this table.
+
+    THREE callers, all in `norms.service` and all asking the same ownership
+    question of the same five columns: `_assert_application_open_for_
+    calculation` (task 5's write guard), `_may_read_calculation` and
+    `list_calculations` (task 8's ruling-11 read rule). A caller wanting a
+    SIXTH COLUMN is a sign the ruling needs amending again; another caller of
+    these five is the grant working as intended.
+    """
+    rows = await db.execute(_APPLICATION_FACTS_SQL, {"application_id": application_id})
+    return rows.mappings().first()

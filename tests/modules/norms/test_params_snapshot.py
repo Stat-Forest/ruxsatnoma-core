@@ -112,12 +112,18 @@ async def test_load_snapshot_returns_the_tariffs_in_force_for_the_activity(
     assert haymaking.tariffs[0].coefficient == Decimal("1.50")
 
 
-async def test_with_no_load_providers_registered_the_load_is_zero(
+async def test_a_contour_with_no_permits_on_it_reports_a_measured_zero(
     db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
 ) -> None:
-    """Ruling 12: `ActivePermitsSB` is a registered seam with nothing behind
-    it until 3.11 — a caller must never mistake the placeholder for a
-    measurement, which is why the source string says so."""
+    """Ruling 12, second half. This asserted `load_source == "none"` while
+    `LOAD_PROVIDERS` was empty — the placeholder that kept a caller from reading
+    the zero as a measurement. 3.11a registers `permits.service.load_provider`
+    (`app/event_subscriptions.py`), so the zero now means "no permit commits a
+    single head on this contour" and the source says who measured it.
+
+    Kept rather than deleted: the snapshot is what `calculations.input_snapshot`
+    freezes forever, so which of the two a stored calculation recorded is a
+    legally meaningful difference, and this is where it is pinned."""
     snapshot = await params.load_snapshot(
         db,
         request=_request(on_date=date(2026, 8, 30), activity_code="haymaking"),
@@ -125,7 +131,7 @@ async def test_with_no_load_providers_registered_the_load_is_zero(
         activity_type_id=haymaking_activity_id,
     )
     assert snapshot.load_sb == Decimal("0")
-    assert snapshot.load_source == "none"
+    assert snapshot.load_source == "permits"
 
 
 async def test_a_calculation_with_no_contour_gets_no_norm_and_no_load(
