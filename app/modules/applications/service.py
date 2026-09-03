@@ -1704,10 +1704,18 @@ async def _apply_transition(
     action: str,
     actor: User,
     reason: str | None = None,
+    reason_item_id: uuid.UUID | None = None,
+    legal_basis: str | None = None,
 ) -> ApplicationStatusHistory:
     """Move an ALREADY-LOCKED application one legal edge, and leave the two
     records every transition owes behind: the `application_status_history` row
     and one `audit_log` entry under the CALLER'S flow verb (ruling 17).
+
+    `reason_item_id`/`legal_basis` are task 7's rejection grounds (`tz/04` С8)
+    and are set HERE, before the insert, never on the returned row: migration
+    0015's BEFORE UPDATE trigger makes `application_status_history` append-only,
+    so a caller that filled them in afterwards would raise instead of
+    recording them.
 
     Deliberately not `set_status`: that function is the level-4 public surface
     and audits every move as `application.status_change`, which cannot say
@@ -1733,12 +1741,19 @@ async def _apply_transition(
         to_status=to_status,
         changed_by=actor.id,
         reason_text=reason,
+        reason_item_id=reason_item_id,
+        legal_basis=legal_basis,
     )
     await repo.add_status_history(db, entry)
     # `updated_at` is `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
     # after a plain UPDATE (lesson: the row in memory is not what Postgres
     # stored) — and every caller here serializes this row into its response.
     await db.refresh(application)
+    new_value: dict[str, Any] = {"status": to_status}
+    if reason_item_id is not None:
+        new_value["reason_item_id"] = str(reason_item_id)
+    if legal_basis is not None:
+        new_value["legal_basis"] = legal_basis
     await audit.log(
         db,
         action=action,
@@ -1746,8 +1761,8 @@ async def _apply_transition(
         object_type="application",
         object_id=application.id,
         old_value={"status": from_status},
-        new_value={"status": to_status},
-        basis=reason,
+        new_value=new_value,
+        basis=reason or legal_basis,
     )
     return entry
 

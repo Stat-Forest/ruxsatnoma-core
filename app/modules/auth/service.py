@@ -979,6 +979,22 @@ async def role_code(db: AsyncSession, user: User) -> str | None:
     return await repo.role_code(db, user)
 
 
+async def role_of(db: AsyncSession, user: User) -> Role | None:
+    """This user's whole `roles` row, or None if it vanished (should not
+    happen: FK). `role_code` above's sibling, and the same shape: no permission
+    and no zone rule, because the caller is another SERVICE in this process.
+
+    `applications` (3.9a) needs the ROW rather than the code because decision
+    #29's approval ceilings — `max_approve_amount` and `max_approve_area` — are
+    columns of `roles`, and reading them through `auth.repo` from another module
+    would reach past this module's declared surface for two attributes.
+    Comparing them against an application's amount and area is the CALLER's
+    business rule, not this module's, so what comes back is the row and not a
+    verdict.
+    """
+    return await repo.get_role(db, user.role_id)
+
+
 async def list_user_ids_by_role_codes(
     db: AsyncSession, role_codes: Sequence[str]
 ) -> list[uuid.UUID]:

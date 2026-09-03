@@ -21,9 +21,11 @@ re-exported AND consumed here."""
 import secrets
 import uuid
 from collections.abc import AsyncIterator
+from datetime import date
+from decimal import Decimal
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -31,10 +33,13 @@ from app.core.models import MediaFile
 from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
-from app.modules.admin.models import Organization
+from app.modules.admin.models import Classifier, ClassifierItem, Organization
 from app.modules.applications.permissions import APPLICATIONS_REVIEW
-from app.modules.auth.models import Applicant, Representation, User
+from app.modules.auth.models import Applicant, Representation, Role, RolePermission, User
 from app.modules.gis.models import Contour, GisLayer
+from app.modules.norms import calculator
+from app.modules.norms import params as norm_params
+from app.modules.norms.models import Norm
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client
 from tests.modules.auth.test_sessions import make_session, make_user
@@ -60,6 +65,7 @@ from tests.modules.gis.conftest import other_leshoz as other_leshoz
 # without it a grazing calculation cannot be computed AT ALL and
 # `norms.service.preview` raises `ERR-NORM-004` naming the missing parameter.
 # Both open their OWN session on purpose — see their docstrings.
+from tests.modules.norms.conftest import CONTOUR_AREA_HA
 from tests.modules.norms.conftest import published_coef_sb as published_coef_sb  # noqa: F401
 from tests.modules.norms.conftest import (
     published_grazing_norm as published_grazing_norm,  # noqa: F401
@@ -610,3 +616,378 @@ async def submitted_application(applicant_client, draft_ready_for_submission: st
     result = await _submit(applicant_client, draft_ready_for_submission)
     assert result.status_code == 200, result.text
     return draft_ready_for_submission
+
+
+# --- Task 7: the head's decision ----------------------------------------------
+
+# The ONE PINFL `test_decision.py::_decide` signs with, and the reason the
+# `executor_head_client` below is a get-or-create rather than a fresh user per
+# test (lesson: the test DB is shared, persistent, and never empty — a row the
+# test then REFERENCES cannot be cleaned up, so take fixed ids).
+#
+# Two mechanisms in `signatures.service` force a STABLE identity here, and
+# `test_submit.py::_submit`'s own docstring records both after hitting them:
+#
+#   * `sign()` re-proves ownership on EVERY call (`_ownership_reason`), so the
+#     certificate's PINFL must be the caller's own or the attempt is refused
+#     `certificate_pinfl_mismatch`;
+#   * `certificates` is UNIQUE on `(serial_number, issuer)` and each row is
+#     BOUND to one user, so the fixed `HEAD-1`/`ISS-1` pair binds to whoever
+#     signs first and is refused for everyone afterwards — including this same
+#     fixture on the suite's SECOND run.
+#
+# `_submit` answers that by randomising both; a decision cannot, because the
+# brief's `_decide` helper names the identity as a literal. So the head is one
+# durable user instead: the same PINFL, the same certificate, re-zoned to
+# whichever `leshoz` the current test built. Leading digit 9 — this package's
+# own `unique_pinfl()` uses 1, and the other test packages sharing this database
+# claim 2 through 8.
+EXECUTOR_HEAD_PINFL = "98765432109876"
+
+# Non-system roles invented by this file, one per axis of decision #29. They
+# have to be roles and not per-user grants: `max_approve_amount` and
+# `max_approve_area` are columns of `roles`, so a limit is a property of the
+# role and of nothing else. `is_system=False` keeps them out of
+# `tests/test_permissions_registry.py`'s and `test_auth_models.py`'s counts,
+# both of which filter on that column for exactly this reason.
+LIMITED_HEAD_ROLES = {
+    # Well under a real grazing fee (millions of soʻm) and under 92 ha.
+    "test_head_limit_both": (Decimal("1.00"), Decimal("1.0000")),
+    "test_head_limit_amount": (Decimal("1.00"), None),
+    "test_head_limit_area": (None, Decimal("1.0000")),
+}
+
+
+async def _limited_head_role(db: AsyncSession, code: str) -> uuid.UUID:
+    """Get-or-create the non-system role `code`, carrying EXACTLY the grants
+    migration 0015/0016 give `executor_head` plus the approval limits above.
+
+    The grants are COPIED from `role_permissions` rather than listed here — a
+    fixture's permission list must mirror the PRODUCTION role's (lesson), and a
+    hand-written list would go stale the day another migration grants
+    `executor_head` something new. The limits are re-applied on every call so
+    that editing `LIMITED_HEAD_ROLES` takes effect against a database a previous
+    run already seeded.
+    """
+    max_amount, max_area = LIMITED_HEAD_ROLES[code]
+    role = (await db.execute(select(Role).where(Role.code == code))).scalar_one_or_none()
+    if role is None:
+        role = Role(
+            code=code,
+            name={"uz_cyrl": f"Тест роли {code}", "en": code},
+            is_system=False,
+        )
+        db.add(role)
+        await db.flush()
+        source_id = (
+            await db.execute(select(Role.id).where(Role.code == "executor_head"))
+        ).scalar_one()
+        for granted in await db.execute(
+            select(RolePermission.permission_code).where(RolePermission.role_id == source_id)
+        ):
+            db.add(RolePermission(role_id=role.id, permission_code=granted[0]))
+    role.max_approve_amount = max_amount
+    role.max_approve_area = max_area
+    await db.flush()
+    return role.id
+
+
+async def _head_client(db: AsyncSession, user: User):
+    """A signed-in client for a staff user built under a PRODUCTION role.
+
+    Not `_client_for`, which builds every actor as `executor_staff` with
+    personal grants: the limit under test is a column of `roles`, so an actor
+    whose role is not the one being examined would prove nothing (the shape
+    `tests/modules/permits/conftest.py::_signer_for` adopted for the same
+    reason)."""
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        _commit_pending_before_requests(client, db)
+        yield client
+
+
+@pytest.fixture
+async def executor_head_client(db: AsyncSession, leshoz: Organization):
+    """«Раҳбар» — the leshoz head, `executor_head` (never `rahbar`, which is not
+    a `roles.code` at all: lesson), zoned to the leshoz that owns
+    `published_contour`, and holding the seeded role's OWN grants rather than a
+    hand-listed copy of them.
+
+    The one durable actor in this package: its PINFL is fixed
+    (`EXECUTOR_HEAD_PINFL`, see that constant for the two signature mechanisms
+    that force it) and the row is reused across tests and across runs, re-zoned
+    each time to the leshoz the current test built. Everything else about it —
+    role, grants, zone — is production-shaped.
+    """
+    user = (
+        await db.execute(select(User).where(User.pinfl == EXECUTOR_HEAD_PINFL))
+    ).scalar_one_or_none()
+    if user is None:
+        user = await make_user(
+            db,
+            role_code="executor_head",
+            organization_id=leshoz.id,
+            pinfl=EXECUTOR_HEAD_PINFL,
+        )
+    else:
+        user.role_id = (
+            await db.execute(select(Role.id).where(Role.code == "executor_head"))
+        ).scalar_one()
+        user.organization_id = leshoz.id
+        await db.flush()
+    async for client in _head_client(db, user):
+        yield client
+
+
+async def _limited_head_client(db: AsyncSession, role_code: str):
+    """A head whose ROLE carries an approval limit low enough to fire.
+
+    **Deliberately zone-free** (no organization, no region, no district — a
+    shape `admin.users_service.create_user` produces whenever the three columns
+    are left unset, and what an agency-level head looks like). Two reasons, and
+    the second is the load-bearing one:
+
+      * the limit is a property of the ROLE, so a zone would only add a second
+        variable to a test about `max_approve_*`; the territorial rule is proven
+        on its own by `other_zone_executor_head_client`;
+      * a forward MOVES the application into the parent organization's zone
+        (`applications.assigned_org_id`), so a leshoz-scoped head would be told
+        404 by the very `GET /timeline` the brief's over-limit test reads
+        straight after forwarding.
+
+    This one never signs — an over-limit approve forwards before `sign()` is
+    reached (ruling 9а) — so its PINFL is random, unlike `executor_head_client`.
+    """
+    user = await make_user(
+        db,
+        role_code="executor_staff",  # replaced below; make_user resolves by code
+        pinfl=unique_pinfl(),
+    )
+    user.role_id = await _limited_head_role(db, role_code)
+    await db.flush()
+    async for client in _head_client(db, user):
+        yield client
+
+
+@pytest.fixture
+async def limited_executor_head_client(db: AsyncSession):
+    """Both limits set — the brief's own over-limit actor."""
+    async for client in _limited_head_client(db, "test_head_limit_both"):
+        yield client
+
+
+@pytest.fixture
+async def amount_limited_executor_head_client(db: AsyncSession):
+    """`max_approve_amount` only; `max_approve_area` NULL."""
+    async for client in _limited_head_client(db, "test_head_limit_amount"):
+        yield client
+
+
+@pytest.fixture
+async def area_limited_executor_head_client(db: AsyncSession):
+    """`max_approve_area` only; `max_approve_amount` NULL."""
+    async for client in _limited_head_client(db, "test_head_limit_area"):
+        yield client
+
+
+@pytest.fixture
+async def other_zone_executor_head_client(db: AsyncSession, other_leshoz: Organization):
+    """The same role and the same grants as `executor_head_client`, zoned to a
+    DIFFERENT leshoz — so a test that passes for one and fails for the other can
+    only be about territory. Never signs: the zone refusal comes first."""
+    user = await make_user(
+        db,
+        role_code="executor_head",
+        organization_id=other_leshoz.id,
+        pinfl=unique_pinfl(),
+    )
+    async for client in _head_client(db, user):
+        yield client
+
+
+@pytest.fixture
+async def agency_org(db: AsyncSession) -> Organization:
+    """The single root organization — `kind='agency'`, `parent_id IS NULL`
+    (`ck_organizations_root_is_agency` plus the `uq_organizations_single_agency`
+    partial index make it a singleton). Reused rather than created when another
+    module already committed one to this shared database, exactly as the
+    `leshoz` fixture does."""
+    agency = (
+        await db.execute(select(Organization).where(Organization.kind == "agency"))
+    ).scalar_one_or_none()
+    if agency is None:
+        agency = Organization(
+            id=uuid7(),
+            code=f"A{uuid.uuid4().hex[:8]}",
+            name={"uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"},
+            kind="agency",
+        )
+        db.add(agency)
+        await db.flush()
+    return agency
+
+
+@pytest.fixture
+async def agency_executor_head_client(db: AsyncSession, agency_org: Organization):
+    """A head at the TOP of the hierarchy, holding a role that is ALSO over its
+    limit — both halves are needed, and the second is easy to miss.
+
+    A forward is only ever attempted for an over-limit application (ruling 9а),
+    so an unlimited head at the agency would simply approve and the "nowhere to
+    escalate to" branch would never run. Zoned to the agency itself, because a
+    head who cannot see the application is refused 404 long before the limit is
+    consulted.
+    """
+    user = await make_user(
+        db,
+        role_code="executor_staff",  # replaced below; make_user resolves by code
+        organization_id=agency_org.id,
+        pinfl=unique_pinfl(),
+    )
+    user.role_id = await _limited_head_role(db, "test_head_limit_both")
+    await db.flush()
+    async for client in _head_client(db, user):
+        yield client
+
+
+@pytest.fixture
+async def agency_hodim_client(db: AsyncSession, agency_org: Organization):
+    """The reviewer who takes the agency's own application into work — the same
+    `applications.review` grant as `hodim_client`, zoned to the agency instead
+    of a leshoz."""
+    async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=agency_org.id):
+        yield client
+
+
+@pytest.fixture
+async def agency_published_contour(
+    db: AsyncSession, contours_layer: GisLayer, agency_org: Organization, approval_doc: MediaFile
+) -> Contour:
+    """A published contour owned by the AGENCY, so an application on it reaches
+    IN_REVIEW at an organization with no parent. Same shape as
+    `published_contour` above; only the owning organization differs."""
+    contour = await make_contour(db, contours_layer, agency_org)
+    await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    await db.flush()
+    return contour
+
+
+@pytest.fixture
+async def agency_grazing_norm(
+    db: AsyncSession,
+    agency_published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> uuid.UUID:
+    """`tests/modules/norms/conftest.py::published_grazing_norm`, for
+    `agency_published_contour` instead of `published_contour` — a norm is
+    per-contour, so the agency's own contour needs its own or the submission is
+    refused before it can ever reach a decision.
+
+    `max_sb` is frozen through `calculator.max_sb` against the REAL seeded VMQ
+    689 constants, never a hand-typed number, for the reason the original
+    fixture states: a change to those constants must not silently desync this
+    from what the real publish lifecycle would produce."""
+    effective_from = date(2020, 1, 1)
+    limit_params = await norm_params.load_limit_params(db, on_date=effective_from)
+    norm = Norm(
+        contour_id=agency_published_contour.id,
+        activity_type_id=grazing_activity_id,
+        yield_c_per_ha=Decimal("12.0"),
+        season={"windows": [{"from": "04-01", "to": "10-31"}]},
+        rotation={"rest_years": []},
+        max_sb=calculator.max_sb(
+            area_ha=CONTOUR_AREA_HA, yield_c_per_ha=Decimal("12.0"), params=limit_params
+        ),
+        effective_from=effective_from,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+    return norm.id
+
+
+@pytest.fixture
+async def application_in_review(hodim_client, submitted_application: str) -> str:
+    """`submitted_application`, taken into work through the REAL route — never
+    by writing `status='IN_REVIEW'` on the row (lesson: build a fixture's
+    precondition through the real transition).
+
+    That matters twice over here: `start-review` is also what writes the FIRST
+    `application_assignments` row and sets `assigned_org_id`, and the over-limit
+    forward is readable only as the SECOND row beside it."""
+    result = await hodim_client.post(f"/api/v1/applications/{submitted_application}/start-review")
+    assert result.status_code == 200, result.text
+    return submitted_application
+
+
+@pytest.fixture
+async def application_in_review_at_agency(
+    applicant_client,
+    agency_hodim_client,
+    agency_published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    sheep_type_id: uuid.UUID,
+    published_coef_sb: None,
+    agency_grazing_norm: uuid.UUID,
+) -> str:
+    """The same journey as `application_in_review`, on a contour the AGENCY
+    owns — so the application sits IN_REVIEW at an organization with no parent
+    and an escalation has nowhere to go.
+
+    Built end to end through the real routes (`POST /applications` -> `PATCH` ->
+    `GET /package` + a real ERI -> `POST /submit` -> `POST /start-review`): a
+    hand-set `assigned_org_id` would reach the same state without proving that
+    the state is reachable.
+
+    A 2029 season keeps it clear of every other draft in this package;
+    `ex_applications_no_duplicate` keys on the contour too, so the different
+    contour alone would already be enough."""
+    from tests.modules.applications.test_submit import _submit
+
+    application_id = await _ready_draft(
+        applicant_client,
+        agency_published_contour.id,
+        grazing_activity_id,
+        sheep_type_id,
+        period_from="2029-05-01",
+        period_to="2029-09-30",
+    )
+    submitted = await _submit(applicant_client, application_id)
+    assert submitted.status_code == 200, submitted.text
+    started = await agency_hodim_client.post(f"/api/v1/applications/{application_id}/start-review")
+    assert started.status_code == 200, started.text
+    return application_id
+
+
+@pytest.fixture
+async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
+    """One ACTIVE item of the `rejection_reasons` classifier — RJ-03, «участка
+    вне границ лесного фонда», seeded by migration 0005 together with the other
+    fourteen.
+
+    Fetched, never created: `rejection_reasons` is a fixed catalogue whose
+    fifteen values come from `tz/10` § 8.2, and a private copy inserted per test
+    would leave rows in this shared, persistent database that
+    `GET /refs/classifiers/rejection_reasons` would then offer on a real
+    form."""
+    classifier_id = (
+        await db.execute(select(Classifier.id).where(Classifier.code == "rejection_reasons"))
+    ).scalar_one()
+    return (
+        await db.execute(
+            select(ClassifierItem).where(
+                ClassifierItem.classifier_id == classifier_id,
+                ClassifierItem.code == "RJ-03",
+                ClassifierItem.status == "active",
+            )
+        )
+    ).scalar_one()

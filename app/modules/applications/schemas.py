@@ -559,3 +559,82 @@ class ApplicationTimelineOut(BaseModel):
             signatures=[TimelineSignatureRow.model_validate(row) for row in timeline["signatures"]],
             info_requests=timeline["info_requests"],
         )
+
+
+# --- Task 7: the head's decision ----------------------------------------------
+
+# `applications.decision_basis` and `application_status_history.legal_basis` are
+# unbounded TEXT, so the only ceiling a legal basis has is the one written here
+# — the same reasoning `REASON_MAX_LENGTH` above spells out for a withdrawal
+# reason.
+LEGAL_BASIS_MAX_LENGTH = 2000
+
+
+class ApplicationApproveIn(BaseModel):
+    """`POST /applications/{id}/approve` — the head's detached PKCS#7 over the
+    bytes `GET /applications/{id}/package` served, and nothing else.
+
+    Identical in shape to `ApplicationSubmitIn` and deliberately its own class:
+    the two sign the same bytes for different reasons and by different people,
+    and a shared model would make a later divergence look like a rename.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pkcs7: str
+
+
+class ApplicationRejectIn(BaseModel):
+    """`POST /applications/{id}/reject` — the ERI plus the grounds `tz/04` С8
+    requires of a refusal BY the state: an RJ-* reason from the
+    `rejection_reasons` classifier AND a legal basis.
+
+    **Both are REQUIRED here rather than validated in the service**, which is
+    what makes «missing grounds» a 422 `ERR-VAL-001` before the request body is
+    ever handed to a function that could reach `sign()` — a signature must never
+    be spent on a request that cannot succeed. `min_length=1` closes the half a
+    plain `str` would leave open: an empty legal basis is a missing one.
+
+    This is the opposite of `ApplicationCancelIn` beside it, whose reason is
+    optional because a citizen withdrawing their own application owes nobody an
+    explanation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pkcs7: str
+    reason_item_id: uuid.UUID
+    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+
+
+class ApplicationDecisionOut(ApplicationOut):
+    """The answer to both decision routes: the application's own columns, flat,
+    plus where an over-limit application was forwarded to.
+
+    `forwarded_to_organization` is `None` on every real decision — an approval,
+    a rejection — and carries the parent organization's id ONLY on a forward,
+    where `status` is still `IN_REVIEW` because ruling 9а means the application
+    genuinely has not been decided. A client tells the two apart by this field,
+    not by guessing from the status.
+
+    Flat rather than `{"application": {...}, "forwarded_to_organization": ...}`,
+    the same choice `ApplicationCardOut` made: a client reads `body["status"]`
+    in every response this module produces.
+    """
+
+    forwarded_to_organization: uuid.UUID | None = None
+
+    @classmethod
+    def build(
+        cls, application: Any, *, forwarded_to_organization: uuid.UUID | None
+    ) -> ApplicationDecisionOut:
+        """`ApplicationOut.model_fields` is read rather than the twenty-four
+        names retyped — a column added there has to appear here too, and a
+        hand-copied list is exactly how the two would drift
+        (`ApplicationCardOut.build` is the same shape, for the same reason)."""
+        return cls.model_validate(
+            {
+                **{name: getattr(application, name) for name in ApplicationOut.model_fields},
+                "forwarded_to_organization": forwarded_to_organization,
+            }
+        )

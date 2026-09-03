@@ -34,17 +34,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
+from app.modules.applications import decision as service_decision
 from app.modules.applications import service
-from app.modules.applications.permissions import APPLICATIONS_CREATE, APPLICATIONS_REVIEW
+from app.modules.applications.permissions import (
+    APPLICATIONS_CREATE,
+    APPLICATIONS_DECIDE,
+    APPLICATIONS_REVIEW,
+)
 from app.modules.applications.schemas import (
+    ApplicationApproveIn,
     ApplicationCancelIn,
     ApplicationCardOut,
     ApplicationCheckOut,
     ApplicationCreate,
+    ApplicationDecisionOut,
     ApplicationDocumentIn,
     ApplicationDocumentOut,
     ApplicationOut,
     ApplicationPatch,
+    ApplicationRejectIn,
     ApplicationStatus,
     ApplicationSubmitIn,
     ApplicationTimelineOut,
@@ -421,3 +429,88 @@ async def get_application_timeline(
     answer to all three, as on the card.
     """
     return ApplicationTimelineOut.build(await service.timeline(db, application_id, actor=user))
+
+
+# --- Task 7: the head's decision -----------------------------------------------
+#
+# Both routes carry `require_permission(APPLICATIONS_DECIDE)` — the code
+# migration 0015 grants `executor_head` («Ваколатли шахс», the leshoz head) and
+# 0016 revoked from `leadership` (decision #59). The ZONE is the other half of
+# the rule and lives in the service, where the application's own organization
+# can be resolved: a permission answers "may this role at all", a zone answers
+# "on whose rows", and a staff path needs BOTH (lesson).
+#
+# No `Idempotency-Key` on either, and for the same reason task 6's two POSTs
+# carry none: the mechanism belongs where a replay would allocate something
+# scarce. A replayed approve or reject finds the application no longer
+# IN_REVIEW and answers 409 (`APPLICATION_TRANSITIONS` has no self-loop), and
+# the invoice 3.10a raises off the approval is idempotent by construction on its
+# own side. A replayed FORWARD is the one case that would write a second
+# assignment row — but the first forward has already moved the application into
+# the parent organization's zone, so the same caller is told 404 by the zone
+# rule before it gets there.
+
+
+@router.post("/applications/{application_id}/approve")
+async def approve_application(
+    application_id: uuid.UUID,
+    payload: ApplicationApproveIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_DECIDE))],
+) -> ApplicationDecisionOut:
+    """The head approves — or, beyond their role's limit, forwards.
+
+    **The answer is never `APPROVED`.** 3.10a's invoice handler subscribes to
+    `application_approved` and runs inside this request's own transaction
+    (ruling 3а), so a real approval comes back `INVOICED`; APPROVED exists only
+    in `application_status_history`. An over-limit request comes back 200 with
+    `status: "IN_REVIEW"` and `forwarded_to_organization` set — ruling 9а: the
+    application genuinely has not been decided, nothing was signed, and 3.10a
+    must not invoice it.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone — the same answer to both, since anything else
+    makes this route an application-existence oracle; the territorial refusal is
+    recorded as RI-12 before it answers. 409 `ERR-APP-004` in any status but
+    IN_REVIEW. 422 `ERR-VAL-001` when the application carries no stored
+    calculation, when `requested_area_ha` is unknown while the role caps area,
+    and when an over-limit application sits at an organization with no parent to
+    escalate to. 422 `ERR-SIGN-001` for an ERI that does not verify against the
+    package bytes.
+    """
+    application, forwarded_to = await service_decision.approve(
+        db, application_id, pkcs7=payload.pkcs7, actor=actor
+    )
+    return ApplicationDecisionOut.build(application, forwarded_to_organization=forwarded_to)
+
+
+@router.post("/applications/{application_id}/reject")
+async def reject_application(
+    application_id: uuid.UUID,
+    payload: ApplicationRejectIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_DECIDE))],
+) -> ApplicationDecisionOut:
+    """IN_REVIEW -> REJECTED, with the grounds `tz/04` С8 requires.
+
+    `reason_item_id` and `legal_basis` are REQUIRED fields of the body, so a
+    refusal with no grounds is 422 `ERR-VAL-001` from pydantic — before the
+    handler, and therefore before a signature could be spent on a request that
+    cannot succeed. A `reason_item_id` outside the `rejection_reasons`
+    classifier, or archived, is the service's own 422 `ERR-VAL-001`
+    (`unknown_rejection_reason`), still ahead of the ERI.
+
+    No role limit: decision #29 caps what a head may GRANT. 404 and 409 exactly
+    as on `/approve` above.
+    """
+    return ApplicationDecisionOut.build(
+        await service_decision.reject(
+            db,
+            application_id,
+            pkcs7=payload.pkcs7,
+            reason_item_id=payload.reason_item_id,
+            legal_basis=payload.legal_basis,
+            actor=actor,
+        ),
+        forwarded_to_organization=None,
+    )

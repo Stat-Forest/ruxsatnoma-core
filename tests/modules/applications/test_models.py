@@ -311,12 +311,19 @@ async def test_applications_permission_seeds(db) -> None:
     leadership's half** once Oybek settled the question — decision #59, option а —
     so the expected set below is the post-0016 state, not 0015's. The two guards in
     `tests/test_permissions_registry.py` assert the same alignment across all three
-    stages that grant an approval code."""
+    stages that grant an approval code.
+
+    **`r.is_system` scopes this to the eleven `0003_auth` seeds**, the same
+    filter `tests/test_permissions_registry.py` applies and for the same reason:
+    this database is shared and persistent, and a role invented by a test —
+    `tests/modules/applications/conftest.py`'s three `test_head_limit_*` roles
+    carry a COPY of `executor_head`'s grants, deliberately — says nothing about
+    what a migration seeded."""
     rows = await db.execute(
         text(
             "SELECT r.code, rp.permission_code FROM role_permissions rp"
             " JOIN roles r ON r.id = rp.role_id"
-            " WHERE rp.permission_code LIKE 'applications.%'"
+            " WHERE rp.permission_code LIKE 'applications.%' AND r.is_system"
         )
     )
     assert {(row[0], row[1]) for row in rows} == {
