@@ -37,10 +37,15 @@ from app.modules.applications import service
 from app.modules.applications.permissions import APPLICATIONS_CREATE
 from app.modules.applications.schemas import (
     ApplicationCardOut,
+    ApplicationCheckOut,
     ApplicationCreate,
+    ApplicationDocumentIn,
+    ApplicationDocumentOut,
     ApplicationOut,
     ApplicationPatch,
     ApplicationStatus,
+    PrecheckCalculationOut,
+    PrecheckOut,
 )
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -154,3 +159,87 @@ async def get_application_card(
     territorial refusal is recorded as RI-12 before it answers.
     """
     return ApplicationCardOut.build(await service.get_card(db, application_id, actor=user))
+
+
+# --- Task 4: documents and the pre-check --------------------------------------
+#
+# All three carry `require_permission(APPLICATIONS_CREATE)`, the same gate as
+# `POST`/`PATCH` above and for the same reason: attaching a document and asking
+# what a draft would cost are both part of «file and edit one's own
+# application», the registry's own description of that code. Ownership is the
+# service's check, so a holder who is not the owner gets 404 — never a 403,
+# which would confirm the application exists.
+#
+# No `Idempotency-Key` on the pre-check either, and deliberately: a repeat check
+# is a NEW row by ruling 12 — the reviewer has to see that a contour passed at
+# submission even if it would fail today — so a replayed pre-check producing a
+# second set of rows is the SPECIFIED behaviour, not the duplicate the mechanism
+# exists to suppress. It belongs on `POST /applications/{id}/submit` (task 5),
+# where a replay would mint a second public number for one filing.
+
+
+@router.post("/applications/{application_id}/documents", status_code=201)
+async def attach_document(
+    application_id: uuid.UUID,
+    payload: ApplicationDocumentIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationDocumentOut:
+    """201 with the attachment. The bytes are uploaded through `POST /files`
+    first and this route stores only the reference — checked to exist, to be
+    active, and to be the caller's OWN upload, because a file id an applicant
+    supplies is untrusted input.
+
+    409 `ERR-APP-004` in any status but DRAFT; 422 `ERR-VAL-001` for a
+    `doc_type_item_id` outside the `doc_types` classifier
+    (`unknown_doc_type`) and for a file that is missing, archived or somebody
+    else's (`document_file_not_found` / `document_file_not_owned`).
+    """
+    return ApplicationDocumentOut.model_validate(
+        await service.add_document(db, application_id, payload, actor=actor)
+    )
+
+
+@router.delete("/applications/{application_id}/documents/{document_id}", status_code=204)
+async def detach_document(
+    application_id: uuid.UUID,
+    document_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> None:
+    """204. DRAFT only, and both ids are checked — a document belonging to a
+    different application is 404, not a cross-application delete. The
+    `media_files` row survives: files are never deleted in this system."""
+    await service.remove_document(db, application_id, document_id, actor=actor)
+
+
+@router.post("/applications/{application_id}/precheck")
+async def precheck_application(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> PrecheckOut:
+    """A dry run: writes the `application_checks` rows and answers with them
+    plus the price. **The status never moves and no calculation is stored**
+    (ruling 8 — the one that is stored is written at submission and is what
+    3.10 invoices from).
+
+    **200 even when a check BLOCKS.** A failing GIS or norm result is in
+    `checks`, as data (design/03): an applicant must be able to see that the
+    herd is over the limit, not merely be refused. Task 5's `submit` runs the
+    identical `checks.run_all` and turns that same result into a 4xx — that
+    difference is the whole point of having both.
+
+    A broken INPUT is still an error here: 422 `ERR-VAL-001` for a reversed or
+    over-long period, 422 `ERR-NORM-004` for a rule parameter that is not
+    published (on a fresh database that is the ten `coef_sb:*` rows, which ship
+    as drafts until VMQ 689 annex 5 arrives). An incomplete draft is neither —
+    it answers 200 with `skipped` rows naming the fields still to fill and a
+    null `calculation`.
+    """
+    card = await service.precheck(db, application_id, actor=actor)
+    priced = card["calculation"]
+    return PrecheckOut(
+        checks=[ApplicationCheckOut.model_validate(row) for row in card["checks"]],
+        calculation=None if priced is None else PrecheckCalculationOut.build(priced),
+    )

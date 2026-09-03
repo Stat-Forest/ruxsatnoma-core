@@ -20,6 +20,7 @@ re-exported AND consumed here."""
 
 import secrets
 import uuid
+from collections.abc import AsyncIterator
 
 import pytest
 from sqlalchemy import text
@@ -28,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core.models import MediaFile
 from app.core.time import business_today
+from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.applications.permissions import APPLICATIONS_REVIEW
@@ -45,8 +47,21 @@ from tests.modules.gis.conftest import (
 )
 from tests.modules.gis.conftest import approval_doc as approval_doc
 from tests.modules.gis.conftest import contours_layer as contours_layer
+from tests.modules.gis.conftest import gis_user as gis_user
 from tests.modules.gis.conftest import leshoz as leshoz
 from tests.modules.gis.conftest import other_leshoz as other_leshoz
+
+# Task 4's pre-check prices the draft, so this package needs norms' own two
+# fixtures. `published_coef_sb` is NOT optional and its absence looks like a bug
+# in the pre-check: the ten seeded `coef_sb:*` rule parameters ship as DRAFTS
+# (VMQ 689 annex 5 has not arrived) and the engine reads published rows only, so
+# without it a grazing calculation cannot be computed AT ALL and
+# `norms.service.preview` raises `ERR-NORM-004` naming the missing parameter.
+# Both open their OWN session on purpose — see their docstrings.
+from tests.modules.norms.conftest import published_coef_sb as published_coef_sb  # noqa: F401
+from tests.modules.norms.conftest import (
+    published_grazing_norm as published_grazing_norm,  # noqa: F401
+)
 
 
 @pytest.fixture(autouse=True)
@@ -252,3 +267,89 @@ async def representative_client(db: AsyncSession, legal_applicant: Applicant):
     await db.flush()
     async for client in _client_for_applicant(db, user):
         yield client
+
+
+@pytest.fixture
+async def draft_ready_for_submission(
+    applicant_client,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    sheep_type_id: uuid.UUID,
+    published_coef_sb: None,
+) -> str:
+    """A DRAFT carrying everything a submission needs: the contour, grazing, a
+    May-September 2027 period and a 40-head sheep herd.
+
+    Built through the REAL routes (`POST /applications` + `PATCH`), never by
+    inserting an `Application` row (lesson: build a fixture's precondition
+    through the real transition) — a draft assembled by hand would not prove
+    that the shape task 5 refuses to submit is the shape task 3 lets an
+    applicant reach.
+
+    40 head is deliberately well inside `published_grazing_norm`'s MaxSB of 250,
+    so a test that wants an over-limit herd raises it itself and a test that
+    does not gets a clean pass.
+
+    Returns the id as a STRING: every consumer interpolates it into a URL, and
+    task 5's own tests re-parse it with `uuid.UUID(...)`.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    assert created.status_code == 201, created.text
+    application_id = created.json()["id"]
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_id}",
+        json={
+            "contour_id": str(published_contour.id),
+            "activity_type_id": str(grazing_activity_id),
+            "period_from": "2027-05-01",
+            "period_to": "2027-09-30",
+            "items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    return application_id
+
+
+@pytest.fixture
+async def doc_type_item_id(engine) -> AsyncIterator[uuid.UUID]:
+    """One `doc_types` classifier item — migration 0005 seeds the CLASSIFIER but
+    none of its items, so `application_documents.doc_type_item_id` has nothing to
+    point at until a test makes one.
+
+    Its own session and its own teardown, the `tests/modules/norms/conftest.py::
+    benefit_category` pattern: a client commits `db` before every request
+    (lesson), so a row added through the test's own session would survive that
+    session's rollback and accumulate in the shared, persistent test database.
+    The code carries a random suffix so two runs can never collide on
+    `uq_classifier_items_active_code`."""
+    item_id = uuid7()
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        await own_db.execute(
+            text(
+                "INSERT INTO classifier_items "
+                "(id, classifier_id, code, name, valid_from, sort_order, status) "
+                "SELECT :id, c.id, :code, CAST(:name AS jsonb), DATE '2020-01-01', 0, 'active' "
+                "FROM classifiers c WHERE c.code = 'doc_types'"
+            ).bindparams(
+                id=item_id,
+                code=f"benefit_proof_{uuid.uuid4().hex[:8]}",
+                name='{"en": "Benefit proof (test)"}',
+            )
+        )
+        await own_db.commit()
+        try:
+            yield item_id
+        finally:
+            # The attachments first: an HTTP-driven test COMMITS its
+            # `application_documents` rows (the app's own session, not the test's
+            # `db`), so they outlive the test and hold an FK on this item.
+            await own_db.execute(
+                text("DELETE FROM application_documents WHERE doc_type_item_id = :id").bindparams(
+                    id=item_id
+                )
+            )
+            await own_db.execute(
+                text("DELETE FROM classifier_items WHERE id = :id").bindparams(id=item_id)
+            )
+            await own_db.commit()

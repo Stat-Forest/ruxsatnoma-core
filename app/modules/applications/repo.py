@@ -113,14 +113,57 @@ async def replace_items(
 
 
 async def list_documents(db: AsyncSession, application_id: uuid.UUID) -> list[ApplicationDocument]:
-    """The attachments, oldest first. Empty for every application until task 4
-    ships the upload route."""
+    """The attachments, oldest first (`uuid7` is time-ordered, so the primary
+    key already serves this)."""
     rows = await db.execute(
         select(ApplicationDocument)
         .where(ApplicationDocument.application_id == application_id)
         .order_by(ApplicationDocument.id)
     )
     return list(rows.scalars().all())
+
+
+async def get_document(db: AsyncSession, document_id: uuid.UUID) -> ApplicationDocument | None:
+    return await db.get(ApplicationDocument, document_id)
+
+
+async def add_document(db: AsyncSession, document: ApplicationDocument) -> None:
+    """Stage and flush, then read the row back: `created_at` is a
+    `server_default` and the 201 response serializes it (lesson: the row in
+    memory is not what Postgres stored)."""
+    db.add(document)
+    await db.flush()
+    await db.refresh(document)
+
+
+async def delete_document(db: AsyncSession, document: ApplicationDocument) -> None:
+    """A real DELETE, and legitimately so: `application_documents` carries no
+    append-only trigger (migration 0015 puts one on
+    `application_status_history` alone), and an applicant unpicking an
+    attachment from their own draft is not a fact the register needs to keep —
+    the audit entry the service writes beside this is. The `media_files` row
+    itself is untouched: files are never deleted (`status='archived'`).
+    """
+    await db.delete(document)
+    await db.flush()
+
+
+async def add_checks(db: AsyncSession, rows: list[ApplicationCheck]) -> None:
+    """Insert one run's check rows and load their server defaults back.
+
+    The re-SELECT is not politeness: `checked_at` is `server_default=func.now()`
+    and is left unloaded by the INSERT, so the first attribute access would
+    emit a lazy refresh — which on an async session raises `MissingGreenlet`
+    the moment it happens during response serialization instead of inside an
+    `await`. One statement for the whole run, not one `refresh` per row.
+    """
+    if not rows:
+        return
+    db.add_all(rows)
+    await db.flush()
+    await db.execute(
+        select(ApplicationCheck).where(ApplicationCheck.id.in_([row.id for row in rows]))
+    )
 
 
 async def list_checks(db: AsyncSession, application_id: uuid.UUID) -> list[ApplicationCheck]:

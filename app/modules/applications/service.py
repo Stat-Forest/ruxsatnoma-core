@@ -4,9 +4,11 @@
 Branch 1 (`stage-3.9a-core`) ships exactly three functions of plan Task 8's
 public surface — `get`, `current_calculation`, `set_status` — on top of
 `core/numbers.py` (moved forward out of Task 5) and the event bus shipped in
-the two commits before this one. Branch 2 adds the rest: `precheck`,
-`submit`, the duplicate guard, and the full decision flow (`start_review`,
-`approve`, `reject`, `return_to_applicant`, `cancel`, `forward`). See the
+the two commits before this one. Branch 2 adds the rest — task 3 the
+draft's own four routes, task 4 `precheck` and the documents, and the tasks
+after it `submit`, the duplicate guard and the full decision flow
+(`start_review`, `approve`, `reject`, `return_to_applicant`, `cancel`,
+`forward`). See the
 "Task 8 public surface" comment below for the contract this file promises
 levels 4+ (payments 3.10, permits 3.11) today."""
 
@@ -20,12 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
+from app.core.models import MediaFile
 from app.core.schemas import PageParams
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
-from app.modules.applications import repo
+from app.modules.applications import checks, repo
 from app.modules.applications.models import (
     Application,
+    ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
 )
@@ -34,7 +38,11 @@ from app.modules.applications.permissions import (
     APPLICATIONS_REVIEW,
     APPLICATIONS_VIEW_ANY,
 )
-from app.modules.applications.schemas import ApplicationCreate, ApplicationPatch
+from app.modules.applications.schemas import (
+    ApplicationCreate,
+    ApplicationDocumentIn,
+    ApplicationPatch,
+)
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -65,6 +73,13 @@ APPLICATION_UPDATE = "application.update"
 # территориальных полномочий», High and immediate — with no way to fire on a
 # read at all. See `_readable_application`.
 APPLICATION_READ = "application.read"
+# Task 4's three. A pre-check writes `application_checks` rows, so it is a
+# state-changing action and audits like one — once, here, never a row per check
+# (`checks.run_all` deliberately audits nothing of its own: task 5's `submit`
+# calls it too and audits under `application.submit`).
+APPLICATION_PRECHECK = "application.precheck"
+APPLICATION_DOCUMENT_ATTACH = "application_document.attach"
+APPLICATION_DOCUMENT_DETACH = "application_document.detach"
 
 # `applications.channel` is NOT NULL and 3.9a has exactly one channel: the
 # portal. `mygov` arrives with the my.gov.uz integration and will be set by
@@ -83,6 +98,11 @@ INITIAL_STATUS = "DRAFT"
 # some classifier item, is what stops a rejection reason being posted as a
 # benefit.
 BENEFIT_CLASSIFIER_CODE = "benefit_categories"
+# The classifier an `application_documents.doc_type_item_id` must belong to
+# (seeded by migration 0005; its ITEMS are the Agency's to fill in). Checked for
+# membership, not merely that the id names some classifier item — otherwise a
+# rejection reason could be attached as a document type.
+DOC_TYPE_CLASSIFIER_CODE = "doc_types"
 
 # tz/05's transition table, verbatim (plan 03.9a task 8, the brief's own
 # copy). All fourteen `APPLICATION_STATUSES` are keys; `ARCHIVED` is
@@ -849,3 +869,175 @@ async def list_applications(
         offset=params.offset,
         limit=params.page_size,
     )
+
+
+# --- Task 4: documents and the pre-check --------------------------------------
+
+
+async def _own_document_file(db: AsyncSession, file_id: uuid.UUID, *, actor: User) -> MediaFile:
+    """The `media_files` row an applicant named, checked before it is stored on
+    their application.
+
+    Three conditions, and the third is the one that matters: the row exists, it
+    is not archived, and `uploaded_by` is the CALLER. `gis.service.
+    _assert_approval_doc_active` stops at the first two because an approval
+    decree is scanned by staff and may legitimately be somebody else's upload;
+    this is `auth.service._check_poa_file`'s situation instead — a file id an
+    APPLICANT supplies, over a table whose ids are guessable in principle, where
+    an existence check alone would let anyone hang another citizen's document on
+    their own application and put it in front of a reviewer as their evidence.
+
+    No content-type rule, unlike `_check_poa_file`'s PDF: a supporting document
+    for a benefit claim is as legitimately a photograph of a certificate as a
+    scan of one, and `core.files` already caps what may be uploaded at all.
+
+    `MediaFile` is a core (level 0) model, so reading it here crosses no module
+    boundary — the same reason `norms.service._assert_doc_active` reads it
+    directly.
+    """
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "document_file_not_found"})
+    if file.uploaded_by != actor.id:
+        raise err("ERR-VAL-001", details={"reason": "document_file_not_owned"})
+    return file
+
+
+async def _assert_doc_type(db: AsyncSession, doc_type_item_id: uuid.UUID) -> None:
+    """The document type must be an ACTIVE item of the `doc_types` classifier.
+
+    Membership, not mere existence: `classifier_items` holds every classifier's
+    values in one table, so an id-only check would accept a rejection reason or
+    a benefit category as a document type. An unknown id reaching the INSERT is
+    an `IntegrityError` with no handler — `ERR-SYS-001`/500 for a typo (lesson).
+    Read through `admin.repo`, never a direct query of `classifier_items`.
+    """
+    item = await admin_repo.get_classifier_item(db, doc_type_item_id)
+    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
+    if (
+        item is None
+        or classifier is None
+        or item.classifier_id != classifier.id
+        or item.status != "active"
+    ):
+        raise err("ERR-VAL-001", details={"reason": "unknown_doc_type"})
+
+
+async def add_document(
+    db: AsyncSession, application_id: uuid.UUID, payload: ApplicationDocumentIn, *, actor: User
+) -> ApplicationDocument:
+    """`POST /applications/{id}/documents` — attach an already-uploaded file.
+
+    The owner's own DRAFT only (`_own_draft_for_update`): 404 for a stranger, 409
+    for an application that has moved on. Two-step by design — the bytes go
+    through `POST /files` first, so this route carries no multipart body, no
+    size cap of its own and no storage failure mode; what it stores is a
+    reference, checked by `_own_document_file`.
+    """
+    application = await _own_draft_for_update(db, application_id, actor=actor)
+    await _assert_doc_type(db, payload.doc_type_item_id)
+    await _own_document_file(db, payload.file_id, actor=actor)
+    document = ApplicationDocument(
+        application_id=application.id,
+        doc_type_item_id=payload.doc_type_item_id,
+        file_id=payload.file_id,
+        uploaded_by=actor.id,
+        note=payload.note,
+    )
+    await repo.add_document(db, document)
+    await audit.log(
+        db,
+        action=APPLICATION_DOCUMENT_ATTACH,
+        user_id=actor.id,
+        object_type="application_document",
+        object_id=document.id,
+        new_value={
+            "application_id": str(application.id),
+            "doc_type_item_id": str(document.doc_type_item_id),
+            "file_id": str(document.file_id),
+        },
+    )
+    return document
+
+
+async def remove_document(
+    db: AsyncSession, application_id: uuid.UUID, document_id: uuid.UUID, *, actor: User
+) -> None:
+    """`DELETE /applications/{id}/documents/{documentId}` — 204, DRAFT only.
+
+    BOTH ids are checked: a document that belongs to a different application is
+    404 rather than a cross-application delete, which is why the path names the
+    application at all. The `media_files` row itself survives — files are never
+    deleted in this system — so the same file can be re-attached, or attached
+    elsewhere, afterwards.
+    """
+    application = await _own_draft_for_update(db, application_id, actor=actor)
+    document = await repo.get_document(db, document_id)
+    if document is None or document.application_id != application.id:
+        raise err("ERR-SYS-003", details={"document": str(document_id)})
+    removed = {
+        "application_id": str(application.id),
+        "doc_type_item_id": str(document.doc_type_item_id),
+        "file_id": str(document.file_id),
+    }
+    await repo.delete_document(db, document)
+    await audit.log(
+        db,
+        action=APPLICATION_DOCUMENT_DETACH,
+        user_id=actor.id,
+        object_type="application_document",
+        object_id=document_id,
+        old_value=removed,
+    )
+
+
+async def precheck(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
+    """`POST /applications/{id}/precheck` — a dry run: it records what the
+    checks said and quotes a price, and moves nothing.
+
+    **A blocking GIS or norm result comes back INSIDE `checks`, as data — never
+    as an HTTP error** (design/03, and 3.7's own `calc_router` docstring). The
+    applicant has to be able to SEE that the herd is 40 head over the limit, not
+    merely be refused; task 5's `submit` runs the identical `checks.run_all` and
+    turns the very same result into `first_blocking_error`'s refusal. A broken
+    INPUT is still an HTTP error on both paths — an unknown livestock type, a
+    reversed period (`norms.checks.run_checks` guards that one fail-closed for
+    every caller), a rule parameter that is not published.
+
+    ONE `norms.service.preview` call, whose check list is handed to
+    `checks.run_all` (`norm_results=`): a second, independent run would let the
+    `checks` an applicant reads and the `calculation` beside them describe two
+    different requests, and its `limit` check would be `skipped` rather than the
+    real comparison — `norms.service.run_checks` never prices, by design.
+
+    **Nothing is stored of that price** (ruling 8): exactly one `calculations`
+    row is ever written, at submission. A speculative row here would be the one
+    3.10 builds its invoice from.
+
+    The owner's own DRAFT only, and locked, exactly like a PATCH: this writes
+    `application_checks` rows against the application, and a pre-check racing a
+    submission would otherwise record evidence for a package that was signed
+    without it. A reviewer re-running the checks on a submitted application is
+    3.9b's route, not this one.
+    """
+    application = await _own_draft_for_update(db, application_id, actor=actor)
+    priced: dict[str, Any] | None = None
+    if not await checks.missing_for_pricing(db, application):
+        priced = await norms_service.preview(
+            db, payload=await checks.calculation_payload(db, application), actor=actor
+        )
+    results = await checks.run_all(
+        db, application, norm_results=None if priced is None else priced["checks"]
+    )
+    await audit.log(
+        db,
+        action=APPLICATION_PRECHECK,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        new_value={
+            "checks": [{"check_type": row.check_type, "result": row.result} for row in results],
+            "priced": priced is not None,
+        },
+    )
+    return {"checks": results, "calculation": priced}

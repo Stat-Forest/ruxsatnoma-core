@@ -167,8 +167,10 @@ class ApplicationItemOut(BaseModel):
 
 
 class ApplicationDocumentOut(BaseModel):
-    """One attachment. Empty for every application until task 4 ships the upload
-    route — the key is on the card now for the same reason `checks` is."""
+    """One attachment, as `POST /applications/{id}/documents` answers and as the
+    card lists it. `uploaded_by` is deliberately absent: on a draft it is always
+    the applicant themselves, and 3.9b's staff-side uploads get their own
+    read."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -317,3 +319,78 @@ class ApplicationCardOut(ApplicationOut):
                 ),
             }
         )
+
+
+# --- Task 4: documents and the pre-check -------------------------------------
+
+
+class ApplicationDocumentIn(BaseModel):
+    """`POST /applications/{id}/documents` — one attachment.
+
+    `file_id` names a `media_files` row the caller has ALREADY uploaded through
+    `POST /files`; the service checks it exists, is active and is the caller's
+    own (`service._own_document_file`), because a file id an applicant supplies
+    is untrusted input.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    doc_type_item_id: uuid.UUID
+    file_id: uuid.UUID
+    note: str | None = None
+
+
+class PrecheckCalculationOut(BaseModel):
+    """The price a pre-check quotes — `norms.service.preview`'s answer, which is
+    written NOWHERE (ruling 8: exactly one calculation is stored, at
+    submission).
+
+    Not `ApplicationCalculationOut`: that one describes a stored `calculations`
+    row and carries its `id` and `created_at`, neither of which a dry run has.
+    The overlapping fields keep the card's names (`rule_version`, not the
+    column's `rule_code_version`) so a client reads one vocabulary.
+
+    Every `Decimal` arrives here already rendered as a string by
+    `norms.calculator.jsonable` — money and conditional heads round-trip
+    exactly as text and would not as floats.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    amount: str
+    used_sb: str | None = None
+    max_sb: int | None = None
+    remaining_sb: str | None = None
+    rule_version: str
+    breakdown: list[Any] = []
+
+    @classmethod
+    def build(cls, priced: dict[str, Any]) -> PrecheckCalculationOut:
+        return cls.model_validate(
+            {
+                "amount": priced["amount"],
+                "used_sb": priced["used_sb"],
+                "max_sb": priced["max_sb"],
+                "remaining_sb": priced["remaining_sb"],
+                "rule_version": priced["rule_code_version"],
+                "breakdown": priced["breakdown"],
+            }
+        )
+
+
+class PrecheckOut(BaseModel):
+    """`POST /applications/{id}/precheck` — what the checks said, and what it
+    would cost.
+
+    A blocking GIS or norm result is IN `checks`, as data, and the response is
+    still 200 (design/03, and 3.7's own `calc_router` docstring): the applicant
+    has to be able to see that the herd is over the limit, not merely be
+    refused. Task 5's submission runs the very same `checks.run_all` and turns
+    that same result into an HTTP error.
+
+    `calculation` is null when the draft is not complete enough to price — the
+    fields still missing are named in each `skipped` check's own `details`.
+    """
+
+    checks: list[ApplicationCheckOut]
+    calculation: PrecheckCalculationOut | None
