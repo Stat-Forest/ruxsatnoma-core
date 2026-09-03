@@ -522,20 +522,39 @@ async def _resolve_recipient_account(
 async def confirm_payment(
     db: AsyncSession, *, invoice: Invoice, transaction: ProviderTransaction
 ) -> None:
-    """The whole business action behind a successful Payme `PerformTransaction`
-    (`payme.py` task 4, ruling J) — invoice -> paid, the 50/50 ledger written,
-    application -> PAID, the applicant notified, `payment_confirmed`
-    published — all inside the CALLER's transaction: `payme.py` owns the
-    session (via `payme_router.py`'s `get_db`), and this function neither
-    commits nor is meant to be called from anywhere but a just-confirmed
-    `PerformTransaction`, which has already run every Payme-protocol check
-    (idempotency, amount, payability) this function does not repeat.
+    """The whole business action behind a confirmed payment — invoice ->
+    paid, the 50/50 ledger written, application -> PAID, the applicant
+    notified, `payment_confirmed` published — all inside the CALLER's
+    transaction: the caller owns the session, and this function neither
+    commits nor performs any check of its own beyond resolving the recipient
+    account. Every check is the caller's.
+
+    TWO callers, and they are the whole list:
+
+    - `payme._perform_transaction` (task 4, ruling J) — a just-confirmed
+      `PerformTransaction`, already past every Payme-protocol check
+      (idempotency, amount, payability) this function does not repeat.
+    - `backoffice_service._confirm_and_pay` (3.10b task 7) — the checker's
+      half of the maker-checker manual PAID (`tz/08` §4's one exception to
+      `tz/05` invariant 3), handing in a SYNTHETIC `provider="manual"`
+      transaction. It has run its own checks instead: maker != checker, the
+      invoice locked and re-read as `pending`, and the amount bounded
+      `> 0` by `backoffice_schemas.ManualConfirmationIn`.
 
     Ruling I: the amount split is `transaction.amount` — the money that
-    actually arrived — never `invoice.amount`. The two are equal by
-    construction (`CheckPerformTransaction`/`CreateTransaction` refuse a
-    mismatch with `-31001`), and Task 3's own tests already prove the
+    actually arrived — never `invoice.amount`. Task 3's own tests prove the
     sourcing rule this function relies on (`ledger.entries_for`).
+
+    **The two amounts are NOT equal by construction.** They are on the Payme
+    path, where `CheckPerformTransaction`/`CreateTransaction` refuse a
+    mismatch with `-31001`; this docstring claimed that as a general
+    invariant until 2026-09-03, and the manual door deliberately breaks it.
+    An accountant may confirm an UNDERPAYMENT — money that really arrived,
+    less than was owed — and 3.10b files the difference as an open
+    `reconciliations` row rather than refusing it. So a caller reading this
+    must not assume `transaction.amount == invoice.amount`: the ledger below
+    settles what arrived, and an invoice can be `paid` with less than its own
+    amount allocated.
     """
     invoice.status = "paid"
     invoice.paid_at = transaction.performed_at

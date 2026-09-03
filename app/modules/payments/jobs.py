@@ -30,7 +30,10 @@ Re-running the whole sweep is a no-op the second time: an expired invoice no
 longer matches pass 1's `status = 'pending'` filter, and a reminder already
 sent no longer passes `already_notified`.
 
---- Lock order: the INVOICE first, then the application -------------------
+--- Lock order: CONFIRMATION, then invoice, then application ---------------
+
+**This section is the codebase's one registry of that rule. A new writer
+that takes more than one of these row locks belongs here.**
 
 `payme._perform_transaction` locks the **invoice** (`repo.get_invoice_for_
 update`) and then, through `service.confirm_payment`, the **application**
@@ -43,10 +46,26 @@ would have escaped the per-row guard, escaped `expire_invoices`, and left
 the whole night's work uncommitted.
 
 One consistent order across the codebase is the cure, not a wider `except`:
-every writer here now takes the invoice before the application
-(`issue_invoice` inserts its invoice before calling `set_status`;
-`confirm_payment` is called with the invoice already locked). Adding a new
-writer that touches both means taking them in this order.
+every writer here takes the invoice before the application (`issue_invoice`
+inserts its invoice before calling `set_status`; `confirm_payment` is called
+with the invoice already locked). Adding a new writer that touches both
+means taking them in this order.
+
+3.10b task 7 added a THIRD row lock ahead of both.
+`backoffice_service.check_manual_confirmation` locks the
+**manual_payment_confirmations** row (`repo.get_manual_confirmation_for_
+update`), then the invoice, then — through `confirm_payment` — the
+application. So the full order is:
+
+    manual_payment_confirmations -> invoices -> applications
+
+and no cycle is possible, because nothing that holds an invoice or
+application lock ever reaches back for a confirmation row: the only other
+writer of that table, `backoffice_service.file_manual_confirmation`, takes
+**no lock at all** (it inserts, and its "one `pending_check` at a time"
+read is unlocked — a deliberate, recorded deferral: two simultaneous
+filings are register noise, never money, and the real fix is a partial
+unique index costing this stage a second migration).
 
 --- One savepoint per row --------------------------------------------------
 

@@ -32,7 +32,10 @@ from app.modules.payments import events as payment_events
 from app.modules.payments import repo
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import (
+    INVOICE_STATUSES,
     MANUAL_CONFIRMATION_STATUSES,
+    PAYMENT_PROVIDERS,
+    RECONCILIATION_RESULTS,
     RECONCILIATION_STATUSES,
     ManualPaymentConfirmation,
     ProviderTransaction,
@@ -168,19 +171,32 @@ MANUAL_REJECT_ACTION = "payment.manual_confirm_reject"
 RISK_INDICATOR_MANUAL_PAID = "RI-01"
 
 # The invoice status a manual confirmation may be filed against and checked
-# on, spelled once. Anything else — `paid` (needs no manual confirmation),
-# `expired`/`cancelled` (must not gain money by this door) — is
-# `ERR-PAY-004`.
-_INVOICE_PAYABLE = "pending"
+# on, spelled once and DERIVED from the model's own tuple (`INVOICE_STATUSES`
+# is what `status_valid` is built from). Anything else — `paid` (needs no
+# manual confirmation), `expired`/`cancelled` (must not gain money by this
+# door) — is `ERR-PAY-004`. The tests pin the resulting literals, so a
+# reordering of the tuple goes red here rather than silently changing which
+# invoices are payable by hand.
+_INVOICE_PAYABLE = INVOICE_STATUSES[0]
 
 _STATUS_PENDING_CHECK, _STATUS_CONFIRMED, _STATUS_REJECTED = MANUAL_CONFIRMATION_STATUSES
+_, _RESULT_DISCREPANCY, _ = RECONCILIATION_RESULTS
 
 # The synthetic transaction's own constants (ruling 14). `state="2"` is
 # Payme's PERFORMED state, reused verbatim rather than given a manual-only
 # vocabulary: `provider_transactions.state` has no CHECK and every existing
 # reader (`allocations`, 4.3's reports) already reads `"2"` as "the money
 # arrived".
-MANUAL_PROVIDER = "manual"
+# Derived, never retyped: `provider_valid` is a real CHECK built from this
+# same tuple, so a literal here could disagree with the database and fail as
+# an IntegrityError 500 on live money. The unpack is deliberate over an index
+# — adding a third provider breaks this line loudly, at the one place that
+# has to decide what the new provider means for a manual confirmation.
+_PAYME_PROVIDER, MANUAL_PROVIDER = PAYMENT_PROVIDERS
+# `provider_transactions.state` has no CHECK and no tuple to derive from
+# (design/02 gives it none — the column stores the provider's own raw state).
+# "2" is Payme's PERFORMED, reused verbatim rather than given a manual-only
+# vocabulary: every existing reader already reads it as "the money arrived".
 MANUAL_TRANSACTION_STATE = "2"
 
 
@@ -262,7 +278,7 @@ async def file_manual_confirmation(
             [
                 Reconciliation(
                     invoice_id=invoice.id,
-                    result="discrepancy",
+                    result=_RESULT_DISCREPANCY,
                     difference=amount - invoice.amount,
                     status=RECONCILIATION_STATUSES[0],
                     assigned_to=actor.id,
@@ -339,7 +355,10 @@ async def check_manual_confirmation(
        `result="success"` — the action succeeded and is legal, the indicator
        says a human should look; a reject raises no indicator, because
        nothing became PAID;
-    9. notify the applicant on `payment.manual_confirmed` (a confirm only).
+    9. notify the MAKER on `payment.manual_confirmed` (a confirm only) —
+       not the applicant, whom `confirm_payment` has already told on
+       `payment.confirmed`; see `_confirm_and_pay` for why, and for why a
+       rejection notifies nobody.
 
     Steps 3-9 are ONE transaction: `get_db`'s commit-on-success (decision
     #37) makes the money, the ledger, the trail and the RI durable together
@@ -456,12 +475,29 @@ async def _confirm_and_pay(
         extra={"risk_indicator": RISK_INDICATOR_MANUAL_PAID},
     )
 
+    # THE MAKER, not the applicant (coordinator ruling, 2026-09-03).
+    # `confirm_payment` above has already sent the applicant
+    # `payment.confirmed` on both `inapp` and `sms`; adding
+    # `payment.manual_confirmed` to the same person made it two billed
+    # Cyrillic SMS for one payment, and the applicant does not care by which
+    # door their payment was confirmed. The accountant who filed the
+    # confirmation does, and nothing else tells them it was approved — so
+    # the seeded template keeps a real reader instead of becoming a dead
+    # seed.
+    #
+    # The REJECT path deliberately sends nothing: there is no
+    # `payment.manual_rejected` template seeded (migration 0022 seeds only
+    # `refund.decided` and `payment.manual_confirmed`), and `notify` on an
+    # unseeded code silently finds no template — a call that looks like a
+    # notification and delivers none. The rejection reason reaches the maker
+    # through the register and the audit trail; a template for it is a
+    # migration, and this stage takes no new number.
     application = await applications_service.get(db, invoice.application_id)
     if application is not None:
         await notifications_service.notify(
             db,
             event_code=payment_events.PAYMENT_MANUAL_CONFIRMED,
-            recipient_user_id=application.submitted_by_user_id,
+            recipient_user_id=confirmation.maker_id,
             params={
                 "application_number": application.number or str(application.id),
                 "amount": confirmation.amount,

@@ -472,26 +472,38 @@ async def test_the_payment_confirmed_event_reaches_permits(
     )
 
 
-async def test_the_applicant_is_notified_of_a_manual_confirmation(
+async def test_the_maker_is_told_their_confirmation_was_approved(
     payments_view_client,
     head_client,
     db: AsyncSession,
+    approved_application: Application,
     pending_invoice: Invoice,
     bank_doc: MediaFile,
 ):
+    """`payment.manual_confirmed` goes to the MAKER, never the applicant
+    (coordinator ruling): `confirm_payment` has already told the applicant on
+    `payment.confirmed`, on both `inapp` and `sms`, so sending them this one
+    too was two billed Cyrillic SMS for one payment. The applicant does not
+    care by which door their payment was confirmed; the accountant who filed
+    it does, and nothing else tells them it was approved."""
     filed = await _file_via_http(payments_view_client, pending_invoice, bank_doc)
+    maker_id = uuid.UUID(filed["maker_id"])
+
     response = await head_client.post(f"{MANUAL_CONFIRMATIONS}/{filed['id']}/confirm")
     assert response.status_code == 200, response.text
 
-    notified = list(
+    recipients = set(
         await db.scalars(
-            select(Notification).where(
+            select(Notification.recipient_user_id).where(
                 Notification.event_code == payment_events.PAYMENT_MANUAL_CONFIRMED,
                 Notification.object_id == pending_invoice.id,
             )
         )
     )
-    assert notified
+    assert recipients == {maker_id}
+    # And the applicant was told exactly once, by `confirm_payment`'s own
+    # `payment.confirmed` — the double-notification this ruling removed.
+    assert approved_application.submitted_by_user_id not in recipients
 
 
 async def test_confirming_an_already_checked_confirmation_answers_err_pay_004(
@@ -604,3 +616,123 @@ async def test_a_rejected_invoice_can_be_confirmed_by_a_fresh_filing(
 
     await db.refresh(pending_invoice)
     assert pending_invoice.status == "paid"
+
+
+# --- the amount bound (critical, review round 1) ------------------------------
+#
+# The Payme door pins the amount to `invoice.amount`
+# (`CreateTransaction`/`CheckPerformTransaction` refuse a mismatch with
+# `-31001`). This door removed that guard and, for one round, put nothing in
+# its place: `-2060000.00` was driven end to end against a real 150 000,00
+# invoice — filed 201, confirmed 200, invoice `paid`, application `PAID`, two
+# NEGATIVE allocations. `0.00` settled the invoice in full with a zero ledger.
+# Ruling 5 accepts an UNDERPAYMENT, never a negative or a zero settlement.
+
+
+@pytest.mark.parametrize(
+    ("amount", "case"),
+    [
+        ("0.00", "a zero settlement is not a payment"),
+        ("-2060000.00", "a negative amount would write a negative ledger"),
+        ("-0.01", "one tiyin below zero is still below zero"),
+        # 19 integer digits — `invoices.amount` and `allocations.amount` are
+        # `numeric(18, 2)`, so this must be a 422 at the edge, never a
+        # `DataError` 500 out of the database.
+        ("1234567890123456789.00", "wider than numeric(18, 2) can hold"),
+    ],
+)
+async def test_an_amount_that_is_not_money_is_refused(
+    payments_view_client,
+    db: AsyncSession,
+    pending_invoice: Invoice,
+    bank_doc: MediaFile,
+    amount: str,
+    case: str,
+):
+    response = await payments_view_client.post(
+        MANUAL_CONFIRMATIONS,
+        json={
+            "invoice_id": str(pending_invoice.id),
+            "amount": amount,
+            "paid_at": "2026-09-01T10:00:00Z",
+            "bank_doc_file_id": str(bank_doc.id),
+        },
+    )
+    assert response.status_code == 422, f"{case}: {response.text}"
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+    # Refused at the edge means nothing at all was written.
+    assert (
+        list(
+            await db.scalars(
+                select(ManualPaymentConfirmation).where(
+                    ManualPaymentConfirmation.invoice_id == pending_invoice.id
+                )
+            )
+        )
+        == []
+    )
+    await db.refresh(pending_invoice)
+    assert pending_invoice.status == "pending"
+
+
+async def test_an_overpayment_is_still_accepted(
+    payments_view_client, db: AsyncSession, pending_invoice: Invoice, bank_doc: MediaFile
+):
+    """No business ceiling, deliberately: an overpayment is a documented
+    refund ground in `tz/08`, so the bound that refuses zero and negatives
+    must not also refuse a real case. Flagged like any other mismatch."""
+    over = pending_invoice.amount + Decimal("1000.00")
+    body = await _file_via_http(payments_view_client, pending_invoice, bank_doc, amount=over)
+
+    assert body["amount_matches_invoice"] is False
+    row = (
+        await db.scalars(
+            select(Reconciliation).where(Reconciliation.invoice_id == pending_invoice.id)
+        )
+    ).one()
+    assert row.difference == Decimal("1000.00")
+
+
+# --- sys_admin is a superuser for permissions, not for maker-checker ----------
+
+
+async def test_a_sys_admin_may_not_check_its_own_filing(
+    db: AsyncSession, pending_invoice: Invoice, bank_doc: MediaFile
+):
+    """`require_permission` lets a `sys_admin` past every permission code as a
+    superuser — so it reaches BOTH routes, and it is the one actor that can
+    file and then check with no second grant. Whose two pairs of eyes saw this
+    money is not a permission question, so `check_manual_confirmation` refuses
+    it anyway, in the service, before any write.
+
+    Driven entirely through HTTP precisely because the superuser bypass lives
+    in the dependency: a service-level call would never exercise it, and this
+    is exactly the property a future refactor of `require_permission` would
+    silently break."""
+    admin = await make_user(db, role_code="sys_admin")
+    async for client in _client_for(db, admin):
+        filed = await _file_via_http(client, pending_invoice, bank_doc)
+        assert uuid.UUID(filed["maker_id"]) == admin.id
+
+        response = await client.post(f"{MANUAL_CONFIRMATIONS}/{filed['id']}/confirm")
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "ERR-ACL-001"
+
+        # A reject is one person deciding alone just as much as a confirm is.
+        rejected = await client.post(
+            f"{MANUAL_CONFIRMATIONS}/{filed['id']}/reject",
+            json={"reason": "on second thoughts"},
+        )
+        assert rejected.status_code == 403, rejected.text
+
+        # Inside the generator's own body: `filed` is bound only if the loop
+        # ran, and pyright is right to refuse to assume it did.
+        row = await db.get(
+            ManualPaymentConfirmation, uuid.UUID(filed["id"]), populate_existing=True
+        )
+        assert row is not None
+        assert row.status == "pending_check"
+        assert row.checker_id is None
+        await db.refresh(pending_invoice)
+        assert pending_invoice.status == "pending"

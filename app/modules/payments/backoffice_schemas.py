@@ -15,7 +15,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class StatementAccepted(BaseModel):
@@ -130,10 +130,27 @@ class ManualConfirmationIn(BaseModel):
     `amount` is the amount the BANK DOCUMENT says arrived, which may
     legitimately disagree with `invoices.amount` (ruling 5): an underpayment
     is a real thing an accountant confirms and then reconciles. It is
-    accepted, recorded and flagged — never refused."""
+    accepted, recorded and flagged — never refused.
+
+    **`gt=0` is the guard this door removed from the money path and has to
+    put back.** On the Payme side `CreateTransaction`/`CheckPerformTransaction`
+    pin the amount to `invoice.amount` and refuse a mismatch with `-31001`;
+    here nothing does, and an unbounded `Decimal` was driven end to end
+    against a real 150 000,00 invoice: `-2060000.00` filed 201, confirmed
+    200, marked the invoice `paid` and the application `PAID`, and wrote two
+    NEGATIVE `allocations` rows. `0.00` settled the invoice in full with a
+    zero ledger. Ruling 5 accepts an UNDERPAYMENT — money that arrived, less
+    than was owed — never a negative or a zero settlement, neither of which
+    is a payment at all.
+
+    **No business ceiling, deliberately.** An overpayment is a documented
+    refund ground in `tz/08`, so capping the upper end would refuse a real
+    case. `max_digits`/`decimal_places` mirror `numeric(18, 2)` exactly and
+    exist only so an overflow is a 422 at the edge rather than a
+    `DataError` 500 from the database."""
 
     invoice_id: uuid.UUID
-    amount: Decimal
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
     paid_at: datetime
     bank_doc_file_id: uuid.UUID
 
