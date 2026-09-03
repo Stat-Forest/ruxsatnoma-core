@@ -65,6 +65,7 @@ from app.modules.integrations.adapters import payme as payme_adapter
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, ledger, repo
 from app.modules.payments.models import (
+    ALLOCATION_ENTRY_TYPES,
     RECONCILIATION_RESULTS,
     RECONCILIATION_STATUSES,
     Allocation,
@@ -114,6 +115,8 @@ DUE_PERIOD = timedelta(days=10)
 # silently changing which row the register shows.
 RECONCILIATION_RESULT_DISCREPANCY = RECONCILIATION_RESULTS[1]
 RECONCILIATION_STATUS_OPEN = RECONCILIATION_STATUSES[0]
+ALLOCATION_ENTRY_PAYMENT = ALLOCATION_ENTRY_TYPES[0]
+ALLOCATION_ENTRY_CORRECTION = ALLOCATION_ENTRY_TYPES[2]
 
 
 # --- Task 7: the public surface for 3.11 permits ---------------------------
@@ -168,14 +171,18 @@ RECONCILIATION_STATUS_OPEN = RECONCILIATION_STATUSES[0]
 #
 #   **What DID ship, in `record_reversal` (below), called from
 #   `payme._cancel_transaction`'s state-`2` branch:** the ledger stays
-#   arithmetically true (one `correction` entry per `payment` row, so the
-#   invoice's whole ledger sums to `0.00` instead of claiming money that is
-#   gone); the discrepancy register carries an OPEN row whose `difference` is
-#   the reversed amount — the operator's handle, and a case only a human can
-#   finish; RI-01 is raised («PAID без подтверждения провайдера/банка» — the
-#   provider withdrew a confirmation the invoice still bears); and RI-10 too
-#   («Разрешение активировано без оплаты») when a permit already exists for
-#   that application.
+#   arithmetically true (one `correction` entry per `payment` row that
+#   transaction wrote, so its entries cancel out instead of claiming money
+#   that is gone — and with it the invoice's whole ledger, for as long as only
+#   one transaction can ever perform against an invoice, which is all today's
+#   paths allow); the discrepancy register carries an OPEN row whose
+#   `difference` is the reversed amount, stored POSITIVE and not in
+#   `matcher.py`'s paid-minus-invoiced convention (`record_reversal` explains
+#   why the column carries both); RI-01 is raised («PAID без подтверждения
+#   провайдера/банка» — the provider withdrew a confirmation the invoice still
+#   bears); and RI-10 too («Разрешение активировано без оплаты») when a permit
+#   in a LIVE status — `pending_signatures`, `active` or `suspended`, never a
+#   `revoked` or `expired` one — already exists for that application.
 #
 #   **What is STILL OPEN, and is not a defect in the code below.** The invoice
 #   stays `paid` and the application stays `PAID`, so this function still
@@ -714,8 +721,11 @@ async def record_reversal(
 
     1. one `correction` allocation per `payment` row this transaction wrote,
        with the sign flipped — the ledger is append-only (ruling 4), so the
-       reversal is new rows and the invoice's whole ledger then sums to
-       `0.00` rather than claiming money that is gone;
+       reversal is new rows rather than an edit of the old ones. This
+       transaction's own entries always cancel out; the INVOICE's whole ledger
+       sums to `0.00` too, as long as only one transaction ever performed
+       against it, which is all today's paths allow (see the comment on
+       `paid_rows` below);
     2. one `reconciliations` row, `result='discrepancy'`, `status='open'` —
        the register a human reads every morning, and the operator's handle on
        a case only a human can finish;
@@ -723,7 +733,9 @@ async def record_reversal(
        провайдера/банка» — the provider has withdrawn its confirmation and
        the invoice is still `paid`), plus a second one carrying **RI-10**
        («Разрешение активировано без оплаты», critical) when a permit already
-       exists for this application.
+       exists for this application in a LIVE status (`repo.
+       permit_exists_for_application` — a `revoked` or `expired` permit does
+       not raise it).
 
     **What it does NOT do, and why.** It does not move the invoice off `paid`
     and it does not move the application off `PAID`.
@@ -748,7 +760,7 @@ async def record_reversal(
     """
     entries = await repo.list_allocations_by_invoice(db, invoice.id)
     mine = [row for row in entries if row.transaction_id == transaction.id]
-    if any(row.entry_type == "correction" for row in mine):
+    if any(row.entry_type == ALLOCATION_ENTRY_CORRECTION for row in mine):
         logger.warning(
             "payments.reversal_already_recorded",
             invoice_id=str(invoice.id),
@@ -759,10 +771,18 @@ async def record_reversal(
     # The rows THIS transaction wrote, not every `payment` row on the invoice:
     # only this transaction's money came back, and negating another
     # transaction's entries would put the ledger further from the truth, not
-    # closer. On today's paths the two sets are the same — an invoice is
-    # `pending` for exactly one performing transaction — so the invoice's whole
-    # ledger does sum back to `0.00`, which is what the test asserts.
-    paid_rows = [row for row in mine if row.entry_type == "payment"]
+    # closer.
+    #
+    # On every path that exists today the two sets are identical, so the
+    # invoice's WHOLE ledger sums back to `0.00` — but that is a consequence,
+    # not the rule this code follows. It holds because an invoice is only ever
+    # performed once: `payme._perform_transaction` refuses an invoice that is
+    # not `pending`, and a reversal leaves it `paid` (ruling 15). Should a
+    # second performing transaction ever become reachable, this function stays
+    # correct and the whole-invoice sum stops being zero — that is the right
+    # way round, and the test asserts the sum for the one-transaction case it
+    # builds, not as a universal law.
+    paid_rows = [row for row in mine if row.entry_type == ALLOCATION_ENTRY_PAYMENT]
     note = f"reversal of {transaction.provider} transaction {transaction.external_id}"
     if reason is not None:
         note = f"{note} (cancel reason {reason})"
@@ -772,7 +792,7 @@ async def record_reversal(
             Allocation(
                 invoice_id=invoice.id,
                 transaction_id=transaction.id,
-                entry_type="correction",
+                entry_type=ALLOCATION_ENTRY_CORRECTION,
                 target=row.target,
                 account=row.account,
                 amount=-row.amount,
@@ -783,10 +803,18 @@ async def record_reversal(
     )
 
     reversed_amount = sum((row.amount for row in paid_rows), Decimal("0.00"))
-    # `difference` here is the money that went back, positive — NOT
-    # `matcher.py`'s paid-minus-invoiced convention, which describes a bank
-    # line against an invoice and has no bank line to describe on this path.
-    # The comment says which of the two a reader is looking at.
+    # **`reconciliations.difference` carries TWO sign conventions, and this is
+    # the second one** (fix round 1). Everywhere a payment is compared with an
+    # invoice — `matcher.py`, `statement_service`, `backoffice_service`'s
+    # underpaid manual confirmation — it is paid MINUS invoiced, so an
+    # underpayment is negative and an overpayment positive, the same sign a
+    # bank line gets. There is no such comparison here: nothing was
+    # under- or over-paid, and there is no bank line at all. What this row
+    # reports is the money that WENT BACK, stored positive, and the row's own
+    # `comment` says "reversed a confirmed payment of ..." so a register reader
+    # is never left inferring it from the number. `transaction_id IS NOT NULL`
+    # with `statement_line_id IS NULL` is what distinguishes the two kinds of
+    # row in a query.
     reconciliation = Reconciliation(
         transaction_id=transaction.id,
         invoice_id=invoice.id,
@@ -825,12 +853,14 @@ async def record_reversal(
         extra={"risk_indicator": RISK_INDICATOR_UNCONFIRMED_PAID},
     )
 
-    # A permit for this application means money has gone back from something
-    # already issued — `tz/10`'s RI-10 verbatim. A read-only COUNT, never a
-    # call into `permits` (both modules are level 4): see
-    # `repo.count_permits_for_application`'s own comment for the boundary
-    # argument and for what drops if it is ever re-decided.
-    if await repo.count_permits_for_application(db, invoice.application_id) > 0:
+    # A LIVE permit for this application means money has gone back from
+    # something already issued — `tz/10`'s RI-10 verbatim. A read-only EXISTS,
+    # never a call into `permits` (both modules are level 4): see
+    # `repo.permit_exists_for_application`'s own comment for the boundary
+    # argument, for which statuses count (a `revoked` or `expired` permit does
+    # NOT — an RI-10 on either is a false positive on a CRITICAL indicator),
+    # and for what drops if the trade is ever re-decided.
+    if await repo.permit_exists_for_application(db, invoice.application_id):
         await audit.log(
             db,
             action=REVERSAL_RECORD,

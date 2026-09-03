@@ -275,9 +275,17 @@ async def file_manual_confirmation(
 
     matches = amount == invoice.amount
     if not matches:
-        # `difference` is paid MINUS invoiced everywhere in this module
-        # (`matcher.py`'s own convention), so an underpayment is negative
-        # and an overpayment positive — the same sign a bank line would get.
+        # `difference` is paid MINUS invoiced on every row that COMPARES a
+        # payment with an invoice (`matcher.py`'s own convention), so an
+        # underpayment is negative and an overpayment positive — the same sign
+        # a bank line would get. That is this row.
+        #
+        # It is not the only convention in the column (fix round 1): a
+        # post-perform reversal (`service.record_reversal`) compares nothing
+        # and stores the money that went back, positive. Those rows carry a
+        # `transaction_id` with no `statement_line_id`, and their `comment`
+        # says "reversed a confirmed payment of ..." — a query or a reader
+        # that must tell the two apart has both.
         await repo.add_reconciliations(
             db,
             [

@@ -5,10 +5,14 @@ GAP and left open.
 Payme's `CancelTransaction` on an ALREADY-PERFORMED transaction (state `2` ->
 `-2`; `design/04` §3.5 reason `5` is literally "funds returned") recorded the
 reversal on `provider_transactions` and NOTHING else. This file pins what
-3.10b writes instead: two `correction` allocations that bring the invoice's
-whole ledger back to `0.00`, one open `reconciliations` row whose `difference`
-is the money that went back, an RI-01 audit row, and — only when a permit
-already exists for that application — a second audit row carrying RI-10.
+3.10b writes instead: two `correction` allocations negating what that
+transaction wrote (which brings this invoice's whole ledger back to `0.00`,
+since only one transaction can perform against it — see
+`test_a_post_perform_cancel_brings_the_ledger_back_to_zero`), one open
+`reconciliations` row whose `difference` is the money that went back, an RI-01
+audit row, and — only when a permit in a LIVE status already exists for that
+application — a second audit row carrying RI-10. A `revoked` permit does not
+raise it: an operator has already dealt with that one.
 
 And it pins, just as hard, the two things this stage does NOT do: the invoice
 stays `paid` and the application stays `PAID`
@@ -23,7 +27,7 @@ commits every request for real (`_commit_pending_before_requests`), which
 would commit this file's own contour/permit scaffolding too. Driven through
 `db` alone, every row this file writes is rolled back with the test.
 
-**The permit row is built directly, with raw SQL** (ruling 20): `payments` and
+**The permit rows are built directly, with raw SQL** (ruling 20): `payments` and
 `permits` are both level 4 (`design/01` rule 3), and a payments test that
 imported `permits` would be the first crack in the boundary the implementation
 itself is careful not to cross. The assertions are on `audit_log`, never on the
@@ -48,7 +52,13 @@ from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
 from app.modules.gis.models import GisLayer
 from app.modules.payments import payme
-from app.modules.payments.models import Allocation, Invoice, Reconciliation
+from app.modules.payments import service as payments_service
+from app.modules.payments.models import (
+    Allocation,
+    Invoice,
+    ProviderTransaction,
+    Reconciliation,
+)
 from tests.modules.gis.conftest import contours_layer as contours_layer
 from tests.modules.gis.conftest import leshoz as leshoz
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
@@ -108,21 +118,17 @@ async def _risk_rows(db: AsyncSession, indicator: str, object_id: uuid.UUID) -> 
     return list((await db.execute(stmt)).scalars().all())
 
 
-@pytest.fixture
-async def permit_for_the_application(
+async def _insert_permit(
     db: AsyncSession,
-    pending_invoice: Invoice,
-    approved_application: Application,
-    grazing_activity_id: uuid.UUID,
+    *,
+    application: Application,
+    activity_type_id: uuid.UUID,
     leshoz,
     contours_layer: GisLayer,
+    status: str,
 ) -> uuid.UUID:
-    """A `permits` row for the same application, inserted with raw SQL — no
-    `permits` import anywhere in this file (ruling 20; both modules are level
-    4). `pending_invoice` is depended on FIRST so its own `db.commit()` runs
-    before any of this fixture's rows exist: everything below is then flushed
-    only, and rolls back with the test rather than leaving a stray contour in
-    the shared database.
+    """A `permits` row for `application`, inserted with raw SQL — no `permits`
+    import anywhere in this file (ruling 20; both modules are level 4).
 
     The contour sits at a random location (`random_box_wkt`) and its version
     stays a draft: nothing here is read by a geometric predicate, the permit
@@ -138,7 +144,7 @@ async def permit_for_the_application(
             " period_from, period_to, amount, status, qr_token, snapshot)"
             " VALUES (:id, :series, :number, :application_id, :applicant_id,"
             " :activity_type_id, :organization_id, :contour_id, :contour_version_id, 1.0000,"
-            " :period_from, :period_to, 100.00, 'active', :qr_token, '{}'::jsonb)"
+            " :period_from, :period_to, 100.00, :status, :qr_token, '{}'::jsonb)"
         ),
         {
             "id": permit_id,
@@ -146,26 +152,80 @@ async def permit_for_the_application(
             # uq_permits_series_number is (series, number) and the test DB is
             # shared: a literal would collide with a past run's committed row.
             "number": uuid.uuid4().int % 1_000_000_000 + 1,
-            "application_id": approved_application.id,
-            "applicant_id": approved_application.applicant_id,
-            "activity_type_id": grazing_activity_id,
+            "application_id": application.id,
+            "applicant_id": application.applicant_id,
+            "activity_type_id": activity_type_id,
             "organization_id": leshoz.id,
             "contour_id": contour.id,
             "contour_version_id": version.id,
             "period_from": date(2027, 1, 1),
             "period_to": date(2027, 12, 31),
+            "status": status,
             "qr_token": uuid.uuid4().hex,
         },
     )
     return permit_id
 
 
+@pytest.fixture
+async def active_permit(
+    db: AsyncSession,
+    pending_invoice: Invoice,
+    approved_application: Application,
+    grazing_activity_id: uuid.UUID,
+    leshoz,
+    contours_layer: GisLayer,
+) -> uuid.UUID:
+    """An `active` permit for the same application. `pending_invoice` is
+    depended on FIRST so its own `db.commit()` runs before any of this
+    fixture's rows exist: everything below is then flushed only, and rolls back
+    with the test rather than leaving a stray contour in the shared database."""
+    return await _insert_permit(
+        db,
+        application=approved_application,
+        activity_type_id=grazing_activity_id,
+        leshoz=leshoz,
+        contours_layer=contours_layer,
+        status="active",
+    )
+
+
+@pytest.fixture
+async def revoked_permit(
+    db: AsyncSession,
+    pending_invoice: Invoice,
+    approved_application: Application,
+    grazing_activity_id: uuid.UUID,
+    leshoz,
+    contours_layer: GisLayer,
+) -> uuid.UUID:
+    """The same row in `revoked` — the status whose RI-10 was a false positive
+    until fix round 1 (see `test_no_ri_10_for_a_revoked_permit`)."""
+    return await _insert_permit(
+        db,
+        application=approved_application,
+        activity_type_id=grazing_activity_id,
+        leshoz=leshoz,
+        contours_layer=contours_layer,
+        status="revoked",
+    )
+
+
 async def test_a_post_perform_cancel_brings_the_ledger_back_to_zero(
     db: AsyncSession, pending_invoice: Invoice
 ):
-    """Two `correction` rows negating the two `payment` rows, so `sum(amount)`
-    over the invoice's WHOLE ledger is `0.00` — the ledger is append-only
-    (ruling 4), so a reversal is new rows, never an update of the old ones."""
+    """Two `correction` rows negating the two `payment` rows — the ledger is
+    append-only (ruling 4), so a reversal is new rows, never an update of the
+    old ones.
+
+    The whole-invoice sum is `0.00` HERE because exactly one transaction ever
+    performed against this invoice, which is all today's paths allow
+    (`payme._perform_transaction` refuses an invoice that is not `pending`, and
+    a reversal leaves it `paid`). That is the property under test, not a
+    universal law: `record_reversal` negates the rows of the transaction that
+    was cancelled, so on an invoice with two performing transactions its own
+    entries would still cancel out while the invoice's total would not be zero
+    — and that would be correct (fix round 1)."""
     tx_id, now = await _perform(db, pending_invoice, "ledger")
 
     before = await _allocations(db, pending_invoice)
@@ -184,7 +244,10 @@ async def test_a_post_perform_cancel_brings_the_ledger_back_to_zero(
     # names the Payme reason — the only place the reason survives outside
     # `provider_transactions`.
     assert all(row.transaction_id is not None for row in corrections)
-    assert all("5" in (row.note or "") for row in corrections)
+    # The whole suffix, not a bare "5" — the transaction's own random hex id is
+    # in the same string and would satisfy a substring check on the digit alone
+    # even with the reason dropped entirely (fix round 1).
+    assert all((row.note or "").endswith("(cancel reason 5)") for row in corrections)
 
 
 async def test_a_post_perform_cancel_opens_one_discrepancy_row(
@@ -226,7 +289,7 @@ async def test_a_post_perform_cancel_writes_an_ri_01_audit_row(
 
 
 async def test_ri_10_fires_only_when_a_permit_already_exists(
-    db: AsyncSession, pending_invoice: Invoice, permit_for_the_application: uuid.UUID
+    db: AsyncSession, pending_invoice: Invoice, active_permit: uuid.UUID
 ):
     """`tz/10` RI-10 — «Разрешение активировано без оплаты», critical and
     immediate. A reversed payment under an existing permit IS that, and it is
@@ -241,6 +304,58 @@ async def test_ri_10_fires_only_when_a_permit_already_exists(
     rows = await _risk_rows(db, RI_PERMIT_WITHOUT_PAYMENT, pending_invoice.application_id)
     assert len(rows) == 1
     assert rows[0].object_type == "application"
+
+
+async def test_no_ri_10_for_a_revoked_permit(
+    db: AsyncSession, pending_invoice: Invoice, revoked_permit: uuid.UUID
+):
+    """A `revoked` permit is one an operator has ALREADY dealt with, so a
+    reversal under it is not «Разрешение активировано без оплаты» — and RI-10
+    is CRITICAL in `tz/10` and harvested by string by 4.2, so a false positive
+    there is expensive.
+
+    Until fix round 1 the count behind this had no status filter and every
+    permit row counted the same, `revoked` and `expired` included. The RI-01
+    row still fires: the money did come back."""
+    tx_id, now = await _perform(db, pending_invoice, "revoked")
+
+    await _cancel(db, tx_id, now)
+
+    assert await _risk_rows(db, RI_PERMIT_WITHOUT_PAYMENT, pending_invoice.application_id) == []
+    assert len(await _risk_rows(db, RI_UNCONFIRMED_PAID, pending_invoice.id)) == 1
+
+
+async def test_recording_the_same_reversal_twice_records_it_once(
+    db: AsyncSession, pending_invoice: Invoice, active_permit: uuid.UUID
+):
+    """`record_reversal`'s own guard: a `correction` row already standing
+    against this transaction means it ran before, and a second pass would
+    negate the ledger a second time — silently, and with no way to tell the
+    duplicate rows from the real ones afterwards.
+
+    `payme`'s state machine cannot produce a second call (state `-2` is
+    terminal per transaction, and the branch that calls this is only reached
+    from state `2`), so the guard exists for a manual re-run — which is exactly
+    why it needs a test of its own: nothing else would notice if a refactor
+    dropped it."""
+    tx_id, now = await _perform(db, pending_invoice, "twice")
+    await _cancel(db, tx_id, now)
+
+    after_first = await _allocations(db, pending_invoice)
+    transaction = (
+        await db.execute(
+            select(ProviderTransaction).where(ProviderTransaction.external_id == tx_id)
+        )
+    ).scalar_one()
+
+    await payments_service.record_reversal(
+        db, invoice=pending_invoice, transaction=transaction, reason=5
+    )
+
+    assert len(await _allocations(db, pending_invoice)) == len(after_first)
+    assert len(await _reconciliations(db, pending_invoice)) == 1
+    assert len(await _risk_rows(db, RI_UNCONFIRMED_PAID, pending_invoice.id)) == 1
+    assert len(await _risk_rows(db, RI_PERMIT_WITHOUT_PAYMENT, pending_invoice.application_id)) == 1
 
 
 async def test_no_ri_10_when_no_permit_exists(db: AsyncSession, pending_invoice: Invoice):
@@ -290,7 +405,7 @@ async def test_the_invoice_stays_paid_and_the_application_stays_paid(
 
 
 async def test_cancelling_a_never_performed_transaction_records_nothing(
-    db: AsyncSession, pending_invoice: Invoice, permit_for_the_application: uuid.UUID
+    db: AsyncSession, pending_invoice: Invoice, active_permit: uuid.UUID
 ):
     """3.10a's behaviour for state `1` -> `-1`, unchanged: no money ever
     arrived, so there is nothing to reverse — no ledger row, no register row,

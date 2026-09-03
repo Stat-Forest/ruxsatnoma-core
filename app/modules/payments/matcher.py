@@ -28,6 +28,13 @@ not to use.
 `difference = line.amount - invoice_amount` — **paid MINUS invoiced**: a
 negative number means the line underpaid the invoice, a positive number means
 it overpaid. A reader must never have to guess the sign of a money delta.
+
+That convention governs every `reconciliations` row that COMPARES a payment
+with an invoice — this module's, `statement_service`'s and
+`backoffice_service`'s. It is not the only convention in that column:
+`service.record_reversal` writes a row that compares nothing and stores the
+money that went BACK, positive (fix round 1). Those rows carry a
+`transaction_id` and no `statement_line_id`.
 """
 
 import re

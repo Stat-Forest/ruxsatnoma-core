@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select, text
+from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.payments.models import (
@@ -140,7 +140,7 @@ async def list_allocations_by_invoice(
 # `permits` and `payments` are BOTH level 4, and `design/01` rule 3 forbids one
 # calling the other — obeyed in the other direction too (`permits.service.issue`
 # reads the APPLICATION's status rather than asking `payments` whether it was
-# paid). This is not a call: it is a read-only COUNT on one table, taken for a
+# paid). This is not a call: it is a read-only EXISTS on one table, taken for a
 # RISK CHECK — "does a permit already exist for the application whose payment
 # just came back", which is `tz/10`'s RI-10 verbatim. It moves nothing, decides
 # nothing about a permit, and imports nothing from that module: raw SQL by the
@@ -154,14 +154,45 @@ async def list_allocations_by_invoice(
 # depends on this function.
 
 
-async def count_permits_for_application(db: AsyncSession, application_id: uuid.UUID) -> int:
-    """How many `permits` rows exist for `application_id` — read-only, see the
-    comment above for why this module may ask. `permits.application_id` is
-    unique, so the answer is only ever 0 or 1; a count rather than an
-    `EXISTS` so a future duplicate register (3.11b's нусха) still reads
-    correctly here without this function having to be revisited."""
-    stmt = text("SELECT count(*) FROM permits WHERE application_id = :application_id")
-    return (await db.execute(stmt, {"application_id": application_id})).scalar_one()
+# The permit statuses that make a reversed payment an RI-10, as LITERALS.
+#
+# `permits.models.PERMIT_STATUSES` is the tuple these three come from, and
+# deriving them from it is exactly what this module does with its OWN model
+# tuples two functions up. It is not done here, deliberately: importing
+# `permits.models` to reach it would be the level-4 import the comment above
+# says this function exists to avoid, and a boundary is worth more than a
+# derived literal (fix round 1, ruling). `tests/modules/payments/
+# test_reversal.py` covers the one status whose absence is load-bearing.
+#
+# Why these three and not the other three (fix round 1, ruling):
+#   - `pending_signatures` COUNTS — the document exists and the money was taken.
+#   - `active` COUNTS — the plain reading of «Разрешение активировано без оплаты».
+#   - `suspended` COUNTS — suspension is reversible; the permit is still live.
+#   - `revoked` does NOT — an operator has already dealt with it, and an RI-10
+#     on it is a false positive on a CRITICAL indicator 4.2 harvests by string.
+#   - `expired` does NOT — it ran its full course on money that was earned.
+#   - `archived` does NOT.
+_RI_10_PERMIT_STATUSES = ("pending_signatures", "active", "suspended")
+
+_PERMIT_EXISTS_SQL = text(
+    "SELECT EXISTS (SELECT 1 FROM permits WHERE application_id = :application_id"
+    " AND status IN :statuses)"
+).bindparams(bindparam("statuses", expanding=True))
+
+
+async def permit_exists_for_application(db: AsyncSession, application_id: uuid.UUID) -> bool:
+    """Does a permit that would make a reversed payment an RI-10 exist for
+    `application_id` — read-only, see the comment above for why this module
+    may ask and which statuses count.
+
+    `EXISTS`, not a count: `permits.application_id` is `unique=True`, so the
+    answer can only ever be 0 or 1 and a number would suggest otherwise."""
+    return (
+        await db.execute(
+            _PERMIT_EXISTS_SQL,
+            {"application_id": application_id, "statuses": list(_RI_10_PERMIT_STATUSES)},
+        )
+    ).scalar_one()
 
 
 async def add_payment_intent(db: AsyncSession, intent: PaymentIntent) -> None:
