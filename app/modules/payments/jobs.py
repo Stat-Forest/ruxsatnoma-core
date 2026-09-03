@@ -16,11 +16,6 @@ two — there is no reminder half to a control deadline.
 session from an `async_sessionmaker`, calls this, and commits (mirrors
 `process_gis_imports`'s split from `gis.import_service.process_pending`).
 
-`expiry_sweep(db)` is pure business logic over an already-open `AsyncSession`
-— `app/workers/jobs.py::expire_invoices` is the thin wrapper that opens the
-session from an `async_sessionmaker`, calls this, and commits (mirrors
-`process_gis_imports`'s split from `gis.import_service.process_pending`).
-
 Two independent passes over `invoices.status = 'pending'`, both idempotent by
 construction because each candidate set is defined by a status/date filter
 that a successful pass removes the row from:
@@ -333,8 +328,14 @@ async def _flag_one_overdue_refund(
     is `audit.service.already_logged`, the shape `expiry_sweep`'s reminder
     pass uses with `notifications.service.already_notified` — RI-07 sends no
     notification, so that function does not apply here, and this one exists
-    for exactly this caller."""
-    if await audit.already_logged(db, action=REFUND_SLA_BREACH, object_id=refund_id):
+    for exactly this caller. `object_type="refund"` is passed through (fix
+    round 1) so the check is served by `ix_audit_log_object`
+    (`object_type`, `object_id`, `occurred_at`) as an index scan rather than
+    a `Seq Scan on audit_log` — `EXPLAIN`-confirmed, see `audit.repo.exists`'s
+    own docstring."""
+    if await audit.already_logged(
+        db, action=REFUND_SLA_BREACH, object_type="refund", object_id=refund_id
+    ):
         return False
     await audit.log(
         db,
