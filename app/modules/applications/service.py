@@ -34,9 +34,10 @@ from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import checks, repo
-from app.modules.applications.events import APPLICATION_SUBMITTED
+from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
     Application,
+    ApplicationAssignment,
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
@@ -122,16 +123,27 @@ DOC_TYPE_CLASSIFIER_CODE = "doc_types"
 # than accepting an unchecked attachment as proof.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
 
-# tz/05's transition table, verbatim (plan 03.9a task 8, the brief's own
-# copy). All fourteen `APPLICATION_STATUSES` are keys; `ARCHIVED` is
-# terminal. No status maps to itself — tz/05 has no self-loop anywhere in
-# this table, so a transition to the status an application already holds is
-# exactly as illegal as any other jump not listed here (3.10's retry paths
-# will attempt this; see `test_public_surface.py`).
+# tz/05's transition table (plan 03.9a task 8, the brief's own copy). All
+# fourteen `APPLICATION_STATUSES` are keys; `ARCHIVED` is terminal. No status
+# maps to itself — tz/05 has no self-loop anywhere in this table, so a
+# transition to the status an application already holds is exactly as illegal
+# as any other jump not listed here (3.10's retry paths will attempt this; see
+# `test_public_surface.py`).
+#
+# **`SUBMITTED -> CANCELLED` and `IN_REVIEW -> CANCELLED` were added by task 6**
+# (controller ruling R20). Branch 1 transcribed this table as tz/05 verbatim and
+# dropped both: tz/05 lets an applicant WITHDRAW at any point before a decision,
+# and without those two edges `POST /applications/{id}/cancel` could only ever
+# work on a draft — an applicant who had already filed would have to wait for a
+# decision on a permit they no longer want, and the plot would stay blocked by
+# `ex_applications_no_duplicate` in the meantime. Purely additive, and it cannot
+# widen what a level-4 module may do: CANCELLED is not in the target list the
+# public-surface comment below permits, and `cancel` is this module's own flow
+# verb.
 APPLICATION_TRANSITIONS: dict[str, frozenset[str]] = {
     "DRAFT": frozenset({"SUBMITTED", "CANCELLED"}),
-    "SUBMITTED": frozenset({"IN_REVIEW", "RETURNED", "REJECTED"}),
-    "IN_REVIEW": frozenset({"PENDING_INFO", "APPROVED", "REJECTED", "RETURNED"}),
+    "SUBMITTED": frozenset({"IN_REVIEW", "RETURNED", "REJECTED", "CANCELLED"}),
+    "IN_REVIEW": frozenset({"PENDING_INFO", "APPROVED", "REJECTED", "RETURNED", "CANCELLED"}),
     "PENDING_INFO": frozenset({"IN_REVIEW", "CANCELLED"}),
     "RETURNED": frozenset({"SUBMITTED", "CANCELLED"}),
     "APPROVED": frozenset({"INVOICED"}),
@@ -537,16 +549,49 @@ async def _readable_application(
         return application
     if not await _holds_staff_read(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_READ)
+    return application
+
+
+async def _assert_in_actor_zone(
+    db: AsyncSession, application: Application, *, actor: User, action: str
+) -> None:
+    """The TERRITORIAL half of a staff rule, on one already-loaded application —
+    and the RI-12 trail its refusal owes (`tz/10`: «попытка доступа вне
+    территориальных полномочий», High, immediate).
+
+    One body for every staff path in this module (task 6): `_readable_
+    application`'s read rule and `start_review`'s write rule ask the identical
+    question, and a second copy is a second place to forget that a null
+    `assigned_org_id` means "read the contour's owner instead"
+    (`_effective_organization`). `action` is the caller's OWN flow-verb constant
+    (ruling 17), so the journal says whether the refused attempt was a read or
+    an attempt to take the application into work — the refusal itself is
+    identical.
+
+    **The refusal is 404 `ERR-SYS-003`, never 403.** Unlike a permit, whose
+    existence is already public through the QR check, an application carries a
+    citizen's name, plot and herd from the moment it is created, so a 403 would
+    make every route on it an application-existence oracle for anybody holding a
+    session. Tasks 3–5 answer 404 on every ownership and zone refusal in this
+    module and this keeps that one answer.
+
+    The trail is written and COMMITTED before the raise (decision #40 ruling 2):
+    the exception would otherwise roll back the very entry that explains it.
+    A caller that has uncommitted work of its own on this session must therefore
+    treat this as a commit point — `start_review` takes its row lock and calls
+    this before writing anything.
+    """
     if zone_of(actor) == Zone(None, None, None):
-        return application
+        return
     organization_id = await _effective_organization(db, application)
     if organization_id is not None and await _organization_in_actor_zone(
         db, actor, organization_id
     ):
-        return application
+        return
     await audit.log(
         db,
-        action=APPLICATION_READ,
+        action=action,
         user_id=actor.id,
         object_type="application",
         object_id=application.id,
@@ -555,7 +600,7 @@ async def _readable_application(
         extra={"risk_indicator": "RI-12"},
     )
     await db.commit()
-    raise err("ERR-SYS-003", details={"application": str(application_id)})
+    raise err("ERR-SYS-003", details={"application": str(application.id)})
 
 
 async def _resolve_applicant(
@@ -719,13 +764,30 @@ async def _own_draft_for_update(
     submitted — its signed package then describes something the stored row no
     longer says.
     """
+    application = await _own_application_for_update(db, application_id, actor=actor)
+    if application.status != INITIAL_STATUS:
+        raise err("ERR-APP-004", details={"reason": "not_draft", "status": application.status})
+    return application
+
+
+async def _own_application_for_update(
+    db: AsyncSession, application_id: uuid.UUID, *, actor: User
+) -> Application:
+    """The caller's own application, locked, in WHATEVER status it holds — the
+    ownership half of `_own_draft_for_update` above, split out by task 6 so
+    `cancel` (legal from DRAFT, SUBMITTED and IN_REVIEW alike) shares ONE
+    definition of "the caller's own" with the draft routes rather than
+    re-deriving it. The status question then belongs to each caller: the draft
+    routes want `DRAFT`, `cancel` wants whatever `APPLICATION_TRANSITIONS` says.
+
+    404 for a stranger, never 403 — see `_assert_in_actor_zone`'s note on why
+    every refusal in this module is the same answer.
+    """
     application = await repo.get_application_for_update(db, application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     if application.applicant_id not in await _own_applicant_ids(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if application.status != INITIAL_STATUS:
-        raise err("ERR-APP-004", details={"reason": "not_draft", "status": application.status})
     return application
 
 
@@ -1589,3 +1651,304 @@ async def submit(
     # `current_calculation`. Handlers run synchronously, in THIS transaction.
     await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
     return application
+
+
+# --- Task 6: taking into work, cancelling, and the timeline -------------------
+#
+# Two flow verbs and one read. What the two verbs have in common — a locked row,
+# `_assert_transition`, a history row and ONE audit entry under the verb's own
+# name — lives in `_apply_transition` below, so task 7's `approve`/`reject` add
+# their decision-specific work rather than a fourth copy of the transition
+# mechanics.
+#
+# **Two things design/03 asks of these routes that 3.9a deliberately does NOT
+# do**, named here so the difference is a decision and not an omission:
+#
+#   * design/03's `start-review` says «an incomplete package is returned
+#     immediately with RJ-01». Returning needs the `RETURNED` status and the
+#     return route, both stage 3.9b's (ruling 2), so 3.9a's `start-review`
+#     checks status and zone only and an incomplete package reaches a human.
+#   * design/03's timeline includes `info_requests`. The table exists from task
+#     1 and nothing writes it until 3.9b, so the key is present and EMPTY rather
+#     than absent — 3.9b then widens data, not a contract.
+
+# Ruling 17, beside `APPLICATION_SUBMIT` above: a flow verb audits under its own
+# name. `APPLICATION_STATUS_CHANGE` belongs to `set_status` — the level-4
+# surface — and says only that a status moved, never why.
+APPLICATION_START_REVIEW = "application.start_review"
+APPLICATION_CANCEL = "application.cancel"
+
+IN_REVIEW_STATUS = "IN_REVIEW"
+CANCELLED_STATUS = "CANCELLED"
+
+# Ruling 25's OTHER half, beside `SUBMISSION_OBJECT_TYPE`/`SUBMISSION_PURPOSE`:
+# a DECISION is signed as `("application", <the application id>,
+# "application_decision")` — one such object per application, however many
+# submission attempts it took. Declared here because the TIMELINE reads them
+# today; task 7 signs with them.
+DECISION_OBJECT_TYPE = "application"
+DECISION_PURPOSE = "application_decision"
+
+# `application_assignments.reason` (`models.ASSIGNMENT_REASONS`). 3.9a has no
+# auto-assignment job — ruling 14 lets any reviewer in the zone pick an
+# application up — so every row this stage writes records a human act. `auto` is
+# 3.9b's, when the assignment is made for the reviewer instead of by them.
+ASSIGNMENT_MANUAL = "manual"
+
+
+async def _apply_transition(
+    db: AsyncSession,
+    application: Application,
+    *,
+    to_status: str,
+    action: str,
+    actor: User,
+    reason: str | None = None,
+) -> ApplicationStatusHistory:
+    """Move an ALREADY-LOCKED application one legal edge, and leave the two
+    records every transition owes behind: the `application_status_history` row
+    and one `audit_log` entry under the CALLER'S flow verb (ruling 17).
+
+    Deliberately not `set_status`: that function is the level-4 public surface
+    and audits every move as `application.status_change`, which cannot say
+    whether an application reached IN_REVIEW because a hodim took it into work
+    or CANCELLED because the citizen withdrew. `submit` writes its own
+    transition for a different reason again (ruling 25's explicit history-row
+    id) — this helper is what stops the third and fourth copies.
+
+    The caller supplies the locked row because the lock is where the ownership
+    or zone rule was decided: `_own_application_for_update` and `start_review`
+    each lock, check their own rule, and only then arrive here.
+
+    Returns the history row, so a caller that has to bind something to that
+    exact transition (ruling 25's signature identity, 3.9b's return reasons) can
+    without re-reading it.
+    """
+    _assert_transition(application, to_status)
+    from_status = application.status
+    application.status = to_status
+    entry = ApplicationStatusHistory(
+        application_id=application.id,
+        from_status=from_status,
+        to_status=to_status,
+        changed_by=actor.id,
+        reason_text=reason,
+    )
+    await repo.add_status_history(db, entry)
+    # `updated_at` is `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
+    # after a plain UPDATE (lesson: the row in memory is not what Postgres
+    # stored) — and every caller here serializes this row into its response.
+    await db.refresh(application)
+    await audit.log(
+        db,
+        action=action,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        old_value={"status": from_status},
+        new_value={"status": to_status},
+        basis=reason,
+    )
+    return entry
+
+
+async def _claim_assignment(
+    db: AsyncSession,
+    application: Application,
+    *,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    reason: str,
+    actor: User,
+) -> ApplicationAssignment:
+    """Supersede whatever active assignment the application has and record the
+    new one — the ONE write path into `application_assignments`.
+
+    `uq_application_assignments_active` is UNIQUE on `(application_id) WHERE
+    is_active`, so a blind second insert is an `IntegrityError`, and the flush
+    between the deactivation and the insert is NOT optional: without it both
+    rows are pending when the index is checked and the insert fails on a
+    conflict the flush would have resolved (lesson: "A partial unique index
+    constrains only the rows it covers, and only after a flush").
+
+    Built as a supersede from the first caller on purpose, though 3.9a's only
+    caller finds nothing to supersede: task 7's forward writes a SECOND row
+    pointing at the parent organization, and 3.9b turns `start_review` into a
+    claim over a row an auto-assignment job wrote. Both are this function with
+    different arguments, and neither is a special case.
+    """
+    await repo.deactivate_assignments(db, application.id)
+    await db.flush()
+    row = ApplicationAssignment(
+        application_id=application.id,
+        org_id=org_id,
+        user_id=user_id,
+        assigned_by=actor.id,
+        reason=reason,
+        is_active=True,
+    )
+    await repo.add_assignment(db, row)
+    # `created_at` is a `server_default` the INSERT leaves unloaded, and the
+    # timeline both sorts on it and serializes it.
+    await db.refresh(row)
+    return row
+
+
+async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
+    """`POST /applications/{id}/start-review` — SUBMITTED -> IN_REVIEW, plus the
+    `application_assignments` row that says who holds it.
+
+    **Ruling 14: any reviewer holding `applications.review` whose zone covers
+    the application may take it.** There is no auto-assignment job in 3.9a and
+    no "the assigned executor" to be, so the route's `require_permission` and
+    the zone check below are the whole of the rule — the permission answers "may
+    this role at all", the zone answers "on whose rows", and a read or write path
+    needs BOTH (lesson).
+
+    The order of the refusals is what the tests pin: a stranger to the zone is
+    404 before anything about the status is revealed, and only then is a
+    non-SUBMITTED application a 409 `ERR-APP-004`. Reversing them would tell an
+    out-of-zone caller which applications exist and what state they are in.
+
+    Locked from the start (`repo.get_application_for_update`): this is a
+    read-check-write over `status`, and two hodims clicking «принять в работу» a
+    millisecond apart would otherwise both pass `_assert_transition`, both write
+    a history row and race on the partial unique index in `_claim_assignment`.
+    The second now blocks, re-reads `IN_REVIEW` and gets a clean 409.
+
+    `assigned_org_id` is set to the application's EFFECTIVE organization — the
+    contour's owner, since nothing has assigned it yet — and not to the actor's
+    own `organization_id`, which is null for a region-scoped reviewer and would
+    silently move the application out of everyone's zone. `assigned_user_id` is
+    the actor: they took it.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    # Before the status check, and before anything is written: this commits its
+    # RI-12 trail and raises 404 on a territorial refusal.
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_START_REVIEW)
+    _assert_transition(application, IN_REVIEW_STATUS)
+
+    organization_id = await _effective_organization(db, application)
+    if organization_id is None:
+        # `application_assignments.org_id` is NOT NULL and there is nothing to
+        # put in it. Unreachable from SUBMITTED — `_assert_complete` makes
+        # `contour_id` mandatory at submission — but a 409 naming the fact beats
+        # an IntegrityError/500 the day some other path reaches here.
+        raise err(
+            "ERR-APP-004",
+            details={"reason": "no_organization", "status": application.status},
+        )
+
+    application.assigned_org_id = organization_id
+    application.assigned_user_id = actor.id
+    await _claim_assignment(
+        db,
+        application,
+        org_id=organization_id,
+        user_id=actor.id,
+        reason=ASSIGNMENT_MANUAL,
+        actor=actor,
+    )
+    await _apply_transition(
+        db,
+        application,
+        to_status=IN_REVIEW_STATUS,
+        action=APPLICATION_START_REVIEW,
+        actor=actor,
+    )
+    return application
+
+
+async def cancel(
+    db: AsyncSession, application_id: uuid.UUID, *, reason: str | None = None, actor: User
+) -> Application:
+    """`POST /applications/{id}/cancel` — the applicant withdraws.
+
+    Legal from DRAFT, SUBMITTED and IN_REVIEW (`APPLICATION_TRANSITIONS`, whose
+    last two edges controller ruling R20 added for exactly this): `tz/05` lets
+    an applicant withdraw at any point before a decision, and one who no longer
+    wants the permit should not have to wait for one. Anything later is
+    somebody else's money or somebody else's document, and `_assert_transition`
+    refuses it as `ERR-APP-004`.
+
+    The OWNER only — `_own_application_for_update`, so a stranger is told 404
+    and never that the application exists. Staff cancellation is not a thing:
+    a reviewer who does not want to grant an application REJECTS it (task 7),
+    which carries a legal ground; «отменено» is the citizen's own word.
+
+    Publishing `APPLICATION_CANCELLED` matters beyond this stage: 3.10a
+    subscribes to it and cancels any in-force invoice, silently and idempotently
+    when there is none (`payments.subscribers.on_application_cancelled`). Its
+    handler runs synchronously in THIS transaction (ruling 3а), and the payload
+    is `application_id` and nothing else — the frozen contract in
+    `applications/events.py`.
+    """
+    application = await _own_application_for_update(db, application_id, actor=actor)
+    await _apply_transition(
+        db,
+        application,
+        to_status=CANCELLED_STATUS,
+        action=APPLICATION_CANCEL,
+        actor=actor,
+        reason=reason,
+    )
+    await publish(db, Event(name=APPLICATION_CANCELLED, payload={"application_id": application.id}))
+    return application
+
+
+async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
+    """`GET /applications/{id}/timeline` — the transitions, the assignments, the
+    signatures and (from 3.9b) the information requests.
+
+    Owner or staff in zone, through `_readable_application`: a stranger is told
+    404, never 403, because this response says who applied for what and when.
+
+    **The signatures are TWO lookups, not one (ruling 25)**, and getting it
+    wrong shows up as an empty `signatures[]` that no assertion about statuses
+    or assignments would catch:
+
+      * the DECISION is signed against the APPLICATION —
+        `("application", <application id>)`, at most one per application
+        however many times it was submitted. It is returned at the TOP level,
+        because it belongs to the application rather than to any one row of its
+        history;
+      * a SUBMISSION is signed against the ATTEMPT —
+        `("application_submission", <the SUBMITTED history row's id>)`. `submit`
+        supplies that id explicitly (ruling 25) precisely so a signature
+        resolves to the exact transition it belongs to with no join table, so
+        each one is attached to ITS OWN entry.
+
+    3.9a produces at most one SUBMITTED row; 3.9b's return-and-resubmit produces
+    several, each with its own signature, which is why the loop below is a loop
+    over every SUBMITTED row rather than a lookup of "the" submission.
+
+    Both are read through `signatures.service.get_for_object` — never by
+    querying that module's table (module boundary, CLAUDE.md).
+
+    `info_requests` is `[]` and present: the table exists and nothing writes it
+    before 3.9b, so shipping the key now means 3.9b widens the DATA and not the
+    contract.
+    """
+    application = await _readable_application(db, application_id, actor=actor)
+    history = await repo.list_status_history(db, application.id)
+    entries: list[dict[str, Any]] = []
+    for entry in history:
+        signatures = (
+            await signatures_service.get_for_object(
+                db, object_type=SUBMISSION_OBJECT_TYPE, object_id=entry.id
+            )
+            if entry.to_status == SUBMITTED_STATUS
+            else []
+        )
+        entries.append({"entry": entry, "signatures": signatures})
+    return {
+        "status_history": entries,
+        "assignments": await repo.list_assignments(db, application.id),
+        "signatures": await signatures_service.get_for_object(
+            db, object_type=DECISION_OBJECT_TYPE, object_id=application.id
+        ),
+        # 3.9b's, and empty by contract until then — see the docstring.
+        "info_requests": [],
+    }

@@ -414,3 +414,148 @@ class ApplicationSubmitIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pkcs7: str
+
+
+# --- Task 6: cancelling, and the timeline -------------------------------------
+
+# `application_status_history.reason_text` is unbounded TEXT, so the only
+# ceiling a withdrawal reason has is the one written here — the same reasoning
+# `MAX_HEAD_COUNT` above spells out for an integer column.
+REASON_MAX_LENGTH = 2000
+
+
+class ApplicationCancelIn(BaseModel):
+    """`POST /applications/{id}/cancel` — an OPTIONAL free-text reason, stored
+    as the history row's `reason_text`.
+
+    Optional because `tz/05` asks for no ground to withdraw one's own
+    application: a citizen who changes their mind owes nobody an explanation.
+    That is the opposite of task 7's rejection, which is a refusal BY the state
+    and needs an RJ-* reason and a legal basis before the signature is even
+    checked.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(max_length=REASON_MAX_LENGTH)] | None = None
+
+
+class TimelineSignatureRow(BaseModel):
+    """One ERI signature as the timeline shows it.
+
+    A REDUCED view of a `signatures` row, not `signatures.schemas.SignatureOut`
+    — exactly the choice `permits.schemas.PermitSignatureRow` made and for the
+    same two reasons: `signature_value` is the whole PKCS#7 envelope (kilobytes,
+    on a screen that only needs to say who signed and whether it verified) and
+    `verification` is the raw provider payload. 3.8's own `GET /signatures?
+    object_type=…&object_id=…` answers the full row for whoever needs it, and
+    defining the shape here keeps the two modules free to change independently.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    object_type: str
+    object_id: uuid.UUID
+    purpose: str
+    signer_user_id: uuid.UUID | None
+    certificate_id: uuid.UUID
+    signed_at: datetime
+    verification_status: str
+
+
+class TimelineHistoryRow(BaseModel):
+    """One transition, with the signature bound to THAT transition.
+
+    `signatures` here is the SUBMISSION line (ruling 25): `submit` signs
+    `("application_submission", <this row's id>)`, so the envelope resolves to
+    the exact attempt it covers. Every other row carries `[]` — a DRAFT or an
+    IN_REVIEW transition is nobody's signed act. The DECISION signature is not
+    here at all: it belongs to the application, not to a row of its history, and
+    sits at the top level of `ApplicationTimelineOut`.
+
+    `reason_item_id`, `legal_basis` and `fields_to_fix` are null for everything
+    3.9a writes and are on the shape from day one: they are 3.9b's return
+    reasons and task 7's rejection grounds, filled in on rows this very read
+    already returns.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    from_status: ApplicationStatus | None
+    to_status: ApplicationStatus
+    changed_by: uuid.UUID | None
+    reason_item_id: uuid.UUID | None
+    reason_text: str | None
+    legal_basis: str | None
+    fields_to_fix: dict[str, Any] | None
+    occurred_at: datetime
+    signatures: list[TimelineSignatureRow] = []
+
+    @classmethod
+    def build(cls, entry: Any, signatures: list[Any]) -> TimelineHistoryRow:
+        """`model_fields` is read rather than the nine names retyped, the same
+        way `ApplicationCardOut.build` assembles the card: a column added here
+        must be read off the row, and a hand-copied list is how the two
+        drift."""
+        return cls.model_validate(
+            {
+                **{name: getattr(entry, name) for name in cls.model_fields if name != "signatures"},
+                "signatures": [TimelineSignatureRow.model_validate(row) for row in signatures],
+            }
+        )
+
+
+class TimelineAssignmentRow(BaseModel):
+    """One row of the assignment register — who held the application, from when,
+    and whether they still do.
+
+    The SUPERSEDED rows are returned too, not only the active one: the register
+    is the record of who held it when, and task 7's over-limit forward is
+    readable only as two rows, the reviewer's deactivated and the parent
+    organization's active.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    user_id: uuid.UUID | None
+    assigned_by: uuid.UUID | None
+    reason: str
+    is_active: bool
+    created_at: datetime
+
+
+class ApplicationTimelineOut(BaseModel):
+    """`GET /applications/{id}/timeline` — design/03's four keys.
+
+    `signatures` at this level is the DECISION signature (`("application",
+    <id>, "application_decision")`), which is why it is empty for everything
+    3.9a can produce before task 7 lands and stays empty on an over-limit
+    forward, where nothing is signed. The submission signatures are NOT here:
+    each sits on its own `status_history` entry, which is the whole point of
+    ruling 25 giving the history row and the signed object the same id.
+
+    `info_requests` is present and empty until 3.9b writes the table.
+    """
+
+    status_history: list[TimelineHistoryRow]
+    assignments: list[TimelineAssignmentRow]
+    signatures: list[TimelineSignatureRow]
+    info_requests: list[Any] = []
+
+    @classmethod
+    def build(cls, timeline: dict[str, Any]) -> ApplicationTimelineOut:
+        return cls(
+            status_history=[
+                TimelineHistoryRow.build(row["entry"], row["signatures"])
+                for row in timeline["status_history"]
+            ],
+            assignments=[
+                TimelineAssignmentRow.model_validate(row) for row in timeline["assignments"]
+            ],
+            signatures=[TimelineSignatureRow.model_validate(row) for row in timeline["signatures"]],
+            info_requests=timeline["info_requests"],
+        )

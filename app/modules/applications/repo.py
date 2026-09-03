@@ -20,12 +20,13 @@ import uuid
 from datetime import date
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
 from app.modules.applications.models import (
     Application,
+    ApplicationAssignment,
     ApplicationCheck,
     ApplicationDocument,
     ApplicationItem,
@@ -338,3 +339,78 @@ async def active_overlapping(
         .limit(1)
     )
     return rows.scalars().first()
+
+
+# --- Task 6: the timeline's rows, and the assignment register -----------------
+
+
+async def list_status_history(
+    db: AsyncSession, application_id: uuid.UUID
+) -> list[ApplicationStatusHistory]:
+    """The application's transitions, oldest first, ordered by `(occurred_at,
+    id)` — **never `occurred_at` alone** (`models.ApplicationStatusHistory`'s
+    own docstring, final review M3).
+
+    `occurred_at` defaults to `now()`, which in Postgres is TRANSACTION start
+    time, so every row written in one transaction shares it to the microsecond.
+    That is the normal case here, not a rarity: task 7's `approve()` writes the
+    APPROVED row and publishes `application_approved`, whose 3.10a handler runs
+    in the SAME transaction and writes INVOICED beside it — sorted on the
+    timestamp alone the two would render in arbitrary order and the timeline
+    would say the invoice preceded the approval. `id` is `uuid7`, hence
+    time-ordered, and `ix_application_status_history_timeline` carries all three
+    columns, so the tie-break is free.
+    """
+    rows = await db.execute(
+        select(ApplicationStatusHistory)
+        .where(ApplicationStatusHistory.application_id == application_id)
+        .order_by(ApplicationStatusHistory.occurred_at, ApplicationStatusHistory.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def list_assignments(
+    db: AsyncSession, application_id: uuid.UUID
+) -> list[ApplicationAssignment]:
+    """Every assignment the application has ever had, oldest first — the
+    superseded ones included, because the register is the record of who held it
+    when. Same `(created_at, id)` tie-break as the history above and for the
+    identical reason: task 7's forward supersedes the reviewer's row and inserts
+    the parent organization's in ONE transaction, so both carry the same
+    `created_at`."""
+    rows = await db.execute(
+        select(ApplicationAssignment)
+        .where(ApplicationAssignment.application_id == application_id)
+        .order_by(ApplicationAssignment.created_at, ApplicationAssignment.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def deactivate_assignments(db: AsyncSession, application_id: uuid.UUID) -> None:
+    """Clear the application's ACTIVE assignment, if it has one — the first half
+    of a supersede write, whose second half is `add_assignment` below.
+
+    `uq_application_assignments_active` is UNIQUE on `(application_id) WHERE
+    is_active`, so the two halves must not be pending at the same time: the
+    index is checked at flush and a still-true old row makes the insert an
+    `IntegrityError` on a conflict the flush order would have resolved (lesson:
+    "A partial unique index constrains only the rows it covers, and only after a
+    flush"). This is a Core UPDATE and therefore hits the database immediately;
+    `service._claim_assignment` flushes between the two all the same, so the
+    ordering is visible where it matters rather than resting on that fact."""
+    await db.execute(
+        update(ApplicationAssignment)
+        .where(
+            ApplicationAssignment.application_id == application_id,
+            ApplicationAssignment.is_active.is_(True),
+        )
+        .values(is_active=False)
+    )
+
+
+async def add_assignment(db: AsyncSession, row: ApplicationAssignment) -> None:
+    """Stage the new assignment and flush, so the partial unique index above
+    surfaces at the call site rather than at the end of the request. Mirrors
+    `add_status_history`."""
+    db.add(row)
+    await db.flush()

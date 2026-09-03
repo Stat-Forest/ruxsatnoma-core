@@ -35,8 +35,9 @@ from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
 from app.modules.applications import service
-from app.modules.applications.permissions import APPLICATIONS_CREATE
+from app.modules.applications.permissions import APPLICATIONS_CREATE, APPLICATIONS_REVIEW
 from app.modules.applications.schemas import (
+    ApplicationCancelIn,
     ApplicationCardOut,
     ApplicationCheckOut,
     ApplicationCreate,
@@ -46,6 +47,7 @@ from app.modules.applications.schemas import (
     ApplicationPatch,
     ApplicationStatus,
     ApplicationSubmitIn,
+    ApplicationTimelineOut,
     PrecheckCalculationOut,
     PrecheckOut,
 )
@@ -326,3 +328,96 @@ async def submit_application(
     out = ApplicationOut.model_validate(application)
     await ctx.save(db, status_code=200, body=out.model_dump(mode="json"))
     return out
+
+
+# --- Task 6: taking into work, cancelling, and the timeline -------------------
+#
+# The three gates differ, and each is the narrowest one that fits:
+#
+#   * `start-review` is a STAFF action — `applications.review`, the code
+#     migration 0015 grants `executor_staff`. The zone is the other half of the
+#     rule (ruling 14: any reviewer in the zone may take it) and lives in the
+#     service, where the application's own organization can be resolved;
+#   * `cancel` is the applicant's own action, so it carries `applications.
+#     create` like `PATCH` and `submit` — «file and edit one's own application»
+#     is one right, and ownership is the service's check;
+#   * `timeline` is a READ that also admits the applicant, who holds none of the
+#     staff codes, so it takes `get_current_user` and both halves of the read
+#     rule live in `service._readable_application` — exactly like the card and
+#     the package beside it.
+#
+# No `Idempotency-Key` on either POST. The mechanism belongs where a replay
+# would allocate something scarce: a second public number on `submit`. A
+# replayed `start-review` finds the application already IN_REVIEW and answers
+# 409; a replayed `cancel` finds it already CANCELLED and answers 409, since
+# `APPLICATION_TRANSITIONS` has no self-loop.
+
+
+@router.post("/applications/{application_id}/start-review")
+async def start_review_application(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationOut:
+    """SUBMITTED -> IN_REVIEW, with the `application_assignments` row saying who
+    holds it.
+
+    404 `ERR-SYS-003` for an id that does not exist AND for an application
+    outside the caller's zone — the same answer to both on purpose, since
+    anything else makes this route an application-existence oracle; the
+    territorial refusal is recorded as RI-12 before it answers. 409
+    `ERR-APP-004` in any status but SUBMITTED.
+
+    **design/03 also says «an incomplete package is returned immediately with
+    RJ-01». That is 3.9b's**: returning needs the `RETURNED` status and the
+    return route, neither of which exists in 3.9a, so an incomplete package
+    reaches a human here rather than bouncing.
+    """
+    return ApplicationOut.model_validate(
+        await service.start_review(db, application_id, actor=actor)
+    )
+
+
+@router.post("/applications/{application_id}/cancel")
+async def cancel_application(
+    application_id: uuid.UUID,
+    payload: ApplicationCancelIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationOut:
+    """The applicant withdraws: DRAFT, SUBMITTED or IN_REVIEW -> CANCELLED, with
+    an optional free-text reason.
+
+    From IN_REVIEW deliberately (`tz/05`): an applicant who no longer wants the
+    permit should not have to wait for a decision. A cancelled application also
+    stops blocking the plot — `ex_applications_no_duplicate`'s WHERE clause
+    excludes CANCELLED — so the citizen can refile immediately.
+
+    404 `ERR-SYS-003` when the caller does not own it; 409 `ERR-APP-004` once it
+    has gone past a decision, and for a repeat cancel of an already-cancelled
+    application.
+    """
+    return ApplicationOut.model_validate(
+        await service.cancel(db, application_id, reason=payload.reason, actor=actor)
+    )
+
+
+@router.get("/applications/{application_id}/timeline")
+async def get_application_timeline(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> ApplicationTimelineOut:
+    """The transitions, the assignments, the signatures and the information
+    requests.
+
+    A SUBMISSION signature sits on its own `status_history` entry (ruling 25:
+    the history row's id IS the signed object's id); the top-level `signatures`
+    is the DECISION line, and is empty until task 7's approve/reject signs one.
+    `info_requests` is `[]` until 3.9b writes that table.
+
+    404 `ERR-SYS-003` for an id that does not exist, for an application this
+    caller has no claim on, and for one outside a staff caller's zone — the same
+    answer to all three, as on the card.
+    """
+    return ApplicationTimelineOut.build(await service.timeline(db, application_id, actor=user))

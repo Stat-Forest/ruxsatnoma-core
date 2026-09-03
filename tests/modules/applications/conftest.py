@@ -586,3 +586,27 @@ async def overlapping_published_contour(
     )
     await db.flush()
     return contour
+
+
+@pytest.fixture
+async def submitted_application(applicant_client, draft_ready_for_submission: str) -> str:
+    """`draft_ready_for_submission`, actually SUBMITTED — through `GET
+    /package` + a real ERI over those exact bytes + `POST /submit`, never by
+    writing `status='SUBMITTED'` on the row (lesson: build a fixture's
+    precondition through the real transition).
+
+    That matters here more than usual: task 6's timeline reads the SUBMITTED
+    history row's `id` as the object the submission signature is bound to
+    (ruling 25), and a hand-set status would produce neither the row nor the
+    signature — every timeline assertion would then pass against a shape the
+    production path never produces.
+
+    `_submit` is imported inside the body rather than at module scope: it lives
+    in a test module, and a conftest importing one at collection time is a
+    circularity waiting for the day that module wants a fixture from here.
+    """
+    from tests.modules.applications.test_submit import _submit
+
+    result = await _submit(applicant_client, draft_ready_for_submission)
+    assert result.status_code == 200, result.text
+    return draft_ready_for_submission

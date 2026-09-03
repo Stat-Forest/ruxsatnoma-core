@@ -72,6 +72,25 @@ def test_no_status_transitions_to_itself() -> None:
         assert status not in targets
 
 
+def test_an_applicant_may_withdraw_at_any_point_before_a_decision() -> None:
+    """Controller ruling R20, pinned here because this is the file that pins the
+    table. `tz/05` lets an applicant withdraw until the head decides, and branch
+    1's transcription dropped both edges — with them missing, `POST /cancel`
+    would work on a draft and nowhere else, so an applicant who had already
+    filed would wait for a decision on a permit they no longer want while
+    `ex_applications_no_duplicate` kept the plot blocked.
+
+    The mirror half matters as much: CANCELLED is NOT reachable from a status
+    where money or a document is already involved. `INVOICED -> CANCELLED` is
+    3.10a's (an unpaid invoice may be withdrawn); PAID, PERMIT_ISSUED, APPROVED
+    and REJECTED are not the citizen's to undo.
+    """
+    for status in ("DRAFT", "SUBMITTED", "IN_REVIEW"):
+        assert "CANCELLED" in APPLICATION_TRANSITIONS[status], status
+    for status in ("APPROVED", "PAID", "PERMIT_ISSUED", "REJECTED"):
+        assert "CANCELLED" not in APPLICATION_TRANSITIONS[status], status
+
+
 # --- service.get -------------------------------------------------------------
 
 
@@ -472,3 +491,38 @@ async def test_set_status_locks_the_row_so_a_concurrent_transition_loses(
         await session_b.rollback()
         await session_a.close()
         await session_b.close()
+
+
+# --- repo.list_status_history: the tie-break (task 6) ------------------------
+
+
+async def test_the_timeline_query_breaks_an_occurred_at_TIE_by_id(
+    db: AsyncSession, applicant: Applicant, staff_user: User
+) -> None:
+    """`repo.list_status_history` is what `GET /timeline` renders, and it orders
+    by `(occurred_at, id)` — never `occurred_at` alone.
+
+    Proven on a real TIE, which is the only way to prove it: `occurred_at`
+    defaults to `now()`, Postgres's TRANSACTION start time, so the three rows
+    below share it to the microsecond. That is the ordinary case, not a corner
+    one — task 7's `approve()` writes APPROVED and publishes
+    `application_approved`, whose 3.10a handler writes INVOICED in the SAME
+    transaction. Sorted on the timestamp alone the timeline could say the
+    invoice preceded the approval it was issued for.
+
+    Driven through `set_status` rather than by inserting rows, so what is
+    ordered is what the application really produces.
+    """
+    from app.modules.applications import repo as applications_repo
+
+    application = await _draft(db, applicant)
+    for target in ("SUBMITTED", "IN_REVIEW", "APPROVED"):
+        await applications_service.set_status(
+            db, application.id, to_status=target, actor=staff_user
+        )
+
+    history = await applications_repo.list_status_history(db, application.id)
+    assert [row.to_status for row in history] == ["SUBMITTED", "IN_REVIEW", "APPROVED"]
+    assert len({row.occurred_at for row in history}) == 1, (
+        "the tie this ordering exists for — if these differ the test proves nothing"
+    )
