@@ -6,7 +6,12 @@ pieces an HTTP-driven package needs (`_app_on_test_db`, the commit hook, the
 re-exported gis fixtures) live there rather than in any one file.
 """
 
+import uuid
 from datetime import date
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.applications.models import Application
 
 
 async def test_a_draft_starts_empty_and_is_patched_field_by_field(
@@ -378,3 +383,58 @@ async def test_the_audit_trail_records_the_herd_that_changed(
     assert [line["head_count"] for line in herd_before] == [40]
     assert [line["head_count"] for line in herd_after] == [4000]
     assert entries[0].old_value["items"] == [], "the first PATCH started from an empty herd"
+
+
+async def test_moving_a_draft_to_another_contour_clears_the_frozen_version(
+    db: AsyncSession,
+    applicant_client,
+    draft_ready_for_submission: str,
+    published_contour,
+    contours_layer,
+    leshoz,
+    approval_doc,
+) -> None:
+    """**A refused submission leaves a frozen version behind, and a later PATCH
+    must not let it outlive its contour** (final review).
+
+    Ruling 19 is deliberate: step 4 freezes `contour_version_id` and
+    `requested_area_ha` BEFORE the signature, and a submission refused after
+    that keeps them as evidence of a genuine attempt. What must not survive is
+    the pair naming a plot the draft no longer points at — `max_approve_area`
+    (decision #29) is compared against `requested_area_ha`, and a permit reads
+    `contour_version_id` straight.
+
+    The refusal is driven with a bad ERI, the cheapest way to reach step 8 with
+    steps 1-7 having really run.
+    """
+    from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+
+    app_id = draft_ready_for_submission
+    refused = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert refused.status_code == 422, refused.text
+
+    row = await db.get(Application, uuid.UUID(app_id))
+    assert row is not None
+    await db.refresh(row)
+    assert row.contour_version_id is not None, "step 4 froze the pair before the signature"
+    assert row.requested_area_ha is not None
+
+    elsewhere = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db, elsewhere.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    await db.flush()
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{app_id}", json={"contour_id": str(elsewhere.id)}
+    )
+    assert patched.status_code == 200, patched.text
+
+    await db.refresh(row)
+    assert row.contour_id == elsewhere.id
+    assert row.contour_version_id is None, "a version of the OLD contour cannot survive the move"
+    assert row.requested_area_ha is None

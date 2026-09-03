@@ -389,24 +389,35 @@ async def start_review_application(
 @router.post("/applications/{application_id}/cancel")
 async def cancel_application(
     application_id: uuid.UUID,
-    payload: ApplicationCancelIn,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+    payload: ApplicationCancelIn | None = None,
 ) -> ApplicationOut:
     """The applicant withdraws: DRAFT, SUBMITTED or IN_REVIEW -> CANCELLED, with
     an optional free-text reason.
+
+    **The BODY is optional too, not merely its one field** — `design/03` writes
+    it as `{reason?}`, and a required body made a reasonless withdrawal a 422
+    for a citizen who owes nobody an explanation. `None` and `{}` mean the same
+    thing here; the parameter moves after the dependencies because a defaulted
+    one cannot precede them.
 
     From IN_REVIEW deliberately (`tz/05`): an applicant who no longer wants the
     permit should not have to wait for a decision. A cancelled application also
     stops blocking the plot — `ex_applications_no_duplicate`'s WHERE clause
     excludes CANCELLED — so the citizen can refile immediately.
 
-    404 `ERR-SYS-003` when the caller does not own it; 409 `ERR-APP-004` once it
-    has gone past a decision, and for a repeat cancel of an already-cancelled
+    404 `ERR-SYS-003` when the caller does not own it; 409 `ERR-APP-004`
+    (`reason="cancel_after_decision"`) in any other status — including
+    INVOICED, which `APPLICATION_TRANSITIONS` allows and this route does not
+    (controller ruling R26; `service.cancel`'s docstring says who drives that
+    edge instead) — and for a repeat cancel of an already-cancelled
     application.
     """
     return ApplicationOut.model_validate(
-        await service.cancel(db, application_id, reason=payload.reason, actor=actor)
+        await service.cancel(
+            db, application_id, reason=None if payload is None else payload.reason, actor=actor
+        )
     )
 
 
@@ -482,11 +493,16 @@ async def approve_application(
     404 `ERR-SYS-003` for an id that does not exist and for an application
     outside the caller's zone — the same answer to both, since anything else
     makes this route an application-existence oracle; the territorial refusal is
-    recorded as RI-12 before it answers. 409 `ERR-APP-004` in any status but
-    IN_REVIEW. 422 `ERR-VAL-001` when the application carries no stored
-    calculation, when `requested_area_ha` is unknown while the role caps area,
-    and when an over-limit application sits at an organization with no parent to
-    escalate to. 422 `ERR-SIGN-001` for an ERI that does not verify against the
+    recorded as RI-12 before it answers. **TWO 409 `ERR-APP-004`s, and the
+    second is not about the status**: `reason="bad_transition"` in any status
+    but IN_REVIEW, and `reason="not_claimed_at_this_level"` when an over-limit
+    application is escalated a second time from a level nobody has taken it
+    into work at (`decision._forward`'s replay guard — a head clicking twice
+    would otherwise walk one rung up the ladder per click). 422 `ERR-VAL-001`
+    when the application carries no stored calculation, when
+    `requested_area_ha` is unknown while the role caps area, and when an
+    over-limit application sits at an organization with no parent to escalate
+    to. 422 `ERR-SIGN-001` for an ERI that does not verify against the
     package bytes.
     """
     application, forwarded_to = await service_decision.approve(

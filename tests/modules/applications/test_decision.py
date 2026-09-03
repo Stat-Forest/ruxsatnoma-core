@@ -558,3 +558,74 @@ async def test_a_forward_audits_under_its_own_action_with_the_ceilings_that_fire
     # (controller minor 4), so both have to be present.
     assert float(entry.new_value["amount"]) > 0
     assert float(entry.new_value["requested_area_ha"]) > 0
+
+
+async def test_a_republished_contour_does_not_invalidate_the_decision_signature(
+    db: AsyncSession, executor_head_client, application_in_review, published_contour
+) -> None:
+    """**A verifier re-derives these bytes from the STORED row, years later.**
+
+    `gis` allows one published version per contour and it may be superseded at
+    any moment — a corrected survey, a boundary fix. The application, and the
+    permit printed from it (`permits.service.issue` reads
+    `application.contour_version_id`), are bound to the version frozen at
+    submission; if `GET /package` priced the version published NOW, the head's
+    ERI would attest to version B while every stored trace names version A, and
+    the decision signature would fail to verify the first time anyone checked.
+
+    The republished version carries the SAME geometry on purpose: the only
+    thing that may differ between the two runs of `_package_bytes` is the
+    version id, so a failure here can be about nothing else.
+    """
+    import hashlib
+
+    from sqlalchemy import select
+
+    from app.modules.applications import service as applications_service
+    from app.modules.gis.models import ContourVersion
+    from app.modules.signatures import service as signatures_service
+
+    frozen = (
+        await db.execute(
+            select(ContourVersion).where(
+                ContourVersion.contour_id == published_contour.id,
+                ContourVersion.status == "published",
+            )
+        )
+    ).scalar_one()
+    frozen_id = frozen.id
+    frozen.status = "archived"
+    await db.flush()
+    republished = ContourVersion(
+        contour_id=published_contour.id,
+        version_no=frozen.version_no + 1,
+        geom=frozen.geom,
+        area_ha=frozen.area_ha,
+        source=frozen.source,
+        status="published",
+        approval_doc_id=frozen.approval_doc_id,
+    )
+    db.add(republished)
+    await db.flush()
+
+    result = await _decide(executor_head_client, application_in_review, "approve")
+    assert result.status_code == 200, result.text
+
+    row = await applications_service.get(db, uuid.UUID(application_in_review))
+    assert row is not None
+    assert row.contour_version_id == frozen_id, (
+        "submission froze version A; republishing must not move the application to B"
+    )
+
+    signature = next(
+        entry
+        for entry in await signatures_service.get_for_object(
+            db, object_type="application", object_id=uuid.UUID(application_in_review)
+        )
+        if entry.verification_status == "valid"
+    )
+    calculation = await applications_service.current_calculation(db, row.id)
+    rederived = applications_service._package_bytes(row, calculation)
+    assert hashlib.sha256(rederived).hexdigest() == signature.doc_hash, (
+        "the bytes the head signed must be re-derivable from the stored row alone"
+    )

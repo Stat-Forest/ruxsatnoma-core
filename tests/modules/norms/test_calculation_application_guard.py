@@ -158,6 +158,18 @@ async def other_zone_reviewer_client(db: AsyncSession, other_leshoz: Organizatio
 
 
 @pytest.fixture
+async def superuser_client(db: AsyncSession):
+    """`sys_admin`. It passes every PERMISSION gate in the system (decision #41
+    ruling 2) and `_holds_one_of` lets it through for that reason — but
+    `_is_entitled_reviewer` then hands it the REVIEWER's status set, never a
+    blanket pass, so APPROVED-and-beyond is closed to it like everybody else.
+    No organization, so the zone half is republic-wide too and cannot be what
+    refuses it."""
+    async for client in _client_as(db, role_code="sys_admin"):
+        yield client
+
+
+@pytest.fixture
 async def national_reviewer_client(db: AsyncSession):
     """`executor_staff` with no zone at all — `Zone(None, None, None)`, which
     `abac` reads as republic-wide and which short-circuits the organization
@@ -430,6 +442,42 @@ async def test_approved_and_beyond_is_refused_for_the_reviewer_too(
         assert error["details"]["reason"] == "application_closed_for_calculation"
 
 
+async def test_approved_and_beyond_is_refused_for_the_superuser_too(
+    db: AsyncSession,
+    superuser_client: httpx.AsyncClient,
+    guarded_application: Application,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """**The one place in this branch where `sys_admin` is deliberately NOT let
+    through a money write, stated rather than assumed** (final review).
+
+    `_is_entitled_reviewer`'s superuser bypass is a PERMISSION bypass:
+    `_holds_one_of` returns True for `sys_admin` without reading its grants,
+    and `_calculable_statuses_for` then returns the REVIEWER's status set —
+    not an unconditional pass. So the superuser may re-price a filing under
+    review, and may NOT price one that has already been billed. Without a test
+    saying so, a deliberate refusal and a forgotten branch look identical to
+    whoever next simplifies this function.
+
+    The IN_REVIEW pass at the end is what proves the refusal is about the
+    STATUS and not about `sys_admin` being locked out of the route entirely.
+    """
+    body = _body(guarded_application, haymaking_activity_id)
+    for status in ("APPROVED", "INVOICED", "PAID", "PERMIT_ISSUED", "REJECTED", "ARCHIVED"):
+        guarded_application.status = status
+        await db.flush()
+        refused = await superuser_client.post(f"{API}/calculations", json=body)
+        assert refused.status_code == 409, (status, refused.text)
+        error = refused.json()["error"]
+        assert error["code"] == "ERR-NORM-005"
+        assert error["details"]["reason"] == "application_closed_for_calculation"
+
+    guarded_application.status = "IN_REVIEW"
+    await db.flush()
+    allowed = await superuser_client.post(f"{API}/calculations", json=body)
+    assert allowed.status_code == 201, allowed.text
+
+
 async def test_the_guard_agrees_with_applications_own_vocabulary() -> None:
     """`norms` is level 2 and may not import `applications`, so `norms.service`
     re-declares two things that BELONG to `applications`: the permission codes
@@ -478,3 +526,94 @@ async def test_the_guard_agrees_with_applications_own_vocabulary() -> None:
     # DRAFT (the SUBMITTED write is step 11) — so DRAFT being in the OWNER set
     # is what keeps the whole submission path working.
     assert "DRAFT" in owner
+
+
+# --- Final review, Important 2: WHICH PLOT the calculation prices ------------
+
+
+@pytest.fixture
+async def another_published_contour(db: AsyncSession, contours_layer, leshoz, approval_doc):
+    """A SECOND published contour in the SAME leshoz as `published_contour`.
+
+    The same zone on purpose: the reviewer below is entitled to the application
+    and entitled to the contour, so the refusal can only be about the two not
+    describing each other.
+    """
+    from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+
+    contour = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    await db.flush()
+    return contour
+
+
+async def test_a_reviewer_cannot_bind_a_calculation_for_a_different_contour(
+    db: AsyncSession,
+    reviewer_client: httpx.AsyncClient,
+    guarded_application: Application,
+    another_published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """**WHO and WHEN are not enough — the row must describe THIS filing.**
+
+    Everything in `CalculationIn` except `application_id` comes from the request
+    body, so an in-zone hodim or head (both hold `applications.review`, and this
+    route requires no permission code at all) could price a cheap contour and
+    bind it to any application in their zone under review. It becomes the newest
+    row, `payments.issue_invoice` bills it, and `permits.service.issue` then
+    refuses the permit outright (`calculation_for_another_subject`): the citizen
+    pays for a plot they never named and can never be issued a document, with
+    the row frozen in an append-only table.
+
+    The actor here is otherwise entitled on every axis the earlier tests cover —
+    the code, the zone and the status all pass — which is what makes this a
+    test of the subject check and of nothing else.
+    """
+    guarded_application.status = "IN_REVIEW"
+    await db.flush()
+    refused = await reviewer_client.post(
+        f"{API}/calculations",
+        json={
+            "application_id": str(guarded_application.id),
+            "contour_id": str(another_published_contour.id),
+            "activity_type_id": str(haymaking_activity_id),
+            "period_from": "2026-06-01",
+            "period_to": "2026-09-30",
+            "quantity": "3",
+        },
+    )
+    assert refused.status_code == 409, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-NORM-005"
+    assert error["details"]["reason"] == "calculation_for_another_contour"
+
+    from sqlalchemy import func, select
+
+    from app.modules.norms.models import Calculation
+
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(Calculation)
+            .where(Calculation.application_id == guarded_application.id)
+        )
+        == 0
+    ), "nothing may be written: `calculations` is append-only (migration 0011)"
+
+
+async def test_the_application_s_own_contour_is_still_accepted(
+    db: AsyncSession,
+    reviewer_client: httpx.AsyncClient,
+    guarded_application: Application,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """The other half: a re-price on the application's OWN contour is exactly
+    what 3.9b's recalculation is, and the guard must not stand in its way."""
+    guarded_application.status = "IN_REVIEW"
+    await db.flush()
+    allowed = await reviewer_client.post(
+        f"{API}/calculations", json=_body(guarded_application, haymaking_activity_id)
+    )
+    assert allowed.status_code == 201, allowed.text

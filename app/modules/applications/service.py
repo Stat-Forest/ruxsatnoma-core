@@ -1,16 +1,19 @@
 """Applications service — business logic over the `applications` tables
 (design/02 § applications; plan `03.9a-applications-core`).
 
-Branch 1 (`stage-3.9a-core`) ships exactly three functions of plan Task 8's
-public surface — `get`, `current_calculation`, `set_status` — on top of
-`core/numbers.py` (moved forward out of Task 5) and the event bus shipped in
-the two commits before this one. Branch 2 adds the rest — task 3 the
-draft's own four routes, task 4 `precheck` and the documents, and the tasks
-after it `submit`, the duplicate guard and the full decision flow
-(`start_review`, `approve`, `reject`, `return_to_applicant`, `cancel`,
-`forward`). See the
-"Task 8 public surface" comment below for the contract this file promises
-levels 4+ (payments 3.10, permits 3.11) today."""
+**Stage 3.9a is complete as of this branch.** The file carries the whole
+applicant-and-staff flow: the draft's own four routes, `precheck` and the
+documents, `GET /package` and `submit` (with the duplicate guard and the
+public number), `start_review`, `cancel` and `timeline`. The head's decision —
+`approve`, `reject` and the over-limit `forward` — lives beside it in
+`decision.py`, which imports this module rather than the other way round.
+
+What is NOT here is 3.9b's, and its absence is deliberate rather than
+pending-in-this-file: `return_to_applicant`, `request_info` and the
+`RETURNED`/`PENDING_INFO` states they produce, and the assignment routes. See
+the "Task 8 public surface" comment below for the contract this file promises
+levels 4+ (payments 3.10, permits 3.11) — three functions and four event
+names, unchanged since branch 1."""
 
 import json
 import uuid
@@ -235,15 +238,20 @@ def _assert_transition(application: Application, to_status: str) -> None:
 #   because `_assert_transition` validates against all of it; it is not a
 #   menu. The only targets a module above this one may pass as `to_status`:
 #
-#       3.10 payments — INVOICED, PAID, EXPIRED_UNPAID
+#       3.10 payments — INVOICED, PAID, EXPIRED_UNPAID, and CANCELLED from
+#                       INVOICED ONLY (3.10b's withdrawal of an unpaid
+#                       invoice — `tz/05` has the edge and `POST /cancel`
+#                       refuses it, controller ruling R26: `payments` is the
+#                       module that can take invoice-then-application in its
+#                       own documented lock order, and `applications` cannot)
 #       3.11 permits  — PERMIT_ISSUED, CLOSED
 #       4.5 archive   — ARCHIVED (nobody's in stage 3)
 #
-#   SUBMITTED, IN_REVIEW, APPROVED, REJECTED, RETURNED, PENDING_INFO and
-#   CANCELLED belong to the applicant/staff flow and are branch 2's own flow
-#   verbs (`submit`, `start_review`, `approve`, `reject`,
-#   `return_to_applicant`, `cancel`, `forward`). Do NOT reach them through
-#   `set_status`, from any module including this one.
+#   SUBMITTED, IN_REVIEW, APPROVED, REJECTED, RETURNED and PENDING_INFO belong
+#   to the applicant/staff flow and are branch 2's own flow verbs (`submit`,
+#   `start_review`, `approve`, `reject`, `return_to_applicant`, `cancel`,
+#   `forward`). Do NOT reach them through `set_status`, from any module
+#   including this one — and CANCELLED only from INVOICED, as above.
 #
 #   Why, concretely: `set_status` moves `status` and nothing else. It does
 #   not know whether the application is COMPLETE, and design/02's "a null
@@ -841,6 +849,15 @@ async def patch_draft(
     not here at all — it is frozen at submission from the contour version's own
     `area_ha` (ruling 22), and `ApplicationPatch` forbids unknown fields so a
     client that tries to set it is told 422 rather than silently ignored.
+
+    **Changing the contour CLEARS the frozen pair** (final review). Ruling 19
+    leaves `contour_version_id` and `requested_area_ha` committed on a draft
+    whose submission was refused after step 4 — deliberately: they are evidence
+    of a genuine attempt. But a draft that then moves to a different contour
+    would carry a version belonging to the OLD one, and a pair that names two
+    different plots is never right, however little reads it today. Clearing
+    both here keeps "the frozen version belongs to the frozen contour" true at
+    every moment rather than only at the moments something happens to look.
     """
     application = await _own_draft_for_update(db, application_id, actor=actor)
     fields = patch.model_dump(exclude_unset=True)
@@ -849,6 +866,13 @@ async def patch_draft(
     # so afterwards there is nothing left to snapshot them from.
     before = _snapshot(application, await repo.list_items(db, application.id))
     items = fields.pop("items", None)
+    if "contour_id" in fields and fields["contour_id"] != application.contour_id:
+        # Not audited separately: the two columns are DERIVED (step 4 writes
+        # them from the contour version), never client-supplied, so `_snapshot`
+        # does not carry them and the `contour_id` change the entry does record
+        # is the whole of what the applicant did.
+        application.contour_version_id = None
+        application.requested_area_ha = None
     for name, value in fields.items():
         setattr(application, name, value)
     if items is not None:
@@ -1224,6 +1248,16 @@ def _canonical_decimal(value: Decimal | str) -> str:
     whole number in scientific notation (`Decimal('100.0000').normalize()` is
     `Decimal('1E+2')`), which would change the signed bytes for round amounts
     only — the worst possible failure to notice.
+
+    **Byte-identical to `schemas._trim_decimal` today, and the two MUST NOT be
+    merged** (final review, and the same warning `checks._jsonable` carries
+    against `_json_safe`). That one renders a `Decimal` for an API RESPONSE and
+    may be changed whenever a client needs a different presentation; this one
+    renders it into bytes that have already been SIGNED, and every existing
+    signature stops verifying the day its output moves. They are the same
+    function only by coincidence of both being right today — one shared helper
+    would couple a frozen non-repudiation format to a presentation decision, so
+    the duplication IS the boundary.
     """
     text = format(Decimal(str(value)), "f")
     if "." in text:
@@ -1266,11 +1300,14 @@ def _package_bytes(
     view. Do NOT "fix" it here by caching the package or by dropping the
     amount from it; both are 3.9b's call to make.
 
-    `contour_version_id` is supplied by `GET /package`, whose application is
-    still a DRAFT and has not frozen the column yet (step 4 does that, at
-    submission). It must be the SAME published version the submission will
-    freeze, or the two calls produce different bytes; both resolve it through
-    `gis.service.published_version`.
+    **`contour_version_id` is the version these bytes NAME, and which version
+    that is depends on whether the application has frozen one yet.** `package`
+    resolves it and passes it here: `gis.service.published_version` while the
+    application is a DRAFT (step 4 has not run, the column is still null or
+    stale), and `application.contour_version_id` itself from SUBMITTED onward.
+    The argument therefore wins over the column only where the column is not
+    yet the answer — see `package`'s own docstring for why the frozen column
+    must win afterwards, and what breaks when it does not.
     """
     version_id = contour_version_id or application.contour_version_id
     if version_id is None:
@@ -1483,6 +1520,13 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     told 404, never 403: this response carries the applicant, the plot and the
     price.
 
+    **No status rule of its own, and the version it names is what makes that
+    safe.** The route serves a DRAFT (the applicant is about to sign it) and an
+    application under review (the head signs the very same bytes — controller
+    ruling R5, `decision._sign_decision` fetches them through this function), so
+    a status restriction would break the decision path. What the two cases do
+    NOT share is which contour version the bytes name: see the comment below.
+
     **RULING 23 applies here, in full.** This route prices through
     `norms.service.preview` at `business_today()`, exactly as `submit` does a
     moment later, and NOTHING freezes the answer in between. A tariff or
@@ -1495,9 +1539,29 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     """
     application = await _readable_application(db, application_id, actor=actor)
     await _assert_complete(db, application)
-    version = await _published_version_or_refuse(db, application)
+    # **The FROZEN version wins the moment there is one.** A DRAFT has not
+    # reached step 4 yet, so the only honest answer is the version currently
+    # published — and `_published_version_or_refuse` is also the 409 for a
+    # contour whose geometry is still a draft. From SUBMITTED onward the
+    # application is BOUND to the version step 4 froze (`permits.service.issue`
+    # reads that same column), and `gis` allows one published version per
+    # contour which may be superseded at any time: pricing the CURRENT one here
+    # would make the head's decision signature attest to version B while the
+    # application, and the permit printed from it, name version A. A verifier
+    # re-deriving these bytes from the stored row would then get a different
+    # string and the signature would not verify — pinned by
+    # `test_decision.py::test_a_republished_contour_does_not_invalidate_the_
+    # decision_signature`.
+    version_id = (
+        (await _published_version_or_refuse(db, application)).id
+        if application.status == INITIAL_STATUS
+        else application.contour_version_id
+    )
     _, priced = await _price(db, application, actor=actor)
-    return _package_bytes(application, priced, contour_version_id=version.id)
+    # A null here is impossible for a submitted application (step 4 freezes the
+    # column in the same transaction that sets the status) and `_package_bytes`
+    # answers it with ERR-SYS-001 rather than signing a package with no plot.
+    return _package_bytes(application, priced, contour_version_id=version_id)
 
 
 async def submit(
@@ -1712,6 +1776,11 @@ APPLICATION_CANCEL = "application.cancel"
 
 IN_REVIEW_STATUS = "IN_REVIEW"
 CANCELLED_STATUS = "CANCELLED"
+# Controller ruling R26: the statuses `POST /cancel` accepts as a SOURCE — a
+# narrower set than `APPLICATION_TRANSITIONS[...]` contains CANCELLED in, and
+# deliberately so. See `cancel`'s docstring for why the table keeps
+# `INVOICED -> CANCELLED` that this route refuses, and who drives it instead.
+CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({INITIAL_STATUS, SUBMITTED_STATUS, IN_REVIEW_STATUS})
 
 # Ruling 25's OTHER half, beside `SUBMISSION_OBJECT_TYPE`/`SUBMISSION_PURPOSE`:
 # a DECISION is signed as `("application", <the application id>,
@@ -1913,12 +1982,28 @@ async def cancel(
 ) -> Application:
     """`POST /applications/{id}/cancel` — the applicant withdraws.
 
-    Legal from DRAFT, SUBMITTED and IN_REVIEW (`APPLICATION_TRANSITIONS`, whose
-    last two edges controller ruling R20 added for exactly this): `tz/05` lets
-    an applicant withdraw at any point before a decision, and one who no longer
-    wants the permit should not have to wait for one. Anything later is
-    somebody else's money or somebody else's document, and `_assert_transition`
-    refuses it as `ERR-APP-004`.
+    **Legal from DRAFT, SUBMITTED and IN_REVIEW, and this route enforces that
+    set ITSELF** (controller ruling R26, final review Important 3): `tz/05`
+    lets an applicant withdraw at any point before a decision, and one who no
+    longer wants the permit should not have to wait for one. Anything later is
+    somebody else's money or somebody else's document — `ERR-APP-004`, with
+    `reason="cancel_after_decision"`.
+
+    **The transition table is deliberately WIDER than this set**, and the gap
+    is not an oversight to be closed by deleting the edge. `INVOICED ->
+    CANCELLED` is in `tz/05` and stage 3.10b will drive it — through
+    `set_status`, from `payments`, which owns the invoice — so the edge stays.
+    What may not happen is THIS route reaching it: `payments` documents its own
+    lock order as invoice-then-application (`payments/service.py`,
+    `payme._perform_transaction` -> `confirm_payment` -> `set_status`), while a
+    cancel from INVOICED would take application-then-invoice, through
+    `on_application_cancelled` running inside this transaction. That inversion
+    became reachable for the first time in 3.9a — this is the first code that
+    ever published `APPLICATION_CANCELLED` — and it cannot be fixed from here:
+    taking the invoice lock in `applications` would be a level-3 -> level-4
+    call the module boundaries forbid. Restricting the SOURCE set puts it back
+    out of reach, and 3.10b lands the withdrawal-after-invoice path in the
+    module that can take the two locks in the documented order.
 
     The OWNER only — `_own_application_for_update`, so a stranger is told 404
     and never that the application exists. Staff cancellation is not a thing:
@@ -1933,6 +2018,14 @@ async def cancel(
     `applications/events.py`.
     """
     application = await _own_application_for_update(db, application_id, actor=actor)
+    if application.status not in CANCELLABLE_BY_APPLICANT_STATUSES:
+        # Ahead of `_apply_transition` and NOT delegated to it: the table would
+        # let INVOICED through, and the reason has to say that the refusal is
+        # about who may withdraw and when, not about a malformed edge.
+        raise err(
+            "ERR-APP-004",
+            details={"reason": "cancel_after_decision", "status": application.status},
+        )
     await _apply_transition(
         db,
         application,

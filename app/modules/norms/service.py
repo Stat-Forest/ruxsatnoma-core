@@ -909,13 +909,13 @@ _REVIEWER_CALCULABLE_STATUSES = _OWNER_CALCULABLE_STATUSES | _REVIEWER_EXTRA_CAL
 # `ARCHIVED` are closed too — pricing an application that is over is
 # meaningless, and meaningless writes to an append-only table are not free.
 #
-# `_APPLICATION_OPEN_FOR_CALCULATION` is the union of everything ANY actor may
-# reach, and exists so the partition below can be asserted: the two sets
-# together are exactly `applications.models.APPLICATION_STATUSES`
-# (`test_calculation_application_guard.py`, which may import it — a TEST is not
-# bound by the module boundary). The runtime check reads the ACTOR's own set,
-# so a status added later is reachable by nobody until someone adds it.
-_APPLICATION_OPEN_FOR_CALCULATION = _REVIEWER_CALCULABLE_STATUSES
+# The two sets below partition `applications.models.APPLICATION_STATUSES`
+# exactly, and `test_calculation_application_guard.py::
+# test_the_guard_agrees_with_applications_own_vocabulary` asserts that against
+# the original (a TEST is not bound by the module boundary). It asserts it on
+# `_REVIEWER_CALCULABLE_STATUSES` directly — the widest set any actor holds —
+# so no alias of it is needed. The runtime check reads the ACTOR's own set, so
+# a status added later is reachable by nobody until someone adds it.
 _APPLICATION_CLOSED_FOR_CALCULATION = frozenset(
     {
         "APPROVED",
@@ -1002,20 +1002,46 @@ async def _calculable_statuses_for(
 
 
 async def _assert_application_open_for_calculation(
-    db: AsyncSession, *, application_id: uuid.UUID, actor: User
+    db: AsyncSession, *, application_id: uuid.UUID, contour_id: uuid.UUID, actor: User
 ) -> None:
     """The refusals that must land with the widened
     `CalculationIn.application_id` — see the block comment above.
 
-    Entitlement first, status second, and the order matters: a stranger is told
-    404 `ERR-SYS-003` — the same answer an id that never existed gets, exactly
-    as `applications.service._readable_application` answers, because an
-    application carries a citizen's name, plot and herd and a 403 would make
-    this route an application-existence oracle. Answering the STATUS refusal
-    first would leak that existence to anyone who could guess a uuid.
+    Entitlement first, status second, SUBJECT third, and the order matters: a
+    stranger is told 404 `ERR-SYS-003` — the same answer an id that never
+    existed gets, exactly as `applications.service._readable_application`
+    answers, because an application carries a citizen's name, plot and herd and
+    a 403 would make this route an application-existence oracle. Answering the
+    STATUS refusal first would leak that existence to anyone who could guess a
+    uuid.
 
     A closed application is `ERR-NORM-005` (409) — this module's own
     state-conflict code, beside `not_draft`/`bad_transition`/`period_overlap`.
+
+    **The third check asks whether the calculation DESCRIBES this application
+    at all** (final review, Important 2). Who and when are not enough: every
+    other field of `CalculationIn` comes from the request body, so an in-zone
+    `executor_staff` or `executor_head` — both hold `applications.review`, and
+    `POST /api/v1/calculations` requires no permission code at all — could
+    price a CHEAP contour and bind that row to any application in their zone
+    sitting in SUBMITTED/IN_REVIEW/PENDING_INFO. It becomes the newest row,
+    `payments.issue_invoice` bills it, and `permits.service.issue` then refuses
+    to issue at all (`calculation_for_another_subject`): the citizen is billed
+    for a plot they never asked about AND cannot receive a permit, with the row
+    frozen in an append-only table.
+
+    Only `contour_id` is compared, and that is a scope limit rather than an
+    oversight: it is one of ruling 20's five columns, so the check costs
+    nothing new. Widening the same comparison to `activity_type_id` and the
+    period would need ruling 20 amended (a sixth and seventh column in
+    `repo.application_facts`) and is handed on as a follow-up — the contour is
+    the field that decides WHICH PLOT is priced, and the one the fee, the norm
+    and the printed permit all key on.
+
+    `applications.service.submit` is unaffected: `checks.calculation_payload`
+    builds its request FROM the application, so its `contour_id` is the
+    application's own by construction, and a legitimate 3.9b re-price is on the
+    same contour by definition.
     """
     facts = await repo.application_facts(db, application_id)
     if facts is None:
@@ -1039,6 +1065,20 @@ async def _assert_application_open_for_calculation(
             "ERR-NORM-005",
             details={"reason": "application_not_editable_by_this_actor", "status": status},
         )
+    if facts["contour_id"] != contour_id:
+        # Fail-closed on a NULL too: an application with no contour of its own
+        # is described by no calculation, and admitting one would let the next
+        # `PATCH` on that draft decide retroactively which plot was priced.
+        raise err(
+            "ERR-NORM-005",
+            details={
+                "reason": "calculation_for_another_contour",
+                "application_contour_id": None
+                if facts["contour_id"] is None
+                else str(facts["contour_id"]),
+                "contour_id": str(contour_id),
+            },
+        )
 
 
 async def save_calculation(db: AsyncSession, *, payload: CalculationIn, actor: User) -> Calculation:
@@ -1050,15 +1090,19 @@ async def save_calculation(db: AsyncSession, *, payload: CalculationIn, actor: U
     an UPDATE (ruling 21).
 
     **`payload.application_id`, when set, is checked BEFORE anything is
-    computed** — ownership and the application's status, per the block comment
-    above. It is checked here rather than in `calc_router` because
+    computed** — ownership, the application's status AND that the request
+    prices the application's OWN contour, per the block comment above. It is
+    checked here rather than in `calc_router` because
     `applications.service.submit` is the other caller and would bypass a
-    router-level gate; and it is checked before `_compute` because refusing a
+    router-level gate entirely; and it is checked before `_compute` because refusing a
     request nobody was entitled to make should not first spend a full pricing
     run on it."""
     if payload.application_id is not None:
         await _assert_application_open_for_calculation(
-            db, application_id=payload.application_id, actor=actor
+            db,
+            application_id=payload.application_id,
+            contour_id=payload.contour_id,
+            actor=actor,
         )
     _, _, result, check_results = await _compute(db, payload)
     blocking = checks.first_blocking_error(check_results)
@@ -1239,7 +1283,7 @@ async def list_calculations(
     priced an application during a valid representation keeps the row. In both
     the card and `GET /calculations/{id}` answer 404 while the list did not.
     Pinned by `tests/modules/applications/test_end_to_end.py::
-    test_a_head_who_forwards_an_application_loses_its_calculation_from_the_list`.
+    test_a_head_who_forwards_an_application_cannot_read_its_calculation_anywhere`.
 
     The scope is deliberately NOT "every calculation on every application I
     could read". Expressing that needs a second read of `applications` — a

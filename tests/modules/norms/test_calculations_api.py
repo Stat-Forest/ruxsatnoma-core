@@ -205,7 +205,8 @@ async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_
     opened the field, because `applications.service.submit` needs it (ruling
     8), and landed two refusals in `service.save_calculation` in the same
     commit: the caller must OWN the application (or be staff entitled to review
-    it), and the application must not be APPROVED or beyond.
+    it), and the application must not be APPROVED or beyond. The final review
+    added a third — the calculation must price the application's OWN contour.
 
     Both are asserted end to end in
     `tests/test_cross_module_journey.py::test_a_calculation_cannot_be_attached_
@@ -229,7 +230,13 @@ async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_
     assert unknown.status_code == 404, unknown.text
     assert unknown.json()["error"]["code"] == "ERR-SYS-003"
 
-    # The caller's own DRAFT: allowed, and the binding is what is stored.
+    # The caller's own DRAFT, ON THE CONTOUR BEING PRICED: allowed, and the
+    # binding is what is stored. The `contour_id` is not decoration — the final
+    # review's Important 2 added a third refusal beside the two above, so a
+    # calculation must also DESCRIBE the application it binds to, and a draft
+    # with no contour of its own is described by no calculation at all
+    # (`calculation_for_another_contour`, pinned in
+    # `test_calculation_application_guard.py`).
     me = (await applicant_client.get("/api/v1/auth/me")).json()
     application = Application(
         applicant_id=uuid.UUID(me["applicant"]["id"]),
@@ -237,6 +244,7 @@ async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_
         on_behalf="self",
         channel="portal",
         status="DRAFT",
+        contour_id=published_contour.id,
     )
     db.add(application)
     await db.flush()

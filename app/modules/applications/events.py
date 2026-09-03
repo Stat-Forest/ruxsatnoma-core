@@ -28,11 +28,11 @@ tell: if it has a dot, it is not one of the four names below. Never pass one of
 these four constants where an `event_code` or an `action` is expected, or vice
 versa; never seed a notification template under one of these four literal values.
 
-Payload contract — what a subscriber may assume is present. Branch 2 is what
-actually calls `publish` for these four names (this task ships the bus and these
-names only, no publisher — see plan 03.9a task 2 "Scope"), so this is the contract
-it commits to, not something exercised end-to-end here: every one of the four
-carries `application_id` and NOTHING else. That is deliberate, not a placeholder —
+Payload contract — what a subscriber may assume is present. All four names are
+now PUBLISHED: `service.submit` and `service.cancel` raise two of them,
+`decision.approve` and `decision.reject` the other two, and
+`tests/modules/applications/test_events.py` asserts the shape on each. Every
+one of the four carries `application_id` and NOTHING else. That is deliberate, not a placeholder —
 it holds even for a value that looks convenient to carry along, such as the public
 `number` assigned at submission or, on `APPLICATION_APPROVED`, an amount to
 invoice (controller ruling, review round 1, finding I4 — an earlier draft of this

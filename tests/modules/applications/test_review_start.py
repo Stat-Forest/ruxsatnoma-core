@@ -88,6 +88,65 @@ async def test_a_cancelled_application_stops_blocking_a_new_one(
     assert result.status_code == 200, result.text
 
 
+async def test_a_draft_is_withdrawn_with_no_body_at_all(
+    applicant_client, draft_ready_for_submission: str
+) -> None:
+    """Two gaps in one test (final review: the deferred minor, and Important
+    3's fifth item).
+
+    **No HTTP test cancelled a DRAFT** — the source status every applicant
+    actually uses — and **the body was mandatory**: `design/03` writes it as
+    `{reason?}`, while the route required an `ApplicationCancelIn` and answered
+    422 to a bare POST. A citizen who withdraws their own unfiled draft owes
+    nobody an explanation, so both the reason and the body around it are
+    optional.
+    """
+    result = await applicant_client.post(
+        f"/api/v1/applications/{draft_ready_for_submission}/cancel"
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "CANCELLED"
+
+
+async def test_cancelling_after_the_decision_is_refused_though_the_table_allows_it(
+    applicant_client, executor_head_client, application_in_review: str
+) -> None:
+    """**Controller ruling R26, at the HTTP level.**
+
+    `APPLICATION_TRANSITIONS` carries `INVOICED -> CANCELLED` — `tz/05` has it
+    and stage 3.10b will drive it from `payments` — but `POST /cancel` must
+    not, and until this branch it did: `cancel` applied no source rule of its
+    own while its own docstring, the route's docstring and this package's
+    public-surface test all said it did.
+
+    The path matters as much as the code: a cancel from INVOICED takes the
+    application's lock and then, through `payments`' own
+    `on_application_cancelled` subscriber running inside this transaction, the
+    invoice's — the exact inverse of the invoice-then-application order
+    `payments` documents for itself, and reachable for the first time because
+    3.9a is the first code that ever published `APPLICATION_CANCELLED`.
+    """
+    from tests.modules.applications.test_decision import _decide
+
+    approved = await _decide(executor_head_client, application_in_review, "approve")
+    assert approved.status_code == 200, approved.text
+    # Never "APPROVED": 3.10a's invoice subscriber runs inside the approval's
+    # own transaction, so the application is already INVOICED here.
+    assert approved.json()["status"] == "INVOICED"
+
+    refused = await applicant_client.post(
+        f"/api/v1/applications/{application_in_review}/cancel", json={"reason": "too late"}
+    )
+    assert refused.status_code == 409, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-APP-004"
+    assert error["details"]["reason"] == "cancel_after_decision"
+    assert error["details"]["status"] == "INVOICED"
+
+    card = (await applicant_client.get(f"/api/v1/applications/{application_in_review}")).json()
+    assert card["status"] == "INVOICED", "a refused cancel moves nothing"
+
+
 # --- the half the five above cannot see (ruling 25) --------------------------
 
 
