@@ -8,6 +8,7 @@ on both paths.
 """
 
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import func, select
 
@@ -168,3 +169,123 @@ async def test_first_blocking_error_maps_each_blocking_type_and_ignores_a_warnin
     error = checks.first_blocking_error([row("norm_limit", "fail"), row("gis_overlap", "pass")])
     assert error is not None and error.details is not None
     assert [c["check_type"] for c in error.details["checks"]] == ["norm_limit", "gis_overlap"]
+
+
+async def test_a_real_overlap_is_reported_with_its_raw_decimal_and_uuid_details(
+    applicant_client,
+    overlapping_published_contour,
+    grazing_activity_id,
+    sheep_type_id,
+    published_coef_sb,
+) -> None:
+    """The one path that carries UNCOERCED values: `gis.checks._intersections`
+    puts a raw `uuid.UUID` (`feature_id`) and a raw `Decimal` (`area_m2`) into
+    `details["items"]`, and nothing between there and the JSONB column would
+    convert them — `checks._jsonable` is the whole defence, and without it this
+    request is a 500 from inside the bind (lesson: nothing in this app
+    configures a JSON encoder).
+
+    It is also the GIS half of "reports rather than refuses": `gis_overlap` is a
+    BLOCKING type, so a submission would be refused `ERR-GIS-005`, while the
+    pre-check answers 200 and hands the applicant the overlapping contour.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={
+            "contour_id": str(overlapping_published_contour.id),
+            "activity_type_id": str(grazing_activity_id),
+            "period_from": "2027-05-01",
+            "period_to": "2027-09-30",
+            "items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}],
+        },
+    )
+
+    result = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
+    assert result.status_code == 200, result.text
+
+    overlap = next(c for c in result.json()["checks"] if c["check_type"] == "gis_overlap")
+    assert overlap["result"] == "fail"
+    item = overlap["details"]["items"][0]
+    assert uuid.UUID(item["feature_id"])
+    assert Decimal(item["area_m2"]) > 0
+
+    # And it survives the round trip through JSONB onto the card.
+    card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
+    stored = next(c for c in card["checks"] if c["check_type"] == "gis_overlap")
+    assert stored["details"]["items"][0]["feature_id"] == item["feature_id"]
+
+
+async def test_a_tariff_exempt_activity_still_has_to_declare_its_quantity(
+    applicant_client, published_contour, science_activity_id
+) -> None:
+    """Minor 3 of the task-4 review, settled: `quantity` is required for EVERY
+    non-grazing activity, `science` included, even though
+    `norms.calculator` never reads it for a `tariff_exempt:` one and would
+    happily bill zero without it.
+
+    The amount is a requisite of the printed permit (`tz/13` 1-ilova), and task
+    5's submission gate requires it — a pre-check that said "ready" here would
+    be contradicted by `ERR-APP-001` at submission, which is the one thing this
+    route exists to prevent.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={
+            "contour_id": str(published_contour.id),
+            "activity_type_id": str(science_activity_id),
+            "period_from": "2027-05-01",
+            "period_to": "2027-09-30",
+        },
+    )
+
+    without = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
+    assert without.status_code == 200, without.text
+    assert without.json()["calculation"] is None
+    norm = next(c for c in without.json()["checks"] if c["check_type"] == "norm_available")
+    assert norm["result"] == "skipped"
+    assert norm["details"]["missing"] == ["quantity"]
+
+    await applicant_client.patch(f"/api/v1/applications/{app_id}", json={"quantity": "12.5"})
+    with_quantity = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
+    assert with_quantity.status_code == 200, with_quantity.text
+    # Un-rated by law, so priced at zero — but priced, not refused and not null.
+    assert Decimal(with_quantity.json()["calculation"]["amount"]) == 0
+
+
+async def test_every_written_row_is_source_auto_and_the_run_is_audited_once(
+    db, applicant_client, draft_ready_for_submission
+) -> None:
+    """Two explicit requirements of the task with nothing else asserting them:
+    3.9a writes `source='auto'` on every check row (`manual_fallback` and
+    `external_api` are 3.9b's), and a pre-check writes `application_checks` rows
+    so it is a state-changing action and audits like one — ONCE, under this
+    module's own constant, never a row per check."""
+    from sqlalchemy import select
+
+    from app.modules.applications.service import APPLICATION_PRECHECK
+    from app.modules.audit.models import AuditLog
+
+    app_id = draft_ready_for_submission
+    result = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
+    assert result.status_code == 200, result.text
+    assert {c["source"] for c in result.json()["checks"]} == {"auto"}
+
+    entries = (
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.action == APPLICATION_PRECHECK,
+                    AuditLog.object_id == uuid.UUID(app_id),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(entries) == 1
+    assert entries[0].object_type == "application"
+    assert len(entries[0].new_value["checks"]) == len(result.json()["checks"])

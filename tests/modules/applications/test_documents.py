@@ -20,8 +20,20 @@ async def _upload(client) -> str:
 
 
 async def test_a_document_is_attached_listed_and_detached(
-    applicant_client, draft_ready_for_submission, doc_type_item_id
+    db, applicant_client, draft_ready_for_submission, doc_type_item_id
 ) -> None:
+    """Both actions are state-changing, so both audit under this module's own
+    constants (ruling 17: `"<object>.<verb>"`, never a literal at the call
+    site). The detach entry carries the removed row in `old_value` — after the
+    DELETE it is the only record that the attachment ever existed."""
+    from sqlalchemy import select
+
+    from app.modules.applications.service import (
+        APPLICATION_DOCUMENT_ATTACH,
+        APPLICATION_DOCUMENT_DETACH,
+    )
+    from app.modules.audit.models import AuditLog
+
     app_id = draft_ready_for_submission
     file_id = await _upload(applicant_client)
 
@@ -42,6 +54,19 @@ async def test_a_document_is_attached_listed_and_detached(
 
     card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
     assert card["documents"] == []
+
+    entries = {
+        entry.action: entry
+        for entry in (
+            await db.execute(select(AuditLog).where(AuditLog.object_id == uuid.UUID(document_id)))
+        )
+        .scalars()
+        .all()
+    }
+    assert set(entries) == {APPLICATION_DOCUMENT_ATTACH, APPLICATION_DOCUMENT_DETACH}
+    assert entries[APPLICATION_DOCUMENT_ATTACH].object_type == "application_document"
+    assert entries[APPLICATION_DOCUMENT_ATTACH].new_value["file_id"] == file_id
+    assert entries[APPLICATION_DOCUMENT_DETACH].old_value["file_id"] == file_id
 
 
 async def test_a_file_the_caller_does_not_own_cannot_be_attached(

@@ -41,8 +41,10 @@ from tests.modules.auth.test_sessions import make_session, make_user
 from tests.modules.gis.conftest import (
     _client_for,
     _commit_pending_before_requests,
+    box_wkt,
     make_contour,
     make_version,
+    random_anchor,
     random_box_wkt,
 )
 from tests.modules.gis.conftest import approval_doc as approval_doc
@@ -353,3 +355,52 @@ async def doc_type_item_id(engine) -> AsyncIterator[uuid.UUID]:
                 text("DELETE FROM classifier_items WHERE id = :id").bindparams(id=item_id)
             )
             await own_db.commit()
+
+
+@pytest.fixture
+async def science_activity_id(db: AsyncSession) -> uuid.UUID:
+    """`science` — «Илмий тадқиқот», the one activity VMQ 278 leaves un-rated
+    (`tariff_exempt:science`, published by migration 0013). Seeded by 0005,
+    never created here: `activity_types` is a fixed catalogue."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'science'"))
+    return rows.scalar_one()
+
+
+@pytest.fixture
+async def overlapping_published_contour(
+    db: AsyncSession, contours_layer: GisLayer, leshoz, approval_doc: MediaFile
+) -> Contour:
+    """TWO published contours that genuinely overlap, of which this returns the
+    one an application may name.
+
+    Both boxes are anchored off ONE `random_anchor()` and offset by half a box,
+    so the overlap is a fact about this pair rather than about whatever else has
+    accumulated at the module's conventional `box_wkt(69.9, 41.5)` spot across
+    past runs (lesson: the test DB is shared, persistent, and never empty —
+    including the spot you picked). `random_box_wkt()` cannot build this: it
+    picks a fresh anchor per call, so two of them never meet.
+
+    What it buys: `gis_overlap` comes back `fail` with real `details.items`,
+    each carrying a raw `uuid.UUID` (`feature_id`) and a raw `Decimal`
+    (`area_m2`) straight out of `gis.checks._intersections` — the only path that
+    exercises `checks._jsonable` on values nothing else has coerced.
+    """
+    lon, lat = random_anchor()
+    neighbour = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        neighbour.id,
+        box_wkt(lon, lat),
+        status="published",
+        approval_doc_id=approval_doc.id,
+    )
+    contour = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        contour.id,
+        box_wkt(lon + 0.005, lat),
+        status="published",
+        approval_doc_id=approval_doc.id,
+    )
+    await db.flush()
+    return contour

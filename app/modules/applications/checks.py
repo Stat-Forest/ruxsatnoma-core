@@ -79,27 +79,9 @@ NORM_CHECK_TYPES = {
     "limit": "norm_limit",
 }
 
-# Everything ruling 21 marks blocking. `norm_restrictions` is the ONE advisory
-# type: an intersection with a restriction or protection layer limits grazing,
-# it does not forbid it, and the judgement is the reviewer's (3.9b). Moving a
-# type in or out of this set is a product decision, not a refactor — the same
-# sentence `gis.checks` and `norms.checks` both carry.
-BLOCKING = frozenset(
-    {
-        "gis_validity",
-        "gis_within_fund",
-        "gis_overlap",
-        "norm_available",
-        "norm_season",
-        "norm_rotation",
-        "norm_fire_ban",
-        "norm_limit",
-    }
-)
-
-# ruling 21's second table. `ERR-GIS-005` is the only 409 among them — an
-# overlap with another published contour is a conflict of state, not a
-# malformed request.
+# ruling 21's second table: which `ERR-` code a failing check refuses with.
+# `ERR-GIS-005` is the only 409 among them — an overlap with another published
+# contour is a conflict of state, not a malformed request.
 _ERROR_BY_CHECK_TYPE = {
     "gis_validity": "ERR-GIS-001",
     "gis_within_fund": "ERR-GIS-002",
@@ -111,6 +93,20 @@ _ERROR_BY_CHECK_TYPE = {
     "norm_fire_ban": "ERR-NORM-006",
 }
 
+# Everything ruling 21 marks blocking — DERIVED from the table above, never a
+# second hand-maintained list of the same eight keys (review I2). Having an
+# error code IS what blocking means here, and `first_blocking_error` indexes
+# that table right after testing membership of this set: two lists that drift by
+# one key turn a clean submission refusal into an unhandled `KeyError`, a 500 on
+# the one path whose whole job is to refuse cleanly.
+#
+# `norm_restrictions` is therefore the ONE advisory type, by having no code: an
+# intersection with a restriction or protection layer limits grazing, it does
+# not forbid it, and the judgement is the reviewer's (3.9b). Moving a type in or
+# out is a product decision, not a refactor — the same sentence `gis.checks` and
+# `norms.checks` both carry — and it is now made in exactly one place.
+BLOCKING = frozenset(_ERROR_BY_CHECK_TYPE)
+
 # What `norms` needs before it can be asked anything at all
 # (`norms.service._build_request_and_snapshot`). The same four fields task 5's
 # completeness check requires, minus `applicant_id`, which is NOT NULL on the
@@ -118,7 +114,7 @@ _ERROR_BY_CHECK_TYPE = {
 REQUIRED_FOR_PRICING = ("activity_type_id", "contour_id", "period_from", "period_to")
 
 
-def _json_safe(value: Any) -> Any:
+def _jsonable(value: Any) -> Any:
     """A check's `details` as a JSONB column and a `DomainError` response can
     both take it: `Decimal`/`date`/`datetime`/`uuid.UUID` -> `str`, recursing
     through `dict`/`list`/`tuple`.
@@ -130,12 +126,20 @@ def _json_safe(value: Any) -> Any:
     `TypeError` inside the JSONB bind, or inside `app.main`'s own exception
     handler, turning a clean refusal into a 500.
 
-    `Decimal` -> `str`, never `float`, matching `norms.calculator.jsonable`:
-    these details carry conditional-head counts and remaining limits, and
-    `str(Decimal(...))` round-trips exactly where a float would not. Kept
-    local, like `service._json_safe` beside it: a private helper of another
-    module is not part of its public surface, and both `gis.checks.jsonable`
-    and `norms.calculator.jsonable` are private in exactly that sense.
+    `Decimal` -> `str`, never `float`: these details carry conditional-head
+    counts and remaining limits, and `str(Decimal(...))` round-trips exactly
+    where a float would not.
+
+    **Named `_jsonable` after `gis.checks.jsonable` and
+    `norms.calculator.jsonable`, which are its templates and which it copies
+    rather than imports because the module boundary forbids reaching into
+    either** (review I1). It is deliberately NOT the `_json_safe` that
+    `service.py` keeps beside it: that one is non-recursive and renders a
+    `Decimal` through `format(value, "f")` for an audit snapshot of the
+    application's own scalar columns, so the two disagree on an exponent-form
+    value (`format(Decimal("1E+2"), "f")` is `"100"`, `str(...)` is `"1E+2"`).
+    Two same-named private helpers in one module would invite a future reader
+    to move a call from one to the other; the different name is the warning.
     """
     if isinstance(value, Decimal):
         return str(value)
@@ -144,9 +148,9 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime | date):
         return value.isoformat()
     if isinstance(value, dict):
-        return {key: _json_safe(item) for key, item in value.items()}
+        return {key: _jsonable(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
-        return [_json_safe(item) for item in value]
+        return [_jsonable(item) for item in value]
     return value
 
 
@@ -173,6 +177,31 @@ async def missing_for_pricing(db: AsyncSession, application: Application) -> lis
     validation error from a module they never called instead of "you left a
     field empty". It is the same rule task 5's completeness check applies
     before it refuses a submission.
+
+    **`quantity` is required for EVERY non-grazing activity, including a
+    tariff-exempt one, and that is deliberately stricter than `norms` itself**
+    (review, minor 3). `norms.calculator` only raises `quantity_required` when
+    a tariff row exists; for `science` — the one activity VMQ 278 genuinely
+    leaves un-rated (`tariff_exempt:science`, migration 0013) — it bills zero
+    and never reads the field. Three reasons the gate stays wider all the same:
+
+      * `applications.quantity` is a REQUISITE of the printed permit
+        (`tz/13` 1-ilova: the document states how much of what, in the
+        activity's own unit — `ha` for `science`), not merely an input to a
+        price. A permit that prints no amount is not a permit.
+      * Task 5's completeness check requires it for every non-grazing activity.
+        A pre-check that reported "ready to file" and a submission that then
+        refused with `ERR-APP-001` would make this route useless at the one
+        thing it exists for: predicting the submission.
+      * Narrowing it would mean asking `norms` whether an activity is
+        tariff-exempt, which its public surface does not expose — and adding an
+        entry point to another module so that a citizen may leave a field of
+        the permit blank is the wrong trade.
+
+    So a scientific-research filing sends `quantity` — the area it will work on
+    — like every other non-grazing one, and is then priced at zero.
+    `test_precheck.py::test_a_tariff_exempt_activity_still_has_to_declare_its_
+    quantity` pins both halves.
     """
     missing = [name for name in REQUIRED_FOR_PRICING if getattr(application, name) is None]
     if application.activity_type_id is None:
@@ -346,7 +375,7 @@ async def run_all(
             application_id=application.id,
             check_type=check_type,
             result=result,
-            details=_json_safe(details),
+            details=_jsonable(details),
             source=SOURCE_AUTO,
         )
         for check_type, result, details in collected
@@ -366,7 +395,7 @@ def first_blocking_error(results: list[ApplicationCheck]) -> DomainError | None:
     Shaped exactly like `norms.checks.first_blocking_error`, including the part
     that matters most: `details` carries the WHOLE check list, not just the one
     that blocked, so a caller never has to re-run anything to learn why. The
-    rows' own `details` were coerced JSON-safe on the way in (`_json_safe`),
+    rows' own `details` were coerced JSON-safe on the way in (`_jsonable`),
     which is what makes them renderable here — `DomainError`'s response goes
     through Starlette's stock `json.dumps` with no encoder of its own (lesson).
     """
