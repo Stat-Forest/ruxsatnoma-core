@@ -100,6 +100,12 @@ async def create_bank_statement(
     before the response so a replay of the same key returns the stored 202 with
     the ORIGINAL statement id instead of queueing a duplicate.
     """
+    # The column map is decoded FIRST, before a byte reaches MinIO: `save_upload`
+    # writes the object before the DB flush by design, so a request rejected
+    # after it leaves an orphaned object behind that nothing will ever reference
+    # or clean up. The cheap, purely-syntactic check goes ahead of the expensive,
+    # side-effecting one.
+    parsed_map = _parse_column_map(column_map)
     cap_bytes = await settings_store.get_int(db, "bank_statement_max_mb") * 1024 * 1024
     data = await files.read_capped(file, cap_bytes, files.declared_length(request.headers))
     stored = await files.save_upload(
@@ -115,7 +121,7 @@ async def create_bank_statement(
         db,
         file_id=stored.id,
         statement_date=statement_date,
-        column_map=_parse_column_map(column_map),
+        column_map=parsed_map,
         actor=user,
     )
     accepted = StatementAccepted(id=row.id, status=row.status)

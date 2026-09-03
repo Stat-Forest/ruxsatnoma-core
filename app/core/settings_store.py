@@ -173,8 +173,9 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "provider_settlement_payer_fragment",
             str,
             "payme",
-            "Case-insensitive fragment of a statement line's payer name that marks it "
-            "an aggregated provider payout rather than one applicant's payment",
+            "Payment provider that settles in bulk: matched case-insensitively as a "
+            "fragment of a bank line's payer name, and used as the provider code "
+            "whose turnover that payout is reconciled against",
         ),
         SettingSpec(
             "refund_control_working_days",

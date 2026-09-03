@@ -5,7 +5,8 @@ service -> repo -> models)."""
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,11 +140,18 @@ async def add_payment_intent(db: AsyncSession, intent: PaymentIntent) -> None:
 async def list_provider_transactions_in_period(
     db: AsyncSession, provider: str, since: datetime, until: datetime
 ) -> list[tuple[ProviderTransaction, str]]:
-    """`GetStatement`'s own reader (`payme._get_statement` ONLY) — every
-    transaction whose OWN `received_at` (never Payme's own `time` param, the
-    same clock the 12h timeout uses) falls within `[since, until]`, joined
-    to its invoice for the `account.id` the wire response carries alongside
-    it. Plain (unlocked): `GetStatement` never mutates."""
+    """The provider's own turnover over a window — every transaction whose OWN
+    `received_at` (never Payme's own `time` param, the same clock the 12h
+    timeout uses) falls within `[since, until]`, joined to its invoice for the
+    `account.id` the wire response carries alongside it. Plain (unlocked):
+    neither caller mutates.
+
+    Two callers, and neither may grow a query of its own instead:
+    `payme._get_statement` (Payme's `GetStatement`, which this was written for)
+    and `statement_service._period_reconciliation` (3.10b), which compares a
+    bank payout against this same total. A second, subtly different turnover
+    query is exactly how a reconciliation comes to disagree with what we already
+    reported to the provider."""
     stmt = (
         select(ProviderTransaction, Invoice.number)
         .join(Invoice, ProviderTransaction.invoice_id == Invoice.id)
@@ -301,3 +309,28 @@ async def list_statement_lines(
         await db.execute(stmt.order_by(BankStatementLine.line_no).offset(offset).limit(limit))
     ).scalars()
     return list(rows), total
+
+
+async def list_invoice_candidates(
+    db: AsyncSession, *, amount: Decimal, since: date, until: date, limit: int
+) -> list[Invoice]:
+    """Invoices that agree with an unmatched bank line on AMOUNT and were issued
+    inside `[since, until)` — ruling 11's hint, and nothing more than a hint.
+
+    Deliberately NOT a matching query: the caller writes what this returns into
+    `reconciliations.comment` for an accountant to read, and never into
+    `matched_invoice_id`. Two leshozes can bill the same sum on the same day, so
+    amount and date can only ever suggest. Ordered newest-first — the likeliest
+    candidate for a payment that just arrived — and always bounded, since one
+    round sum («2 000 000,00») can legitimately be on hundreds of invoices."""
+    stmt = (
+        select(Invoice)
+        .where(
+            Invoice.amount == amount,
+            Invoice.issued_at >= since,
+            Invoice.issued_at < until,
+        )
+        .order_by(Invoice.issued_at.desc(), Invoice.id.desc())
+        .limit(limit)
+    )
+    return list((await db.execute(stmt)).scalars().all())

@@ -67,14 +67,28 @@ FINISH_ACTION = "bank_statement.finish"
 # parser, which `core.files._magic_ok` documents as the meaning of an empty tuple.
 STATEMENT_UPLOAD_TYPES: dict[str, tuple[bytes, ...]] = {"text/csv": ()}
 
-# `error_report` is one JSONB column returned whole by
-# `GET /payments/bank-statements/{id}`. Unbounded it is unbounded worker memory,
-# an unbounded column and a response that cannot be serialized — and under a
-# 10 MB cap a statement exported with the wrong column map reaches that by
-# accident, every row failing identically. Same cap and marker shape as
+# How many bad rows `error_report` STORES. It is one JSONB column returned whole
+# by `GET /payments/bank-statements/{id}`, so unbounded it is an unbounded column
+# and a response that cannot be serialized — and under a 10 MB upload cap a
+# statement exported with the wrong column map reaches that by accident, every
+# row failing identically. This is a bound on the STORED report only: `parse_csv`
+# accumulates its `LineError`s without a cap, and capping that is the parser's own
+# business, not this task's. Same value and marker shape as
 # `gis.importer.MAX_REPORT_ROWS`, defined here rather than imported: `payments`
 # does not reach into `gis`.
 MAX_REPORT_ROWS = 200
+
+# How far from a line's `operation_date` an invoice may have been ISSUED and still
+# be offered as a hint for an unmatched payment (ruling 11). An invoice's own
+# payment window is ten days (`payments.jobs.expiry_sweep`), and a bank posts with
+# a day or two of lag, so a fortnight covers a real late payment without turning
+# the hint into "every invoice for that amount, ever".
+CANDIDATE_WINDOW_DAYS = 14
+
+# At most this many candidates are named in one `reconciliations.comment`. The
+# hint exists to give an accountant somewhere to start, not to reproduce a query
+# result inside a text column.
+MAX_CANDIDATES = 5
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -90,10 +104,12 @@ def day_bounds(day: date) -> tuple[datetime, datetime]:
 
 
 def _error_report(errors: list[LineError]) -> dict[str, Any] | None:
-    """The stored, accountant-visible shape of the parser's own errors. Bounded
-    (see `MAX_REPORT_ROWS`) and stating the TRUE number omitted, never one
-    producer's count — a report that under-states its own truncation is worse
-    than one that does not truncate."""
+    """The stored, accountant-visible shape of the parser's own errors.
+
+    Bounded by `MAX_REPORT_ROWS` and stating the TRUE number omitted — a report
+    that under-states its own truncation is worse than one that does not
+    truncate. The bound is on what is STORED and returned, not on what the
+    parser accumulated to get here."""
     if not errors:
         return None
     omitted = max(len(errors) - MAX_REPORT_ROWS, 0)
@@ -139,70 +155,132 @@ async def _invoice_for(
     return number, cache[number]
 
 
-def _is_provider_settlement(line: ParsedLine, fragment: str) -> bool:
+def _is_provider_settlement(line: ParsedLine, provider: str) -> bool:
     """A case-insensitive fragment check of the line's payer name against
-    `provider_settlement_payer_fragment` (default `"payme"`). Payme money lands
-    in our own cashbox wallet and reaches a leshoz later as ONE aggregated
-    payout, so such a line stands for many invoices at once and must never be
-    matched to one — nor dumped into the exception register, which would bury
-    the whole month's provider turnover under it (ruling 10)."""
-    if not fragment or line.payer_name is None:
+    `provider_settlement_payer_fragment` (default `"payme"`).
+
+    Provider money lands in our own cashbox wallet and reaches a leshoz later as
+    ONE aggregated payout, so such a line stands for many invoices at once and
+    must never be matched to one — nor dumped into the exception register, which
+    would bury the whole month's provider turnover under it (ruling 10).
+
+    **The setting names the PROVIDER, and is matched as a fragment of the payer
+    name.** One value drives both halves of the settlement comparison: the line
+    is recognised by it here, and `_period_reconciliation` asks for that same
+    provider's turnover. They were two independent values until a review pointed
+    out that retuning the fragment silently left the turnover side comparing
+    against `payme` — a settlement check that answers about the wrong provider is
+    worse than one that answers nothing. It works as one value because the
+    provider code is what a bank writes inside the payer name («PAYME TRANSIT»),
+    so an exact match on `provider_transactions.provider` and a substring match
+    on `payer_name` are satisfied by the same string.
+    """
+    if not provider or line.payer_name is None:
         return False
-    return fragment.casefold() in line.payer_name.casefold()
+    return provider.casefold() in line.payer_name.casefold()
 
 
-async def _period_reconciliations(
-    db: AsyncSession, row: BankStatement, settlements: list[ParsedLine]
+async def _candidate_hint(db: AsyncSession, line: ParsedLine) -> str:
+    """Ruling 11's HINT for a payment whose purpose names no invoice we hold:
+    the invoices that agree with this line on AMOUNT and fall near its date.
+
+    **A hint is never a match.** It is written into `reconciliations.comment` and
+    nowhere else — it does not set `matched_invoice_id`, does not change
+    `match_status`, and no code path can promote it. That is ruling 11's whole
+    point: two leshozes can bill the same sum on the same day, so amount and date
+    can only ever suggest, and the accountant is the one who decides. Saying "no
+    candidates" out loud is part of it — an empty comment would read as "nobody
+    looked".
+    """
+    candidates = await repo.list_invoice_candidates(
+        db,
+        amount=line.amount,
+        since=line.operation_date - timedelta(days=CANDIDATE_WINDOW_DAYS),
+        until=line.operation_date + timedelta(days=1),
+        limit=MAX_CANDIDATES + 1,
+    )
+    if not candidates:
+        return "no invoice number in the purpose; no candidates by amount and date"
+    named = ", ".join(
+        f"{invoice.number} (issued {invoice.issued_at.date().isoformat()})"
+        for invoice in candidates[:MAX_CANDIDATES]
+    )
+    more = " and more" if len(candidates) > MAX_CANDIDATES else ""
+    return (
+        f"no invoice number in the purpose; candidates by amount and date: "
+        f"{named}{more} — a hint for the accountant, never an automatic match"
+    )
+
+
+async def _period_reconciliation(
+    db: AsyncSession, row: BankStatement, settlements: list[ParsedLine], *, provider: str
 ) -> list[Reconciliation]:
-    """One reconciliation row per period the statement's provider payouts
-    cover, comparing the payout total against the provider's own turnover for
-    the same period.
+    """ONE reconciliation row for the whole statement, comparing its provider
+    payouts against that provider's turnover over the statement's covered range.
 
-    **Per-invoice matching of provider money is impossible by design**: a Payme
-    payout is one aggregated settlement standing for many invoices, and nothing
-    in it names any of them. The only honest comparison is a total against a
-    total — which is why this reads `repo.list_provider_transactions_in_period`,
-    the function 3.10a already wrote for Payme's own `GetStatement`, rather than
+    **Per-invoice matching of provider money is impossible by design**: a payout
+    is one aggregated settlement standing for many invoices, and nothing in it
+    names any of them. The only honest comparison is a total against a total —
+    which is why this reads `repo.list_provider_transactions_in_period`, the
+    function 3.10a already wrote for Payme's own `GetStatement`, rather than
     growing a second query that would drift from it.
 
-    The period is one calendar day: that is the finest grain a statement line
-    carries (`operation_date` is a date, not an instant), and a day that
-    disagrees is a day an accountant can actually go and look at. Only
-    PERFORMED transactions count — money a cancelled transaction never moved is
-    not missing from the payout, and counting it would manufacture a
-    discrepancy out of every cancellation.
+    **The window is the whole statement, not one day.** It was per-day until a
+    review pointed out what that costs: a provider settles with a LAG, so
+    yesterday's transactions arrive in today's payout and a per-day comparison
+    opens a discrepancy on essentially every payout day — the register-flooding
+    this stage exists to prevent, merely moved from per-line rows to period rows.
+    A statement-wide window nets the lag out inside itself and leaves only the
+    effect at the two boundaries. No lag setting is invented for it: nobody can
+    source a default, and a wrong one would be worse than the boundary effect.
+
+    Only PERFORMED transactions count — money a cancelled transaction never moved
+    is not missing from the payout, and counting it would manufacture a
+    discrepancy out of every cancellation. `payme.STATE_PERFORMED` is that
+    provider's own vocabulary and Payme is the only writer of
+    `provider_transactions` today; a second provider makes this filter
+    provider-specific, which is the moment to split it.
+
+    Returns a list (empty when the statement carries no payout at all) so the
+    caller can concatenate it with the per-line rows unconditionally.
     """
-    rows: list[Reconciliation] = []
-    for day in sorted({line.operation_date for line in settlements}):
-        paid_out = sum(
-            (line.amount for line in settlements if line.operation_date == day), Decimal("0.00")
-        )
-        since, until = day_bounds(day)
-        turnover = sum(
-            (
-                transaction.amount
-                for transaction, _number in await repo.list_provider_transactions_in_period(
-                    db, payme.PROVIDER, since, until
-                )
-                if transaction.state == payme.STATE_PERFORMED
-            ),
-            Decimal("0.00"),
-        )
-        difference = paid_out - turnover
-        agrees = difference == 0
-        rows.append(
-            Reconciliation(
-                result="matched" if agrees else "discrepancy",
-                difference=None if agrees else difference,
-                status="resolved" if agrees else "open",
-                comment=(
-                    f"{payme.PROVIDER} settlement for {day.isoformat()}: "
-                    f"payout {paid_out} vs provider turnover {turnover} "
-                    f"(statement {row.id})"
-                ),
+    if not settlements:
+        return []
+    period_from = min(parsed.operation_date for parsed in settlements)
+    period_to = max(parsed.operation_date for parsed in settlements)
+    if row.period_from is not None and row.period_to is not None:
+        period_from, period_to = row.period_from, row.period_to
+    paid_out = sum((parsed.amount for parsed in settlements), Decimal("0.00"))
+    since, _ = day_bounds(period_from)
+    _, until = day_bounds(period_to)
+    turnover = sum(
+        (
+            transaction.amount
+            for transaction, _number in await repo.list_provider_transactions_in_period(
+                db, provider, since, until
             )
+            if transaction.state == payme.STATE_PERFORMED
+        ),
+        Decimal("0.00"),
+    )
+    difference = paid_out - turnover
+    agrees = difference == 0
+    return [
+        Reconciliation(
+            result="matched" if agrees else "discrepancy",
+            difference=None if agrees else difference,
+            status="resolved" if agrees else "open",
+            # The row belongs to no single line and `reconciliations` has no
+            # `statement_id` column, so the statement is named here — which is
+            # also how the accountant knows which file to open.
+            comment=(
+                f"{provider} settlement for "
+                f"{period_from.isoformat()}..{period_to.isoformat()}: "
+                f"payout {paid_out} vs provider turnover {turnover} "
+                f"(statement {row.id})"
+            ),
         )
-    return rows
+    ]
 
 
 def _build_rows(
@@ -210,6 +288,7 @@ def _build_rows(
     lines: list[ParsedLine],
     outcomes: list[matcher.MatchOutcome],
     invoices: list[Invoice | None],
+    comments: list[str | None],
 ) -> tuple[list[BankStatementLine], list[tuple[int, Reconciliation]], dict[str, int]]:
     """Turn one parsed statement into the rows it becomes. Pure — no session —
     so what is written is decided in one readable pass and the savepoint below
@@ -218,12 +297,17 @@ def _build_rows(
     Returns the line rows, the reconciliation rows paired with the INDEX of the
     line each belongs to (their `statement_line_id` can only be filled in once
     the lines have been flushed and have ids), and the per-status counters
-    `stats` reports.
+    `stats` reports. `comments` is the caller's per-line hint (ruling 11's
+    amount+date candidates), positional like every other list here — the lookup
+    it needs is a query, which is why it arrives ready-made rather than being
+    done in this pure function.
     """
     line_rows: list[BankStatementLine] = []
     pending: list[tuple[int, Reconciliation]] = []
     counts: dict[str, int] = {}
-    for index, (parsed, outcome, invoice) in enumerate(zip(lines, outcomes, invoices, strict=True)):
+    for index, (parsed, outcome, invoice, hint) in enumerate(
+        zip(lines, outcomes, invoices, comments, strict=True)
+    ):
         counts[outcome.match_status] = counts.get(outcome.match_status, 0) + 1
         line_rows.append(
             BankStatementLine(
@@ -255,7 +339,10 @@ def _build_rows(
                     result=outcome.result,
                     difference=outcome.difference,
                     status="resolved" if resolved else "open",
-                    comment=outcome.comment,
+                    # The matcher never sets a comment today; the amount+date
+                    # hint of ruling 11 is the service's own, because finding
+                    # candidates needs a query and the matcher is pure.
+                    comment=hint or outcome.comment,
                 ),
             )
         )
@@ -295,102 +382,129 @@ async def _finish(
     )
 
 
-async def run_statement(db: AsyncSession, row: BankStatement) -> None:
-    """Process ONE claimed statement, in the caller's transaction.
+async def _import(
+    db: AsyncSession, row: BankStatement, errors: list[LineError]
+) -> tuple[str, dict[str, Any] | None]:
+    """Load, parse, match and WRITE one statement, extending `errors` with
+    everything the file got wrong. Returns the status and the `stats` to stamp;
+    `run_statement` is the only caller and the only place `_finish` is called.
 
-    Never raises for a bad file: every failure a delivery can cause becomes
-    `status="failed"` plus an `error_report`, which is the deliverable. Our OWN
-    defects are caught too — they happen inside the savepoint, which rolls back
-    without poisoning the outer transaction, so a crashed statement is recorded
-    as failed rather than re-claimed by every tick of the scheduler forever.
+    Raises on anything that is not "a bad file" — a `csv.Error`, a row the
+    database refuses, a bug of ours. `run_statement` turns that into the same
+    `failed` record, which is the point: nothing may escape to the worker and
+    leave the row `pending` to be re-claimed every thirty seconds forever.
     """
-    row.status = "parsing"
-    await db.flush()
-
     data = await _load_file(db, row)
     if data is None:
-        await _finish(
-            db,
-            row,
-            status="failed",
-            errors=[
-                LineError(line_no=1, field="file", message="the stored statement file is gone")
-            ],
+        errors.append(
+            LineError(line_no=1, field="file", message="the stored statement file is gone")
         )
-        return
+        return "failed", None
 
-    lines, errors = statement_parser.parse_csv(data, column_map=row.column_map or {})
+    lines, parse_errors = statement_parser.parse_csv(data, column_map=row.column_map or {})
+    errors.extend(parse_errors)
     if not lines:
         # Nothing to import. Either the parser short-circuited the whole file
         # (undecodable bytes, a required column the header does not have) or
         # every row was bad — in both cases there is no partial success to keep.
-        await _finish(db, row, status="failed", errors=errors)
-        return
+        return "failed", None
 
-    fragment = await settings_store.get_str(db, "provider_settlement_payer_fragment")
-    try:
-        # The savepoint: everything the batch writes is undone together, while
-        # the outer transaction — and the failure record written on it below —
-        # survives.
-        async with db.begin_nested():
-            cache: dict[str, Invoice | None] = {}
-            outcomes: list[matcher.MatchOutcome] = []
-            invoices: list[Invoice | None] = []
-            for parsed in lines:
-                settlement = _is_provider_settlement(parsed, fragment)
-                if settlement:
-                    number, invoice = None, None
-                else:
-                    number, invoice = await _invoice_for(db, parsed, cache)
-                outcomes.append(
-                    matcher.classify(
-                        parsed,
-                        invoice_amount=invoice.amount if invoice is not None else None,
-                        invoice_found=number is not None and invoice is not None,
-                        is_provider_settlement=settlement,
-                    )
-                )
-                invoices.append(invoice)
-
-            line_rows, pending, counts = _build_rows(row, lines, outcomes, invoices)
-            await repo.add_statement_lines(db, line_rows)
-            for index, reconciliation in pending:
-                reconciliation.statement_line_id = line_rows[index].id
-            settlements = [
-                parsed
-                for parsed, outcome in zip(lines, outcomes, strict=True)
-                if outcome.match_status == "provider_settlement"
-            ]
-            await repo.add_reconciliations(
-                db,
-                [reconciliation for _index, reconciliation in pending]
-                + await _period_reconciliations(db, row, settlements),
+    provider = await settings_store.get_str(db, "provider_settlement_payer_fragment")
+    # The savepoint of the atomicity rule: everything below is undone together,
+    # while the outer transaction — and the failure record `run_statement` writes
+    # on it — survives.
+    async with db.begin_nested():
+        cache: dict[str, Invoice | None] = {}
+        outcomes: list[matcher.MatchOutcome] = []
+        invoices: list[Invoice | None] = []
+        comments: list[str | None] = []
+        for parsed in lines:
+            settlement = _is_provider_settlement(parsed, provider)
+            if settlement:
+                number, invoice = None, None
+            else:
+                number, invoice = await _invoice_for(db, parsed, cache)
+            outcome = matcher.classify(
+                parsed,
+                invoice_amount=invoice.amount if invoice is not None else None,
+                invoice_found=number is not None and invoice is not None,
+                is_provider_settlement=settlement,
             )
-            row.period_from = min(parsed.operation_date for parsed in lines)
-            row.period_to = max(parsed.operation_date for parsed in lines)
-    except Exception:
-        # Not "a bad file" — reaching here is a defect in our own code or a row
-        # the database refused. The savepoint has already undone every write, so
-        # the outer transaction is usable and the failure is recordable.
-        logger.exception("payments.statement.write_failed", statement_id=str(row.id))
-        await _finish(
-            db,
-            row,
-            status="failed",
-            errors=[
-                *errors,
-                LineError(line_no=1, field="import", message="the statement import failed"),
-            ],
-        )
-        return
+            outcomes.append(outcome)
+            invoices.append(invoice)
+            comments.append(
+                await _candidate_hint(db, parsed)
+                if outcome.match_status == "unknown_payment"
+                else None
+            )
 
-    await _finish(
-        db,
-        row,
-        status="parsed",
-        stats={"imported": len(lines), "skipped": len(errors), **counts},
-        errors=errors,
-    )
+        # The covered range is stamped BEFORE the period row is built: that row
+        # compares the statement's whole window, and reading it off the same
+        # columns the accountant sees keeps the two from disagreeing.
+        row.period_from = min(parsed.operation_date for parsed in lines)
+        row.period_to = max(parsed.operation_date for parsed in lines)
+
+        line_rows, pending, counts = _build_rows(row, lines, outcomes, invoices, comments)
+        await repo.add_statement_lines(db, line_rows)
+        for index, reconciliation in pending:
+            reconciliation.statement_line_id = line_rows[index].id
+        settlements = [
+            parsed
+            for parsed, outcome in zip(lines, outcomes, strict=True)
+            if outcome.match_status == "provider_settlement"
+        ]
+        await repo.add_reconciliations(
+            db,
+            [reconciliation for _index, reconciliation in pending]
+            + await _period_reconciliation(db, row, settlements, provider=provider),
+        )
+    return "parsed", {"imported": len(lines), "skipped": len(parse_errors), **counts}
+
+
+async def run_statement(db: AsyncSession, row: BankStatement) -> None:
+    """Process ONE claimed statement, in the caller's transaction.
+
+    **Never raises.** Every failure a delivery can cause becomes
+    `status="failed"` plus an `error_report`, and so does every failure our own
+    code can cause: the guard wraps the WHOLE import, not just the writes.
+
+    That distinction was a real bug. The file load and the parse used to sit
+    outside it on the argument that only the writes can fail — but the stdlib
+    `csv` module raises `Error: field larger than field limit (131072)` on an
+    unclosed quote in a file over 128 KB, which is a FILE's doing, not ours. The
+    exception escaped, the transaction rolled back, and the statement stayed
+    `pending` for the scheduler to re-claim every thirty seconds, forever. A
+    failure that cannot be recorded is a failure that never stops.
+
+    The outer transaction is still usable in the handler: writes only ever
+    happen inside `_import`'s savepoint, which is rolled back on the way out,
+    and everything before it touches nothing.
+
+    `statement_id` is read ONCE, before the try. Rolling the savepoint back
+    EXPIRES every instance modified inside it — `row` among them — and reading
+    an expired attribute is a lazy load, which in async SQLAlchemy is IO
+    attempted from a plain attribute access: `MissingGreenlet`, raised from the
+    handler, replacing the recorded failure with an unrecorded one. `_finish`
+    below is safe for the same reason in reverse: it only ASSIGNS until its
+    `flush()`, and reads `row.id` after it, inside the greenlet context.
+    """
+    statement_id = row.id
+    row.status = "parsing"
+    await db.flush()
+    errors: list[LineError] = []
+    try:
+        status, stats = await _import(db, row, errors)
+    except Exception:
+        logger.exception("payments.statement.import_failed", statement_id=str(statement_id))
+        status, stats = "failed", None
+        errors.append(
+            LineError(
+                line_no=1,
+                field="import",
+                message="the statement could not be imported — check the file and re-upload it",
+            )
+        )
+    await _finish(db, row, status=status, stats=stats, errors=errors)
 
 
 async def process_pending(db: AsyncSession) -> int:

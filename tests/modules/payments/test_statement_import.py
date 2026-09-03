@@ -12,8 +12,8 @@ twice.
 What the JOB must get right is the whole point of the stage: **matching a bank
 line does not pay an invoice** (`tz/05` invariant 3 — only a provider's
 confirmation or the maker-checker path does), an unparseable row is a warning
-and not a failure, and a Payme payout is reconciled as a period TOTAL rather
-than being buried in the exception register invoice by invoice.
+and not a failure, and a Payme payout is reconciled as ONE statement-wide TOTAL
+rather than being buried in the exception register invoice by invoice.
 """
 
 import csv
@@ -24,8 +24,10 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import select
 
+from app.core import storage
+from app.core.time import business_today
 from app.modules.payments import payme, statement_service
 from app.modules.payments.models import (
     BankStatement,
@@ -48,11 +50,13 @@ COLUMN_MAP = {
 }
 HEADER = ["Документ", "Дата", "Сумма", "Плательщик", "Счет", "Назначение"]
 STATEMENT_DATE = "2026-09-02"
-# The settlement test compares a whole DAY's payout against that day's provider
-# turnover, so it needs a day no OTHER test can put a `provider_transactions`
-# row in. `test_payme_rpc.py` stamps its own rows with the wall clock, so the
-# one safe choice is a date the wall clock will not reach.
+# The settlement test compares a statement's whole payout against the provider's
+# turnover over the same range, so it needs days no OTHER test can put a
+# `provider_transactions` row in. `test_payme_rpc.py` stamps its own rows with
+# the wall clock, so the one safe choice is a range the wall clock will not
+# reach.
 PAYOUT_DAY = date(2030, 1, 15)
+NEXT_PAYOUT_DAY = date(2030, 1, 16)
 
 
 def csv_bytes(*rows: list[str]) -> bytes:
@@ -121,6 +125,21 @@ async def bank_invoice(db, approved_application) -> Invoice:
 
 async def _statements(db) -> list[BankStatement]:
     return list((await db.execute(select(BankStatement))).scalars().all())
+
+
+async def _reconciliations(db, line_id) -> list[Reconciliation]:
+    """Every reconciliation row raised for ONE statement line — the register
+    entry a line produced, scoped to it (this database is shared and persistent,
+    so an unscoped `select(Reconciliation)` reads other tests' rows too)."""
+    return list(
+        (
+            await db.execute(
+                select(Reconciliation).where(Reconciliation.statement_line_id == line_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 async def drain(db) -> None:
@@ -249,15 +268,7 @@ async def test_a_line_naming_its_invoice_for_the_exact_amount_matches_and_pays_n
     assert line.matched_invoice_id == bank_invoice.id
     assert line.payer_account == "20208000000000000001"  # stored raw, never a key
 
-    rows = (
-        (
-            await db.execute(
-                select(Reconciliation).where(Reconciliation.statement_line_id == line.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    rows = await _reconciliations(db, line.id)
     assert len(rows) == 1
     assert rows[0].result == "matched" and rows[0].status == "resolved"
     assert rows[0].invoice_id == bank_invoice.id
@@ -280,15 +291,7 @@ async def test_a_line_whose_amount_disagrees_opens_a_discrepancy_with_the_signed
 
     (line,) = await _lines(db, statement_id)
     assert line.match_status == "discrepancy"
-    (open_row,) = (
-        (
-            await db.execute(
-                select(Reconciliation).where(Reconciliation.statement_line_id == line.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    (open_row,) = await _reconciliations(db, line.id)
     assert open_row.status == "open"
     assert open_row.result == "discrepancy"
     assert open_row.difference == Decimal("-60000.00")
@@ -304,15 +307,7 @@ async def test_a_line_naming_no_invoice_is_an_unknown_payment(payments_view_clie
     (line,) = await _lines(db, statement_id)
     assert line.match_status == "unknown_payment"
     assert line.matched_invoice_id is None
-    (open_row,) = (
-        (
-            await db.execute(
-                select(Reconciliation).where(Reconciliation.statement_line_id == line.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    (open_row,) = await _reconciliations(db, line.id)
     assert open_row.result == "unknown" and open_row.status == "open"
 
 
@@ -364,31 +359,49 @@ async def test_a_column_map_that_names_a_column_the_file_does_not_have_fails_the
     assert await _lines(db, statement_id) == []  # the savepoint rolled every write back
 
 
-async def test_a_payme_payout_is_reconciled_as_a_period_total_not_per_invoice(
+async def test_a_payme_payout_is_reconciled_once_for_the_whole_statement(
     payments_view_client, db, bank_invoice
 ):
-    """Ruling 10 + the task's own ruling 4: a provider payout is ONE aggregated
-    line standing for many invoices, so it is compared against the period's own
-    provider turnover — never matched invoice by invoice, and never dumped into
-    the exception register every month."""
+    """Ruling 10 plus the statement-wide window: a provider payout is ONE
+    aggregated line standing for many invoices, so it is compared against the
+    provider's turnover over the STATEMENT's covered range — never invoice by
+    invoice, and never day by day.
+
+    The day-by-day version of this comparison is what the window replaced, and
+    this file is the proof: the provider settles with a LAG, so the payout is
+    split across two days here while the turnover behind it all landed on the
+    second. Per day that is two open rows (+1 000 000 and -1 060 000) — a
+    discrepancy manufactured out of ordinary provider behaviour, on every payout
+    day forever. Statement-wide it is one row, and the only thing it reports is
+    the 60 000 that is genuinely unaccounted for.
+    """
     response = await upload(
         payments_view_client,
         csv_bytes(
             row(
+                doc="1",
                 on=PAYOUT_DAY.strftime("%d.%m.%Y"),
-                amount="2 000 000,00",
+                amount="1 000 000,00",
                 payer="PAYME TRANSIT",
-                purpose="Реестр за 14.01",
-            )
+                purpose="Реестр, часть 1",
+            ),
+            row(
+                doc="2",
+                on=NEXT_PAYOUT_DAY.strftime("%d.%m.%Y"),
+                amount="1 000 000,00",
+                payer="PAYME TRANSIT",
+                purpose="Реестр, часть 2",
+            ),
         ),
     )
     statement_id = uuid.UUID(response.json()["id"])
 
-    # The provider's own turnover for that day, added AFTER the upload and never
-    # followed by another request: `_commit_pending_before_requests` commits this
-    # session before every outgoing call, so a transaction staged BEFORE the
-    # upload would be committed into a database the next run reuses — and the
-    # day's turnover would then double on every run (it did).
+    # The provider's own turnover, added AFTER the upload and never followed by
+    # another request: `_commit_pending_before_requests` commits this session
+    # before every outgoing call, so a transaction staged BEFORE the upload would
+    # be committed into a database the next run reuses — and the turnover would
+    # then double on every run (it did). It lands on the SECOND day, which is
+    # the lag the statement-wide window exists to absorb.
     db.add(
         ProviderTransaction(
             invoice_id=bank_invoice.id,
@@ -396,25 +409,24 @@ async def test_a_payme_payout_is_reconciled_as_a_period_total_not_per_invoice(
             external_id=uuid.uuid4().hex,
             amount=Decimal("2060000.00"),
             state=payme.STATE_PERFORMED,
-            received_at=statement_service.day_bounds(PAYOUT_DAY)[0],
+            received_at=statement_service.day_bounds(NEXT_PAYOUT_DAY)[0],
         )
     )
     await db.flush()
     await drain(db)
 
-    (line,) = await _lines(db, statement_id)
-    assert line.match_status == "provider_settlement"
-    assert (
-        await db.scalar(
-            select(func.count())
-            .select_from(Reconciliation)
-            .where(Reconciliation.statement_line_id == line.id)
-        )
-    ) == 0  # never a per-line exception
+    statement = await db.get(BankStatement, statement_id, populate_existing=True)
+    assert statement is not None
+    assert statement.period_from == PAYOUT_DAY and statement.period_to == NEXT_PAYOUT_DAY
+
+    lines = await _lines(db, statement_id)
+    assert [line.match_status for line in lines] == ["provider_settlement"] * 2
+    for line in lines:
+        assert await _reconciliations(db, line.id) == []  # never a per-line exception
 
     # A period row belongs to no single line, so it names its statement in the
     # comment — which is also how the accountant knows where it came from.
-    (period_row,) = (
+    rows = (
         (
             await db.execute(
                 select(Reconciliation).where(
@@ -426,8 +438,177 @@ async def test_a_payme_payout_is_reconciled_as_a_period_total_not_per_invoice(
         .scalars()
         .all()
     )
-    assert period_row.result == "discrepancy" and period_row.status == "open"
-    assert period_row.difference == Decimal("-60000.00")  # payout minus provider turnover
+    assert len(rows) == 1  # ONE row for the statement, not one per payout day
+    assert rows[0].result == "discrepancy" and rows[0].status == "open"
+    assert rows[0].difference == Decimal("-60000.00")  # payout minus provider turnover
+
+
+# --- the two ways an import can fail without a bad ROW ------------------------
+
+
+async def test_a_file_the_csv_reader_itself_refuses_ends_as_failed_not_as_a_stuck_row(
+    payments_view_client, db
+):
+    """The guard has to wrap the PARSE, not only the writes.
+
+    An unclosed quote in a file over 128 KB makes the stdlib `csv` module raise
+    `Error: field larger than field limit (131072)` — a FILE's doing, not a bug
+    of ours, and `parse_csv` deliberately does not catch it. While the load and
+    the parse sat outside the guard, that exception escaped `run_statement`, the
+    transaction rolled back, and the statement stayed `pending` for the scheduler
+    to re-claim every thirty seconds, forever. A failure that cannot be recorded
+    is a failure that never stops.
+    """
+    header = ",".join(HEADER).encode()
+    broken = header + b'\r\n1,02.09.2026,"' + b"x" * 140_000
+    response = await upload(payments_view_client, broken)
+    statement_id = uuid.UUID(response.json()["id"])
+
+    await drain(db)  # must not raise
+
+    statement = await db.get(BankStatement, statement_id, populate_existing=True)
+    assert statement is not None
+    assert statement.status == "failed"  # NOT still `pending`
+    assert (statement.error_report or {})["errors"][-1]["field"] == "import"
+    assert await _lines(db, statement_id) == []
+
+
+async def test_a_row_the_database_refuses_rolls_every_line_back_and_still_records_it(
+    payments_view_client, db, bank_invoice
+):
+    """The atomicity rule's own test: the whole batch's writes live in ONE
+    savepoint, and the failure record survives on the OUTER transaction.
+
+    A NUL byte is what drives it — PostgreSQL text cannot hold `\x00`, the
+    parser passes it through happily, and asyncpg refuses it at the flush, i.e.
+    INSIDE the savepoint and after a good row has already been written. Both
+    halves are asserted, because either one alone would pass for the wrong
+    reason: every line is gone, AND `failed` plus the `error_report` is there.
+    """
+    response = await upload(
+        payments_view_client,
+        csv_bytes(
+            row(doc="1", purpose=f"Оплата по счёту {bank_invoice.number}"),
+            row(doc="2", purpose="Оплата\x00 с нулевым байтом"),
+        ),
+    )
+    statement_id = uuid.UUID(response.json()["id"])
+
+    await drain(db)  # must not raise
+
+    statement = await db.get(BankStatement, statement_id, populate_existing=True)
+    assert statement is not None
+    assert statement.status == "failed"
+    assert (statement.error_report or {})["errors"][-1]["field"] == "import"
+    # The savepoint rolled back the line that WAS accepted, too.
+    assert await _lines(db, statement_id) == []
+
+
+# --- ruling 11's hint ---------------------------------------------------------
+
+
+async def test_an_unknown_payment_names_amount_and_date_candidates_as_a_hint(
+    payments_view_client, db, bank_invoice
+):
+    """Ruling 11: a payment whose purpose names no invoice is never matched on
+    amount and date — but those candidates are worth an accountant's eye, so
+    they are written into the register row's comment as a HINT.
+
+    The line's own date is today's, because the hint window is anchored on
+    `invoices.issued_at` and this fixture's invoice was issued just now.
+    """
+    response = await upload(
+        payments_view_client,
+        csv_bytes(row(on=business_today().strftime("%d.%m.%Y"), purpose="Оплата за услуги")),
+    )
+    statement_id = uuid.UUID(response.json()["id"])
+    await drain(db)
+
+    (line,) = await _lines(db, statement_id)
+    # A hint is never a match: neither of these may move because of it.
+    assert line.match_status == "unknown_payment"
+    assert line.matched_invoice_id is None
+
+    (open_row,) = await _reconciliations(db, line.id)
+    assert open_row.result == "unknown" and open_row.status == "open"
+    assert open_row.invoice_id is None
+    assert open_row.comment is not None
+    assert bank_invoice.number in open_row.comment
+    assert "never an automatic match" in open_row.comment
+
+
+async def test_an_unknown_payment_with_no_candidates_says_so_out_loud(
+    payments_view_client, db, bank_invoice
+):
+    """An empty comment would read as "nobody looked". `7 777 777,00` matches no
+    invoice this suite ever writes."""
+    response = await upload(
+        payments_view_client,
+        csv_bytes(
+            row(
+                on=business_today().strftime("%d.%m.%Y"),
+                amount="7 777 777,00",
+                purpose="Оплата за услуги",
+            )
+        ),
+    )
+    statement_id = uuid.UUID(response.json()["id"])
+    await drain(db)
+
+    (line,) = await _lines(db, statement_id)
+    (open_row,) = await _reconciliations(db, line.id)
+    assert open_row.comment == "no invoice number in the purpose; no candidates by amount and date"
+
+
+# --- the column map, at the transport edge ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        ("not json at all", "column_map_not_json"),
+        (json.dumps(["Сумма"]), "column_map_not_a_string_map"),
+        (json.dumps({"amount": 1}), "column_map_not_a_string_map"),
+        (json.dumps({**COLUMN_MAP, "amout": "Сумма"}), "column_map_unknown_fields"),
+    ],
+)
+async def test_a_malformed_column_map_is_refused_at_the_edge(payments_view_client, raw, reason):
+    """`column_map` is stored in JSONB and later read as column names, so a list,
+    a number or a typo'd field would fail far from the request that supplied it —
+    a statement that imports and matches nothing being the worst of those, since
+    nobody would notice. The unknown-field branch is deliberately stricter than
+    `gis._parse_attributes`: there is no contracted bank format, so a mistyped
+    field name is the single likeliest mistake an accountant makes."""
+    response = await payments_view_client.post(
+        "/api/v1/payments/bank-statements",
+        data={"statement_date": STATEMENT_DATE, "column_map": raw},
+        files={"file": ("vypiska.csv", csv_bytes(row()), "text/csv")},
+        headers=idem(),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == reason
+
+
+async def test_a_bad_column_map_is_refused_before_the_file_is_stored(
+    payments_view_client, monkeypatch
+):
+    """Ordering, not just outcome. `save_upload` writes the MinIO object BEFORE
+    the database flush by design, so a request rejected after it leaves an
+    orphaned object nothing will ever reference or clean up. Storage is booby-
+    trapped here: reaching it at all fails the test."""
+
+    async def _explode(*args, **kwargs):
+        raise AssertionError("the file was stored before the column map was validated")
+
+    monkeypatch.setattr(storage, "put_object", _explode)
+    response = await payments_view_client.post(
+        "/api/v1/payments/bank-statements",
+        data={"statement_date": STATEMENT_DATE, "column_map": json.dumps({"amout": "Сумма"})},
+        files={"file": ("vypiska.csv", csv_bytes(row()), "text/csv")},
+        headers=idem(),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == "column_map_unknown_fields"
 
 
 # --- the read route ---------------------------------------------------------
