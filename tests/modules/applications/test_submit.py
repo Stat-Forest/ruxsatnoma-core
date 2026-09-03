@@ -321,6 +321,27 @@ async def test_the_package_route_is_refused_to_a_stranger(
     assert refused.status_code == 404
 
 
+async def test_a_draft_cancelled_without_ever_being_submitted_still_serves_a_package(
+    applicant_client, draft_ready_for_submission
+) -> None:
+    """`cancel` from DRAFT never freezes `contour_version_id` (nothing does,
+    before `submit`'s step 4), so a completed-then-withdrawn draft reaches
+    `package` with the column still null. Before the fix, `package` took the
+    frozen-column branch for every non-DRAFT status including CANCELLED, found
+    it null and `_package_bytes` answered 500 `ERR-SYS-001`
+    `package_without_a_contour_version` — a real regression the fix wave's
+    change to that branch introduced. The DRAFT-typed fallback resolves the
+    current published version instead, the same way an actual DRAFT does."""
+    app_id = draft_ready_for_submission
+    cancelled = await applicant_client.post(f"/api/v1/applications/{app_id}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "CANCELLED"
+
+    result = await applicant_client.get(f"/api/v1/applications/{app_id}/package")
+    assert result.status_code == 200, result.text
+    assert len(result.content) > 0
+
+
 async def test_a_stranger_cannot_submit_my_draft(
     other_applicant_client, draft_ready_for_submission
 ) -> None:

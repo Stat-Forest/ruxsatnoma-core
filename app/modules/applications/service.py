@@ -1313,8 +1313,12 @@ def _package_bytes(
     if version_id is None:
         # Never an `assert` on a request path — `-O` strips it, and what this
         # function returns is SIGNED (review round 2, minor 9). Unreachable
-        # today: both callers run `_published_version_or_refuse` first, which
-        # is the honest 409 for a contour whose geometry is still a draft.
+        # today, but for a different reason than "both callers pass one
+        # in": both call sites now GUARANTEE a non-null id before calling
+        # here — `package` by falling back to `_published_version_or_refuse`
+        # when the frozen column is null (a cancelled-from-DRAFT application),
+        # `submit` by freezing `contour_version_id` in the same transaction
+        # that sets the status.
         raise err("ERR-SYS-001", details={"reason": "package_without_a_contour_version"})
     if isinstance(priced, Mapping):
         amount = priced["amount"]
@@ -1552,15 +1556,22 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     # string and the signature would not verify — pinned by
     # `test_decision.py::test_a_republished_contour_does_not_invalidate_the_
     # decision_signature`.
-    version_id = (
-        (await _published_version_or_refuse(db, application)).id
-        if application.status == INITIAL_STATUS
-        else application.contour_version_id
-    )
+    # **The DRAFT branch stays status-keyed, not null-keyed.** Ruling 19
+    # leaves a STALE frozen version on a refused submission, so a draft must
+    # always re-resolve the current published version, even when its column
+    # happens to be set from an earlier attempt — `is None` here would serve
+    # the stale one instead.
+    frozen = None if application.status == INITIAL_STATUS else application.contour_version_id
+    # The fallback below can never fire for a SUBMITTED-or-later application:
+    # `submit` freezes `contour_version_id` in the same transaction that sets
+    # the status. The only status that reaches it is CANCELLED-from-DRAFT — a
+    # draft completed and then withdrawn without ever being submitted, so the
+    # column was never frozen — and there `_published_version_or_refuse` gives
+    # the honest 409 for a contour whose geometry has since gone back to draft,
+    # rather than `_package_bytes` finding a null and answering ERR-SYS-001 for
+    # an application that is perfectly able to show what it once priced.
+    version_id = frozen or (await _published_version_or_refuse(db, application)).id
     _, priced = await _price(db, application, actor=actor)
-    # A null here is impossible for a submitted application (step 4 freezes the
-    # column in the same transaction that sets the status) and `_package_bytes`
-    # answers it with ERR-SYS-001 rather than signing a package with no plot.
     return _package_bytes(application, priced, contour_version_id=version_id)
 
 
