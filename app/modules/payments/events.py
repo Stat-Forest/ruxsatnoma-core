@@ -19,8 +19,10 @@ layer may pass to `notify(...)`: `invoice.issued` (Task 2, seeded by
 migration `0009_notifications.py` for both `inapp` and `sms`),
 `payment.confirmed` (Task 4, same migration, same two channels) and
 `invoice.due_soon` (Task 6, seeded by migration `0018` for both channels —
-`0009` predates this module and could not have seeded it). Later tasks of
-this stage append to the tuple, never replace it.
+`0009` predates this module and could not have seeded it). 3.10b task 1 adds
+`refund.decided` and `payment.manual_confirmed`, seeded by migration `0022`
+for both channels. Later tasks of this stage append to the tuple, never
+replace it.
 
 --- Bus event name — `core.events.publish`/`subscribe` --------------------
 
@@ -62,7 +64,15 @@ a deliberate no-op, not a gap.
 INVOICE_ISSUED = "invoice.issued"
 PAYMENT_CONFIRMED_NOTIFICATION_CODE = "payment.confirmed"
 INVOICE_DUE_SOON = "invoice.due_soon"
+REFUND_DECIDED = "refund.decided"
+PAYMENT_MANUAL_CONFIRMED = "payment.manual_confirmed"
 
-NOTIFIED_EVENT_CODES = (INVOICE_ISSUED, PAYMENT_CONFIRMED_NOTIFICATION_CODE, INVOICE_DUE_SOON)
+NOTIFIED_EVENT_CODES = (
+    INVOICE_ISSUED,
+    PAYMENT_CONFIRMED_NOTIFICATION_CODE,
+    INVOICE_DUE_SOON,
+    REFUND_DECIDED,
+    PAYMENT_MANUAL_CONFIRMED,
+)
 
 PAYMENT_CONFIRMED = "payment_confirmed"
