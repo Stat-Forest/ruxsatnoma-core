@@ -1,6 +1,7 @@
 """Permission codes owned by applications; importing registers them (same idiom as
-app/modules/gis/permissions.py; registration itself is a stand-in import in
-app/main.py until branch 2's router.py exists and imports this module directly).
+app/modules/gis/permissions.py). Registration happens through `router.py`, which
+imports this module and is itself wired into `app/main.py` — the stand-in import
+that stood in `main.py` while this module had no router is gone.
 
 Migration 0015 grants each to a role (ruling 16, with one controller correction):
 create -> applicant, review -> executor_staff ("hodim" in the plan's prose, tz/03

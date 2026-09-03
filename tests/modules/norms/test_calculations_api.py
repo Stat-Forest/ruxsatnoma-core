@@ -14,10 +14,8 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.applications.models import Application
-from app.modules.auth.models import Applicant
 from app.modules.gis.models import Contour
 from app.modules.norms.models import Calculation
-from tests.modules.auth.test_sessions import make_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -122,18 +120,19 @@ async def test_the_history_for_an_application_lists_newest_first(
     `application_id` now needs a real `applications` row: stage 3.9a's
     migration 0015 closed `calculations.application_id`'s deferred FK (this
     test predates `applications` and originally used a bare `uuid.uuid4()`).
-    The listing route filters by `application_id` alone with no ownership
-    check (`norms/repo.py`), so this synthetic applicant need not match
-    `applicant_client`'s own identity."""
-    owner = await make_user(db, role_code="applicant", pinfl=f"1{uuid.uuid4().int % 10**13:013d}")
-    applicant = Applicant(
-        kind="individual", pinfl=owner.pinfl, name=owner.full_name, owner_user_id=owner.id
-    )
-    db.add(applicant)
-    await db.flush()
+
+    **The application is `applicant_client`'s OWN as of stage 3.9a task 8
+    (ruling 11).** It used to belong to a synthetic applicant, on the stated
+    grounds that "the listing route filters by `application_id` alone with no
+    ownership check" — which is exactly what ruling 11 closed: the route now
+    answers an empty page for an application the caller has no claim on, so
+    that shape asserted `total == 2` against `total == 0`. The ordering this
+    test is about is unaffected; only whose application it runs on changed.
+    """
+    me = (await applicant_client.get("/api/v1/auth/me")).json()
     application = Application(
-        applicant_id=applicant.id,
-        submitted_by_user_id=owner.id,
+        applicant_id=uuid.UUID(me["applicant"]["id"]),
+        submitted_by_user_id=uuid.UUID(me["user"]["id"]),
         on_behalf="self",
         channel="portal",
     )
@@ -189,25 +188,103 @@ async def test_get_calculation_missing_id_is_404(applicant_client: AsyncClient) 
     assert response.json()["error"]["code"] == "ERR-SYS-003"
 
 
-async def test_a_calculation_cannot_be_bound_to_an_application_yet(
+async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_touch(
     applicant_client: AsyncClient,
+    db: AsyncSession,
     published_contour: Contour,
     haymaking_activity_id: uuid.UUID,
+    frozen_on_date: date,
 ) -> None:
-    """I4 (final review): `POST /calculations` persisted `application_id`
-    verbatim — no FK (ruling 4 defers it to 3.9), no ownership check, and
-    `calculations` is append-only, so a row bound to ANY application id could
-    be inserted by any authenticated user and could never be deleted or
-    corrected. 3.10 builds an invoice from "the newest row for the
-    application", which makes a pre-seeded row a live under-billing vector the
-    moment `applications` exists.
+    """**Rewritten by stage 3.9a task 5, not deleted** — this is the same
+    concern the 3.7 version pinned, now asserting the real guard instead of the
+    accident that stood in for it.
 
-    Nothing in THIS stage can validate that id, and no legitimate caller has
-    one yet, so it is refused at the schema edge until 3.9 opens it."""
-    response = await applicant_client.post(
+    3.7 (finding I4) typed `CalculationIn.application_id` as `None` so that
+    `POST /calculations` — `get_current_user` and NO permission code — could
+    not persist an unvalidated application id into an append-only table. 3.9a
+    opened the field, because `applications.service.submit` needs it (ruling
+    8), and landed two refusals in `service.save_calculation` in the same
+    commit: the caller must OWN the application (or be staff entitled to review
+    it), and the application must not be APPROVED or beyond. The final review
+    added a third — the calculation must price the application's OWN contour.
+
+    Both are asserted end to end in
+    `tests/test_cross_module_journey.py::test_a_calculation_cannot_be_attached_
+    to_an_application_through_the_write_path`, which has the paid/approved
+    fixtures. What THIS module owns is the two ends of the range: an id that
+    names nothing at all is 404 and never an `IntegrityError`/500 from the FK
+    migration 0015 added, and an application the caller does own is saved and
+    bound.
+    """
+    body = {
+        "contour_id": str(published_contour.id),
+        "activity_type_id": str(haymaking_activity_id),
+        "period_from": "2026-06-01",
+        "period_to": "2026-09-30",
+        "quantity": "3",
+    }
+
+    unknown = await applicant_client.post(
+        "/api/v1/calculations", json={**body, "application_id": str(uuid.uuid4())}
+    )
+    assert unknown.status_code == 404, unknown.text
+    assert unknown.json()["error"]["code"] == "ERR-SYS-003"
+
+    # The caller's own DRAFT, ON THE CONTOUR BEING PRICED: allowed, and the
+    # binding is what is stored. The `contour_id` is not decoration — the final
+    # review's Important 2 added a third refusal beside the two above, so a
+    # calculation must also DESCRIBE the application it binds to, and a draft
+    # with no contour of its own is described by no calculation at all
+    # (`calculation_for_another_contour`, pinned in
+    # `test_calculation_application_guard.py`).
+    me = (await applicant_client.get("/api/v1/auth/me")).json()
+    application = Application(
+        applicant_id=uuid.UUID(me["applicant"]["id"]),
+        submitted_by_user_id=uuid.UUID(me["user"]["id"]),
+        on_behalf="self",
+        channel="portal",
+        status="DRAFT",
+        contour_id=published_contour.id,
+    )
+    db.add(application)
+    await db.flush()
+
+    mine = await applicant_client.post(
+        "/api/v1/calculations", json={**body, "application_id": str(application.id)}
+    )
+    assert mine.status_code == 201, mine.text
+    assert mine.json()["application_id"] == str(application.id)
+
+
+# The guard's own vocabulary check moved to
+# `test_calculation_application_guard.py` with the rename of
+# `_APPLICATION_READ_CODES` -> `_APPLICATION_RECALCULATE_CODES` (review round
+# 2, Critical 1): the name it asserted against documented the defect, and the
+# whole predicate — entitlement, zone, and the actor-dependent status split —
+# is covered in one place there rather than half here.
+
+
+async def test_a_bare_calculation_is_readable_by_its_creator_and_by_nobody_else(
+    applicant_client: AsyncClient,
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    frozen_on_date: date,
+) -> None:
+    """Ruling 11's second half. A calculation with NO `application_id` is a
+    bare price check: it names no application and belongs to no leshoz, so
+    there is no ownership and no zone to ask about, and the only claim anybody
+    has on it is having made it.
+
+    `gis_specialist_client` is the proof that this is not merely "any staffer
+    is refused by accident": it holds a real permission and a real zone — the
+    zone that owns `published_contour`, at that — and is still told 404,
+    because a staff code is a claim on an APPLICATION and this row has none.
+    Both routes, since ruling 11 narrows both.
+    """
+    created = await applicant_client.post(
         "/api/v1/calculations",
         json={
-            "application_id": str(uuid.uuid4()),
             "contour_id": str(published_contour.id),
             "activity_type_id": str(haymaking_activity_id),
             "period_from": "2026-06-01",
@@ -215,8 +292,17 @@ async def test_a_calculation_cannot_be_bound_to_an_application_yet(
             "quantity": "3",
         },
     )
-    assert response.status_code == 422, response.text
-    assert response.json()["error"]["code"] == "ERR-VAL-001"
+    assert created.status_code == 201, created.text
+    calculation_id = created.json()["id"]
+
+    assert (await applicant_client.get(f"/api/v1/calculations/{calculation_id}")).status_code == 200
+    refused = await gis_specialist_client.get(f"/api/v1/calculations/{calculation_id}")
+    assert refused.status_code == 404, refused.text
+    assert refused.json()["error"]["code"] == "ERR-SYS-003"
+
+    listed = await gis_specialist_client.get("/api/v1/calculations")
+    assert listed.status_code == 200, listed.text
+    assert calculation_id not in [item["id"] for item in listed.json()["items"]]
 
 
 async def test_a_calculation_with_no_application_id_is_still_saved(
