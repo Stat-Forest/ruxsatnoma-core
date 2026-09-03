@@ -37,13 +37,16 @@ from decimal import Decimal
 from app.modules.payments.models import LINE_MATCH_STATUSES, RECONCILIATION_RESULTS
 from app.modules.payments.statement_parser import ParsedLine
 
-# `INV-{YEAR(4)}-{NUMBER(6)}`, verified against `app.core.numbers.next_public_number`
+# `INV-{YEAR(4)}-{NUMBER(6+)}`, verified against `app.core.numbers.next_public_number`
 # (`f"{prefix}-{on_date.year}-{row.last_value:06d}"`) and
 # `app.modules.payments.service.INVOICE_NUMBER_PREFIX = "INV"` — the same shape
-# design/03 §"Public numbers" documents (`INV-2026-000123`). `\b` word boundaries
-# so the hit inside free text ("Оплата по счёту INV-2026-000042 от 01.09") does
-# not require the number to be the whole field.
-INVOICE_NUMBER_RE = re.compile(r"\bINV-\d{4}-\d{6}\b", re.IGNORECASE)
+# design/03 §"Public numbers" documents (`INV-2026-000123`). `:06d` is a MINIMUM
+# width, not a fixed one: the year's 1 000 000th invoice formats as 7 digits, so
+# the counter half is `\d{6,}`, not `\d{6}` — a fixed count would silently stop
+# matching once a leshoz's yearly volume crosses that boundary. `\b` word
+# boundaries so the hit inside free text ("Оплата по счёту INV-2026-000042 от
+# 01.09") does not require the number to be the whole field.
+INVOICE_NUMBER_RE = re.compile(r"\bINV-\d{4}-\d{6,}\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,25 +54,26 @@ class MatchOutcome:
     match_status: str
     result: str | None
     difference: Decimal | None
-    comment: str | None
+    comment: str | None = None
 
 
-def _outcome(
-    *, match_status: str, result: str | None, difference: Decimal | None, comment: str | None
-) -> MatchOutcome:
+def _outcome(*, match_status: str, result: str | None, difference: Decimal | None) -> MatchOutcome:
     """The one place `MatchOutcome` is built, so every value this module can
     return is checked against `models.LINE_MATCH_STATUSES` /
-    `models.RECONCILIATION_RESULTS` rather than retyped and trusted."""
-    assert match_status in LINE_MATCH_STATUSES, match_status  # fail-closed on a typo'd literal
-    assert result is None or result in RECONCILIATION_RESULTS, result
-    return MatchOutcome(
-        match_status=match_status, result=result, difference=difference, comment=comment
-    )
+    `models.RECONCILIATION_RESULTS` rather than retyped and trusted. Real
+    `ValueError`s, not `assert` — an `assert` is stripped under `python -O`,
+    which would turn a typo'd literal into a value silently written past the
+    CHECK constraint that would otherwise have caught it at insert time."""
+    if match_status not in LINE_MATCH_STATUSES:
+        raise ValueError(f"not a valid match_status: {match_status!r}")
+    if result is not None and result not in RECONCILIATION_RESULTS:
+        raise ValueError(f"not a valid reconciliation result: {result!r}")
+    return MatchOutcome(match_status=match_status, result=result, difference=difference)
 
 
 def extract_invoice_number(purpose: str | None) -> str | None:
-    """The first `INV-YYYY-NNNNNN` found inside `purpose`, upper-cased, or
-    `None` if the text names none."""
+    """The first `INV-YYYY-NNNNNN` (or longer) found inside `purpose`,
+    upper-cased, or `None` if the text names none."""
     if purpose is None:
         return None
     match = INVOICE_NUMBER_RE.search(purpose)
@@ -101,26 +105,19 @@ def classify(
        `difference`.
     """
     if is_provider_settlement:
-        return _outcome(
-            match_status="provider_settlement", result=None, difference=None, comment=None
-        )
+        return _outcome(match_status="provider_settlement", result=None, difference=None)
 
     if not invoice_found or invoice_amount is None:
-        return _outcome(
-            match_status="unknown_payment", result="unknown", difference=None, comment=None
-        )
+        return _outcome(match_status="unknown_payment", result="unknown", difference=None)
 
     if extract_invoice_number(line.purpose) is None:
-        return _outcome(
-            match_status="unknown_payment", result="unknown", difference=None, comment=None
-        )
+        return _outcome(match_status="unknown_payment", result="unknown", difference=None)
 
     if line.amount == invoice_amount:
-        return _outcome(match_status="matched", result="matched", difference=None, comment=None)
+        return _outcome(match_status="matched", result="matched", difference=None)
 
     return _outcome(
         match_status="discrepancy",
         result="discrepancy",
         difference=line.amount - invoice_amount,
-        comment=None,
     )

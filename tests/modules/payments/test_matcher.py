@@ -101,3 +101,17 @@ def test_a_provider_settlement_is_neither_matched_nor_an_exception(line_factory)
         is_provider_settlement=True,
     )
     assert (out.match_status, out.result) == ("provider_settlement", None)
+
+
+def test_a_seven_digit_invoice_number_still_matches(line_factory):
+    """`:06d` in `core/numbers.py` is a MINIMUM width, not a fixed one — the
+    year's 1 000 000th invoice is `INV-2026-1000000` (7 digits), and a `\\d{6}`
+    regex would silently stop matching it."""
+    assert extract_invoice_number("счёт INV-2026-1000000") == "INV-2026-1000000"
+    out = classify(
+        line_factory(purpose="счёт INV-2026-1000000", amount=Decimal("5.00")),
+        invoice_amount=Decimal("5.00"),
+        invoice_found=True,
+        is_provider_settlement=False,
+    )
+    assert (out.match_status, out.result) == ("matched", "matched")
