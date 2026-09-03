@@ -596,6 +596,230 @@ async def test_approve_writes_negative_allocations_and_the_ledger_sums_to_paid_m
     assert application.status == "PAID"
 
 
+async def test_approve_refuses_a_refund_on_a_never_paid_invoice(
+    db: AsyncSession,
+    payments_view_client,
+    head_client,
+    pending_invoice: Invoice,
+    rf01: uuid.UUID,
+):
+    """The finding's probe 1: `POST /refunds` on a `pending` (never-paid)
+    invoice still files (ruling 2 — filing is not the door;
+    `_hint_for_invoice` already answers `suggestion_reason ==
+    "no_in_force_invoice"`), and `submit-decision` accepts any complete
+    breakdown regardless of invoice status (ruling 4 — it stores figures,
+    it never touches money). The refusal has to land on `approve`, the ONLY
+    place `allocations` is written: `ERR-PAY-004` (409) — the invoice
+    itself cannot be acted on in its CURRENT status, the same code
+    `service.py`'s own state-conflict guards use — and no allocation is
+    written, so the ledger stays `0.00`."""
+    filed = await _request_refund(payments_view_client, pending_invoice.application_id, rf01)
+    assert filed["suggestion_reason"] == "no_in_force_invoice"
+    submitted = await payments_view_client.post(
+        f"{REFUNDS}/{filed['id']}/submit-decision",
+        json={
+            "final_amount": "50000.00",
+            "budget_amount": "10000.00",
+            "recipient_amount": "40000.00",
+            "other_amount": "0.00",
+        },
+    )
+    assert submitted.status_code == 200, submitted.text
+
+    response = await head_client.post(
+        f"{REFUNDS}/{filed['id']}/approve", json={"resolution": "returned"}
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ERR-PAY-004"
+
+    rows = (
+        (await db.execute(select(Allocation).where(Allocation.invoice_id == pending_invoice.id)))
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+
+async def test_approve_refuses_a_second_full_refund_on_the_same_invoice(
+    db: AsyncSession,
+    payments_view_client,
+    head_client,
+    refund_application: Application,
+    paid_refund_invoice: Invoice,
+    rf01: uuid.UUID,
+):
+    """The finding's probe 2: a first refund for the WHOLE invoice amount is
+    approved (the ledger goes from `+1000000.00` to `0.00`), then a second
+    refund is filed and approved on the same invoice. `invoice.status`
+    stays `paid` across a refund (ruling 6 — neither branch touches it), so
+    the status check from probe 1 does not fire here at all; it is the
+    BALANCE the ledger itself carries — `0.00` after the first refund —
+    that refuses the second. `ERR-VAL-001` (422), not `ERR-PAY-004`:
+    the invoice's status is not in conflict, its arithmetic is."""
+    first = await _request_refund(payments_view_client, refund_application.id, rf01)
+    first_submit = await payments_view_client.post(
+        f"{REFUNDS}/{first['id']}/submit-decision",
+        json={
+            "final_amount": "1000000.00",
+            "budget_amount": "500000.00",
+            "recipient_amount": "500000.00",
+            "other_amount": "0.00",
+        },
+    )
+    assert first_submit.status_code == 200, first_submit.text
+    first_approve = await head_client.post(
+        f"{REFUNDS}/{first['id']}/approve", json={"resolution": "returned"}
+    )
+    assert first_approve.status_code == 200, first_approve.text
+
+    second = await _request_refund(payments_view_client, refund_application.id, rf01)
+    second_submit = await payments_view_client.post(
+        f"{REFUNDS}/{second['id']}/submit-decision",
+        json={
+            "final_amount": "600000.00",
+            "budget_amount": "100000.00",
+            "recipient_amount": "500000.00",
+            "other_amount": "0.00",
+        },
+    )
+    assert second_submit.status_code == 200, second_submit.text
+
+    response = await head_client.post(
+        f"{REFUNDS}/{second['id']}/approve", json={"resolution": "returned"}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+    rows = (
+        (
+            await db.execute(
+                select(Allocation).where(Allocation.invoice_id == paid_refund_invoice.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total = sum((r.amount for r in rows), Decimal("0.00"))
+    assert total == Decimal("0.00")
+
+
+async def test_approve_refuses_a_refund_after_a_post_perform_reversal(
+    db: AsyncSession,
+    payments_view_client,
+    head_client,
+    refund_application: Application,
+    rf01: uuid.UUID,
+):
+    """The finding's probe 3: a Payme perform followed by a post-perform
+    cancel (`service.record_reversal`, ruling 15) brings the ledger back to
+    `0.00` WITHOUT moving `invoice.status` off `paid` (ruling 15's own
+    deliberate choice — the invoice's history stays intact). A refund filed
+    afterwards still gets a stale non-zero hint from `_hint_for_invoice`,
+    which reads `invoice.status`/`invoice.amount` alone and knows nothing
+    about the ledger — but `approve` refuses it anyway: the invoice IS
+    `paid` (`ERR-PAY-004` does not fire), yet the ledger sums to `0.00`, so
+    any positive `final_amount` fails the balance check (`ERR-VAL-001`)."""
+    await publish(
+        db, Event(name=APPLICATION_APPROVED, payload={"application_id": refund_application.id})
+    )
+    await db.commit()
+    invoice = await payments_service.invoice_for_application(db, refund_application.id)
+    assert invoice is not None
+    transaction = await _pay_in_full(db, invoice)
+    await db.commit()
+    await db.refresh(invoice)
+
+    await payments_service.record_reversal(db, invoice=invoice, transaction=transaction, reason=5)
+    await db.commit()
+    await db.refresh(invoice)
+    assert invoice.status == "paid"  # ruling 15: never rewritten
+
+    filed = await _request_refund(payments_view_client, refund_application.id, rf01)
+    submitted = await payments_view_client.post(
+        f"{REFUNDS}/{filed['id']}/submit-decision",
+        json={
+            "final_amount": "600000.00",
+            "budget_amount": "100000.00",
+            "recipient_amount": "500000.00",
+            "other_amount": "0.00",
+        },
+    )
+    assert submitted.status_code == 200, submitted.text
+
+    response = await head_client.post(
+        f"{REFUNDS}/{filed['id']}/approve", json={"resolution": "returned"}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+    rows = (
+        (await db.execute(select(Allocation).where(Allocation.invoice_id == invoice.id)))
+        .scalars()
+        .all()
+    )
+    total = sum((r.amount for r in rows), Decimal("0.00"))
+    assert total == Decimal("0.00")
+
+
+async def test_two_partial_refunds_within_the_remaining_balance_both_succeed(
+    db: AsyncSession,
+    payments_view_client,
+    head_client,
+    refund_application: Application,
+    paid_refund_invoice: Invoice,
+    rf01: uuid.UUID,
+):
+    """The balance guard is not "forbid refunds" wearing a disguise: two
+    PARTIAL refunds against the same 1,000,000.00 invoice both succeed as
+    long as each stays within what the ledger still carries —
+    400,000.00 first, leaving 600,000.00, then a SECOND refund for exactly
+    that remaining 600,000.00 (`final_amount == balance`, the boundary —
+    pinned here rather than as a case that is merely "under" the limit)."""
+    first = await _request_refund(payments_view_client, refund_application.id, rf01)
+    first_submit = await payments_view_client.post(
+        f"{REFUNDS}/{first['id']}/submit-decision",
+        json={
+            "final_amount": "400000.00",
+            "budget_amount": "100000.00",
+            "recipient_amount": "300000.00",
+            "other_amount": "0.00",
+        },
+    )
+    assert first_submit.status_code == 200, first_submit.text
+    first_approve = await head_client.post(
+        f"{REFUNDS}/{first['id']}/approve", json={"resolution": "returned"}
+    )
+    assert first_approve.status_code == 200, first_approve.text
+
+    second = await _request_refund(payments_view_client, refund_application.id, rf01)
+    second_submit = await payments_view_client.post(
+        f"{REFUNDS}/{second['id']}/submit-decision",
+        json={
+            "final_amount": "600000.00",
+            "budget_amount": "100000.00",
+            "recipient_amount": "500000.00",
+            "other_amount": "0.00",
+        },
+    )
+    assert second_submit.status_code == 200, second_submit.text
+    second_approve = await head_client.post(
+        f"{REFUNDS}/{second['id']}/approve", json={"resolution": "returned"}
+    )
+    assert second_approve.status_code == 200, second_approve.text
+
+    rows = (
+        (
+            await db.execute(
+                select(Allocation).where(Allocation.invoice_id == paid_refund_invoice.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total = sum((r.amount for r in rows), Decimal("0.00"))
+    assert total == Decimal("0.00")
+
+
 async def test_approve_rejected_writes_no_allocations(
     db: AsyncSession,
     payments_view_client,

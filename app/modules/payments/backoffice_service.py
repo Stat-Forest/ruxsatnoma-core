@@ -837,17 +837,37 @@ async def approve_refund(
        future write path that reaches `in_review` some other way cannot
        skip straight past this module's one arithmetic guard into the
        database CHECK;
-    2. resolves the recipient's account the SAME way `service.confirm_payment`
+    2. **re-reads the invoice and refuses `ERR-PAY-004` (409) unless it is
+       CURRENTLY `paid`** — filing (`request_refund`) never checks this
+       (`tz/08` lets the applicant file against an unpaid invoice; the
+       accountant's job is to decide, not the door), so an invoice can file
+       clean and drift to `pending`/`cancelled` — or simply have started
+       there — before `approve` ever runs. Without this, PR #31's own
+       defect class recurs one stage later: `_hint_for_invoice` already
+       knows `invoice.status != "paid"` at filing time and that knowledge
+       used to die there, letting a never-paid invoice's ledger go negative;
+    3. **refuses `ERR-VAL-001` (422) when `row.final_amount` exceeds the
+       invoice's CURRENT ledger balance** — `sum(amount)` over
+       `payments_service.allocations_for(db, row.invoice_id)`, the same
+       reader `service.py` itself exposes for exactly this (no second way to
+       total a ledger). This is the general form of the same guard: a full
+       refund already approved, or a post-perform reversal that brought the
+       ledger back to `0.00` (`service.record_reversal`, ruling 15 —
+       deliberately does not move `invoice.status` off `paid`), both leave a
+       `paid` invoice with nothing left to refund, and the balance is what
+       catches both, not the status. A PARTIAL refund still succeeds: it
+       only checks `final_amount <= balance`, never `balance == invoice.amount`;
+    4. resolves the recipient's account the SAME way `service.confirm_payment`
        does (`payments_service.resolve_recipient_account`) — the leshoz's
        own bank account, `None` when it has none on file. The budget half's
        account is `None` unconditionally (ruling 5, `tz/12` #15 — the state
        budget's account number is stored nowhere in this system) and so is
        the `other` bucket's, which names no account of its own either;
-    3. writes ONE negative `entry_type="refund"` allocation per NON-ZERO
+    5. writes ONE negative `entry_type="refund"` allocation per NON-ZERO
        component, each carrying `refund_id` — a `0.00` component writes no
        row, the same "nothing from this source" reading
        `refunds.breakdown_is_complete` already gives it;
-    4. moves the refund to `returned`.
+    6. moves the refund to `returned`.
 
     `resolution="rejected"` writes NOTHING to `allocations` — no money ever
     moved, so there is nothing to reverse — and moves the refund straight to
@@ -875,6 +895,20 @@ async def approve_refund(
             row.final_amount, row.budget_amount, row.recipient_amount, row.other_amount
         ):
             raise err("ERR-VAL-001", details={"reason": "breakdown_incomplete"})
+
+        invoice_now = await repo.get_invoice(db, row.invoice_id)
+        if invoice_now is None or invoice_now.status != "paid":
+            raise err(
+                "ERR-PAY-004",
+                details={"status": invoice_now.status if invoice_now is not None else None},
+            )
+        ledger = await payments_service.allocations_for(db, row.invoice_id)
+        balance = sum((entry.amount for entry in ledger), Decimal("0.00"))
+        if row.final_amount > balance:
+            raise err(
+                "ERR-VAL-001",
+                details={"reason": "refund_exceeds_balance", "balance": str(balance)},
+            )
 
         application = await applications_service.get(db, row.application_id)
         recipient_account = await payments_service.resolve_recipient_account(
