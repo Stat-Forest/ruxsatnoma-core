@@ -558,7 +558,7 @@ async def create_pay_intent(
     return intent, payment_url
 
 
-async def _resolve_recipient_account(
+async def resolve_recipient_account(
     db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
 ) -> str | None:
     """Ruling H: the leshoz's own bank account for the 50/50 recipient half —
@@ -576,7 +576,17 @@ async def _resolve_recipient_account(
     `app/` outside `applications` itself and `models_registry.py` before
     this fix. `confirm_payment` (the caller) already holds the row via
     `applications.service.get`, itself the sanctioned cross-module surface —
-    only the TYPE import for this helper's own signature was the violation."""
+    only the TYPE import for this helper's own signature was the violation.
+
+    Named WITHOUT a leading underscore since 3.10b task 9: it gained a
+    SECOND caller in that stage, `backoffice_service.approve_refund`, which
+    resolves the very same account for a refund's recipient-side entry — a
+    module-internal helper with two callers across two files of the SAME
+    module is exactly what the rest of this file (`invoice_for_application`,
+    `allocations_for`, ...) already spells with no underscore; only a
+    helper that stays single-file-private keeps one (`_holds_payments_view`,
+    `_may_act_on_invoices_of` right below, still called from nowhere but
+    this file)."""
     org_id: uuid.UUID | None
     if contour_id is not None:
         org_id = await gis_service.contour_organization(db, contour_id)
@@ -638,7 +648,7 @@ async def confirm_payment(
         # by payme_router.py's generic handler and answered -32400.
         raise err("ERR-SYS-003", details={"invoice": str(invoice.id)})
 
-    recipient_account = await _resolve_recipient_account(
+    recipient_account = await resolve_recipient_account(
         db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
     )
     entries = ledger.entries_for(

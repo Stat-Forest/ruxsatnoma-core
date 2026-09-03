@@ -21,6 +21,7 @@ from app.modules.payments.models import (
     PaymentIntent,
     ProviderTransaction,
     Reconciliation,
+    Refund,
 )
 
 # What "in force" means for an invoice (mirrors `uq_invoices_one_in_force`,
@@ -484,3 +485,49 @@ async def get_pending_manual_confirmation(
             .limit(1)
         )
     ).first()
+
+
+# --- 3.10b task 9: refunds -----------------------------------------------
+
+
+async def add_refund(db: AsyncSession, refund: Refund) -> None:
+    db.add(refund)
+    await db.flush()
+
+
+async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
+    return await db.get(Refund, refund_id)
+
+
+async def get_refund_for_update(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
+    """The locking read for `submit_refund_decision`/`approve_refund` —
+    mirrors `get_manual_confirmation_for_update`'s own reasoning: two
+    accountants (or an accountant and a rahbar) racing the same refund must
+    serialize, or both could read a stale status and both go on to write a
+    decision that contradicts the other's."""
+    return await db.get(Refund, refund_id, with_for_update=True, populate_existing=True)
+
+
+async def list_refunds(
+    db: AsyncSession,
+    *,
+    application_id: uuid.UUID | None,
+    status: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Refund], int]:
+    """`GET /refunds` — every refund, newest first, optionally narrowed to
+    one application or one status. Both filters are optional and independent
+    (mirrors `list_reconciliations`'s own shape, one filter wider)."""
+    stmt = select(Refund)
+    if application_id is not None:
+        stmt = stmt.where(Refund.application_id == application_id)
+    if status is not None:
+        stmt = stmt.where(Refund.status == status)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Refund.requested_at.desc(), Refund.id.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total

@@ -13,11 +13,18 @@ docstring says why (`tz/05` invariant 3: only a provider confirmation or the
 maker-checker path pays an invoice). Closing a row here records that an
 accountant looked at a discrepancy and explains it; it does not resolve it
 financially.
+
+Task 9 adds the refunds half at the bottom of this file: `request_refund`,
+`submit_refund_decision`, `approve_refund`, `list_refunds` — a manual
+process (`tz/08`, decision #12) that DOES write `allocations`, the one
+exception to the paragraph above, and only on `approve_refund`, never on
+`request_refund`/`submit_refund_decision` (see that function's own
+docstring for why the negative entries land there and not earlier).
 """
 
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
 
@@ -25,22 +32,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.core.models import MediaFile
+from app.core.time import add_working_days, business_today
+from app.modules.admin import repo as admin_repo
 from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
+from app.modules.auth import service as auth_service
+from app.modules.auth.deps import SUPERUSER_ROLE
+from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events as payment_events
-from app.modules.payments import repo
+from app.modules.payments import refunds, repo
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import (
+    ALLOCATION_ENTRY_TYPES,
+    ALLOCATION_TARGETS,
     INVOICE_STATUSES,
     MANUAL_CONFIRMATION_STATUSES,
     PAYMENT_PROVIDERS,
     RECONCILIATION_RESULTS,
     RECONCILIATION_STATUSES,
+    REFUND_STATUSES,
+    Allocation,
+    Invoice,
     ManualPaymentConfirmation,
     ProviderTransaction,
     Reconciliation,
+    Refund,
 )
+from app.modules.payments.permissions import PAYMENTS_MANAGE
 
 RESOLVE_ACTION = "reconciliation.resolve"
 
@@ -518,3 +538,419 @@ async def _confirm_and_pay(
             object_type="invoice",
             object_id=invoice.id,
         )
+
+
+# --- Task 9: refunds -----------------------------------------------------
+#
+# `tz/08`, decision #12: a refund is a MANUAL process. The money moves
+# outside this system — there is no banking refund integration, and this
+# stage does not build one. What lives here is the paper trail: the
+# grounds, the formula's HINT, the accountant's actual figure and its
+# breakdown by source, the 20-working-day control deadline, and the
+# negative `allocations` entries that make the ledger agree with what
+# actually went back.
+#
+# **The negative entries are written on APPROVE, not on submit-decision**
+# (ruling 4). `submit_refund_decision` (accountant, `payments.manage`)
+# only STORES the accountant's figures and moves `requested` -> `in_review`;
+# `approve_refund` (rahbar, `payments.confirm`) is the one function in this
+# module that touches `allocations` for a refund, and only when the
+# resolution is `returned`.
+#
+# **A refund never moves the invoice or the application** (ruling 6,
+# `tz/05`, `design/02`: "the invoice status is not rewritten, the history
+# stays intact"). There is no transition for it in either state machine,
+# and this module invents none — `request_refund`/`submit_refund_decision`/
+# `approve_refund` read `applications.service.get` for the OWNERSHIP check
+# and the recipient-account lookup only, never `set_status`.
+
+REFUND_REQUEST_ACTION = "refund.request"
+REFUND_SUBMIT_DECISION_ACTION = "refund.submit_decision"
+REFUND_APPROVE_ACTION = "refund.approve"
+
+_STATUS_REQUESTED, _STATUS_IN_REVIEW, _STATUS_RETURNED, _STATUS_REJECTED = REFUND_STATUSES
+_TARGET_RECIPIENT, _TARGET_BUDGET, _TARGET_OTHER = ALLOCATION_TARGETS
+# Unpacked rather than retyped (module docstring's own vocabulary rule,
+# already followed above for `RECONCILIATION_STATUSES`/`MANUAL_CONFIRMATION_
+# STATUSES`): `ALLOCATION_ENTRY_TYPES[1]` is `"refund"`, the third value
+# this module's own writes use alongside `service.py`'s `"payment"`/
+# `"correction"`.
+_, ALLOCATION_ENTRY_REFUND, _ = ALLOCATION_ENTRY_TYPES
+
+# The refund resolution `approve_refund` accepts, spelled once. Not derived
+# from `REFUND_STATUSES` (unlike the four constants above): the wire value
+# is a VERB two of those four statuses share the name of, and deriving it
+# from the tuple's own order would silently break the day `REFUND_STATUSES`
+# is ever reordered.
+REFUND_RESOLUTIONS = (_STATUS_RETURNED, _STATUS_REJECTED)
+
+
+async def _may_request_refund_for(db: AsyncSession, applicant_id: uuid.UUID, *, actor: Any) -> bool:
+    """`payments.manage` (the accountant) files for anyone; otherwise the
+    actor must own the SAME applicant identity the application belongs to,
+    or hold an effective representation of it — the exact ownership rule
+    `payments.service._may_act_on_invoices_of` gives `GET /invoices/{id}`,
+    reimplemented here rather than imported (that function is `service.py`'s
+    own file-private helper, not part of this module's cross-file surface;
+    see the lesson on module-private names)."""
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    if PAYMENTS_MANAGE in await auth_repo.permission_codes(db, actor):
+        return True
+    own_applicant = await auth_service.get_own_applicant(db, actor.id)
+    if own_applicant is not None and own_applicant.id == applicant_id:
+        return True
+    return await auth_service.has_effective_representation_of(
+        db, user_id=actor.id, applicant_id=applicant_id
+    )
+
+
+async def _assert_refund_basis_active(db: AsyncSession, basis_item_id: uuid.UUID) -> None:
+    """An EXISTENCE check, not a validity check (the same split
+    `_assert_doc_active` draws above): confirms `basis_item_id` names a
+    `classifier_items` row that is not archived, nothing about whether it
+    actually explains this refund."""
+    item = await admin_repo.get_classifier_item(db, basis_item_id)
+    if item is None or item.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "basis_item_not_active"})
+
+
+async def _hint_for_invoice(db: AsyncSession, invoice: Invoice) -> refunds.RefundHint:
+    """`request_refund`'s own chain (ruling 1): `invoice.calculation_id` ->
+    `norms.service.get_calculation` -> `input_snapshot["request"]
+    ["period_from"/"period_to"]` -> `refunds.hint`. **Never
+    `applications.service.current_calculation`**, which answers the NEWEST
+    calculation — the cross-module divergence PR #31 caught printing
+    9 999 999,00 on a permit against 2 060 000,00 paid. This reads the
+    calculation the INVOICE itself froze, and nothing else.
+
+    A hint is never an error (ruling 2) — every branch below returns a
+    `RefundHint` instead of raising, and `request_refund` files the refund
+    regardless of which one comes back:
+
+    - `invoice.status != "paid"` — covers BOTH "no in-force invoice" (the
+      newest invoice for this application is `cancelled`/`expired`) and an
+      in-force-but-still-`pending` one: neither has a PAID amount to price
+      a refund's unused share against, so both read the same reason;
+    - `invoice.calculation_id IS NULL`;
+    - `input_snapshot` has no `"request"` key, or it is not an object;
+    - `period_from`/`period_to` are missing or fail `date.fromisoformat`;
+    - the parsed period is reversed or zero-length (`period_to < period_from`)
+      — a malformed snapshot, never fed to `refunds.hint`, whose own
+      precondition is a positive-length period.
+
+    Everything else — including a period that has already run its course,
+    which prices at a real `0.00` — goes to `refunds.hint` itself."""
+    if invoice.status != "paid":
+        return refunds.RefundHint(None, "no_in_force_invoice")
+    if invoice.calculation_id is None:
+        return refunds.RefundHint(None, "calculation_missing")
+    calculation = await norms_service.get_calculation(db, invoice.calculation_id)
+    snapshot = calculation.input_snapshot
+    request = snapshot.get("request") if isinstance(snapshot, dict) else None
+    if not isinstance(request, dict):
+        return refunds.RefundHint(None, "snapshot_missing_request")
+    raw_from = request.get("period_from")
+    raw_to = request.get("period_to")
+    if not isinstance(raw_from, str) or not isinstance(raw_to, str):
+        return refunds.RefundHint(None, "period_unparseable")
+    try:
+        period_from = date.fromisoformat(raw_from)
+        period_to = date.fromisoformat(raw_to)
+    except ValueError:
+        return refunds.RefundHint(None, "period_unparseable")
+    if period_to < period_from:
+        return refunds.RefundHint(None, "period_zero_length")
+    amount = refunds.hint(
+        paid=invoice.amount, period_from=period_from, period_to=period_to, on_date=business_today()
+    )
+    return refunds.RefundHint(amount, None)
+
+
+async def request_refund(
+    db: AsyncSession,
+    *,
+    application_id: uuid.UUID,
+    basis_item_id: uuid.UUID,
+    comment: str | None,
+    actor: Any,
+) -> Refund:
+    """`POST /refunds` — an applicant appealing their OWN application, or an
+    accountant (`payments.manage`) filing on anyone's behalf (ruling 7).
+
+    `application_id` resolves to `payments.service.invoice_for_application`'s
+    in-force invoice first; when there is none (the newest invoice, if any,
+    is `cancelled`/`expired`), the most recent invoice of ANY status is used
+    instead — `refunds.invoice_id` is a NOT NULL FK, so a refund still needs
+    an invoice to point at even when there is nothing to price a hint
+    against. Only when the application has NO invoice at all (never
+    approved, or approved but never invoiced) is this a hard failure
+    (`ERR-SYS-003`) rather than a degenerate hint — there is nothing to
+    create the row against.
+
+    `due_at` is `add_working_days(business_today(), 20)` — `tz/08`'s
+    20-working-day control deadline (RI-07)."""
+    application = await applications_service.get(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if not await _may_request_refund_for(db, application.applicant_id, actor=actor):
+        # Same oracle reasoning as `get_invoice_for_actor`: a stranger gets
+        # the same 404 a missing application would, never a 403 that would
+        # confirm the id is real.
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_refund_basis_active(db, basis_item_id)
+
+    invoice = await payments_service.invoice_for_application(db, application_id)
+    if invoice is None:
+        candidates, _total = await repo.list_invoices_by_application(
+            db, application_id, limit=1, offset=0
+        )
+        invoice = candidates[0] if candidates else None
+    if invoice is None:
+        raise err(
+            "ERR-SYS-003", details={"reason": "no_invoice", "application": str(application_id)}
+        )
+
+    hint = await _hint_for_invoice(db, invoice)
+
+    row = Refund(
+        application_id=application_id,
+        invoice_id=invoice.id,
+        basis_item_id=basis_item_id,
+        suggested_amount=hint.amount,
+        suggestion_reason=hint.reason,
+        status=_STATUS_REQUESTED,
+        requested_by=actor.id,
+        requested_at=datetime.now(UTC),
+        due_at=add_working_days(business_today(), 20),
+        comment=comment,
+    )
+    await repo.add_refund(db, row)
+    await audit.log(
+        db,
+        action=REFUND_REQUEST_ACTION,
+        user_id=actor.id,
+        object_type="refund",
+        object_id=row.id,
+        new_value={
+            "application_id": str(application_id),
+            "invoice_id": str(invoice.id),
+            "basis_item_id": str(basis_item_id),
+            "suggested_amount": str(hint.amount) if hint.amount is not None else None,
+            "suggestion_reason": hint.reason,
+        },
+    )
+    return row
+
+
+async def submit_refund_decision(
+    db: AsyncSession,
+    refund_id: uuid.UUID,
+    *,
+    final_amount: Decimal,
+    budget_amount: Decimal,
+    recipient_amount: Decimal,
+    other_amount: Decimal,
+    comment: str | None,
+    actor: Any,
+) -> Refund:
+    """`POST /refunds/{id}/submit-decision` — the accountant's own half
+    (ruling 4): STORE the figures, move `requested` -> `in_review`, touch no
+    money. `approve_refund` is what writes the ledger.
+
+    The breakdown is checked against `refunds.breakdown_is_complete` BEFORE
+    the row is written — `ERR-VAL-001`, not an IntegrityError 500 — even
+    though `returned_needs_complete_breakdown` itself only fires once
+    `approve_refund` moves the row to `returned`, not at this status: a
+    wrong number caught here never reaches the rahbar's screen at all."""
+    row = await repo.get_refund_for_update(db, refund_id)
+    if row is None:
+        raise err("ERR-SYS-003", details={"refund": str(refund_id)})
+    if row.status != _STATUS_REQUESTED:
+        raise err("ERR-PAY-006", details={"status": row.status})
+    if not refunds.breakdown_is_complete(
+        final_amount, budget_amount, recipient_amount, other_amount
+    ):
+        raise err("ERR-VAL-001", details={"reason": "breakdown_incomplete"})
+
+    old_value = {"status": row.status}
+    row.final_amount = final_amount
+    row.budget_amount = budget_amount
+    row.recipient_amount = recipient_amount
+    row.other_amount = other_amount
+    row.status = _STATUS_IN_REVIEW
+    if comment:
+        row.comment = comment
+    await db.flush()
+    await audit.log(
+        db,
+        action=REFUND_SUBMIT_DECISION_ACTION,
+        user_id=actor.id,
+        object_type="refund",
+        object_id=row.id,
+        old_value=old_value,
+        new_value={
+            "status": row.status,
+            "final_amount": str(final_amount),
+            "budget_amount": str(budget_amount),
+            "recipient_amount": str(recipient_amount),
+            "other_amount": str(other_amount),
+        },
+    )
+    return row
+
+
+class ApprovedRefund(NamedTuple):
+    """What `approve_refund` answers with — the refund row, and the
+    `allocations` it just wrote (empty on `rejected`, since nothing moved).
+    The router cannot compute the second half itself (router -> service ->
+    repo), the same reason `FiledConfirmation` above carries
+    `amount_matches_invoice` alongside its own row."""
+
+    refund: Refund
+    allocations: list[Allocation]
+
+
+async def approve_refund(
+    db: AsyncSession,
+    refund_id: uuid.UUID,
+    *,
+    resolution: str,
+    comment: str | None,
+    actor: Any,
+) -> ApprovedRefund:
+    """`POST /refunds/{id}/approve` — the rahbar's (`payments.confirm`) own
+    half, and the only place a refund ever touches `allocations` (ruling 4).
+
+    `resolution="returned"`:
+
+    1. re-validates `refunds.breakdown_is_complete` against the row's OWN
+       stored figures — defensive, not decorative: `submit_refund_decision`
+       already checked the same arithmetic, but re-checking here means a
+       future write path that reaches `in_review` some other way cannot
+       skip straight past this module's one arithmetic guard into the
+       database CHECK;
+    2. resolves the recipient's account the SAME way `service.confirm_payment`
+       does (`payments_service.resolve_recipient_account`) — the leshoz's
+       own bank account, `None` when it has none on file. The budget half's
+       account is `None` unconditionally (ruling 5, `tz/12` #15 — the state
+       budget's account number is stored nowhere in this system) and so is
+       the `other` bucket's, which names no account of its own either;
+    3. writes ONE negative `entry_type="refund"` allocation per NON-ZERO
+       component, each carrying `refund_id` — a `0.00` component writes no
+       row, the same "nothing from this source" reading
+       `refunds.breakdown_is_complete` already gives it;
+    4. moves the refund to `returned`.
+
+    `resolution="rejected"` writes NOTHING to `allocations` — no money ever
+    moved, so there is nothing to reverse — and moves the refund straight to
+    `rejected`.
+
+    **Neither branch touches the invoice or the application** (ruling 6):
+    `design/02` — "the invoice status is not rewritten, the history stays
+    intact" — and `tz/05` gives neither state machine a transition for a
+    refund at all.
+
+    Notifies the applicant on `refund.decided` either way (migration `0022`
+    seeds it for `inapp`/`sms`) — an accountant filing on someone else's
+    behalf does not change who the money (or its absence) belongs to."""
+    row = await repo.get_refund_for_update(db, refund_id)
+    if row is None:
+        raise err("ERR-SYS-003", details={"refund": str(refund_id)})
+    if row.status != _STATUS_IN_REVIEW:
+        raise err("ERR-PAY-006", details={"status": row.status})
+
+    old_value = {"status": row.status}
+    written: list[Allocation] = []
+
+    if resolution == _STATUS_RETURNED:
+        if row.final_amount is None or not refunds.breakdown_is_complete(
+            row.final_amount, row.budget_amount, row.recipient_amount, row.other_amount
+        ):
+            raise err("ERR-VAL-001", details={"reason": "breakdown_incomplete"})
+
+        application = await applications_service.get(db, row.application_id)
+        recipient_account = await payments_service.resolve_recipient_account(
+            db,
+            contour_id=application.contour_id if application else None,
+            assigned_org_id=application.assigned_org_id if application else None,
+        )
+        components = (
+            (_TARGET_RECIPIENT, recipient_account, row.recipient_amount),
+            (_TARGET_BUDGET, None, row.budget_amount),
+            (_TARGET_OTHER, None, row.other_amount),
+        )
+        for target, account, amount in components:
+            if not amount:
+                continue
+            written.append(
+                Allocation(
+                    invoice_id=row.invoice_id,
+                    refund_id=row.id,
+                    entry_type=ALLOCATION_ENTRY_REFUND,
+                    target=target,
+                    account=account,
+                    amount=-amount,
+                    note=f"refund {row.id} approved ({resolution})",
+                )
+            )
+        if written:
+            await repo.add_allocations(db, written)
+        row.status = _STATUS_RETURNED
+    else:
+        row.status = _STATUS_REJECTED
+
+    row.decided_by = actor.id
+    row.decided_at = datetime.now(UTC)
+    if comment:
+        row.comment = comment
+    await db.flush()
+
+    await audit.log(
+        db,
+        action=REFUND_APPROVE_ACTION,
+        user_id=actor.id,
+        object_type="refund",
+        object_id=row.id,
+        old_value=old_value,
+        new_value={
+            "status": row.status,
+            "allocations": [str(a.id) for a in written],
+        },
+        basis=comment,
+    )
+
+    application = await applications_service.get(db, row.application_id)
+    if application is not None:
+        await notifications_service.notify(
+            db,
+            event_code=payment_events.REFUND_DECIDED,
+            recipient_user_id=application.submitted_by_user_id,
+            params={
+                "application_number": application.number or str(application.id),
+                "status": row.status,
+                "amount": row.final_amount if row.final_amount is not None else Decimal("0.00"),
+            },
+            object_type="refund",
+            object_id=row.id,
+        )
+
+    return ApprovedRefund(refund=row, allocations=written)
+
+
+async def list_refunds(
+    db: AsyncSession,
+    *,
+    application_id: uuid.UUID | None,
+    status: str | None,
+    limit: int,
+    offset: int,
+    actor: Any,
+) -> tuple[list[Refund], int]:
+    """`GET /refunds` — `payments.view` sees every refund (optionally
+    narrowed by `application_id`/`status`); `actor` is accepted for symmetry
+    with `list_reconciliations` and is not used to filter further — the
+    route's own `PAYMENTS_VIEW` gate already decides who may call this."""
+    return await repo.list_refunds(
+        db, application_id=application_id, status=status, limit=limit, offset=offset
+    )

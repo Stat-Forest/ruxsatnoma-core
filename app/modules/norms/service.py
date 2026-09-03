@@ -877,14 +877,19 @@ async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calcul
 # --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
 # 3.10, permits 3.11) ---------------------------------------------------------
 #
-# Eight entry points, and nothing else: `preview` and `save_calculation`
+# Nine entry points, and nothing else: `preview` and `save_calculation`
 # above (Task 7), `LOAD_PROVIDERS` and `committed_load_sb` above (Task 4,
 # ruling 12 — the seam and the reader over it are two separate things a
-# caller touches, not one), `effective_norm`/`run_checks`/`latest_calculation`
-# right below, and `calculator.from_input_snapshot` (I9) — VERIFICATION only,
-# rebuilding the request/snapshot pair to confirm a stored row still
-# recomputes to the same numbers, never for pricing a new one. A level-4+
-# caller must NEVER:
+# caller touches, not one), `get_calculation` right above (payments 3.10b,
+# task 9: `refunds.request_refund` reads `input_snapshot["request"]
+# ["period_from"/"period_to"]` off the calculation an invoice already froze
+# via `invoice.calculation_id` — never a fresh lookup by application, which
+# would be `latest_calculation`'s job and would silently reprice a refund
+# hint against a calculation that was never billed), `effective_norm`/
+# `run_checks`/`latest_calculation` right below, and
+# `calculator.from_input_snapshot` (I9) — VERIFICATION only, rebuilding the
+# request/snapshot pair to confirm a stored row still recomputes to the same
+# numbers, never for pricing a new one. A level-4+ caller must NEVER:
 #   - import `norms.repo` (or any other private module here) directly — every
 #     fact it could read that way is already reachable through one of the
 #     eight, the same reason a level-3 module reaches `gis` only through

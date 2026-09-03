@@ -8,6 +8,16 @@ Money is carried on the wire as a STRING, never a JSON float — the same
 fixed-scale-NUMERIC rule `schemas.InvoiceOut.amount` follows and for the same
 reason: 2 060 000.00 has no exact binary representation and a tiyin lost on the
 wire is a tiyin lost in a financial ledger.
+
+Task 9 adds the refund schemas below. They are the one exception to "read by
+exactly one audience": `RefundOut` is also what an applicant's own
+`POST /refunds` (mounted at the ROOT `/refunds` prefix by `refunds_router.py`,
+design/03 — never under `/payments`) answers with, since ruling 7 lets an
+applicant file for their own application. `RefundOut.budget_account` is
+`None` on every response before `approve` decides `returned`, and stays
+`None` afterwards too when the resolution is `rejected` — see
+`backoffice_service.approve_refund`'s own docstring for why the field is
+present rather than omitted (`tz/12` #15, ruling 5).
 """
 
 import uuid
@@ -203,3 +213,127 @@ class FiledManualConfirmationOut(ManualConfirmationOut):
     `reconciliations` row for the difference."""
 
     amount_matches_invoice: bool
+
+
+# --- Task 9: refunds -----------------------------------------------------
+
+
+class RefundRequestIn(BaseModel):
+    """`POST /refunds` (design/03) — an applicant appealing their own
+    application, or an accountant filing on anyone's behalf (the ownership
+    rule lives in `backoffice_service._may_request_refund_for`, never here).
+
+    `basis_item_id` names one of the four seeded `refund_reasons` items
+    (`RF-01`..`RF-04`, migration `0022`) — checked as an ACTIVE classifier
+    item by the service, not by this schema, the same existence-not-validity
+    split `backoffice_service._assert_doc_active` already draws for a
+    document id."""
+
+    application_id: uuid.UUID
+    basis_item_id: uuid.UUID
+    comment: str | None = None
+
+
+class RefundSubmitDecisionIn(BaseModel):
+    """`POST /refunds/{id}/submit-decision` — the accountant's (`payments.
+    manage`) own half (ruling 4): the three-way breakdown and the amount it
+    is meant to sum to. Checked against `refunds.breakdown_is_complete` in
+    code BEFORE the insert, so a mismatch answers `ERR-VAL-001` rather than
+    an IntegrityError 500 from `returned_needs_complete_breakdown` — even
+    though that CHECK only fires once `approve` moves the row to `returned`,
+    catching the arithmetic here is what keeps a wrong number from ever
+    reaching the rahbar's screen at all.
+
+    Each component defaults to `0.00`, not `None`: an accountant who leaves
+    a source untouched means "nothing from here", the same reading
+    `refunds.breakdown_is_complete`'s own `coalesce`-style treatment of
+    `None` already gives it — a bare `Field(ge=0, ...)` on each keeps a
+    negative component (which `returned_needs_complete_breakdown` does not
+    itself forbid) out of a financial ledger at the edge, before it becomes
+    a negative-of-a-negative allocation."""
+
+    final_amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    budget_amount: Decimal = Field(default=Decimal("0.00"), ge=0, max_digits=18, decimal_places=2)
+    recipient_amount: Decimal = Field(
+        default=Decimal("0.00"), ge=0, max_digits=18, decimal_places=2
+    )
+    other_amount: Decimal = Field(default=Decimal("0.00"), ge=0, max_digits=18, decimal_places=2)
+    comment: str | None = None
+
+
+class RefundApproveIn(BaseModel):
+    """`POST /refunds/{id}/approve` — the rahbar's (`payments.confirm`) own
+    half: `resolution="returned"` validates the breakdown again (defensive —
+    see `approve_refund`'s own docstring), writes the negative ledger
+    entries and moves the refund to `returned`; `resolution="rejected"`
+    moves it to `rejected` and writes nothing to `allocations` — no money
+    ever moved, so there is nothing to reverse (design/03: "approval →
+    status returned/rejected")."""
+
+    resolution: str = Field(pattern="^(returned|rejected)$")
+    comment: str | None = None
+
+
+class RefundAllocationOut(BaseModel):
+    """One ledger row `approve_refund` just wrote — what makes ruling 5's
+    NULL visible on the wire rather than only in the database (see
+    `RefundOut.budget_account`'s own docstring)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    target: str
+    account: str | None
+    amount: Decimal
+
+    @field_serializer("amount")
+    def _amount(self, value: Decimal) -> str:
+        return str(value)
+
+
+class RefundOut(BaseModel):
+    """One `refunds` row. `suggested_amount`/`suggestion_reason` are the
+    formula's hint (`backoffice_service.request_refund`'s own docstring
+    lists every degenerate case that leaves `suggested_amount` `None`); a
+    hint is never an error, so `POST /refunds` always answers 201 with one
+    of the two set.
+
+    `budget_account`/`recipient_account` are NOT columns on `refunds` — they
+    are filled in only by `POST /refunds/{id}/approve`'s own response, from
+    the allocations that call just wrote, and stay `None` on every other
+    response (nothing has been decided yet to have an account at all).
+    **`budget_account` is `None` by design, not by omission** (`tz/12` #15
+    — the state budget's account number is stored nowhere in this system):
+    the field is declared here, with an explicit default, specifically so an
+    accountant reading this response sees a `null` the API chose to report
+    rather than a key that silently is not there. `allocations` carries the
+    same two rows in full (target, account, amount) for a client that wants
+    more than the two named accounts."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    application_id: uuid.UUID
+    invoice_id: uuid.UUID
+    basis_item_id: uuid.UUID
+    suggested_amount: Decimal | None
+    suggestion_reason: str | None
+    final_amount: Decimal | None
+    budget_amount: Decimal | None
+    recipient_amount: Decimal | None
+    other_amount: Decimal | None
+    status: str
+    requested_by: uuid.UUID | None
+    requested_at: datetime
+    due_at: date
+    decided_by: uuid.UUID | None
+    decided_at: datetime | None
+    comment: str | None
+    recipient_account: str | None = None
+    budget_account: str | None = None
+    allocations: list[RefundAllocationOut] = Field(default_factory=list)
+
+    @field_serializer(
+        "suggested_amount", "final_amount", "budget_amount", "recipient_amount", "other_amount"
+    )
+    def _money(self, value: Decimal | None) -> str | None:
+        return None if value is None else str(value)

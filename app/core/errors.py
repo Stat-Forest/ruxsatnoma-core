@@ -39,6 +39,14 @@ ERRORS: dict[str, tuple[int, str]] = {
     # of this stage (closing a reconciliations row), the same "registered,
     # not dead" pattern as ERR-PERM-002.
     "ERR-PAY-005": (409, "Расхождение уже закрыто"),
+    # 3.10b task 9: a refund is not in the status `submit-decision`/`approve`
+    # each require — already decided, decided by someone else while this
+    # request waited on the row lock, or `approve` called before
+    # `submit-decision` ever ran. Never `ERR-PAY-004`, whose registered
+    # message names an invoice specifically (the same reasoning
+    # `backoffice_service.resolve_reconciliation` gives for minting its own
+    # `ERR-PAY-005` rather than reusing that code for a reconciliation).
+    "ERR-PAY-006": (409, "Запрос на возврат не может быть изменён в текущем статусе"),
     "ERR-PERM-001": (409, "Недопустимый переход статуса разрешения"),
     "ERR-PERM-002": (409, "Документ уже подписан и не может быть перевыпущен"),
     "ERR-SIGN-001": (422, "Ошибка подписания"),
