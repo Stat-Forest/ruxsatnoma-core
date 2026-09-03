@@ -432,15 +432,26 @@ async def test_a_grazing_draft_with_no_herd_names_items_as_the_missing_field(
     assert refused.json()["error"]["details"]["missing"] == ["items"]
 
 
-async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unseeded(
-    applicant_client, draft_ready_for_submission, benefit_category_item_id
+async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfigured(
+    applicant_client,
+    draft_ready_for_submission,
+    benefit_category_item_id,
+    benefit_doc_type_unseeded,
 ) -> None:
-    """Ruling 10а, FAIL-CLOSED (review round 2, important 5). Migration 0005
-    seeds the `doc_types` classifier but none of its items — they are the
-    Agency's — so on a fresh database `benefit_proof` does not exist and a
-    benefit claim cannot be proven at all. An unconfigurable rule REFUSES; it
-    does not accept the claim on whatever happens to be attached, because a
-    benefit REDUCES the fee."""
+    """Ruling 10а, FAIL-CLOSED (review round 2, important 5). With no active
+    `benefit_proof` item in the `doc_types` classifier, a benefit claim cannot
+    be PROVEN at all — and an unconfigurable rule REFUSES; it does not accept
+    the claim on whatever happens to be attached, because a benefit REDUCES the
+    fee.
+
+    **The state is now reached by a fixture, not by the empty database.** Task
+    8's migration `0024` seeds that item, because the code is ours rather than
+    the Agency's and a citizen with a real benefit must not be refused for a
+    row we forgot. Archiving it is how a database still reaches this state —
+    the admin CRUD supersedes reference data by archiving — and it is the only
+    thing that changed here: the refusal, its code and its reason are the ones
+    review round 2 asked for, unaltered.
+    """
     app_id = draft_ready_for_submission
     patched = await applicant_client.patch(
         f"/api/v1/applications/{app_id}",

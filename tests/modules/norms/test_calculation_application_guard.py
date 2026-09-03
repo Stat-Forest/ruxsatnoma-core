@@ -451,6 +451,21 @@ async def test_the_guard_agrees_with_applications_own_vocabulary() -> None:
     assert service._APPLICATION_RECALCULATE_CODES == {APPLICATIONS_REVIEW, APPLICATIONS_DECIDE}
     assert APPLICATIONS_VIEW_ANY not in service._APPLICATION_RECALCULATE_CODES
 
+    # Ruling 11's READ set, added by task 8, and the one place the two sets are
+    # held apart: `view_any` belongs in the read set — a prosecutor exists to
+    # look — and must never be in the write one. It is the same three codes
+    # `applications.service._holds_staff_read` accepts, which is what makes
+    # "may read the calculation" mean the same thing as "may read the
+    # application it prices".
+    assert service._APPLICATION_READ_CODES == {
+        APPLICATIONS_VIEW_ANY,
+        APPLICATIONS_REVIEW,
+        APPLICATIONS_DECIDE,
+    }
+    assert service._APPLICATION_RECALCULATE_CODES < service._APPLICATION_READ_CODES, (
+        "anyone entitled to re-price an application is entitled to read its price"
+    )
+
     owner = service._OWNER_CALCULABLE_STATUSES
     reviewer = service._REVIEWER_CALCULABLE_STATUSES
     closed = service._APPLICATION_CLOSED_FOR_CALCULATION

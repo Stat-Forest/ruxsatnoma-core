@@ -164,7 +164,7 @@ async def list_norms(
     return await paginate(db, stmt, limit, offset)
 
 
-def _calculations_query(application_id: uuid.UUID | None) -> Select:
+def _calculations_query(application_id: uuid.UUID | None, created_by: uuid.UUID | None) -> Select:
     """The WHERE + ORDER BY `list_calculations` and `newest_calculation`
     share, NEWEST first — the one ordering in this module not by
     `effective_from`, since a calculation has no period of its own. `id`
@@ -173,23 +173,43 @@ def _calculations_query(application_id: uuid.UUID | None) -> Select:
     stmt = select(Calculation)
     if application_id is not None:
         stmt = stmt.where(Calculation.application_id == application_id)
+    if created_by is not None:
+        stmt = stmt.where(Calculation.created_by == created_by)
     return stmt.order_by(Calculation.created_at.desc(), Calculation.id.desc())
 
 
 async def list_calculations(
-    db: AsyncSession, *, application_id: uuid.UUID | None, limit: int, offset: int
+    db: AsyncSession,
+    *,
+    application_id: uuid.UUID | None,
+    created_by: uuid.UUID | None,
+    limit: int,
+    offset: int,
 ) -> tuple[list[Calculation], int]:
     """An append-only table's history, paged, with its total (review M3:
-    the `COUNT(*)` a page needs and `newest_calculation` below does not)."""
-    return await paginate(db, _calculations_query(application_id), limit, offset)
+    the `COUNT(*)` a page needs and `newest_calculation` below does not).
+
+    `created_by` is ruling 11's own-rows scope, and it is keyword-only with NO
+    default on purpose: this table holds every fee the system has ever quoted,
+    and an unscoped read of it is the defect this stage exists to close. The
+    caller — `service.list_calculations`, the only one — has to say `None`
+    deliberately, which it does exactly twice: for a named application whose
+    entitlement it already checked, and for the superuser.
+    """
+    return await paginate(db, _calculations_query(application_id, created_by), limit, offset)
 
 
 async def newest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Calculation | None:
     """The single newest row for `application_id`, or `None` — `LIMIT 1` off
     the same ordering as `list_calculations`, without `paginate`'s
     `COUNT(*)` (review M3: `norms.service.latest_calculation` runs this once
-    per invoice build in 3.10, and the total is never used there)."""
-    stmt = _calculations_query(application_id).limit(1)
+    per invoice build in 3.10, and the total is never used there).
+
+    `created_by=None` on purpose and not by default: this is the IN-PROCESS
+    read 3.10a builds an invoice from, where the caller is another service and
+    ruling 11's scope — an HTTP rule about a signed-in human — does not
+    apply."""
+    stmt = _calculations_query(application_id, created_by=None).limit(1)
     return (await db.execute(stmt)).scalars().first()
 
 

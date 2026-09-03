@@ -61,3 +61,27 @@ APPLICATION_SUBMITTED = "application_submitted"
 APPLICATION_APPROVED = "application_approved"
 APPLICATION_REJECTED = "application_rejected"
 APPLICATION_CANCELLED = "application_cancelled"
+
+
+# --- The notification registry (task 8, ruling 26) ----------------------------
+#
+# Every DOTTED `notification_templates.event_code` this module passes to
+# `notifications.service.notify()`, and the one place a new notification has to
+# be registered. NOT the four bus constants above: those are flat snake_case,
+# match no template, and `notify()` answers an unknown code by writing a raw
+# fallback string in-app and sending NOTHING by SMS or e-mail — silently, with
+# one log line. Two tests in `tests/modules/applications/test_end_to_end.py`
+# hold the pair together: one asserts every code here has an active `inapp`
+# template seeded, the other that every `NOTIFY_*` constant in this module
+# appears here, so an unregistered notification fails CI instead of going out
+# blank.
+#
+# `application.cancelled` is deliberately ABSENT: `cancel` sends no
+# notification at all (no such template is seeded), so listing it here would
+# make the first test fail for a message nobody sends. The day cancellation
+# notifies, the template and this entry land in the same commit.
+NOTIFIED_EVENT_CODES = (
+    "application.submitted",
+    "application.approved",
+    "application.rejected",
+)

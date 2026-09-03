@@ -24,7 +24,7 @@ from app.core.deps import get_db
 from app.core.schemas import PAGING_MAX, Page
 from app.modules.auth.deps import get_current_user
 from app.modules.auth.models import User
-from app.modules.norms import repo, service
+from app.modules.norms import service
 from app.modules.norms.schemas import CalculationIn, CalculationOut
 
 router = APIRouter(tags=["norms"])
@@ -52,11 +52,23 @@ async def create_calculation(
     return await service.save_calculation(db, payload=payload, actor=actor)
 
 
-# Read is open to any authenticated user in THIS stage: there is no
-# `applications` table yet to ask "is this actor the owner or a reviewer of
-# the application this calculation belongs to". Stage 3.9 must narrow both
-# routes below to the application's owner and its reviewers once that
-# ownership exists (carried over in the stage plan).
+# **Ruling 11 (stage 3.9a task 8): both read routes below are NARROWED.** The
+# 3.7 comment that stood here said "read is open to any authenticated user in
+# THIS stage: there is no `applications` table yet to ask whether this actor
+# owns or reviews the application this calculation belongs to". There is now,
+# so the rule is: a calculation bound to an application is readable by that
+# application's applicant, by staff whose zone covers its leshoz, and by the
+# superuser; an unbound one (a bare price check) by its creator and the
+# superuser. `GET /calculations/{id}` answers 404 rather than 403 — the whole
+# predicate, and why each half is what it is, lives in the block comment above
+# `norms.service._may_read_calculation`.
+#
+# It sits in the SERVICE and not in this router for the same reason the write
+# guard does: `service.get_calculation`/`list_calculations` are the functions,
+# and a rule written here would be one an in-process caller walks straight
+# past. The routes keep `get_current_user` and no permission code — an
+# applicant reads their own price and holds no code at all (`tz/04` С3), so
+# there is nothing a route-level dependency could usefully demand.
 #
 # The WRITE path was closed rather than carried over (I4, final review):
 # `CalculationIn.application_id` refused a non-null value outright, because a
@@ -74,13 +86,16 @@ async def create_calculation(
 @router.get("/calculations", response_model=Page[CalculationOut])
 async def list_calculations(
     db: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    actor: Annotated[User, Depends(get_current_user)],
     application_id: uuid.UUID | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
-    items, total = await repo.list_calculations(
-        db, application_id=application_id, limit=limit, offset=offset
+    # `service`, not `repo`: ruling 11's scope is part of the read, and the
+    # router used to reach past it into `repo.list_calculations` with no scope
+    # at all.
+    items, total = await service.list_calculations(
+        db, actor=actor, application_id=application_id, limit=limit, offset=offset
     )
     return Page[CalculationOut](
         items=[CalculationOut.model_validate(item) for item in items],
@@ -94,6 +109,6 @@ async def list_calculations(
 async def get_calculation(
     calculation_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    actor: Annotated[User, Depends(get_current_user)],
 ) -> Any:
-    return await service.get_calculation(db, calculation_id)
+    return await service.get_calculation(db, calculation_id, actor=actor)

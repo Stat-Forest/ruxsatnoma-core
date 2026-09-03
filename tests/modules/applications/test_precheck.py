@@ -52,18 +52,49 @@ async def test_a_precheck_never_changes_the_status_or_stores_a_calculation(
     db, applicant_client, draft_ready_for_submission
 ) -> None:
     """Ruling 8: exactly one calculation is written, at submission. A
-    speculative row before it would be the one 3.10 bills from."""
-    app_id = draft_ready_for_submission
-    result = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
+    speculative row before it would be the one 3.10 bills from.
+
+    **The zero below is checked against a control, because on its own it used
+    to be vacuous.** While `CalculationIn.application_id` was typed `None`
+    (stage 3.7, finding I4) NOTHING in the system could write a calculation
+    bound to an application, so this count was zero whatever the pre-check did
+    — it would have stayed green over a pre-check that saved. Task 5 widened
+    the field, so the same query can now find rows; submitting the very same
+    application afterwards and seeing the count go to exactly ONE is what
+    proves the zero was the pre-check's restraint and not the query's
+    blindness.
+    """
+    from tests.modules.applications.test_submit import _submit
+
+    app_id = uuid.UUID(draft_ready_for_submission)
+
+    async def stored_calculations() -> int:
+        # `db` and the app hold separate sessions and never see each other's
+        # current state (lesson) — this is a fresh SELECT each time, and the
+        # app has committed by the time it runs.
+        return await db.scalar(
+            select(func.count())
+            .select_from(Calculation)
+            .where(Calculation.application_id == app_id)
+        )
+
+    result = await applicant_client.post(
+        f"/api/v1/applications/{draft_ready_for_submission}/precheck"
+    )
     assert result.json()["calculation"]["amount"] is not None
 
-    card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
+    card = (await applicant_client.get(f"/api/v1/applications/{draft_ready_for_submission}")).json()
     assert card["status"] == "DRAFT"
+    assert await stored_calculations() == 0
 
-    stored = await db.scalar(
-        select(func.count()).select_from(Calculation).where(Calculation.application_id == app_id)
+    # The control: the SAME query, the SAME application, after the one write
+    # ruling 8 does allow.
+    submitted = await _submit(applicant_client, draft_ready_for_submission)
+    assert submitted.status_code == 200, submitted.text
+    assert await stored_calculations() == 1, (
+        "the query finds a bound calculation when there is one — so the zero above "
+        "is the pre-check writing nothing, not the read being unable to see it"
     )
-    assert stored == 0
 
 
 async def test_a_half_empty_draft_is_answered_with_skipped_rows_not_an_error(

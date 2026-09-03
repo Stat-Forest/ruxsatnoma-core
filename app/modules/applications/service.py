@@ -175,12 +175,32 @@ def _assert_transition(application: Application, to_status: str) -> None:
 
 # --- Task 8: the public surface for levels 4+ (payments 3.10, permits 3.11) -
 #
-# Branch 1 ships three of Task 8's functions below — `get`,
-# `current_calculation`, `set_status` — plus the four event names already
-# shipped in `applications/events.py`. Branch 2 adds `precheck`, `submit` and
-# the decision flow; everything below still applies to the FULL surface,
-# stated now because 3.10a and 3.11 are blocked on it today, not when branch
-# 2 lands.
+# **COMPLETE as of branch 2's task 8 — this is the whole of it.** Branch 1
+# shipped `get`, `current_calculation` and `set_status`, plus the four event
+# names in `applications/events.py`, and said "branch 2 adds `precheck`,
+# `submit` and the decision flow". Branch 2 has: tasks 3-7 landed the draft
+# lifecycle, the documents and the pre-check, `GET /package` + `submit`,
+# `start-review`/`cancel`/`timeline`, and `decision.py`'s
+# approve/reject/forward. **None of them widened the surface below** — every
+# one is a FLOW VERB reached over HTTP by a human's own client, behind
+# `get_current_user` and this module's own ownership and zone rules, and none
+# is a function a level-4 module may call. The three functions and the four
+# names below are still the entire contract 3.10 and 3.11 build against, and
+# they have not changed.
+#
+# Two additions branch 2 DID make to what a level-4 caller must know, neither
+# of them a new entry point:
+#
+#   * `applications.events.NOTIFIED_EVENT_CODES` — the dotted
+#     `notification_templates.event_code` values this module notifies on,
+#     beside the four flat bus names. A module ADDING a notification here
+#     registers it there; a module reading events wants the four names, not
+#     these.
+#   * the signature identities below are now PRODUCED, not merely promised:
+#     `submit` writes the SUBMITTED history row with `id = <the signed
+#     submission id>` and `decision.py` signs the application itself. 3.11
+#     collects both through `signatures.service.get_for_object` and must not
+#     guess either.
 #
 # - `get(db, application_id) -> Application | None` — no permission or zone
 #   rule; the caller is another service inside this process, mirroring
@@ -242,7 +262,12 @@ def _assert_transition(application: Application, to_status: str) -> None:
 #   application reaching INVOICED, is the same hole, so the fix is
 #   completeness at the flow verb, never a narrower target list here.
 # - The four event names in `applications.events`: APPLICATION_SUBMITTED,
-#   APPLICATION_APPROVED, APPLICATION_REJECTED, APPLICATION_CANCELLED.
+#   APPLICATION_APPROVED, APPLICATION_REJECTED, APPLICATION_CANCELLED. All
+#   four are PUBLISHED as of branch 2 — `submit` publishes the first,
+#   `decision.approve`/`reject` the next two, `cancel` the last — each with
+#   `{"application_id": ...}` and nothing else, the payload contract
+#   `applications/events.py` froze. `forward` publishes NOTHING: it moves the
+#   assignment, not the application, and there is no decision yet to react to.
 #
 # The signature identities (ruling 25), because 3.11 collects signatures and
 # must not guess: a SUBMISSION is signed as `("application_submission", <the

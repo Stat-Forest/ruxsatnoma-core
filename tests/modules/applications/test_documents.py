@@ -145,3 +145,40 @@ async def test_a_document_of_another_application_is_not_detachable_through_this_
         f"/api/v1/applications/{other_id}/documents/{document_id}"
     )
     assert refused.status_code == 404
+
+
+async def test_the_benefit_proof_doc_type_is_seeded_and_active(db) -> None:
+    """Migration `0024`'s row, and the only thing holding it to the constant
+    the code looks it up by.
+
+    `service._benefit_doc_type` searches `doc_types` for exactly
+    `BENEFIT_DOC_TYPE_CODE` and refuses every benefit claim when it finds
+    nothing (ruling 10а, fail-closed). The migration writes the code as a
+    LITERAL on purpose — a migration is a frozen historical statement and must
+    not change meaning when a constant is renamed — so a rename would leave the
+    guard looking for a code nothing seeds, refusing every benefit claim in
+    production with a message about configuration. This assertion is what turns
+    that into a red test instead.
+    """
+    from sqlalchemy import select
+
+    from app.modules.admin.models import Classifier, ClassifierItem
+    from app.modules.applications.service import BENEFIT_DOC_TYPE_CODE
+
+    item = await db.scalar(
+        select(ClassifierItem)
+        .join(Classifier, Classifier.id == ClassifierItem.classifier_id)
+        .where(
+            Classifier.code == "doc_types",
+            ClassifierItem.code == BENEFIT_DOC_TYPE_CODE,
+            ClassifierItem.status == "active",
+        )
+    )
+    assert item is not None, (
+        "migration 0024 seeds this row; without it every benefit claim is refused "
+        "as 'benefit_doc_type_not_configured' — which must mean the Agency has not "
+        "answered, never that we forgot a row"
+    )
+    # Bilingual, like every other seeded classifier item: `uz_cyrl` is the one
+    # key design/02 guarantees and `decision.FALLBACK_LANGUAGE` reads.
+    assert "uz_cyrl" in item.name

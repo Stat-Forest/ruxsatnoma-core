@@ -931,17 +931,24 @@ _APPLICATION_CLOSED_FOR_CALCULATION = frozenset(
 )
 
 
-async def _is_entitled_reviewer(db: AsyncSession, actor: User, facts: Any) -> bool:
-    """Whether `actor` is staff entitled to REVIEW this application — a
-    permission code AND a zone, neither a substitute for the other (lesson:
-    zone scoping is not a permission check).
+async def _holds_one_of(db: AsyncSession, actor: User, codes: frozenset[str]) -> bool:
+    """The "may this role, at all" half of a rule over an application — and
+    ONLY that half; the zone is `_application_in_actor_zone` below, and neither
+    substitutes for the other (lesson: zone scoping is not a permission check).
 
     `sys_admin` passes every permission gate (decision #41 ruling 2) and
     therefore passes this one, exactly as `permits.service._holds_view_any` and
     `applications.service._holds_staff_read` do — a rule checked INSIDE a
-    handler does not get `require_permission`'s superuser branch for free. It
-    is a permission bypass and NOT a status bypass: the superuser still gets
-    the reviewer's status set, never the closed one.
+    handler does not get `require_permission`'s superuser branch for free.
+    """
+    if await auth_service.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return not (await auth_repo.permission_codes(db, actor)).isdisjoint(codes)
+
+
+async def _application_in_actor_zone(db: AsyncSession, actor: User, facts: Any) -> bool:
+    """The "on whose rows" half: whether this actor's zone covers the leshoz
+    the application belongs to.
 
     The zone is resolved from `assigned_org_id` while the application has one
     and from the CONTOUR's owner before a reviewer takes it into work — the
@@ -951,10 +958,6 @@ async def _is_entitled_reviewer(db: AsyncSession, actor: User, facts: Any) -> bo
     no contour yet) is outside every ZONED actor's zone and inside a
     republic-wide one's, which is what the ordering below says.
     """
-    if await auth_service.role_code(db, actor) != SUPERUSER_ROLE:
-        held = await auth_repo.permission_codes(db, actor)
-        if held.isdisjoint(_APPLICATION_RECALCULATE_CODES):
-            return False
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
         return True
@@ -965,6 +968,19 @@ async def _is_entitled_reviewer(db: AsyncSession, actor: User, facts: Any) -> bo
         return False
     org = await admin_repo.get_organization(db, organization_id)
     return org is not None and _organization_in_zone(zone, org)
+
+
+async def _is_entitled_reviewer(db: AsyncSession, actor: User, facts: Any) -> bool:
+    """Whether `actor` is staff entitled to REVIEW this application — a
+    permission code AND a zone.
+
+    The superuser bypass is a PERMISSION bypass and not a status bypass: it
+    still gets the reviewer's status set from `_calculable_statuses_for`, never
+    the closed one.
+    """
+    return await _holds_one_of(db, actor, _APPLICATION_RECALCULATE_CODES) and (
+        await _application_in_actor_zone(db, actor, facts)
+    )
 
 
 async def _calculable_statuses_for(
@@ -1078,11 +1094,159 @@ async def save_calculation(db: AsyncSession, *, payload: CalculationIn, actor: U
     return row
 
 
-async def get_calculation(db: AsyncSession, calculation_id: uuid.UUID) -> Calculation:
+# --- Ruling 11 (stage 3.9a task 8): who may READ a calculation --------------
+#
+# Until this stage both read routes admitted ANY authenticated user, with a
+# comment saying stage 3.9 must narrow them "once ownership exists". It exists
+# now, so here is the rule, in one place, for both routes:
+#
+#   * a calculation WITH an `application_id` — the application's own applicant,
+#     staff holding a read code whose ZONE covers the application's leshoz, and
+#     the superuser;
+#   * a calculation with NO `application_id` (a bare price check, the normal
+#     3.7 case) — its creator and the superuser. Nobody else has a claim on it:
+#     it names no application and belongs to no leshoz, so there is no zone to
+#     ask about.
+#
+# A calculation carries the applicant's herd, their plot and the fee they will
+# be billed, so a refusal is **404 `ERR-SYS-003`, never 403** — the same answer
+# an id that never existed gets, and the same choice
+# `applications.service._readable_application` and
+# `_assert_application_open_for_calculation` above already make. A 403 would
+# turn this route into a "does this calculation exist" oracle for anyone who
+# can guess a uuid.
+#
+# The LIST route FILTERS instead of refusing (ruling 11's own words: "so a user
+# sees their own and nothing else"). A filter has no target to answer 403
+# about, and answering 404 for a named `application_id` would leak the very
+# existence the single read is careful to hide — so a caller with no claim gets
+# an empty page and HTTP 200.
+#
+# **`applications.view_any` IS in this set, and deliberately so — the exact
+# opposite of the WRITE guard above.** `_APPLICATION_RECALCULATE_CODES` excludes
+# it because `prosecutor` (the only role migration 0015 grants it to) has no
+# write authority anywhere and must never set a fee. Reading is what that role
+# exists for. The name `_APPLICATION_READ_CODES` was retired from the write
+# guard in review round 2 precisely because it described the defect there; here
+# it describes the rule.
+#
+# Declared as STRINGS for the same reason the write set is: `norms` is level 2
+# and may not import `applications.permissions`; ruling 20 bought this module a
+# read of one TABLE, not an import. Both sets are asserted against
+# `applications.permissions` by
+# `tests/modules/norms/test_calculation_application_guard.py`, so a rename
+# cannot silently move either gate.
+_APPLICATION_READ_CODES = frozenset(
+    {"applications.view_any", "applications.review", "applications.decide"}
+)
+
+
+async def _may_read_application(db: AsyncSession, actor: User, facts: Any) -> bool:
+    """Whether `actor` may see the application these `repo.application_facts`
+    describe: its own applicant, or staff with a read code AND the zone.
+
+    The mirror of `applications.service._readable_application`'s two branches,
+    restated here rather than called: `norms` is level 2 and `applications`
+    level 3, so the call is forbidden in that direction and ruling 20's
+    read-only right on the table is what stands in for it.
+    """
+    if facts["applicant_id"] in await auth_service.own_applicant_ids(db, actor.id):
+        return True
+    return await _holds_one_of(db, actor, _APPLICATION_READ_CODES) and (
+        await _application_in_actor_zone(db, actor, facts)
+    )
+
+
+async def _may_read_calculation(db: AsyncSession, actor: User, row: Calculation) -> bool:
+    """Ruling 11's predicate for ONE row — see the block comment above.
+
+    The superuser is handled in exactly ONE of the two branches, and the split
+    is deliberate. Down the bound branch it is already covered, and covered the
+    RIGHT way: `_may_read_application` -> `_holds_one_of` gives `sys_admin`
+    `require_permission`'s own bypass, which skips the CODE and not the zone
+    (decision #41 ruling 2), so this predicate agrees exactly with what
+    `applications.service._readable_application` would answer about the same
+    application. A blanket bypass here would make a zone-scoped `sys_admin` able
+    to read the PRICE of an application whose card it cannot open.
+
+    The unbound branch has no permission code to bypass and no application to
+    zone by — the whole rule there is "you made it" — so the superuser needs
+    its own clause or it could read no bare price check at all.
+    """
+    if row.application_id is None:
+        return (row.created_by is not None and row.created_by == actor.id) or (
+            await auth_service.role_code(db, actor) == SUPERUSER_ROLE
+        )
+    facts = await repo.application_facts(db, row.application_id)
+    return facts is not None and await _may_read_application(db, actor, facts)
+
+
+async def get_calculation(
+    db: AsyncSession, calculation_id: uuid.UUID, *, actor: User
+) -> Calculation:
+    """`GET /calculations/{id}`, narrowed by ruling 11.
+
+    A row the actor has no claim on is `ERR-SYS-003` — indistinguishable from
+    one that does not exist, on purpose (block comment above).
+    """
     row = await db.get(Calculation, calculation_id)
-    if row is None:
+    if row is None or not await _may_read_calculation(db, actor, row):
         raise err("ERR-SYS-003")
     return row
+
+
+async def list_calculations(
+    db: AsyncSession,
+    *,
+    actor: User,
+    application_id: uuid.UUID | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Calculation], int]:
+    """`GET /calculations`, narrowed by ruling 11 — a FILTER, never a refusal.
+
+    Two scopes, because only one of them can be expressed in SQL with the read
+    ruling 20 grants:
+
+      * **an `application_id` is named** — the entitlement question is asked
+        ONCE, about that application, through the same `repo.application_facts`
+        the write guard uses, and the answer decides between the application's
+        page and an empty one. No per-row predicate is needed: every row in the
+        page belongs to that one application.
+      * **no `application_id`** — `created_by = actor.id`, which is every row
+        this actor made: their bare price checks and the calculation their own
+        submission stored (`applications.service.submit` passes the applicant
+        as `actor`). The superuser sees the lot.
+
+    The second scope is deliberately NOT "every calculation on every
+    application I could read". Expressing that needs a second read of
+    `applications` — a subquery over `applicant_id`, plus a join to
+    `organizations` for the zone — and ruling 20's grant is one predicate on
+    five columns, not a licence to build `applications.repo.list_applications`
+    a second time inside `norms`. Nothing needs it either: 3.10a reads the
+    newest row in process through `latest_calculation`, the application card
+    carries the current price, and a reviewer looking at a filing names its
+    `application_id`. The narrow scope fails CLOSED — it shows too little,
+    never too much — and the day a screen genuinely needs the wider one, it is
+    ruling 20 that gets amended, in daylight, rather than this function.
+    """
+    if application_id is not None:
+        # `_may_read_application` carries the superuser's bypass already, and
+        # carries it as a PERMISSION bypass rather than a blanket one — see
+        # `_may_read_calculation`'s docstring for why that distinction matters.
+        facts = await repo.application_facts(db, application_id)
+        if facts is None or not await _may_read_application(db, actor, facts):
+            return [], 0
+        return await repo.list_calculations(
+            db, application_id=application_id, created_by=None, limit=limit, offset=offset
+        )
+    # Unfiltered: no application to zone by, so the superuser gets its own
+    # clause here, exactly as the unbound branch of `_may_read_calculation`
+    # does and for the same reason.
+    created_by = None if await auth_service.role_code(db, actor) == SUPERUSER_ROLE else actor.id
+    return await repo.list_calculations(
+        db, application_id=None, created_by=created_by, limit=limit, offset=offset
+    )
 
 
 # --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
