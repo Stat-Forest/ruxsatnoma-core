@@ -1330,14 +1330,27 @@ async def list_calculations(
 # --- Task 8: the public surface for levels 4+ (applications 3.9, payments ---
 # 3.10, permits 3.11) ---------------------------------------------------------
 #
-# Eight entry points, and nothing else: `preview` and `save_calculation`
+# Nine entry points, and nothing else: `preview` and `save_calculation`
 # above (Task 7), `LOAD_PROVIDERS` and `committed_load_sb` above (Task 4,
 # ruling 12 — the seam and the reader over it are two separate things a
-# caller touches, not one), `effective_norm`/`run_checks`/`latest_calculation`
-# right below, and `calculator.from_input_snapshot` (I9) — VERIFICATION only,
-# rebuilding the request/snapshot pair to confirm a stored row still
-# recomputes to the same numbers, never for pricing a new one. A level-4+
-# caller must NEVER:
+# caller touches, not one), `calculation_by_id` right above (payments 3.10b,
+# task 9: `refunds.request_refund` reads `input_snapshot["request"]
+# ["period_from"/"period_to"]` off the calculation an invoice already froze
+# via `invoice.calculation_id` — never a fresh lookup by application, which
+# would be `latest_calculation`'s job and would silently reprice a refund
+# hint against a calculation that was never billed), `effective_norm`/
+# `run_checks`/`latest_calculation` right below, and
+# `calculator.from_input_snapshot` (I9) — VERIFICATION only, rebuilding the
+# request/snapshot pair to confirm a stored row still recomputes to the same
+# numbers, never for pricing a new one. **`get_calculation` is NOT on this
+# list** — stage 3.9a-flow (merged into `dev` after this list's previous
+# revision, which wrongly named it here) made it `GET /calculations/{id}`'s
+# own route-facing function: it takes a mandatory `actor: User` and applies
+# ruling 11's ACL, raising `ERR-SYS-003` for a row the actor has no claim on,
+# deliberately indistinguishable from "does not exist" — exactly the
+# behaviour a level-4+ caller acting on behalf of the SYSTEM must never
+# trigger against a calculation it holds a legitimate reference to but no
+# personal claim on. A level-4+ caller must NEVER:
 #   - import `norms.repo` (or any other private module here) directly — every
 #     fact it could read that way is already reachable through one of the
 #     eight, the same reason a level-3 module reaches `gis` only through
@@ -1416,3 +1429,26 @@ async def latest_calculation(db: AsyncSession, application_id: uuid.UUID) -> Cal
     `COUNT(*)` (review M3) — this runs once per invoice build and the total
     is never used here."""
     return await repo.newest_calculation(db, application_id)
+
+
+async def calculation_by_id(db: AsyncSession, calculation_id: uuid.UUID) -> Calculation | None:
+    """The `calculations` row named by `calculation_id`, or `None` — for a
+    level-4+ caller that already holds a legitimate REFERENCE to the row
+    (e.g. `invoices.calculation_id`, frozen at the invoice's issuance),
+    never for one resolving an id out of a request body.
+
+    Like `effective_norm` and `latest_calculation`, this carries NO
+    permission and NO zone rule: the caller is another SERVICE inside this
+    process, not an HTTP actor, and the id it passes in was never chosen by
+    the end user making the current request. `None` is a normal answer, not
+    an error — a caller such as `payments.backoffice_service._hint_for_invoice`
+    turns a missing row into a hint reason (`calculation_missing`), not an
+    exception, because a hint may never fail the refund it prices.
+
+    This is deliberately **not** a replacement for `get_calculation`, which
+    is `GET /calculations/{id}`'s own route-facing function and applies
+    ruling 11's ACL. An HTTP route must NEVER call this one: doing so would
+    let any authenticated actor read the full price/herd/plot detail of any
+    calculation in the system merely by guessing its id, the exact leak
+    ruling 11 exists to close."""
+    return await db.get(Calculation, calculation_id)

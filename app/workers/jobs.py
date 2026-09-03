@@ -21,6 +21,7 @@ from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
 from app.modules.payments import jobs as payments_jobs
+from app.modules.payments import statement_service as payments_statement_service
 from app.modules.permits import jobs as permits_jobs
 
 logger = structlog.get_logger(__name__)
@@ -205,6 +206,24 @@ async def process_gis_imports(factory: async_sessionmaker[AsyncSession]) -> int:
     return processed
 
 
+async def process_bank_statements(factory: async_sessionmaker[AsyncSession]) -> int:
+    """Parse and match at most one queued bank statement (plan 03.10b task 4).
+
+    Thin wrapper only — `payments.statement_service.process_pending(db)` holds
+    the claim, the state machine and its own failure records, the same split
+    `process_gis_imports` has from `gis_import_service.process_pending` and
+    `expire_invoices` has from `payments.jobs.expiry_sweep`. One statement per
+    tick, not a loop: a backlog drains steadily while a single month-long file
+    can never hold the scheduler's thread.
+    """
+    async with factory() as db:
+        processed = await payments_statement_service.process_pending(db)
+        await db.commit()
+    if processed:
+        logger.info("job.process_bank_statements", processed=processed)
+    return processed
+
+
 async def expire_invoices(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
     """Close an unpaid invoice's 10-day window and remind the applicant before
     it closes (plan 03.10a-payments-core task 6, ruling 13).
@@ -219,6 +238,23 @@ async def expire_invoices(factory: async_sessionmaker[AsyncSession]) -> dict[str
         await db.commit()
     if counts["expired"] or counts["reminded"]:
         logger.info("job.expire_invoices", **counts)
+    return counts
+
+
+async def refund_sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
+    """Flag a refund still `requested`/`in_review` past its 20-working-day
+    control deadline — RI-07 (plan `03.10b-payments-reconciliation` task 10).
+
+    Thin wrapper only — `payments.jobs.refund_sla_sweep(db)` holds the
+    actual logic (the candidate query, the once-only check, the audit
+    trail), the same split `expire_invoices` above has from
+    `payments.jobs.expiry_sweep`. This function's own job is the one every
+    other job in this file already does: open a session, run it, commit."""
+    async with factory() as db:
+        counts = await payments_jobs.refund_sla_sweep(db)
+        await db.commit()
+    if counts["flagged"]:
+        logger.info("job.refund_sla_sweep", **counts)
     return counts
 
 
