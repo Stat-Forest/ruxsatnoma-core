@@ -311,12 +311,19 @@ async def test_applications_permission_seeds(db) -> None:
     leadership's half** once Oybek settled the question — decision #59, option а —
     so the expected set below is the post-0016 state, not 0015's. The two guards in
     `tests/test_permissions_registry.py` assert the same alignment across all three
-    stages that grant an approval code."""
+    stages that grant an approval code.
+
+    **`r.is_system` scopes this to the eleven `0003_auth` seeds**, the same
+    filter `tests/test_permissions_registry.py` applies and for the same reason:
+    this database is shared and persistent, and a role invented by a test —
+    `tests/modules/applications/conftest.py`'s three `test_head_limit_*` roles
+    carry a COPY of `executor_head`'s grants, deliberately — says nothing about
+    what a migration seeded."""
     rows = await db.execute(
         text(
             "SELECT r.code, rp.permission_code FROM role_permissions rp"
             " JOIN roles r ON r.id = rp.role_id"
-            " WHERE rp.permission_code LIKE 'applications.%'"
+            " WHERE rp.permission_code LIKE 'applications.%' AND r.is_system"
         )
     )
     assert {(row[0], row[1]) for row in rows} == {
@@ -326,3 +333,27 @@ async def test_applications_permission_seeds(db) -> None:
         ("prosecutor", "applications.view_any"),
         ("sys_admin", "applications.assign"),
     }
+
+
+def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> None:
+    """The one guard against `schemas.ApplicationStatus` and its three siblings
+    drifting from the tuples `models.py` builds its CHECK constraints from
+    (lesson: an enum-ish column has ONE source of truth). The members have to be
+    written out — pyright rejects a starred variable inside `Literal` — so a
+    value added on one side and forgotten on the other would be a 422 that
+    should have been a 200, or an `IntegrityError` 500 that should have been a
+    422. `permits/test_models.py` carries the identical guard."""
+    from typing import get_args
+
+    from app.modules.applications.models import APPLICATION_KINDS, CHANNELS, ON_BEHALF_VALUES
+    from app.modules.applications.schemas import (
+        ApplicationKind,
+        ApplicationStatus,
+        Channel,
+        OnBehalf,
+    )
+
+    assert set(get_args(ApplicationStatus)) == set(APPLICATION_STATUSES)
+    assert set(get_args(OnBehalf)) == set(ON_BEHALF_VALUES)
+    assert set(get_args(Channel)) == set(CHANNELS)
+    assert set(get_args(ApplicationKind)) == set(APPLICATION_KINDS)

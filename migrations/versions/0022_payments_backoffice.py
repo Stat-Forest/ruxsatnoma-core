@@ -53,7 +53,17 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "0022"
-down_revision: str | Sequence[str] | None = "merge_0018_0020"
+# Re-chained onto `0024` on 2026-09-03, when stage 3.9a-flow merged into `dev`
+# first. Both revisions had been written against `merge_0018_0020`, which would
+# have left the chain with TWO heads the moment this branch merged. `0024` is
+# already on `dev` and stamped in other sessions' databases, so it cannot move;
+# this one was never pushed and only its own worktree's test database held it,
+# so re-pointing it costs one local re-migration and no stranded database.
+# Preferred over a second `alembic merge heads` revision: an empty merge node is
+# permanent, and it is only warranted when BOTH sides are already merged (which is
+# why `merge_0018_0020` itself exists). The numbers now run 0024 -> 0022, which is
+# ugly and harmless — Alembic follows the chain, not the filename.
+down_revision: str | Sequence[str] | None = "0024"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

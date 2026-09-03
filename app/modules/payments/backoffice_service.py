@@ -624,12 +624,24 @@ async def _assert_refund_basis_active(db: AsyncSession, basis_item_id: uuid.UUID
 
 async def _hint_for_invoice(db: AsyncSession, invoice: Invoice) -> refunds.RefundHint:
     """`request_refund`'s own chain (ruling 1): `invoice.calculation_id` ->
-    `norms.service.get_calculation` -> `input_snapshot["request"]
+    `norms.service.calculation_by_id` -> `input_snapshot["request"]
     ["period_from"/"period_to"]` -> `refunds.hint`. **Never
     `applications.service.current_calculation`**, which answers the NEWEST
     calculation — the cross-module divergence PR #31 caught printing
     9 999 999,00 on a permit against 2 060 000,00 paid. This reads the
     calculation the INVOICE itself froze, and nothing else.
+
+    Deliberately `calculation_by_id`, not `norms.service.get_calculation`:
+    stage 3.9a-flow gave the latter a mandatory `actor: User` and ruling
+    11's ACL, because it is `GET /calculations/{id}`'s own route-facing
+    function. The actor approving a refund (accountant, `executor_head`)
+    routinely has no claim on the citizen's calculation under
+    `_may_read_calculation` — passing them through would make this hint
+    silently answer `calculation_missing` for a perfectly valid refund, a
+    wrong answer about money produced by asking the wrong question.
+    `calculation_by_id` is the actor-free sibling built for exactly this: a
+    SERVICE resolving a reference it already legitimately holds
+    (`invoice.calculation_id`, frozen at issuance), never an ACL check.
 
     A hint is never an error (ruling 2) — every branch below returns a
     `RefundHint` instead of raising, and `request_refund` files the refund
@@ -639,7 +651,9 @@ async def _hint_for_invoice(db: AsyncSession, invoice: Invoice) -> refunds.Refun
       newest invoice for this application is `cancelled`/`expired`) and an
       in-force-but-still-`pending` one: neither has a PAID amount to price
       a refund's unused share against, so both read the same reason;
-    - `invoice.calculation_id IS NULL`;
+    - `invoice.calculation_id IS NULL`, or names a row that no longer exists
+      (`calculation_by_id` returns `None` for either — both read the same
+      `calculation_missing` reason, since neither has an amount to hint);
     - `input_snapshot` has no `"request"` key, or it is not an object;
     - `period_from`/`period_to` are missing or fail `date.fromisoformat`;
     - the parsed period is reversed or zero-length (`period_to < period_from`)
@@ -652,7 +666,9 @@ async def _hint_for_invoice(db: AsyncSession, invoice: Invoice) -> refunds.Refun
         return refunds.RefundHint(None, "no_in_force_invoice")
     if invoice.calculation_id is None:
         return refunds.RefundHint(None, "calculation_missing")
-    calculation = await norms_service.get_calculation(db, invoice.calculation_id)
+    calculation = await norms_service.calculation_by_id(db, invoice.calculation_id)
+    if calculation is None:
+        return refunds.RefundHint(None, "calculation_missing")
     snapshot = calculation.input_snapshot
     request = snapshot.get("request") if isinstance(snapshot, dict) else None
     if not isinstance(request, dict):

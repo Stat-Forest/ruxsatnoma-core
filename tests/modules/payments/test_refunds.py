@@ -301,6 +301,36 @@ async def test_an_accountant_may_file_a_refund_for_any_application(
     assert response.status_code == 201, response.text
 
 
+async def test_the_hint_prices_correctly_for_an_actor_with_no_claim_on_the_calculation(
+    payments_view_client,
+    refund_application: Application,
+    paid_refund_invoice: Invoice,
+    rf01: uuid.UUID,
+):
+    """The regression `_hint_for_invoice` -> `norms.service.calculation_by_id`
+    exists to prevent: stage 3.9a-flow gave `norms.service.get_calculation`
+    (the function this used to call) a mandatory `actor: User` and ruling
+    11's ACL, which raises `ERR-SYS-003` for a row the actor has no claim
+    on — indistinguishable from "does not exist". `payments_view_client` is
+    the accountant, migration 0017's `payments.view`/`payments.manage`
+    grants only — no `applications.*` read code and not the calculation's
+    own applicant, so `_may_read_calculation` would refuse it outright.
+
+    Filing through `get_calculation` instead of `calculation_by_id` would
+    silently regress this to `suggested_amount is None`,
+    `suggestion_reason == "calculation_missing"` — a wrong answer about
+    money for a refund that IS priceable, not a raised error, which is why
+    `test_an_accountant_may_file_a_refund_for_any_application` above (a
+    bare `201`) does not catch it on its own. This asserts the real hint:
+    the same `600000.00` (1 000 000,00 x the 60 unused of 100 days)
+    `test_request_refund_files_with_the_frozen_calculations_hint` gets for
+    the calculation's own owner."""
+    filed = await _request_refund(payments_view_client, refund_application.id, rf01)
+    assert filed["suggested_amount"] == "600000.00"
+    assert filed["suggestion_reason"] is None
+    assert filed["invoice_id"] == str(paid_refund_invoice.id)
+
+
 async def test_an_invoice_with_no_calculation_still_files_the_refund(
     db: AsyncSession,
     payments_view_client,

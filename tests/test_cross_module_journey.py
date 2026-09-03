@@ -62,6 +62,7 @@ from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
+from app.modules.norms.schemas import CalculationIn
 from app.modules.notifications.models import Notification
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import ProviderTransaction
@@ -77,6 +78,7 @@ from tests.modules.permits.conftest import Signer, _signer_for, sign_permit
 # database is the bug (lesson).
 from tests.modules.permits.conftest import _app_on_test_db as _app_on_test_db  # noqa: F401
 from tests.modules.permits.conftest import accountant_client as accountant_client  # noqa: F401
+from tests.modules.permits.conftest import applicant_client as applicant_client  # noqa: F401
 from tests.modules.permits.conftest import approval_doc as approval_doc  # noqa: F401
 from tests.modules.permits.conftest import (
     approved_application as approved_application,  # noqa: F401
@@ -503,49 +505,83 @@ async def test_a_calculation_made_after_the_decision_refuses_issuance(
 
 async def test_a_calculation_cannot_be_attached_to_an_application_through_the_write_path(
     db: AsyncSession,
-    hodim_client: httpx.AsyncClient,
+    applicant_client: httpx.AsyncClient,
+    journey_holder: Signer,
     approved_application: Application,
     grazing_activity_id: uuid.UUID,
 ):
-    """**This test stands in for a guard that does not exist yet.**
+    """**The guard this test used to stand in for now exists, and this asserts
+    it.**
 
     `payments.issue_invoice` and `permits.issue` each read "the newest
     calculation for this application" independently. Nothing compares the two,
-    and being both level 4 they cannot. If a newer calculation could be attached
-    to an application after it was invoiced, the citizen would be billed
-    2 060 000,00 and the permit would print 9 999 999,00 — demonstrated by the
-    test above, which has to reach past the API to build that state.
+    and being both level 4 they cannot. A newer calculation attached to an
+    application after it was invoiced bills the citizen 2 060 000,00 and prints
+    9 999 999,00 on the permit — demonstrated by the test above, which has to
+    reach past the API to build that state.
 
-    It is unreachable through the public write path TODAY only because
-    `norms.schemas.CalculationIn.application_id` is typed `None = None`, so
-    `POST /api/v1/calculations` cannot bind a calculation to an application at
-    all — an accident of 3.7's fail-closed edge (I4), not a designed guard.
-    `norms.save_calculation` itself has no application-status check of any kind.
+    Until stage 3.9a that was unreachable through the public write path only
+    because `norms.schemas.CalculationIn.application_id` was typed
+    `None = None`, so `POST /api/v1/calculations` could not bind a calculation
+    to an application at all — an accident of 3.7's fail-closed edge (I4), not
+    a designed guard. **3.9a task 5 opened the field and landed the real guards
+    in the same commit**, in `norms.service.save_calculation` and not in
+    `calc_router`, because `applications.service.submit` is the other caller
+    and would walk straight past a router-level check.
 
-    **Stage 3.9 opens that field.** Whoever does must land, in the same commit,
-    the guard that refuses a calculation for an application at APPROVED or
-    beyond (3.9b's own ruling already says so) — and then rewrite this test to
-    assert THAT refusal. Deleting it because the field now accepts a value is
-    exactly the failure it exists to catch.
+    Both refusals are driven here through the REAL route — the one that
+    requires `get_current_user` and no permission code at all, which is what
+    made this a live money hole rather than a theoretical one:
+
+      1. a STRANGER naming somebody else's application is told 404
+         `ERR-SYS-003` — the same answer an id that never existed gets, never
+         403, which would make this route an application-existence oracle for
+         a document full of personal data;
+      2. the application's OWN applicant is told 409 `ERR-NORM-005` because the
+         application is APPROVED — at or beyond that line a price has been
+         billed, and a newer row is the under-billing above.
+
+    And nothing was written either time: `calculations` is append-only
+    (migration 0011), so a row that slipped through could never be deleted or
+    corrected.
     """
-    from app.modules.norms.schemas import CalculationIn
-
-    # The schema field, not the route: `CalculationIn` is what the write route
-    # validates against, and pydantic refuses anything but None for it.
     period_from, period_to = approved_application.period_from, approved_application.period_to
     assert period_from is not None and period_to is not None
-    with pytest.raises(ValueError):
-        CalculationIn(
-            application_id=approved_application.id,  # type: ignore[arg-type]
-            contour_id=uuid.uuid4(),
-            activity_type_id=grazing_activity_id,
-            period_from=period_from,
-            period_to=period_to,
-        )
+    body = {
+        "application_id": str(approved_application.id),
+        "contour_id": str(approved_application.contour_id),
+        "activity_type_id": str(grazing_activity_id),
+        "period_from": period_from.isoformat(),
+        "period_to": period_to.isoformat(),
+        "quantity": "1",
+    }
 
-    assert CalculationIn.model_fields["application_id"].annotation is type(None), (
-        "CalculationIn.application_id has been opened up — see this test's docstring: "
-        "payments and permits each read the NEWEST calculation and cannot compare notes, "
-        "so an application-status guard must land in `applications`/`norms` in the same "
-        "commit, and this test must be rewritten to assert it"
+    # The field itself now accepts a value — the accident is gone, and what
+    # stands in its place is a guard rather than a type error.
+    assert CalculationIn.model_fields["application_id"].annotation is not type(None)
+
+    before = (
+        await db.scalars(
+            select(Calculation).where(Calculation.application_id == approved_application.id)
+        )
+    ).all()
+
+    stranger = await applicant_client.post(f"{API}/calculations", json=body)
+    assert stranger.status_code == 404, stranger.text
+    assert stranger.json()["error"]["code"] == "ERR-SYS-003"
+
+    owner = await journey_holder.client.post(f"{API}/calculations", json=body)
+    assert owner.status_code == 409, owner.text
+    error = owner.json()["error"]
+    assert error["code"] == "ERR-NORM-005"
+    assert error["details"]["reason"] == "application_closed_for_calculation"
+    assert error["details"]["status"] == "APPROVED"
+
+    after = (
+        await db.scalars(
+            select(Calculation).where(Calculation.application_id == approved_application.id)
+        )
+    ).all()
+    assert [row.id for row in after] == [row.id for row in before], (
+        "an append-only table: a row that slipped past the guard could never be removed"
     )

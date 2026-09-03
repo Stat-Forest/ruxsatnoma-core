@@ -821,6 +821,24 @@ async def has_effective_representation_of(
     return representation is not None
 
 
+async def effective_representation_of(
+    db: AsyncSession, *, user_id: uuid.UUID, applicant_id: uuid.UUID
+) -> Representation | None:
+    """The ROW behind `has_effective_representation_of` above, for a caller that
+    has to STORE which power of attorney it acted under rather than merely check
+    that one exists — `applications.service.create_draft` fills
+    `applications.representation_id`, the column that says on whose authority a
+    representative filed for a legal entity.
+
+    Same "effective" meaning as every sibling here: `status='active'` and not
+    past `valid_until`, judged against `business_today()`, never `date.today()`
+    (lesson). Same repo call as the boolean sibling, so the two can never
+    disagree about which representation is the effective one."""
+    return await repo.get_effective_representation(
+        db, applicant_id=applicant_id, user_id=user_id, today=business_today()
+    )
+
+
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
     """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
     `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not
@@ -959,6 +977,22 @@ async def role_code(db: AsyncSession, user: User) -> str | None:
     `repo.role_code` directly, being inside this module.
     """
     return await repo.role_code(db, user)
+
+
+async def role_of(db: AsyncSession, user: User) -> Role | None:
+    """This user's whole `roles` row, or None if it vanished (should not
+    happen: FK). `role_code` above's sibling, and the same shape: no permission
+    and no zone rule, because the caller is another SERVICE in this process.
+
+    `applications` (3.9a) needs the ROW rather than the code because decision
+    #29's approval ceilings — `max_approve_amount` and `max_approve_area` — are
+    columns of `roles`, and reading them through `auth.repo` from another module
+    would reach past this module's declared surface for two attributes.
+    Comparing them against an application's amount and area is the CALLER's
+    business rule, not this module's, so what comes back is the row and not a
+    verdict.
+    """
+    return await repo.get_role(db, user.role_id)
 
 
 async def list_user_ids_by_role_codes(

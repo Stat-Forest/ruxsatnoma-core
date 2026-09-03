@@ -12,11 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-# Branch 1 of 3.9a-applications-core ships no router.py yet, so nothing else
-# imports applications.permissions and register() never runs. Stand in until
-# applications/router.py lands and imports it itself, the way every other
-# module's router does (gis, norms, signatures, ...).
-import app.modules.applications.permissions  # noqa: F401
 from app.config import get_settings
 from app.core import storage
 from app.core.errors import ERRORS, DomainError
@@ -32,6 +27,7 @@ from app.modules.admin.integrations_router import router as integrations_admin_r
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
+from app.modules.applications.router import router as applications_router
 from app.modules.auth.router import router as auth_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
@@ -226,6 +222,7 @@ def create_app() -> FastAPI:
     app.include_router(norms_router, prefix="/api/v1")
     app.include_router(norms_calc_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
+    app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
     app.include_router(payments_backoffice_router, prefix="/api/v1")
     app.include_router(refunds_router, prefix="/api/v1")
