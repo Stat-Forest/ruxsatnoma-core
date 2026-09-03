@@ -19,6 +19,18 @@ from datetime import date
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 
 
+async def _upload(client) -> str:
+    """A real file through the real route, so `media_files.uploaded_by` is the
+    caller — which is what `service._own_document_file` reads. Same helper
+    `test_documents.py` uses, kept local for the same reason it is local
+    there."""
+    result = await client.post(
+        "/api/v1/files", files={"file": ("proof.pdf", b"%PDF-1.4 test", "application/pdf")}
+    )
+    assert result.status_code == 201, result.text
+    return result.json()["id"]
+
+
 async def _submit(client, app_id, pinfl=None, *, key=None):
     """`GET /package`, sign those exact bytes, `POST /submit` — the real client
     flow, and the only one that can work: a detached PKCS#7 cannot be produced
@@ -420,12 +432,15 @@ async def test_a_grazing_draft_with_no_herd_names_items_as_the_missing_field(
     assert refused.json()["error"]["details"]["missing"] == ["items"]
 
 
-async def test_a_benefit_claim_with_no_supporting_document_is_refused(
+async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unseeded(
     applicant_client, draft_ready_for_submission, benefit_category_item_id
 ) -> None:
-    """Ruling 10а: a claimed benefit needs a supporting document (`tz/06`
-    § Льготы, `tz/04` С3 item 9). 422 `ERR-APP-003` — «неполный комплект
-    документов», which is what this is."""
+    """Ruling 10а, FAIL-CLOSED (review round 2, important 5). Migration 0005
+    seeds the `doc_types` classifier but none of its items — they are the
+    Agency's — so on a fresh database `benefit_proof` does not exist and a
+    benefit claim cannot be proven at all. An unconfigurable rule REFUSES; it
+    does not accept the claim on whatever happens to be attached, because a
+    benefit REDUCES the fee."""
     app_id = draft_ready_for_submission
     patched = await applicant_client.patch(
         f"/api/v1/applications/{app_id}",
@@ -439,7 +454,72 @@ async def test_a_benefit_claim_with_no_supporting_document_is_refused(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 422, refused.text
-    assert refused.json()["error"]["code"] == "ERR-APP-003"
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-APP-003"
+    assert error["details"]["reason"] == "benefit_doc_type_not_configured"
+    assert error["details"]["doc_type_code"] == "benefit_proof"
+
+
+async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other(
+    applicant_client,
+    draft_ready_for_submission,
+    benefit_category_item_id,
+    benefit_doc_type_item_id,
+    doc_type_item_id,
+) -> None:
+    """With the type seeded, ruling 10а's real rule: a document of ANOTHER type
+    does not satisfy the claim, and one of the benefit type does.
+
+    Both halves in one test on purpose — "a document is attached" passing while
+    "a document of the right type is attached" fails is precisely the
+    difference between the fail-open version this replaces and the fail-closed
+    one, and only the pair can tell them apart.
+    """
+    app_id = draft_ready_for_submission
+    await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={"benefit_category_item_id": str(benefit_category_item_id)},
+    )
+
+    wrong = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/documents",
+        json={
+            "doc_type_item_id": str(doc_type_item_id),
+            "file_id": await _upload(applicant_client),
+        },
+    )
+    assert wrong.status_code == 201, wrong.text
+    refused = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["details"]["reason"] == "benefit_claim_needs_a_document"
+
+    right = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/documents",
+        json={
+            "doc_type_item_id": str(benefit_doc_type_item_id),
+            "file_id": await _upload(applicant_client),
+        },
+    )
+    assert right.status_code == 201, right.text
+    # The claim is now PROVEN: step 3 is satisfied and the submission moves on.
+    # It is still refused — by step 7's pricing, because decision #50 validates
+    # the benefit CODE against the union of every tariff row the request
+    # resolved and no seeded VMQ 278 tariff carries a modifier for a category a
+    # test invented (`benefit_categories` ships empty, `tz/12` #2). That is the
+    # OTHER half of ruling 10а working, and what matters here is which gate now
+    # answers: not `ERR-APP-003` any more.
+    past_step_three = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert past_step_three.status_code == 422, past_step_three.text
+    assert past_step_three.json()["error"]["code"] != "ERR-APP-003"
+    assert past_step_three.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_a_draft_on_an_unpublished_contour_cannot_be_submitted(
@@ -642,6 +722,7 @@ def test_the_package_is_canonical_json_with_no_whitespace() -> None:
     # columns and the type checker reads its signature, so a stand-in object
     # would only prove that a stand-in works.
     application = Application(
+        id=uuid.UUID("00000000-0000-0000-0000-0000000000c3"),
         applicant_id=uuid.UUID("00000000-0000-0000-0000-0000000000a1"),
         contour_version_id=uuid.UUID("00000000-0000-0000-0000-0000000000b2"),
         period_from=date(2027, 5, 1),
@@ -665,6 +746,10 @@ def test_the_package_is_canonical_json_with_no_whitespace() -> None:
         b'{"activity_type_code":"grazing",'
         b'"amount":"2060000",'
         b'"applicant_id":"00000000-0000-0000-0000-0000000000a1",'
+        # Review round 2, important 3: WHICH application. Without it two drafts
+        # of one applicant with identical content sign to identical bytes and
+        # one PKCS#7 verifies for either.
+        b'"application_id":"00000000-0000-0000-0000-0000000000c3",'
         b'"contour_version_id":"00000000-0000-0000-0000-0000000000b2",'
         b'"items":[{"count":2,"livestock_code":"cattle_2y"},'
         b'{"count":40,"livestock_code":"sheep_goat_6m"}],'

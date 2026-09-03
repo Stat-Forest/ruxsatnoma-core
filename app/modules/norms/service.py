@@ -852,45 +852,70 @@ async def preview(db: AsyncSession, *, payload: CalculationIn, actor: User) -> d
 # other one. 3.9b's ruling 17 says the same thing for `POST /recalculate`,
 # which is a third path this one already covers.
 
-# `applications`' own read permission codes, as STRINGS. `norms` is level 2 and
-# may not import `applications.permissions`; ruling 20 bought this module a
-# read of one TABLE, not an import. Re-declared rather than imported, the same
-# trade `applications.checks.GRAZING_ACTIVITY_CODE` makes in the other
-# direction — and `tests/modules/norms/test_calculations_api.py` asserts the
-# three strings against `applications.permissions` so a rename cannot silently
-# open this gate.
-_APPLICATION_READ_CODES = frozenset(
-    {"applications.view_any", "applications.review", "applications.decide"}
-)
+# **WHO may bind a calculation is not one flat rule — it depends on the ACTOR,
+# and getting that wrong is how a read-only auditor sets a fee** (review round
+# 2, Critical 1 and 2). Two sets of codes and three sets of statuses below.
+#
+# `applications`' own codes, as STRINGS: `norms` is level 2 and may not import
+# `applications.permissions`; ruling 20 bought this module a read of one TABLE,
+# not an import. Re-declared rather than imported, the same trade
+# `applications.checks.GRAZING_ACTIVITY_CODE` makes in the other direction —
+# and `tests/modules/norms/test_calculation_application_guard.py` asserts these
+# strings against `applications.permissions`, so a rename cannot silently move
+# this gate.
+#
+# **`applications.view_any` is deliberately ABSENT and must stay absent.**
+# Migration 0015 grants it to `prosecutor` — an oversight role with no write
+# authority anywhere in the system — so admitting it here let a prosecutor
+# whose zone covers the leshoz POST a one-head calculation against a SUBMITTED
+# application and have `payments.issue_invoice` bill it and `permits.issue`
+# print it. A READ code must never gate a MONEY write. What the guard needs is
+# "entitled to REVIEW it", which is `applications.review` (the hodim who takes
+# the filing into work) and `applications.decide` (the leshoz head who decides
+# it) — the two roles that already correct a herd or a period in 3.9b.
+_APPLICATION_RECALCULATE_CODES = frozenset({"applications.review", "applications.decide"})
 
-# Which application statuses may still receive a calculation, and which may not.
+# Which statuses each kind of actor may bind a calculation in.
 #
-# OPEN — the application is still being assembled or decided, so a (re)price is
-# the normal course of events: `DRAFT` is what `applications.service.submit`
-# writes its one calculation against (ruling 8, at step 9, while the row is
-# still a draft); `SUBMITTED`/`IN_REVIEW`/`PENDING_INFO`/`RETURNED` are the
-# review states 3.9b recalculates in, after a reviewer corrects a herd or a
-# period. Nothing downstream has read a price yet in any of them.
-#
-# CLOSED — "APPROVED or beyond", enumerated rather than compared by ordering
-# (an ordering test over a 14-member state machine is a claim about the shape
-# of the machine, which `APPLICATION_TRANSITIONS` does not actually make).
+# **OWNER — `DRAFT` and `RETURNED` only: the two states in which the applicant
+# is the editor.** `DRAFT` is what `applications.service.submit` needs at step 9
+# (the status is still DRAFT there; the SUBMITTED write is step 11), and
+# `RETURNED` is 3.9b's resubmission after a correction. It stops at SUBMITTED
+# because the newest calculation is what `payments.issue_invoice` bills: an
+# applicant who submits at 2 060 000,00 — signed, and bound to that submission
+# — and then POSTs the same `application_id` with one head while the filing
+# sits in review would be invoiced for the cheap row, and `permits`' own
+# `calculation_after_decision` defence cannot fire because the row predates the
+# decision. Same divergence the audit probe found, reached from the applicant's
+# side. A speculative row planted in DRAFT before submitting needs no extra
+# rule: the submission writes a NEWER one in a later transaction and
+# `repo.newest_calculation` orders `created_at DESC, id DESC`
+# (pinned by `test_a_row_planted_in_draft_is_not_what_an_invoice_would_bill`).
+_OWNER_CALCULABLE_STATUSES = frozenset({"DRAFT", "RETURNED"})
+# **REVIEWER — additionally the three states in which the filing is theirs to
+# work on.** That is 3.9b's recalculation: a legitimate, audited staff action
+# on an application under review, and the reason the codes above are the REVIEW
+# codes rather than the read ones.
+_REVIEWER_EXTRA_CALCULABLE_STATUSES = frozenset({"SUBMITTED", "IN_REVIEW", "PENDING_INFO"})
+_REVIEWER_CALCULABLE_STATUSES = _OWNER_CALCULABLE_STATUSES | _REVIEWER_EXTRA_CALCULABLE_STATUSES
+
+# CLOSED to EVERYONE — "APPROVED or beyond", enumerated rather than compared by
+# ordering (an ordering test over a 14-member state machine is a claim about
+# the shape of the machine, which `APPLICATION_TRANSITIONS` does not make).
 # `APPROVED` is the line because 3.10a's `application_approved` subscriber
-# issues the invoice inside the approval's own transaction: from that instant
-# a price has been billed, and a newer row would be the under-billing above.
-# The four terminal states (`REJECTED`, `CANCELLED`, `EXPIRED_UNPAID`,
-# `CLOSED`) and `ARCHIVED` are in the closed set too — pricing an application
-# that is over is meaningless, and meaningless writes to an append-only table
-# are not free.
+# issues the invoice inside the approval's own transaction: from that instant a
+# price has been billed, and a newer row is the under-billing above. The four
+# terminal states (`REJECTED`, `CANCELLED`, `EXPIRED_UNPAID`, `CLOSED`) and
+# `ARCHIVED` are closed too — pricing an application that is over is
+# meaningless, and meaningless writes to an append-only table are not free.
 #
-# The two sets together are exactly `applications.models.APPLICATION_STATUSES`
-# (asserted by `tests/modules/norms/test_calculations_api.py`, which may import
-# it — a TEST is not bound by the module boundary), and the CHECK below reads
-# the OPEN one so that a status added later fails closed rather than slipping
-# through an enumeration nobody remembered to extend.
-_APPLICATION_OPEN_FOR_CALCULATION = frozenset(
-    {"DRAFT", "SUBMITTED", "IN_REVIEW", "PENDING_INFO", "RETURNED"}
-)
+# `_APPLICATION_OPEN_FOR_CALCULATION` is the union of everything ANY actor may
+# reach, and exists so the partition below can be asserted: the two sets
+# together are exactly `applications.models.APPLICATION_STATUSES`
+# (`test_calculation_application_guard.py`, which may import it — a TEST is not
+# bound by the module boundary). The runtime check reads the ACTOR's own set,
+# so a status added later is reachable by nobody until someone adds it.
+_APPLICATION_OPEN_FOR_CALCULATION = _REVIEWER_CALCULABLE_STATUSES
 _APPLICATION_CLOSED_FOR_CALCULATION = frozenset(
     {
         "APPROVED",
@@ -906,25 +931,30 @@ _APPLICATION_CLOSED_FOR_CALCULATION = frozenset(
 )
 
 
-async def _may_calculate_for(db: AsyncSession, actor: User, facts: Any) -> bool:
-    """Whether `actor` may attach a calculation to the application `facts`
-    describes: its own applicant, the superuser, or staff holding one of
-    `applications`' three read codes whose ZONE covers it.
+async def _is_entitled_reviewer(db: AsyncSession, actor: User, facts: Any) -> bool:
+    """Whether `actor` is staff entitled to REVIEW this application — a
+    permission code AND a zone, neither a substitute for the other (lesson:
+    zone scoping is not a permission check).
 
-    Both halves are needed, and neither is a substitute for the other (lesson:
-    zone scoping is not a permission check). The zone is resolved from
-    `assigned_org_id` while the application has one and from the contour's
-    owner before a reviewer takes it into work — the same rule
-    `applications.service._effective_organization` applies, restated here
-    because a private helper of another module is not part of its surface.
+    `sys_admin` passes every permission gate (decision #41 ruling 2) and
+    therefore passes this one, exactly as `permits.service._holds_view_any` and
+    `applications.service._holds_staff_read` do — a rule checked INSIDE a
+    handler does not get `require_permission`'s superuser branch for free. It
+    is a permission bypass and NOT a status bypass: the superuser still gets
+    the reviewer's status set, never the closed one.
+
+    The zone is resolved from `assigned_org_id` while the application has one
+    and from the CONTOUR's owner before a reviewer takes it into work — the
+    same rule `applications.service._effective_organization` applies, restated
+    here because a private helper of another module is not part of its surface.
+    An application whose organization cannot be resolved at all (a draft with
+    no contour yet) is outside every ZONED actor's zone and inside a
+    republic-wide one's, which is what the ordering below says.
     """
-    if facts["applicant_id"] in await auth_service.own_applicant_ids(db, actor.id):
-        return True
-    if await auth_service.role_code(db, actor) == SUPERUSER_ROLE:
-        return True
-    held = await auth_repo.permission_codes(db, actor)
-    if held.isdisjoint(_APPLICATION_READ_CODES):
-        return False
+    if await auth_service.role_code(db, actor) != SUPERUSER_ROLE:
+        held = await auth_repo.permission_codes(db, actor)
+        if held.isdisjoint(_APPLICATION_RECALCULATE_CODES):
+            return False
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
         return True
@@ -937,13 +967,31 @@ async def _may_calculate_for(db: AsyncSession, actor: User, facts: Any) -> bool:
     return org is not None and _organization_in_zone(zone, org)
 
 
+async def _calculable_statuses_for(
+    db: AsyncSession, actor: User, facts: Any
+) -> frozenset[str] | None:
+    """Which statuses THIS actor may bind a calculation in, or `None` when they
+    have no claim on the application at all.
+
+    Returning the SET rather than a bool is what makes the two questions
+    separable: "may you touch this application" decides between 404 and a
+    refusal with a reason, and "in this state" decides which reason.
+    """
+    owner = facts["applicant_id"] in await auth_service.own_applicant_ids(db, actor.id)
+    if await _is_entitled_reviewer(db, actor, facts):
+        return _REVIEWER_CALCULABLE_STATUSES
+    if owner:
+        return _OWNER_CALCULABLE_STATUSES
+    return None
+
+
 async def _assert_application_open_for_calculation(
     db: AsyncSession, *, application_id: uuid.UUID, actor: User
 ) -> None:
-    """The two refusals that must land with the widened
+    """The refusals that must land with the widened
     `CalculationIn.application_id` — see the block comment above.
 
-    Ownership first, status second, and the order matters: a stranger is told
+    Entitlement first, status second, and the order matters: a stranger is told
     404 `ERR-SYS-003` — the same answer an id that never existed gets, exactly
     as `applications.service._readable_application` answers, because an
     application carries a citizen's name, plot and herd and a 403 would make
@@ -956,12 +1004,24 @@ async def _assert_application_open_for_calculation(
     facts = await repo.application_facts(db, application_id)
     if facts is None:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if not await _may_calculate_for(db, actor, facts):
+    allowed = await _calculable_statuses_for(db, actor, facts)
+    if allowed is None:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if facts["status"] not in _APPLICATION_OPEN_FOR_CALCULATION:
+    status = facts["status"]
+    if status in _APPLICATION_CLOSED_FOR_CALCULATION:
+        # Closed to everyone, whoever is asking.
         raise err(
             "ERR-NORM-005",
-            details={"reason": "application_closed_for_calculation", "status": facts["status"]},
+            details={"reason": "application_closed_for_calculation", "status": status},
+        )
+    if status not in allowed:
+        # Open — but not to THIS actor: today that is the owner reaching for
+        # their own application after they submitted it, which only a reviewer
+        # may re-price. A distinct reason, because "closed" would be untrue and
+        # would send the applicant looking for a state change that never comes.
+        raise err(
+            "ERR-NORM-005",
+            details={"reason": "application_not_editable_by_this_actor", "status": status},
         )
 
 

@@ -442,6 +442,58 @@ async def doc_type_item_id(engine) -> AsyncIterator[uuid.UUID]:
 
 
 @pytest.fixture
+async def benefit_doc_type_item_id(engine) -> AsyncIterator[uuid.UUID]:
+    """The `doc_types` item whose code is EXACTLY
+    `service.BENEFIT_DOC_TYPE_CODE` — the one document type a benefit claim can
+    be proven with (ruling 10а, fail-closed).
+
+    Unlike `doc_type_item_id` above, the code cannot carry a random suffix: the
+    submission looks the item up BY that code. `uq_classifier_items_active_code`
+    therefore makes it a shared name in a shared, persistent database, so this
+    reuses an existing active row when one is there and only deletes what it
+    inserted itself — a blanket delete would strip a row another run is using
+    (lesson: the test DB is shared, persistent and never empty).
+    """
+    from app.modules.applications.service import BENEFIT_DOC_TYPE_CODE
+
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        existing = await own_db.scalar(
+            text(
+                "SELECT i.id FROM classifier_items i JOIN classifiers c ON c.id = i.classifier_id "
+                "WHERE c.code = 'doc_types' AND i.code = :code AND i.status = 'active'"
+            ).bindparams(code=BENEFIT_DOC_TYPE_CODE)
+        )
+        if existing is not None:
+            yield existing
+            return
+        item_id = uuid7()
+        await own_db.execute(
+            text(
+                "INSERT INTO classifier_items "
+                "(id, classifier_id, code, name, valid_from, sort_order, status) "
+                "SELECT :id, c.id, :code, CAST(:name AS jsonb), DATE '2020-01-01', 0, 'active' "
+                "FROM classifiers c WHERE c.code = 'doc_types'"
+            ).bindparams(id=item_id, code=BENEFIT_DOC_TYPE_CODE, name='{"en": "Benefit proof"}')
+        )
+        await own_db.commit()
+        try:
+            yield item_id
+        finally:
+            # The attachments first: an HTTP-driven test COMMITS its
+            # `application_documents` rows, so they outlive it and hold an FK.
+            await own_db.execute(
+                text("DELETE FROM application_documents WHERE doc_type_item_id = :id").bindparams(
+                    id=item_id
+                )
+            )
+            await own_db.execute(
+                text("DELETE FROM classifier_items WHERE id = :id").bindparams(id=item_id)
+            )
+            await own_db.commit()
+
+
+@pytest.fixture
 async def benefit_category_item_id(engine) -> AsyncIterator[uuid.UUID]:
     """One `benefit_categories` classifier item, by ID.
 

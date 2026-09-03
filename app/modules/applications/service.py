@@ -114,6 +114,13 @@ BENEFIT_CLASSIFIER_CODE = "benefit_categories"
 # membership, not merely that the id names some classifier item — otherwise a
 # rejection reason could be attached as a document type.
 DOC_TYPE_CLASSIFIER_CODE = "doc_types"
+# The ONE `doc_types` item a benefit claim is proven with (ruling 10а, made
+# fail-closed by review round 2's important 5). Named here so a reader can see
+# WHAT the submission looks for; migration 0005 seeds the classifier but none
+# of its items — they are the Agency's to supply — so until this code exists
+# and is active, `_assert_benefit_documents` refuses every benefit claim rather
+# than accepting an unchecked attachment as proof.
+BENEFIT_DOC_TYPE_CODE = "benefit_proof"
 
 # tz/05's transition table, verbatim (plan 03.9a task 8, the brief's own
 # copy). All fourteen `APPLICATION_STATUSES` are keys; `ARCHIVED` is
@@ -1172,7 +1179,12 @@ def _package_bytes(
     `gis.service.published_version`.
     """
     version_id = contour_version_id or application.contour_version_id
-    assert version_id is not None, "the caller resolves the published version first"
+    if version_id is None:
+        # Never an `assert` on a request path — `-O` strips it, and what this
+        # function returns is SIGNED (review round 2, minor 9). Unreachable
+        # today: both callers run `_published_version_or_refuse` first, which
+        # is the honest 409 for a contour whose geometry is still a draft.
+        raise err("ERR-SYS-001", details={"reason": "package_without_a_contour_version"})
     if isinstance(priced, Mapping):
         amount = priced["amount"]
         rule_version = priced["rule_code_version"]
@@ -1186,6 +1198,18 @@ def _package_bytes(
         "activity_type_code": request["activity_code"],
         "amount": _canonical_decimal(amount),
         "applicant_id": str(application.applicant_id),
+        # **WHICH application this is** (review round 2, important 3). Without
+        # it two drafts of one applicant with identical content produce
+        # identical bytes, so one PKCS#7 verifies for either — and "I signed
+        # THIS application" is exactly what a non-repudiation document must be
+        # able to prove from the bytes alone.
+        #
+        # `submission_id` is deliberately NOT here: it is minted per attempt at
+        # `submit`'s step 0, and `GET /package` cannot know it, so including it
+        # would make every fetched package differ from the bytes `submit` signs
+        # and every submission would fail `ERR-SIGN-001`. The attempt is
+        # identified by the signature's own `object_id` instead (ruling 25).
+        "application_id": str(application.id),
         "contour_version_id": str(version_id),
         # Sorted by code, never in the order the rows happened to arrive: a herd
         # re-sent in a different order is the same herd, and the bytes have to
@@ -1228,31 +1252,74 @@ async def _assert_complete(db: AsyncSession, application: Application) -> None:
         raise err("ERR-APP-001", details={"missing": missing})
 
 
-async def _assert_benefit_documents(db: AsyncSession, application: Application) -> None:
-    """Step 3, ruling 10а: a claimed benefit needs a supporting document
-    (`tz/06` § Льготы — «Реестр льготных категорий + подтверждающие
-    документы»; `tz/04` С3 item 9). 422 `ERR-APP-003`, «неполный комплект
-    документов», which is exactly what this is.
+async def _benefit_doc_type(db: AsyncSession) -> Any:
+    """The ACTIVE `doc_types` item whose code is `BENEFIT_DOC_TYPE_CODE`, or
+    `None` when the Agency has not seeded it yet.
 
-    **What is checked is that a document is attached at all, not that it is of
-    the benefit TYPE, and that is the honest limit of 3.9a.** The `doc_types`
-    classifier is seeded EMPTY by migration 0005 — its items are the Agency's
-    to supply — so there is no code this module could compare against, and
-    inventing one here would be a product decision made in a service. Ruling
-    10а's second half already covers the gap: the reviewer confirms the
-    document is the right kind, and that confirmation is recorded as its own
-    `application_checks` row (3.9b, which owns the review screen). The claim
-    itself is validated against the benefit classifier at PATCH time
-    (`_assert_references`) and against the tariff rows it must resolve at
+    Read through `admin.repo`, never a query of `classifier_items` here
+    (CLAUDE.md: reference data is read-only and reached through its owner).
+    `list_classifier_items` already applies "valid today AND active", which is
+    the only sense in which a doc type is usable on a submission — an archived
+    or not-yet-valid one is not proof of anything.
+    """
+    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
+    if classifier is None:
+        return None
+    items = await admin_repo.list_classifier_items(db, classifier.id)
+    return next((item for item in items if item.code == BENEFIT_DOC_TYPE_CODE), None)
+
+
+async def _assert_benefit_documents(db: AsyncSession, application: Application) -> None:
+    """Step 3, ruling 10а: a claimed benefit needs a supporting document of the
+    BENEFIT type (`tz/06` § Льготы — «Реестр льготных категорий +
+    подтверждающие документы»; `tz/04` С3 item 9). 422 `ERR-APP-003`,
+    «неполный комплект документов», which is exactly what this is.
+
+    **FAIL-CLOSED, and deliberately so** (review round 2, important 5). A
+    benefit REDUCES the fee, so "any attachment will do" is a fee-reducing
+    claim accepted on evidence nobody checked. The project's posture on
+    benefits is fail-closed everywhere else — `ERR-NORM-004` refuses a grazing
+    fee outright rather than guessing a missing `coef_sb:*`, and
+    `benefit_categories` ships EMPTY so no benefit can be claimed at all today
+    — and this now matches it:
+
+      * the document must be of the `doc_types` item whose code is
+        `BENEFIT_DOC_TYPE_CODE` below; a document of any other type does not
+        satisfy the claim;
+      * if that classifier item does not exist or is not active — which is the
+        state of a fresh database, since migration 0005 seeds the `doc_types`
+        CLASSIFIER but none of its ITEMS, those being the Agency's to supply —
+        the claim is REFUSED with `benefit_doc_type_not_configured`, never
+        accepted. An unconfigurable rule refuses; it does not wave things
+        through.
+
+    The consequence, stated plainly: until the Agency seeds `benefit_proof` in
+    `doc_types`, no benefit can be claimed on a submission. That is the same
+    fail-closed state `tz/12` #2 already describes for the benefit list itself,
+    and the controller is recording it as an open question.
+
+    The claim is separately validated against the benefit classifier at PATCH
+    time (`_assert_references`) and against the tariff rows it must resolve at
     pricing time (decision #50), so an invented category never gets this far.
     """
     if application.benefit_category_item_id is None:
         return
-    if not await repo.list_documents(db, application.id):
+    doc_type = await _benefit_doc_type(db)
+    if doc_type is None:
+        raise err(
+            "ERR-APP-003",
+            details={
+                "reason": "benefit_doc_type_not_configured",
+                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
+            },
+        )
+    documents = await repo.list_documents(db, application.id)
+    if not any(document.doc_type_item_id == doc_type.id for document in documents):
         raise err(
             "ERR-APP-003",
             details={
                 "reason": "benefit_claim_needs_a_document",
+                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
                 "benefit_category_item_id": str(application.benefit_category_item_id),
             },
         )

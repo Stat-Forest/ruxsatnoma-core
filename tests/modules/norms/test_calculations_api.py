@@ -249,43 +249,12 @@ async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_
     assert mine.json()["application_id"] == str(application.id)
 
 
-async def test_the_calculation_guard_agrees_with_applications_own_vocabulary() -> None:
-    """`norms` is level 2 and may not import `applications`, so
-    `norms.service` re-declares two things that BELONG to `applications`: its
-    three read permission codes, and which statuses may still receive a
-    calculation. A test is not bound by the module boundary, so this is where
-    the copies are held to the originals.
-
-    Without it a rename in `applications.permissions` would silently widen the
-    money guard (an unknown code is held by nobody, so the staff branch would
-    simply stop admitting anyone — or, worse, a code REMOVED from the frozenset
-    would admit staff who should not be there), and a fifteenth application
-    status would land in neither set with nobody to notice.
-    """
-    from app.modules.applications.models import APPLICATION_STATUSES
-    from app.modules.applications.permissions import (
-        APPLICATIONS_DECIDE,
-        APPLICATIONS_REVIEW,
-        APPLICATIONS_VIEW_ANY,
-    )
-    from app.modules.norms import service
-
-    assert service._APPLICATION_READ_CODES == {
-        APPLICATIONS_VIEW_ANY,
-        APPLICATIONS_REVIEW,
-        APPLICATIONS_DECIDE,
-    }
-
-    open_, closed = (
-        service._APPLICATION_OPEN_FOR_CALCULATION,
-        service._APPLICATION_CLOSED_FOR_CALCULATION,
-    )
-    assert open_ & closed == frozenset()
-    assert open_ | closed == set(APPLICATION_STATUSES)
-    # The line itself: APPROVED is where a price has been billed (3.10a's
-    # subscriber invoices inside the approval's own transaction), so it and
-    # everything after it are closed.
-    assert "APPROVED" in closed and "RETURNED" in open_
+# The guard's own vocabulary check moved to
+# `test_calculation_application_guard.py` with the rename of
+# `_APPLICATION_READ_CODES` -> `_APPLICATION_RECALCULATE_CODES` (review round
+# 2, Critical 1): the name it asserted against documented the defect, and the
+# whole predicate — entitlement, zone, and the actor-dependent status split —
+# is covered in one place there rather than half here.
 
 
 async def test_a_calculation_with_no_application_id_is_still_saved(

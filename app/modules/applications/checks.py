@@ -237,9 +237,13 @@ async def calculation_payload(db: AsyncSession, application: Application) -> Cal
     because reference data is never re-queried from another module's tables
     (CLAUDE.md).
 
-    `application_id` is left at its default: `norms.schemas.CalculationIn` types
-    it `None` for the whole of 3.9a's task 4, and task 5 widens it together with
-    the ownership and status guard that has to land in the same commit.
+    `application_id` is left at its default. Task 5 widened
+    `norms.schemas.CalculationIn.application_id` to a real `uuid.UUID | None`,
+    but it stays unset HERE: the pre-check prices without storing anything
+    (ruling 19), and the one caller that does store — `service.submit` at step
+    9 — adds the binding itself with `model_copy(update=...)` on the very
+    object this function returned, so the row that is stored and the package
+    that was signed describe one request rather than two builds of it.
     """
     assert application.activity_type_id is not None
     assert application.contour_id is not None
