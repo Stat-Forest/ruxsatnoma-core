@@ -42,7 +42,7 @@ from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events as payment_events
-from app.modules.payments import refunds, repo
+from app.modules.payments import refunds, repo, statement_service
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import (
     ALLOCATION_ENTRY_TYPES,
@@ -216,8 +216,10 @@ _, _RESULT_DISCREPANCY, _ = RECONCILIATION_RESULTS
 # same tuple, so a literal here could disagree with the database and fail as
 # an IntegrityError 500 on live money. The unpack is deliberate over an index
 # — adding a third provider breaks this line loudly, at the one place that
-# has to decide what the new provider means for a manual confirmation.
-_PAYME_PROVIDER, MANUAL_PROVIDER = PAYMENT_PROVIDERS
+# has to decide what the new provider means for a manual confirmation. Only
+# `MANUAL_PROVIDER` is read below; the first slot (`"payme"`) is discarded
+# rather than bound to an unused name.
+_, MANUAL_PROVIDER = PAYMENT_PROVIDERS
 # `provider_transactions.state` has no CHECK and no tuple to derive from
 # (design/02 gives it none — the column stores the provider's own raw state).
 # "2" is Payme's PERFORMED, reused verbatim rather than given a manual-only
@@ -518,13 +520,18 @@ async def _confirm_and_pay(
     # the seeded template keeps a real reader instead of becoming a dead
     # seed.
     #
-    # The REJECT path deliberately sends nothing: there is no
+    # The REJECT path deliberately calls `notify()` on nobody. There is no
     # `payment.manual_rejected` template seeded (migration 0022 seeds only
-    # `refund.decided` and `payment.manual_confirmed`), and `notify` on an
-    # unseeded code silently finds no template — a call that looks like a
-    # notification and delivers none. The rejection reason reaches the maker
-    # through the register and the audit trail; a template for it is a
-    # migration, and this stage takes no new number.
+    # `refund.decided` and `payment.manual_confirmed`) — but `notify()` on an
+    # unseeded code is NOT silent: it still writes an `inapp` row (raw
+    # fallback text, no template) and logs `notification.template_missing`
+    # at ERROR (`notifications.service.notify`). Calling it here would give
+    # the maker an untranslated, unreviewed cabinet message instead of
+    # nothing, which is worse than the register and the audit trail they
+    # already have. The rejection reason reaches the maker through those two
+    # instead; seeding `payment.manual_rejected` (a migration — this stage
+    # takes no new number) is the follow-up that lets this call be added for
+    # real.
     application = await applications_service.get(db, invoice.application_id)
     if application is not None:
         await notifications_service.notify(
@@ -953,4 +960,45 @@ async def list_refunds(
     route's own `PAYMENTS_VIEW` gate already decides who may call this."""
     return await repo.list_refunds(
         db, application_id=application_id, status=status, limit=limit, offset=offset
+    )
+
+
+# --- Task 10: the ledger read route ---------------------------------------
+
+
+async def list_allocations(
+    db: AsyncSession,
+    *,
+    invoice_id: uuid.UUID | None,
+    period_from: date | None,
+    period_to: date | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Allocation], int]:
+    """`GET /payments/allocations` — the whole `allocations` ledger, oldest
+    first, selected either by ONE invoice (`invoice_id`) or by an
+    `occurred_at` PERIOD (`period_from`/`period_to`, a calendar-day pair in
+    Asia/Tashkent, resolved to UTC instants through `statement_service.
+    day_bounds` — the same conversion `statement_service._period_
+    reconciliation` uses for the identical calendar-day-vs-timestamptz
+    problem). Neither given is `ERR-VAL-001`: a route with no filter at all
+    would page the whole ledger this system will ever write.
+
+    A reversed period (`period_to < period_from`) is `ERR-VAL-001` too — the
+    lesson on a reversed date period silently hiding the rows it should
+    find, checked here rather than left to an empty page nobody would
+    question. `invoice_id` takes priority when both are given: it names
+    exactly one invoice's ledger, which no period could narrow further."""
+    if invoice_id is not None:
+        return await repo.list_allocations(
+            db, invoice_id=invoice_id, since=None, until=None, limit=limit, offset=offset
+        )
+    if period_from is None or period_to is None:
+        raise err("ERR-VAL-001", details={"reason": "invoice_id_or_period_required"})
+    if period_to < period_from:
+        raise err("ERR-VAL-001", details={"reason": "period_reversed"})
+    since, _ = statement_service.day_bounds(period_from)
+    _, until = statement_service.day_bounds(period_to)
+    return await repo.list_allocations(
+        db, invoice_id=None, since=since, until=until, limit=limit, offset=offset
     )

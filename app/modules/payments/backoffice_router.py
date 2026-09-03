@@ -58,6 +58,7 @@ from app.modules.auth.deps import idempotency_context, require_permission
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service, statement_service
 from app.modules.payments.backoffice_schemas import (
+    AllocationOut,
     FiledManualConfirmationOut,
     ManualConfirmationIn,
     ManualConfirmationOut,
@@ -367,3 +368,52 @@ async def reject_manual_confirmation(
         db, confirmation_id, approve=False, reason=body.reason, actor=actor
     )
     return ManualConfirmationOut.model_validate(row)
+
+
+# --- Task 10: the ledger read route -------------------------------------------
+
+
+@router.get("/allocations", response_model=Page[AllocationOut])
+async def list_allocations(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    invoice_id: Annotated[uuid.UUID | None, Query()] = None,
+    period_from: Annotated[date | None, Query()] = None,
+    period_to: Annotated[date | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
+) -> Any:
+    """The whole `allocations` ledger, oldest first — `payment`, `correction`
+    (a reversal's negation, `service.record_reversal`) and `refund` (a
+    returned refund's negative entries, `backoffice_service.approve_refund`)
+    rows alike, never filtered by `entry_type`. Selected either by ONE
+    invoice (`?invoice_id=`) or by an `occurred_at` PERIOD
+    (`?period_from=&period_to=`, a calendar-day pair in Asia/Tashkent);
+    neither given, or only one half of the pair, is `ERR-VAL-001` — a route
+    with no filter at all would page the whole ledger this system will ever
+    write, and a half-given pair silently hides the rows a reversed or
+    incomplete range would miss (the lesson on a reversed date period).
+
+    **This route answers "did the money arrive against an invoice" — never
+    "did each half of the 50/50 split reach its own account"** (ruling 10,
+    the same limitation `GET /payments/reconciliations`'s own docstring
+    states): `account` is `null`, present on EVERY row, whenever that row
+    is the state budget's own half or names a leshoz with no account on
+    file (`tz/12` #15 — the state budget's account number is stored nowhere
+    in this system). A client renders that `null` as "settled outside the
+    system", never as a blank account number.
+    """
+    rows, total = await backoffice_service.list_allocations(
+        db,
+        invoice_id=invoice_id,
+        period_from=period_from,
+        period_to=period_to,
+        limit=limit,
+        offset=offset,
+    )
+    return Page[AllocationOut](
+        items=[AllocationOut.model_validate(row) for row in rows],
+        total=total,
+        page=offset // limit + 1,
+        page_size=limit,
+    )

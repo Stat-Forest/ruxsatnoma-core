@@ -66,3 +66,15 @@ async def log(
     )
     await repo.add(db, entry)
     return entry
+
+
+async def already_logged(db: AsyncSession, *, action: str, object_id: uuid.UUID) -> bool:
+    """Whether `object_id` already has an `audit_log` row for `action` — the
+    once-only check a periodic job needs before writing a risk-indicator row
+    a second time (mirrors `notifications.service.already_notified`'s own
+    shape and its own reasoning: a caller outside `audit` may not query
+    `AuditLog` directly, and needs no new column to ask "was this already
+    flagged"). First caller: `payments.jobs.refund_sla_sweep` (3.10b task
+    10), whose RI-07 is a fact about the refund, not a notification, so
+    `already_notified` does not apply to it."""
+    return await repo.exists(db, action=action, object_id=object_id)

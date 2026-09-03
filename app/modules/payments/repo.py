@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.payments.models import (
     MANUAL_CONFIRMATION_STATUSES,
+    REFUND_STATUSES,
     Allocation,
     BankStatement,
     BankStatementLine,
@@ -134,6 +135,39 @@ async def list_allocations_by_invoice(
         .order_by(Allocation.occurred_at, Allocation.id)
     )
     return (await db.execute(stmt)).scalars().all()
+
+
+async def list_allocations(
+    db: AsyncSession,
+    *,
+    invoice_id: uuid.UUID | None,
+    since: datetime | None,
+    until: datetime | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Allocation], int]:
+    """`GET /payments/allocations` (3.10b task 10) — the whole ledger, oldest
+    first, unfiltered by `entry_type` (mirrors `list_allocations_by_invoice`'s
+    own reasoning: `payment`, `correction` and `refund` rows all belong in
+    the one page a report or an audit reads). Selected either by ONE
+    invoice, or by an `occurred_at` window — the ROUTE resolves a
+    `period_from`/`period_to` pair into `since`/`until` and guarantees
+    exactly one selection mode is given (`ERR-VAL-001` otherwise); this
+    function only builds whichever WHERE clause it is handed."""
+    stmt = select(Allocation)
+    if invoice_id is not None:
+        stmt = stmt.where(Allocation.invoice_id == invoice_id)
+    if since is not None:
+        stmt = stmt.where(Allocation.occurred_at >= since)
+    if until is not None:
+        stmt = stmt.where(Allocation.occurred_at <= until)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Allocation.occurred_at, Allocation.id).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
 
 
 # --- The one read this module makes outside its own tables (3.10b task 8) ----
@@ -495,10 +529,6 @@ async def add_refund(db: AsyncSession, refund: Refund) -> None:
     await db.flush()
 
 
-async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
-    return await db.get(Refund, refund_id)
-
-
 async def get_refund_for_update(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
     """The locking read for `submit_refund_decision`/`approve_refund` —
     mirrors `get_manual_confirmation_for_update`'s own reasoning: two
@@ -531,3 +561,22 @@ async def list_refunds(
         )
     ).scalars()
     return list(rows), total
+
+
+# --- 3.10b task 10: the refund SLA sweep --------------------------------------
+
+# Which refund statuses are still "awaiting a decision" for RI-07's purposes
+# (mirrors `IN_FORCE_STATUSES` above): a `returned`/`rejected` row is
+# terminal and untouched by the sweep, even one long past its own `due_at`.
+REFUND_OPEN_STATUSES = (REFUND_STATUSES[0], REFUND_STATUSES[1])  # "requested", "in_review"
+
+
+async def list_refunds_past_due(db: AsyncSession, *, on_date: date) -> Sequence[Refund]:
+    """Every `requested`/`in_review` refund whose 20-working-day control
+    deadline (`due_at`, RI-07) is already in the past — `payments.jobs.
+    refund_sla_sweep`'s candidate set. A `returned`/`rejected` row is
+    excluded by the status filter alone, which is also what makes a second
+    sweep run a no-op for a row an earlier run already flagged AND decided
+    in between."""
+    stmt = select(Refund).where(Refund.status.in_(REFUND_OPEN_STATUSES), Refund.due_at < on_date)
+    return (await db.execute(stmt)).scalars().all()

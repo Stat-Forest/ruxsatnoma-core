@@ -356,21 +356,43 @@ async def test_no_in_force_invoice_still_files_the_refund_with_a_reason(
     assert body["invoice_id"] == str(cancelled_invoice.id)
 
 
-async def test_a_snapshot_with_no_request_key_still_files_the_refund(
+@pytest.mark.parametrize(
+    ("input_snapshot", "expected_reason"),
+    [
+        pytest.param({}, "snapshot_missing_request", id="no_request_key"),
+        pytest.param(
+            {"request": {"period_from": "not-a-date", "period_to": "2026-01-01"}},
+            "period_unparseable",
+            id="unparseable_period",
+        ),
+        pytest.param(
+            {"request": {"period_from": "2026-05-10", "period_to": "2026-05-01"}},
+            "period_zero_length",
+            id="zero_length_period",
+        ),
+    ],
+)
+async def test_a_malformed_frozen_snapshot_still_files_the_refund(
     db: AsyncSession,
     payments_view_client,
     approved_application: Application,
     grazing_activity_id: uuid.UUID,
     rf01: uuid.UUID,
+    input_snapshot: dict,
+    expected_reason: str,
 ):
-    """Ruling 2's "snapshot missing the request key" case — the frozen
-    calculation's own `input_snapshot` has no `"request"` object at all
-    (`approved_application`'s own fixture builds exactly this: `{}`)."""
+    """Ruling 2's three degenerate-snapshot cases, parametrized — they differ
+    only in `input_snapshot` and the `suggestion_reason` it degrades to: the
+    frozen calculation's own `input_snapshot` has no `"request"` object at
+    all (`approved_application`'s own fixture builds exactly this: `{}`), an
+    unparseable date, and a `period_to` strictly before `period_from` (never
+    fed to `refunds.hint`, whose own precondition is a positive-length
+    period). A hint is never an error in any of the three."""
     calc = Calculation(
         application_id=approved_application.id,
         activity_type_id=grazing_activity_id,
         rule_code_version="norms-1.0.0",
-        input_snapshot={},
+        input_snapshot=input_snapshot,
         amount=Decimal("100.00"),
         breakdown={},
     )
@@ -392,83 +414,7 @@ async def test_a_snapshot_with_no_request_key_still_files_the_refund(
         json={"application_id": str(approved_application.id), "basis_item_id": str(rf01)},
     )
     assert response.status_code == 201, response.text
-    assert response.json()["suggestion_reason"] == "snapshot_missing_request"
-
-
-async def test_an_unparseable_period_still_files_the_refund(
-    db: AsyncSession,
-    payments_view_client,
-    approved_application: Application,
-    grazing_activity_id: uuid.UUID,
-    rf01: uuid.UUID,
-):
-    """Ruling 2's "unparseable date" case."""
-    calc = Calculation(
-        application_id=approved_application.id,
-        activity_type_id=grazing_activity_id,
-        rule_code_version="norms-1.0.0",
-        input_snapshot={"request": {"period_from": "not-a-date", "period_to": "2026-01-01"}},
-        amount=Decimal("100.00"),
-        breakdown={},
-    )
-    db.add(calc)
-    await db.flush()
-    invoice = Invoice(
-        application_id=approved_application.id,
-        calculation_id=calc.id,
-        number=f"INV-2027-{uuid.uuid4().hex[:6]}",
-        amount=Decimal("100.00"),
-        status="paid",
-        paid_at=datetime.now(UTC),
-    )
-    db.add(invoice)
-    await db.commit()
-
-    response = await payments_view_client.post(
-        REFUNDS,
-        json={"application_id": str(approved_application.id), "basis_item_id": str(rf01)},
-    )
-    assert response.status_code == 201, response.text
-    assert response.json()["suggestion_reason"] == "period_unparseable"
-
-
-async def test_a_zero_length_period_still_files_the_refund(
-    db: AsyncSession,
-    payments_view_client,
-    approved_application: Application,
-    grazing_activity_id: uuid.UUID,
-    rf01: uuid.UUID,
-):
-    """Ruling 2's "zero-length paid period" case — `period_to` strictly
-    before `period_from` in the frozen snapshot, never fed to `refunds.hint`,
-    whose own precondition is a positive-length period."""
-    calc = Calculation(
-        application_id=approved_application.id,
-        activity_type_id=grazing_activity_id,
-        rule_code_version="norms-1.0.0",
-        input_snapshot={"request": {"period_from": "2026-05-10", "period_to": "2026-05-01"}},
-        amount=Decimal("100.00"),
-        breakdown={},
-    )
-    db.add(calc)
-    await db.flush()
-    invoice = Invoice(
-        application_id=approved_application.id,
-        calculation_id=calc.id,
-        number=f"INV-2027-{uuid.uuid4().hex[:6]}",
-        amount=Decimal("100.00"),
-        status="paid",
-        paid_at=datetime.now(UTC),
-    )
-    db.add(invoice)
-    await db.commit()
-
-    response = await payments_view_client.post(
-        REFUNDS,
-        json={"application_id": str(approved_application.id), "basis_item_id": str(rf01)},
-    )
-    assert response.status_code == 201, response.text
-    assert response.json()["suggestion_reason"] == "period_zero_length"
+    assert response.json()["suggestion_reason"] == expected_reason
 
 
 async def test_submit_decision_with_a_wrong_breakdown_answers_err_val_001(

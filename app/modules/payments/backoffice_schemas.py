@@ -85,6 +85,38 @@ class StatementOut(BaseModel):
     lines_total: int
 
 
+class AllocationOut(BaseModel):
+    """One `allocations` ledger row (`GET /payments/allocations`, 3.10b task
+    10) — `payment`, `correction` (a reversal's negation,
+    `service.record_reversal`) and `refund` (a returned refund's negative
+    entries, `backoffice_service.approve_refund`) rows alike.
+
+    **`account` is `null` whenever the row is the state budget's own half of
+    the 50/50 split, or names a leshoz with no account on file** (`tz/12`
+    #15, ruling 10 — the budget's account number is stored nowhere in this
+    system): declared here with no default and no `field_serializer` of its
+    own, so a `None` value serializes as JSON `null` — present on every
+    response, never omitted, never `""`. An accountant's UI must render that
+    as "settled outside the system", not as a blank account number."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    invoice_id: uuid.UUID
+    transaction_id: uuid.UUID | None
+    refund_id: uuid.UUID | None
+    entry_type: str
+    target: str
+    account: str | None
+    amount: Decimal
+    occurred_at: datetime
+    note: str | None
+
+    @field_serializer("amount")
+    def _amount(self, value: Decimal) -> str:
+        return str(value)
+
+
 class ReconciliationOut(BaseModel):
     """One row of the discrepancy register (`GET /payments/reconciliations`) —
     either a per-line comparison (`statement_line_id` set) or a whole

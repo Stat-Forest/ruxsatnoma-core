@@ -241,6 +241,23 @@ async def expire_invoices(factory: async_sessionmaker[AsyncSession]) -> dict[str
     return counts
 
 
+async def refund_sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
+    """Flag a refund still `requested`/`in_review` past its 20-working-day
+    control deadline — RI-07 (plan `03.10b-payments-reconciliation` task 10).
+
+    Thin wrapper only — `payments.jobs.refund_sla_sweep(db)` holds the
+    actual logic (the candidate query, the once-only check, the audit
+    trail), the same split `expire_invoices` above has from
+    `payments.jobs.expiry_sweep`. This function's own job is the one every
+    other job in this file already does: open a session, run it, commit."""
+    async with factory() as db:
+        counts = await payments_jobs.refund_sla_sweep(db)
+        await db.commit()
+    if counts["flagged"]:
+        logger.info("job.refund_sla_sweep", **counts)
+    return counts
+
+
 async def _drain_batches(
     factory: async_sessionmaker[AsyncSession],
     sweep: Callable[[AsyncSession, uuid.UUID | None], Awaitable[permits_jobs.SweepBatch]],

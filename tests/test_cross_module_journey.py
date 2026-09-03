@@ -44,6 +44,7 @@ literal — these fixtures COMMIT their users, `users.pinfl` is unique and
 and fails on the second run of the suite.
 """
 
+import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -54,6 +55,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
+from app.core.models import MediaFile
 from app.modules.applications import service as applications_service
 from app.modules.applications.events import APPLICATION_APPROVED
 from app.modules.applications.models import Application
@@ -257,6 +259,151 @@ async def test_the_journey_from_approval_to_the_public_qr_page(
     # `payments.issue_invoice` and `permits.issue` each call
     # `applications.service.current_calculation` independently, and being both
     # level 4 they cannot compare notes. Here they can be compared.
+    assert permit.amount == billed_amount, (
+        f"the permit prints {permit.amount} but the citizen was billed {billed_amount}"
+    )
+    assert billed_calculation_id is not None
+    assert str(permit.snapshot["calculation_id"]) == str(billed_calculation_id), (
+        "the invoice and the permit's frozen snapshot name different calculations, "
+        "so a paid invoice cannot be reconciled with the document it paid for"
+    )
+
+
+async def test_the_manual_confirmation_door_reaches_every_downstream_module_too(
+    db: AsyncSession,
+    client: httpx.AsyncClient,
+    hodim_client: httpx.AsyncClient,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    journey_holder: Signer,
+    journey_executor: User,
+    approved_application: Application,
+):
+    """The Payme branch above (plan `03.10b-payments-reconciliation` task
+    10) proves the bus/signature/QR chain once through the PROVIDER door;
+    this proves the OTHER legal way an invoice becomes `paid` — `tz/08` §4's
+    maker-checker manual confirmation — reaches every one of the same
+    downstream modules.
+
+    No new actor is introduced: `accountant_client` (`accountant`, holds
+    `payments.manage`) FILES and `head_client` (`executor_head`, holds
+    `payments.confirm`) DECIDES — the same two roles this file already needs
+    a few lines below for two of the four ERI signatures. Only a new ACTION
+    by actors already in the journey.
+
+    Hop 2 is the only thing this test does differently from the Payme
+    version above: `POST /payments/manual-confirmations` then
+    `.../confirm`, never a `ProviderTransaction` built by hand. The checker's
+    approval pays through the exact same `payments.service.confirm_payment`
+    the Payme webhook calls (ruling 14), so hops 1 and 3-6 are asserted
+    IDENTICALLY to the Payme test above — a divergence between the two doors
+    downstream of `confirm_payment` is exactly the seam this test exists to
+    catch.
+    """
+    app_id = approved_application.id
+
+    # --- hop 1: APPROVED -> INVOICED, carried by the bus ----------------------
+    await publish(db, Event(name=APPLICATION_APPROVED, payload={"application_id": app_id}))
+    await db.commit()
+
+    application = await applications_service.get(db, app_id)
+    assert application is not None
+    assert (await _reread(db, application)).status == "INVOICED"
+
+    invoice = await payments_service.invoice_for_application(db, app_id)
+    assert invoice is not None, "the bus hop application_approved -> issue_invoice did not happen"
+    await db.refresh(invoice)
+    billed_amount = invoice.amount
+    billed_calculation_id = invoice.calculation_id
+
+    # --- hop 2: the money arrives, through the MANUAL door --------------------
+    bank_doc = MediaFile(
+        storage_key=f"journey-bank-docs/{uuid.uuid4().hex}.pdf",
+        filename="payment-order.pdf",
+        content_type="application/pdf",
+        size_bytes=2048,
+        sha256=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+    )
+    db.add(bank_doc)
+    await db.commit()
+
+    filed = await accountant_client.client.post(
+        f"{API}/payments/manual-confirmations",
+        json={
+            "invoice_id": str(invoice.id),
+            "amount": str(invoice.amount),
+            "paid_at": datetime.now(UTC).isoformat(),
+            "bank_doc_file_id": str(bank_doc.id),
+        },
+    )
+    assert filed.status_code == 201, filed.text
+    confirmation_id = filed.json()["id"]
+
+    confirmed = await head_client.client.post(
+        f"{API}/payments/manual-confirmations/{confirmation_id}/confirm"
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+    assert (await _reread(db, application)).status == "PAID"
+    # `is_paid` reads the invoice back through its OWN query, but the
+    # object it resolves to is already in this session's identity map from
+    # the `invoice_for_application` call above — a `SELECT` does not refresh
+    # an already-loaded instance's attributes (lesson: "the db fixture
+    # session and the app's session never see each other's current state").
+    # `_reread` is exactly this fix, applied to `invoice` instead of
+    # `application`.
+    await _reread(db, invoice)
+    assert await payments_service.is_paid(db, app_id) is True
+
+    # --- hop 3: the executor learns a permit is due --------------------------
+    due = list(
+        await db.scalars(
+            select(Notification).where(
+                Notification.event_code == permit_events.PERMIT_DUE,
+                Notification.recipient_user_id == journey_executor.id,
+                Notification.object_id == app_id,
+            )
+        )
+    )
+    assert due, "the manual door did not carry payment_confirmed to permits.on_payment_confirmed"
+    assert {row.params["amount"] for row in due} == {str(billed_amount)}
+    assert await permits_service.for_application(db, app_id) is None
+
+    # --- hop 4: a human forms the document -----------------------------------
+    issued = await hodim_client.post(f"{API}/applications/{app_id}/permit")
+    assert issued.status_code == 201, issued.text
+    permit_id = uuid.UUID(issued.json()["id"])
+
+    pdf_response = await journey_holder.client.get(f"{API}/permits/{permit_id}/pdf")
+    assert pdf_response.status_code == 200, pdf_response.text
+    pdf = pdf_response.content
+
+    assert (await _reread(db, application)).status == "PAID"
+
+    # --- hop 5: the 3+1 ERI signatures ---------------------------------------
+    for signer, purpose in (
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+        (accountant_client, "permit_accountant"),
+        (journey_holder, signers.RECIPIENT_PURPOSE),
+    ):
+        result = await sign_permit(signer, permit_id, purpose, pdf)
+        assert result.status_code == 200, (purpose, result.text)
+
+    permit = await permits_service.get(db, permit_id)
+    assert permit is not None
+    assert (await _reread(db, permit)).status == "active"
+    assert (await _reread(db, application)).status == "PERMIT_ISSUED"
+
+    # --- hop 6: the anonymous public check ------------------------------------
+    public = await client.get(f"{API}/public/permits/check", params={"qr": permit.qr_token})
+    assert public.status_code == 200, public.text
+    body = public.json()
+    assert body["found"] is True
+    assert body["status"] == permits_service.PUBLIC_STATUS_LABELS["active"]
+
+    # --- what only this test can see: the money is ONE number ----------------
     assert permit.amount == billed_amount, (
         f"the permit prints {permit.amount} but the citizen was billed {billed_amount}"
     )

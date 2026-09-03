@@ -64,6 +64,17 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # RI-07 (plan 03.10b-payments-reconciliation task 10): a daily digest,
+    # not immediate (`tz/10` classifies it medium severity) — same slot
+    # shape as the invoice sweep just above, five minutes after it.
+    sched.add_job(
+        _wrap(factory, jobs.refund_sla_sweep),
+        CronTrigger(hour=0, minute=35, timezone=TIMEZONE),
+        next_run_time=now,
+        id="refund_sla_sweep",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     sched.add_job(
         _wrap(factory, jobs.alert_dead_outbox),
         IntervalTrigger(minutes=5, timezone=TIMEZONE),

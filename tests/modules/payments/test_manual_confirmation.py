@@ -289,8 +289,11 @@ async def test_an_underpayment_is_accepted_recorded_and_flagged(
     ).one()
     assert row.status == "open"
     assert row.result == "discrepancy"
-    # `difference` is paid MINUS invoiced everywhere in this module
-    # (`matcher.py`'s own convention), so an underpayment is negative.
+    # `difference` is paid MINUS invoiced on every row that COMPARES a
+    # payment with an invoice (`matcher.py`'s own convention, also this
+    # module's) — an underpayment is negative. `service.record_reversal`
+    # is the one row that does NOT compare: it stores the money that went
+    # back, positive (`service.py`'s own docstring at that call site).
     assert row.difference == Decimal("-500.00")
 
 

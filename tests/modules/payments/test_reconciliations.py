@@ -12,15 +12,36 @@ than trusting the first page to hold any one row, the same reasoning
 directly instead of by position.
 """
 
+import hashlib
 import uuid
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.models import MediaFile
 from app.modules.audit.models import AuditLog
 from app.modules.payments.backoffice_service import RESOLVE_ACTION
 from app.modules.payments.models import BankStatementLine, Reconciliation
 from tests.modules.payments.test_statement_import import csv_bytes, drain, upload
 from tests.modules.payments.test_statement_import import row as csv_row
+
+
+@pytest.fixture
+async def correcting_doc(db: AsyncSession) -> MediaFile:
+    """A genuine `media_files` row for `resolution_doc_id` — mirrors
+    `test_manual_confirmation.py::bank_doc`'s own reasoning for the other
+    `_assert_doc_active` caller in this module."""
+    row = MediaFile(
+        storage_key=f"correcting-docs/{uuid.uuid4().hex}.pdf",
+        filename="correcting-document.pdf",
+        content_type="application/pdf",
+        size_bytes=1024,
+        sha256=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+    )
+    db.add(row)
+    await db.flush()
+    return row
 
 
 async def _make_reconciliation(
@@ -122,6 +143,29 @@ async def test_resolve_on_an_already_resolved_row_answers_err_pay_005(payments_v
     )
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "ERR-PAY-005"
+
+
+async def test_resolve_requires_the_correcting_document_to_be_active(
+    payments_view_client, db, correcting_doc: MediaFile
+):
+    """`_assert_doc_active` (untested since Task 5 shipped it) — an archived
+    `media_files` row must not name a correcting document, the same
+    existence-not-validity guard `bank_doc_not_active` mirrors on the
+    manual-confirmation side."""
+    correcting_doc.status = "archived"
+    row = await _make_reconciliation(db)
+    await db.commit()
+
+    response = await payments_view_client.post(
+        f"/api/v1/payments/reconciliations/{row.id}/resolve",
+        json={
+            "comment": "see the attached corrected order",
+            "resolution_doc_id": str(correcting_doc.id),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+    assert response.json()["error"]["details"]["reason"] == "resolution_doc_not_active"
 
 
 async def test_an_applicant_may_not_resolve_a_reconciliation(applicant_client, db):
