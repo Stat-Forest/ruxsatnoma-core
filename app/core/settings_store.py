@@ -136,6 +136,23 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             # row, never the code, if that shows up in the field.
             "Per-IP limit for the anonymous permit check by series and number",
         ),
+        # The public price estimate (decision #63) is the third anonymous surface
+        # after the login-adjacent routes and the QR check — same reasoning as
+        # both: an anonymous compute endpoint is an obvious abuse target, and the
+        # two narrow catalog reads it needs (activity/livestock types) are cheap
+        # enough to share one, higher-headroom bucket rather than one each.
+        SettingSpec(
+            "ratelimit_public_calc_estimate_per_minute",
+            int,
+            20,
+            "Per-IP limit for the anonymous POST /public/calculations/estimate",
+        ),
+        SettingSpec(
+            "ratelimit_public_refs_per_minute",
+            int,
+            60,
+            "Per-IP limit for the anonymous GET /public/refs/* catalog reads",
+        ),
         SettingSpec(
             "gis_area_mismatch_pct",
             int,

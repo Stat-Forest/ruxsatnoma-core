@@ -1,6 +1,6 @@
 # Single entry point for the local gate. `make check` mirrors CI
 # (.github/workflows/ci.yml) exactly, so the two can never drift apart.
-.PHONY: help install hooks up down logs migrate revision bootstrap seed api workers test lint fmt type security check heads lessons-check
+.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test lint fmt type security check heads lessons-check
 
 help:               ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -39,6 +39,9 @@ bootstrap:          ## Create the first sys_admin — make bootstrap LOGIN=admin
 
 seed:               ## Import reference data — make seed KIND=organizations FILE=path.json
 	uv run python -m app.seed "$(KIND)" "$(FILE)"
+
+demo-seed:          ## Fill the DB with demo-sprint data (idempotent) — targets DATABASE_URL
+	uv run python -m app.seed.demo
 
 api:                ## Run the API on the host (after `make up`) — http://localhost:8000
 	@# Behind a proxy add --proxy-headers --forwarded-allow-ips (the rate limiter keys

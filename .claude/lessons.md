@@ -352,26 +352,26 @@ Tooling and environment.
 
 # Permissions, roles, transitions
 
-## Zone scoping is not a permission check — a read path needs both
+## An access rule has ONE source, and every path that answers it derives from there
 
-- **Rule:** `require_permission(...)` answers "may this role do this at all"; `zone_filter`
-  answers "on whose rows". Every endpoint returning territory-scoped data needs BOTH,
-  including the small sibling endpoints.
-- **Why:** `GET /admin/users/{id}/permissions` passed the permission gate but was not
-  zone-scoped like the user card next to it, so a regional admin could read another region's
-  user through it (3.3b final review, `aa1d551`).
-- **How to apply:** Adding an endpoint next to a scoped one, copy its scoping, not just its
-  permission code. Add a cross-zone denial test.
-
-## A superuser bypass must be reflected in every path that REPORTS permissions
-
-- **Rule:** `sys_admin` skips the check in `require_permission` (decision #41) — so every
-  endpoint answering "what may I do" must special-case it too.
-- **Why:** `GET /auth/me` reported an empty `permissions[]` for a superuser holding no
-  personal grants: fully privileged in fact, powerless on screen, and the adminka would have
-  hidden every button (3.3a — `MeOut.is_superuser` plus the full registry).
-- **How to apply:** Any new "what can this user do" response gets the superuser branch, not
-  just the enforcement point.
+- **Rule:** Permission, zone and "which named official" are separate questions, and each has
+  exactly one source. Every path that answers a question — enforcing it, reporting it, or
+  merely reading the row — derives its answer from that source, never from a second list
+  written beside it.
+- **Why:** Three drifts, one class. `require_permission` answers "may this role at all",
+  `zone_filter` "on whose rows": `GET /admin/users/{id}/permissions` had the first and not
+  the second, so a regional admin read another region's user (3.3b, `aa1d551`). `sys_admin`
+  skips `require_permission` (decision #41), but `GET /auth/me` reported an empty
+  `permissions[]` for one — fully privileged in fact, powerless on screen (3.3a). And
+  `permits._readable_permit` admitted only the holder or `permits.view_any`, while
+  `add_signature` independently admitted the three required official signers — so the head,
+  chief forester and accountant could SIGN a permit they could not OPEN, and no permit was
+  signable through the UI at all (3.11a, found by an end-to-end run, not by any suite).
+- **How to apply:** Adding a path near a guarded one, copy its scoping, not just its
+  permission code, and add a cross-zone/cross-org denial test. When a read and a write guard
+  the same object, the read derives its rule from the write's own sources — the permits fix
+  intersects `required_purposes()` with `signers.required_role()` and reuses the write path's
+  organization equality.
 
 ## A role name from spec or plan prose is never a `roles.code` — «Раҳбар» is `executor_head`
 
