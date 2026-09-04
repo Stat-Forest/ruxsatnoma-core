@@ -1,0 +1,42 @@
+# deploy/proxy/Caddyfile
+# TLS for the three dev subdomains. Caddy obtains and renews Let's Encrypt certificates by
+# itself; ports 80 and 443 must reach this host from the internet for the HTTP-01 challenge
+# (see the plan's prerequisite P2).
+#
+# Upstreams are addressed by container name over the shared `ruxsatnoma-edge` network, so no
+# application publishes a port to the host.
+
+{
+	email oybekyuldashov45@gmail.com
+}
+
+dev-api.ruxsatnoma-urmon.uz {
+	# Ruling R5: the printed QR encodes {PUBLIC_BASE_URL}/check?qr=… and PUBLIC_BASE_URL is
+	# this origin (Eskiz's delivery callback needs the API host). The page a citizen reads
+	# lives in the landing bundle, so that one path is proxied there. This is a dev-only
+	# patch for one setting serving two hosts; production needs a real split.
+	handle /check* {
+		reverse_proxy landing:80
+	}
+
+	handle {
+		reverse_proxy api:8000
+	}
+
+	# The public QR route must not be access-logged: the line would carry the visitor's IP
+	# and the printed token in plaintext, which is exactly what qr_check_log avoids storing.
+	# The app drops its own uvicorn line for that path; a fronting proxy has to do the same
+	# itself, and `skip_log` is how Caddy does it.
+	log {
+		output file /var/log/caddy/api.log
+	}
+	log_skip /api/v1/public/permits/check*
+}
+
+dev-admin.ruxsatnoma-urmon.uz {
+	reverse_proxy admin:80
+}
+
+dev.ruxsatnoma-urmon.uz {
+	reverse_proxy landing:80
+}
