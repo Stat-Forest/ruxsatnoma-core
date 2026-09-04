@@ -1,0 +1,98 @@
+# docker-compose.deploy.yml
+# The dev-server stack. Every secret comes from .env, which lives ONLY on the server and is
+# never in git; a missing one fails the deploy (`:?`) instead of starting insecurely.
+# No port is published to the host — Caddy reaches the api over the shared edge network.
+#
+# Bring up:  docker compose -f docker-compose.deploy.yml up -d
+# Migrate:   docker compose -f docker-compose.deploy.yml run --rm api alembic upgrade head
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set in .env}
+    volumes:
+      - miniodata:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: ruxsatnoma-api:latest
+    # The bucket is created by ensure_bucket() in the app lifespan — nothing to do here.
+    # app/main.py exposes create_app() only, no module-level `app` — --factory matches
+    # the image's own CMD (deploy/Dockerfile) and the project's dev command (Makefile).
+    command:
+      - uvicorn
+      - app.main:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      # Both hops of the chain visitor -> gateway (192.168.0.244) -> Caddy (172.28.0.2) -> api
+      # must be listed. uvicorn 0.52.4's X-Forwarded-For parser walks the header IN REVERSE
+      # and returns the first entry NOT in this trusted set. Caddy's reverse_proxy appends its
+      # own peer (the gateway) to XFF, so the header uvicorn sees is "<visitor>, 192.168.0.244".
+      # Trusting only 172.28.0.2 (the TCP peer that gates the middleware at all) leaves
+      # 192.168.0.244 untrusted, so THAT becomes the attributed client — which is exactly the
+      # bug that put the gateway's IP into every audit_log row and collapsed the public QR
+      # route's rate limit into one shared bucket for the whole country. Adding 192.168.0.244
+      # tells uvicorn to skip over it too and keep walking left to the real visitor.
+      # This stays unspoofable: a client-supplied XFF value is always inserted to the LEFT of
+      # the gateway's own appended entry, so the reverse walk can never reach it before it has
+      # already matched a trusted hop and kept going — a wildcard, not this exact pair, is what
+      # would let a client spoof it.
+      - --forwarded-allow-ips
+      - 172.28.0.2,192.168.0.244
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      # `default` is this stack's private network: db and minio are reachable only here.
+      default:
+      edge:
+        aliases: [api]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  pgdata:
+  miniodata:
+
+networks:
+  # `default` is this stack's private network: db and minio are reachable only from api.
+  edge:
+    external: true
+    name: ruxsatnoma-edge

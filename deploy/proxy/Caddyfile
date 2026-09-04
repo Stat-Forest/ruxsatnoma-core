@@ -1,0 +1,78 @@
+# deploy/proxy/Caddyfile
+# Caddy obtains and renews Let's Encrypt certificates for the three dev subdomains, and routes
+# each name to its container over the shared `ruxsatnoma-edge` network, so no application
+# publishes a port to the host.
+#
+# THE DEV ENVIRONMENT SITS BEHIND A KERIO CONTROL GATEWAY THAT TERMINATES TLS ITSELF
+# (measured 2026-09-04; the network team cannot provide a plain DNAT forward). What reaches
+# Caddy is therefore always plain HTTP on :80, sourced from the gateway at 192.168.0.244, with
+# the real visitor in X-Forwarded-For. Two consequences are configured below.
+#
+# 1. `auto_https disable_redirects` — Caddy still ACQUIRES AND RENEWS certificates (the
+#    HTTP-01 challenge arrives over the gateway's port-80 publication and works), but it must
+#    not answer with a 308 to https://, because the visitor's TLS already terminated at the
+#    gateway; the redirect would send them back through the same hop forever. The certificates
+#    are exported for the network team to install on the gateway — see deploy/export-certs.sh.
+# 2. `trusted_proxies` — without it every visitor is seen as 192.168.0.244, they share one
+#    rate-limit bucket, and the audit trail records the gateway instead of the citizen. The
+#    chain is visitor -> gateway (192.168.0.244) -> Caddy (172.28.0.2) -> api, and each hop
+#    trusts exactly the one in front of it; the api's own half is `--forwarded-allow-ips
+#    172.28.0.2` in docker-compose.deploy.yml. Never widen either to a wildcard: any client
+#    could then spoof X-Forwarded-For and defeat the public QR route's only protection.
+#
+# When the gateway is eventually replaced by a plain forward, delete `auto_https
+# disable_redirects` and the `trusted_proxies` line, and nothing else changes.
+{
+	email oybekyuldashov45@gmail.com
+	auto_https disable_redirects
+
+	# 3. Only the HTTP-01 challenge can ever succeed here. Caddy tries TLS-ALPN-01 as well by
+	#    default, and that one needs the CA to open a TLS connection to port 443 of this host —
+	#    which the gateway answers itself, so Let's Encrypt gets "Connection refused" and the
+	#    whole order fails. Disabling it leaves HTTP-01, which arrives over the gateway's
+	#    port-80 publication and works. Without this, a name that happens to try TLS-ALPN first
+	#    never gets a certificate at all, while one that tries HTTP-01 first does — which is
+	#    exactly why dev-api was issued and the other two were not.
+	cert_issuer acme {
+		disable_tlsalpn_challenge
+	}
+
+	servers {
+		trusted_proxies static 192.168.0.244/32
+	}
+}
+
+http://dev-api.ruxsatnoma-urmon.uz, https://dev-api.ruxsatnoma-urmon.uz {
+	# Ruling R5: the printed QR encodes {PUBLIC_BASE_URL}/check?qr=… and PUBLIC_BASE_URL is
+	# this origin (Eskiz's delivery callback needs the API host). The page a citizen reads
+	# lives in the landing bundle, so that one path is proxied there. This is a dev-only
+	# patch for one setting serving two hosts; production needs a real split.
+	handle /check* {
+		reverse_proxy landing:80
+	}
+
+	handle {
+		reverse_proxy api:8000
+	}
+
+	# The public QR route must not be access-logged: the line would carry the visitor's IP
+	# and the printed token in plaintext, which is exactly what qr_check_log avoids storing.
+	# The app drops its own uvicorn line for that path; a fronting proxy has to do the same
+	# itself, and `skip_log` is how Caddy does it. /check* is the same rule for the printed
+	# QR's actual landing path (see ruling R5's handle block above, and Caddy's `uri` log
+	# field includes the query string that carries ?qr=<token>) — it just happens to live on
+	# this host too, proxied through to landing rather than answered by the api.
+	log {
+		output file /var/log/caddy/api.log
+	}
+	log_skip /api/v1/public/permits/check*
+	log_skip /check*
+}
+
+http://dev-admin.ruxsatnoma-urmon.uz, https://dev-admin.ruxsatnoma-urmon.uz {
+	reverse_proxy admin:80
+}
+
+http://dev.ruxsatnoma-urmon.uz, https://dev.ruxsatnoma-urmon.uz {
+	reverse_proxy landing:80
+}
