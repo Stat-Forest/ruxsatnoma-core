@@ -1,0 +1,610 @@
+"""payments backoffice
+
+Schema for stage 3.10b task 1 (design/02 § payments, plan
+`03.10b-payments-reconciliation`): the five tables design/02 has always listed
+under § payments that 3.10a deliberately did not create — `manual_payment_
+confirmations` (the one legal way to mark an invoice PAID by hand, maker-checker
+plus a bank document, ruling 1), `bank_statements`/`bank_statement_lines` (the
+imported statement), `reconciliations` (the discrepancy register) and `refunds`
+(the manual refund and its breakdown by source) — plus `allocations.refund_id`,
+which 3.10a's own migration (`0017`) could not create because its FK target did
+not exist yet (ruling P2). See `app/modules/payments/models.py`'s module
+docstring and each new class's own docstring for the shape and the invariants.
+
+Every CHECK below mirrors a module-level tuple in `models.py`; autogenerate
+picked all of them up on its own this time (the `checkconstraint_byname`
+plugin, unlike `0017`'s day) — this file adds only what autogenerate cannot
+see: the `payments.confirm` permission and its grant, the `refund_reasons`
+classifier and its four items, and two notification templates.
+
+Grants `payments.confirm` to `executor_head` (`roles.code = 'executor_head'`,
+«Ваколатли шахс», verified against `0016_approver_role_alignment.py` rather
+than plan prose, per the lesson on role codes) — the leshoz head is who signs
+off as the maker-checker's checker on a manual PAID.
+
+Seeds a sixth classifier, `refund_reasons` (ruling 16): `design/02` gives
+`refunds.basis_item_id` an FK to `classifier_items`, and `tz/08` names four
+grounds from VMQ 278 §§9-11 — revocation, an unused period, an overpayment, a
+confirmed benefit category — none of which `0005_admin_seeds.py`'s five
+classifiers cover. Mirrors that migration's `REJECTION_REASONS` loop shape
+exactly (`gen_random_uuid()` per item, `jsonb_build_object` for both `name`
+and `props`, `valid_from DATE '2026-01-01'`, `sort_order` = index x 10).
+`0005` is NOT edited — its own downgrade lists its five classifiers by name,
+and this migration owns everything it inserts, including these four items and
+their classifier, in its own downgrade.
+
+Seeds two notification templates x two channels (`inapp`, `sms`), mirroring
+`0018_payments_seeds.py`: `refund.decided` and `payment.manual_confirmed`.
+`payment.confirmed` is NOT re-seeded — `0009_notifications.py` already has an
+active row for it, and a second one would fail `uq_notification_templates_active`.
+
+Revision ID: 0022
+Revises: merge_0018_0020
+Create Date: 2026-09-03 10:49:12.493041
+
+"""
+
+import uuid
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+# revision identifiers, used by Alembic.
+revision: str = "0022"
+# Re-chained onto `0024` on 2026-09-03, when stage 3.9a-flow merged into `dev`
+# first. Both revisions had been written against `merge_0018_0020`, which would
+# have left the chain with TWO heads the moment this branch merged. `0024` is
+# already on `dev` and stamped in other sessions' databases, so it cannot move;
+# this one was never pushed and only its own worktree's test database held it,
+# so re-pointing it costs one local re-migration and no stranded database.
+# Preferred over a second `alembic merge heads` revision: an empty merge node is
+# permanent, and it is only warranted when BOTH sides are already merged (which is
+# why `merge_0018_0020` itself exists). The numbers now run 0024 -> 0022, which is
+# ugly and harmless — Alembic follows the chain, not the filename.
+down_revision: str | Sequence[str] | None = "0024"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+ROLE_GRANTS: list[tuple[str, str]] = [
+    ("executor_head", "payments.confirm"),
+]
+
+REFUND_REASONS_CLASSIFIER_ID = "0198f100-0003-7000-8000-000000000006"
+
+# tz/08: grounds for a refund, VMQ 278 §§9-11.
+REFUND_REASONS = [
+    ("RF-01", "Рухсатнома бекор қилинди", "Permit revoked", "ВМҚ 278 §§9-11"),
+    (
+        "RF-02",
+        "Фойдаланилмаган давр қолди",
+        "Unused period remains",
+        "ВМҚ 278 §§9-11",
+    ),
+    ("RF-03", "Ортиқча тўлов", "Overpayment", "ВМҚ 278 §§9-11"),
+    (
+        "RF-04",
+        "Тасдиқланган имтиёз тоифаси",
+        "Confirmed benefit category",
+        "ВМҚ 278 §§9-11",
+    ),
+]
+
+_BODIES: dict[str, dict[str, str]] = {
+    "refund.decided": {
+        "uz_cyrl": "{application_number} аризаси бўйича қайтариш сўрови кўриб чиқилди:"
+        " {status}. Сумма: {amount} сўм.",
+        "ru": "Запрос на возврат по заявке {application_number} рассмотрен:"
+        " {status}. Сумма: {amount} сум.",
+    },
+    "payment.manual_confirmed": {
+        "uz_cyrl": "{application_number} аризаси бўйича {amount} сўм тўлов қўлда тасдиқланди.",
+        "ru": "Оплата {amount} сум по заявке {application_number} подтверждена вручную.",
+    },
+}
+
+SEED_TEMPLATES: list[tuple[str, str, dict[str, str]]] = [
+    (event_code, channel, body)
+    for event_code, body in _BODIES.items()
+    for channel in ("inapp", "sms")
+]
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table(
+        "bank_statements",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("source", sa.Text(), nullable=False),
+        sa.Column("format", sa.Text(), nullable=False),
+        sa.Column("file_id", sa.Uuid(), nullable=True),
+        sa.Column("statement_date", sa.Date(), nullable=False),
+        sa.Column("period_from", sa.Date(), nullable=True),
+        sa.Column("period_to", sa.Date(), nullable=True),
+        sa.Column(
+            "column_map",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default="{}",
+            nullable=False,
+        ),
+        sa.Column("imported_by", sa.Uuid(), nullable=True),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column(
+            "stats", postgresql.JSONB(astext_type=sa.Text()), server_default="{}", nullable=False
+        ),
+        sa.Column("error_report", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint("format IN ('csv')", name=op.f("ck_bank_statements_format_valid")),
+        sa.CheckConstraint(
+            "source IN ('api', 'file')", name=op.f("ck_bank_statements_source_valid")
+        ),
+        sa.CheckConstraint(
+            "status IN ('pending', 'parsing', 'parsed', 'failed')",
+            name=op.f("ck_bank_statements_status_valid"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["file_id"], ["media_files.id"], name=op.f("fk_bank_statements_file_id_media_files")
+        ),
+        sa.ForeignKeyConstraint(
+            ["imported_by"], ["users.id"], name=op.f("fk_bank_statements_imported_by_users")
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_bank_statements")),
+    )
+    op.create_index(
+        op.f("ix_bank_statements_file_id"), "bank_statements", ["file_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_bank_statements_imported_by"), "bank_statements", ["imported_by"], unique=False
+    )
+    op.create_table(
+        "manual_payment_confirmations",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("invoice_id", sa.Uuid(), nullable=False),
+        sa.Column("amount", sa.Numeric(precision=18, scale=2), nullable=False),
+        sa.Column("paid_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("bank_doc_file_id", sa.Uuid(), nullable=False),
+        sa.Column("maker_id", sa.Uuid(), nullable=False),
+        sa.Column("checker_id", sa.Uuid(), nullable=True),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("reason", sa.Text(), nullable=True),
+        sa.Column("checked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "status <> 'confirmed' OR (checker_id IS NOT NULL AND checker_id <> maker_id)",
+            # Named "..._checker", not "..._independent_checker": the longer
+            # name pushed "ck_manual_payment_confirmations_..." past
+            # Postgres's 63-byte identifier limit, so Postgres silently
+            # truncated and hashed it on create while the ORM's own metadata
+            # kept the full name — `test_autogenerate_diff_empty` then saw a
+            # constraint "removed" and "added" on every run. Renamed short
+            # enough to never need truncating, in both this file and the
+            # model, so the stored name and the metadata name are identical.
+            name=op.f("ck_manual_payment_confirmations_confirmed_needs_checker"),
+        ),
+        sa.CheckConstraint(
+            "status IN ('pending_check', 'confirmed', 'rejected')",
+            name=op.f("ck_manual_payment_confirmations_status_valid"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["bank_doc_file_id"],
+            ["media_files.id"],
+            name=op.f("fk_manual_payment_confirmations_bank_doc_file_id_media_files"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["checker_id"],
+            ["users.id"],
+            name=op.f("fk_manual_payment_confirmations_checker_id_users"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["invoice_id"],
+            ["invoices.id"],
+            name=op.f("fk_manual_payment_confirmations_invoice_id_invoices"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["maker_id"], ["users.id"], name=op.f("fk_manual_payment_confirmations_maker_id_users")
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_manual_payment_confirmations")),
+    )
+    op.create_index(
+        op.f("ix_manual_payment_confirmations_bank_doc_file_id"),
+        "manual_payment_confirmations",
+        ["bank_doc_file_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_manual_payment_confirmations_checker_id"),
+        "manual_payment_confirmations",
+        ["checker_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_manual_payment_confirmations_invoice_id"),
+        "manual_payment_confirmations",
+        ["invoice_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_manual_payment_confirmations_maker_id"),
+        "manual_payment_confirmations",
+        ["maker_id"],
+        unique=False,
+    )
+    op.create_table(
+        "refunds",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("application_id", sa.Uuid(), nullable=False),
+        sa.Column("invoice_id", sa.Uuid(), nullable=False),
+        sa.Column("basis_item_id", sa.Uuid(), nullable=False),
+        sa.Column("suggested_amount", sa.Numeric(precision=18, scale=2), nullable=True),
+        sa.Column("suggestion_reason", sa.Text(), nullable=True),
+        sa.Column("final_amount", sa.Numeric(precision=18, scale=2), nullable=True),
+        sa.Column("budget_amount", sa.Numeric(precision=18, scale=2), nullable=True),
+        sa.Column("recipient_amount", sa.Numeric(precision=18, scale=2), nullable=True),
+        sa.Column("other_amount", sa.Numeric(precision=18, scale=2), nullable=True),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("requested_by", sa.Uuid(), nullable=True),
+        sa.Column("requested_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("due_at", sa.Date(), nullable=False),
+        sa.Column("decided_by", sa.Uuid(), nullable=True),
+        sa.Column("decided_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("comment", sa.Text(), nullable=True),
+        sa.CheckConstraint(
+            "status <> 'returned' OR (final_amount IS NOT NULL AND "
+            "coalesce(budget_amount, 0) + coalesce(recipient_amount, 0) "
+            "+ coalesce(other_amount, 0) = final_amount)",
+            name=op.f("ck_refunds_returned_needs_complete_breakdown"),
+        ),
+        sa.CheckConstraint(
+            "status IN ('requested', 'in_review', 'returned', 'rejected')",
+            name=op.f("ck_refunds_status_valid"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["application_id"],
+            ["applications.id"],
+            name=op.f("fk_refunds_application_id_applications"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["basis_item_id"],
+            ["classifier_items.id"],
+            name=op.f("fk_refunds_basis_item_id_classifier_items"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["decided_by"], ["users.id"], name=op.f("fk_refunds_decided_by_users")
+        ),
+        sa.ForeignKeyConstraint(
+            ["invoice_id"], ["invoices.id"], name=op.f("fk_refunds_invoice_id_invoices")
+        ),
+        sa.ForeignKeyConstraint(
+            ["requested_by"], ["users.id"], name=op.f("fk_refunds_requested_by_users")
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_refunds")),
+    )
+    op.create_index(op.f("ix_refunds_application_id"), "refunds", ["application_id"], unique=False)
+    op.create_index(op.f("ix_refunds_basis_item_id"), "refunds", ["basis_item_id"], unique=False)
+    op.create_index(op.f("ix_refunds_decided_by"), "refunds", ["decided_by"], unique=False)
+    op.create_index(op.f("ix_refunds_invoice_id"), "refunds", ["invoice_id"], unique=False)
+    op.create_index(op.f("ix_refunds_requested_by"), "refunds", ["requested_by"], unique=False)
+    op.create_table(
+        "bank_statement_lines",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("statement_id", sa.Uuid(), nullable=False),
+        sa.Column("line_no", sa.Integer(), nullable=False),
+        sa.Column("doc_number", sa.Text(), nullable=True),
+        sa.Column("amount", sa.Numeric(precision=18, scale=2), nullable=False),
+        sa.Column("operation_date", sa.Date(), nullable=False),
+        sa.Column("payer_name", sa.Text(), nullable=True),
+        sa.Column("payer_account", sa.Text(), nullable=True),
+        sa.Column("purpose", sa.Text(), nullable=True),
+        sa.Column("raw", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("match_status", sa.Text(), nullable=False),
+        sa.Column("matched_invoice_id", sa.Uuid(), nullable=True),
+        sa.Column("matched_transaction_id", sa.Uuid(), nullable=True),
+        sa.CheckConstraint(
+            "match_status IN ('unmatched', 'matched', 'unknown_payment', "
+            "'discrepancy', 'provider_settlement')",
+            name=op.f("ck_bank_statement_lines_match_status_valid"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["matched_invoice_id"],
+            ["invoices.id"],
+            name=op.f("fk_bank_statement_lines_matched_invoice_id_invoices"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["matched_transaction_id"],
+            ["provider_transactions.id"],
+            # Shortened to stay under Postgres's 63-byte identifier limit —
+            # see the matching comment on `BankStatementLine.matched_transaction_id`
+            # in models.py; the literal default name is 68 bytes and gets
+            # silently truncated+hashed by Postgres, which then diverges from
+            # the ORM's own metadata name (the finding this fixes).
+            name=op.f("fk_bank_statement_lines_matched_transaction_id_provider_tx"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["statement_id"],
+            ["bank_statements.id"],
+            name=op.f("fk_bank_statement_lines_statement_id_bank_statements"),
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_bank_statement_lines")),
+        sa.UniqueConstraint(
+            "statement_id", "line_no", name="uq_bank_statement_lines_statement_line"
+        ),
+    )
+    op.create_index(
+        op.f("ix_bank_statement_lines_matched_invoice_id"),
+        "bank_statement_lines",
+        ["matched_invoice_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_bank_statement_lines_matched_transaction_id"),
+        "bank_statement_lines",
+        ["matched_transaction_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_bank_statement_lines_statement_id"),
+        "bank_statement_lines",
+        ["statement_id"],
+        unique=False,
+    )
+    op.create_table(
+        "reconciliations",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("statement_line_id", sa.Uuid(), nullable=True),
+        sa.Column("transaction_id", sa.Uuid(), nullable=True),
+        sa.Column("invoice_id", sa.Uuid(), nullable=True),
+        sa.Column("result", sa.Text(), nullable=False),
+        sa.Column("difference", sa.Numeric(precision=18, scale=2), nullable=True),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("assigned_to", sa.Uuid(), nullable=True),
+        sa.Column("comment", sa.Text(), nullable=True),
+        sa.Column("resolution_doc_id", sa.Uuid(), nullable=True),
+        sa.Column("resolved_by", sa.Uuid(), nullable=True),
+        sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "occurred_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "result IN ('matched', 'discrepancy', 'unknown')",
+            name=op.f("ck_reconciliations_result_valid"),
+        ),
+        sa.CheckConstraint(
+            "status IN ('open', 'resolved')", name=op.f("ck_reconciliations_status_valid")
+        ),
+        sa.ForeignKeyConstraint(
+            ["assigned_to"], ["users.id"], name=op.f("fk_reconciliations_assigned_to_users")
+        ),
+        sa.ForeignKeyConstraint(
+            ["invoice_id"], ["invoices.id"], name=op.f("fk_reconciliations_invoice_id_invoices")
+        ),
+        sa.ForeignKeyConstraint(
+            ["resolution_doc_id"],
+            ["media_files.id"],
+            name=op.f("fk_reconciliations_resolution_doc_id_media_files"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["resolved_by"], ["users.id"], name=op.f("fk_reconciliations_resolved_by_users")
+        ),
+        sa.ForeignKeyConstraint(
+            ["statement_line_id"],
+            ["bank_statement_lines.id"],
+            name=op.f("fk_reconciliations_statement_line_id_bank_statement_lines"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["transaction_id"],
+            ["provider_transactions.id"],
+            name=op.f("fk_reconciliations_transaction_id_provider_transactions"),
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_reconciliations")),
+    )
+    op.create_index(
+        op.f("ix_reconciliations_assigned_to"), "reconciliations", ["assigned_to"], unique=False
+    )
+    op.create_index(
+        op.f("ix_reconciliations_invoice_id"), "reconciliations", ["invoice_id"], unique=False
+    )
+    op.create_index(
+        "ix_reconciliations_open", "reconciliations", ["status", "occurred_at"], unique=False
+    )
+    op.create_index(
+        op.f("ix_reconciliations_resolution_doc_id"),
+        "reconciliations",
+        ["resolution_doc_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_reconciliations_resolved_by"), "reconciliations", ["resolved_by"], unique=False
+    )
+    op.create_index(
+        op.f("ix_reconciliations_statement_line_id"),
+        "reconciliations",
+        ["statement_line_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_reconciliations_transaction_id"),
+        "reconciliations",
+        ["transaction_id"],
+        unique=False,
+    )
+    op.add_column("allocations", sa.Column("refund_id", sa.Uuid(), nullable=True))
+    op.create_index(op.f("ix_allocations_refund_id"), "allocations", ["refund_id"], unique=False)
+    op.create_foreign_key(
+        op.f("fk_allocations_refund_id_refunds"), "allocations", "refunds", ["refund_id"], ["id"]
+    )
+    # ### end Alembic commands ###
+
+    for role, code in ROLE_GRANTS:
+        op.execute(
+            sa.text(
+                "INSERT INTO role_permissions (role_id, permission_code) "
+                "SELECT id, :code FROM roles WHERE code = :role "
+                "ON CONFLICT DO NOTHING"
+            ).bindparams(code=code, role=role)
+        )
+
+    op.execute(
+        sa.text(
+            "INSERT INTO classifiers (id, code, name) VALUES "
+            "(CAST(:id AS uuid), :code, jsonb_build_object('uz_cyrl', :cyr, 'en', :en))"
+        ).bindparams(
+            id=REFUND_REASONS_CLASSIFIER_ID,
+            code="refund_reasons",
+            cyr="Қайтариш асослари",
+            en="Refund grounds",
+        )
+    )
+    for index, (code, name_cyr, name_en, legal_basis) in enumerate(REFUND_REASONS, 1):
+        op.execute(
+            sa.text(
+                "INSERT INTO classifier_items "
+                "(id, classifier_id, code, name, props, valid_from, sort_order, status) VALUES "
+                "(gen_random_uuid(), CAST(:classifier_id AS uuid), :code, "
+                "jsonb_build_object('uz_cyrl', :cyr, 'en', :en), "
+                "jsonb_build_object('legal_basis', :basis), "
+                "DATE '2026-01-01', :sort, 'active')"
+            ).bindparams(
+                classifier_id=REFUND_REASONS_CLASSIFIER_ID,
+                code=code,
+                cyr=name_cyr,
+                en=name_en,
+                basis=legal_basis,
+                sort=index * 10,
+            )
+        )
+
+    templates = sa.table(
+        "notification_templates",
+        sa.column("id", sa.Uuid()),
+        sa.column("event_code", sa.Text()),
+        sa.column("channel", sa.Text()),
+        sa.column("body", postgresql.JSONB(astext_type=sa.Text())),
+        sa.column("version", sa.Integer()),
+        sa.column("status", sa.Text()),
+    )
+    op.bulk_insert(
+        templates,
+        [
+            {
+                # Deliberately uuid4(), not app.db.uuid7 — migrations must not
+                # depend on app code that could move/rename later (same call
+                # as 0009/0010/0018).
+                "id": uuid.uuid4(),
+                "event_code": event_code,
+                "channel": channel,
+                "body": body,
+                "version": 1,
+                "status": "active",
+            }
+            for event_code, channel, body in SEED_TEMPLATES
+        ],
+    )
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # Notifications and their templates first (lesson: a downgrade must
+    # delete whatever its upgrade made possible) — a sent
+    # `refund.decided`/`payment.manual_confirmed` notification's
+    # `template_id` FK would otherwise break. Neither depends on the
+    # `payments` tables below, so their order relative to those is free.
+    op.execute(
+        sa.text(
+            "DELETE FROM notifications WHERE event_code IN "
+            "('refund.decided', 'payment.manual_confirmed')"
+        )
+    )
+    op.execute(
+        sa.text(
+            "DELETE FROM notification_templates WHERE event_code IN "
+            "('refund.decided', 'payment.manual_confirmed')"
+        )
+    )
+    # Derived from ROLE_GRANTS, not hard-coded — a second grant added there
+    # later must not silently survive a downgrade.
+    _granted_codes = ", ".join(f"'{code}'" for _role, code in ROLE_GRANTS)
+    op.execute(f"DELETE FROM role_permissions WHERE permission_code IN ({_granted_codes})")
+
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_constraint(op.f("fk_allocations_refund_id_refunds"), "allocations", type_="foreignkey")
+    op.drop_index(op.f("ix_allocations_refund_id"), table_name="allocations")
+    op.drop_column("allocations", "refund_id")
+    op.drop_index(op.f("ix_reconciliations_transaction_id"), table_name="reconciliations")
+    op.drop_index(op.f("ix_reconciliations_statement_line_id"), table_name="reconciliations")
+    op.drop_index(op.f("ix_reconciliations_resolved_by"), table_name="reconciliations")
+    op.drop_index(op.f("ix_reconciliations_resolution_doc_id"), table_name="reconciliations")
+    op.drop_index("ix_reconciliations_open", table_name="reconciliations")
+    op.drop_index(op.f("ix_reconciliations_invoice_id"), table_name="reconciliations")
+    op.drop_index(op.f("ix_reconciliations_assigned_to"), table_name="reconciliations")
+    op.drop_table("reconciliations")
+    op.drop_index(op.f("ix_bank_statement_lines_statement_id"), table_name="bank_statement_lines")
+    op.drop_index(
+        op.f("ix_bank_statement_lines_matched_transaction_id"), table_name="bank_statement_lines"
+    )
+    op.drop_index(
+        op.f("ix_bank_statement_lines_matched_invoice_id"), table_name="bank_statement_lines"
+    )
+    op.drop_table("bank_statement_lines")
+    op.drop_index(op.f("ix_refunds_requested_by"), table_name="refunds")
+    op.drop_index(op.f("ix_refunds_invoice_id"), table_name="refunds")
+    op.drop_index(op.f("ix_refunds_decided_by"), table_name="refunds")
+    op.drop_index(op.f("ix_refunds_basis_item_id"), table_name="refunds")
+    op.drop_index(op.f("ix_refunds_application_id"), table_name="refunds")
+    op.drop_table("refunds")
+    # ### end Alembic commands (table drops resume below the classifier cleanup) ###
+
+    # `fk_refunds_basis_item_id_classifier_items` is NO ACTION, so a
+    # `classifier_items` row this migration seeded cannot be deleted while a
+    # COMMITTED `refunds` row still references it — the round-trip test never
+    # caught this because it runs on a session that never commits a refund.
+    # `refunds` is dropped above, taking every referencing row with it, so
+    # only NOW is the delete safe (four items before their classifier — the
+    # FK from `classifier_items` blocks the classifier delete otherwise).
+    op.execute(
+        sa.text("DELETE FROM classifier_items WHERE classifier_id = CAST(:id AS uuid)").bindparams(
+            id=REFUND_REASONS_CLASSIFIER_ID
+        )
+    )
+    op.execute(
+        sa.text("DELETE FROM classifiers WHERE id = CAST(:id AS uuid)").bindparams(
+            id=REFUND_REASONS_CLASSIFIER_ID
+        )
+    )
+
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(
+        op.f("ix_manual_payment_confirmations_maker_id"),
+        table_name="manual_payment_confirmations",
+    )
+    op.drop_index(
+        op.f("ix_manual_payment_confirmations_invoice_id"),
+        table_name="manual_payment_confirmations",
+    )
+    op.drop_index(
+        op.f("ix_manual_payment_confirmations_checker_id"),
+        table_name="manual_payment_confirmations",
+    )
+    op.drop_index(
+        op.f("ix_manual_payment_confirmations_bank_doc_file_id"),
+        table_name="manual_payment_confirmations",
+    )
+    op.drop_table("manual_payment_confirmations")
+    op.drop_index(op.f("ix_bank_statements_imported_by"), table_name="bank_statements")
+    op.drop_index(op.f("ix_bank_statements_file_id"), table_name="bank_statements")
+    op.drop_table("bank_statements")
+    # ### end Alembic commands ###

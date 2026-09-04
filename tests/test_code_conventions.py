@@ -228,6 +228,31 @@ def test_registering_the_event_subscriptions_twice_registers_nothing_twice() -> 
     )
 
 
+def test_ri_10_permit_statuses_are_a_subset_of_the_real_permit_statuses() -> None:
+    """3.10b task 8/10. `payments.repo._RI_10_PERMIT_STATUSES` is a tuple of
+    THREE LITERAL STRINGS, deliberately — `design/01` rule 3 forbids one
+    level-4 module (`payments`) importing another (`permits`), so
+    `payments/repo.py` cannot derive them from `permits.models.
+    PERMIT_STATUSES` the way it derives its OWN enum-ish constants from its
+    OWN model tuples. A TEST carries no such boundary and may import
+    `permits.models` freely, which is exactly what this check does: without
+    it, renaming `"active"` to something else in `permits.models.
+    PERMIT_STATUSES` would silently strand the literal in `payments/repo.py`
+    at its old spelling, and RI-10 — `tz/10`'s CRITICAL indicator for a
+    reversed payment against a permit that already exists — would stop
+    firing for every permit in that (renamed) status, with nothing red
+    anywhere to say so.
+    """
+    from app.modules.payments.repo import _RI_10_PERMIT_STATUSES
+    from app.modules.permits.models import PERMIT_STATUSES
+
+    offenders = sorted(set(_RI_10_PERMIT_STATUSES) - set(PERMIT_STATUSES))
+    assert not offenders, (
+        "payments.repo._RI_10_PERMIT_STATUSES has a status permits.models."
+        f"PERMIT_STATUSES no longer knows: {offenders}"
+    )
+
+
 def test_the_payment_confirmed_bus_name_is_written_down_exactly_once() -> None:
     """The 3.10a/3.11a seam. `payments` publishes on the bus name
     `payment_confirmed` and `permits` subscribes to it, and the two may not

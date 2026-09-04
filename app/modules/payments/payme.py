@@ -341,23 +341,29 @@ def _cancel_result(transaction: ProviderTransaction) -> dict[str, Any]:
 async def _cancel_transaction(
     db: AsyncSession, params: dict[str, Any], now: datetime
 ) -> dict[str, Any]:
-    """state `1` -> `-1`; state `2` -> `-2`, reason recorded either way. Never
-    reverses the invoice/ledger for a state-`2` cancellation — that is the
-    refund path, 3.10b's `refunds` table, deliberately absent from this
-    stage (module docstring); this method's whole job is recording Payme's
-    own state (the brief's method table).
+    """state `1` -> `-1`; state `2` -> `-2`, reason recorded either way.
 
-    A state-`2` cancellation is therefore logged at ERROR, not written off
-    as ordinary traffic (whole-branch review). `design/04` §3.5 reason `5`
-    is literally "funds returned", and until 3.10b builds the reversal the
-    system's own books disagree with reality: the invoice stays `paid`, the
-    application stays `PAID`, `allocations` still claims two `payment` rows
-    summing to money that has gone back, `service.is_paid` still answers
-    `True`, and — because `permits.service.issue` gates on the APPLICATION's
-    own status, which nothing moves off PAID — a permit can still be issued
-    for it. That is a manual, human reversal on live money, and the log line
-    is the only thing that tells anyone it happened. See the KNOWN GAP paragraph in
-    `service.py`'s public-surface comment for the whole shape of it."""
+    A state-`2` cancellation is money that was already confirmed going back
+    (`design/04` §3.5 reason `5` is literally "funds returned"), and since
+    3.10b it does more than move the transaction row: it calls
+    `service.record_reversal`, which writes the negating `correction`
+    entries, opens a `reconciliations` row and raises RI-01 (plus RI-10 when
+    a permit already exists). 3.10a reversed nothing at all, and this
+    docstring said so — see `service.py`'s public-surface banner for what
+    shipped and for the one thing still open.
+
+    **It is still logged at ERROR**, not written off as ordinary traffic
+    (whole-branch review), and the reason is now narrower but real: a
+    reversal is a manual human act on live money, and neither the invoice
+    nor the application moves off `paid`/`PAID` (ruling 15 — `tz/05` gives
+    PAID no other exit, and adding one is stage 3.9's). Until an operator
+    works the register row, `service.is_paid` still answers `True` and
+    `permits.service.issue`, which gates on the APPLICATION's own status,
+    would still issue against it.
+
+    A state-`1` cancellation reverses nothing, because nothing arrived: no
+    ledger row, no register row, no risk indicator (pinned by
+    `tests/modules/payments/test_reversal.py`)."""
     external_id = _external_id(params)
     transaction = (
         await repo.get_provider_transaction_by_external_id_for_update(db, PROVIDER, external_id)
@@ -384,17 +390,27 @@ async def _cancel_transaction(
             new_value={"state": new_state, "reason": reason},
         )
         if old_state == STATE_PERFORMED:
-            # Money that was already confirmed is going back, and 3.10a
-            # reverses nothing (see this function's docstring). ERROR, not
-            # info: the invoice, the application and the ledger all still
-            # say "paid" after this returns, and nothing else in the system
-            # will ever mention it.
+            # Money that was already confirmed is going back. ERROR, not
+            # info: the invoice and the application still say "paid" after
+            # this returns (ruling 15), so the register row and this line
+            # are what tell a human it happened.
             logger.error(
                 "payme.cancel_after_perform",
                 transaction_id=str(transaction.id),
                 invoice_id=str(transaction.invoice_id),
                 external_id=transaction.external_id,
                 reason=reason,
+            )
+            # AFTER the transaction row is updated, so the reversal is
+            # recorded against a row that already reads `-2`. A plain read of
+            # the invoice, not `get_invoice_for_update`: nothing here writes
+            # to `invoices` — the ledger, the register and the audit trail
+            # are the whole of it.
+            invoice = await repo.get_invoice(db, transaction.invoice_id)
+            if invoice is None:  # pragma: no cover - NOT NULL FK
+                raise PaymeError(ERR_CANNOT_CANCEL, "Invoice not found")
+            await service.record_reversal(
+                db, invoice=invoice, transaction=transaction, reason=reason
             )
     elif transaction.state not in (STATE_CANCELLED_BEFORE, STATE_CANCELLED_AFTER):
         # Invariant guard, not a documented Payme trigger: this module only

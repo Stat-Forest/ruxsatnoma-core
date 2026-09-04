@@ -64,6 +64,17 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # RI-07 (plan 03.10b-payments-reconciliation task 10): a daily digest,
+    # not immediate (`tz/10` classifies it medium severity) — same slot
+    # shape as the invoice sweep just above, five minutes after it.
+    sched.add_job(
+        _wrap(factory, jobs.refund_sla_sweep),
+        CronTrigger(hour=0, minute=35, timezone=TIMEZONE),
+        next_run_time=now,
+        id="refund_sla_sweep",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     sched.add_job(
         _wrap(factory, jobs.alert_dead_outbox),
         IntervalTrigger(minutes=5, timezone=TIMEZONE),
@@ -102,6 +113,18 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         IntervalTrigger(seconds=10, timezone=TIMEZONE),
         next_run_time=now,
         id="process_gis_imports",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    # Every 30 seconds: a statement is uploaded by hand, a few times a month,
+    # so an accountant waiting half a minute for the parse to start is fine —
+    # and the poll is one indexed `SELECT ... FOR UPDATE SKIP LOCKED` when the
+    # queue is empty, which it almost always is.
+    sched.add_job(
+        _wrap(factory, jobs.process_bank_statements),
+        IntervalTrigger(seconds=30, timezone=TIMEZONE),
+        next_run_time=now,
+        id="process_bank_statements",
         misfire_grace_time=3600,
         coalesce=True,
     )

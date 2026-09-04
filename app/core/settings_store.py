@@ -168,6 +168,21 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "SHA-256 hex digest of the rotated Payme cashbox key (empty means "
             "PAYME_CASHBOX_KEY is still authoritative)",
         ),
+        SettingSpec("bank_statement_max_mb", int, 10, "Upload cap for a bank statement file"),
+        SettingSpec(
+            "provider_settlement_payer_fragment",
+            str,
+            "payme",
+            "Payment provider that settles in bulk: matched case-insensitively as a "
+            "fragment of a bank line's payer name, and used as the provider code "
+            "whose turnover that payout is reconciled against",
+        ),
+        SettingSpec(
+            "refund_control_working_days",
+            int,
+            20,
+            "Working days from a refund request to its control deadline (tz/08; RI-07 past it)",
+        ),
     )
 }
 
