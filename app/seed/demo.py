@@ -41,6 +41,7 @@ Usage: `uv run python -m app.seed.demo` (== `make demo-seed`). Targets
 
 import asyncio
 import io
+import os
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -81,7 +82,13 @@ from app.modules.norms.service import PARAMETER
 from app.modules.norms.service import publish_versioned as norms_publish_versioned
 from app.seed import seed_organizations
 
-DEMO_PASSWORD = "Demo#Seed2026"  # meets tz/11's policy; printed, never secret
+# One FIXED password per account, never a shared one (Oybek, 2026-09-04). The demo
+# runs on the dev server, which is reachable from the internet, so a single string
+# opening all eight accounts — `sys_admin` among them — is not acceptable there;
+# and these are deliberately NOT derivable from the login by any visible rule, so
+# learning one does not hand over the rest. They are stable across reseeds on
+# purpose: an operator writes them down once. Dev only — production accounts come
+# from `app/bootstrap.py` and a real password change, never from this module.
 BURCHMULLA_CODE = "burchmulla"
 
 # The agency root + the Burchmulla leshoz (decision #45), for a truly empty
@@ -102,8 +109,39 @@ _ORGANIZATION_ROWS = [
     },
 ]
 
+
 # Source data (decision #45); read-only, never modified.
-_SHAPEFILE_DIR = Path("/Users/oybek/projects/forest/ruxsatnoma/data/geodata/burchmulla/shapefile")
+#
+# `DEMO_SHAPEFILE_DIR` wins wherever it is set, because the DEPLOYED container has
+# nothing resembling this repository's layout — and when the directory is missing
+# the import is skipped with a warning rather than failing the run, so a seed that
+# cannot reach the geodata still produces users and organizations. That skip is
+# quiet enough to be dangerous on its own (no contours means no application, no
+# permit and no QR check), which is why `_resolve_shapefile_dir`'s answer is
+# PRINTED in the report: an operator sees which directory was actually consulted.
+_SHAPEFILE_RELATIVE = Path("data/geodata/burchmulla/shapefile")
+
+
+def _resolve_shapefile_dir() -> Path:
+    configured = os.environ.get("DEMO_SHAPEFILE_DIR")
+    if configured:
+        return Path(configured)
+    # Walk UP looking for the directory rather than counting parents: a git
+    # worktree puts this file at backend/.claude/worktrees/<name>/app/seed/,
+    # two levels deeper than a plain checkout, and a fixed `parents[3]` there
+    # resolves to `backend/.claude/worktrees/data/...` — a path that does not
+    # exist, so the import is skipped and the demo silently loses every contour.
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / _SHAPEFILE_RELATIVE
+        if candidate.is_dir():
+            return candidate
+    # Nothing found: return the conventional location so the warning names a
+    # path a human recognises instead of the deepest directory we happened to try.
+    return here.parents[3] / _SHAPEFILE_RELATIVE
+
+
+_SHAPEFILE_DIR = _resolve_shapefile_dir()
 _SHAPEFILE_STEM = "Ижарачилар"
 _SHAPEFILE_EXTS = (".shp", ".dbf", ".prj", ".shx", ".cpg")
 
@@ -126,6 +164,7 @@ class DemoUser:
     role_code: str
     organization_code: str | None = None
     pinfl: str | None = None
+    password: str = ""
 
 
 # Every staff account needs its OWN `pinfl`: `signatures.service._ownership_reason`
@@ -139,13 +178,20 @@ class DemoUser:
 # why a collision-resistant CHOICE matters more here than a general
 # vacate-then-assign mechanism would.
 DEMO_STAFF: list[DemoUser] = [
-    DemoUser("demo_sysadmin", "Demo Sys Admin", "sys_admin", pinfl="30260904000001"),
+    DemoUser(
+        "demo_sysadmin",
+        "Demo Sys Admin",
+        "sys_admin",
+        pinfl="30260904000001",
+        password="Chatqal#Sys7412",
+    ),
     DemoUser(
         "demo_executor",
         "Demo Executor (Burchmulla DOX)",
         "executor_staff",
         "burchmulla",
         pinfl="30260904000002",
+        password="Yonbagʻir#Exe3096",
     ),
     DemoUser(
         "demo_executor_head",
@@ -153,12 +199,17 @@ DEMO_STAFF: list[DemoUser] = [
         "executor_head",
         "burchmulla",
         pinfl="30260904000003",
+        password="Qirrali#Head8254",
     ),
     # Holds `norms.tariffs.publish` for real (migration 0010's grant) — used to
     # publish the demo's coef_sb:* drafts so that gate is exercised on its own
     # merit, not on the sys_admin superuser bypass (`_holds_tariffs_publish`).
     DemoUser(
-        "demo_central_admin", "Demo Central Office Admin", "central_admin", pinfl="30260904000004"
+        "demo_central_admin",
+        "Demo Central Office Admin",
+        "central_admin",
+        pinfl="30260904000004",
+        password="Bulutli#Mrkz5731",
     ),
     # `permits.signers._signer_refusal` checks STRICT equality on
     # `users.organization_id` against the permit's own organization for every
@@ -169,9 +220,20 @@ DEMO_STAFF: list[DemoUser] = [
     # above, or their otherwise-valid signature is refused as
     # `wrong_organization`.
     DemoUser(
-        "demo_accountant", "Demo Accountant", "accountant", "burchmulla", pinfl="30260904000005"
+        "demo_accountant",
+        "Demo Accountant",
+        "accountant",
+        "burchmulla",
+        pinfl="30260904000005",
+        password="Shirin#Hisob2648",
     ),
-    DemoUser("demo_prosecutor", "Demo Prosecutor", "prosecutor", pinfl="30260904000006"),
+    DemoUser(
+        "demo_prosecutor",
+        "Demo Prosecutor",
+        "prosecutor",
+        pinfl="30260904000006",
+        password="Toshloq#Nzrt9187",
+    ),
     # `permit_chief_forester` (`tz/13` requisite 21, decision #32) — the one
     # purpose `chief_forester` exists for. Without this account no permit can
     # ever collect its full 3+1 signatures, so nothing ever reaches ACTIVE:
@@ -182,9 +244,16 @@ DEMO_STAFF: list[DemoUser] = [
         "chief_forester",
         "burchmulla",
         pinfl="30260904000007",
+        password="Archali#Bosh4523",
     ),
 ]
-DEMO_APPLICANT = DemoUser("demo_applicant", "Demo Applicant", "applicant", pinfl="20260904000001")
+DEMO_APPLICANT = DemoUser(
+    "demo_applicant",
+    "Demo Applicant",
+    "applicant",
+    pinfl="20260904000001",
+    password="Adirli#Fuqr6390",
+)
 DEMO_APPLICANT_PHONE = "+998901112233"
 
 
@@ -203,7 +272,7 @@ async def _ensure_user(
     """Get-or-create one demo account. Returns (user, its TOTP secret,
     created?, pinfl/organization_id/password converged?).
 
-    The password is the fixed, printed `DEMO_PASSWORD` regardless of whether
+    The password is `spec.password` — this account's own fixed, printed one — regardless of whether
     the row already existed — we chose it, we do not need to read it back, so
     an existing row's hash CONVERGES on it the same way `pinfl` and
     `organization_id` do below (verified with `verify_password` first, so a
@@ -270,9 +339,9 @@ async def _ensure_user(
             )
             converged = True
         if existing.password_hash is None or not verify_password(
-            DEMO_PASSWORD, existing.password_hash
+            spec.password, existing.password_hash
         ):
-            existing.password_hash = hash_password(DEMO_PASSWORD)
+            existing.password_hash = hash_password(spec.password)
             await audit.log(
                 db,
                 action="user.update",
@@ -294,7 +363,7 @@ async def _ensure_user(
         role_id=role_id,
         organization_id=organization_id,
         pinfl=spec.pinfl,
-        password_hash=hash_password(DEMO_PASSWORD),
+        password_hash=hash_password(spec.password),
         mfa_secret=encrypt_str(shared_secret),
         must_change_password=False,  # the one thing bootstrap.py's users start with (ruling 8)
     )
@@ -591,7 +660,16 @@ async def _ensure_burchmulla_contours(db: AsyncSession, *, actor: User) -> str:
 
 
 async def _main() -> None:
-    validate_password_policy(DEMO_PASSWORD)
+    # Every account's own password, not one shared string — and a duplicate is
+    # refused outright, so a future edit cannot quietly collapse them back into
+    # one credential that opens all eight.
+    for _spec in (*DEMO_STAFF, DEMO_APPLICANT):
+        if not _spec.password:
+            raise ValueError(f"demo seed: {_spec.login} has no password")
+        validate_password_policy(_spec.password)
+    _passwords = [spec.password for spec in (*DEMO_STAFF, DEMO_APPLICANT)]
+    if len(set(_passwords)) != len(_passwords):
+        raise ValueError("demo seed: two accounts share a password")
     engine = make_engine(get_settings().database_url)
     factory = make_session_factory(engine)
     report: list[str] = []
@@ -615,8 +693,7 @@ async def _main() -> None:
                 created_users[spec.login] = (user, secret, created, converged)
             await db.commit()
 
-        report.append("=== Demo accounts (password + TOTP for every one) ===")
-        report.append(f"password (all accounts): {DEMO_PASSWORD}")
+        report.append("=== Demo accounts (own password + TOTP for every one) ===")
         for spec in [*DEMO_STAFF, DEMO_APPLICANT]:
             user, secret, created, converged = created_users[spec.login]
             if created:
@@ -626,6 +703,7 @@ async def _main() -> None:
             else:
                 state = "(already existed)"
             report.append(f"  {spec.login:20s} role={spec.role_code:15s} {state}")
+            report.append(f"      password:    {spec.password}")
             report.append(f"      pinfl:       {spec.pinfl}")
             report.append(f"      TOTP secret: {secret}")
             report.append(f"      TOTP URI:    {totp_provisioning_uri(secret, spec.login)}")
@@ -684,6 +762,7 @@ async def _main() -> None:
             gis_message = await _ensure_burchmulla_contours(db, actor=sysadmin_user)
             await db.commit()
         report.append("")
+        report.append(f"Geodata source: {_SHAPEFILE_DIR}")
         report.append(gis_message)
 
         # --- Grazing norm (UNCONFIRMED placeholder — see _ensure_grazing_norm's
