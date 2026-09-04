@@ -124,6 +124,101 @@ async def test_a_stranger_can_neither_attach_nor_detach(
     assert refused.status_code == 404
 
 
+async def test_the_owner_may_attach_and_detach_on_a_returned_application(
+    db, applicant_client, submitted_application, doc_type_item_id
+) -> None:
+    """`service._EDITABLE_STATUSES` deliberately holds `{DRAFT, RETURNED}`
+    (3.9b task 1 review, Important finding): a returned application is
+    correctable again, which includes its attachments, not just its fields —
+    PATCH and the document routes share ONE definition of "still editable"
+    (`_own_draft_for_update`) for exactly this reason. Do NOT narrow it back
+    to DRAFT-only.
+
+    Built by injecting the status directly, the same way
+    `test_assignment.py::test_a_resubmission_does_not_re_fire_auto_assignment`
+    does — Task 3's `/return` route does not exist yet and will produce
+    RETURNED for real once it ships. The assertions read the card back after
+    each step, not merely the status code, so a route that silently no-ops
+    on a RETURNED application would not pass here.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import update
+
+    from app.modules.applications.models import Application
+
+    await db.execute(
+        update(Application)
+        .where(Application.id == _uuid.UUID(submitted_application))
+        .values(status="RETURNED")
+    )
+    await db.commit()
+
+    app_id = submitted_application
+    file_id = await _upload(applicant_client)
+    attached = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/documents",
+        json={"doc_type_item_id": str(doc_type_item_id), "file_id": file_id},
+    )
+    assert attached.status_code == 201, attached.text
+    document_id = attached.json()["id"]
+
+    card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
+    assert [d["id"] for d in card["documents"]] == [document_id]
+
+    detached = await applicant_client.delete(
+        f"/api/v1/applications/{app_id}/documents/{document_id}"
+    )
+    assert detached.status_code == 204
+
+    card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
+    assert card["documents"] == []
+
+
+async def test_a_stranger_still_cannot_touch_a_returned_applications_documents(
+    db, applicant_client, other_applicant_client, submitted_application, doc_type_item_id
+) -> None:
+    """RETURNED becoming editable again (task 1 review finding) must not also
+    make it readable/writable by anyone but its owner — the SAME 404 a
+    stranger already gets against a DRAFT (`test_a_stranger_can_neither_
+    attach_nor_detach` above)."""
+    import uuid as _uuid
+
+    from sqlalchemy import update
+
+    from app.modules.applications.models import Application
+
+    await db.execute(
+        update(Application)
+        .where(Application.id == _uuid.UUID(submitted_application))
+        .values(status="RETURNED")
+    )
+    await db.commit()
+
+    app_id = submitted_application
+    file_id = await _upload(applicant_client)
+    attached = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/documents",
+        json={"doc_type_item_id": str(doc_type_item_id), "file_id": file_id},
+    )
+    assert attached.status_code == 201, attached.text
+    document_id = attached.json()["id"]
+
+    stranger_file = await _upload(other_applicant_client)
+    refused = await other_applicant_client.post(
+        f"/api/v1/applications/{app_id}/documents",
+        json={"doc_type_item_id": str(doc_type_item_id), "file_id": stranger_file},
+    )
+    assert refused.status_code == 404
+    assert refused.json()["error"]["code"] == "ERR-SYS-003"
+
+    refused = await other_applicant_client.delete(
+        f"/api/v1/applications/{app_id}/documents/{document_id}"
+    )
+    assert refused.status_code == 404
+    assert refused.json()["error"]["code"] == "ERR-SYS-003"
+
+
 async def test_a_document_of_another_application_is_not_detachable_through_this_one(
     applicant_client, draft_ready_for_submission, doc_type_item_id
 ) -> None:

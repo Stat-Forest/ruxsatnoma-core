@@ -791,6 +791,15 @@ async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
             raise err("ERR-VAL-001", details={"reason": "unknown_livestock_type"})
 
 
+# DELIBERATELY both, not `DRAFT` alone — do NOT narrow this back (task 1
+# review finding): PATCH, the document routes and `submit`'s own
+# resubmission all share this one set, because an application returned for
+# correction (3.9b) exists so the applicant CAN correct it — a return
+# nobody can act on would make the whole feature pointless. Covered by
+# `tests/modules/applications/test_draft_api.py::
+# test_the_owner_may_patch_a_returned_application` and
+# `test_documents.py::test_the_owner_may_attach_and_detach_on_a_returned_
+# application`, each with a stranger-is-still-refused sibling.
 _EDITABLE_STATUSES = frozenset({INITIAL_STATUS, RETURNED_STATUS})
 
 
@@ -799,7 +808,10 @@ async def _own_draft_for_update(
 ) -> Application:
     """The caller's own application, locked, and only while it is still
     EDITABLE — `DRAFT`, or `RETURNED` (task 1, 3.9b): a returned application
-    becomes correctable again.
+    becomes correctable again, and PATCH/documents/`submit` must reach it
+    exactly as they reach DRAFT (see `_EDITABLE_STATUSES`'s own comment for
+    why this is deliberate and covered, not an oversight to "fix" back to
+    DRAFT-only).
 
     Ownership is checked BEFORE the status, and both refusals differ: a
     stranger gets 404 (they may not learn that this id is an application at
