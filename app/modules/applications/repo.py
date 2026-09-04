@@ -18,7 +18,7 @@ this file imports no other module's service (review I2)."""
 
 import uuid
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
@@ -34,6 +34,7 @@ from app.modules.applications.models import (
     ApplicationItem,
     ApplicationStatusHistory,
 )
+from app.modules.applications.sla import SLA_ACTIVE_STATUSES
 
 
 async def get_application(db: AsyncSession, application_id: uuid.UUID) -> Application | None:
@@ -467,3 +468,41 @@ async def review_candidates(
         Candidate(user_id=user_id, open_count=open_counts.get(user_id, 0))
         for user_id in eligible_user_ids
     ]
+
+
+# --- Task 2: the SLA sweep's own two candidate sets --------------------------
+#
+# Both mirror `payments.repo.list_invoices_due_soon`/`list_refunds_past_due`
+# exactly: a status filter alone is what makes a second sweep run a no-op for
+# a row the first one already moved past this query's own WHERE clause
+# (decided, or paused into `PENDING_INFO`). `sla.SLA_ACTIVE_STATUSES` is the
+# same tuple `sla.is_overdue` reads — one source for "is the clock even
+# running" — and deliberately NOT this file's own `ACTIVE_STATUSES` above
+# (migration 0015's duplicate-guard set, a different question entirely: an
+# APPROVED/INVOICED/PAID application still occupies its plot, but its SLA
+# clock has already stopped).
+
+
+async def list_applications_sla_due_soon(
+    db: AsyncSession, *, now: datetime, before: datetime
+) -> Sequence[Application]:
+    """Every SLA-active application due in `[now, before]` — not yet overdue
+    (`list_applications_past_sla_deadline`'s own set) but inside
+    `applications.jobs.sla_sweep`'s reminder window."""
+    stmt = select(Application).where(
+        Application.status.in_(SLA_ACTIVE_STATUSES),
+        Application.sla_deadline_at >= now,
+        Application.sla_deadline_at <= before,
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+async def list_applications_past_sla_deadline(
+    db: AsyncSession, *, now: datetime
+) -> Sequence[Application]:
+    """Every SLA-active application whose deadline has already passed —
+    `applications.jobs.sla_sweep`'s candidate set for RI-07."""
+    stmt = select(Application).where(
+        Application.status.in_(SLA_ACTIVE_STATUSES), Application.sla_deadline_at < now
+    )
+    return (await db.execute(stmt)).scalars().all()

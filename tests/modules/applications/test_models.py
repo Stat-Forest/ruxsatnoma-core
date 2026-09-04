@@ -116,7 +116,11 @@ async def test_check_type_check_rejects_a_bogus_value(db, applicant) -> None:
     db.add(app_row)
     await db.flush()
     check = ApplicationCheck(
-        application_id=app_row.id, check_type="gis_restrictions", result="pass", details={}
+        application_id=app_row.id,
+        check_type="gis_restrictions",
+        result="pass",
+        details={},
+        created_by=app_row.submitted_by_user_id,
     )
     db.add(check)
     with pytest.raises(IntegrityError, match="ck_application_checks_check_type_valid"):
@@ -137,7 +141,11 @@ async def test_check_type_check_accepts_every_check_type(db, applicant) -> None:
     await db.flush()
     for check_type in CHECK_TYPES:
         check = ApplicationCheck(
-            application_id=app_row.id, check_type=check_type, result="pass", details={}
+            application_id=app_row.id,
+            check_type=check_type,
+            result="pass",
+            details={},
+            created_by=app_row.submitted_by_user_id,
         )
         db.add(check)
         await db.flush()
@@ -155,7 +163,11 @@ async def test_result_check_rejects_a_bogus_value(db, applicant) -> None:
     db.add(app_row)
     await db.flush()
     check = ApplicationCheck(
-        application_id=app_row.id, check_type="gis_validity", result="unknown", details={}
+        application_id=app_row.id,
+        check_type="gis_validity",
+        result="unknown",
+        details={},
+        created_by=app_row.submitted_by_user_id,
     )
     db.add(check)
     with pytest.raises(IntegrityError, match="ck_application_checks_result_valid"):
@@ -179,7 +191,11 @@ async def test_result_check_accepts_every_result(db, applicant) -> None:
     await db.flush()
     for result in CHECK_RESULTS:
         check = ApplicationCheck(
-            application_id=app_row.id, check_type="gis_validity", result=result, details={}
+            application_id=app_row.id,
+            check_type="gis_validity",
+            result=result,
+            details={},
+            created_by=app_row.submitted_by_user_id,
         )
         db.add(check)
         await db.flush()
