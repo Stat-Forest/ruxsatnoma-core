@@ -4,9 +4,13 @@ running it twice changes nothing on the second run and never raises.
 Fills whatever the demo scenario needs that reference-data migrations do not
 already provide:
 
-  * one staff user per role the demo scenario touches, with a known password
-    and a TOTP secret already enrolled (never `must_change_password`, so every
-    route past `GET /auth/me` is reachable right after login+MFA);
+  * one staff user per role the demo scenario touches, with a known password,
+    a TOTP secret already enrolled (never `must_change_password`, so every
+    route past `GET /auth/me` is reachable right after login+MFA), AND a
+    deterministic `pinfl` that CONVERGES on every run — `signatures.service`
+    refuses a personal signer with no pinfl as `signer_pinfl_unknown`
+    (ERR-SIGN-001), so without one the leshoz head cannot approve anything,
+    which is step 4 of the seven-step demo scenario;
   * one applicant with a finished registration (`applicants` row of their own,
     so `get_current_user` never raises ERR-AUTH-008);
   * the Burchmulla leshoz's real geodata, imported through `gis`'s own
@@ -111,21 +115,40 @@ class DemoUser:
     pinfl: str | None = None
 
 
+# Every staff account needs its OWN `pinfl`: `signatures.service._ownership_reason`
+# refuses a personal (14-digit) signer with `user.pinfl is None` as
+# `"signer_pinfl_unknown"` (ERR-SIGN-001) — the head cannot approve, the
+# executor cannot sign anything requiring their own identity, and this is not
+# optional for a demo whose step 4 IS the head's decision signature. Prefixed
+# `3026090400...` (never `2026090400...`, the applicant's own prefix) so a
+# fresh value can never collide with anything a human might have typed by hand
+# elsewhere in this database — see `_ensure_user`'s convergence note below for
+# why a collision-resistant CHOICE matters more here than a general
+# vacate-then-assign mechanism would.
 DEMO_STAFF: list[DemoUser] = [
-    DemoUser("demo_sysadmin", "Demo Sys Admin", "sys_admin"),
-    DemoUser("demo_executor", "Demo Executor (Burchmulla DOX)", "executor_staff", "burchmulla"),
+    DemoUser("demo_sysadmin", "Demo Sys Admin", "sys_admin", pinfl="30260904000001"),
+    DemoUser(
+        "demo_executor",
+        "Demo Executor (Burchmulla DOX)",
+        "executor_staff",
+        "burchmulla",
+        pinfl="30260904000002",
+    ),
     DemoUser(
         "demo_executor_head",
         "Demo Executor Head (Burchmulla DOX)",
         "executor_head",
         "burchmulla",
+        pinfl="30260904000003",
     ),
     # Holds `norms.tariffs.publish` for real (migration 0010's grant) — used to
     # publish the demo's coef_sb:* drafts so that gate is exercised on its own
     # merit, not on the sys_admin superuser bypass (`_holds_tariffs_publish`).
-    DemoUser("demo_central_admin", "Demo Central Office Admin", "central_admin"),
-    DemoUser("demo_accountant", "Demo Accountant", "accountant"),
-    DemoUser("demo_prosecutor", "Demo Prosecutor", "prosecutor"),
+    DemoUser(
+        "demo_central_admin", "Demo Central Office Admin", "central_admin", pinfl="30260904000004"
+    ),
+    DemoUser("demo_accountant", "Demo Accountant", "accountant", pinfl="30260904000005"),
+    DemoUser("demo_prosecutor", "Demo Prosecutor", "prosecutor", pinfl="30260904000006"),
 ]
 DEMO_APPLICANT = DemoUser("demo_applicant", "Demo Applicant", "applicant", pinfl="20260904000001")
 DEMO_APPLICANT_PHONE = "+998901112233"
@@ -142,8 +165,9 @@ async def _ensure_organizations(db: AsyncSession) -> tuple[int, int]:
 
 async def _ensure_user(
     db: AsyncSession, spec: DemoUser, *, shared_secret: str
-) -> tuple[User, str, bool]:
-    """Get-or-create one demo account. Returns (user, its TOTP secret, created?).
+) -> tuple[User, str, bool, bool]:
+    """Get-or-create one demo account. Returns (user, its TOTP secret,
+    created?, pinfl converged?).
 
     The password is the fixed, printed `DEMO_PASSWORD` regardless of whether
     the row already existed — we chose it, we do not need to read it back.
@@ -151,11 +175,36 @@ async def _ensure_user(
     random per first run), so an existing user's own `mfa_secret` is decrypted
     rather than re-generated — a fresh secret would silently invalidate an
     already-configured authenticator.
+
+    `pinfl` CONVERGES instead: an already-existing row's pinfl is forced back
+    to `spec.pinfl` whenever it differs, not merely left alone. Idempotent
+    seeding here does not mean "do nothing when a row exists" — this dev
+    database has already carried demo accounts whose `pinfl` was hand-patched
+    (and then overwritten again by something else) by a session working
+    around ERR-SIGN-001 `signer_pinfl_unknown`, so the values sitting there
+    were accidental, not seeded, and the next reseed must put them back to a
+    known state on its own. `spec.pinfl`'s own prefix (`3026090400...`) is
+    chosen to never collide with anything already in this table, so a plain
+    UPDATE is safe without a separate vacate pass.
     """
     existing = (await db.execute(select(User).where(User.login == spec.login))).scalar_one_or_none()
     if existing is not None:
         secret = decrypt_str(existing.mfa_secret) if existing.mfa_secret else shared_secret
-        return existing, secret, False
+        pinfl_converged = False
+        if spec.pinfl is not None and existing.pinfl != spec.pinfl:
+            old_pinfl = existing.pinfl
+            existing.pinfl = spec.pinfl
+            await db.flush()
+            await audit.log(
+                db,
+                action="user.update",
+                object_type="user",
+                object_id=existing.id,
+                basis="demo seed CLI — converge pinfl to its seeded value",
+                extra={"login": spec.login, "old_pinfl": old_pinfl, "new_pinfl": spec.pinfl},
+            )
+            pinfl_converged = True
+        return existing, secret, False, pinfl_converged
 
     role_id = (await db.execute(select(Role.id).where(Role.code == spec.role_code))).scalar_one()
     organization_id = None
@@ -188,7 +237,7 @@ async def _ensure_user(
         basis="demo seed CLI",
         extra={"login": spec.login, "role": spec.role_code},
     )
-    return user, shared_secret, True
+    return user, shared_secret, True, False
 
 
 async def _ensure_applicant_registration(db: AsyncSession, user: User) -> bool:
@@ -367,21 +416,27 @@ async def _main() -> None:
 
         # --- Users -------------------------------------------------------
         shared_secret = new_totp_secret()
-        created_users: dict[str, tuple[User, str, bool]] = {}
+        created_users: dict[str, tuple[User, str, bool, bool]] = {}
         async with factory() as db:
             for spec in [*DEMO_STAFF, DEMO_APPLICANT]:
-                user, secret, created = await _ensure_user(db, spec, shared_secret=shared_secret)
-                created_users[spec.login] = (user, secret, created)
+                user, secret, created, pinfl_fixed = await _ensure_user(
+                    db, spec, shared_secret=shared_secret
+                )
+                created_users[spec.login] = (user, secret, created, pinfl_fixed)
             await db.commit()
 
         report.append("=== Demo accounts (password + TOTP for every one) ===")
         report.append(f"password (all accounts): {DEMO_PASSWORD}")
         for spec in [*DEMO_STAFF, DEMO_APPLICANT]:
-            user, secret, created = created_users[spec.login]
-            report.append(
-                f"  {spec.login:20s} role={spec.role_code:15s} "
-                f"{'(created)' if created else '(already existed)'}"
-            )
+            user, secret, created, pinfl_fixed = created_users[spec.login]
+            if created:
+                state = "(created)"
+            elif pinfl_fixed:
+                state = "(already existed — pinfl converged to the seeded value)"
+            else:
+                state = "(already existed)"
+            report.append(f"  {spec.login:20s} role={spec.role_code:15s} {state}")
+            report.append(f"      pinfl:       {spec.pinfl}")
             report.append(f"      TOTP secret: {secret}")
             report.append(f"      TOTP URI:    {totp_provisioning_uri(secret, spec.login)}")
 
