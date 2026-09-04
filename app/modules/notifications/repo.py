@@ -97,20 +97,30 @@ async def get_by_provider_message_id(
 
 
 async def notification_exists(
-    db: AsyncSession, *, event_code: str, object_id: uuid.UUID, channel: str
+    db: AsyncSession,
+    *,
+    event_code: str,
+    object_id: uuid.UUID,
+    channel: str,
+    recipient_user_id: uuid.UUID | None = None,
 ) -> bool:
     """Whether at least one `channel` notification for `event_code`/`object_id`
     already exists — a periodic job's own once-only check before calling
-    `notify()` again for the same object (payments.jobs.expiry_sweep, task 6)."""
-    stmt = (
-        select(Notification.id)
-        .where(
-            Notification.event_code == event_code,
-            Notification.object_id == object_id,
-            Notification.channel == channel,
-        )
-        .limit(1)
-    )
+    `notify()` again for the same object (payments.jobs.expiry_sweep, task 6).
+
+    `recipient_user_id`, when given, narrows the check to THAT recipient
+    (applications.jobs.sla_sweep, task 2 fix round 1): a reminder sent to one
+    of several recipients for the same object must not silently block the
+    others — each gets its own once-only guard. `None` (every existing
+    caller) keeps the original object-wide check."""
+    conditions = [
+        Notification.event_code == event_code,
+        Notification.object_id == object_id,
+        Notification.channel == channel,
+    ]
+    if recipient_user_id is not None:
+        conditions.append(Notification.recipient_user_id == recipient_user_id)
+    stmt = select(Notification.id).where(*conditions).limit(1)
     return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 

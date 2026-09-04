@@ -8,10 +8,14 @@ Two independent passes, both idempotent by construction because each
 candidate set is defined by a status/deadline filter that a successful pass
 removes the row from:
 
-1. **Reminder** — an SLA-active application (`sla.ACTIVE_STATUSES`) due
-   within `SLA_REMINDER_DAYS_BEFORE` days, not yet reminded. `notifications.
-   service.already_notified` is the once-only check, the same shape
-   `payments.jobs._remind_about_one_invoice` uses.
+1. **Reminder** — an SLA-active application (`sla.SLA_ACTIVE_STATUSES`) due
+   within `SLA_REMINDER_DAYS_BEFORE` days, reminded to the ASSIGNED EXECUTOR
+   and the head of the application's organization (`tz/04` scenario line 45:
+   «приближение SLA -> напоминание исполнителю и руководителю») — never the
+   applicant, who cannot make the office decide any faster.
+   `notifications.service.already_notified` is the once-only check, one per
+   RECIPIENT (its own `recipient_user_id` filter, fix round 1) — the same
+   shape `payments.jobs._remind_about_one_invoice` uses per object.
 2. **RI-07** — an SLA-active application whose deadline has already passed,
    not yet flagged. `audit.service.already_logged` is the once-only check,
    the same shape `payments.jobs._flag_one_overdue_refund` uses — a risk
@@ -39,8 +43,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.applications import repo
 from app.modules.applications.models import Application
+from app.modules.applications.permissions import APPLICATIONS_DECIDE
 from app.modules.applications.sla import is_overdue
 from app.modules.audit import service as audit
+from app.modules.auth import service as auth_service
 from app.modules.notifications import service as notifications_service
 
 logger = structlog.get_logger(__name__)
@@ -63,26 +69,66 @@ NOTIFY_APPLICATION_SLA_APPROACHING = "application.sla_approaching"
 SLA_REMINDER_DAYS_BEFORE = 3
 
 
+async def _reminder_recipients(db: AsyncSession, application: Application) -> set[uuid.UUID]:
+    """The ASSIGNED EXECUTOR and the head of the application's organization —
+    `tz/04` scenario line 45 names both, never the applicant. The head is
+    resolved through `APPLICATIONS_DECIDE` (`applications.permissions`'s own
+    module docstring: this permission "belongs to `executor_head` and to it
+    alone"), the SAME accessor `_auto_assign_on_submission` uses for
+    `APPLICATIONS_REVIEW` — never a raw `role.code == "executor_head"`
+    comparison, which would be a second, driftable source of the same rule.
+
+    Either half can come back empty: an application somehow missing its
+    active assignment (logged, matches `permits.subscribers.
+    on_payment_confirmed`'s own "log and skip" shape for the identical
+    column), or an organization with nobody currently holding the decide
+    permission."""
+    recipients: set[uuid.UUID] = set()
+    if application.assigned_user_id is not None:
+        recipients.add(application.assigned_user_id)
+    else:
+        logger.info("job.sla_sweep.reminder_unassigned", application_id=str(application.id))
+    if application.assigned_org_id is not None:
+        heads = await auth_service.user_ids_with_permission(
+            db, APPLICATIONS_DECIDE, organization_id=application.assigned_org_id
+        )
+        recipients.update(heads)
+    return recipients
+
+
 async def _remind_one(db: AsyncSession, application: Application, *, correlation_id: str) -> bool:
     """One due-soon application's whole body, run by the caller inside a
     SAVEPOINT (mirrors `payments.jobs._remind_about_one_invoice`). `True`
-    when a reminder was sent, `False` when it was skipped."""
-    if await notifications_service.already_notified(
-        db, event_code=NOTIFY_APPLICATION_SLA_APPROACHING, object_id=application.id
-    ):
-        return False
+    when at least one recipient was actually reminded, `False` when every
+    resolved recipient already had one (or none could be resolved at all).
+
+    Each recipient carries its OWN `already_notified` check
+    (`recipient_user_id=`): the executor's own notification row must not
+    make the head look already-reminded, or vice versa."""
     deadline = application.sla_deadline_at
     assert deadline is not None  # the candidate query's own WHERE clause
-    await notifications_service.notify(
-        db,
-        event_code=NOTIFY_APPLICATION_SLA_APPROACHING,
-        recipient_user_id=application.submitted_by_user_id,
-        params={"application_number": application.number, "deadline": deadline.date()},
-        object_type="application",
-        object_id=application.id,
-        correlation_id=correlation_id,
-    )
-    return True
+    params = {"application_number": application.number, "deadline": deadline.date()}
+
+    sent = False
+    for recipient_id in await _reminder_recipients(db, application):
+        if await notifications_service.already_notified(
+            db,
+            event_code=NOTIFY_APPLICATION_SLA_APPROACHING,
+            object_id=application.id,
+            recipient_user_id=recipient_id,
+        ):
+            continue
+        await notifications_service.notify(
+            db,
+            event_code=NOTIFY_APPLICATION_SLA_APPROACHING,
+            recipient_user_id=recipient_id,
+            params=params,
+            object_type="application",
+            object_id=application.id,
+            correlation_id=correlation_id,
+        )
+        sent = True
+    return sent
 
 
 async def _send_reminders(db: AsyncSession, *, now: datetime, correlation_id: str) -> int:

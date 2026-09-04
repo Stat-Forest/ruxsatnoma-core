@@ -12,8 +12,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.admin.models import Organization
 from app.modules.applications import sla
 from app.modules.applications.models import Application
+from tests.modules.auth.test_sessions import make_user
 
 
 def test_a_pause_moves_the_deadline_forward_by_its_own_length() -> None:
@@ -76,6 +78,19 @@ async def application_due_in_two_days(db: AsyncSession, application_in_review: s
     return application_id
 
 
+@pytest.fixture
+async def org_head_id(db: AsyncSession, leshoz: Organization) -> uuid.UUID:
+    """A SECOND staff member holding `executor_head` in the SAME `leshoz` as
+    `application_in_review`'s own `hodim_user` — fix round 1's "head" half of
+    the reminder's two recipients (`tz/04` scenario line 45). `leshoz` is
+    function-scoped and pytest caches it per test, so requesting it here and
+    through `application_in_review`'s own chain (`hodim_user` depends on it
+    too) resolves to the SAME organization row."""
+    head = await make_user(db, role_code="executor_head", organization_id=leshoz.id)
+    await db.flush()
+    return head.id
+
+
 async def test_the_sweep_logs_ri_07_once_and_only_once(db, overdue_application) -> None:
     """Ruling 2: RI-07 goes into the audit journal for oversight (4.2) to
     harvest. The job runs daily — a second pass must not log it again."""
@@ -94,21 +109,46 @@ async def test_the_sweep_logs_ri_07_once_and_only_once(db, overdue_application) 
     assert len(breaches) == 1
 
 
-async def test_the_sweep_reminds_before_the_deadline_once(db, application_due_in_two_days) -> None:
+async def test_the_sweep_reminds_the_executor_and_the_head_not_the_applicant(
+    db, application_due_in_two_days, org_head_id
+) -> None:
+    """Fix round 1 (Important finding): `tz/04` scenario line 45 —
+    «приближение SLA -> напоминание исполнителю и руководителю». The
+    applicant cannot make the office decide any faster, so a reminder to
+    them changes nothing while the deadline it warns about passes — the
+    ASSIGNED EXECUTOR and the head of the application's organization are the
+    only two recipients who can act on it.
+
+    Runs the sweep TWICE, same as the RI-07 test above: `already_notified`'s
+    `recipient_user_id` filter (fix round 1) must guard EACH recipient on
+    its own, or the executor's own row would make the head look
+    already-reminded on the very first pass, not just the second."""
     from sqlalchemy import func, select
 
     from app.modules.applications import jobs
     from app.modules.notifications.models import Notification
 
+    application = await db.get(Application, application_due_in_two_days)
+    assert application is not None
+    executor_id = application.assigned_user_id
+    applicant_id = application.submitted_by_user_id
+    assert executor_id is not None
+
     await jobs.sla_sweep(db)
     await jobs.sla_sweep(db)
 
-    sent = await db.scalar(
-        select(func.count())
-        .select_from(Notification)
-        .where(
-            Notification.object_id == application_due_in_two_days,
-            Notification.event_code == "application.sla_approaching",
+    rows = (
+        await db.execute(
+            select(Notification.recipient_user_id, func.count())
+            .where(
+                Notification.object_id == application_due_in_two_days,
+                Notification.event_code == "application.sla_approaching",
+                Notification.channel == "inapp",
+            )
+            .group_by(Notification.recipient_user_id)
         )
-    )
-    assert sent == 1
+    ).all()
+    counts = dict(rows)
+
+    assert counts == {executor_id: 1, org_head_id: 1}
+    assert applicant_id not in counts

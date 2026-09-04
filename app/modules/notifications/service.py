@@ -301,7 +301,12 @@ async def notify(
 
 
 async def already_notified(
-    db: AsyncSession, *, event_code: str, object_id: uuid.UUID, channel: str = "inapp"
+    db: AsyncSession,
+    *,
+    event_code: str,
+    object_id: uuid.UUID,
+    channel: str = "inapp",
+    recipient_user_id: uuid.UUID | None = None,
 ) -> bool:
     """Whether `object_id` already has a `channel` notification for `event_code`
     — the once-only check a periodic job needs before calling `notify()` again
@@ -309,9 +314,20 @@ async def already_notified(
     not query `Notification` directly). `inapp` (the default) is the right
     channel to check: `notify()` always writes it, unlike `sms`/`email`, which
     an unreachable recipient or the kill switch can skip — so it is the one
-    channel guaranteed present after a successful call, no new column needed."""
+    channel guaranteed present after a successful call, no new column needed.
+
+    `recipient_user_id` narrows the check to one recipient among several for
+    the same object (`applications.jobs.sla_sweep`, which reminds BOTH the
+    assigned executor and the organization's head): without it, the first
+    recipient's own notification row would make every other recipient look
+    already-notified. Omit it (every caller before this one) for the
+    original object-wide check."""
     return await repo.notification_exists(
-        db, event_code=event_code, object_id=object_id, channel=channel
+        db,
+        event_code=event_code,
+        object_id=object_id,
+        channel=channel,
+        recipient_user_id=recipient_user_id,
     )
 
 
