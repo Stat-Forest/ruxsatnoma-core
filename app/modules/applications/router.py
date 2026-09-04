@@ -55,13 +55,19 @@ from app.modules.applications.schemas import (
     ApplicationOut,
     ApplicationPatch,
     ApplicationRejectIn,
+    ApplicationReturnIn,
     ApplicationStatus,
     ApplicationSubmitIn,
     ApplicationTimelineOut,
     PrecheckCalculationOut,
     PrecheckOut,
 )
-from app.modules.auth.deps import get_current_user, idempotency_context, require_permission
+from app.modules.auth.deps import (
+    get_current_user,
+    idempotency_context,
+    require_any_permission,
+    require_permission,
+)
 from app.modules.auth.models import User
 
 # `applications.number` is `RX-<yyyy>-<seq>` (plan ruling 5а). Bounded because
@@ -472,6 +478,53 @@ async def assign_application(
     return ApplicationOut.model_validate(
         await service.assign(
             db, application_id, user_id=payload.user_id, reason=payload.reason, actor=actor
+        )
+    )
+
+
+# --- Task 3 (3.9b): return for correction --------------------------------------
+#
+# `applications.review` (hodim) OR `applications.decide` (the head) —
+# `require_any_permission`, because sending a package back for correction is
+# not the head's decision alone the way approve/reject are: the reviewer who
+# caught an incomplete filing sends it back before the head ever sees it. The
+# zone is the other half of the rule and lives in the service
+# (`service._assert_in_actor_zone`), exactly like start-review beside it.
+#
+# No `Idempotency-Key`: a replay finds the application no longer SUBMITTED or
+# IN_REVIEW (already RETURNED) and answers 409 — the same reasoning task 6's
+# two POSTs give for carrying none.
+
+
+@router.post("/applications/{application_id}/return")
+async def return_application(
+    application_id: uuid.UUID,
+    payload: ApplicationReturnIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[
+        User, Depends(require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE))
+    ],
+) -> ApplicationOut:
+    """SUBMITTED or IN_REVIEW -> RETURNED, with a typed reason, the fields to
+    fix and a legal basis — so the applicant can correct and resubmit.
+
+    422 `ERR-VAL-001`: `unknown_rejection_reason` for a `reason_item_id`
+    outside the `rejection_reasons` classifier; `reason_not_returnable` for
+    one that IS in it but types a refusal or a withdrawal rather than a return
+    (RJ-03 is a REFUSAL — returning under it would misdescribe the decision);
+    `fields_to_fix_required` for an empty object; `unknown_field` for a key
+    naming no real column of the application. 404 `ERR-SYS-003` for an id that
+    does not exist and for an application outside the caller's zone. 409
+    `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
+    """
+    return ApplicationOut.model_validate(
+        await service.return_to_applicant(
+            db,
+            application_id,
+            reason_item_id=payload.reason_item_id,
+            fields_to_fix=payload.fields_to_fix,
+            legal_basis=payload.legal_basis,
+            actor=actor,
         )
     )
 

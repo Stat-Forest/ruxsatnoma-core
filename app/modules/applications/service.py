@@ -35,7 +35,7 @@ from app.core.schemas import PageParams
 from app.core.time import business_today
 from app.db import uuid7
 from app.modules.admin import repo as admin_repo
-from app.modules.admin.models import Organization
+from app.modules.admin.models import ClassifierItem, Organization
 from app.modules.applications import checks, repo
 from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
@@ -1671,12 +1671,28 @@ async def submit(
         payload=payload.model_copy(update={"application_id": application.id}),
         actor=actor,
     )
-    # Step 10, ruling 5а. AFTER the signature, so a refused ERI never reaches
-    # the counter at all; inside the transaction, so a failure later than this
-    # rolls the counter back with it and the year's numbering has no holes.
-    number = await next_public_number(db, NUMBER_PREFIX, business_today())
+    # Step 10, ruling 5а — conditional since ruling 16.1 (3.9b task 3): a
+    # RESUBMISSION after RETURNED keeps its number rather than allocating a
+    # second one, which would break the per-year counter design/03 requires
+    # to stay continuous. `application.number` is set only once, on the FIRST
+    # submission (below, inside the savepoint) — a non-null value here means
+    # this is not that first attempt.
+    number = application.number
+    if number is None:
+        # AFTER the signature, so a refused ERI never reaches the counter at
+        # all; inside the transaction, so a failure later than this rolls the
+        # counter back with it and the year's numbering has no holes.
+        number = await next_public_number(db, NUMBER_PREFIX, business_today())
 
-    submitted_at = datetime.now(UTC)
+    # Ruling 16.1's other half: `submitted_at`/`sla_deadline_at` belong to the
+    # FIRST submission alone — task 2's SLA clock must not reset on a
+    # resubmission, so both are read off the row first and only computed when
+    # still unset.
+    submitted_at = application.submitted_at
+    sla_deadline_at = application.sla_deadline_at
+    if submitted_at is None:
+        submitted_at = datetime.now(UTC)
+        sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)
     # The duplicate's key, read BEFORE the savepoint and never after it. A
     # `begin_nested()` ROLLBACK expires every instance that was dirty inside the
     # savepoint (`SessionTransaction._restore_snapshot`), so `application.
@@ -1700,7 +1716,7 @@ async def submit(
             application.status = SUBMITTED_STATUS
             application.number = number
             application.submitted_at = submitted_at
-            application.sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)
+            application.sla_deadline_at = sla_deadline_at
             await db.flush()
     except IntegrityError as exc:
         # `IntegrityError` IS a `DBAPIError` subclass and this narrow clause
@@ -1857,13 +1873,16 @@ async def _apply_transition(
     reason: str | None = None,
     reason_item_id: uuid.UUID | None = None,
     legal_basis: str | None = None,
+    fields_to_fix: dict[str, Any] | None = None,
 ) -> ApplicationStatusHistory:
     """Move an ALREADY-LOCKED application one legal edge, and leave the two
     records every transition owes behind: the `application_status_history` row
     and one `audit_log` entry under the CALLER'S flow verb (ruling 17).
 
-    `reason_item_id`/`legal_basis` are task 7's rejection grounds (`tz/04` С8)
-    and are set HERE, before the insert, never on the returned row: migration
+    `reason_item_id`/`legal_basis` are task 7's rejection grounds (`tz/04` С8);
+    `fields_to_fix` is task 3's own, beside them (3.9b) — a JSON OBJECT, never
+    a list (`models.py`'s column is `Mapped[dict[str, Any] | None]`). All three
+    are set HERE, before the insert, never on the returned row: migration
     0015's BEFORE UPDATE trigger makes `application_status_history` append-only,
     so a caller that filled them in afterwards would raise instead of
     recording them.
@@ -1894,6 +1913,7 @@ async def _apply_transition(
         reason_text=reason,
         reason_item_id=reason_item_id,
         legal_basis=legal_basis,
+        fields_to_fix=fields_to_fix,
     )
     await repo.add_status_history(db, entry)
     # `updated_at` is `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
@@ -1905,6 +1925,8 @@ async def _apply_transition(
         new_value["reason_item_id"] = str(reason_item_id)
     if legal_basis is not None:
         new_value["legal_basis"] = legal_basis
+    if fields_to_fix is not None:
+        new_value["fields_to_fix"] = fields_to_fix
     await audit.log(
         db,
         action=action,
@@ -2141,6 +2163,119 @@ async def assign(
         old_value={},
         new_value={"assigned_org_id": str(organization_id), "assigned_user_id": str(user_id)},
         basis=reason,
+    )
+    return application
+
+
+# --- Task 3 (3.9b): return for correction --------------------------------
+
+APPLICATION_RETURN = "application.return"
+# `notification_templates.event_code` — DOTTED, seeded by migration 0025
+# (task 2's own). No bus event beside it: unlike submit/approve/reject/cancel,
+# nothing above this module subscribes to a return — it is a same-level
+# bounce back to the applicant, not a signal `payments`/`permits` act on.
+NOTIFY_APPLICATION_RETURNED = "application.returned"
+# The SAME `rejection_reasons` classifier `decision._reason_item` reads
+# (tz/10 §8.2) — repeated here rather than imported because `decision.py`
+# imports `service.py`, never the reverse. Ruling 3's KIND check below is this
+# function's own; `decision.reject` checks no kind at all.
+RETURN_REASON_CLASSIFIER_CODE = "rejection_reasons"
+# `classifier_items.props["kind"]` values a RETURN may cite (0005_admin_seeds;
+# 0025 recast RJ-15 from "reject" to "both"). RJ-03 ("plot outside the forest
+# fund") types "reject" and is refused with `reason_not_returnable` —
+# returning under it would misdescribe the decision and hand the applicant
+# something they cannot fix.
+RETURNABLE_REASON_KINDS = frozenset({"return", "both"})
+# "field names that exist on the application" (task 3's own words): the
+# columns of `applications` itself. An existence check, not a validity check
+# (lesson) — naming `created_at` passes membership exactly as a nonsensical
+# but real classifier item id passes `_assert_references`.
+_APPLICATION_FIELD_NAMES = frozenset(column.name for column in Application.__table__.columns)
+
+
+async def _return_reason_item(db: AsyncSession, reason_item_id: uuid.UUID) -> ClassifierItem:
+    """The RJ-* ground a return is made on. 422 `unknown_rejection_reason` for
+    an id outside the ACTIVE `rejection_reasons` classifier (same membership
+    check as `decision._reason_item`); 422 `reason_not_returnable` for one
+    that IS in it but types a refusal or a withdrawal instead (ruling 3)."""
+    item = await admin_repo.get_classifier_item(db, reason_item_id)
+    classifier = await admin_repo.get_classifier_by_code(db, RETURN_REASON_CLASSIFIER_CODE)
+    if (
+        item is None
+        or classifier is None
+        or item.classifier_id != classifier.id
+        or item.status != "active"
+    ):
+        raise err("ERR-VAL-001", details={"reason": "unknown_rejection_reason"})
+    if item.props.get("kind") not in RETURNABLE_REASON_KINDS:
+        raise err("ERR-VAL-001", details={"reason": "reason_not_returnable"})
+    return item
+
+
+async def return_to_applicant(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    reason_item_id: uuid.UUID,
+    fields_to_fix: dict[str, Any],
+    legal_basis: str,
+    actor: User,
+) -> Application:
+    """`POST /applications/{id}/return` — SUBMITTED or IN_REVIEW -> RETURNED,
+    so the applicant can correct and resubmit through `submit`'s own
+    resubmission path (`_EDITABLE_STATUSES`, ruling 14).
+
+    **`applications.review` (hodim) OR `applications.decide` (the head)** —
+    the route's own `require_any_permission`, checked ahead of this function.
+    Sending a package back for correction is not the same act as deciding it:
+    the reviewer who caught an incomplete filing sends it back before the head
+    ever sees it. Unlike `decision.reject`, nothing is signed here — 3.9a
+    gives no ERI purpose to a reviewer, only the head holds
+    `application_decision`.
+
+    Validation runs in this order (ruling 3): the RJ code exists and TYPES a
+    return, never a refusal (`_return_reason_item`); `legal_basis` is
+    non-empty — `ApplicationReturnIn`'s own `min_length=1`, so a body missing
+    it is 422 before this function is ever reached, the same shape
+    `ApplicationRejectIn` uses; then `fields_to_fix` must be a non-empty
+    object naming real columns of the application. Only once all three hold
+    does the status move.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone — the same answer to both, as on every staff
+    route in this module (`_assert_in_actor_zone` records the RI-12 trail
+    first). 409 `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_RETURN)
+    _assert_transition(application, RETURNED_STATUS)
+
+    await _return_reason_item(db, reason_item_id)
+    if not fields_to_fix:
+        raise err("ERR-VAL-001", details={"reason": "fields_to_fix_required"})
+    unknown = sorted(set(fields_to_fix) - _APPLICATION_FIELD_NAMES)
+    if unknown:
+        raise err("ERR-VAL-001", details={"reason": "unknown_field", "fields": unknown})
+
+    await _apply_transition(
+        db,
+        application,
+        to_status=RETURNED_STATUS,
+        action=APPLICATION_RETURN,
+        actor=actor,
+        reason_item_id=reason_item_id,
+        legal_basis=legal_basis,
+        fields_to_fix=fields_to_fix,
+    )
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_RETURNED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": application.number},
+        object_type="application",
+        object_id=application.id,
     )
     return application
 

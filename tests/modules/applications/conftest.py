@@ -1040,17 +1040,14 @@ async def application_in_review_at_agency(
     return application_id
 
 
-@pytest.fixture
-async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
-    """One ACTIVE item of the `rejection_reasons` classifier — RJ-03, «участка
-    вне границ лесного фонда», seeded by migration 0005 together with the other
-    fourteen.
+async def _rejection_reasons_item(db: AsyncSession, code: str) -> ClassifierItem:
+    """One ACTIVE item of the `rejection_reasons` classifier by its RJ-* code
+    — the fixed catalogue `tz/10` § 8.2 seeds through migration 0005 (fifteen
+    values) and 0025 (RJ-15's `kind`, "reject" -> "both").
 
-    Fetched, never created: `rejection_reasons` is a fixed catalogue whose
-    fifteen values come from `tz/10` § 8.2, and a private copy inserted per test
-    would leave rows in this shared, persistent database that
-    `GET /refs/classifiers/rejection_reasons` would then offer on a real
-    form."""
+    Fetched, never created: a private copy inserted per test would leave rows
+    in this shared, persistent database that `GET /refs/classifiers/
+    rejection_reasons` would then offer on a real form."""
     classifier_id = (
         await db.execute(select(Classifier.id).where(Classifier.code == "rejection_reasons"))
     ).scalar_one()
@@ -1058,11 +1055,34 @@ async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
         await db.execute(
             select(ClassifierItem).where(
                 ClassifierItem.classifier_id == classifier_id,
-                ClassifierItem.code == "RJ-03",
+                ClassifierItem.code == code,
                 ClassifierItem.status == "active",
             )
         )
     ).scalar_one()
+
+
+@pytest.fixture
+async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
+    """RJ-03, «участок вне границ лесного фонда» — `kind="reject"`, task 7's
+    own rejection ground."""
+    return await _rejection_reasons_item(db, "RJ-03")
+
+
+@pytest.fixture
+async def rj_01_return_reason(db: AsyncSession) -> ClassifierItem:
+    """RJ-01, «документы неполны или не соответствуют требованиям» —
+    `kind="return"` (ruling 3), task 3's own (3.9b) valid return ground."""
+    return await _rejection_reasons_item(db, "RJ-01")
+
+
+@pytest.fixture
+async def rj_03_reject_reason(db: AsyncSession) -> ClassifierItem:
+    """The same RJ-03 row as `rejection_reason_item` above, under task 3's own
+    (3.9b) test name: a REFUSAL (`kind="reject"`), the negative control for
+    `test_a_return_requires_a_reason_of_the_right_type` — returning under it
+    would misdescribe the decision (ruling 3)."""
+    return await _rejection_reasons_item(db, "RJ-03")
 
 
 @pytest.fixture

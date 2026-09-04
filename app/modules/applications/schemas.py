@@ -620,6 +620,36 @@ class ApplicationRejectIn(BaseModel):
     legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
 
 
+class ApplicationReturnIn(BaseModel):
+    """`POST /applications/{id}/return` — task 3 (3.9b): send an application
+    back for correction, with a typed reason, the fields to fix, and a legal
+    basis.
+
+    **No `pkcs7` here, unlike `ApplicationApproveIn`/`ApplicationRejectIn`** —
+    returning a package for correction is not a decision the state signs
+    (`applications.review`, the hodim's own permission, holds no ERI purpose
+    at all); only approve/reject spend one.
+
+    `legal_basis` is required with the same `min_length=1` as
+    `ApplicationRejectIn`'s own, closing the identical gap a plain `str` would
+    leave open. `fields_to_fix` is a JSON **OBJECT** — field name -> what is
+    wrong with it, e.g. `{"period_to": "срок выходит за пределы сезона
+    выпаса"}` — never a bare list of names, which would tell the applicant
+    WHAT to fix but not why; `ApplicationStatusHistory.fields_to_fix` and
+    `TimelineHistoryRow.fields_to_fix` are both `dict[str, Any] | None` for
+    exactly this shape. Pydantic checks the TYPE only — that it is non-empty
+    and that its keys name real columns of the application is the service's
+    own check (`service.return_to_applicant`), which needs the row to answer
+    "real column of THIS application".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason_item_id: uuid.UUID
+    fields_to_fix: dict[str, Any]
+    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+
+
 class ApplicationDecisionOut(ApplicationOut):
     """The answer to both decision routes: the application's own columns, flat,
     plus where an over-limit application was forwarded to.
