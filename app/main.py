@@ -33,6 +33,7 @@ from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
 from app.modules.norms.calc_router import router as norms_calc_router
+from app.modules.norms.public_router import router as norms_public_router
 from app.modules.norms.refs_router import router as norms_refs_router
 from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
@@ -221,6 +222,9 @@ def create_app() -> FastAPI:
     app.include_router(norms_refs_router, prefix="/api/v1")
     app.include_router(norms_router, prefix="/api/v1")
     app.include_router(norms_calc_router, prefix="/api/v1")
+    # The anonymous public price estimate (decision #63) — no session, no
+    # parcel, no permission code; a rate limit instead of all three.
+    app.include_router(norms_public_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
     app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
