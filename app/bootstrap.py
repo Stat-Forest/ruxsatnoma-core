@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.models_registry  # noqa: F401  # every models.py -> Base.metadata (FK targets)
 from app.config import get_settings
 from app.core.crypto import encrypt_str
 from app.core.security import (
