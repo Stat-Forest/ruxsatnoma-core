@@ -1784,24 +1784,90 @@ async def _holds_view_any(db: AsyncSession, actor: User) -> bool:
     return PERMITS_VIEW_ANY in await auth_repo.permission_codes(db, actor)
 
 
+async def _is_required_signer(db: AsyncSession, permit: Permit, actor: User) -> bool:
+    """Whether `actor` is one of the officials THIS permit's signatures name —
+    the read-side half of ruling 4, found missing by the verification run one
+    hour before the demo: `executor_head`, `chief_forester` and `accountant`
+    hold `permits.sign` and are exactly who `add_signature` lets attach a
+    signature, yet `_readable_permit` admitted only the holder and a
+    `permits.view_any` holder, so all three got the same 404 as a stranger and
+    could never open the very permit they are required to sign through the UI
+    (only a direct API call could reach them — `POST /permits/{id}/signatures`
+    itself carries no such gate).
+
+    Derived from the exact two sources `add_signature` itself reads, on
+    purpose, so read access cannot drift from write access the way this
+    defect did: `signatures_service.required_purposes` (ruling 7 — the
+    admin-editable requirement set; a purpose an operator has turned off opens
+    no read slot either, the same as it opens no write slot) intersected with
+    `signers.required_role` (ruling 4 — the purpose -> role map
+    `_signer_refusal` already applies on the write side). `RECIPIENT_PURPOSE`
+    maps to no role and is excluded by `required_role` returning `None` for
+    it; the holder is `_is_holder`'s question, asked first by the caller.
+
+    Organization is checked with the SAME strict equality `_signer_refusal`
+    uses on the write path — never the three-axis `Zone` predicate a
+    `permits.view_any` holder is scoped by. A signature answers "which named
+    official of which named organization attests to this document", not
+    "whose rows may I see", and there is no such thing as a republic-wide
+    leshoz head; a head of a different leshoz holding the identical role and
+    the identical `permits.sign` grant still gets nothing here, exactly as
+    they get `wrong_organization` if they try to sign it.
+
+    **Access does not expire at signing or at ACTIVE, and this is a
+    deliberate choice, not an oversight.** Nothing about a signer's identity
+    changes at either boundary: the same head who could read the permit to
+    sign it must still be able to open the very document their own signature
+    is on — to confirm the signature went through, and afterwards to consult
+    a permit they personally attested to (an audit, a dispute, 3.11b's
+    duplicate register). Ending access at either point would reproduce this
+    exact defect one step later — a head who can read a permit right up until
+    they sign it, then not — and would make a staff signer's access to a
+    document they signed WEAKER than the citizen holder's, who never loses
+    access to their own permit either (`_is_holder`, unconditional on
+    status). The alternative — checking `missing_purposes` here too — was
+    considered and rejected for exactly that reason.
+    """
+    role = await auth_service.role_code(db, actor)
+    if role is None or actor.organization_id != permit.organization_id:
+        return False
+    required = await signatures_service.required_purposes(db, OBJECT_TYPE)
+    return any(signers.required_role(purpose) == role for purpose in required)
+
+
 async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) -> Permit:
     """The permit `actor` is allowed to read, or a refusal.
 
-    Two refusals, on purpose, and the difference is what the caller already
-    knows:
+    THREE admissions, checked in this order, and the difference between the
+    two refusals below is what the caller already knows:
 
-      * a caller who is neither the holder nor a `permits.view_any` holder gets
-        `ERR-SYS-003` (404) — the same answer an id that never existed gets.
-        Anything else is a permit-existence oracle: a citizen could learn which
-        ids are real by which ones answer 403;
-      * a `permits.view_any` holder outside the permit's zone gets `ERR-ACL-002`
-        (403). This one is staff, the refusal IS territorial, and saying so is
-        what `_assert_organization_in_zone` says on the issuance path for the
-        same actor and the same leshoz.
+      * the holder (`_is_holder`) — the 4th signature line, checked first so a
+        citizen never depends on the zone: an applicant carries no zone at
+        all, and staff who also happen to hold a permit of their own in
+        another leshoz read it as its holder;
+      * a required official signer of THIS permit, in its own organization
+        (`_is_required_signer`) — the read-side half of ruling 4, added by
+        this fix: `executor_head`, `chief_forester` and `accountant` hold
+        `permits.sign` and are exactly who `add_signature` lets attach a
+        signature, and a caller who cannot even OPEN the permit can never
+        reach the sign screen a UI would put in front of that route;
+      * a `permits.view_any` holder, subject to the zone below.
 
-    The holder is checked FIRST so a citizen never depends on the zone: an
-    applicant carries no zone at all, and staff who also happen to hold a permit
-    of their own in another leshoz read it as its holder.
+    A caller admitted by neither gets `ERR-SYS-003` (404) — the same answer an
+    id that never existed gets. Anything else is a permit-existence oracle: a
+    citizen could learn which ids are real by which ones answer 403. This is
+    also what a wrong-organization official gets: `executor_head`,
+    `chief_forester` and `accountant` hold no `permits.view_any` (migration
+    0019), so a head of a DIFFERENT leshoz falls straight through
+    `_is_required_signer`'s organization check into this branch, refused like
+    a stranger rather than told territorially — the same shape
+    `test_a_staff_role_without_view_any_is_refused_like_a_stranger` already
+    pins for `gis_specialist`.
+
+    A `permits.view_any` holder outside the permit's zone gets `ERR-ACL-002`
+    (403) instead: this one is staff, the refusal IS territorial, and saying
+    so is what `_assert_organization_in_zone` says on the issuance path for
+    the same actor and the same leshoz.
 
     **The territorial refusal writes an RI-12 trail before it raises** (ruling
     T8-a, `tz/10`: «попытка доступа вне территориальных полномочий», High,
@@ -1811,6 +1877,11 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
     attempting to SIGN a permit outside their zone is already recorded
     (`_signer_refusal`'s `wrong_organization`); without this, stage 4.2's risk
     report would see who tried to sign one and miss who tried to look at one.
+    A wrong-organization SIGNER's read attempt is deliberately NOT given the
+    same RI-12 treatment here — `_signer_refusal` already records it the
+    moment that same person actually tries to sign, and a second trail on the
+    mere READ that precedes every sign attempt would double the indicator for
+    one event.
 
     **RI-12 coverage on reads is DIRECT ACCESS ONLY, and 4.2 needs to know it.**
     `GET /permits` cannot produce a territorial denial at all — nobody named a
@@ -1829,6 +1900,8 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
     if permit is None:
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
     if await _is_holder(db, permit, actor):
+        return permit
+    if await _is_required_signer(db, permit, actor):
         return permit
     if not await _holds_view_any(db, actor):
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
