@@ -191,6 +191,23 @@ class PermitSignatureOut(BaseModel):
     missing_signatures: list[str]
 
 
+class DecisionIn(BaseModel):
+    """The body `/suspend`, `/resume` and `/revoke` share (plan
+    `03.11b-permits-lifecycle`, `lifecycle_router.py` and Task 4's own route).
+
+    `legal_basis` and `doc_file_id` are optional at the SCHEMA level because
+    their true requirement is PER-ACT (ruling 6: a document is required for
+    `suspend`/`revoke`, and `PS-07` alone forces a non-blank `legal_basis`) —
+    only the service knows which act is running, and a schema-level
+    `Field(...)` cannot vary by the URL a body was posted to.
+    """
+
+    reason_item_id: uuid.UUID
+    legal_basis: str | None = None
+    doc_file_id: uuid.UUID | None = None
+    pkcs7: Annotated[str, Field(min_length=1)]
+
+
 # The four words `tz/04` С12 and `design/03` fix for the public page, spelled out
 # by hand for the same reason `PermitStatus` above is: a `Literal`'s members must
 # be statically visible to pyright, so `Literal[*PUBLIC_STATUS_LABELS.values()]`

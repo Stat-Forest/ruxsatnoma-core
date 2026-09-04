@@ -43,9 +43,7 @@ has asked for).
 
 import json
 import uuid
-from typing import Annotated
 
-from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
@@ -57,6 +55,7 @@ from app.modules.auth.models import User
 from app.modules.notifications import service as notifications
 from app.modules.permits import grounds, repo, service, signers
 from app.modules.permits.models import Permit
+from app.modules.permits.schemas import DecisionIn
 from app.modules.signatures import service as signatures_service
 
 # "<object>.<verb>", this module's own action (CLAUDE.md's audit invariant) —
@@ -71,22 +70,6 @@ PERMIT_DECIDE = "permit.decide"
 # `DECISION_PURPOSE` and no second line to distinguish it from.
 DECISION_OBJECT_TYPE = "permit_decision"
 DECISION_PURPOSE = signers.DECISION_PURPOSE
-
-
-class DecisionIn(BaseModel):
-    """The body `/suspend`, `/resume` and `/revoke` share (`router.py`).
-
-    `legal_basis` and `doc_file_id` are optional at the SCHEMA level because
-    their true requirement is PER-ACT (ruling 6: a document is required for
-    `suspend`/`revoke`, and `PS-07` alone forces a non-blank `legal_basis`) —
-    only the service knows which act is running, and a schema-level
-    `Field(...)` cannot vary by the URL a body was posted to.
-    """
-
-    reason_item_id: uuid.UUID
-    legal_basis: str | None = None
-    doc_file_id: uuid.UUID | None = None
-    pkcs7: Annotated[str, Field(min_length=1)]
 
 
 def decision_document(
