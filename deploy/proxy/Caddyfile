@@ -27,6 +27,17 @@
 	email oybekyuldashov45@gmail.com
 	auto_https disable_redirects
 
+	# 3. Only the HTTP-01 challenge can ever succeed here. Caddy tries TLS-ALPN-01 as well by
+	#    default, and that one needs the CA to open a TLS connection to port 443 of this host —
+	#    which the gateway answers itself, so Let's Encrypt gets "Connection refused" and the
+	#    whole order fails. Disabling it leaves HTTP-01, which arrives over the gateway's
+	#    port-80 publication and works. Without this, a name that happens to try TLS-ALPN first
+	#    never gets a certificate at all, while one that tries HTTP-01 first does — which is
+	#    exactly why dev-api was issued and the other two were not.
+	cert_issuer acme {
+		disable_tlsalpn_challenge
+	}
+
 	servers {
 		trusted_proxies static 192.168.0.244/32
 	}
