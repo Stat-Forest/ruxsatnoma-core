@@ -10,7 +10,9 @@
 # ---- builder ----
 FROM python:3.14-slim-bookworm AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Pinned, not :latest — a floating tag would let a breaking uv release land mid-deploy on
+# the server with no code change to point at. Bump deliberately when there is a reason to.
+COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /usr/local/bin/uv
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \

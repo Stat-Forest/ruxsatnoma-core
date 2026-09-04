@@ -55,12 +55,20 @@ else
 	POSTGRES_PASSWORD=$(openssl rand -hex 24)
 	S3_SECRET_KEY=$(openssl rand -hex 24)
 	export SECRET_KEY POSTGRES_PASSWORD S3_SECRET_KEY
+	# Render to a temp file in the same directory, then mv it into place. envsubst writing
+	# straight to "$API_DIR/.env" would leave a truncated file behind if the process dies
+	# mid-write (disk full, killed run) — and the check above treats ANY existing .env as
+	# "already present, left untouched", so a truncated one would never self-heal on a rerun.
+	# A same-directory mv is an atomic rename, so .env is either the old file or the fully
+	# rendered new one, never a partial write.
 	# Single quotes are deliberate: this is envsubst's variable-list argument, so the
 	# literal `$VAR` tokens must reach envsubst unexpanded — it does its own substitution
 	# against the exported environment, restricted to just these three names.
+	TMP_ENV="$API_DIR/.env.tmp.$$"
 	# shellcheck disable=SC2016
 	envsubst '$SECRET_KEY $POSTGRES_PASSWORD $S3_SECRET_KEY' \
-		< "$TEMPLATE" > "$API_DIR/.env"
+		< "$TEMPLATE" > "$TMP_ENV"
+	mv "$TMP_ENV" "$API_DIR/.env"
 	echo "    generated with fresh secrets"
 fi
 

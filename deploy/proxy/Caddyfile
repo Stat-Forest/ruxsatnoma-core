@@ -22,7 +22,6 @@
 #
 # When the gateway is eventually replaced by a plain forward, delete `auto_https
 # disable_redirects` and the `trusted_proxies` line, and nothing else changes.
-
 {
 	email oybekyuldashov45@gmail.com
 	auto_https disable_redirects
@@ -59,11 +58,15 @@ http://dev-api.ruxsatnoma-urmon.uz, https://dev-api.ruxsatnoma-urmon.uz {
 	# The public QR route must not be access-logged: the line would carry the visitor's IP
 	# and the printed token in plaintext, which is exactly what qr_check_log avoids storing.
 	# The app drops its own uvicorn line for that path; a fronting proxy has to do the same
-	# itself, and `skip_log` is how Caddy does it.
+	# itself, and `skip_log` is how Caddy does it. /check* is the same rule for the printed
+	# QR's actual landing path (see ruling R5's handle block above, and Caddy's `uri` log
+	# field includes the query string that carries ?qr=<token>) — it just happens to live on
+	# this host too, proxied through to landing rather than answered by the api.
 	log {
 		output file /var/log/caddy/api.log
 	}
 	log_skip /api/v1/public/permits/check*
+	log_skip /check*
 }
 
 http://dev-admin.ruxsatnoma-urmon.uz, https://dev-admin.ruxsatnoma-urmon.uz {

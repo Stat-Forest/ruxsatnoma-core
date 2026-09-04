@@ -32,6 +32,13 @@ out_dir="$HOME/certs-for-gateway"
 case "${1:-}" in
 	--check) mode=check ;;
 	"") ;;
+	# Any other dash-led argument is a typo'd flag, not a directory name — without this,
+	# `--help` would be treated as the output dir and the script would happily write private
+	# keys into a literal directory named "./--help".
+	-*)
+		echo "usage: $0 [--check] [output-dir]" >&2
+		exit 1
+		;;
 	*) out_dir="$1" ;;
 esac
 

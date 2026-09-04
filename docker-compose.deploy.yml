@@ -53,18 +53,28 @@ services:
       - --port
       - "8000"
       - --proxy-headers
-      # Caddy's pinned address on the edge network (see deploy/proxy/docker-compose.yml).
-      # A wildcard here would let any client spoof X-Forwarded-For and defeat the public
-      # QR route's rate limit, which is that route's whole security control.
+      # Both hops of the chain visitor -> gateway (192.168.0.244) -> Caddy (172.28.0.2) -> api
+      # must be listed. uvicorn 0.52.4's X-Forwarded-For parser walks the header IN REVERSE
+      # and returns the first entry NOT in this trusted set. Caddy's reverse_proxy appends its
+      # own peer (the gateway) to XFF, so the header uvicorn sees is "<visitor>, 192.168.0.244".
+      # Trusting only 172.28.0.2 (the TCP peer that gates the middleware at all) leaves
+      # 192.168.0.244 untrusted, so THAT becomes the attributed client — which is exactly the
+      # bug that put the gateway's IP into every audit_log row and collapsed the public QR
+      # route's rate limit into one shared bucket for the whole country. Adding 192.168.0.244
+      # tells uvicorn to skip over it too and keep walking left to the real visitor.
+      # This stays unspoofable: a client-supplied XFF value is always inserted to the LEFT of
+      # the gateway's own appended entry, so the reverse walk can never reach it before it has
+      # already matched a trusted hop and kept going — a wildcard, not this exact pair, is what
+      # would let a client spoof it.
       - --forwarded-allow-ips
-      - 172.28.0.2
+      - 172.28.0.2,192.168.0.244
     env_file: .env
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
     networks:
       # `default` is this stack's private network: db and minio are reachable only here.
       default:
