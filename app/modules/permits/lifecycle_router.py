@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_db
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
-from app.modules.permits import decisions, events, grounds
+from app.modules.permits import service
 from app.modules.permits.permissions import PERMITS_MANAGE
 from app.modules.permits.schemas import DecisionIn, PermitOut
 
@@ -33,10 +33,14 @@ router = APIRouter(tags=["permits"])
 # Both share `permits.manage`, migration 0019's own reservation for "3.11b's
 # suspend / resume / revoke / duplicate" (`permissions.py`'s own docstring
 # names this stage by number, so no migration of this stage's own is needed
-# to grant it). `decisions.decide` carries the whole order of checks
-# (`ERR-ACL-002` before `ERR-ACL-001`, the per-act document requirement, the
-# audited signer refusal); these routes are only the thin, per-act shell
-# around it.
+# to grant it). Both call `service.suspend`/`service.resume` rather than
+# `decisions.decide` directly — the one cross-module path backend/CLAUDE.md
+# requires ("Cross-module calls only via the other module's service"), and the
+# same path stage 4.1's inspector-initiated suspension will reach with its own
+# actor. Those two service functions are themselves thin: `decisions.decide`
+# carries the whole order of checks (`ERR-ACL-002` before `ERR-ACL-001`, the
+# per-act document requirement, the audited signer refusal) — see that
+# module's own docstring.
 
 
 @router.post("/permits/{permit_id}/suspend")
@@ -55,15 +59,7 @@ async def suspend_permit(
     `ERR-ACL-002` outside the caller's leshoz, `ERR-ACL-001` when the caller
     holds `permits.manage` but not `executor_head` OF this leshoz.
     """
-    permit = await decisions.decide(
-        db,
-        permit_id,
-        act=grounds.SUSPEND,
-        to_status="suspended",
-        data=payload,
-        actor=actor,
-        event_code=events.PERMIT_SUSPENDED,
-    )
+    permit = await service.suspend(db, permit_id, data=payload, actor=actor)
     return PermitOut.model_validate(permit)
 
 
@@ -79,13 +75,5 @@ async def resume_permit(
     document cannot add to; 409 `ERR-PERM-001` when the permit is not
     `suspended`.
     """
-    permit = await decisions.decide(
-        db,
-        permit_id,
-        act=grounds.RESUME,
-        to_status="active",
-        data=payload,
-        actor=actor,
-        event_code=events.PERMIT_RESUMED,
-    )
+    permit = await service.resume(db, permit_id, data=payload, actor=actor)
     return PermitOut.model_validate(permit)

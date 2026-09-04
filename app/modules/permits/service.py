@@ -50,7 +50,7 @@ from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
-from app.modules.permits import events, render, repo, signers
+from app.modules.permits import events, grounds, render, repo, signers
 from app.modules.permits.models import (
     Permit,
     PermitStatusHistory,
@@ -58,6 +58,7 @@ from app.modules.permits.models import (
     QrCheckLog,
 )
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
+from app.modules.permits.schemas import DecisionIn
 from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
@@ -1778,6 +1779,63 @@ async def set_status(
         extra=None if reason_item_id is None else {"reason_item_id": str(reason_item_id)},
     )
     return permit
+
+
+# --- Task 3: suspend and resume, the first two acts riding on `decide()` -----
+#
+# Thin on purpose (ruling 4, option а — the recommended one): each names the
+# act and the target status and hands `data`/`actor` straight to
+# `decisions.decide()`, which carries the whole order of checks (that module's
+# own docstring). `lifecycle_router.py`'s two routes call these rather than
+# `decisions.decide` directly, so a cross-module caller has exactly one path to
+# each act (backend/CLAUDE.md: "Cross-module calls only via the other module's
+# service") — stage 4.1's inspector-initiated suspension reaches the same act
+# through these, with its OWN `actor`, never `permits.decisions` directly.
+#
+# **The import below is function-local, deliberately** — the same idiom
+# `app/event_subscriptions.py::register_event_subscriptions` already uses to
+# break a cycle of this exact shape. `decisions.py` imports `service` at
+# module level (for `_assert_transition`, `set_status`, …), so a module-level
+# `import decisions` HERE would close that into a real cycle; deferred to call
+# time, after both modules have finished loading, it costs nothing and creates
+# none. `grounds` and `events` need no such deferral — neither imports this
+# module — so both stay in this file's ordinary top-level import list.
+
+
+async def suspend(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+) -> Permit:
+    """С13: suspend an ACTIVE permit on a named ground. See the section
+    docstring above for why this exists beside `lifecycle_router.py`'s route
+    rather than the route calling `decisions.decide` on its own."""
+    from app.modules.permits import decisions
+
+    return await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.SUSPEND,
+        to_status="suspended",
+        data=data,
+        actor=actor,
+        event_code=events.PERMIT_SUSPENDED,
+    )
+
+
+async def resume(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+) -> Permit:
+    """С13: resume a SUSPENDED permit, back to `active`. See `suspend` above."""
+    from app.modules.permits import decisions
+
+    return await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.RESUME,
+        to_status="active",
+        data=data,
+        actor=actor,
+        event_code=events.PERMIT_RESUMED,
+    )
 
 
 # --- the three read routes' service side -------------------------------------
