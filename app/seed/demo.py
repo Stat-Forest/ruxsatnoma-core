@@ -63,6 +63,7 @@ from app.core.security import (
     new_totp_secret,
     totp_provisioning_uri,
     validate_password_policy,
+    verify_password,
 )
 from app.db import make_engine, make_session_factory
 from app.modules.admin import repo as admin_repo
@@ -200,27 +201,31 @@ async def _ensure_user(
     db: AsyncSession, spec: DemoUser, *, shared_secret: str
 ) -> tuple[User, str, bool, bool]:
     """Get-or-create one demo account. Returns (user, its TOTP secret,
-    created?, pinfl/organization_id converged?).
+    created?, pinfl/organization_id/password converged?).
 
     The password is the fixed, printed `DEMO_PASSWORD` regardless of whether
-    the row already existed — we chose it, we do not need to read it back.
-    The TOTP secret DOES need to be read back on a rerun (it is genuinely
-    random per first run), so an existing user's own `mfa_secret` is decrypted
-    rather than re-generated — a fresh secret would silently invalidate an
-    already-configured authenticator.
+    the row already existed — we chose it, we do not need to read it back, so
+    an existing row's hash CONVERGES on it the same way `pinfl` and
+    `organization_id` do below (verified with `verify_password` first, so a
+    row already on the right password is not rehashed and audited for
+    nothing every single run). The TOTP secret DOES need to be read back on a
+    rerun (it is genuinely random per first run), so an existing user's own
+    `mfa_secret` is decrypted rather than re-generated — a fresh secret would
+    silently invalidate an already-configured authenticator.
 
-    `pinfl` and `organization_id` CONVERGE instead: an already-existing row's
-    values are forced back to `spec`'s whenever they differ, not merely left
-    alone. Idempotent seeding here does not mean "do nothing when a row
+    `pinfl`, `organization_id` and the password CONVERGE: an already-existing
+    row's values are forced back to `spec`'s whenever they differ, not merely
+    left alone. Idempotent seeding here does not mean "do nothing when a row
     exists" — this dev database has already carried demo accounts hand-patched
     by a session working around ERR-SIGN-001 `signer_pinfl_unknown` (and,
     separately, `permits.signers._signer_refusal`'s STRICT
     `users.organization_id == permit.organization_id` check, which an
-    org-less accountant or chief forester fails the identical way), so the
-    values sitting there were accidental, not seeded, and the next reseed must
-    put them back to a known state on its own. `spec.pinfl`'s own prefix
-    (`3026090400...`) is chosen to never collide with anything already in this
-    table, so a plain UPDATE is safe without a separate vacate pass.
+    org-less accountant or chief forester fails the identical way, and a
+    password changed by hand while chasing either one), so the values sitting
+    there were accidental, not seeded, and the next reseed must put them back
+    to a known state on its own. `spec.pinfl`'s own prefix (`3026090400...`)
+    is chosen to never collide with anything already in this table, so a
+    plain UPDATE is safe without a separate vacate pass.
     """
     organization_id = None
     if spec.organization_code is not None:
@@ -262,6 +267,19 @@ async def _ensure_user(
                     "old_organization_id": str(old_org) if old_org else None,
                     "new_organization_id": str(organization_id),
                 },
+            )
+            converged = True
+        if existing.password_hash is None or not verify_password(
+            DEMO_PASSWORD, existing.password_hash
+        ):
+            existing.password_hash = hash_password(DEMO_PASSWORD)
+            await audit.log(
+                db,
+                action="user.update",
+                object_type="user",
+                object_id=existing.id,
+                basis="demo seed CLI — converge password_hash to its seeded value",
+                extra={"login": spec.login},
             )
             converged = True
         if converged:
@@ -604,7 +622,7 @@ async def _main() -> None:
             if created:
                 state = "(created)"
             elif converged:
-                state = "(already existed — pinfl/organization converged to the seeded value)"
+                state = "(already existed — pinfl/organization/password converged)"
             else:
                 state = "(already existed)"
             report.append(f"  {spec.login:20s} role={spec.role_code:15s} {state}")
