@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Imports every modules/*/models.py so Base.metadata knows the whole schema before
+# the first flush. Importing only auth.models left `users.district_id`'s FK
+# unresolvable (`districts` lives in admin.models, never imported), so SQLAlchemy
+# raised `NoReferencedTableError` at insert time and a fresh deployment could not
+# create its first sys_admin at all (decision #61).
+import app.models_registry  # noqa: F401
 from app.config import get_settings
 from app.core.crypto import encrypt_str
 from app.core.security import (
