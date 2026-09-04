@@ -32,7 +32,7 @@
 	}
 }
 
-dev-api.ruxsatnoma-urmon.uz {
+http://dev-api.ruxsatnoma-urmon.uz, https://dev-api.ruxsatnoma-urmon.uz {
 	# Ruling R5: the printed QR encodes {PUBLIC_BASE_URL}/check?qr=… and PUBLIC_BASE_URL is
 	# this origin (Eskiz's delivery callback needs the API host). The page a citizen reads
 	# lives in the landing bundle, so that one path is proxied there. This is a dev-only
@@ -55,10 +55,10 @@ dev-api.ruxsatnoma-urmon.uz {
 	log_skip /api/v1/public/permits/check*
 }
 
-dev-admin.ruxsatnoma-urmon.uz {
+http://dev-admin.ruxsatnoma-urmon.uz, https://dev-admin.ruxsatnoma-urmon.uz {
 	reverse_proxy admin:80
 }
 
-dev.ruxsatnoma-urmon.uz {
+http://dev.ruxsatnoma-urmon.uz, https://dev.ruxsatnoma-urmon.uz {
 	reverse_proxy landing:80
 }
