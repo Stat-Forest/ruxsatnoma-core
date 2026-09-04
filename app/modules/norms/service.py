@@ -25,7 +25,7 @@ from app.core.errors import err
 from app.core.models import MediaFile
 from app.core.time import business_today
 from app.modules.admin import repo as admin_repo
-from app.modules.admin.models import Organization
+from app.modules.admin.models import ActivityType, LivestockType, Organization
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -36,7 +36,7 @@ from app.modules.norms import calculator, checks, repo
 from app.modules.norms import params as norm_params
 from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
 from app.modules.norms.permissions import TARIFFS_PUBLISH
-from app.modules.norms.schemas import CalculationIn, NormIn, NormPatch
+from app.modules.norms.schemas import CalculationIn, NormIn, NormPatch, PublicEstimateIn
 
 
 @dataclass(frozen=True)
@@ -825,6 +825,90 @@ async def preview(db: AsyncSession, *, payload: CalculationIn, actor: User) -> d
             "input_snapshot": result.input_snapshot,
         }
     )
+
+
+# --- The public surface (decision #63): anonymous, deliberately approximate --
+#
+# A citizen on the public `landing` site has no session at all and no parcel —
+# `CalculationIn.contour_id` names a specific contour a random visitor cannot
+# know. `_build_request_and_snapshot` is the wrong entry point for that caller:
+# it unconditionally resolves `payload.contour_id` through `gis_service`
+# (existence, then the published version's area), which is exactly the lookup
+# an anonymous estimate has nothing to give it. `estimate_public` instead calls
+# `norm_params.load_snapshot`/`calculator.calculate` directly — the SAME pure
+# arithmetic `_compute` uses, with `contour_id=None`, which `load_snapshot`
+# already treats as "no norm, no committed load" (its own docstring). A `None`
+# norm is also why `checks.run_checks` is never called here: every one of its
+# five checks (`checks.BLOCKING`) needs a contour to check against
+# (`_territory_checks` queries `gis.service` BY `contour_id`), so this is not a
+# per-endpoint guard skipped by oversight — there is no contour to hand it.
+#
+# A missing/unpublished parameter (a draft `coef_sb:*` row, ВМҚ 689 annex 5
+# still pending) is not swallowed here either: `calculator.calculate` raises
+# its own self-naming `ERR-NORM-004` exactly as it does for `preview`, and the
+# route answers a normal 422 — a clear refusal, never a 500 and never an
+# invented number.
+
+
+async def estimate_public(db: AsyncSession, *, payload: PublicEstimateIn) -> dict[str, Any]:
+    """`POST /public/calculations/estimate`'s arithmetic. No `actor`: the route
+    carries no session to have one. Guards `period_to`/`period_from` itself
+    (the same reasons and the same `checks.MAX_PERIOD_DAYS` ceiling
+    `checks.run_checks` enforces) because that guard is never reached any other
+    way here — `run_checks` itself is not called (see the block comment
+    above)."""
+    activity_code = await _resolve_activity_code(db, payload.activity_type_id)
+    if payload.period_to < payload.period_from:
+        raise err("ERR-VAL-001", details={"reason": "period_reversed"})
+    if (payload.period_to - payload.period_from).days > checks.MAX_PERIOD_DAYS:
+        raise err("ERR-VAL-001", details={"reason": "period_too_long"})
+
+    request = calculator.CalcRequest(
+        activity_code=activity_code,
+        on_date=business_today(),
+        period_from=payload.period_from,
+        period_to=payload.period_to,
+        # No contour to draw a published area from, and `calculator.calculate`
+        # never reads `area_ha` into `Amount` either way (its own docstring) —
+        # only a norm's own `max_sb`, which stays absent with no contour.
+        area_ha=Decimal("0"),
+        items=tuple(
+            calculator.LivestockItem(item.livestock_code, item.count) for item in payload.items
+        ),
+        quantity=payload.quantity,
+        benefit_code=None,  # decision #63: no benefit claim on the anonymous surface
+    )
+    snapshot = await norm_params.load_snapshot(
+        db, request=request, contour_id=None, activity_type_id=payload.activity_type_id
+    )
+    result = calculator.calculate(request, snapshot)
+    return {
+        "activity_type_id": payload.activity_type_id,
+        "period_from": payload.period_from,
+        "period_to": payload.period_to,
+        "quantity": payload.quantity,
+        "items": payload.items,
+        "amount": result.amount,
+        "used_sb": result.used_sb,
+        "rule_code_version": result.rule_code_version,
+        "breakdown": result.breakdown,
+    }
+
+
+async def list_public_activity_types(db: AsyncSession) -> list[ActivityType]:
+    """`GET /public/refs/activity-types`'s data — the same `admin_repo` call
+    `_resolve_activity_code` above already makes, so the anonymous catalog and
+    the internal one can never disagree. No rule to apply and nothing to scope
+    (reference data, `backend/CLAUDE.md`), so there is no service-layer logic
+    beyond this pass-through; kept here rather than called directly from the
+    router so this module's own cross-module boundary — `admin.repo`, never
+    `admin.models` — stays in one place."""
+    return await admin_repo.list_activity_types(db)
+
+
+async def list_public_livestock_types(db: AsyncSession) -> list[LivestockType]:
+    """The livestock sibling of `list_public_activity_types` above."""
+    return await admin_repo.list_livestock_types(db)
 
 
 # --- The application guard on a stored calculation (plan 03.9a task 5) -------

@@ -357,3 +357,96 @@ class CalculationOut(BaseModel):
     @field_serializer("amount")
     def _amount(self, value: Decimal) -> str:
         return str(value)
+
+
+# --- The public surface (decision #63): a citizen with no session and no ------
+# parcel, priced approximately. `PublicEstimateIn`/`PublicEstimateOut` are
+# deliberately NOT `CalculationIn`/`CalculationOut`: this door takes no
+# `contour_id`, no `application_id` and no `benefit_code`, and nothing it
+# returns is ever persisted. See `norms.public_router`/`norms.service.estimate_public`.
+
+
+class PublicEstimateIn(BaseModel):
+    """`POST /public/calculations/estimate`'s request: the activity, the
+    declared quantity or — for grazing — per-group head counts shaped exactly
+    like `LivestockItemIn`, and the period. No `contour_id` (a random visitor
+    names no parcel), no `application_id` and no `benefit_code` (an anonymous
+    claim would be unverifiable and is refused by design, not merely unasked)."""
+
+    activity_type_id: uuid.UUID
+    period_from: date
+    period_to: date
+    quantity: Annotated[Decimal, Field(ge=0)] | None = None
+    items: list[LivestockItemIn] = Field(default_factory=list)
+
+
+# The five admissibility checks `checks.run_checks` runs (`checks.BLOCKING`) all
+# need a contour — a published norm, a fire-ban/restriction layer, a season or
+# rotation window recorded against THAT parcel. An anonymous estimate names
+# none, so none of the five ever runs; `PublicEstimateOut.checks_skipped` is
+# what states that absence, rather than leaving a reader to assume a bare
+# `amount` means everything was checked and came back clean.
+SKIPPED_CHECKS: tuple[str, ...] = ("norm", "season", "rotation", "fire_ban", "limit")
+
+PUBLIC_ESTIMATE_DISCLAIMER = (
+    "Approximate estimate only — not a binding calculation. No parcel was "
+    "selected, so the norm, season, rotation, fire-ban and occupancy-limit "
+    "checks did not run, and no benefit was applied. The final amount is set "
+    "once a real parcel is chosen inside an application."
+)
+
+
+class PublicEstimateOut(BaseModel):
+    """Deliberately NOT `CalculationOut`: nothing here is stored (`calculations`
+    is append-only and belongs to a real application), and `approximate=True`
+    is a FIELD, not just this docstring — the contract that keeps a front-end
+    from rendering the figure as a bill."""
+
+    approximate: Literal[True] = True
+    disclaimer: str = PUBLIC_ESTIMATE_DISCLAIMER
+    checks_skipped: list[str] = Field(default_factory=lambda: list(SKIPPED_CHECKS))
+    activity_type_id: uuid.UUID
+    period_from: date
+    period_to: date
+    quantity: Decimal | None
+    items: list[LivestockItemIn]
+    amount: Decimal
+    used_sb: Decimal | None
+    rule_code_version: str
+    breakdown: Any
+
+    @field_serializer("amount")
+    def _amount(self, value: Decimal) -> str:
+        return str(value)
+
+    @field_serializer("quantity", "used_sb")
+    def _nullable_decimal(self, value: Decimal | None) -> str | None:
+        return str(value) if value is not None else None
+
+
+class PublicActivityTypeOut(BaseModel):
+    """A narrowed `admin.schemas.ActivityTypeOut` for `GET
+    /public/refs/activity-types`: only what a dropdown needs — `id`, `code`
+    (the front-end's own hook for "this is grazing", so it can decide whether
+    to render herd inputs) and `name`. Never `quantity_unit`/`status`, which
+    the general, authenticated `/refs/*` router already answers and this
+    anonymous surface has no reason to repeat. `name` carries whatever
+    languages the row has — `en`/`uz_cyrl` today (`tz/12` #31: no Latin-script
+    Uzbek yet) — returned as-is, never invented."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    code: str
+    name: dict[str, Any]
+
+
+class PublicLivestockTypeOut(BaseModel):
+    """Same narrowing as `PublicActivityTypeOut`, for `GET
+    /public/refs/livestock-types`."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    code: str
+    name: dict[str, Any]
