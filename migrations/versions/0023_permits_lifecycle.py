@@ -11,7 +11,11 @@ Plan `03.11b-permits-lifecycle`, rulings 5, 18 and 19. Four things and no more:
    (the same reasoning `0024_benefit_proof_doc_type.py` gives for its own
    literal). Each item's `props` is exactly `{"kinds": [...]}` — the acts
    (`suspend`/`resume`/`revoke`) it may justify — read defensively by
-   `grounds._kinds`, never trusted as shaped.
+   `grounds._kinds`, never trusted as shaped. Its DOWNGRADE stands the
+   append-only trigger down for one `UPDATE` before deleting these items —
+   `permit_status_history` predates this classifier by four revisions, so
+   the day `permits.decisions.decide` (Task 2) has signed a single real
+   decision, some row there points at exactly the id being removed.
 2. Six new `notification_templates` rows (ruling 18): `permit.suspended`,
    `permit.resumed`, `permit.revoked`, `permit.duplicate_issued`,
    `forest_ticket.issued`, `permit.unsigned_stalled` — `inapp` and `sms`,
@@ -269,6 +273,29 @@ def downgrade() -> None:
             codes=event_codes
         )
     )
+
+    # `permit_status_history` FIRST too, and for a reason 0005's downgrade never
+    # had to face: that table was created by 0019, FOUR revisions before this one
+    # seeds the classifier its own `reason_item_id` FKs to. The moment any decision
+    # (Task 2, `permits.decisions.decide`) has actually happened, a real row there
+    # points at exactly the id the next statement is about to delete — and the
+    # table is append-only (0019's own `permit_status_history_append_only`
+    # trigger), so even nulling that column needs the trigger stood down for the
+    # one statement. `DISABLE`/`ENABLE TRIGGER` is a migration's own tool, not an
+    # application's: the trigger exists to stop a REQUEST from rewriting history,
+    # and this is a schema rollback correcting the reference a classifier row it
+    # is about to remove leaves behind — never an in-place rewrite of what a
+    # decision WAS, only of what it now points at once that classifier is gone.
+    op.execute("ALTER TABLE permit_status_history DISABLE TRIGGER ALL")
+    op.execute(
+        sa.text(
+            "UPDATE permit_status_history SET reason_item_id = NULL"
+            " WHERE reason_item_id IN ("
+            "SELECT id FROM classifier_items WHERE classifier_id = CAST(:id AS uuid)"
+            ")"
+        ).bindparams(id=CLASSIFIER_ID)
+    )
+    op.execute("ALTER TABLE permit_status_history ENABLE TRIGGER ALL")
 
     # Items before the classifier, or the FK from classifier_items blocks it
     # (0005's downgrade shape).

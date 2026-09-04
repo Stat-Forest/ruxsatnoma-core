@@ -39,6 +39,7 @@ from app.core.errors import err
 from app.core.models import MediaFile
 from app.core.schemas import PageParams
 from app.core.time import business_today
+from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
@@ -1654,6 +1655,7 @@ async def set_status(
     reason_item_id: uuid.UUID | None = None,
     doc_file_id: uuid.UUID | None = None,
     correlation_id: str | None = None,
+    history_id: uuid.UUID | None = None,
 ) -> Permit:
     """Move a permit from one `tz/05` status to another: validate the edge, write
     the `permit_status_history` row, audit it, return the permit.
@@ -1682,6 +1684,17 @@ async def set_status(
     database, and a service-level existence check would be a second opinion that
     can only ever be more permissive than the constraint. The caller supplying
     them is inside this module (3.11b) or a level-4 module with its own route.
+
+    **`history_id` is this stage's one change to a contract 3.11a froze.**
+    `None` for every caller before 3.11b, so the `permit_status_history` row's
+    own `default=uuid7` still mints its primary key exactly as it always has —
+    every existing call site is untouched. `permits.decisions.decide` is the
+    one caller that passes a real value: it mints `history_id = uuid7()` itself,
+    hands that SAME id to `signatures.service.sign()` as `object_id` before
+    ever reaching here, and passes it again here so the row this call writes is
+    the very row that signature already points at. Minting it a second time
+    HERE — the obvious alternative — would anchor the signature to an id no
+    row on `permit_status_history` actually carries.
 
     Enforces NO permission and NO zone rule of its own — the same design as every
     other function on this page, and for the same reason
@@ -1724,6 +1737,13 @@ async def set_status(
     await repo.add_status_history(
         db,
         PermitStatusHistory(
+            # `history_id or uuid7()`, not the model's own `default=uuid7`: a
+            # `decide()` caller has already handed this SAME id to `sign()` as
+            # `object_id`, and passing it explicitly is what anchors that
+            # signature to the exact row being written here. Every other
+            # caller passes `None` and gets a freshly minted id, unchanged
+            # from before this parameter existed.
+            id=history_id or uuid7(),
             permit_id=permit.id,
             from_status=from_status,
             to_status=to_status,

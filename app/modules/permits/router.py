@@ -31,8 +31,9 @@ from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.permits import service
-from app.modules.permits.permissions import PERMITS_ISSUE, PERMITS_SIGN
+from app.modules.permits import decisions, events, grounds, service
+from app.modules.permits.decisions import DecisionIn
+from app.modules.permits.permissions import PERMITS_ISSUE, PERMITS_MANAGE, PERMITS_SIGN
 from app.modules.permits.schemas import (
     PermitCardOut,
     PermitOut,
@@ -106,6 +107,92 @@ async def sign_permit(
             "missing_signatures": await service.missing_signatures(db, permit.id),
         }
     )
+
+
+# --- 3.11b: the signed decision (plan `03.11b-permits-lifecycle`) -----------
+#
+# All three share `permits.manage`, migration 0019's own reservation for
+# "3.11b's suspend / resume / revoke / duplicate" — `permissions.py`'s own
+# docstring names this stage by number, so no migration of this stage's own is
+# needed to grant it. `decisions.decide` carries the whole order of checks
+# (`ERR-ACL-002` before `ERR-ACL-001`, the per-act document requirement, the
+# audited signer refusal); these three routes are only the thin, per-act shell
+# around it.
+
+
+@router.post("/permits/{permit_id}/suspend")
+async def suspend_permit(
+    permit_id: uuid.UUID,
+    payload: DecisionIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
+) -> PermitOut:
+    """С13: suspend an ACTIVE permit on a named ground, with the leshoz head's
+    ERI signature over the decision itself (`decisions.py`'s module docstring).
+
+    A supporting document is required (`ERR-VAL-001`, `doc_file_required`) —
+    PS-04's fire-danger restriction and every other suspension ground name an
+    order behind them. 409 `ERR-PERM-001` when the permit is not `active`; 403
+    `ERR-ACL-002` outside the caller's leshoz, `ERR-ACL-001` when the caller
+    holds `permits.manage` but not `executor_head` OF this leshoz.
+    """
+    permit = await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.SUSPEND,
+        to_status="suspended",
+        data=payload,
+        actor=actor,
+        event_code=events.PERMIT_SUSPENDED,
+    )
+    return PermitOut.model_validate(permit)
+
+
+@router.post("/permits/{permit_id}/resume")
+async def resume_permit(
+    permit_id: uuid.UUID,
+    payload: DecisionIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
+) -> PermitOut:
+    """С13: resume a SUSPENDED permit, back to `active`. No supporting document
+    is required — PS-06 «сабаб бартараф этилди» is a fact about the world a
+    document cannot add to; 409 `ERR-PERM-001` when the permit is not
+    `suspended`.
+    """
+    permit = await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.RESUME,
+        to_status="active",
+        data=payload,
+        actor=actor,
+        event_code=events.PERMIT_RESUMED,
+    )
+    return PermitOut.model_validate(permit)
+
+
+@router.post("/permits/{permit_id}/revoke")
+async def revoke_permit(
+    permit_id: uuid.UUID,
+    payload: DecisionIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
+) -> PermitOut:
+    """С13: revoke an ACTIVE or SUSPENDED permit — a terminal act (`tz/05`:
+    revoked only ever moves on to `archived`, 4.7's own job). A supporting
+    document is required, the same rule suspension carries.
+    """
+    permit = await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.REVOKE,
+        to_status="revoked",
+        data=payload,
+        actor=actor,
+        event_code=events.PERMIT_REVOKED,
+    )
+    return PermitOut.model_validate(permit)
 
 
 # --- Task 8: the read surface ------------------------------------------------
