@@ -203,7 +203,7 @@ class DecisionIn(BaseModel):
     """
 
     reason_item_id: uuid.UUID
-    legal_basis: str | None = None
+    legal_basis: Annotated[str | None, Field(max_length=2000)] = None
     doc_file_id: uuid.UUID | None = None
     pkcs7: Annotated[str, Field(min_length=1)]
 
