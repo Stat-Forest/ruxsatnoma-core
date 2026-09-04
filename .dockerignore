@@ -1,0 +1,16 @@
+# .dockerignore — the build context is the repository root.
+# Without this, `docker build` uploads pg-data and minio-data (gigabytes of local volume
+# state) to the daemon on every build, and the local .venv would shadow the image's own.
+.git
+.venv
+.claude
+.idea
+.pytest_cache
+.ruff_cache
+pg-data
+minio-data
+tests
+docs
+*.md
+.env
+.env.*
