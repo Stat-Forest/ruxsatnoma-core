@@ -440,6 +440,19 @@ class ApplicationCancelIn(BaseModel):
     reason: Annotated[str, Field(max_length=REASON_MAX_LENGTH)] | None = None
 
 
+class ApplicationAssignIn(BaseModel):
+    """`POST /applications/{id}/assign` — `sys_admin` only (Task 1 ANSWERED
+    (б), 2026-09-05). `reason` is restricted to the two HUMAN values
+    `application_assignments.reason`'s CHECK allows for a manual act —
+    `"auto"` is `assignment.py`'s own, never a client's to name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: uuid.UUID
+    reason: Literal["manual", "absence"]
+
+
 class TimelineSignatureRow(BaseModel):
     """One ERI signature as the timeline shows it.
 

@@ -37,12 +37,14 @@ from app.core.schemas import Page, PageParams
 from app.modules.applications import decision as service_decision
 from app.modules.applications import service
 from app.modules.applications.permissions import (
+    APPLICATIONS_ASSIGN,
     APPLICATIONS_CREATE,
     APPLICATIONS_DECIDE,
     APPLICATIONS_REVIEW,
 )
 from app.modules.applications.schemas import (
     ApplicationApproveIn,
+    ApplicationAssignIn,
     ApplicationCancelIn,
     ApplicationCardOut,
     ApplicationCheckOut,
@@ -440,6 +442,38 @@ async def get_application_timeline(
     answer to all three, as on the card.
     """
     return ApplicationTimelineOut.build(await service.timeline(db, application_id, actor=user))
+
+
+# --- Task 1 (3.9b): manual reassignment ----------------------------------------
+#
+# `applications.assign` is granted to `sys_admin` and to NOBODY else
+# (migration 0015's `ROLE_GRANTS`; Task 1 ANSWERED (б), 2026-09-05 —
+# reassignment is an administrator's action, logged and rare, not the leshoz
+# head's, whatever `design/03` and ruling 13's own prose still say). No zone
+# check on the route or in the service: the one role that can reach it at all
+# is already unrestricted nationwide (decision #41 ruling 2).
+
+
+@router.post("/applications/{application_id}/assign")
+async def assign_application(
+    application_id: uuid.UUID,
+    payload: ApplicationAssignIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_ASSIGN))],
+) -> ApplicationOut:
+    """Name who holds an application, superseding whatever assignment it has
+    now — or claiming one auto-assignment left with no reviewer.
+
+    403 `ERR-ACL-001` for anyone but `sys_admin`, from the dependency, before
+    the service is ever reached. 404 `ERR-SYS-003` for an id that does not
+    exist. 409 `ERR-APP-004` (`reason="no_organization"`) for a DRAFT with no
+    contour yet — unreachable once an application is genuinely SUBMITTED.
+    """
+    return ApplicationOut.model_validate(
+        await service.assign(
+            db, application_id, user_id=payload.user_id, reason=payload.reason, actor=actor
+        )
+    )
 
 
 # --- Task 7: the head's decision -----------------------------------------------

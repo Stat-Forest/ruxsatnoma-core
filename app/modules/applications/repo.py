@@ -17,6 +17,7 @@ ours to FETCH either, so `service.list_applications` obtains it from
 this file imports no other module's service (review I2)."""
 
 import uuid
+from collections.abc import Sequence
 from datetime import date
 from typing import Any
 
@@ -24,6 +25,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
+from app.modules.applications.assignment import Candidate
 from app.modules.applications.models import (
     Application,
     ApplicationAssignment,
@@ -414,3 +416,54 @@ async def add_assignment(db: AsyncSession, row: ApplicationAssignment) -> None:
     `add_status_history`."""
     db.add(row)
     await db.flush()
+
+
+# --- Task 1 (3.9b): auto-assignment on submission ------------------------------
+
+
+async def get_active_assignment(
+    db: AsyncSession, application_id: uuid.UUID
+) -> ApplicationAssignment | None:
+    """The application's current assignment row, if it has one — the read half
+    of the claim/supersede decision `service._claim_assignment` makes (ruling
+    16.2), and the guard `submit`'s auto-assignment hook checks before running
+    at all (ruling 6: a resubmission must find one and skip)."""
+    rows = await db.execute(
+        select(ApplicationAssignment).where(
+            ApplicationAssignment.application_id == application_id,
+            ApplicationAssignment.is_active.is_(True),
+        )
+    )
+    return rows.scalars().first()
+
+
+async def review_candidates(
+    db: AsyncSession, eligible_user_ids: Sequence[uuid.UUID]
+) -> list[Candidate]:
+    """One `Candidate` per id in `eligible_user_ids`, carrying how many
+    applications each currently holds as an ACTIVE assignment.
+
+    WHO is eligible is `auth`'s question — a permission lookup the caller
+    (`service._auto_assign_on_submission`) resolves and hands down, the same
+    way `list_applications` receives `contour_organization_col` rather than
+    reaching into `gis` itself (review I2: this file imports no other
+    module's service). HOW LOADED each one already is, is this module's own
+    `application_assignments` table. Every id comes back — zero-count ones
+    included — so `assignment.choose_executor` sees the WHOLE pool ruling 7
+    asks it to tie-break over, not just the ones with an existing row.
+    """
+    if not eligible_user_ids:
+        return []
+    rows = await db.execute(
+        select(ApplicationAssignment.user_id, func.count())
+        .where(
+            ApplicationAssignment.user_id.in_(eligible_user_ids),
+            ApplicationAssignment.is_active.is_(True),
+        )
+        .group_by(ApplicationAssignment.user_id)
+    )
+    open_counts = {user_id: count for user_id, count in rows.all()}
+    return [
+        Candidate(user_id=user_id, open_count=open_counts.get(user_id, 0))
+        for user_id in eligible_user_ids
+    ]

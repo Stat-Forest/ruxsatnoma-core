@@ -37,6 +37,7 @@ from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import checks, repo
+from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
     Application,
@@ -107,6 +108,12 @@ CHANNEL_PORTAL = "portal"
 # application this module creates is `new`.
 KIND_NEW = "new"
 INITIAL_STATUS = "DRAFT"
+# `_own_draft_for_update`'s OTHER editable status (task 1, 3.9b): a returned
+# application becomes correctable again, per that function's own docstring,
+# written when it was DRAFT-only in 3.9a and already naming this. Not "task
+# 3's own constant" — `submit`'s resubmission needs it too, and 3.9b has no
+# second definition of what "still editable" means.
+RETURNED_STATUS = "RETURNED"
 # The classifier a `benefit_category_item_id` must belong to — seeded by
 # migration 0005 and the same catalogue `norms.calculator` resolves a
 # `benefit_code` against. Checking membership, not merely that the id names
@@ -784,28 +791,30 @@ async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
             raise err("ERR-VAL-001", details={"reason": "unknown_livestock_type"})
 
 
+_EDITABLE_STATUSES = frozenset({INITIAL_STATUS, RETURNED_STATUS})
+
+
 async def _own_draft_for_update(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> Application:
-    """The caller's own application, locked, and only while it is still a
-    DRAFT.
+    """The caller's own application, locked, and only while it is still
+    EDITABLE — `DRAFT`, or `RETURNED` (task 1, 3.9b): a returned application
+    becomes correctable again.
 
     Ownership is checked BEFORE the status, and both refusals differ: a
     stranger gets 404 (they may not learn that this id is an application at
     all), while the owner of an application that has moved on gets 409
     `ERR-APP-004` — a conflict with the application's current state, which is
-    the honest answer to "why can I no longer edit this". In 3.9a `DRAFT` is
-    the only editable status; 3.9b adds `RETURNED`, when a returned application
-    becomes correctable again.
+    the honest answer to "why can I no longer edit this".
 
     Locked (`repo.get_application_for_update`) because this is a read-check-
     write over `status`: without it a PATCH and a concurrent `submit` both read
-    `DRAFT`, both pass, and the edit lands on an application that is already
-    submitted — its signed package then describes something the stored row no
-    longer says.
+    the same editable status, both pass, and the edit lands on an application
+    that is already submitted — its signed package then describes something
+    the stored row no longer says.
     """
     application = await _own_application_for_update(db, application_id, actor=actor)
-    if application.status != INITIAL_STATUS:
+    if application.status not in _EDITABLE_STATUSES:
         raise err("ERR-APP-004", details={"reason": "not_draft", "status": application.status})
     return application
 
@@ -1597,9 +1606,14 @@ async def submit(
     # written, and the row says "an attempt was made against submission X and
     # it was rejected".
     submission_id = uuid7()
-    # Step 1. The owner's own DRAFT, locked: 404 for a stranger, 409
-    # `ERR-APP-004` for an application that has moved on. 3.9b adds RETURNED.
+    # Step 1. The owner's own DRAFT (or, task 1, 3.9b: RETURNED), locked: 404
+    # for a stranger, 409 `ERR-APP-004` for an application that has moved on
+    # some other way. Captured before anything overwrites `application.status`
+    # below — a RESUBMISSION's history row and audit entry must say
+    # `from_status="RETURNED"`, not a hardcoded "DRAFT" that was true only for
+    # the FIRST submission.
     application = await _own_draft_for_update(db, application_id, actor=actor)
+    from_status = application.status
     await _assert_complete(db, application)  # step 2
     await _assert_benefit_documents(db, application)  # step 3
     # Step 4, ruling 22: the geometry decided upon AND its area, frozen
@@ -1717,7 +1731,7 @@ async def submit(
         ApplicationStatusHistory(
             id=submission_id,
             application_id=application.id,
-            from_status=INITIAL_STATUS,
+            from_status=from_status,
             to_status=SUBMITTED_STATUS,
             changed_by=actor.id,
         ),
@@ -1734,7 +1748,7 @@ async def submit(
         user_id=actor.id,
         object_type="application",
         object_id=application.id,
-        old_value={"status": INITIAL_STATUS},
+        old_value={"status": from_status},
         new_value={
             "status": SUBMITTED_STATUS,
             "number": number,
@@ -1757,6 +1771,16 @@ async def submit(
     # subscriber reads everything else through `service.get` /
     # `current_calculation`. Handlers run synchronously, in THIS transaction.
     await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
+    # Task 1 (3.9b), and genuinely the LAST step: an application must never
+    # exist in SUBMITTED with no assignment row at all (ruling 7). See the
+    # hook's own docstring for the resubmission guard (ruling 6).
+    await _auto_assign_on_submission(db, application)
+    # The hook may have just written `assigned_org_id`/`assigned_user_id`
+    # (a plain UPDATE, whose `onupdate=func.now()` on `updated_at` is not
+    # reloaded automatically — lesson: "the row in memory is not what
+    # Postgres stored"). Refresh unconditionally rather than branching on
+    # whether it actually wrote anything.
+    await db.refresh(application)
     return application
 
 
@@ -1801,11 +1825,14 @@ CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({INITIAL_STATUS, SUBMITTED_STATUS,
 DECISION_OBJECT_TYPE = "application"
 DECISION_PURPOSE = "application_decision"
 
-# `application_assignments.reason` (`models.ASSIGNMENT_REASONS`). 3.9a has no
-# auto-assignment job — ruling 14 lets any reviewer in the zone pick an
-# application up — so every row this stage writes records a human act. `auto` is
-# 3.9b's, when the assignment is made for the reviewer instead of by them.
+# `application_assignments.reason` (`models.ASSIGNMENT_REASONS`). 3.9a had no
+# auto-assignment job — ruling 14 let any reviewer in the zone pick an
+# application up — so every row that stage wrote recorded a human act.
+# `ASSIGNMENT_AUTO` is 3.9b task 1's own: the reason on the row
+# `_auto_assign_on_submission` writes, for a reviewer picked FOR them rather
+# than BY them.
 ASSIGNMENT_MANUAL = "manual"
+ASSIGNMENT_AUTO = "auto"
 
 
 async def _apply_transition(
@@ -1886,31 +1913,53 @@ async def _claim_assignment(
     org_id: uuid.UUID,
     user_id: uuid.UUID | None,
     reason: str,
-    actor: User,
+    actor: User | None,
 ) -> ApplicationAssignment:
-    """Supersede whatever active assignment the application has and record the
-    new one — the ONE write path into `application_assignments`.
+    """CLAIM the active assignment if it is unheld or already names this same
+    person, otherwise SUPERSEDE it — the ONE write path into
+    `application_assignments` (ruling 16.2).
 
-    `uq_application_assignments_active` is UNIQUE on `(application_id) WHERE
-    is_active`, so a blind second insert is an `IntegrityError`, and the flush
-    between the deactivation and the insert is NOT optional: without it both
-    rows are pending when the index is checked and the insert fails on a
-    conflict the flush would have resolved (lesson: "A partial unique index
-    constrains only the rows it covers, and only after a flush").
+    Three cases, checked in this order:
 
-    Built as a supersede from the first caller on purpose, though 3.9a's only
-    caller finds nothing to supersede: task 7's forward writes a SECOND row
-    pointing at the parent organization, and 3.9b turns `start_review` into a
-    claim over a row an auto-assignment job wrote. Both are this function with
-    different arguments, and neither is a special case.
+    * an active row exists and its `user_id` is `NULL`, or already equals the
+      `user_id` being set here → **claim**: only `user_id` is written: the
+      row, its `id` and its OWN `reason` are left exactly as they were. The
+      "already equals" half is not in the ruling's own text but is load-
+      bearing on the EXISTING 3.9a suite, not just this task's: once
+      auto-assignment can pick a real candidate, that candidate is very often
+      the SAME person who then calls `start-review` on their own file, naming
+      `user_id=actor.id` — `test_a_hodim_in_the_zone_takes_it_into_work` and
+      `test_claiming_an_assignment_twice_supersedes_instead_of_colliding`
+      both pin `len(timeline["assignments"])` on that reclaim NOT superseding.
+    * an active row exists and names somebody else (a real, DIFFERENT
+      `user_id`) → **supersede**: deactivate it, `flush()`, then insert the
+      new row. `uq_application_assignments_active` is UNIQUE on
+      `(application_id) WHERE is_active`, so a blind second insert beside a
+      live row is an `IntegrityError`, and the flush between the two is NOT
+      optional — without it both rows are pending when the index is checked
+      and the insert fails on a conflict the flush would have resolved
+      (lesson: "A partial unique index constrains only the rows it covers,
+      and only after a flush").
+    * no active row at all → insert.
+
+    Three callers, one helper: `_auto_assign_on_submission` (`reason='auto'`,
+    `actor=None` — nobody's personal act, so `assigned_by` stays `NULL`),
+    `start_review` (`reason='manual'`, claiming the auto row), and `assign`
+    (`POST /assign`, a caller-supplied reason, usually superseding it).
     """
+    active = await repo.get_active_assignment(db, application.id)
+    if active is not None and (active.user_id is None or active.user_id == user_id):
+        active.user_id = user_id
+        await db.flush()
+        await db.refresh(active)
+        return active
     await repo.deactivate_assignments(db, application.id)
     await db.flush()
     row = ApplicationAssignment(
         application_id=application.id,
         org_id=org_id,
         user_id=user_id,
-        assigned_by=actor.id,
+        assigned_by=None if actor is None else actor.id,
         reason=reason,
         is_active=True,
     )
@@ -1919,6 +1968,46 @@ async def _claim_assignment(
     # timeline both sorts on it and serializes it.
     await db.refresh(row)
     return row
+
+
+async def _auto_assign_on_submission(db: AsyncSession, application: Application) -> None:
+    """`submit`'s last step (task 1): give the freshly SUBMITTED application a
+    reviewer, or failing that, at least an organization — ruling 7, "the
+    application is still assigned to the ORGANIZATION [...] it must never
+    silently fail to assign".
+
+    **Guarded to a FIRST submission only** (ruling 6): `submit` also drives a
+    RESUBMISSION after 3.9b's return for correction, and firing this hook
+    unconditionally would run `choose_executor` again — the supersede branch
+    of `_claim_assignment` would then silently hand the file to a fresh
+    auto-pick, taking it away from the very reviewer who returned it. An
+    application that already carries an active `application_assignments` row,
+    auto or manual, is left untouched.
+    """
+    if await repo.get_active_assignment(db, application.id) is not None:
+        return
+    organization_id = await _effective_organization(db, application)
+    if organization_id is None:
+        # Unreachable from a genuinely SUBMITTED application —
+        # `_assert_complete` makes `contour_id` mandatory before `submit`
+        # ever gets here — but this step fails closed rather than raising
+        # mid-submission for work that is not itself what the applicant is
+        # waiting on.
+        return
+    eligible = await auth_service.user_ids_with_permission(
+        db, APPLICATIONS_REVIEW, organization_id=organization_id
+    )
+    picked = choose_executor(await repo.review_candidates(db, eligible))
+    application.assigned_org_id = organization_id
+    application.assigned_user_id = picked
+    await _claim_assignment(
+        db,
+        application,
+        org_id=organization_id,
+        user_id=picked,
+        reason=ASSIGNMENT_AUTO,
+        actor=None,
+    )
 
 
 async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
@@ -1984,6 +2073,62 @@ async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: Us
         to_status=IN_REVIEW_STATUS,
         action=APPLICATION_START_REVIEW,
         actor=actor,
+    )
+    return application
+
+
+APPLICATION_ASSIGN = "application.assign"
+
+
+async def assign(
+    db: AsyncSession, application_id: uuid.UUID, *, user_id: uuid.UUID, reason: str, actor: User
+) -> Application:
+    """`POST /applications/{id}/assign` — sys_admin names who holds an
+    application, superseding whatever assignment it has now.
+
+    **Gated entirely at the route.** `require_permission(APPLICATIONS_ASSIGN)`
+    is `sys_admin`-only (migration 0015's `ROLE_GRANTS`; Task 1 ANSWERED (б),
+    2026-09-05 — an `executor_head` gets 403 `ERR-ACL-001` from the dependency,
+    never a refusal from here), so there is no zone check in this function
+    either: the one role that can reach it at all is already unrestricted
+    nationwide (decision #41 ruling 2), the same reasoning `_forward` in
+    `decision.py` states for an unzoned agency-level head.
+
+    Reassignment goes through `_claim_assignment` (ruling 16.2) — the SAME
+    helper `start_review` and the auto-assignment hook use: it supersedes an
+    active row naming somebody else, or claims one that is unheld or already
+    names this exact person.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    organization_id = await _effective_organization(db, application)
+    if organization_id is None:
+        # Same unreachable-but-named-anyway guard as `start_review`'s own:
+        # `application_assignments.org_id` is NOT NULL and a DRAFT with no
+        # contour yet has nothing to put in it.
+        raise err(
+            "ERR-APP-004",
+            details={"reason": "no_organization", "status": application.status},
+        )
+    # Set BEFORE `_claim_assignment`, not after — that call's own flush is what
+    # carries these two along with it, the same order `start_review` uses;
+    # `db.refresh` right after relies on nothing here being separately dirty.
+    application.assigned_org_id = organization_id
+    application.assigned_user_id = user_id
+    await _claim_assignment(
+        db, application, org_id=organization_id, user_id=user_id, reason=reason, actor=actor
+    )
+    await db.refresh(application)
+    await audit.log(
+        db,
+        action=APPLICATION_ASSIGN,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        old_value={},
+        new_value={"assigned_org_id": str(organization_id), "assigned_user_id": str(user_id)},
+        basis=reason,
     )
     return application
 

@@ -196,10 +196,29 @@ async def other_applicant_client(db: AsyncSession):
 
 
 @pytest.fixture
-async def hodim_client(db: AsyncSession, leshoz: Organization):
+async def hodim_user(db: AsyncSession, leshoz: Organization) -> User:
+    """A hodim (tz/03's «ходим», role `executor_staff`) actually IN the leshoz
+    that owns `published_contour` — the identity `hodim_client` below signs in
+    as, and a real candidate `assignment.choose_executor` (3.9b task 1) can
+    pick.
+
+    Plain `make_user(role_code="executor_staff", ...)`, not `_client_for`'s
+    personal-grant shape: `executor_staff`'s OWN `role_permissions` row already
+    carries `applications.review` (migration 0015), so a personal grant on top
+    would be redundant — and `hodim_client` below builds on this SAME row for
+    exactly one reason: a test requesting both must get ONE reviewer, never
+    two independently-created ones a tie-break in `choose_executor` could pick
+    between unpredictably.
+    """
+    return await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+
+
+@pytest.fixture
+async def hodim_client(db: AsyncSession, hodim_user: User):
     """The reviewer (tz/03's «ходим», role `executor_staff`) of the leshoz that
-    owns `published_contour` — the two share the `leshoz` fixture, which pytest
-    caches per test, so "the same zone" is a fact rather than a coincidence.
+    owns `published_contour`, signed in as `hodim_user` — the two share the
+    `leshoz` fixture, which pytest caches per test, so "the same zone" is a
+    fact rather than a coincidence.
 
     ONE permission, and it is exactly what migration 0015 grants
     `executor_staff`: `applications.review`. `applications.view_any` goes to
@@ -211,7 +230,7 @@ async def hodim_client(db: AsyncSession, leshoz: Organization):
     `service._holds_staff_read`, which accepts `applications.review` or
     `.decide` or `.view_any` — this fixture is what proves that.
     """
-    async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=leshoz.id):
+    async for client in _head_client(db, hodim_user):
         yield client
 
 
@@ -345,6 +364,16 @@ async def draft_ready_for_submission(
         period_from="2027-05-01",
         period_to="2027-09-30",
     )
+
+
+@pytest.fixture
+async def draft_in_reviewerless_leshoz(draft_ready_for_submission: str) -> str:
+    """Ruling 7's empty case: `draft_ready_for_submission`'s own `leshoz` is a
+    FRESH organization every test (random code), so it is already reviewerless
+    unless the SAME test also pulls in `hodim_user`/`hodim_client` — this name
+    just states that intent explicitly for the one test exercising it, rather
+    than relying on the reader to notice an absence."""
+    return draft_ready_for_submission
 
 
 @pytest.fixture
@@ -596,7 +625,9 @@ async def overlapping_published_contour(
 
 
 @pytest.fixture
-async def submitted_application(applicant_client, draft_ready_for_submission: str) -> str:
+async def submitted_application(
+    applicant_client, draft_ready_for_submission: str, hodim_user: User
+) -> str:
     """`draft_ready_for_submission`, actually SUBMITTED — through `GET
     /package` + a real ERI over those exact bytes + `POST /submit`, never by
     writing `status='SUBMITTED'` on the row (lesson: build a fixture's
@@ -611,12 +642,44 @@ async def submitted_application(applicant_client, draft_ready_for_submission: st
     `_submit` is imported inside the body rather than at module scope: it lives
     in a test module, and a conftest importing one at collection time is a
     circularity waiting for the day that module wants a fixture from here.
+
+    `hodim_user` is a DEPENDENCY, not merely used by the body (3.9b task 1): a
+    fixture's own dependencies always resolve before its body runs, no matter
+    where a TEST lists them relative to `submitted_application` itself — the
+    one way to guarantee auto-assignment has a real candidate at the moment
+    `_submit` fires below. Without it, a test that also names `hodim_user`
+    directly (to assert it is the pick) would find it created only AFTER this
+    fixture's own submission already ran with nobody eligible (pytest resolves
+    independent fixtures in the order a test lists them — verified in the
+    lessons file). Harmless for every test that does not care who got picked.
     """
     from tests.modules.applications.test_submit import _submit
 
     result = await _submit(applicant_client, draft_ready_for_submission)
     assert result.status_code == 200, result.text
     return draft_ready_for_submission
+
+
+@pytest.fixture
+async def other_hodim_user(db: AsyncSession, leshoz: Organization) -> User:
+    """A SECOND hodim in the same leshoz as `hodim_user` — the manual
+    reassignment's target (`POST /assign`, 3.9b task 1), distinct from
+    whichever reviewer auto-assignment already picked for
+    `submitted_application`."""
+    return await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+
+
+@pytest.fixture
+async def sys_admin_client(db: AsyncSession):
+    """The superuser — the ONLY role migration 0015 grants
+    `applications.assign` (Task 1 ANSWERED (б), 2026-09-05). Zone-free like
+    every real `sys_admin` account (`_head_client`'s user carries no
+    `organization_id`/`region_id`), so it can reach `POST /assign` at any
+    leshoz — `require_permission` waves it through the gate before the code
+    check even runs (decision #41 ruling 2)."""
+    user = await make_user(db, role_code="sys_admin", pinfl=unique_pinfl())
+    async for client in _head_client(db, user):
+        yield client
 
 
 # --- Task 7: the head's decision ----------------------------------------------

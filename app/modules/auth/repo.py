@@ -116,6 +116,39 @@ async def user_permission_codes(db: AsyncSession, user_id: uuid.UUID) -> set[str
     return set(result.scalars())
 
 
+async def user_ids_with_permission(
+    db: AsyncSession, permission_code: str, *, organization_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Every ACTIVE user in `organization_id` holding `permission_code` —
+    through their role's own grant (`role_permissions`) or a personal one
+    (`user_permissions`), the same two sources `permission_codes` above merges
+    for one user already in hand, generalised here to a whole organization.
+    `applications.assignment`'s auto-assignment candidate lookup (3.9b task 1)
+    is the first caller."""
+    role_grant = (
+        select(User.id)
+        .join(Role, Role.id == User.role_id)
+        .join(RolePermission, RolePermission.role_id == Role.id)
+        .where(
+            RolePermission.permission_code == permission_code,
+            User.organization_id == organization_id,
+            User.status == "active",
+        )
+    )
+    personal_grant = (
+        select(User.id)
+        .join(UserPermission, UserPermission.user_id == User.id)
+        .where(
+            UserPermission.permission_code == permission_code,
+            User.organization_id == organization_id,
+            User.status == "active",
+        )
+    )
+    role_ids = set((await db.execute(role_grant)).scalars())
+    personal_ids = set((await db.execute(personal_grant)).scalars())
+    return list(role_ids | personal_ids)
+
+
 async def role_codes_by_permission(db: AsyncSession) -> dict[str, list[str]]:
     """Which role codes grant each permission code (`GET /admin/permissions`
     coverage view, С23) — a code held by no role is simply absent from the dict;
