@@ -61,15 +61,29 @@ async def test_a_refused_signature_leaves_the_permit_untouched(
 
 
 async def test_the_head_of_another_leshoz_may_not_decide(
-    db, active_permit, other_org_head_client, suspend_reason_id, order_file_id
+    db, issued_permit, other_org_head_client, suspend_reason_id, order_file_id
 ) -> None:
-    """`decide()`'s step 3 (`_assert_organization_in_zone`) runs before its
-    step 6 (the signer-identity check): a head of a wholly different leshoz
-    fails the coarser zone gate first, so the finer-grained role/organization
-    comparison behind `sign()` is never reached."""
+    """`decide()`'s step 2 (`_assert_organization_in_zone`) runs before its
+    step 3 (`_assert_transition`) AND its step 6 (the signer-identity check):
+    a head of a wholly different leshoz fails the coarser zone gate first,
+    before either the status check or the finer-grained role/organization
+    comparison behind `sign()` is ever reached.
+
+    `issued_permit` (not `active_permit`) is deliberately `pending_signatures`
+    — `PERMIT_TRANSITIONS["pending_signatures"]` allows only `active`, so
+    `suspend` is not a legal transition out of it AT ALL. This is what pins
+    the ordering rather than merely exercising it: against an `active` permit
+    the transition check would pass regardless of who is asking, so a
+    same-order regression (zone AFTER transition) would still return 403 here
+    and the test would not notice. Against `pending_signatures` a
+    transition-first regression instead returns 409 `ERR-PERM-001` naming the
+    permit's REAL status (`{"reason": "bad_transition", "from":
+    "pending_signatures", "to": "suspended"}`) — exactly the cross-leshoz
+    status oracle the whole-branch review found: an outsider learns a
+    permit's current state by attempting a doomed transition on it."""
     refused = await sign_decision(
         other_org_head_client,
-        active_permit.id,
+        issued_permit.id,
         "suspend",
         reason_item_id=suspend_reason_id,
         doc_file_id=order_file_id,

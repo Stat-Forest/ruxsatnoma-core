@@ -13,8 +13,11 @@ notification is this stage's WHOLE refund story (ruling 15 — no
 
 import uuid
 
+from sqlalchemy import select
+
 from app.modules.applications import service as applications_service
-from app.modules.permits import events, jobs
+from app.modules.audit.models import AuditLog
+from app.modules.permits import events, jobs, service
 from app.modules.permits.models import ForestTicket
 from tests.modules.permits.conftest import notification_rows, sign_decision
 
@@ -147,3 +150,50 @@ async def test_revocation_also_revokes_the_permits_live_forest_ticket(
 
     await db.refresh(ticket)
     assert ticket.status == "revoked"
+
+
+async def test_the_forest_tickets_own_revocation_is_audited(
+    db, active_permit, head_client, revoke_reason_id, order_file_id
+) -> None:
+    """Whole-branch review fix: `revoke_tickets_of` used to flip `status` to
+    `"revoked"` with nothing else — its two siblings, `FOREST_TICKET_ISSUE`
+    (`test_forest_ticket.py`) and `FOREST_TICKET_EXPIRE`
+    (`test_jobs.py::test_the_expiry_is_audited_as_a_job`), both audit, and the
+    audit invariant is repo-wide (`backend/CLAUDE.md`), not a choice each
+    writer makes for itself. Without this row a prosecutor asking who
+    cancelled a given ЧТ number and when would find the ticket's own trail
+    ending at issuance — the permit's `permit.decide` row names the PERMIT,
+    not the ticket."""
+    ticket = ForestTicket(
+        number=f"CHT-{uuid.uuid4()}",
+        permit_id=active_permit.id,
+        valid_from=active_permit.period_from,
+        valid_to=active_permit.period_to,
+        restrictions={},
+        status="active",
+        issued_by=head_client.user.id,
+    )
+    db.add(ticket)
+    await db.flush()
+
+    revoked = await sign_decision(
+        head_client,
+        active_permit.id,
+        "revoke",
+        reason_item_id=revoke_reason_id,
+        doc_file_id=order_file_id,
+    )
+    assert revoked.status_code == 200, revoked.text
+
+    row = (
+        await db.execute(
+            select(AuditLog).where(
+                AuditLog.object_id == ticket.id,
+                AuditLog.action == service.FOREST_TICKET_REVOKE,
+            )
+        )
+    ).scalar_one()
+    assert row.object_type == "forest_ticket"
+    assert row.user_id == head_client.user.id
+    assert row.old_value == {"status": "active"}
+    assert row.new_value == {"status": "revoked"}

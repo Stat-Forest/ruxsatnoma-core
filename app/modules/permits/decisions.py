@@ -146,7 +146,7 @@ async def _decision_signer_refusal(db: AsyncSession, permit: Permit, *, actor: U
     literal here would be a second one that could silently drift from it).
 
     Strict equality on `users.organization_id`, deliberately NOT the
-    three-axis `Zone` predicate `decide()`'s own step 3 already used: a zone
+    three-axis `Zone` predicate `decide()`'s own step 2 already used: a zone
     answers "whose rows may I see", and a zone-free actor legitimately covers
     the whole republic; this answers "which named official of which named
     organization decides THIS permit's fate", and there is no such thing as a
@@ -177,12 +177,18 @@ async def decide(
     """One suspension, resumption or revocation, in the one order that is safe.
 
     1. lock (`repo.permit_by_id_for_update`) — 404 `ERR-SYS-003` if gone;
-    2. `service._assert_transition` — 409 `ERR-PERM-001`, `from == to` on a
+    2. `service._assert_organization_in_zone` — 403 `ERR-ACL-002`, the coarse
+       territorial gate, checked BEFORE step 3's status check AND step 6's
+       finer-grained identity comparison (whole-branch review: this used to
+       run AFTER step 3, which made `decide()` a cross-leshoz status oracle —
+       an outsider's doomed transition came back 409 naming the permit's REAL
+       `from` status instead of a 403 that reveals nothing, the same class of
+       leak this stage's own review already closed in `issue_duplicate`): a
+       head of a wholly different leshoz meets a determined, information-free
+       answer here, never a coin toss between the two 403s and never a peek
+       at the permit's current state;
+    3. `service._assert_transition` — 409 `ERR-PERM-001`, `from == to` on a
        retry against the status the permit already holds;
-    3. `service._assert_organization_in_zone` — 403 `ERR-ACL-002`, the coarse
-       territorial gate, checked BEFORE step 6's finer-grained identity
-       comparison: a head of a wholly different leshoz meets a determined
-       answer here, never a coin toss between the two 403s;
     4. `grounds.assert_applicable` — 422 `ERR-VAL-001`, a named reason;
     5. the supporting file (`_assert_decision_doc`) — 422 `ERR-VAL-001`,
        required for suspend and revoke (ruling 6);
@@ -204,11 +210,12 @@ async def decide(
     if permit is None:
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
 
-    # 2. Checked before a real ground/file/signature is ever spent on it.
-    service._assert_transition(permit, to_status)
+    # 2. Before the status check and everything after it — see the docstring
+    # above for why the order matters.
+    await service._assert_organization_in_zone(db, actor, permit.organization_id)
 
     # 3.
-    await service._assert_organization_in_zone(db, actor, permit.organization_id)
+    service._assert_transition(permit, to_status)
 
     # 4.
     item = await grounds.assert_applicable(

@@ -1855,6 +1855,13 @@ async def resume(
 # rather than inside `decisions.decide` itself, which would otherwise need a
 # fourth parameter naming the act just to know whether to run it.
 
+# `revoke_tickets_of`'s own action (whole-branch review fix): its two
+# siblings, `FOREST_TICKET_ISSUE` and `FOREST_TICKET_EXPIRE`, both audit —
+# the invariant is repo-wide (`backend/CLAUDE.md`'s audit invariant), not a
+# per-writer choice — so a ticket's audit trail must not end at issuance while
+# the ticket issuance produced no longer exists.
+FOREST_TICKET_REVOKE = "forest_ticket.revoke"
+
 
 async def revoke_tickets_of(db: AsyncSession, permit: Permit, *, actor: User) -> None:
     """Revoke `permit`'s live forest ticket(s) (ruling 14).
@@ -1874,13 +1881,23 @@ async def revoke_tickets_of(db: AsyncSession, permit: Permit, *, actor: User) ->
     sweep resolves, then re-reading under the lock this function's own
     docstring explains, reproduces the exact same guard.
 
-    `actor` is accepted but not read: `forest_tickets` carries no
-    `revoked_by`-shaped column to write it to, and this stage's migration
-    (0023) is already closed — adding one is a later stage's call.
+    `actor` IS read now (whole-branch review fix): `forest_tickets` still
+    carries no `revoked_by`-shaped column, but `audit_log.user_id` needs no
+    such column — it is the SAME shape `FOREST_TICKET_ISSUE`'s own audit call
+    already uses for `issued_by`'s actor, not a new one invented here.
     """
     for ticket in await repo.live_forest_tickets(db, permit.id):
         ticket.status = "revoked"
-    await db.flush()
+        await db.flush()
+        await audit.log(
+            db,
+            action=FOREST_TICKET_REVOKE,
+            user_id=actor.id,
+            object_type="forest_ticket",
+            object_id=ticket.id,
+            old_value={"status": "active"},
+            new_value={"status": "revoked"},
+        )
 
 
 async def revoke(
@@ -1967,7 +1984,7 @@ async def issue_duplicate(
     **Zoned, like every other write path on this permit** (fix round 1 —
     `issue_duplicate` originally checked neither): `_assert_organization_in_zone`
     runs FIRST, before either domain check below, the same order `decide()`
-    (`decisions.py` step 3) and `issue` (`_assert_in_zone`) already use. An
+    (`decisions.py` step 2) and `issue` (`_assert_in_zone`) already use. An
     out-of-zone `permits.issue`/`permits.manage` holder — both roles are
     organization-scoped (migration 0019) but the route's permission gate
     cannot see WHICH organization a target permit belongs to — must learn
