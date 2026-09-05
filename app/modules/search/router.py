@@ -1,0 +1,99 @@
+"""`search` — a level-5 reader (design/01 rule 5). Every route requires
+`search.use`; the zone restriction on top of it lives in `service.py`, never
+here (same split every other module's router/service pair uses)."""
+
+import uuid
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.deps import get_db
+from app.core.schemas import Page, PageParams
+from app.modules.auth.deps import require_permission
+from app.modules.auth.models import User
+from app.modules.search import service
+from app.modules.search.permissions import SEARCH_USE
+from app.modules.search.schemas import (
+    SavedFilterIn,
+    SavedFilterOut,
+    SavedFilterPatch,
+    SearchKind,
+    SearchResultOut,
+)
+
+router = APIRouter(tags=["search"])
+
+
+@router.get("/search", response_model=Page[SearchResultOut])
+async def search(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+    params: Annotated[PageParams, Depends()],
+    kind: SearchKind,
+    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    filter_status: Annotated[str | None, Query(alias="status")] = None,
+    organization_id: uuid.UUID | None = None,
+    activity_type_id: uuid.UUID | None = None,
+    series: Annotated[str | None, Query(max_length=10)] = None,
+) -> Page[SearchResultOut]:
+    return await service.search(
+        db,
+        actor=actor,
+        kind=kind,
+        params=params,
+        q=q,
+        status=filter_status,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        series=series,
+    )
+
+
+@router.post("/search/profiles", response_model=SavedFilterOut, status_code=status.HTTP_201_CREATED)
+async def create_profile(
+    data: SavedFilterIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> SavedFilterOut:
+    row = await service.create_saved_filter(db, actor, data)
+    return SavedFilterOut.model_validate(row)
+
+
+@router.get("/search/profiles", response_model=list[SavedFilterOut])
+async def list_profiles(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> list[SavedFilterOut]:
+    rows = await service.list_saved_filters(db, actor)
+    return [SavedFilterOut.model_validate(row) for row in rows]
+
+
+@router.get("/search/profiles/{profile_id}", response_model=SavedFilterOut)
+async def get_profile(
+    profile_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> SavedFilterOut:
+    row = await service.get_saved_filter(db, actor, profile_id)
+    return SavedFilterOut.model_validate(row)
+
+
+@router.patch("/search/profiles/{profile_id}", response_model=SavedFilterOut)
+async def update_profile(
+    profile_id: uuid.UUID,
+    patch: SavedFilterPatch,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> SavedFilterOut:
+    row = await service.update_saved_filter(db, actor, profile_id, patch)
+    return SavedFilterOut.model_validate(row)
+
+
+@router.delete("/search/profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_profile(
+    profile_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> None:
+    await service.delete_saved_filter(db, actor, profile_id)

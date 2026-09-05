@@ -30,6 +30,7 @@ from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
 from app.modules.applications.router import router as applications_router
+from app.modules.archive.router import router as archive_router
 from app.modules.auth.router import router as auth_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
@@ -48,6 +49,7 @@ from app.modules.payments.router import router as payments_router
 from app.modules.permits.lifecycle_router import router as permits_lifecycle_router
 from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
+from app.modules.search.router import router as search_router
 from app.modules.signatures.router import router as signatures_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -301,5 +303,8 @@ def create_app() -> FastAPI:
     # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
     # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
     app.include_router(permits_public_router, prefix="/api/v1")
+    # Track B4 (stage 4): two narrow level-5 readers, no other track's tables written.
+    app.include_router(search_router, prefix="/api/v1")
+    app.include_router(archive_router, prefix="/api/v1")
 
     return app
