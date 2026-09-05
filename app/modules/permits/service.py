@@ -29,7 +29,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -52,6 +52,7 @@ from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
 from app.modules.permits import events, grounds, render, repo, signers
 from app.modules.permits.models import (
+    ForestTicket,
     Permit,
     PermitStatusHistory,
     PermitTemplate,
@@ -1836,6 +1837,72 @@ async def resume(
         actor=actor,
         event_code=events.PERMIT_RESUMED,
     )
+
+
+# --- Task 4: revoke, the third act riding on `decide()` ----------------------
+#
+# Bigger than `suspend`/`resume` by exactly one thing (ruling 14): a revoked
+# permit's live forest ticket goes down with it, in the SAME transaction. A
+# suspension must NOT do this — a suspended permit may still resume and use
+# the very same ticket — so the step lives here, AFTER `decide()` returns,
+# rather than inside `decisions.decide` itself, which would otherwise need a
+# fourth parameter naming the act just to know whether to run it.
+
+
+async def revoke_tickets_of(db: AsyncSession, permit: Permit, *, actor: User) -> None:
+    """Revoke `permit`'s live forest ticket (ruling 14).
+
+    A stand-in for Task 6's own register: `uq_forest_tickets_active` already
+    limits a permit to at most one `active` row, so there is never more than
+    one to touch, and this stays a plain two-statement query until Task 6
+    moves it into `repo` beside its siblings. `actor` is accepted but not
+    read yet — the register is expected to want it (an `issued_by`-shaped
+    trail of who revoked a ticket), and taking the parameter now means this
+    function's shape does not have to change again when Task 6 lands.
+    """
+    await db.execute(
+        update(ForestTicket)
+        .where(ForestTicket.permit_id == permit.id, ForestTicket.status == "active")
+        .values(status="revoked")
+    )
+
+
+async def revoke(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+) -> Permit:
+    """С13: cancel a permit for cause. Reachable from `active` AND from
+    `suspended` (`PERMIT_TRANSITIONS`); terminal but for 4.7's `archived`.
+
+    **No refund is created and no accountant is looked up** (ruling 15): a
+    refund is a manual accountant process the holder starts with their own
+    обращение (decision #12), `payments` is level 4 like this module, and the
+    `permit.revoked` notification template's own text is where the holder is
+    told they may ask for one. `start_refund` is deliberately absent from
+    `DecisionIn` — there is no such field to widen.
+
+    The permit's live forest ticket is revoked in this SAME transaction
+    (ruling 14), by a plain call AFTER `decide()` returns rather than a hook
+    inside it (see the section comment above). That ordering is safe because
+    `decide()` never commits on the success path this return relies on:
+    `get_db` is what commits the whole request, once, at the very end, and
+    the only commits `decide()` itself makes happen on a path that RAISES —
+    the signer-identity refusal it writes itself, or whichever refusal
+    `sign()` finds first. So `revoke_tickets_of` lands in exactly the same
+    still-open transaction the status change itself is sitting in.
+    """
+    from app.modules.permits import decisions
+
+    permit = await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.REVOKE,
+        to_status="revoked",
+        data=data,
+        actor=actor,
+        event_code=events.PERMIT_REVOKED,
+    )
+    await revoke_tickets_of(db, permit, actor=actor)
+    return permit
 
 
 # --- the three read routes' service side -------------------------------------
