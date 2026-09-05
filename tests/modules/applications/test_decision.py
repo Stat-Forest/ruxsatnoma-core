@@ -629,3 +629,81 @@ async def test_a_republished_contour_does_not_invalidate_the_decision_signature(
     assert hashlib.sha256(rederived).hexdigest() == signature.doc_hash, (
         "the bytes the head signed must be re-derivable from the stored row alone"
     )
+
+
+async def test_a_price_that_moved_before_the_decision_is_labeled_package_changed(
+    db: AsyncSession, executor_head_client, application_in_review
+) -> None:
+    """Ruling 18 (в)'s decision-path mirror of `test_submit.py::
+    test_a_price_that_moved_after_signing_is_labeled_package_changed`.
+
+    `_sign_decision` fetches `GET /package` and signs exactly those bytes
+    through the same `service.package` `submit` uses (controller ruling R5),
+    so the identical exposure applies on this path too: a tariff, a
+    `rule_parameter`, a norm or midnight in Tashkent moving between the
+    head's `GET /package` and their `POST /approve` recomputes different
+    bytes than the ones actually signed — and Oybek confirmed keeping BOTH
+    paths under this fix, not only the applicant's.
+
+    The herd moves through the ORM directly, never through the citizen-facing
+    `PATCH /applications/{id}` — that route is DRAFT-only (`ERR-APP-004` in
+    any other status) and cannot reach an `IN_REVIEW` application at all.
+    `application_items` is this application's OWN row, the same reasoning
+    `test_a_republished_contour_does_not_invalidate_the_decision_signature`
+    already uses to mutate this application's own `contour_versions` directly
+    and rely on `_commit_pending_before_requests` to make it visible to the
+    next request — never a shared, migration-seeded row. 60 head is still
+    well inside `published_grazing_norm`'s MaxSB of 250, so nothing here
+    trips a blocking check; the only thing under test is the stale signature.
+    """
+    from sqlalchemy import select
+
+    from app.modules.applications.models import ApplicationItem
+
+    doc = (
+        await executor_head_client.get(f"/api/v1/applications/{application_in_review}/package")
+    ).content
+
+    item = (
+        await db.execute(
+            select(ApplicationItem).where(
+                ApplicationItem.application_id == uuid.UUID(application_in_review)
+            )
+        )
+    ).scalar_one()
+    item.head_count = 60
+    await db.flush()
+
+    result = await executor_head_client.post(
+        f"/api/v1/applications/{application_in_review}/approve",
+        json={
+            "pkcs7": encode_mock_signature(
+                document=doc, serial="HEAD-1", issuer="ISS-1", pinfl="98765432109876"
+            )
+        },
+    )
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "package_changed"
+
+
+async def test_a_genuinely_bad_decision_signature_is_not_labeled_package_changed(
+    executor_head_client, application_in_review
+) -> None:
+    """The paired negative, mirroring `test_submit.py::
+    test_an_invalid_signature_refuses_the_submission_whole`: an envelope this
+    broken (not even decodable base64url JSON) never reaches the
+    `document_sha256` comparison at all — `eimzo.py::_unparseable_signature`
+    hands back an empty `raw`, so `signatures.service._raised_reason` has
+    nothing to compare and leaves the generic reason alone. A genuinely bad
+    signature on the decision path must never be told apart from a stale
+    package as anything OTHER than `"signature_invalid"`."""
+    result = await executor_head_client.post(
+        f"/api/v1/applications/{application_in_review}/approve",
+        json={"pkcs7": "not-a-signature"},
+    )
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "signature_invalid"
