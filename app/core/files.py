@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import UploadFile
+from geoalchemy2.elements import WKTElement
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, storage
@@ -193,6 +194,41 @@ async def save_upload(
     # by a later DB failure is harmless garbage.
     await storage.put_object(file.storage_key, data, content_type)
     db.add(file)
+    await db.flush()
+    return file
+
+
+async def set_capture_metadata(
+    db: AsyncSession,
+    file_id: uuid.UUID,
+    *,
+    taken_at: datetime | None = None,
+    gps: tuple[float, float] | None = None,
+    device: dict[str, Any] | None = None,
+) -> MediaFile:
+    """Fill `taken_at`/`gps`/`device` on an ALREADY-UPLOADED `media_files` row
+    — those three columns exist since 3.3b ("inspector photo metadata",
+    design/02) with no writer until stage 4.1. Deliberately a second call
+    rather than new parameters on `save_upload`: the generic `POST /files`
+    route stays untouched (design/01's own file-router exception), and a
+    module attaching capture metadata does so through its OWN attach step,
+    the same way any module attaches an already-uploaded file to its own
+    object (`application_documents`, `inspection_act_files`) rather than a
+    second upload endpoint.
+
+    `gps` is `(lon, lat)` — floats a caller's own pydantic schema already
+    bounded, never raw text reaching the WKT literal this builds. Raises
+    `ERR-SYS-003` for an unknown or archived file, the same code
+    `get_readable` uses for the same situation."""
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-SYS-003")
+    if taken_at is not None:
+        file.taken_at = taken_at
+    if gps is not None:
+        file.gps = WKTElement(f"POINT({gps[0]} {gps[1]})", srid=4326)
+    if device is not None:
+        file.device = device
     await db.flush()
     return file
 

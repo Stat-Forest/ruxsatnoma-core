@@ -1354,6 +1354,16 @@ async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.
     return await repo.contour_organization(db, contour_id)
 
 
+async def distance_to_contour_m(
+    db: AsyncSession, contour_id: uuid.UUID, *, lon: float, lat: float
+) -> Decimal | None:
+    """A point's distance to the contour's published version, in metres, or
+    `None` when there is no published version to compare against. `inspections`
+    (level 5) is today's only caller — an inspector's GPS fix at a field act
+    versus the plot being checked (tz/04 С15)."""
+    return await repo.distance_to_published_version_m(db, contour_id, lon=lon, lat=lat)
+
+
 def contour_organization_column(contour_id_col: Any) -> Any:
     """`contour_organization` above, shaped as a SQL expression for a caller
     whose zone rule has to run INSIDE a paged query.
