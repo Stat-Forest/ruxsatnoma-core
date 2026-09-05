@@ -1031,6 +1031,60 @@ async def agency_grazing_norm(
 
 
 @pytest.fixture
+async def other_leshoz_published_contour(
+    db: AsyncSession, contours_layer: GisLayer, other_leshoz: Organization, approval_doc: MediaFile
+) -> Contour:
+    """A published contour owned by `other_leshoz` — the SECOND leshoz's own
+    plot. Final whole-branch review, Critical: the cross-leshoz resubmission
+    test PATCHes an application's `contour_id` onto this contour, so its
+    owning organization must genuinely differ from `published_contour`'s.
+    Same shape as `published_contour`/`agency_published_contour`; only the
+    owning organization differs."""
+    contour = await make_contour(db, contours_layer, other_leshoz)
+    await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    await db.flush()
+    return contour
+
+
+@pytest.fixture
+async def other_leshoz_grazing_norm(
+    db: AsyncSession,
+    other_leshoz_published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> uuid.UUID:
+    """`published_grazing_norm`, for `other_leshoz_published_contour` instead
+    of `published_contour` — a norm is per-contour, so re-pricing a
+    resubmission against the second leshoz's own plot (`submit`'s ruling-23
+    fresh pricing) needs its own published norm, or the cross-leshoz
+    reassignment under test is never reached: `submit` would refuse the
+    resubmission at `norms.service` first."""
+    effective_from = date(2020, 1, 1)
+    limit_params = await norm_params.load_limit_params(db, on_date=effective_from)
+    norm = Norm(
+        contour_id=other_leshoz_published_contour.id,
+        activity_type_id=grazing_activity_id,
+        yield_c_per_ha=Decimal("12.0"),
+        season={"windows": [{"from": "04-01", "to": "10-31"}]},
+        rotation={"rest_years": []},
+        max_sb=calculator.max_sb(
+            area_ha=CONTOUR_AREA_HA, yield_c_per_ha=Decimal("12.0"), params=limit_params
+        ),
+        effective_from=effective_from,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+    return norm.id
+
+
+@pytest.fixture
 async def application_in_review(hodim_client, submitted_application: str) -> str:
     """`submitted_application`, taken into work through the REAL route — never
     by writing `status='IN_REVIEW'` on the row (lesson: build a fixture's

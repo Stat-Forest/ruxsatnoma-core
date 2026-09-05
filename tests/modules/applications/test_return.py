@@ -123,3 +123,113 @@ async def test_a_returned_application_is_edited_and_resubmitted_keeping_its_numb
     assert len(submissions) == 2, "the resubmission adds its own history row"
     assert all(len(r["signatures"]) == 1 for r in submissions), "each package is signed"
     assert timeline["signatures"] == [], "the top level is the DECISION signature"
+
+
+async def test_a_return_that_moves_the_contour_to_another_leshoz_reassigns_the_organization(
+    hodim_client,
+    applicant_client,
+    other_zone_hodim_client,
+    application_in_review,
+    rj_01_return_reason,
+    other_leshoz_published_contour,
+    other_leshoz_grazing_norm,
+    leshoz,
+    other_leshoz,
+) -> None:
+    """Final whole-branch review, CRITICAL. RJ-01 plus `fields_to_fix:
+    {contour_id}` is exactly "wrong plot, pick the right one" — the applicant
+    then PATCHes `contour_id` onto a plot owned by a DIFFERENT leshoz and
+    resubmits. Before the fix, `_auto_assign_on_submission` saw an existing
+    active assignment and returned unconditionally (ruling 6's guard, read too
+    broadly): `assigned_org_id` stayed the FIRST leshoz's forever, because
+    `_effective_organization` echoes a set `assigned_org_id` back verbatim
+    rather than re-checking the contour. The application then stayed in the
+    first leshoz's queue while pointing at the second leshoz's plot — the
+    wrong authority reviews, approves and would ERI-sign a permit for land it
+    does not own, while the actual owner cannot even see the file.
+
+    The fix re-derives the organization from the contour itself whenever an
+    active assignment already exists, and only when that disagrees with what
+    is stored does it drop the stale assignment and pick again — which is
+    exactly what this test proves end to end."""
+    from tests.modules.applications.test_submit import _submit
+
+    returned = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/return",
+        json={
+            "reason_item_id": str(rj_01_return_reason.id),
+            "fields_to_fix": {"contour_id": "неверный участок — территория другого лесхоза"},
+            "legal_basis": "ВМҚ 290",
+        },
+    )
+    assert returned.status_code == 200, returned.text
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_in_review}",
+        json={"contour_id": str(other_leshoz_published_contour.id)},
+    )
+    assert patched.status_code == 200, patched.text
+
+    again = await _submit(applicant_client, application_in_review)
+    assert again.status_code == 200, again.text
+    assert again.json()["status"] == "SUBMITTED"
+
+    timeline = (
+        await applicant_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    active = [a for a in timeline["assignments"] if a["is_active"]]
+    assert len(active) == 1, "the partial unique index allows exactly one active row"
+    assert active[0]["org_id"] == str(other_leshoz.id), (
+        "the application must move to the leshoz that now owns its plot"
+    )
+
+    # Leshoz A no longer has this application in its territory — it is not an
+    # existence oracle, so the refusal is 404, the same answer a stranger's id
+    # gets (`_readable_application`'s own rule).
+    stale = await hodim_client.get(f"/api/v1/applications/{application_in_review}")
+    assert stale.status_code == 404
+
+    # Leshoz B — the plot's actual owner — can now open its own application.
+    fresh = await other_zone_hodim_client.get(f"/api/v1/applications/{application_in_review}")
+    assert fresh.status_code == 200, fresh.text
+
+
+async def test_a_return_resubmitted_on_the_same_contour_keeps_its_reviewer(
+    hodim_client, applicant_client, application_in_review, rj_01_return_reason, leshoz, hodim_user
+) -> None:
+    """The other half of the same fix: a correction that does NOT touch
+    `contour_id` must not be mistaken for one that does. Task 1's
+    `test_a_resubmission_does_not_re_fire_auto_assignment` already pins this
+    directly against `submit` (ruling 6); this is the same guarantee proven
+    through the actual `/return` route the final review's Critical walks
+    through, so the fix is checked against both the changed and the unchanged
+    path."""
+    from tests.modules.applications.test_submit import _submit
+
+    returned = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/return",
+        json={
+            "reason_item_id": str(rj_01_return_reason.id),
+            "fields_to_fix": {"period_to": "срок выходит за сезон выпаса"},
+            "legal_basis": "ВМҚ 290",
+        },
+    )
+    assert returned.status_code == 200, returned.text
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_in_review}", json={"period_to": "2027-08-31"}
+    )
+    assert patched.status_code == 200, patched.text
+
+    again = await _submit(applicant_client, application_in_review)
+    assert again.status_code == 200, again.text
+
+    timeline = (
+        await applicant_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    active = [a for a in timeline["assignments"] if a["is_active"]]
+    assert len(active) == 1, "an unchanged contour must not insert a second assignment row"
+    assert active[0]["org_id"] == str(leshoz.id)
+    assert active[0]["user_id"] == str(hodim_user.id), (
+        "a resubmission on the SAME contour must keep its existing reviewer"
+    )

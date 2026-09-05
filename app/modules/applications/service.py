@@ -2065,17 +2065,63 @@ async def _auto_assign_on_submission(db: AsyncSession, application: Application)
     application is still assigned to the ORGANIZATION [...] it must never
     silently fail to assign".
 
-    **Guarded to a FIRST submission only** (ruling 6): `submit` also drives a
+    **Guarded to a FIRST submission on an UNCHANGED contour** (ruling 6, and
+    the final whole-branch review's Critical). `submit` also drives a
     RESUBMISSION after 3.9b's return for correction, and firing this hook
     unconditionally would run `choose_executor` again — the supersede branch
     of `_claim_assignment` would then silently hand the file to a fresh
     auto-pick, taking it away from the very reviewer who returned it. An
-    application that already carries an active `application_assignments` row,
-    auto or manual, is left untouched.
+    application that already carries an active `application_assignments` row
+    is therefore left untouched, **unless the contour it now names is owned
+    by a DIFFERENT leshoz than the one the row was assigned to.**
+
+    That second case is not hypothetical: RJ-01 plus `fields_to_fix:
+    {contour_id}` is "wrong plot, pick the right one", and correcting a plot
+    can legitimately move it to another leshoz. `assigned_org_id`, once
+    written, is a plain stored column — `_effective_organization` returns it
+    verbatim without re-checking the contour — so without this branch a
+    corrected application would resubmit into SUBMITTED still bearing the
+    FIRST leshoz's `assigned_org_id` while naming the SECOND leshoz's plot:
+    the first leshoz keeps reviewing and signing a permit for land it does
+    not own, and the second leshoz cannot even see its own application. The
+    fix re-derives the organization straight from `gis.service` (never
+    through `_effective_organization`, which would just echo the stale value
+    back) and, only when it disagrees with the stored one, drops the stale
+    assignment and falls through to the same fresh pick a first submission
+    gets. Refusing the resubmission instead was considered and rejected: RJ-01
+    exists precisely so the office can say "pick the right plot", and a typed
+    error here would make that instruction unusable.
     """
-    if await repo.get_active_assignment(db, application.id) is not None:
-        return
-    organization_id = await _effective_organization(db, application)
+    active = await repo.get_active_assignment(db, application.id)
+    organization_id: uuid.UUID | None
+    if active is not None:
+        # Re-derived straight from `gis.service`, never through
+        # `_effective_organization` — that helper returns
+        # `application.assigned_org_id` VERBATIM whenever it is set, which is
+        # exactly the stale value this branch exists to catch, not confirm.
+        # `contour_id is None` is unreachable from a genuinely SUBMITTED
+        # application (`_assert_complete`'s own guard, `_effective_
+        # organization`'s identical null check below) but is treated as "no
+        # change" rather than narrowing the type with an assert, the same
+        # fail-closed shape this function already uses for `organization_id`.
+        current_org = (
+            None
+            if application.contour_id is None
+            else await gis_service.contour_organization(db, application.contour_id)
+        )
+        if current_org is None or current_org == application.assigned_org_id:
+            return
+        # The contour's owner changed under an existing assignment: supersede
+        # it explicitly (a plain deactivate, not `_claim_assignment`'s own
+        # supersede branch) so the fresh insert below always carries the NEW
+        # `org_id` — `_claim_assignment`'s "claim" branch writes `user_id`
+        # alone and would leave the row's `org_id` stale on the one coincidence
+        # where the new pick's `user_id` matches the old one's (both `None`,
+        # say, if neither leshoz has an eligible reviewer).
+        await repo.deactivate_assignments(db, application.id)
+        organization_id = current_org
+    else:
+        organization_id = await _effective_organization(db, application)
     if organization_id is None:
         # Unreachable from a genuinely SUBMITTED application —
         # `_assert_complete` makes `contour_id` mandatory before `submit`
