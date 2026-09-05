@@ -35,23 +35,29 @@ from app.core.schemas import PageParams
 from app.core.time import business_today
 from app.db import uuid7
 from app.modules.admin import repo as admin_repo
-from app.modules.admin.models import Organization
-from app.modules.applications import checks, repo
+from app.modules.admin.models import ClassifierItem, Organization
+from app.modules.applications import checks, repo, sla
+from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
     APPLICATION_KINDS,
     Application,
     ApplicationAssignment,
+    ApplicationCheck,
+    ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
+    InfoRequest,
 )
 from app.modules.applications.permissions import (
+    APPLICATIONS_CONCLUDE_GIS,
     APPLICATIONS_DECIDE,
     APPLICATIONS_REVIEW,
     APPLICATIONS_VIEW_ANY,
 )
 from app.modules.applications.schemas import (
+    ApplicationCheckIn,
     ApplicationCreate,
     ApplicationDocumentIn,
     ApplicationPatch,
@@ -62,6 +68,11 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
+from app.modules.integrations import service as integrations_service
+from app.modules.integrations.adapters import cadastre as cadastre_adapter
+from app.modules.integrations.adapters import vet as vet_adapter
+from app.modules.integrations.adapters.cadastre import CadastreCheckResult
+from app.modules.integrations.adapters.vet import VetCheckResult
 from app.modules.norms import service as norms_service
 from app.modules.norms.models import Calculation
 from app.modules.norms.schemas import CalculationIn
@@ -111,6 +122,12 @@ CHANNEL_PORTAL = "portal"
 KIND_NEW = "new"
 KIND_EXTENSION = "extension"
 INITIAL_STATUS = "DRAFT"
+# `_own_draft_for_update`'s OTHER editable status (task 1, 3.9b): a returned
+# application becomes correctable again, per that function's own docstring,
+# written when it was DRAFT-only in 3.9a and already naming this. Not "task
+# 3's own constant" — `submit`'s resubmission needs it too, and 3.9b has no
+# second definition of what "still editable" means.
+RETURNED_STATUS = "RETURNED"
 # The classifier a `benefit_category_item_id` must belong to — seeded by
 # migration 0005 and the same catalogue `norms.calculator` resolves a
 # `benefit_code` against. Checking membership, not merely that the id names
@@ -826,28 +843,42 @@ async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
             raise err("ERR-VAL-001", details={"reason": "unknown_livestock_type"})
 
 
+# DELIBERATELY both, not `DRAFT` alone — do NOT narrow this back (task 1
+# review finding): PATCH, the document routes and `submit`'s own
+# resubmission all share this one set, because an application returned for
+# correction (3.9b) exists so the applicant CAN correct it — a return
+# nobody can act on would make the whole feature pointless. Covered by
+# `tests/modules/applications/test_draft_api.py::
+# test_the_owner_may_patch_a_returned_application` and
+# `test_documents.py::test_the_owner_may_attach_and_detach_on_a_returned_
+# application`, each with a stranger-is-still-refused sibling.
+_EDITABLE_STATUSES = frozenset({INITIAL_STATUS, RETURNED_STATUS})
+
+
 async def _own_draft_for_update(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> Application:
-    """The caller's own application, locked, and only while it is still a
-    DRAFT.
+    """The caller's own application, locked, and only while it is still
+    EDITABLE — `DRAFT`, or `RETURNED` (task 1, 3.9b): a returned application
+    becomes correctable again, and PATCH/documents/`submit` must reach it
+    exactly as they reach DRAFT (see `_EDITABLE_STATUSES`'s own comment for
+    why this is deliberate and covered, not an oversight to "fix" back to
+    DRAFT-only).
 
     Ownership is checked BEFORE the status, and both refusals differ: a
     stranger gets 404 (they may not learn that this id is an application at
     all), while the owner of an application that has moved on gets 409
     `ERR-APP-004` — a conflict with the application's current state, which is
-    the honest answer to "why can I no longer edit this". In 3.9a `DRAFT` is
-    the only editable status; 3.9b adds `RETURNED`, when a returned application
-    becomes correctable again.
+    the honest answer to "why can I no longer edit this".
 
     Locked (`repo.get_application_for_update`) because this is a read-check-
     write over `status`: without it a PATCH and a concurrent `submit` both read
-    `DRAFT`, both pass, and the edit lands on an application that is already
-    submitted — its signed package then describes something the stored row no
-    longer says.
+    the same editable status, both pass, and the edit lands on an application
+    that is already submitted — its signed package then describes something
+    the stored row no longer says.
     """
     application = await _own_application_for_update(db, application_id, actor=actor)
-    if application.status != INITIAL_STATUS:
+    if application.status not in _EDITABLE_STATUSES:
         raise err("ERR-APP-004", details={"reason": "not_draft", "status": application.status})
     return application
 
@@ -950,10 +981,11 @@ async def patch_draft(
 
 async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
     """`GET /applications/{id}` — the application, its items, its documents, its
-    checks and its current price.
+    checks, its conclusions and its current price.
 
     `checks` is the FULL list, never the latest per type: a repeat check is a
-    new row and the history is the evidence (ruling 12). `calculation` is
+    new row and the history is the evidence (ruling 12); `conclusions` (task 5)
+    is the same shape for the identical reason (ruling 10). `calculation` is
     `current_calculation` — the newest `calculations` row, which is what
     `payments` invoices from — read through this module's own public surface
     rather than by querying `norms`' tables, so the card and the invoice can
@@ -962,14 +994,27 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
     Both keys are present and empty/null from task 3, before anything can write
     either: they are a contract 3.10a and 3.11a already read
     (`card["calculation"]["amount"]`), not a placeholder a later task adds.
+
+    `sla_overdue` (task 4, 3.9b, ruling 8) is computed HERE, not on the schema:
+    `sla.is_overdue` needs both `status` (an OPEN pause suspends the clock
+    whatever the stored deadline says) and the wall clock. A `DRAFT` or a
+    decided/terminal application has no deadline at all, and `False` is the
+    honest answer for it — never overdue, having never been timed.
     """
     application = await _readable_application(db, application_id, actor=actor)
+    deadline = application.sla_deadline_at
     return {
         "application": application,
         "items": await repo.list_items(db, application.id),
         "documents": await repo.list_documents(db, application.id),
         "checks": await repo.list_checks(db, application.id),
+        "conclusions": await repo.list_conclusions(db, application.id),
         "calculation": await current_calculation(db, application.id),
+        "sla_overdue": (
+            False
+            if deadline is None
+            else sla.is_overdue(application.status, deadline, datetime.now(UTC))
+        ),
     }
 
 
@@ -1258,6 +1303,13 @@ async def precheck(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
 # valid signature and a resubmission collides with nothing.
 SUBMISSION_OBJECT_TYPE = "application_submission"
 SUBMISSION_PURPOSE = "application_submit"
+# Ruling 18 (в), the second half (2026-09-05): `signatures.service.sign()`'s
+# `content_changed_reason` opt-in, passed at both places this module signs a
+# freshly re-priced package (`submit` below and `decision._sign_decision`) —
+# never at any OTHER `sign()` call in the codebase, which is exactly why this
+# constant lives here and not in `signatures`. See `_package_bytes`' and
+# `package`'s own docstrings for what "the package" is and why it can drift.
+STALE_PACKAGE_REASON = "package_changed"
 # Ruling 17, beside the constants above: a flow verb audits under its own name.
 APPLICATION_SUBMIT = "application.submit"
 # `notification_templates.event_code`, seeded by migration 0009 — DOTTED, and a
@@ -1331,16 +1383,19 @@ def _package_bytes(
     through `_canonical_decimal`, everything else out of `input_snapshot`,
     which both carry in the same shape.
 
-    **RULING 23 — a stale package is an accepted 3.9a exposure, and this is the
+    **RULING 23 — a stale package is an accepted exposure, and this is the
     function it starts in.** The amount comes from `norms.service.preview`,
     which prices at `business_today()` against whatever tariffs and БҲМ are
     effective right then. So a tariff or `rule_parameter` published between the
     `GET /package` and the `POST /submit`, a norm published or archived, or
-    plain midnight in Tashkent, changes these bytes — and the applicant then
-    meets `ERR-SIGN-001` for something they did not do. Oybek chose option (в)
-    on 2026-09-02: leave it, and fix it in 3.9b with the whole review flow in
-    view. Do NOT "fix" it here by caching the package or by dropping the
-    amount from it; both are 3.9b's call to make.
+    plain midnight in Tashkent, changes these bytes. **Ruling 18 (в),
+    2026-09-05: accepted permanently — do NOT "fix" it here by caching the
+    package or by dropping the amount from it** — but no longer left
+    unexplained: `submit` and `decision._sign_decision` both pass
+    `STALE_PACKAGE_REASON` into `signatures.service.sign()`, so a signer whose
+    package genuinely moved out from under them meets
+    `details.reason == "package_changed"` rather than a bare
+    `"signature_invalid"` indistinguishable from a forged one.
 
     **`contour_version_id` is the version these bytes NAME, and which version
     that is depends on whether the application has frozen one yet.** `package`
@@ -1577,11 +1632,16 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     `norms.service.preview` at `business_today()`, exactly as `submit` does a
     moment later, and NOTHING freezes the answer in between. A tariff or
     `rule_parameter` published between the two calls, a norm published or
-    archived, or midnight in Tashkent, changes the bytes — and the applicant
-    signs one package while the server verifies against another, meeting
-    `ERR-SIGN-001` for something they did not do. Accepted for 3.9a (Oybek's
-    choice, option в, 2026-09-02) and 3.9b's to fix; do not cache the package
-    or drop the amount from it here.
+    archived, or midnight in Tashkent, changes the bytes — and the signer
+    signs one package while the server verifies against another. **Accepted
+    permanently by ruling 18 (в), 2026-09-05** — no cache, no freeze, no
+    dropping the amount — but the two callers that sign what this route just
+    served (`submit` and `decision._sign_decision`) both pass
+    `content_changed_reason=STALE_PACKAGE_REASON` into `sign()`, so a signer
+    who did nothing wrong meets `details.reason == "package_changed"` rather
+    than the bare, indistinguishable-from-forgery `"signature_invalid"`. Do
+    not cache the package or drop the amount from it here — that is exactly
+    what was decided against.
     """
     application = await _readable_application(db, application_id, actor=actor)
     await _assert_complete(db, application)
@@ -1627,9 +1687,24 @@ async def submit(
     package is priced afresh HERE, and the bytes the client signed came from a
     separate `GET /package` call priced at its own moment. A tariff, a
     `rule_parameter`, a norm or the Tashkent date moving in between makes the
-    two disagree and the applicant meets `ERR-SIGN-001` for something they did
-    not do. Accepted for 3.9a; 3.9b decides between freezing the package and
-    dropping the amount from it.
+    two disagree and the applicant's signature no longer verifies against what
+    `submit` just recomputed.
+
+    **RULING 18 (в), 2026-09-05: the exposure itself is accepted, permanently —
+    no freeze table, no TTL, no migration — but `sign()` is told about it.**
+    Passing `content_changed_reason=STALE_PACKAGE_REASON` does not stop this
+    from happening; it only tells the difference apart in what gets raised.
+    `signatures.service.sign()` already has both halves of that comparison in
+    hand — the bytes it just hashed and the hash the envelope actually
+    signed — so when they disagree under an otherwise-valid signature, the
+    422 carries `details.reason == "package_changed"` instead of the bare
+    `"signature_invalid"` a genuinely broken or forged signature still gets.
+    The applicant meets "the price changed while you were signing, please
+    re-open the form" instead of a cryptographic error for something they did
+    not do; `test_submit.py`'s
+    `test_a_price_that_moved_after_signing_is_labeled_package_changed` pins it,
+    and the paired `test_an_invalid_signature_refuses_the_submission_whole`
+    pins the negative — a genuinely bad signature keeps the generic reason.
     """
     # Step 0. Minted before anything is written, because it is what step 8
     # signs and what step 11 stores as the history row's primary key (ruling
@@ -1639,9 +1714,14 @@ async def submit(
     # written, and the row says "an attempt was made against submission X and
     # it was rejected".
     submission_id = uuid7()
-    # Step 1. The owner's own DRAFT, locked: 404 for a stranger, 409
-    # `ERR-APP-004` for an application that has moved on. 3.9b adds RETURNED.
+    # Step 1. The owner's own DRAFT (or, task 1, 3.9b: RETURNED), locked: 404
+    # for a stranger, 409 `ERR-APP-004` for an application that has moved on
+    # some other way. Captured before anything overwrites `application.status`
+    # below — a RESUBMISSION's history row and audit entry must say
+    # `from_status="RETURNED"`, not a hardcoded "DRAFT" that was true only for
+    # the FIRST submission.
     application = await _own_draft_for_update(db, application_id, actor=actor)
+    from_status = application.status
     await _assert_complete(db, application)  # step 2
     await _assert_benefit_documents(db, application)  # step 3
     # Step 4, ruling 22: the geometry decided upon AND its area, frozen
@@ -1672,6 +1752,7 @@ async def submit(
         document=_package_bytes(application, priced, contour_version_id=version.id),
         pkcs7=pkcs7,
         user=actor,
+        content_changed_reason=STALE_PACKAGE_REASON,
     )
 
     # Step 9, ruling 8: EXACTLY ONE calculation per application, written here
@@ -1687,12 +1768,28 @@ async def submit(
         payload=payload.model_copy(update={"application_id": application.id}),
         actor=actor,
     )
-    # Step 10, ruling 5а. AFTER the signature, so a refused ERI never reaches
-    # the counter at all; inside the transaction, so a failure later than this
-    # rolls the counter back with it and the year's numbering has no holes.
-    number = await next_public_number(db, NUMBER_PREFIX, business_today())
+    # Step 10, ruling 5а — conditional since ruling 16.1 (3.9b task 3): a
+    # RESUBMISSION after RETURNED keeps its number rather than allocating a
+    # second one, which would break the per-year counter design/03 requires
+    # to stay continuous. `application.number` is set only once, on the FIRST
+    # submission (below, inside the savepoint) — a non-null value here means
+    # this is not that first attempt.
+    number = application.number
+    if number is None:
+        # AFTER the signature, so a refused ERI never reaches the counter at
+        # all; inside the transaction, so a failure later than this rolls the
+        # counter back with it and the year's numbering has no holes.
+        number = await next_public_number(db, NUMBER_PREFIX, business_today())
 
-    submitted_at = datetime.now(UTC)
+    # Ruling 16.1's other half: `submitted_at`/`sla_deadline_at` belong to the
+    # FIRST submission alone — task 2's SLA clock must not reset on a
+    # resubmission, so both are read off the row first and only computed when
+    # still unset.
+    submitted_at = application.submitted_at
+    sla_deadline_at = application.sla_deadline_at
+    if submitted_at is None:
+        submitted_at = datetime.now(UTC)
+        sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)
     # The duplicate's key, read BEFORE the savepoint and never after it. A
     # `begin_nested()` ROLLBACK expires every instance that was dirty inside the
     # savepoint (`SessionTransaction._restore_snapshot`), so `application.
@@ -1716,7 +1813,7 @@ async def submit(
             application.status = SUBMITTED_STATUS
             application.number = number
             application.submitted_at = submitted_at
-            application.sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)
+            application.sla_deadline_at = sla_deadline_at
             await db.flush()
     except IntegrityError as exc:
         # `IntegrityError` IS a `DBAPIError` subclass and this narrow clause
@@ -1759,7 +1856,7 @@ async def submit(
         ApplicationStatusHistory(
             id=submission_id,
             application_id=application.id,
-            from_status=INITIAL_STATUS,
+            from_status=from_status,
             to_status=SUBMITTED_STATUS,
             changed_by=actor.id,
         ),
@@ -1776,7 +1873,7 @@ async def submit(
         user_id=actor.id,
         object_type="application",
         object_id=application.id,
-        old_value={"status": INITIAL_STATUS},
+        old_value={"status": from_status},
         new_value={
             "status": SUBMITTED_STATUS,
             "number": number,
@@ -1799,6 +1896,16 @@ async def submit(
     # subscriber reads everything else through `service.get` /
     # `current_calculation`. Handlers run synchronously, in THIS transaction.
     await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
+    # Task 1 (3.9b), and genuinely the LAST step: an application must never
+    # exist in SUBMITTED with no assignment row at all (ruling 7). See the
+    # hook's own docstring for the resubmission guard (ruling 6).
+    await _auto_assign_on_submission(db, application)
+    # The hook may have just written `assigned_org_id`/`assigned_user_id`
+    # (a plain UPDATE, whose `onupdate=func.now()` on `updated_at` is not
+    # reloaded automatically — lesson: "the row in memory is not what
+    # Postgres stored"). Refresh unconditionally rather than branching on
+    # whether it actually wrote anything.
+    await db.refresh(application)
     return application
 
 
@@ -1843,11 +1950,14 @@ CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({INITIAL_STATUS, SUBMITTED_STATUS,
 DECISION_OBJECT_TYPE = "application"
 DECISION_PURPOSE = "application_decision"
 
-# `application_assignments.reason` (`models.ASSIGNMENT_REASONS`). 3.9a has no
-# auto-assignment job — ruling 14 lets any reviewer in the zone pick an
-# application up — so every row this stage writes records a human act. `auto` is
-# 3.9b's, when the assignment is made for the reviewer instead of by them.
+# `application_assignments.reason` (`models.ASSIGNMENT_REASONS`). 3.9a had no
+# auto-assignment job — ruling 14 let any reviewer in the zone pick an
+# application up — so every row that stage wrote recorded a human act.
+# `ASSIGNMENT_AUTO` is 3.9b task 1's own: the reason on the row
+# `_auto_assign_on_submission` writes, for a reviewer picked FOR them rather
+# than BY them.
 ASSIGNMENT_MANUAL = "manual"
+ASSIGNMENT_AUTO = "auto"
 
 
 async def _apply_transition(
@@ -1860,13 +1970,16 @@ async def _apply_transition(
     reason: str | None = None,
     reason_item_id: uuid.UUID | None = None,
     legal_basis: str | None = None,
+    fields_to_fix: dict[str, Any] | None = None,
 ) -> ApplicationStatusHistory:
     """Move an ALREADY-LOCKED application one legal edge, and leave the two
     records every transition owes behind: the `application_status_history` row
     and one `audit_log` entry under the CALLER'S flow verb (ruling 17).
 
-    `reason_item_id`/`legal_basis` are task 7's rejection grounds (`tz/04` С8)
-    and are set HERE, before the insert, never on the returned row: migration
+    `reason_item_id`/`legal_basis` are task 7's rejection grounds (`tz/04` С8);
+    `fields_to_fix` is task 3's own, beside them (3.9b) — a JSON OBJECT, never
+    a list (`models.py`'s column is `Mapped[dict[str, Any] | None]`). All three
+    are set HERE, before the insert, never on the returned row: migration
     0015's BEFORE UPDATE trigger makes `application_status_history` append-only,
     so a caller that filled them in afterwards would raise instead of
     recording them.
@@ -1897,6 +2010,7 @@ async def _apply_transition(
         reason_text=reason,
         reason_item_id=reason_item_id,
         legal_basis=legal_basis,
+        fields_to_fix=fields_to_fix,
     )
     await repo.add_status_history(db, entry)
     # `updated_at` is `onupdate=func.now()`, which SQLAlchemy leaves EXPIRED
@@ -1908,6 +2022,8 @@ async def _apply_transition(
         new_value["reason_item_id"] = str(reason_item_id)
     if legal_basis is not None:
         new_value["legal_basis"] = legal_basis
+    if fields_to_fix is not None:
+        new_value["fields_to_fix"] = fields_to_fix
     await audit.log(
         db,
         action=action,
@@ -1928,31 +2044,53 @@ async def _claim_assignment(
     org_id: uuid.UUID,
     user_id: uuid.UUID | None,
     reason: str,
-    actor: User,
+    actor: User | None,
 ) -> ApplicationAssignment:
-    """Supersede whatever active assignment the application has and record the
-    new one — the ONE write path into `application_assignments`.
+    """CLAIM the active assignment if it is unheld or already names this same
+    person, otherwise SUPERSEDE it — the ONE write path into
+    `application_assignments` (ruling 16.2).
 
-    `uq_application_assignments_active` is UNIQUE on `(application_id) WHERE
-    is_active`, so a blind second insert is an `IntegrityError`, and the flush
-    between the deactivation and the insert is NOT optional: without it both
-    rows are pending when the index is checked and the insert fails on a
-    conflict the flush would have resolved (lesson: "A partial unique index
-    constrains only the rows it covers, and only after a flush").
+    Three cases, checked in this order:
 
-    Built as a supersede from the first caller on purpose, though 3.9a's only
-    caller finds nothing to supersede: task 7's forward writes a SECOND row
-    pointing at the parent organization, and 3.9b turns `start_review` into a
-    claim over a row an auto-assignment job wrote. Both are this function with
-    different arguments, and neither is a special case.
+    * an active row exists and its `user_id` is `NULL`, or already equals the
+      `user_id` being set here → **claim**: only `user_id` is written: the
+      row, its `id` and its OWN `reason` are left exactly as they were. The
+      "already equals" half is not in the ruling's own text but is load-
+      bearing on the EXISTING 3.9a suite, not just this task's: once
+      auto-assignment can pick a real candidate, that candidate is very often
+      the SAME person who then calls `start-review` on their own file, naming
+      `user_id=actor.id` — `test_a_hodim_in_the_zone_takes_it_into_work` and
+      `test_claiming_an_assignment_twice_supersedes_instead_of_colliding`
+      both pin `len(timeline["assignments"])` on that reclaim NOT superseding.
+    * an active row exists and names somebody else (a real, DIFFERENT
+      `user_id`) → **supersede**: deactivate it, `flush()`, then insert the
+      new row. `uq_application_assignments_active` is UNIQUE on
+      `(application_id) WHERE is_active`, so a blind second insert beside a
+      live row is an `IntegrityError`, and the flush between the two is NOT
+      optional — without it both rows are pending when the index is checked
+      and the insert fails on a conflict the flush would have resolved
+      (lesson: "A partial unique index constrains only the rows it covers,
+      and only after a flush").
+    * no active row at all → insert.
+
+    Three callers, one helper: `_auto_assign_on_submission` (`reason='auto'`,
+    `actor=None` — nobody's personal act, so `assigned_by` stays `NULL`),
+    `start_review` (`reason='manual'`, claiming the auto row), and `assign`
+    (`POST /assign`, a caller-supplied reason, usually superseding it).
     """
+    active = await repo.get_active_assignment(db, application.id)
+    if active is not None and (active.user_id is None or active.user_id == user_id):
+        active.user_id = user_id
+        await db.flush()
+        await db.refresh(active)
+        return active
     await repo.deactivate_assignments(db, application.id)
     await db.flush()
     row = ApplicationAssignment(
         application_id=application.id,
         org_id=org_id,
         user_id=user_id,
-        assigned_by=actor.id,
+        assigned_by=None if actor is None else actor.id,
         reason=reason,
         is_active=True,
     )
@@ -1961,6 +2099,92 @@ async def _claim_assignment(
     # timeline both sorts on it and serializes it.
     await db.refresh(row)
     return row
+
+
+async def _auto_assign_on_submission(db: AsyncSession, application: Application) -> None:
+    """`submit`'s last step (task 1): give the freshly SUBMITTED application a
+    reviewer, or failing that, at least an organization — ruling 7, "the
+    application is still assigned to the ORGANIZATION [...] it must never
+    silently fail to assign".
+
+    **Guarded to a FIRST submission on an UNCHANGED contour** (ruling 6, and
+    the final whole-branch review's Critical). `submit` also drives a
+    RESUBMISSION after 3.9b's return for correction, and firing this hook
+    unconditionally would run `choose_executor` again — the supersede branch
+    of `_claim_assignment` would then silently hand the file to a fresh
+    auto-pick, taking it away from the very reviewer who returned it. An
+    application that already carries an active `application_assignments` row
+    is therefore left untouched, **unless the contour it now names is owned
+    by a DIFFERENT leshoz than the one the row was assigned to.**
+
+    That second case is not hypothetical: RJ-01 plus `fields_to_fix:
+    {contour_id}` is "wrong plot, pick the right one", and correcting a plot
+    can legitimately move it to another leshoz. `assigned_org_id`, once
+    written, is a plain stored column — `_effective_organization` returns it
+    verbatim without re-checking the contour — so without this branch a
+    corrected application would resubmit into SUBMITTED still bearing the
+    FIRST leshoz's `assigned_org_id` while naming the SECOND leshoz's plot:
+    the first leshoz keeps reviewing and signing a permit for land it does
+    not own, and the second leshoz cannot even see its own application. The
+    fix re-derives the organization straight from `gis.service` (never
+    through `_effective_organization`, which would just echo the stale value
+    back) and, only when it disagrees with the stored one, drops the stale
+    assignment and falls through to the same fresh pick a first submission
+    gets. Refusing the resubmission instead was considered and rejected: RJ-01
+    exists precisely so the office can say "pick the right plot", and a typed
+    error here would make that instruction unusable.
+    """
+    active = await repo.get_active_assignment(db, application.id)
+    organization_id: uuid.UUID | None
+    if active is not None:
+        # Re-derived straight from `gis.service`, never through
+        # `_effective_organization` — that helper returns
+        # `application.assigned_org_id` VERBATIM whenever it is set, which is
+        # exactly the stale value this branch exists to catch, not confirm.
+        # `contour_id is None` is unreachable from a genuinely SUBMITTED
+        # application (`_assert_complete`'s own guard, `_effective_
+        # organization`'s identical null check below) but is treated as "no
+        # change" rather than narrowing the type with an assert, the same
+        # fail-closed shape this function already uses for `organization_id`.
+        current_org = (
+            None
+            if application.contour_id is None
+            else await gis_service.contour_organization(db, application.contour_id)
+        )
+        if current_org is None or current_org == application.assigned_org_id:
+            return
+        # The contour's owner changed under an existing assignment: supersede
+        # it explicitly (a plain deactivate, not `_claim_assignment`'s own
+        # supersede branch) so the fresh insert below always carries the NEW
+        # `org_id` — `_claim_assignment`'s "claim" branch writes `user_id`
+        # alone and would leave the row's `org_id` stale on the one coincidence
+        # where the new pick's `user_id` matches the old one's (both `None`,
+        # say, if neither leshoz has an eligible reviewer).
+        await repo.deactivate_assignments(db, application.id)
+        organization_id = current_org
+    else:
+        organization_id = await _effective_organization(db, application)
+    if organization_id is None:
+        # Unreachable from a genuinely SUBMITTED application —
+        # `_assert_complete` makes `contour_id` mandatory before `submit`
+        # ever gets here — but this step fails closed rather than raising
+        # mid-submission for work that is not itself what the applicant is
+        # waiting on.
+        return
+    eligible = await auth_service.user_ids_with_permission(
+        db, APPLICATIONS_REVIEW, organization_id=organization_id
+    )
+    picked = choose_executor(await repo.review_candidates(db, eligible))
+    application.assigned_org_id = organization_id
+    application.assigned_user_id = picked
+    await _claim_assignment(
+        db,
+        application,
+        org_id=organization_id,
+        user_id=picked,
+        reason=ASSIGNMENT_AUTO,
+        actor=None,
+    )
 
 
 async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
@@ -2030,6 +2254,522 @@ async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: Us
     return application
 
 
+APPLICATION_ASSIGN = "application.assign"
+
+
+async def assign(
+    db: AsyncSession, application_id: uuid.UUID, *, user_id: uuid.UUID, reason: str, actor: User
+) -> Application:
+    """`POST /applications/{id}/assign` — sys_admin names who holds an
+    application, superseding whatever assignment it has now.
+
+    **Gated entirely at the route.** `require_permission(APPLICATIONS_ASSIGN)`
+    is `sys_admin`-only (migration 0015's `ROLE_GRANTS`; Task 1 ANSWERED (б),
+    2026-09-05 — an `executor_head` gets 403 `ERR-ACL-001` from the dependency,
+    never a refusal from here), so there is no zone check in this function
+    either: the one role that can reach it at all is already unrestricted
+    nationwide (decision #41 ruling 2), the same reasoning `_forward` in
+    `decision.py` states for an unzoned agency-level head.
+
+    Reassignment goes through `_claim_assignment` (ruling 16.2) — the SAME
+    helper `start_review` and the auto-assignment hook use: it supersedes an
+    active row naming somebody else, or claims one that is unheld or already
+    names this exact person.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    organization_id = await _effective_organization(db, application)
+    if organization_id is None:
+        # Same unreachable-but-named-anyway guard as `start_review`'s own:
+        # `application_assignments.org_id` is NOT NULL and a DRAFT with no
+        # contour yet has nothing to put in it.
+        raise err(
+            "ERR-APP-004",
+            details={"reason": "no_organization", "status": application.status},
+        )
+    # Set BEFORE `_claim_assignment`, not after — that call's own flush is what
+    # carries these two along with it, the same order `start_review` uses;
+    # `db.refresh` right after relies on nothing here being separately dirty.
+    application.assigned_org_id = organization_id
+    application.assigned_user_id = user_id
+    await _claim_assignment(
+        db, application, org_id=organization_id, user_id=user_id, reason=reason, actor=actor
+    )
+    await db.refresh(application)
+    await audit.log(
+        db,
+        action=APPLICATION_ASSIGN,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        old_value={},
+        new_value={"assigned_org_id": str(organization_id), "assigned_user_id": str(user_id)},
+        basis=reason,
+    )
+    return application
+
+
+# --- Task 3 (3.9b): return for correction --------------------------------
+
+APPLICATION_RETURN = "application.return"
+# `notification_templates.event_code` — DOTTED, seeded by migration 0025
+# (task 2's own). No bus event beside it: unlike submit/approve/reject/cancel,
+# nothing above this module subscribes to a return — it is a same-level
+# bounce back to the applicant, not a signal `payments`/`permits` act on.
+NOTIFY_APPLICATION_RETURNED = "application.returned"
+# The SAME `rejection_reasons` classifier `decision._reason_item` reads
+# (tz/10 §8.2) — repeated here rather than imported because `decision.py`
+# imports `service.py`, never the reverse. Ruling 3's KIND check below is this
+# function's own; `decision.reject` checks no kind at all.
+RETURN_REASON_CLASSIFIER_CODE = "rejection_reasons"
+# `classifier_items.props["kind"]` values a RETURN may cite (0005_admin_seeds;
+# 0025 recast RJ-15 from "reject" to "both"). RJ-03 ("plot outside the forest
+# fund") types "reject" and is refused with `reason_not_returnable` —
+# returning under it would misdescribe the decision and hand the applicant
+# something they cannot fix.
+RETURNABLE_REASON_KINDS = frozenset({"return", "both"})
+# "field names that exist on the application" (task 3's own words): the
+# columns of `applications` itself. An existence check, not a validity check
+# (lesson) — naming `created_at` passes membership exactly as a nonsensical
+# but real classifier item id passes `_assert_references`.
+_APPLICATION_FIELD_NAMES = frozenset(column.name for column in Application.__table__.columns)
+
+
+async def _return_reason_item(db: AsyncSession, reason_item_id: uuid.UUID) -> ClassifierItem:
+    """The RJ-* ground a return is made on. 422 `unknown_rejection_reason` for
+    an id outside the ACTIVE `rejection_reasons` classifier (same membership
+    check as `decision._reason_item`); 422 `reason_not_returnable` for one
+    that IS in it but types a refusal or a withdrawal instead (ruling 3)."""
+    item = await admin_repo.get_classifier_item(db, reason_item_id)
+    classifier = await admin_repo.get_classifier_by_code(db, RETURN_REASON_CLASSIFIER_CODE)
+    if (
+        item is None
+        or classifier is None
+        or item.classifier_id != classifier.id
+        or item.status != "active"
+    ):
+        raise err("ERR-VAL-001", details={"reason": "unknown_rejection_reason"})
+    if item.props.get("kind") not in RETURNABLE_REASON_KINDS:
+        raise err("ERR-VAL-001", details={"reason": "reason_not_returnable"})
+    return item
+
+
+async def return_to_applicant(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    reason_item_id: uuid.UUID,
+    fields_to_fix: dict[str, Any],
+    legal_basis: str,
+    actor: User,
+) -> Application:
+    """`POST /applications/{id}/return` — SUBMITTED or IN_REVIEW -> RETURNED,
+    so the applicant can correct and resubmit through `submit`'s own
+    resubmission path (`_EDITABLE_STATUSES`, ruling 14).
+
+    **`applications.review` (hodim) OR `applications.decide` (the head)** —
+    the route's own `require_any_permission`, checked ahead of this function.
+    Sending a package back for correction is not the same act as deciding it:
+    the reviewer who caught an incomplete filing sends it back before the head
+    ever sees it. Unlike `decision.reject`, nothing is signed here — 3.9a
+    gives no ERI purpose to a reviewer, only the head holds
+    `application_decision`.
+
+    Validation runs in this order (ruling 3): the RJ code exists and TYPES a
+    return, never a refusal (`_return_reason_item`); `legal_basis` is
+    non-empty — `ApplicationReturnIn`'s own `min_length=1`, so a body missing
+    it is 422 before this function is ever reached, the same shape
+    `ApplicationRejectIn` uses; then `fields_to_fix` must be a non-empty
+    object naming real columns of the application. Only once all three hold
+    does the status move.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone — the same answer to both, as on every staff
+    route in this module (`_assert_in_actor_zone` records the RI-12 trail
+    first). 409 `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_RETURN)
+    _assert_transition(application, RETURNED_STATUS)
+
+    await _return_reason_item(db, reason_item_id)
+    if not fields_to_fix:
+        raise err("ERR-VAL-001", details={"reason": "fields_to_fix_required"})
+    unknown = sorted(set(fields_to_fix) - _APPLICATION_FIELD_NAMES)
+    if unknown:
+        raise err("ERR-VAL-001", details={"reason": "unknown_field", "fields": unknown})
+
+    await _apply_transition(
+        db,
+        application,
+        to_status=RETURNED_STATUS,
+        action=APPLICATION_RETURN,
+        actor=actor,
+        reason_item_id=reason_item_id,
+        legal_basis=legal_basis,
+        fields_to_fix=fields_to_fix,
+    )
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_RETURNED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": application.number},
+        object_type="application",
+        object_id=application.id,
+    )
+    return application
+
+
+# --- Task 4 (3.9b): request for information and the SLA pause ---------------
+
+APPLICATION_REQUEST_INFO = "application.request_info"
+APPLICATION_RESPOND_INFO = "application.respond_info"
+# `notification_templates.event_code` — DOTTED, seeded by migration 0025
+# (task 2's own), sent by `request_info` alone: `respond_info` is the
+# applicant's own act and notifies nobody, the same shape `cancel` gives its
+# own withdrawal.
+NOTIFY_APPLICATION_INFO_REQUESTED = "application.info_requested"
+PENDING_INFO_STATUS = "PENDING_INFO"
+# The ONE `doc_types` item a `respond_info` attachment is filed under —
+# migration `0025` seeds it (fix round 1, after review found the first draft's
+# "first ACTIVE `doc_types` item" fallback was a REACHABLE BYPASS of
+# `_assert_benefit_documents`'s fail-closed benefit guard below: that fallback
+# resolved to `BENEFIT_DOC_TYPE_CODE` in every migrated database today, so an
+# unrelated `respond-info` attachment was indistinguishable from real benefit
+# proof the moment the application was returned, PATCHed with a benefit claim,
+# and resubmitted. A reserved, unambiguous code closes that path — never a
+# fallback to "the first item of some other type," here or anywhere `doc_
+# types` membership stands in for evidence.
+INFO_RESPONSE_DOC_TYPE_CODE = "info_response"
+INFO_RESPONSE_DOCUMENT_NOTE = "Attached in response to a request for information."
+
+
+def _now() -> datetime:
+    """The wall clock `request_info`/`respond_info` read the pause's two
+    endpoints through — patched by `tests/modules/applications/conftest.py::
+    frozen_clock`, exactly as `payments.payme_router._now` is (`payments/
+    conftest.py`'s own `frozen_clock`). Ruling 8's arithmetic must be provable
+    against a controlled clock: a test cannot wait three real days to prove a
+    three-day pause shifts the deadline by three days."""
+    return datetime.now(UTC)
+
+
+async def _info_response_doc_type(db: AsyncSession) -> ClassifierItem | None:
+    """The ACTIVE `doc_types` item whose code is `INFO_RESPONSE_DOC_TYPE_CODE`,
+    or `None` when it is missing or archived — `_benefit_doc_type`'s own shape,
+    read through `admin.repo` rather than a direct `classifier_items` query
+    (CLAUDE.md: reference data is read-only and reached through its owner).
+    `respond_info` FAILS CLOSED on `None`, exactly as `_assert_benefit_
+    documents` fails closed on `_benefit_doc_type` returning `None` — never a
+    fallback to some other item, which is the defect fix round 1 found."""
+    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
+    if classifier is None:
+        return None
+    items = await admin_repo.list_classifier_items(db, classifier.id)
+    return next((item for item in items if item.code == INFO_RESPONSE_DOC_TYPE_CODE), None)
+
+
+async def request_info(
+    db: AsyncSession, application_id: uuid.UUID, *, message: str, actor: User
+) -> Application:
+    """`POST /applications/{id}/request-info` — SUBMITTED or IN_REVIEW ->
+    PENDING_INFO, opening the `info_requests` row that pauses the SLA clock
+    (ruling 8) until `respond_info` closes it.
+
+    **`applications.review`, zone-checked** — the route's own `require_
+    permission` plus `_assert_in_actor_zone` here, exactly `start_review`'s own
+    two-part rule beside it: the permission answers "may this role at all",
+    the zone answers "on whose rows".
+
+    A second `request-info` while one is already open is `ERR-APP-004`
+    (`reason="info_request_already_open"`): two open pauses have no
+    `responded_at` to pair unambiguously with a `requested_at`, which is
+    exactly the arithmetic `sla.shift_deadline` depends on staying 1:1.
+    Checked BEFORE `_assert_transition` and independently of it — being
+    PENDING_INFO already implies an open row (nothing else in this module
+    writes one), so a bare `_assert_transition` would answer that repeat call
+    with the generic `bad_transition` and hide the actual reason; every OTHER
+    illegal source status still falls through to it unchanged.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone — the same answer to both, as on every staff
+    route in this module. 409 `ERR-APP-004` in any status but SUBMITTED or
+    IN_REVIEW.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    # Before the status check, and before anything is written: this commits
+    # its RI-12 trail and raises 404 on a territorial refusal.
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_REQUEST_INFO)
+
+    if await repo.get_open_info_request(db, application.id) is not None:
+        raise err("ERR-APP-004", details={"reason": "info_request_already_open"})
+    _assert_transition(application, PENDING_INFO_STATUS)
+
+    await repo.add_info_request(
+        db,
+        InfoRequest(
+            application_id=application.id,
+            requested_by=actor.id,
+            message=message,
+            requested_at=_now(),
+        ),
+    )
+    await _apply_transition(
+        db,
+        application,
+        to_status=PENDING_INFO_STATUS,
+        action=APPLICATION_REQUEST_INFO,
+        actor=actor,
+        reason=message,
+    )
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_INFO_REQUESTED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": application.number},
+        object_type="application",
+        object_id=application.id,
+    )
+    return application
+
+
+async def respond_info(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    text: str,
+    file_ids: list[uuid.UUID],
+    actor: User,
+) -> Application:
+    """`POST /applications/{id}/respond-info` — the OWNER's own reply:
+    PENDING_INFO -> IN_REVIEW, closing the newest open `info_requests` row,
+    attaching `file_ids` as `application_documents`, and RESUMING the SLA
+    clock by shifting `sla_deadline_at` forward by exactly the length of the
+    pause (ruling 8, `sla.shift_deadline`) — never re-derived from a fresh
+    count, and never left untouched, which would let the days the office spent
+    waiting on the applicant count against it.
+
+    `_own_application_for_update` is the ownership half (404 for a stranger);
+    `_assert_transition` is the status half — PENDING_INFO is the only source
+    this route may leave from, so an application no longer paused is
+    `ERR-APP-004` (`reason="bad_transition"`).
+
+    Every `file_ids` entry is checked exactly as `add_document` checks its own
+    `file_id` (`_own_document_file`): it must be the caller's OWN ACTIVE
+    upload, never merely an id that exists. An empty list attaches nothing —
+    a text-only reply is legal.
+    """
+    application = await _own_application_for_update(db, application_id, actor=actor)
+    _assert_transition(application, IN_REVIEW_STATUS)
+
+    info_request = await repo.get_open_info_request(db, application.id)
+    # An application only reaches PENDING_INFO through `request_info`, which
+    # never returns without opening exactly one, unclosed, request — the
+    # invariant is this module's own two writers, not user input.
+    assert info_request is not None, (
+        "PENDING_INFO with no open info_requests row — request_info's own invariant broke"
+    )
+    now = _now()
+    info_request.responded_at = now
+    info_request.response_text = text
+
+    if file_ids:
+        doc_type = await _info_response_doc_type(db)
+        if doc_type is None:
+            raise err("ERR-APP-003", details={"reason": "doc_type_not_configured"})
+        for file_id in file_ids:
+            file = await _own_document_file(db, file_id, actor=actor)
+            document = ApplicationDocument(
+                application_id=application.id,
+                doc_type_item_id=doc_type.id,
+                file_id=file.id,
+                uploaded_by=actor.id,
+                note=INFO_RESPONSE_DOCUMENT_NOTE,
+            )
+            await repo.add_document(db, document)
+            await audit.log(
+                db,
+                action=APPLICATION_DOCUMENT_ATTACH,
+                user_id=actor.id,
+                object_type="application_document",
+                object_id=document.id,
+                new_value={
+                    "application_id": str(application.id),
+                    "doc_type_item_id": str(document.doc_type_item_id),
+                    "file_id": str(document.file_id),
+                },
+            )
+
+    if application.sla_deadline_at is not None:
+        application.sla_deadline_at = sla.shift_deadline(
+            application.sla_deadline_at, paused_for=now - info_request.requested_at
+        )
+    await _apply_transition(
+        db,
+        application,
+        to_status=IN_REVIEW_STATUS,
+        action=APPLICATION_RESPOND_INFO,
+        actor=actor,
+        reason=text,
+    )
+    return application
+
+
+# --- Task 5 (3.9b): conclusions and recalculation ---------------------------
+
+APPLICATION_CONCLUSION_ADD = "application_conclusion.add"
+
+
+async def _holds(db: AsyncSession, actor: User, code: str) -> bool:
+    """One permission code, `sys_admin` bypass included — `_holds_staff_read`'s
+    own idiom (line ~459), narrowed to a single code: `add_conclusion` gates a
+    WRITE on exactly one code per `kind`, never "any of several"."""
+    if await auth_service.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return code in await auth_repo.permission_codes(db, actor)
+
+
+async def add_conclusion(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    kind: str,
+    text: str,
+    recommendation: str | None,
+    actor: User,
+) -> ApplicationConclusion:
+    """`POST /applications/{id}/conclusion` — tz/04 С8: a specialist's written
+    finding, on the record for the head to read before deciding. Immutable
+    (ruling 10): no PATCH, no DELETE anywhere in this module — a correction is
+    a NEW row (`test_a_corrected_conclusion_is_a_second_row_and_both_are_
+    visible`), and `application_conclusions` carries no append-only DB trigger
+    only because nothing here ever attempts an UPDATE in the first place.
+
+    WHO may write which `kind` is not one flat rule, and the permission check
+    runs BEFORE the application is even fetched — exactly as a route-level
+    `require_permission` would answer before the handler ever sees the id —
+    since `kind` alone already decides it and leaks nothing about which
+    application is being asked about:
+
+      * `kind="executor"` — the hodim, gated on `applications.review` and then
+        zone-checked (`_assert_in_actor_zone`, the same two-part rule
+        `request_info` applies beside it: the permission answers "may this
+        role at all", the zone answers "on whose rows").
+      * `kind="gis"` — gated on `applications.conclude_gis`, then
+        zone-checked exactly like the `executor` branch above (fix round 1,
+        task 5: the controller ruling that closed the gap the first draft of
+        this function flagged). `app/modules/gis/permissions.py` registers no
+        code that fits — only `gis.contours.manage`, `.approve` and
+        `gis.layers.manage`, and `gis.contours.approve` was rejected
+        explicitly (it would let a pure contour editor write conclusions on
+        applications, a different authority) — so the code is owned HERE, by
+        `applications`, the same reason `review`/`decide`/`assign` are too:
+        the thing it authorises is a write on an APPLICATION, not on a
+        contour. tz/03's matrix gives the GIS specialist unzoned "K" (read)
+        on every application, but that answers WHO may look, not WHO may
+        write a finding into its record — every other staff write in this
+        module pairs its permission with the actor's own zone (lesson: zone
+        scoping is not a permission check), and a written conclusion is a
+        write, so this one is zoned the same way.
+    """
+    if kind == "executor":
+        if not await _holds(db, actor, APPLICATIONS_REVIEW):
+            raise err("ERR-ACL-001", details={"permission": APPLICATIONS_REVIEW})
+    elif kind == "gis":
+        if not await _holds(db, actor, APPLICATIONS_CONCLUDE_GIS):
+            raise err("ERR-ACL-001", details={"permission": APPLICATIONS_CONCLUDE_GIS})
+    else:
+        # The schema's `Literal["executor", "gis"]` admits nothing else; kept
+        # as a fail-closed default rather than an `assert`, which pyright
+        # would accept but a bypassed/loosened schema would then reach as a
+        # 500 instead of a 403.
+        raise err("ERR-ACL-001", details={"reason": "unknown_conclusion_kind"})
+
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_CONCLUSION_ADD)
+
+    row = ApplicationConclusion(
+        application_id=application.id,
+        author_id=actor.id,
+        kind=kind,
+        text=text,
+        recommendation=recommendation,
+    )
+    await repo.add_conclusion(db, row)
+    await audit.log(
+        db,
+        action=APPLICATION_CONCLUSION_ADD,
+        user_id=actor.id,
+        object_type="application_conclusion",
+        object_id=row.id,
+        new_value={
+            "application_id": str(application.id),
+            "kind": kind,
+            "recommendation": recommendation,
+        },
+    )
+    return row
+
+
+NOTIFY_APPLICATION_RECALCULATED = "application.recalculated"
+
+
+async def recalculate(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Calculation:
+    """`POST /applications/{id}/recalculate` — ruling 17: a NEW `calculations`
+    row for an application still open to review (SUBMITTED, IN_REVIEW,
+    PENDING_INFO or RETURNED); from APPROVED onward it is refused, because by
+    then the figure has been billed (3.10a) and, once a permit exists, printed
+    on a signed document (3.11a). tz/04 С5: after the vet/cadastre checks, the
+    hodim confirms the price or sends it for recalculation — a corrected
+    tariff, a newly published `coef_sb` row, or a discrepancy one of those
+    external checks surfaced. The GIS specialist is NOT among the actors this
+    route admits (owner decision, 2026-09-05); their own `kind=gis` conclusion
+    beside this route is what `design/03` grants them instead of a re-price.
+
+    Routed entirely through `norms.service.save_calculation`, which already
+    carries `_assert_application_open_for_calculation` — the actor-dependent
+    WHO/WHEN guard (`applications.review`/`.decide`, plus the four statuses
+    above; APPROVED-and-beyond closed to everyone) and the SUBJECT check (the
+    calculation must price the application's own contour). Nothing here
+    re-implements any of that (CLAUDE.md: the guard lives in `norms` and
+    BOTH write paths go through it), and the refusal is `norms`' own
+    state-conflict code, `ERR-NORM-005` (409) — never `ERR-APP-004`.
+
+    `checks.calculation_payload` builds the request from the application's
+    CURRENT stored fields — the same call `submit`'s own `_price` makes — and
+    prices them against whatever `norms` reads as effective right now. This
+    stage adds no route letting a reviewer edit those fields directly, so what
+    a recalculation can change is the RATES the engine reads, not the
+    application's own columns; a future stage that lets a reviewer correct the
+    herd or the area mid-review reprices through this same function.
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    payload = await checks.calculation_payload(db, application)
+    calculation = await norms_service.save_calculation(
+        db,
+        payload=payload.model_copy(update={"application_id": application.id}),
+        actor=actor,
+    )
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_RECALCULATED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": application.number},
+        object_type="application",
+        object_id=application.id,
+    )
+    return calculation
+
+
 async def cancel(
     db: AsyncSession, application_id: uuid.UUID, *, reason: str | None = None, actor: User
 ) -> Application:
@@ -2091,6 +2831,116 @@ async def cancel(
     return application
 
 
+# Task 6, 3.9b. A flow verb like `APPLICATION_CANCEL` above, audited under its
+# own name for the same reason: it does more than move a status, it creates a
+# whole new row.
+APPLICATION_CLONE = "application.clone"
+
+
+async def clone(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
+    """`POST /applications/{id}/clone` — a fresh DRAFT pre-filled from an
+    application the caller owns, in WHATEVER status it holds: a herder
+    renewing next season's grazing should not have to retype the plot, the
+    activity or the herd every filing.
+
+    **The point of a clone is what it does NOT copy.** Everything the source
+    EARNED by being reviewed, priced, signed or decided stays behind — the
+    public `number`, `status` (always a fresh `DRAFT`), the frozen
+    `contour_version_id`, every timestamp, the SLA deadline, the assignment,
+    the documents, the checks, the calculation and the whole status history:
+    the clone's own timeline holds exactly the one `DRAFT` row this function
+    writes. Documents are excluded ON PURPOSE, not merely deferred: a
+    veterinary certificate has a validity period, and silently carrying last
+    year's into a new filing is exactly the kind of quiet error this system
+    exists to prevent — the applicant attaches a fresh one.
+
+    What copies is the request itself: who is filing and on whose authority
+    (`applicant_id`, `on_behalf`, `representation_id`), the plot and activity
+    (`contour_id`, `activity_type_id`), the declared period, area, quantity and
+    herd (`period_from`, `period_to`, `requested_area_ha`, `quantity`,
+    `items`) and the claimed `benefit_category_item_id`. The period comes
+    along with the rest of the request rather than being left for a mandatory
+    `PATCH`: `checks.REQUIRED_FOR_PRICING` refuses a submission missing it, and
+    a clone an applicant cannot submit without editing fields that did not
+    change (the plot, the herd) would save them nothing. `contour_version_id`
+    is deliberately NOT among them: the clone reprices against whichever
+    version is published at ITS OWN submission (ruling 22), never the one the
+    source was decided against.
+
+    `parent_application_id` is set to the SOURCE while `kind` stays `"new"`
+    (`KIND_NEW`): a clone is a brand-new filing that happens to remember where
+    it came from, not `extend` (`tz/12` #6) — that verb belongs to 3.11's
+    `POST /permits/{id}/extend`, on an already-ISSUED permit, and is out of
+    scope here.
+
+    The OWNER only, in ANY status — a stranger is told 404, the same answer
+    every other refusal in this module gives, never 403 (`_readable_
+    application`'s own reasoning: an application carries a citizen's name,
+    plot and herd from the moment it exists). Unlocked, deliberately unlike
+    `_own_application_for_update`: the source is only ever READ here, never
+    written, so there is nothing to serialise against a concurrent writer.
+
+    No event is published and no notification sent: nothing subscribes to a
+    clone and no template is seeded for one — inventing either here would be
+    exactly the mistake `events.NOTIFIED_EVENT_CODES`'s own note on
+    `application.cancelled` warns against.
+    """
+    source = await repo.get_application(db, application_id)
+    if source is None or source.applicant_id not in await _own_applicant_ids(db, actor):
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    application = Application(
+        applicant_id=source.applicant_id,
+        submitted_by_user_id=actor.id,
+        on_behalf=source.on_behalf,
+        representation_id=source.representation_id,
+        activity_type_id=source.activity_type_id,
+        contour_id=source.contour_id,
+        requested_area_ha=source.requested_area_ha,
+        period_from=source.period_from,
+        period_to=source.period_to,
+        quantity=source.quantity,
+        benefit_category_item_id=source.benefit_category_item_id,
+        status=INITIAL_STATUS,
+        channel=CHANNEL_PORTAL,
+        kind=KIND_NEW,
+        parent_application_id=source.id,
+    )
+    db.add(application)
+    await db.flush()
+    for item in await repo.list_items(db, source.id):
+        db.add(
+            ApplicationItem(
+                application_id=application.id,
+                livestock_type_id=item.livestock_type_id,
+                head_count=item.head_count,
+            )
+        )
+    await repo.add_status_history(
+        db,
+        ApplicationStatusHistory(
+            application_id=application.id,
+            from_status=None,
+            to_status=INITIAL_STATUS,
+            changed_by=actor.id,
+        ),
+    )
+    # `created_at`/`updated_at`/`requested_area_ha`/`quantity` all round-trip
+    # through Postgres defaults or `NUMERIC`'s own scale (the same lesson
+    # `create_draft` and `patch_draft` both carry) — refreshed before this row
+    # is serialized into the 201 response.
+    await db.refresh(application)
+    await audit.log(
+        db,
+        action=APPLICATION_CLONE,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        old_value={"parent_application_id": str(source.id)},
+        new_value=_snapshot(application, await repo.list_items(db, application.id)),
+    )
+    return application
+
+
 async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
     """`GET /applications/{id}/timeline` — the transitions, the assignments, the
     signatures and (from 3.9b) the information requests.
@@ -2120,8 +2970,13 @@ async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
     Both are read through `signatures.service.get_for_object` — never by
     querying that module's table (module boundary, CLAUDE.md).
 
-    `info_requests` is `[]` and present: the table exists and nothing writes it
-    before 3.9b, so shipping the key now means 3.9b widens the DATA and not the
+    **`info_requests` is populated (final whole-branch review, IMPORTANT)**:
+    open or closed, oldest first (`repo.list_info_requests`). The pause it
+    records is the one event on this branch that silently moves a
+    legally-consequential deadline (`sla_deadline_at`, `sla.shift_deadline`),
+    and this is the only audit view an inspector or the applicant reads — a
+    deadline that jumped with no explanation anywhere in the timeline was the
+    actual defect the empty list used to hide, not merely an unfinished
     contract.
     """
     application = await _readable_application(db, application_id, actor=actor)
@@ -2142,6 +2997,187 @@ async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
         "signatures": await signatures_service.get_for_object(
             db, object_type=DECISION_OBJECT_TYPE, object_id=application.id
         ),
-        # 3.9b's, and empty by contract until then — see the docstring.
-        "info_requests": [],
+        "info_requests": await repo.list_info_requests(db, application.id),
     }
+
+
+# --- Task 7 (3.9b): external checks — veterinary and cadastre ---------------
+#
+# tz/04 С5: after start-review, the office checks the application against the
+# veterinary registry and the cadastre. Both routes below carry
+# `applications.review` alone (router.py) — maker and confirmer are the SAME
+# role here, unlike `norms.service.publish_versioned`'s maker/checker split
+# across two different codes, so there is only one to gate on; the identity
+# comparison in `confirm_check` is what tells the two calls apart (lesson: "A
+# maker-checker route needs BOTH roles' permission").
+#
+# `check_type in ("vet", "cadastre")` only — the auto GIS/norm checks
+# (`gis_validity`, `norm_season`, ...) are `checks.run_all`'s alone, written
+# with `source="auto"`, and this route never touches them.
+
+APPLICATION_CHECK_ADD = "application_check.add"
+APPLICATION_CHECK_CONFIRM = "application_check.confirm"
+
+
+async def _external_check(
+    check_type: str, *, application_id: uuid.UUID
+) -> VetCheckResult | CadastreCheckResult:
+    """Dispatches to whichever adapter `ApplicationCheckIn.check_type` named —
+    `vet_adapter`/`cadastre_adapter`'s own `get_adapter()` factory, exactly
+    the shape `oneid.get_oneid_adapter`/`otp_sender.get_otp_sender` already
+    use. A plain `if`/`else` rather than a dict of callables: the schema's
+    `Literal["vet", "cadastre"]` already admits nothing else, and this way
+    every adapter's own result type stays visible to pyright.
+
+    **Final whole-branch review**: `get_adapter()` raises a bare
+    `NotImplementedError` on two paths — `app_env=prod` refusing to answer
+    from a mock, or `*_MODE=real` naming a contract that has not been
+    written — and left uncaught here that reached `app.main`'s generic
+    handler as an unhandled `ERR-SYS-001` 500 with a traceback: a crash where
+    the ruling meant an honest refusal. Both paths leave the office with the
+    identical remedy, `add_check`'s `source="manual_fallback"` branch, so
+    both are translated the same way, into `ERR-APP-004` with a `reason` —
+    the same shape this module's other typed refusals on this exact route
+    already carry (`not_manual_fallback`, `already_confirmed`, ...)."""
+    try:
+        if check_type == "vet":
+            return await vet_adapter.get_adapter().check(application_id=application_id)
+        return await cadastre_adapter.get_adapter().check(application_id=application_id)
+    except NotImplementedError as exc:
+        raise err(
+            "ERR-APP-004",
+            details={"reason": "live_check_unavailable", "check_type": check_type},
+        ) from exc
+
+
+async def _assert_check_doc_active(db: AsyncSession, file_id: uuid.UUID) -> None:
+    """Existence + active only — `gis.service._assert_approval_doc_active`'s
+    own shape (lesson: "An existence check is not a validity check"). The
+    scanned paper result may legitimately be uploaded by office staff other
+    than the one filing this check, so `_own_document_file`'s ownership
+    requirement does not apply here."""
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "check_doc_not_found"})
+
+
+async def add_check(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    payload: ApplicationCheckIn,
+    *,
+    actor: User,
+) -> ApplicationCheck:
+    """`POST /applications/{id}/checks` — either calls the live vet/cadastre
+    adapter (`source="external_api"`), or records a paper result under
+    maker-checker (`source="manual_fallback"`, Oybek's ruling, 2026-09-05: the
+    paper fallback is exactly the case a second pair of eyes exists for). A
+    manual row is always written `confirmed_by=None`; `confirm_check` below is
+    the only path that ever sets it.
+
+    404 `ERR-SYS-003` for an id that does not exist or an application outside
+    the caller's zone — `_assert_in_actor_zone`, before anything is written,
+    the same two-part rule every staff write in this module applies (permission
+    is the route's, zone is here). 422 `ERR-VAL-001` for the manual shape
+    missing `result` or `doc_file_id`, or naming a `doc_file_id` that is
+    missing or archived.
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_CHECK_ADD)
+
+    if payload.source == "manual_fallback":
+        if payload.result is None or payload.doc_file_id is None:
+            raise err(
+                "ERR-VAL-001",
+                details={"reason": "manual_fallback_requires_result_and_doc_file_id"},
+            )
+        await _assert_check_doc_active(db, payload.doc_file_id)
+        row = ApplicationCheck(
+            application_id=application.id,
+            check_type=payload.check_type,
+            result=payload.result,
+            details={"source": "manual_fallback"},
+            source="manual_fallback",
+            doc_file_id=payload.doc_file_id,
+            created_by=actor.id,
+        )
+    else:
+        verdict = await _external_check(payload.check_type, application_id=application.id)
+        # Decision #46 ruling 9: a synchronous adapter call logs in the
+        # CALLER's transaction (mock-only today), never a separate session.
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system=payload.check_type,
+            endpoint=str(application.id),
+            meta={"result": verdict.result},
+        )
+        row = ApplicationCheck(
+            application_id=application.id,
+            check_type=payload.check_type,
+            result=verdict.result,
+            details=verdict.details,
+            source="external_api",
+            created_by=actor.id,
+        )
+    await repo.add_checks(db, [row])
+    await audit.log(
+        db,
+        action=APPLICATION_CHECK_ADD,
+        user_id=actor.id,
+        object_type="application_check",
+        object_id=row.id,
+        new_value={
+            "application_id": str(application.id),
+            "check_type": row.check_type,
+            "source": row.source,
+            "result": row.result,
+        },
+    )
+    return row
+
+
+async def confirm_check(
+    db: AsyncSession, application_id: uuid.UUID, check_id: uuid.UUID, *, actor: User
+) -> ApplicationCheck:
+    """`POST /applications/{id}/checks/{check_id}/confirm` — the SECOND
+    person a paper result needs before it is usable. Stage 3.7's tariff
+    maker-checker is the identical rule (`norms.service.publish_versioned`):
+    the maker of THIS row may not also be its confirmer.
+
+    404 `ERR-SYS-003` for an id that does not exist, an application outside
+    the caller's zone, or a `check_id` that does not belong to this
+    application. 409 `ERR-APP-004` for a row that is not
+    `source="manual_fallback"` (`reason="not_manual_fallback"` — there is
+    nothing to confirm on an automatic or external-api check), one already
+    confirmed (`reason="already_confirmed"`), or a confirmer who is also its
+    own maker (`reason="maker_cannot_confirm_own_record"`).
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_CHECK_CONFIRM)
+
+    check = await repo.get_check(db, check_id)
+    if check is None or check.application_id != application.id:
+        raise err("ERR-SYS-003", details={"check": str(check_id)})
+    if check.source != "manual_fallback":
+        raise err("ERR-APP-004", details={"reason": "not_manual_fallback"})
+    if check.confirmed_by is not None:
+        raise err("ERR-APP-004", details={"reason": "already_confirmed"})
+    if check.created_by == actor.id:
+        raise err("ERR-APP-004", details={"reason": "maker_cannot_confirm_own_record"})
+
+    check.confirmed_by = actor.id
+    check.confirmed_at = datetime.now(UTC)
+    await audit.log(
+        db,
+        action=APPLICATION_CHECK_CONFIRM,
+        user_id=actor.id,
+        object_type="application_check",
+        object_id=check.id,
+        new_value={"confirmed_by": str(actor.id)},
+    )
+    return check

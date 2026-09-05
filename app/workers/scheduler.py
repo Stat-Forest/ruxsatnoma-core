@@ -75,6 +75,17 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # The applications SLA sweep (plan `03.9b-applications-review` task 2):
+    # a daily reminder before the deadline and RI-07 once it passes. Same
+    # slot shape as `refund_sla_sweep` just above, ten minutes after it.
+    sched.add_job(
+        _wrap(factory, jobs.sla_sweep),
+        CronTrigger(hour=0, minute=45, timezone=TIMEZONE),
+        next_run_time=now,
+        id="applications_sla_sweep",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     sched.add_job(
         _wrap(factory, jobs.alert_dead_outbox),
         IntervalTrigger(minutes=5, timezone=TIMEZONE),

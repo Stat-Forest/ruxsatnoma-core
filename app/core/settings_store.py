@@ -37,7 +37,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.key: spec
     for spec in (
         SettingSpec("session_absolute_hours", int, 12, "Session lifetime in hours"),
-        SettingSpec("session_idle_minutes", int, 30, "Sign-out after this much inactivity"),
+        SettingSpec("session_idle_minutes", int, 300, "Sign-out after this much inactivity"),
         SettingSpec("login_max_attempts", int, 5, "Failed logins before the account locks"),
         SettingSpec("login_lockout_minutes", int, 15, "How long a locked account stays locked"),
         SettingSpec("mfa_token_ttl_minutes", int, 5, "Lifetime of the interim MFA token"),

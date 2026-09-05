@@ -417,6 +417,51 @@ async def _reconcile_status(db: AsyncSession, cert: Certificate, live_status: st
     await db.flush()
 
 
+def _raised_reason(
+    verdict: Verdict, *, doc_hash: str, content_changed_reason: str | None
+) -> str | None:
+    """The reason `sign()` puts in the RAISED error's `details` — `verdict.reason`
+    itself, unless the caller opted into a friendlier name for one shape of
+    that verdict.
+
+    **This is a PRESENTATION HINT, not an attestation, and fix round 1 of
+    this task's own review proved it can be spoofed under the mock adapter.**
+    The naive read is "a present, mismatched `document_sha256` proves an
+    honest signature over a package that later changed" — that is FALSE.
+    The mock's decoding step only requires well-formed base64url JSON with
+    the right keys; it does not require that the caller ever actually priced
+    or fetched anything through `GET /package`. A caller can fabricate an
+    envelope claiming `document_sha256` over bytes that were NEVER shown to
+    anyone — `b"this-was-never-priced"`, say — sign it with their OWN
+    genuinely-owned certificate, and this function will relabel the result
+    `package_changed` exactly as it would for an honest race. Presence of
+    the hash proves only that the envelope decoded; it proves nothing about
+    WHERE that hash came from.
+
+    **What actually makes this safe despite being spoofable: the label is
+    cosmetic, and nothing that matters depends on it.** `sign()` still
+    refuses the attempt with 422 either way — spoofing changes which STRING
+    appears in `details.reason`, never whether the request succeeds.
+    Nothing STORED reads this function's return value: `signatures.
+    verification`/`verification_status` are written from `verdict` itself
+    before this is ever called (see `sign()`'s own note below), the audit
+    entry's `basis` is `verdict.reason`, and RI-05's `extra` is computed
+    from `verdict.reason` too — all three keep the honest `"signature_
+    invalid"` finding regardless of what this function returns. An attacker
+    who forges the mismatch gains nothing but a friendlier-sounding error
+    message for an attempt that was refused anyway, with the true verdict
+    intact in every durable record. Every reason OTHER than the ambiguous
+    `"signature_invalid"` (an unowned certificate, a missing purpose, a
+    revoked certificate…) is returned unchanged, spoofable or not — this
+    relabelling is scoped to the one string that is genuinely ambiguous."""
+    if content_changed_reason is None or verdict.reason != "signature_invalid":
+        return verdict.reason
+    original_hash = verdict.record.get("raw", {}).get("document_sha256")
+    if original_hash is not None and original_hash != doc_hash:
+        return content_changed_reason
+    return verdict.reason
+
+
 async def sign(
     db: AsyncSession,
     *,
@@ -426,6 +471,7 @@ async def sign(
     document: bytes,
     pkcs7: str,
     user: User,
+    content_changed_reason: str | None = None,
 ) -> Signature:
     """Attach a signature to `(object_type, object_id, purpose)`.
 
@@ -472,6 +518,31 @@ async def sign(
     ALWAYS, valid or not (ruling 8: a failed attempt is evidence) -> audit ->
     if the verdict itself is invalid, commit that evidence and only THEN
     raise.
+
+    **`content_changed_reason` (applications ruling 18, 2026-09-05) relabels
+    only the RAISED error, and is a presentation hint — NOT an attestation.**
+    `verdict.reason == "signature_invalid"` is the mock adapter's one
+    genuinely ambiguous answer, and `_raised_reason` (above) tells apart an
+    undecodable envelope from a decoded one whose claimed `document_sha256`
+    disagrees with `doc_hash`. **Read `_raised_reason`'s own docstring before
+    trusting this field for anything beyond wording: it can be spoofed under
+    the mock adapter** — decoding only requires well-formed JSON, not proof
+    that `GET /package` was ever actually called, so a caller can fabricate
+    a `document_sha256` over content nobody ever priced and still earn
+    `"package_changed"`. **What makes that safe is that the label changes
+    nothing else.** `sign()` still refuses with 422 either way, the
+    `signatures.verification` row and its `verification_status`, the audit
+    entry's `basis`, and RI-05's `extra` are all computed from `verdict`
+    itself — untouched by `content_changed_reason` and still the honest
+    `"signature_invalid"` finding regardless of what gets raised. Spoofing
+    the label buys nothing but different wording on a refusal that was
+    happening anyway. Every OTHER verdict reason (an unowned certificate, a
+    missing purpose, a revoked certificate…) is untouched by this parameter
+    even when it IS honest, and every caller that leaves it `None` — every
+    caller today except `applications`' `submit` and `_sign_decision` — gets
+    today's exact behaviour, byte for byte: this is why the three
+    permit-object `signature_invalid` tests in `tests/modules/signatures/`
+    needed no change at all.
     """
     required = await required_purposes(db, object_type)
     if required and purpose not in required:
@@ -669,9 +740,18 @@ async def sign(
         # Early-commit pattern: the failed attempt IS the evidence (ruling 8)
         # and stage 4.2's risk reporting reads it — a raise before this commit
         # would roll the row and the audit entry back together with the very
-        # exception they exist to explain.
+        # exception they exist to explain. `_raised_reason` only ever changes
+        # what THIS raise says, never `verification`/`basis` above, which is
+        # already committed with the honest `verdict.reason`.
         await db.commit()
-        raise err("ERR-SIGN-001", details={"reason": verdict.reason})
+        raise err(
+            "ERR-SIGN-001",
+            details={
+                "reason": _raised_reason(
+                    verdict, doc_hash=doc_hash, content_changed_reason=content_changed_reason
+                )
+            },
+        )
 
     return signature
 

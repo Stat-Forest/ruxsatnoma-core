@@ -10,6 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import delete
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
@@ -18,6 +19,7 @@ from app.core.errors import ERRORS, DomainError
 from app.core.health import router as health_router
 from app.core.idempotency import StoredIdempotentResponse
 from app.core.logging import CORRELATION_ID_KEY, configure_logging
+from app.core.models import IdempotencyKey
 from app.db import make_engine, make_session_factory
 from app.event_subscriptions import register_event_subscriptions
 from app.files_router import router as files_router
@@ -100,6 +102,53 @@ def _error_body(request: Request, code: str, message: str, details: dict | None)
     }
 
 
+async def _settle_idempotency_record(request: Request, *, close: tuple[int, dict] | None) -> None:
+    """The one place all three exception handlers that can end a request
+    carrying an `Idempotency-Key` settle its marker (3.9b task 3, fix round 1,
+    2026-09-05) — extracted once a SECOND handler needed the same shape, so a
+    third never copies it again.
+
+    `auth.deps.idempotency_context` stashes `ctx` on `request.state.
+    idempotency_ctx` right after `begin()` returns it; unset when no such
+    dependency ran on this route, or when a stored replay short-circuited
+    before `begin()` ever returned a fresh context — both make this a no-op.
+    The route's (or the failed dependency's) own `db` is already rolled back
+    and closed by this point: `get_db`'s `except BaseException: await
+    session.rollback(); raise` runs whenever the dependency exit stack unwinds
+    with an exception, which happens for an exception raised INSIDE the
+    endpoint (`DomainError`, an unhandled bug) exactly as it does for a
+    `RequestValidationError` raised from sibling-dependency/body validation
+    errors collected BEFORE the endpoint is ever called — `idempotency_context`
+    is one such sibling, and by the time either shape of failure is detected
+    it has already run and committed the marker. Either way this function
+    reaches a session-less request, so it always opens its OWN fresh one.
+
+    `close=(status_code, body)` CLOSES the record with that response — the
+    same write `IdempotencyContext.save()` performs on success — so a retry
+    with the SAME key replays it: the refusal (`DomainError`) or the malformed
+    body (`RequestValidationError`) was the CLIENT's to fix, and a corrected
+    retry needs a NEW key to reach the endpoint at all. `close=None` DELETES
+    the record instead (`unhandled_handler`'s 500s only): the SERVER failed,
+    not the request, and the client is entitled to retry the IDENTICAL request
+    with the SAME key rather than be told it already "succeeded" with a 500 —
+    replaying a 500 would be actively wrong.
+    """
+    ctx = getattr(request.state, "idempotency_ctx", None)
+    if ctx is None:
+        return
+    async with request.app.state.session_factory() as fresh_db:
+        if close is not None:
+            status_code, body = close
+            await ctx.save(fresh_db, status_code=status_code, body=body)
+        else:
+            await fresh_db.execute(
+                delete(IdempotencyKey).where(
+                    IdempotencyKey.key == ctx.key, IdempotencyKey.user_id == ctx.user_id
+                )
+            )
+        await fresh_db.commit()
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_format)
@@ -154,10 +203,13 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
-        return JSONResponse(
-            status_code=exc.http_status,
-            content=_error_body(request, exc.code, exc.message, exc.details),
-        )
+        # 3.9b task 3 (ANSWERED а, 2026-09-05): close the idempotency record on
+        # the EXCEPTION path too, mirroring `IdempotencyContext.save()`'s own
+        # success-path call — see `_settle_idempotency_record`'s own docstring
+        # for the full reasoning, shared with the two handlers below it.
+        body = _error_body(request, exc.code, exc.message, exc.details)
+        await _settle_idempotency_record(request, close=(exc.http_status, body))
+        return JSONResponse(status_code=exc.http_status, content=body)
 
     @app.exception_handler(StoredIdempotentResponse)
     async def stored_idempotent_handler(request: Request, exc: StoredIdempotentResponse):
@@ -181,15 +233,21 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
-        return JSONResponse(
-            status_code=422,
-            content=_error_body(
-                request,
-                "ERR-VAL-001",
-                ERRORS["ERR-VAL-001"][1],
-                {"errors": jsonable_encoder(exc.errors())},
-            ),
+        # 3.9b task 3, fix round 1 (2026-09-05): `idempotency_context` is a
+        # SIBLING dependency FastAPI resolves — and commits — before it ever
+        # discovers a sibling body param is malformed, so this handler needs
+        # the SAME closing `domain_error_handler` does or a retry with the
+        # SAME key (even a corrected body) answers 409 `in_flight`/
+        # `fingerprint_mismatch` for the rest of `IN_FLIGHT_TTL` instead of
+        # replaying this 422.
+        body = _error_body(
+            request,
+            "ERR-VAL-001",
+            ERRORS["ERR-VAL-001"][1],
+            {"errors": jsonable_encoder(exc.errors())},
         )
+        await _settle_idempotency_record(request, close=(422, body))
+        return JSONResponse(status_code=422, content=body)
 
     @app.exception_handler(Exception)
     async def unhandled_handler(request: Request, exc: Exception):
@@ -199,6 +257,11 @@ def create_app() -> FastAPI:
         # проставляем здесь явно из request.state.
         rid = getattr(request.state, "correlation_id", None)
         structlog.get_logger().exception("unhandled_error", correlation_id=rid)
+        # 3.9b task 3, fix round 1: DELETE, never close — a 500 is the
+        # SERVER's failure, not the request's, so the client is entitled to
+        # retry the IDENTICAL request with the SAME key. Replaying a stored
+        # 500 would be actively wrong, unlike the refusal-replays above.
+        await _settle_idempotency_record(request, close=None)
         return JSONResponse(
             status_code=500,
             content=_error_body(request, "ERR-SYS-001", "Внутренняя ошибка сервера", None),

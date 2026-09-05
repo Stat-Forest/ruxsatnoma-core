@@ -84,25 +84,15 @@ Tooling and environment.
   then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red
   in a task that changed no migration, look for the event it started emitting.
 
-## Multiple Alembic heads: resolve with an empty merge migration
+## A new Alembic head needs both a merge migration and the round-trip test's literal moved
 
-- **Rule:** When two branches each add a migration, run `alembic merge heads` — never
-  delete a migration or hand-edit `down_revision`.
-- **Why:** Rewriting revision history breaks every environment that already applied the
-  original revisions (dev DB, test DB, CI, later prod). *(from ControlAI; live risk here
-  — Oybek runs parallel sessions.)*
-- **How to apply:** `uv run alembic merge heads -m "merge"`, commit it, keep going.
-  `make heads` is the gate; check `uv run alembic heads` after any rebase.
-
-## The round-trip test's expected head version is a hardcoded string every migration must bump
-
-- **Rule:** After adding a migration, update `tests/test_migrations.py::
-  test_downgrade_upgrade_roundtrip`'s `assert version == "<old head>"` in the same commit.
-- **Why:** The assertion is a literal, not derived from `alembic heads` — a brand-new
-  migration passes every test of its own and fails this one with `assert '0011' == '0010'`,
-  which reads like a chain bug rather than a one-line test update (hit adding 0011, 3.7 t1).
-- **How to apply:** New head → grep `tests/test_migrations.py` for the previous head string.
-  It is on no task brief's file list, so only a full run surfaces it.
+- **Rule:** Two branches, two migrations → `alembic merge heads`, never a hand-edited
+  `down_revision`; same commit, bump `test_migrations.py`'s hardcoded head-literal assertion.
+- **Why:** Hand-editing history breaks every environment on the original revisions
+  (*ControlAI*); the literal isn't derived from `alembic heads`, so a new migration fails it
+  alone, reading like a chain bug (0011, 3.7 t1; `merge_0018_0020`, 3.9b/3.11b).
+- **How to apply:** `alembic merge heads -m "merge"`; `make heads` is the gate — grep the
+  test for the previous head string, since no task brief lists that file.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
@@ -490,6 +480,16 @@ Tooling and environment.
   `used_sb`, `if snapshot.norm is not None:` for `max_sb`/`remaining_sb`. Before adding a
   caller-side workaround for a gap in a shared function, check whether the gate reads what it
   claims to gate on: a condition never referenced inside its own block is the tell.
+
+## A cached fact must be re-validated wherever its own source can later change
+
+- **Rule:** A column deriving from X, once set trusted to diverge from X on purpose (an
+  assignment), must be RE-checked against X — not just checked for presence — wherever a
+  LATER feature could make X editable again.
+- **Why:** `assigned_org_id` derived from the contour's owner until assigned, then was
+  trusted unconditionally; a later task made RETURNED editable, so a corrected `contour_id`
+  onto another leshoz kept the FIRST leshoz assigned, invisible to either task alone (3.9b).
+- **How to apply:** Before trusting "already set", re-derive from source and compare.
 
 ## A reversed date period inverts a range predicate and hides the rows it should find
 

@@ -318,7 +318,14 @@ class ApplicationCheck(Base):
     optional.
 
     3.9a always writes `source='auto'` and leaves `doc_file_id` null; both columns
-    exist from day one because 3.9b's manual fallback needs them."""
+    exist from day one because 3.9b's manual fallback needs them.
+
+    `created_by`/`confirmed_by`/`confirmed_at` are migration `0025`'s three
+    columns for task 7's maker-checker (ruling 15, ANSWERED а) — every row
+    names WHO created it (3.9a's own auto checks attribute it to the
+    application's `submitted_by_user_id`, `checks.run_all`'s own reasoning),
+    while only a MANUAL check that has actually been confirmed carries the
+    other two."""
 
     __tablename__ = "application_checks"
 
@@ -330,6 +337,9 @@ class ApplicationCheck(Base):
     source: Mapped[str] = mapped_column(default="auto")
     doc_file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"), index=True)
     checked_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    confirmed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    confirmed_at: Mapped[datetime | None]
 
     __table_args__ = (
         CheckConstraint(f"check_type IN {CHECK_TYPES}", name="check_type_valid"),

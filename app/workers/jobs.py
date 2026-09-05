@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core import settings_store
 from app.core.models import IdempotencyKey
 from app.core.time import business_today
+from app.modules.applications import jobs as applications_jobs
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Representation, Session
@@ -255,6 +256,25 @@ async def refund_sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[st
         await db.commit()
     if counts["flagged"]:
         logger.info("job.refund_sla_sweep", **counts)
+    return counts
+
+
+async def sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
+    """Remind an application's office before its SLA deadline and raise
+    RI-07 once it passes (plan `03.9b-applications-review` task 2).
+
+    Thin wrapper only — `applications.jobs.sla_sweep(db)` holds the actual
+    logic (both candidate queries, the once-only checks, the notification
+    and the audit trail), the same split `refund_sla_sweep` above has from
+    `payments.jobs.refund_sla_sweep`. This function's own job is the one
+    every other job in this file already does: open a session, run it,
+    commit. Same name as the module-level function it wraps, deliberately —
+    `refund_sla_sweep` above is the precedent."""
+    async with factory() as db:
+        counts = await applications_jobs.sla_sweep(db)
+        await db.commit()
+    if counts["reminded"] or counts["flagged"]:
+        logger.info("job.applications_sla_sweep", **counts)
     return counts
 
 

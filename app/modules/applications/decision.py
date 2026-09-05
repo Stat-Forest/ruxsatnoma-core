@@ -378,8 +378,12 @@ async def _sign_decision(
 
     Ruling 23 applies here as it does at submission: the package is priced
     afresh at `business_today()`, so a tariff, a rule parameter, a norm or
-    midnight in Tashkent moving between the head's `GET /package` and this POST
-    changes the bytes and produces `ERR-SIGN-001` for something they did not do.
+    midnight in Tashkent moving between the head's `GET /package` and this
+    POST changes the bytes. **Ruling 18 (в), 2026-09-05**, the same fix
+    `submit` carries: `content_changed_reason=flow.STALE_PACKAGE_REASON`
+    below means a head whose decision-signature is valid over a package that
+    moved out from under them meets `details.reason == "package_changed"`,
+    not the bare `"signature_invalid"` a forged or corrupted ERI still gets.
 
     `sign()` is the first thing on either decision path that can commit, which
     is why every refusal runs ahead of it and nothing is written before it.
@@ -393,6 +397,7 @@ async def _sign_decision(
         document=document,
         pkcs7=pkcs7,
         user=actor,
+        content_changed_reason=flow.STALE_PACKAGE_REASON,
     )
 
 
