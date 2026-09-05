@@ -48,6 +48,7 @@ from app.modules.payments.router import router as payments_router
 from app.modules.permits.lifecycle_router import router as permits_lifecycle_router
 from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
+from app.modules.reports.router import router as reports_router
 from app.modules.signatures.router import router as signatures_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -301,5 +302,8 @@ def create_app() -> FastAPI:
     # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
     # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
     app.include_router(permits_public_router, prefix="/api/v1")
+    # Level 5 reader (design/01 rule 5) — stage 4.3, no event subscriptions
+    # (nothing else in the system needs to react to a report's lifecycle).
+    app.include_router(reports_router, prefix="/api/v1")
 
     return app
