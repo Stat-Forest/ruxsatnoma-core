@@ -1,0 +1,85 @@
+"""The anonymous surface — appeals and open data. No `get_current_user`, no
+permission code anywhere in this file; a rate limit instead of both, same
+idiom `permits.public_router` and `norms.public_router` already established.
+
+`POST /public/appeals` and `GET /public/appeals/check` are in
+`app/core/logging.py`'s `SILENT_ACCESS_LOG_PATHS` — `check`'s `contact` query
+parameter is exactly the kind of thing that precedent exists to keep out of a
+process log. The open-data routes carry no personal data and are deliberately
+left out of that list."""
+
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.deps import get_db
+from app.core.ratelimit import rate_limit
+from app.modules.public import service
+from app.modules.public.schemas import (
+    AppealContact,
+    AppealIn,
+    AppealStatusOut,
+    AppealSubmitOut,
+    OpenDataLayerOut,
+    OpenDataStatsOut,
+)
+
+router = APIRouter(prefix="/public", tags=["public"])
+
+_APPEAL_SUBMIT_LIMIT = Depends(
+    rate_limit("public_appeal_submit", "ratelimit_public_appeal_submit_per_minute")
+)
+_APPEAL_STATUS_LIMIT = Depends(
+    rate_limit("public_appeal_status", "ratelimit_public_appeal_status_per_minute")
+)
+_OPEN_DATA_LIMIT = Depends(rate_limit("public_open_data", "ratelimit_public_open_data_per_minute"))
+
+
+@router.post(
+    "/appeals", response_model=AppealSubmitOut, status_code=201, dependencies=[_APPEAL_SUBMIT_LIMIT]
+)
+async def submit_appeal(payload: AppealIn, db: Annotated[AsyncSession, Depends(get_db)]) -> Any:
+    number = await service.submit_appeal(
+        db,
+        applicant_name=payload.applicant_name,
+        contact=payload.contact,
+        subject=payload.subject,
+        body=payload.body,
+    )
+    return {"number": number}
+
+
+@router.get("/appeals/check", response_model=AppealStatusOut, dependencies=[_APPEAL_STATUS_LIMIT])
+async def check_appeal_status(
+    number: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    phone: str | None = None,
+    email: str | None = None,
+) -> Any:
+    """`phone`/`email` — the shared secret R3 requires (`plans/
+    04.6-4.8-public-help.md`). Neither is validated as a real phone/email
+    shape here: an unparsable value simply never matches anything, the same
+    "found: false" answer an unknown number gets — validating it would only
+    buy an attacker a way to distinguish "malformed" from "wrong" for free."""
+    contact = AppealContact.model_construct(phone=phone, email=email)
+    return await service.check_appeal_status(db, number=number, contact=contact)
+
+
+@router.get(
+    "/open-data/layers", response_model=list[OpenDataLayerOut], dependencies=[_OPEN_DATA_LIMIT]
+)
+async def open_data_layers(db: Annotated[AsyncSession, Depends(get_db)]) -> Any:
+    return await service.open_data_layers(db)
+
+
+@router.get("/open-data/layers/{code}/features", dependencies=[_OPEN_DATA_LIMIT])
+async def open_data_layer_features(
+    code: str, db: Annotated[AsyncSession, Depends(get_db)]
+) -> dict[str, Any]:
+    return await service.open_data_layer_features(db, code)
+
+
+@router.get("/open-data/stats", response_model=OpenDataStatsOut, dependencies=[_OPEN_DATA_LIMIT])
+async def open_data_stats(db: Annotated[AsyncSession, Depends(get_db)]) -> Any:
+    return await service.open_data_stats(db)

@@ -35,6 +35,8 @@ from app.modules.dashboard.router import router as dashboard_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
+from app.modules.help.admin_router import router as help_admin_router
+from app.modules.help.router import router as help_router
 from app.modules.inspections.router import router as inspections_router
 from app.modules.norms.calc_router import router as norms_calc_router
 from app.modules.norms.public_router import router as norms_public_router
@@ -51,6 +53,8 @@ from app.modules.payments.router import router as payments_router
 from app.modules.permits.lifecycle_router import router as permits_lifecycle_router
 from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
+from app.modules.public.admin_router import router as public_admin_router
+from app.modules.public.router import router as public_router
 from app.modules.reports.router import router as reports_router
 from app.modules.signatures.router import router as signatures_router
 
@@ -312,5 +316,15 @@ def create_app() -> FastAPI:
     # 4.2/4.4 — level-5 readers, no writes of their own beyond an audit trail.
     app.include_router(oversight_router, prefix="/api/v1")
     app.include_router(dashboard_router, prefix="/api/v1")
+    # 4.6 `public`: citizen appeals (anonymous submit/check + staff triage) and
+    # open data (anonymous, k-anonymity-suppressed). Anonymous routes here
+    # follow permits_public_router's own precedent: rate limit instead of
+    # auth, and the two appeal routes are silenced in app/core/logging.py.
+    app.include_router(public_router, prefix="/api/v1")
+    app.include_router(public_admin_router, prefix="/api/v1")
+    # 4.8 `help`: FAQ (anonymous read, staff-managed write) and support
+    # tickets (any authenticated user; staff triage under help.tickets.manage).
+    app.include_router(help_router, prefix="/api/v1")
+    app.include_router(help_admin_router, prefix="/api/v1")
 
     return app

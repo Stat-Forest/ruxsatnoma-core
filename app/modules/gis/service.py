@@ -1563,3 +1563,21 @@ async def list_features(
         status=status or "published",
         import_id=import_id,
     )
+
+
+async def public_features(
+    db: AsyncSession, code: str, *, bbox: str | None = None
+) -> dict[str, Any]:
+    """The anonymous mirror of `list_features` (4.6 `public`, design/01 rule 2:
+    cross-module calls go through the service). No `actor` exists on this path,
+    so there is no operator escape hatch and none is needed: always `published`,
+    and only a layer marked `is_public` — the identical rule `list_features`
+    enforces for an `applicant`, applied here to every caller since anonymous
+    IS the least-privileged role."""
+    layer = await repo.layer_by_code(db, code)
+    if layer is None or not layer.is_public:
+        raise err("ERR-SYS-003")
+    parsed_bbox = _parse_bbox(bbox)
+    return await repo.features_geojson(
+        db, layer_code=code, bbox=parsed_bbox, valid_on=None, status="published", import_id=None
+    )
