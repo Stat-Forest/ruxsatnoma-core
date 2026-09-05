@@ -138,11 +138,26 @@ class PermitCardOut(PermitOut):
     row of the list are the same object seen at two depths, and nesting would
     make a client read `body["permit"]["status"]` here and `body["status"]`
     there for the identical fact.
+
+    `document_date` (demo-sprint defect, `docs/status.md` "`Berilgan sana`
+    renders in UTC"): `issued_at` above is `permits.issued_at`, the ACTIVATION
+    timestamp `service._activate` stamps in UTC when the last of the 3+1
+    signatures completes — a card was the only place `issued_at` sat beside
+    `signatures[].signed_at`, and the only date-like field this schema offered
+    for "Берилган сана" was that UTC activation instant, which a caller then
+    has to convert. The document itself already carries the RIGHT value, frozen
+    Tashkent-local at issuance and printed on the PDF: `snapshot["issued_at"]`
+    (`service._snapshot`'s own comment: "the calendar date the DOCUMENT bears,
+    in Tashkent"). `document_date` surfaces exactly that stored string as a
+    `date`, so a caller displaying "Берилган сана" needs no timezone
+    arithmetic of its own to get it wrong — it reads the same calendar day the
+    paper permit shows, never `issued_at`'s UTC clock digits.
     """
 
     signatures: list[PermitSignatureRow]
     history: list[PermitHistoryRow]
     missing_signatures: list[str]
+    document_date: date
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> PermitCardOut:
@@ -152,7 +167,12 @@ class PermitCardOut(PermitOut):
         column added to `PermitOut` has to appear on the card too, and a
         hand-copied list is exactly how the two would drift. `model_validate`
         does the rest — including the nested rows, which arrive as ORM objects
-        and are validated `from_attributes`.
+        and are validated `from_attributes`. `document_date` is parsed here
+        from `permit.snapshot["issued_at"]` — an ISO date string, `_snapshot`'s
+        own format — rather than added to `PermitOut.model_fields`'s generic
+        copy: `snapshot` itself stays excluded from every response (this
+        schema's own module docstring), so one field is lifted out of it by
+        name, never the whole blob.
         """
         permit = card["permit"]
         return cls.model_validate(
@@ -161,6 +181,7 @@ class PermitCardOut(PermitOut):
                 "signatures": card["signatures"],
                 "history": card["history"],
                 "missing_signatures": card["missing_signatures"],
+                "document_date": date.fromisoformat(permit.snapshot["issued_at"]),
             }
         )
 
