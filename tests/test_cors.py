@@ -26,6 +26,7 @@ async def test_no_cors_headers_when_not_configured():
 
 async def test_configured_origin_is_allowed(monkeypatch):
     monkeypatch.setenv("CORS_ORIGINS", f'["{ADMIN_ORIGIN}"]')
+    monkeypatch.setenv("ADMIN_BASE_URL", ADMIN_ORIGIN)
     get_settings.cache_clear()
     app = create_app()
     async with make_client(app) as client:
@@ -36,6 +37,7 @@ async def test_configured_origin_is_allowed(monkeypatch):
 
 async def test_unknown_origin_gets_no_allow_header(monkeypatch):
     monkeypatch.setenv("CORS_ORIGINS", f'["{ADMIN_ORIGIN}"]')
+    monkeypatch.setenv("ADMIN_BASE_URL", ADMIN_ORIGIN)
     get_settings.cache_clear()
     app = create_app()
     async with make_client(app) as client:
@@ -62,6 +64,7 @@ def test_samesite_follows_the_cross_origin_setup():
         eskiz_sender="4546",
         eskiz_callback_secret="a-real-callback-secret",
         public_base_url="https://ruxsatnoma.example.uz",
+        admin_base_url=ADMIN_ORIGIN,
         smtp_host="smtp.example.uz",
         smtp_from="noreply@example.uz",
         payme_merchant_id="a-real-merchant-id",
@@ -75,6 +78,7 @@ def test_samesite_follows_the_cross_origin_setup():
     cross_origin_dev = Settings(
         app_env="dev",
         cors_origins=[ADMIN_ORIGIN],
+        admin_base_url=ADMIN_ORIGIN,
         _env_file=None,  # pyright: ignore[reportCallIssue]
     )
     assert cross_origin_dev.resolve_cookie_samesite() == "lax"

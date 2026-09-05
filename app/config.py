@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     permit_series: str = "А"
     workers_mode: Literal["embedded", "off"] = "embedded"
     oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
+    # Where the OneID callback sends the browser once the session cookies are
+    # set. It is a REDIRECT TARGET, not an origin to trust: the callback is
+    # reached by a browser returning from an identity provider, and answering
+    # it with a JSON body renders `{"user": ...}` as text on the screen.
+    admin_base_url: str = "http://localhost:5173"
     oneid_scope: str = "mock-scope"
     # Payme JSON-RPC server (stage 3.10a, design/04 §3). "mock" points at
     # Payme's own SANDBOX cashbox key, not a fake — see
@@ -112,6 +117,32 @@ class Settings(BaseSettings):
                 "sms_mode=real requires public_base_url to be the externally reachable "
                 "origin — Eskiz posts its delivery reports back to it, and a local "
                 f"origin loses every one of them silently (got {self.public_base_url!r})"
+            )
+        cors_names_a_deployed_origin = any(
+            not _is_local_origin(origin) for origin in self.cors_origins
+        )
+        if cors_names_a_deployed_origin and _is_local_origin(self.admin_base_url):
+            # NOT plain "cors_origins non-empty": local dev (this repo's own
+            # .env since stage 6.0) lists several LOCALHOST ports there too —
+            # the adminka/landing Vite servers on 5173-5178 talking to the API
+            # on 8000 — and admin_base_url staying localhost in that setup is
+            # correct, not a bug. The real signal is a cors_origins entry that
+            # is NOT local: that only happens once something has configured
+            # the deployed adminka's actual origin, which is exactly the
+            # environment where admin_base_url must not still be the default.
+            # The OneID callback (app/modules/auth/router.py) redirects a
+            # browser THAT ALREADY CARRIES VALID SESSION COOKIES to
+            # admin_base_url — a deploy that forgets to set it keeps
+            # `http://localhost:5173` and sends that authenticated citizen to
+            # their own machine's localhost: a browser "connection refused",
+            # with nothing in the logs anywhere to say why (final review of
+            # stage 6.6, finding 2 — mirrors the sms_mode=real/public_base_url
+            # guard above).
+            raise ValueError(
+                "admin_base_url must be the deployed adminka origin once "
+                "cors_origins names a non-local one — the OneID callback "
+                "redirects an already-authenticated browser there, and a "
+                f"local origin sends it to a dead end (got {self.admin_base_url!r})"
             )
         if self.email_mode == "real" and not all((self.smtp_host, self.smtp_from)):
             raise ValueError("email_mode=real requires smtp_host and smtp_from")

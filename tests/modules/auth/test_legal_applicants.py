@@ -61,7 +61,7 @@ async def register_individual(client, pinfl: str, *, db, legal_info=()) -> None:
     r = await client.get(
         f"{API}/auth/oneid/callback", params={"code": encode_mock_code(prof), "state": state}
     )
-    assert r.status_code == 200
+    assert r.status_code == 303
     phone = f"+9989{pinfl[-8:]}"
     await client.post(
         f"{API}/auth/otp/request",
@@ -294,9 +294,11 @@ async def test_add_second_representative(db):
         await second_client.get(f"{API}/auth/oneid/authorize")
         state = second_client.cookies.get("oneid_state")
         prof = OneIdProfile(pinfl=second, full_name="SECOND")
-        me = await second_client.get(
+        r = await second_client.get(
             f"{API}/auth/oneid/callback", params={"code": encode_mock_code(prof), "state": state}
         )
+        assert r.status_code == 303
+        me = await second_client.get(f"{API}/auth/me")
         assert me.json()["representations"][0]["applicant"]["stir"] == stir
 
 

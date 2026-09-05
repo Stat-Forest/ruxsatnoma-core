@@ -77,18 +77,57 @@ def encode_mock_code(profile: OneIdProfile) -> str:
     return encode_payload(profile.to_snapshot())
 
 
+def provider_authorize_url(*, state: str, redirect_uri: str, scope: str) -> str:
+    """The real sso.egov.uz `Authorization.do` request shape (field names to be
+    re-verified against current OneID docs before the stage 5.1 real adapter is
+    written — see the module docstring). This used to be what
+    `MockOneId.authorize_url` itself returned, which sent a browser clicking the
+    adminka's OneID button to the real provider even with `ONEID_MODE=mock` —
+    a dead end with no route back (final review of stage 6.6, finding 1).
+    Nothing calls this today (`get_oneid_adapter()` still raises
+    `NotImplementedError` for `oneid_mode=real`); it is kept, and pinned by a
+    test, purely so that shape is not lost and stage 5.1 has it to reproduce."""
+    query = urlencode(
+        {
+            "response_type": "one_code",
+            "client_id": "mock",
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": scope,
+        }
+    )
+    return f"https://sso.egov.uz/sso/oauth/Authorization.do?{query}"
+
+
+# The identity a click on the mock OneID button logs a browser in as. Never a
+# real citizen's PINFL — no PINFL-generation scheme in use produces fourteen
+# identical digits, the same reasoning behind the reserved prefixes
+# `app/seed/demo.py`'s own DEMO_STAFF/DEMO_APPLICANT rows document. A
+# constant, not a setting: `oneid_mode=mock` never runs in prod
+# (`_forbid_default_secret_in_prod` forbids it), so no deployment would ever
+# want a different demo persona here — this identity exists only to prove the
+# redirect chain is walkable in a browser, not to pick who is being demoed.
+MOCK_DEMO_PROFILE = OneIdProfile(
+    pinfl="99999999999999",
+    full_name="MOCK ONEID DEMO",
+    phone="+998900000000",
+)
+
+
 class MockOneId:
     def authorize_url(self, *, state: str, redirect_uri: str, scope: str) -> str:
-        query = urlencode(
-            {
-                "response_type": "one_code",
-                "client_id": "mock",
-                "redirect_uri": redirect_uri,
-                "state": state,
-                "scope": scope,
-            }
-        )
-        return f"https://sso.egov.uz/sso/oauth/Authorization.do?{query}"
+        """Points a browser back at THIS application's own callback with a
+        walkable demo `code`, never at the real provider — before this, the
+        adminka's OneID tab sent a citizen's whole browser tab to
+        sso.egov.uz's real error page with no way back, on every environment
+        that exists today (final review of stage 6.6, finding 1). `scope` is
+        accepted only to match `OneIdAdapter`'s shape: the callback this URL
+        targets reads just `code` and `state`, and `redirect_uri` is reused
+        verbatim rather than reconstructed, so this always lands exactly where
+        the real provider was configured to."""
+        code = encode_mock_code(MOCK_DEMO_PROFILE)
+        query = urlencode({"code": code, "state": state})
+        return f"{redirect_uri}?{query}"
 
     async def exchange_code(self, code: str) -> OneIdProfile:
         try:
