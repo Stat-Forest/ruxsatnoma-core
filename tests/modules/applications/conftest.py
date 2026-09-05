@@ -247,6 +247,28 @@ async def other_zone_hodim_client(db: AsyncSession, other_leshoz: Organization):
         yield client
 
 
+@pytest.fixture
+async def gis_specialist_client(db: AsyncSession, leshoz: Organization):
+    """Task 5's `kind="gis"` caller — a real `gis_specialist` ROLE user
+    (migrations 0010/0011's `ROLE_GRANTS`: `gis.contours.manage`,
+    `gis.layers.manage`, `norms.manage` — none of which is "authorised to
+    write an application conclusion" or holds `applications.review`), zoned to
+    the SAME `leshoz` `hodim_client` shares.
+
+    **`_head_client`, never `_client_for`** (`hodim_client`'s own template,
+    line ~784): `_client_for`/`signed_in_with` build every actor under the
+    `executor_staff` ROLE, personal grants on top — and `executor_staff`'s OWN
+    `role_permissions` row already carries `applications.review` (migration
+    0015), which would silently let this fixture through `/recalculate`'s
+    `require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE)` and
+    prove nothing about a role that does not hold either. `make_user(...,
+    role_code="gis_specialist")` is what makes this the actor design/03 and
+    the fail-closed gap are actually about."""
+    user = await make_user(db, role_code="gis_specialist", organization_id=leshoz.id)
+    async for client in _head_client(db, user):
+        yield client
+
+
 def unique_stir() -> str:
     """A fresh, valid-shape (`^[0-9]{9}$`) STIR per call — `applicants.stir` is
     UNIQUE and this test DB is shared and persistent. ASCII digits written out,
@@ -1001,6 +1023,37 @@ async def application_in_review(hodim_client, submitted_application: str) -> str
     result = await hodim_client.post(f"/api/v1/applications/{submitted_application}/start-review")
     assert result.status_code == 200, result.text
     return submitted_application
+
+
+@pytest.fixture
+async def approved_application(executor_head_client, application_in_review: str) -> str:
+    """`application_in_review`, carried through the REAL decision route —
+    never by writing `status='APPROVED'` on the row (lesson: build a fixture's
+    precondition through the real transition). Task 5's own
+    `test_recalculating_an_approved_application_is_refused` (ruling 17) is the
+    one caller, and all it needs is a `calculations`-CLOSED status; it does
+    not need the status to be literally `APPROVED`.
+
+    It will not literally BE `APPROVED` when this returns: 3.10a's
+    `payments.subscribers.on_application_approved` is registered on the same
+    bus and runs INSIDE `/approve`'s own transaction, so the row is already
+    `INVOICED` (backend/CLAUDE.md, `applications` section) — no client of this
+    route ever observes `APPROVED`, only the history has it. `INVOICED` sits in
+    `norms.service._APPLICATION_CLOSED_FOR_CALCULATION` beside `APPROVED`
+    itself, so the one thing the fixture's name promises — "closed to a
+    recalculation, whoever asks" — holds regardless.
+
+    `_decide` is `test_decision.py`'s own helper (fetch `GET /package`, sign
+    exactly those bytes, POST) — imported locally, the same reason
+    `submitted_application` above imports `_submit` locally: a conftest
+    importing a test module at collection time is a circularity waiting for
+    the day that module wants a fixture from here.
+    """
+    from tests.modules.applications.test_decision import _decide
+
+    result = await _decide(executor_head_client, application_in_review, "approve")
+    assert result.status_code == 200, result.text
+    return application_in_review
 
 
 @pytest.fixture

@@ -352,20 +352,29 @@ async def test_applications_permission_seeds(db) -> None:
 
 
 def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> None:
-    """The one guard against `schemas.ApplicationStatus` and its three siblings
+    """The one guard against `schemas.ApplicationStatus` and its siblings
     drifting from the tuples `models.py` builds its CHECK constraints from
     (lesson: an enum-ish column has ONE source of truth). The members have to be
     written out — pyright rejects a starred variable inside `Literal` — so a
     value added on one side and forgotten on the other would be a 422 that
     should have been a 200, or an `IntegrityError` 500 that should have been a
-    422. `permits/test_models.py` carries the identical guard."""
+    422. `permits/test_models.py` carries the identical guard. Task 5 (3.9b)
+    adds `ConclusionKind`/`ConclusionRecommendation` beside the original four."""
     from typing import get_args
 
-    from app.modules.applications.models import APPLICATION_KINDS, CHANNELS, ON_BEHALF_VALUES
+    from app.modules.applications.models import (
+        APPLICATION_KINDS,
+        CHANNELS,
+        CONCLUSION_KINDS,
+        CONCLUSION_RECOMMENDATIONS,
+        ON_BEHALF_VALUES,
+    )
     from app.modules.applications.schemas import (
         ApplicationKind,
         ApplicationStatus,
         Channel,
+        ConclusionKind,
+        ConclusionRecommendation,
         OnBehalf,
     )
 
@@ -373,3 +382,5 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(OnBehalf)) == set(ON_BEHALF_VALUES)
     assert set(get_args(Channel)) == set(CHANNELS)
     assert set(get_args(ApplicationKind)) == set(APPLICATION_KINDS)
+    assert set(get_args(ConclusionKind)) == set(CONCLUSION_KINDS)
+    assert set(get_args(ConclusionRecommendation)) == set(CONCLUSION_RECOMMENDATIONS)

@@ -30,6 +30,7 @@ from app.modules.applications.models import (
     Application,
     ApplicationAssignment,
     ApplicationCheck,
+    ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
@@ -151,6 +152,30 @@ async def delete_document(db: AsyncSession, document: ApplicationDocument) -> No
     """
     await db.delete(document)
     await db.flush()
+
+
+async def list_conclusions(
+    db: AsyncSession, application_id: uuid.UUID
+) -> list[ApplicationConclusion]:
+    """EVERY conclusion row, oldest first (`uuid7` is time-ordered) — never
+    "the latest per kind": a repeat conclusion after rework is a NEW row and
+    the head reads the history (ruling 10), the same reason `list_checks`
+    beside it never collapses to one row per `check_type`."""
+    rows = await db.execute(
+        select(ApplicationConclusion)
+        .where(ApplicationConclusion.application_id == application_id)
+        .order_by(ApplicationConclusion.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def add_conclusion(db: AsyncSession, conclusion: ApplicationConclusion) -> None:
+    """Stage and flush, then read the row back — `add_document`'s own shape:
+    `created_at` is a `server_default` and the 201 response serializes it
+    (lesson: the row in memory is not what Postgres stored)."""
+    db.add(conclusion)
+    await db.flush()
+    await db.refresh(conclusion)
 
 
 async def add_checks(db: AsyncSession, rows: list[ApplicationCheck]) -> None:

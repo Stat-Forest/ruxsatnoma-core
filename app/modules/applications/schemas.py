@@ -54,6 +54,10 @@ ApplicationStatus = Literal[
 OnBehalf = Literal["self", "legal"]
 Channel = Literal["portal", "mygov"]
 ApplicationKind = Literal["new", "extension"]
+# `application_conclusions.kind`/`.recommendation` (task 5, 3.9b) — the same
+# CHECK-backed-tuple shape as the four above, guarded by the same test.
+ConclusionKind = Literal["executor", "gis"]
+ConclusionRecommendation = Literal["approve", "reject"]
 
 # `application_items.head_count` is a plain integer column, so the only ceiling
 # it has is the one written here. Bounded for the same reason every integer
@@ -246,6 +250,25 @@ class ApplicationCalculationOut(BaseModel):
         )
 
 
+class ApplicationConclusionOut(BaseModel):
+    """One specialist's written finding (task 5, 3.9b; tz/04 С8) — as `POST
+    /applications/{id}/conclusion` answers the one it just wrote, and as the
+    card lists them.
+
+    Immutable (ruling 10): a correction is a NEW row, so — like
+    `ApplicationCheckOut` beside it — the card's `conclusions` is the FULL
+    list, never "the latest per kind"."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    author_id: uuid.UUID
+    kind: ConclusionKind
+    text: str
+    recommendation: ConclusionRecommendation | None
+    created_at: datetime
+
+
 class ApplicationOut(BaseModel):
     """The application's own columns — the response to create and patch, and one
     row of `GET /applications`.
@@ -289,7 +312,7 @@ class ApplicationOut(BaseModel):
 
 
 class ApplicationCardOut(ApplicationOut):
-    """`GET /applications/{id}` — the columns above, flat, plus the five things
+    """`GET /applications/{id}` — the columns above, flat, plus the six things
     that are not columns of `applications` at all."""
 
     items: list[ApplicationItemOut]
@@ -305,6 +328,9 @@ class ApplicationCardOut(ApplicationOut):
     # design/03's own `sla_overdue=true` filter is a LIST feature nothing in
     # this task adds.
     sla_overdue: bool
+    # Task 5 (3.9b), tz/04 С8: every conclusion on record — "the rahbar sees
+    # both conclusions" — never just the newest per `kind` (ruling 10).
+    conclusions: list[ApplicationConclusionOut]
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> ApplicationCardOut:
@@ -323,6 +349,7 @@ class ApplicationCardOut(ApplicationOut):
                 "items": card["items"],
                 "documents": card["documents"],
                 "checks": card["checks"],
+                "conclusions": card["conclusions"],
                 "calculation": (
                     None if calculation is None else ApplicationCalculationOut.build(calculation)
                 ),
@@ -692,6 +719,27 @@ class ApplicationRespondInfoIn(BaseModel):
 
     text: Annotated[str, Field(min_length=1)]
     file_ids: list[uuid.UUID]
+
+
+class ApplicationConclusionIn(BaseModel):
+    """`POST /applications/{id}/conclusion` — task 5 (3.9b): a specialist's
+    written finding (tz/04 С8), immutable (ruling 10 — no PATCH, no DELETE; a
+    correction is a new row, never an edit of this one).
+
+    `kind` names WHICH specialist is writing and is not decoration:
+    `service.add_conclusion` gates each value on its own permission —
+    `"executor"` on `applications.review` (the hodim), and `"gis"` refused
+    with `ERR-ACL-001` for EVERY caller today, because `app/modules/gis/
+    permissions.py` registers no code yet that means "authorised to write an
+    application conclusion" (see that function's docstring — a gap for
+    `decisions.md`/`design/03`, not something this schema can paper over).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ConclusionKind
+    text: Annotated[str, Field(min_length=1)]
+    recommendation: ConclusionRecommendation | None = None
 
 
 class ApplicationDecisionOut(ApplicationOut):

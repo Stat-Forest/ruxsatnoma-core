@@ -87,4 +87,5 @@ NOTIFIED_EVENT_CODES = (
     "application.sla_approaching",
     "application.returned",
     "application.info_requested",
+    "application.recalculated",
 )

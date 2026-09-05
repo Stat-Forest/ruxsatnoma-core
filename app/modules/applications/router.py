@@ -45,9 +45,12 @@ from app.modules.applications.permissions import (
 from app.modules.applications.schemas import (
     ApplicationApproveIn,
     ApplicationAssignIn,
+    ApplicationCalculationOut,
     ApplicationCancelIn,
     ApplicationCardOut,
     ApplicationCheckOut,
+    ApplicationConclusionIn,
+    ApplicationConclusionOut,
     ApplicationCreate,
     ApplicationDecisionOut,
     ApplicationDocumentIn,
@@ -588,6 +591,78 @@ async def respond_info_application(
         await service.respond_info(
             db, application_id, text=payload.text, file_ids=payload.file_ids, actor=actor
         )
+    )
+
+
+# --- Task 5 (3.9b): conclusions and recalculation ------------------------------
+#
+# `conclusion` takes `Depends(get_current_user)` rather than a fixed
+# `require_permission`: which permission it needs depends on the BODY's own
+# `kind`, decided per request inside `service.add_conclusion` (a route-level
+# dependency is resolved before the body is even parsed, so it cannot see
+# `kind` at all). Both branches — `applications.review` for `kind="executor"`,
+# fail-closed for `kind="gis"` — are documented on that function.
+#
+# `recalculate` DOES carry a route-level gate, `applications.review` OR
+# `.decide` — "the hodim or the head" (ruling 17, narrowed 2026-09-05: the GIS
+# specialist is not among them). The WHEN half — which statuses, and whose
+# calculation — is `norms.service.save_calculation`'s own guard
+# (`_assert_application_open_for_calculation`) and is not repeated here.
+#
+# Neither carries an `Idempotency-Key`: a repeat conclusion is a second row by
+# design (ruling 10), and a repeat recalculation is `calculations`' own
+# append-only "the newest wins" (ruling 11) — both replays are the SPECIFIED
+# behaviour, not the duplicate the mechanism exists to suppress.
+
+
+@router.post("/applications/{application_id}/conclusion", status_code=201)
+async def add_conclusion(
+    application_id: uuid.UUID,
+    payload: ApplicationConclusionIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(get_current_user)],
+) -> ApplicationConclusionOut:
+    """A specialist's written finding on the application (tz/04 С8) — the
+    hodim's `kind="executor"`, or `kind="gis"` (refused today, see
+    `service.add_conclusion`). Immutable: no PATCH, no DELETE anywhere in this
+    module — a repeat conclusion after rework is a new row (ruling 10).
+
+    403 `ERR-ACL-001` for a caller who does not hold the permission `kind`
+    requires. 404 `ERR-SYS-003` for an id that does not exist or an
+    application outside the caller's zone.
+    """
+    return ApplicationConclusionOut.model_validate(
+        await service.add_conclusion(
+            db,
+            application_id,
+            kind=payload.kind,
+            text=payload.text,
+            recommendation=payload.recommendation,
+            actor=actor,
+        )
+    )
+
+
+@router.post("/applications/{application_id}/recalculate")
+async def recalculate_application(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[
+        User, Depends(require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE))
+    ],
+) -> ApplicationCalculationOut:
+    """A new `calculations` row, priced off the application's current stored
+    fields against whatever `norms` reads as effective right now — for the
+    hodim or the head to call during review (ruling 17; tz/04 С5: after the
+    vet/cadastre checks, confirm the price or send it for recalculation).
+
+    409 `ERR-NORM-005` (`norms`' own state-conflict code, never
+    `ERR-APP-004`) once the application is APPROVED or beyond — by then the
+    figure has been billed and, once a permit exists, printed on a signed
+    document.
+    """
+    return ApplicationCalculationOut.build(
+        await service.recalculate(db, application_id, actor=actor)
     )
 
 

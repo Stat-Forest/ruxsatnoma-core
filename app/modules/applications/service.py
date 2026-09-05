@@ -42,6 +42,7 @@ from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_S
 from app.modules.applications.models import (
     Application,
     ApplicationAssignment,
+    ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
@@ -930,10 +931,11 @@ async def patch_draft(
 
 async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
     """`GET /applications/{id}` — the application, its items, its documents, its
-    checks and its current price.
+    checks, its conclusions and its current price.
 
     `checks` is the FULL list, never the latest per type: a repeat check is a
-    new row and the history is the evidence (ruling 12). `calculation` is
+    new row and the history is the evidence (ruling 12); `conclusions` (task 5)
+    is the same shape for the identical reason (ruling 10). `calculation` is
     `current_calculation` — the newest `calculations` row, which is what
     `payments` invoices from — read through this module's own public surface
     rather than by querying `norms`' tables, so the card and the invoice can
@@ -956,6 +958,7 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
         "items": await repo.list_items(db, application.id),
         "documents": await repo.list_documents(db, application.id),
         "checks": await repo.list_checks(db, application.id),
+        "conclusions": await repo.list_conclusions(db, application.id),
         "calculation": await current_calculation(db, application.id),
         "sla_overdue": (
             False
@@ -2488,6 +2491,151 @@ async def respond_info(
         reason=text,
     )
     return application
+
+
+# --- Task 5 (3.9b): conclusions and recalculation ---------------------------
+
+APPLICATION_CONCLUSION_ADD = "application_conclusion.add"
+
+
+async def _holds(db: AsyncSession, actor: User, code: str) -> bool:
+    """One permission code, `sys_admin` bypass included — `_holds_staff_read`'s
+    own idiom (line ~459), narrowed to a single code: `add_conclusion` gates a
+    WRITE on exactly one code per `kind`, never "any of several"."""
+    if await auth_service.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    return code in await auth_repo.permission_codes(db, actor)
+
+
+async def add_conclusion(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    kind: str,
+    text: str,
+    recommendation: str | None,
+    actor: User,
+) -> ApplicationConclusion:
+    """`POST /applications/{id}/conclusion` — tz/04 С8: a specialist's written
+    finding, on the record for the head to read before deciding. Immutable
+    (ruling 10): no PATCH, no DELETE anywhere in this module — a correction is
+    a NEW row (`test_a_corrected_conclusion_is_a_second_row_and_both_are_
+    visible`), and `application_conclusions` carries no append-only DB trigger
+    only because nothing here ever attempts an UPDATE in the first place.
+
+    WHO may write which `kind` is not one flat rule, and the permission check
+    runs BEFORE the application is even fetched — exactly as a route-level
+    `require_permission` would answer before the handler ever sees the id —
+    since `kind` alone already decides it and leaks nothing about which
+    application is being asked about:
+
+      * `kind="executor"` — the hodim, gated on `applications.review` and then
+        zone-checked (`_assert_in_actor_zone`, the same two-part rule
+        `request_info` applies beside it: the permission answers "may this
+        role at all", the zone answers "on whose rows").
+      * `kind="gis"` — `design/03` grants the GIS specialist their own
+        conclusion ("formally only 'K' on an application, but the role
+        description includes conclusions, and a conclusion does not mutate
+        the application"), but `app/modules/gis/permissions.py` registers no
+        code that means "authorised to write an application conclusion" —
+        only `gis.contours.manage`, `gis.contours.approve` and
+        `gis.layers.manage` exist there (migration 0010's `ROLE_GRANTS` for
+        `gis_specialist`), and none of the three fits. **FAILS CLOSED**:
+        refused with `ERR-ACL-001` for every caller, including the real
+        `gis_specialist` role holding both of its own grants — never widened
+        onto an `applications.*` code invented for this route, and never a
+        role-string comparison at this site. This is a gap for
+        `decisions.md`/`design/03` to close explicitly with a real
+        permission code, not something this route can paper over.
+    """
+    if kind == "executor":
+        if not await _holds(db, actor, APPLICATIONS_REVIEW):
+            raise err("ERR-ACL-001", details={"permission": APPLICATIONS_REVIEW})
+    else:
+        # The schema's `Literal["executor", "gis"]` admits nothing else.
+        raise err(
+            "ERR-ACL-001",
+            details={"reason": "gis_conclusion_permission_not_yet_defined"},
+        )
+
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_CONCLUSION_ADD)
+
+    row = ApplicationConclusion(
+        application_id=application.id,
+        author_id=actor.id,
+        kind=kind,
+        text=text,
+        recommendation=recommendation,
+    )
+    await repo.add_conclusion(db, row)
+    await audit.log(
+        db,
+        action=APPLICATION_CONCLUSION_ADD,
+        user_id=actor.id,
+        object_type="application_conclusion",
+        object_id=row.id,
+        new_value={
+            "application_id": str(application.id),
+            "kind": kind,
+            "recommendation": recommendation,
+        },
+    )
+    return row
+
+
+NOTIFY_APPLICATION_RECALCULATED = "application.recalculated"
+
+
+async def recalculate(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Calculation:
+    """`POST /applications/{id}/recalculate` — ruling 17: a NEW `calculations`
+    row for an application still open to review (SUBMITTED, IN_REVIEW,
+    PENDING_INFO or RETURNED); from APPROVED onward it is refused, because by
+    then the figure has been billed (3.10a) and, once a permit exists, printed
+    on a signed document (3.11a). tz/04 С5: after the vet/cadastre checks, the
+    hodim confirms the price or sends it for recalculation — a corrected
+    tariff, a newly published `coef_sb` row, or a discrepancy one of those
+    external checks surfaced. The GIS specialist is NOT among the actors this
+    route admits (owner decision, 2026-09-05); their own `kind=gis` conclusion
+    beside this route is what `design/03` grants them instead of a re-price.
+
+    Routed entirely through `norms.service.save_calculation`, which already
+    carries `_assert_application_open_for_calculation` — the actor-dependent
+    WHO/WHEN guard (`applications.review`/`.decide`, plus the four statuses
+    above; APPROVED-and-beyond closed to everyone) and the SUBJECT check (the
+    calculation must price the application's own contour). Nothing here
+    re-implements any of that (CLAUDE.md: the guard lives in `norms` and
+    BOTH write paths go through it), and the refusal is `norms`' own
+    state-conflict code, `ERR-NORM-005` (409) — never `ERR-APP-004`.
+
+    `checks.calculation_payload` builds the request from the application's
+    CURRENT stored fields — the same call `submit`'s own `_price` makes — and
+    prices them against whatever `norms` reads as effective right now. This
+    stage adds no route letting a reviewer edit those fields directly, so what
+    a recalculation can change is the RATES the engine reads, not the
+    application's own columns; a future stage that lets a reviewer correct the
+    herd or the area mid-review reprices through this same function.
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    payload = await checks.calculation_payload(db, application)
+    calculation = await norms_service.save_calculation(
+        db,
+        payload=payload.model_copy(update={"application_id": application.id}),
+        actor=actor,
+    )
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_RECALCULATED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": application.number},
+        object_type="application",
+        object_id=application.id,
+    )
+    return calculation
 
 
 async def cancel(
