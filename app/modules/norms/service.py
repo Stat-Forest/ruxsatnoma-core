@@ -1036,7 +1036,7 @@ async def _application_in_actor_zone(db: AsyncSession, actor: User, facts: Any) 
 
     The zone is resolved from `assigned_org_id` while the application has one
     and from the CONTOUR's owner before a reviewer takes it into work — the
-    same rule `applications.service._effective_organization` applies, restated
+    same rule `applications.service.effective_organization` applies, restated
     here because a private helper of another module is not part of its surface.
     An application whose organization cannot be resolved at all (a draft with
     no contour yet) is outside every ZONED actor's zone and inside a
