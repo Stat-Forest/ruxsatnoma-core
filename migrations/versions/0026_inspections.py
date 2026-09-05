@@ -728,28 +728,39 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
-    # Seeds first, in reverse order (lesson: a downgrade must delete whatever
-    # its upgrade made possible).
+    """Downgrade schema.
+
+    Order matters here for the same reason the lesson states it
+    ("a downgrade must delete whatever its upgrade made possible"), with a
+    twist this migration's own seeds add: `checklists` and `classifier_items`
+    are seeded with tests in mind, and a REAL test run leaves REAL committed
+    rows in `inspection_acts`/`violation_cases` pointing at them (`_client_
+    for`-style HTTP clients commit for real; `db`'s own rollback never
+    touches them). A manual `DELETE FROM checklists`/`classifier_items` run
+    BEFORE those referencing tables are dropped hits
+    `fk_inspection_acts_checklist_id_checklists` /
+    `fk_violation_cases_violation_type_item_id_classifier_items` on any
+    database a real test suite has actually exercised — invisible against a
+    freshly-migrated, empty one, which is exactly why this shipped once
+    before a live round-trip caught it.
+
+    So: `checklists` needs NO manual delete of its own seeded row at all —
+    `op.drop_table("checklists")` below removes it, and by the time that
+    statement runs, `inspection_acts` (the only referrer) is ALREADY
+    dropped, in the correct order, a few lines above it. `classifier_items`
+    is different: `0005_admin_seeds.py` owns that table and it is NOT
+    dropped here, so its six VT-* rows still need an explicit delete — moved
+    to the END of this function, after `op.drop_table("violation_cases")`
+    (the only referrer) has already run.
+    """
+    # Seeds first, in reverse order — `role_permissions` has no FK from
+    # anything this migration creates, so its position is unconstrained.
     for role, code in ROLE_GRANTS:
         op.execute(
             sa.text(
                 "DELETE FROM role_permissions WHERE permission_code = :code "
                 "AND role_id = (SELECT id FROM roles WHERE code = :role)"
             ).bindparams(code=code, role=role)
-        )
-    op.execute(
-        sa.text("DELETE FROM checklists WHERE id = CAST(:id AS uuid)").bindparams(id=CHECKLIST_ID)
-    )
-    # By ID, one at a time, never by classifier_id: `0005_admin_seeds.py` owns
-    # the classifier itself (and may hold admin-created items beside ours by
-    # the time this downgrade runs) — this migration owns only the six rows it
-    # inserted (the same per-row shape `0024_benefit_proof_doc_type.py` uses).
-    for _code, item_id, *_rest in VIOLATION_TYPES:
-        op.execute(
-            sa.text("DELETE FROM classifier_items WHERE id = CAST(:id AS uuid)").bindparams(
-                id=item_id
-            )
         )
 
     op.execute(
@@ -802,3 +813,17 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_checklists_activity_type_id"), table_name="checklists")
     op.drop_table("checklists")
     # ### end Alembic commands ###
+
+    # `classifier_items` is NOT ours to drop (`0005_admin_seeds.py` owns
+    # `classifiers`/`classifier_items`) — delete only the six rows THIS
+    # migration inserted, one at a time by id (never by classifier_id: an
+    # admin may have added items beside ours). Run HERE, after
+    # `violation_cases` was dropped above — its `violation_type_item_id` FK
+    # is exactly what an upgrade-mirrored delete order would hit against a
+    # live committed case (see this function's own docstring).
+    for _code, item_id, *_rest in VIOLATION_TYPES:
+        op.execute(
+            sa.text("DELETE FROM classifier_items WHERE id = CAST(:id AS uuid)").bindparams(
+                id=item_id
+            )
+        )
