@@ -487,6 +487,86 @@ async def list_contours(
     return list(result.all()), total
 
 
+async def contour_features_geojson(
+    db: AsyncSession,
+    *,
+    bbox: tuple[float, float, float, float] | None,
+    zone: Any,
+    organization_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Published contours as a GeoJSON FeatureCollection — the layer a map
+    draws when NOTHING is picked yet, so an applicant can see the leshoz's
+    parcels at once instead of finding them one at a time in the list.
+
+    Deliberately a sibling of `list_contours` rather than a flag on it: that
+    one is PAGED (`?page=&page_size=`, max 100) because it feeds a list, and
+    paging is the wrong shape for a map, which wants everything inside the
+    viewport and nothing outside it. Same predicates though — published
+    versions only (decision 6), the same `zone` filter, the same
+    `ST_Intersects` bbox — so the two can never disagree about which contours
+    a caller may see.
+
+    Capped like `features_geojson`, with `truncated` saying so: without a
+    bbox this is every published contour in the country, ~13,500 rows once the
+    leshozes land, and the flag is what tells a client to send a viewport
+    instead of trusting a clipped answer.
+
+    Properties stay to identity and area on purpose. Occupancy costs a
+    per-contour aggregate over permits (`contour_card`'s own provider seam),
+    and a map that draws 2,000 polygons would pay it 2,000 times for figures
+    only the picked one ever shows.
+    """
+    conditions: list[Any] = [ContourVersion.status == "published", zone]
+    if organization_id is not None:
+        conditions.append(Contour.organization_id == organization_id)
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        conditions.append(
+            func.ST_Intersects(
+                ContourVersion.geom,
+                func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
+            )
+        )
+    rows = (
+        await db.execute(
+            select(
+                Contour.id.label("contour_id"),
+                Contour.number,
+                Contour.organization_id,
+                ContourVersion.area_ha,
+                func.ST_AsGeoJSON(ContourVersion.geom).label("geometry"),
+            )
+            .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+            .join(Organization, Organization.id == Contour.organization_id)
+            .where(*conditions)
+            .order_by(Contour.number)
+            # One past the cap, so "there are more" is read off this query
+            # rather than a second COUNT over the same predicate.
+            .limit(FEATURE_COLLECTION_LIMIT + 1)
+        )
+    ).all()
+    truncated = len(rows) > FEATURE_COLLECTION_LIMIT
+    rows = rows[:FEATURE_COLLECTION_LIMIT]
+    return {
+        "type": "FeatureCollection",
+        "truncated": truncated,
+        "features": [
+            {
+                "type": "Feature",
+                "id": str(row.contour_id),
+                "geometry": json.loads(row.geometry),
+                "properties": {
+                    "contour_id": str(row.contour_id),
+                    "number": row.number,
+                    "organization_id": str(row.organization_id),
+                    "area_ha": str(row.area_ha),
+                },
+            }
+            for row in rows
+        ],
+    }
+
+
 async def contour_card(db: AsyncSession, contour_id: uuid.UUID) -> Any | None:
     """The published version's card: identity + area + geometry
     (`ST_AsGeoJSON`, computed in SQL — only the resulting STRING crosses into

@@ -29,6 +29,7 @@ from app.modules.gis.schemas import (
     ContourListItem,
     ContourOut,
     ContourPatch,
+    FeatureCollectionOut,
     VersionIn,
     VersionOut,
     VersionPatch,
@@ -61,6 +62,33 @@ async def list_contours(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/contours/features", response_model=FeatureCollectionOut)
+async def list_contour_features(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    organization_id: uuid.UUID | None = None,
+    bbox: str | None = None,
+) -> FeatureCollectionOut:
+    """The published contour layer as GeoJSON — what a map draws before the
+    applicant has picked anything. `GET /gis/contours` above answers the same
+    contours as a paged LIST with no geometry; this answers them as a
+    collection with geometry and no paging, because a viewport is not a page.
+
+    **This route must stay ABOVE `/contours/{contour_id}`.** FastAPI matches in
+    declaration order, so with the two swapped the literal `features` is read
+    as a `uuid.UUID` path parameter and every call to this endpoint is a 422
+    that mentions a contour id nobody sent.
+
+    Send a `?bbox=` — without one this is every published contour the caller
+    may see, and `truncated` in the response says when that hit the cap.
+    """
+    return FeatureCollectionOut.model_validate(
+        await service.list_contour_features(
+            db, bbox=bbox, organization_id=organization_id, actor=user
+        )
     )
 
 
