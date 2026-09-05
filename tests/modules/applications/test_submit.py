@@ -450,6 +450,82 @@ async def test_a_same_key_retry_after_a_refused_submission_replays_it_not_in_fli
     assert retried.json()["error"]["code"] == "ERR-APP-001"
 
 
+async def test_a_same_key_retry_after_a_malformed_body_replays_the_422(
+    applicant_client,
+) -> None:
+    """The `RequestValidationError` handler's own half of the fix (3.9b task
+    3, fix round 1, 2026-09-05): `idempotency_context` is a SIBLING
+    dependency FastAPI resolves — and COMMITS — before it ever discovers a
+    missing `pkcs7` makes the body itself invalid. Without
+    `_settle_idempotency_record` closing the record here too, the SAME key
+    would answer 409 `in_flight` (or `fingerprint_mismatch` for a corrected
+    body) for the whole `IN_FLIGHT_TTL` instead of replaying this 422 — the
+    lockout through the OTHER door `domain_error_handler` alone left open.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    key = str(uuid.uuid4())
+
+    first = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={},  # missing the required `pkcs7` — fails BEFORE the endpoint runs
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 422, first.text
+    assert first.json()["error"]["code"] == "ERR-VAL-001"
+
+    replay = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={},
+        headers={"Idempotency-Key": key},
+    )
+    assert replay.status_code == 422, replay.text
+    assert replay.json() == first.json(), "the SAME key must replay, never hit in_flight"
+
+
+async def test_a_same_key_retry_after_a_server_error_is_not_locked_out(
+    monkeypatch, applicant_client
+) -> None:
+    """The catch-all `Exception` handler's own half of the fix: a 500 is the
+    SERVER's failure, not the request's, so `_settle_idempotency_record`
+    DELETES the marker instead of closing it — unlike the two refusal-replay
+    tests above, a retry with the SAME key must proceed FRESH, never replay
+    the 500 and never hit 409 `in_flight` either.
+
+    Simulated with a monkeypatch that makes `_assert_complete` raise a bare
+    `RuntimeError` instead of its own `ERR-APP-001` — a real, unhandled bug,
+    not a weakened handler — so the request genuinely reaches
+    `unhandled_handler`. The patch is undone before the retry so that call
+    exercises the real code path and its own, unrelated 400 refusal.
+    """
+    from app.modules.applications import service
+
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    key = str(uuid.uuid4())
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated bug")
+
+    monkeypatch.setattr(service, "_assert_complete", _boom)
+    first = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 500, first.text
+    monkeypatch.undo()
+
+    retry = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert retry.status_code != 409, retry.text
+    assert retry.status_code == 400, retry.text
+    assert retry.json()["error"]["code"] == "ERR-APP-001"
+
+
 async def test_an_incomplete_draft_is_refused_400_naming_the_missing_fields(
     applicant_client, published_contour
 ) -> None:
