@@ -158,6 +158,49 @@ def test_sms_mode_real_requires_a_reachable_public_base_url():
     )
 
 
+def test_admin_base_url_must_be_reachable_when_cors_names_a_deployed_origin():
+    """Mirrors the sms_mode=real/public_base_url guard above: the OneID
+    callback (app/modules/auth/router.py) redirects an already-authenticated
+    browser (valid session cookies already set) to admin_base_url. A deploy
+    that points cors_origins at the real adminka origin but forgets
+    ADMIN_BASE_URL sends that browser to its own localhost — a browser
+    "connection refused" with nothing in the logs to explain it (final review
+    of stage 6.6, finding 2)."""
+    with pytest.raises(ValidationError, match="admin_base_url"):
+        Settings(
+            cors_origins=["https://admin.ruxsatnoma.uz"],
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )  # the default, http://localhost:5173, looks configured but is not
+    with pytest.raises(ValidationError, match="admin_base_url"):
+        Settings(
+            cors_origins=["https://admin.ruxsatnoma.uz"],
+            admin_base_url="http://127.0.0.1:5173",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+    assert (
+        Settings(
+            cors_origins=["https://admin.ruxsatnoma.uz"],
+            admin_base_url="https://admin.ruxsatnoma.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        ).admin_base_url
+        == "https://admin.ruxsatnoma.uz"
+    )
+
+
+def test_admin_base_url_stays_local_for_local_multi_port_dev_cors():
+    """Local dev (this repo's own .env, stage 6.0) lists several LOCALHOST
+    ports in cors_origins — the adminka/landing Vite dev servers on their own
+    ports talking to the API on another — and admin_base_url staying
+    localhost there is correct, not the deploy-forgot-to-set-it bug the guard
+    above catches. A guard keyed on plain "cors_origins is non-empty" would
+    refuse this legitimate, working local configuration outright."""
+    settings = Settings(
+        cors_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+    )
+    assert settings.admin_base_url == "http://localhost:5173"
+
+
 def test_env_example_is_a_working_env_file(tmp_path, monkeypatch):
     """`cp .env.example .env` is the README's documented first step, so every entry
     in that file must be a value the app can actually start on. pydantic-settings

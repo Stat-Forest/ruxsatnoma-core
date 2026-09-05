@@ -118,6 +118,32 @@ class Settings(BaseSettings):
                 "origin — Eskiz posts its delivery reports back to it, and a local "
                 f"origin loses every one of them silently (got {self.public_base_url!r})"
             )
+        cors_names_a_deployed_origin = any(
+            not _is_local_origin(origin) for origin in self.cors_origins
+        )
+        if cors_names_a_deployed_origin and _is_local_origin(self.admin_base_url):
+            # NOT plain "cors_origins non-empty": local dev (this repo's own
+            # .env since stage 6.0) lists several LOCALHOST ports there too —
+            # the adminka/landing Vite servers on 5173-5178 talking to the API
+            # on 8000 — and admin_base_url staying localhost in that setup is
+            # correct, not a bug. The real signal is a cors_origins entry that
+            # is NOT local: that only happens once something has configured
+            # the deployed adminka's actual origin, which is exactly the
+            # environment where admin_base_url must not still be the default.
+            # The OneID callback (app/modules/auth/router.py) redirects a
+            # browser THAT ALREADY CARRIES VALID SESSION COOKIES to
+            # admin_base_url — a deploy that forgets to set it keeps
+            # `http://localhost:5173` and sends that authenticated citizen to
+            # their own machine's localhost: a browser "connection refused",
+            # with nothing in the logs anywhere to say why (final review of
+            # stage 6.6, finding 2 — mirrors the sms_mode=real/public_base_url
+            # guard above).
+            raise ValueError(
+                "admin_base_url must be the deployed adminka origin once "
+                "cors_origins names a non-local one — the OneID callback "
+                "redirects an already-authenticated browser there, and a "
+                f"local origin sends it to a dead end (got {self.admin_base_url!r})"
+            )
         if self.email_mode == "real" and not all((self.smtp_host, self.smtp_from)):
             raise ValueError("email_mode=real requires smtp_host and smtp_from")
         if self.payme_mode == "real" and not all((self.payme_merchant_id, self.payme_cashbox_key)):
