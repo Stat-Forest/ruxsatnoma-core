@@ -148,6 +148,43 @@ async def test_the_contour_card_reports_a_measured_zero_on_an_untaken_contour(
     assert body["s_available_ha"] == body["area_ha"]
 
 
+async def test_an_over_allocated_contour_floors_available_area_at_zero_and_says_so(
+    applicant_client, published_contour, leshoz
+):
+    """The Burchmulla demo's own defect: two permits issued over the whole
+    parcel (`10517қ`) made `s_available_ha` render -65.0694 against a
+    65.0694 ga total — `area_ha - occupied_ha` with no floor. Decision
+    (recorded, `.claude/lessons.md` budget is full so it lives in this
+    docstring and `TRACK-REPORT.md` instead): floor `s_available_ha` at zero
+    (a negative "how much can still be requested" is meaningless) but never
+    silently — `over_allocated` names the state a floored figure alone would
+    hide. `published_contour.area_ha` is a fixed 92.0000 (`conftest.py`); the
+    provider below reports 92.0001, one ten-thousandth of a hectare over."""
+    from decimal import Decimal
+
+    from app.modules.gis import service
+
+    async def over_committed(db_, contour_ids):
+        return {published_contour.contour_id: Decimal("92.0001")}
+
+    service.OCCUPANCY_PROVIDERS.append(over_committed)
+    try:
+        card = await applicant_client.get(f"/api/v1/gis/contours/{published_contour.contour_id}")
+        body = card.json()
+        assert body["occupied_ha"] == "92.0001"
+        assert body["s_available_ha"] == "0"
+        assert body["over_allocated"] is True
+
+        listing = await applicant_client.get(f"/api/v1/gis/contours?organization_id={leshoz.id}")
+        item = next(
+            i for i in listing.json()["items"] if i["id"] == str(published_contour.contour_id)
+        )
+        assert item["s_available_ha"] == "0"
+        assert item["over_allocated"] is True
+    finally:
+        service.OCCUPANCY_PROVIDERS.remove(over_committed)
+
+
 async def test_two_registered_occupancy_providers_are_summed_over_a_whole_page(
     db, published_contour, draft_contour
 ):

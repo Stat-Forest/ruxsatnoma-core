@@ -1177,6 +1177,29 @@ async def occupancy_ha(db: AsyncSession, contour_id: uuid.UUID) -> tuple[Decimal
     return totals[contour_id], source
 
 
+def _available_ha(area_ha: Decimal, occupied_ha: Decimal) -> tuple[Decimal, bool]:
+    """`s_available_ha` and whether the contour is over-allocated.
+
+    Two permits issued over the same whole parcel (the Burchmulla demo's
+    `10517қ`: -65.0694 ga reported against a 65.0694 ga total) make
+    `area_ha - occupied_ha` negative — a true state, not a measurement bug
+    (`occupancy_provider`'s own docstring: counting every ACTIVE permit with
+    no period filter is the DELIBERATE conservative direction, "never
+    over-book" stated as a ceiling on how FREE the figure may read, not a
+    promise it can never go negative). A raw negative reads as nonsense to
+    any consumer computing "how much can still be requested" — but silently
+    flooring it to zero would erase the one signal that the allocation is
+    wrong, so both are reported: `s_available_ha` floored at zero (what
+    remains that CAN be allocated) alongside an explicit `over_allocated`
+    flag (that the parcel already has too much committed against it) —
+    "loudly wrong beats silently wrong" (`CLAUDE.md`'s own phrase for
+    `coef_sb:*`/`benefit_proof`), never a value an operator has to notice by
+    subtracting two other fields themselves.
+    """
+    raw = area_ha - occupied_ha
+    return max(raw, Decimal("0")), raw < Decimal("0")
+
+
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
     """Four comma-separated finite WGS84 degrees — anything else (wrong count,
     non-numeric, non-finite, out of range, min greater than max) is
@@ -1259,18 +1282,21 @@ async def list_contours(
         limit=params.page_size,
     )
     occupied_by_id, source = await occupancy_map(db, [row.contour_id for row in rows])
-    items = [
-        {
-            "id": row.contour_id,
-            "number": row.number,
-            "organization_id": row.organization_id,
-            "area_ha": row.area_ha,
-            "occupied_ha": occupied_by_id[row.contour_id],
-            "s_available_ha": row.area_ha - occupied_by_id[row.contour_id],
-            "occupancy_source": source,
-        }
-        for row in rows
-    ]
+    items = []
+    for row in rows:
+        available, over_allocated = _available_ha(row.area_ha, occupied_by_id[row.contour_id])
+        items.append(
+            {
+                "id": row.contour_id,
+                "number": row.number,
+                "organization_id": row.organization_id,
+                "area_ha": row.area_ha,
+                "occupied_ha": occupied_by_id[row.contour_id],
+                "s_available_ha": available,
+                "over_allocated": over_allocated,
+                "occupancy_source": source,
+            }
+        )
     return items, total
 
 
@@ -1317,6 +1343,7 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
     if row is None:
         raise err("ERR-SYS-003")
     occupied, source = await occupancy_ha(db, contour_id)
+    available, over_allocated = _available_ha(row.area_ha, occupied)
     return {
         "id": row.contour_id,
         "number": row.number,
@@ -1326,7 +1353,8 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
         "area_ha": row.area_ha,
         "geometry": json.loads(row.geometry),
         "occupied_ha": occupied,
-        "s_available_ha": row.area_ha - occupied,
+        "s_available_ha": available,
+        "over_allocated": over_allocated,
         "occupancy_source": source,
     }
 

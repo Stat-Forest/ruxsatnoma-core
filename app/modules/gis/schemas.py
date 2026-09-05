@@ -300,7 +300,15 @@ class ContourListItem(BaseModel):
     placeholder, shared with `ContourCardOut` below: `s_available_ha`
     degrades to the full `area_ha` until something registers an
     `OCCUPANCY_PROVIDERS` entry, and `occupancy_source` says so explicitly so
-    a front-end can never mistake the placeholder for a measurement."""
+    a front-end can never mistake the placeholder for a measurement.
+
+    `s_available_ha` is floored at zero (`gis.service._available_ha`) — a
+    negative "available area" is meaningless to a consumer asking how much
+    can still be requested. `over_allocated` is the explicit signal for the
+    case that floor would otherwise hide: `occupied_ha` already exceeding
+    `area_ha` (two permits issued over the whole parcel is a real,
+    demo-witnessed state, not a display bug) — named rather than left for a
+    reader to notice by subtracting two other fields themselves."""
 
     id: uuid.UUID
     number: str
@@ -308,6 +316,7 @@ class ContourListItem(BaseModel):
     area_ha: Decimal
     occupied_ha: Decimal
     s_available_ha: Decimal
+    over_allocated: bool
     occupancy_source: str
 
     @field_serializer("area_ha", "s_available_ha")
@@ -321,7 +330,8 @@ class ContourCardOut(BaseModel):
     `occupied_ha` is intentionally NOT run through `_trim_decimal`: it is a
     computed sum, not a value round-tripped through a NUMERIC column, and
     keeping its full 4-dp precision (`"0.0000"`, not `"0"`) is what makes it
-    read as a real figure rather than a rounded-away one."""
+    read as a real figure rather than a rounded-away one. `s_available_ha`/
+    `over_allocated` — see `ContourListItem`'s own docstring, the same shape."""
 
     id: uuid.UUID
     number: str
@@ -332,6 +342,7 @@ class ContourCardOut(BaseModel):
     geometry: dict[str, Any]
     occupied_ha: Decimal
     s_available_ha: Decimal
+    over_allocated: bool
     occupancy_source: str
 
     @field_serializer("area_ha", "s_available_ha")
