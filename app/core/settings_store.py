@@ -37,7 +37,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.key: spec
     for spec in (
         SettingSpec("session_absolute_hours", int, 12, "Session lifetime in hours"),
-        SettingSpec("session_idle_minutes", int, 30, "Sign-out after this much inactivity"),
+        SettingSpec("session_idle_minutes", int, 300, "Sign-out after this much inactivity"),
         SettingSpec("login_max_attempts", int, 5, "Failed logins before the account locks"),
         SettingSpec("login_lockout_minutes", int, 15, "How long a locked account stays locked"),
         SettingSpec("mfa_token_ttl_minutes", int, 5, "Lifetime of the interim MFA token"),
@@ -136,6 +136,23 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             # row, never the code, if that shows up in the field.
             "Per-IP limit for the anonymous permit check by series and number",
         ),
+        # The public price estimate (decision #63) is the third anonymous surface
+        # after the login-adjacent routes and the QR check — same reasoning as
+        # both: an anonymous compute endpoint is an obvious abuse target, and the
+        # two narrow catalog reads it needs (activity/livestock types) are cheap
+        # enough to share one, higher-headroom bucket rather than one each.
+        SettingSpec(
+            "ratelimit_public_calc_estimate_per_minute",
+            int,
+            20,
+            "Per-IP limit for the anonymous POST /public/calculations/estimate",
+        ),
+        SettingSpec(
+            "ratelimit_public_refs_per_minute",
+            int,
+            60,
+            "Per-IP limit for the anonymous GET /public/refs/* catalog reads",
+        ),
         SettingSpec(
             "gis_area_mismatch_pct",
             int,
@@ -160,6 +177,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             str,
             "permit_head,permit_chief_forester,permit_accountant,permit_recipient",
             "Purposes that must all be signed before a permit may become ACTIVE (C11)",
+        ),
+        # `signatures._REQUIREMENT_SETTINGS["permit_decision"]` — the same data
+        # change that spec's own comment invites, for a second `object_type`. Its
+        # literal, "permit_decision", is `signers.DECISION_PURPOSE` repeated by
+        # hand: this module may not import a domain module to reach it
+        # (`app/core/` never imports domain modules).
+        SettingSpec(
+            "permit_decision_required_signatures",
+            str,
+            "permit_decision",
+            "Purpose that must be signed to change a permit's status (suspend/resume/revoke)",
         ),
         SettingSpec(
             "payme_cashbox_key_hash",

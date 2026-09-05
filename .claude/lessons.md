@@ -63,40 +63,36 @@ Tooling and environment.
 - **How to apply:** New model file → registry import → `alembic revision --autogenerate`
   → the diff must be non-empty and must contain your tables.
 
-## A downgrade must delete whatever its upgrade made possible
+## A downgrade must delete whatever its upgrade made possible — and an append-only referrer blocks even the nulling UPDATE
 
 - **Rule:** A migration that widens a CHECK, or seeds a row other tables will reference,
-  owes its `downgrade()` the matching `DELETE` — written when the migration is written,
-  not when someone finally hits it.
-- **Why:** Two shapes, both already red in CI: `0006` widened `otp_codes.purpose` and
-  restored the narrow CHECK against rows that already violated it; `0010` seeded the
-  `gis.import.finished` template and deleted only the template, so
-  `fk_notifications_template_id_notification_templates` broke the round-trip the moment
-  task 7 actually sent the event — in a task that touched no migration.
-- **How to apply:** Widening a constraint → data-cleanup statement in the downgrade.
-  Seeding a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the
-  template delete. When the round-trip goes red in a task that changed no migration, look
-  for the event that task started emitting.
+  owes its `downgrade()` the matching `DELETE` — written when the migration is written, not
+  when someone finally hits it. If the table holding the FK is append-only, its own trigger
+  blocks even the `UPDATE ... SET col = NULL` a plain FK-clearing `DELETE` would need first.
+- **Why:** Three shapes, one class. `0006` widened `otp_codes.purpose` and restored the
+  narrow CHECK against rows that already violated it; `0010` seeded `gis.import.finished`
+  and deleted only the template, breaking the round-trip via
+  `fk_notifications_template_id_notification_templates` the moment task 7 sent the event —
+  in a task that touched no migration. `0023` (3.11b) seeds `permit_status_reasons`, which
+  `permit_status_history.reason_item_id` FKs to: a bare `DELETE` on the classifier hits that
+  FK, and nulling it first with a bare `UPDATE` hits the table's OWN append-only trigger —
+  invisible against an EMPTY database, real once one real decision has been signed.
+- **How to apply:** Widening a constraint → data-cleanup statement in the downgrade. Seeding
+  a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the template
+  delete. Seeding a row an APPEND-ONLY table's column will FK to → wrap the nulling `UPDATE`:
+  `DISABLE`/`ENABLE TRIGGER USER` (never `ALL`, superuser-only) around `UPDATE ... SET col = NULL`,
+  then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red
+  in a task that changed no migration, look for the event it started emitting.
 
-## Multiple Alembic heads: resolve with an empty merge migration
+## A new Alembic head needs both a merge migration and the round-trip test's literal moved
 
-- **Rule:** When two branches each add a migration, run `alembic merge heads` — never
-  delete a migration or hand-edit `down_revision`.
-- **Why:** Rewriting revision history breaks every environment that already applied the
-  original revisions (dev DB, test DB, CI, later prod). *(from ControlAI; live risk here
-  — Oybek runs parallel sessions.)*
-- **How to apply:** `uv run alembic merge heads -m "merge"`, commit it, keep going.
-  `make heads` is the gate; check `uv run alembic heads` after any rebase.
-
-## The round-trip test's expected head version is a hardcoded string every migration must bump
-
-- **Rule:** After adding a migration, update `tests/test_migrations.py::
-  test_downgrade_upgrade_roundtrip`'s `assert version == "<old head>"` in the same commit.
-- **Why:** The assertion is a literal, not derived from `alembic heads` — a brand-new
-  migration passes every test of its own and fails this one with `assert '0011' == '0010'`,
-  which reads like a chain bug rather than a one-line test update (hit adding 0011, 3.7 t1).
-- **How to apply:** New head → grep `tests/test_migrations.py` for the previous head string.
-  It is on no task brief's file list, so only a full run surfaces it.
+- **Rule:** Two branches, two migrations → `alembic merge heads`, never a hand-edited
+  `down_revision`; same commit, bump `test_migrations.py`'s hardcoded head-literal assertion.
+- **Why:** Hand-editing history breaks every environment on the original revisions
+  (*ControlAI*); the literal isn't derived from `alembic heads`, so a new migration fails it
+  alone, reading like a chain bug (0011, 3.7 t1; `merge_0018_0020`, 3.9b/3.11b).
+- **How to apply:** `alembic merge heads -m "merge"`; `make heads` is the gate — grep the
+  test for the previous head string, since no task brief lists that file.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
@@ -107,26 +103,20 @@ Tooling and environment.
 - **How to apply:** If `alembic check` is suddenly dirty on a machine that just recreated
   its volumes, check for those schemas before suspecting the models.
 
-## `sa.literal(value, JSONB)` inside `.bindparams()` binds the wrong object
+## A raw `sa.text()` bind touching a Postgres cast has two separate traps
 
-- **Rule:** For a JSONB literal in a raw migration `sa.text(...)`, pre-serialize with
-  `json.dumps` and bind it as text with an explicit `CAST(:x AS jsonb)` — never pass
-  `sa.literal(value, postgresql.JSONB)` as the keyword value.
-- **Why:** `.bindparams(key=sa.literal(v, type_))` binds the `BindParameter` construct
-  itself, not `v`; asyncpg then raises `DataError: ... object has no attribute 'encode'`
-  (migration 0010, caught RED/GREEN, never reached a database).
-- **How to apply:** Prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and a
-  plain dict (0009's pattern, unaffected); otherwise `json.dumps` + `CAST`.
-
-## A bind param immediately followed by `::` loses its last letter in `sa.text()`
-
-- **Rule:** Never write `:name::cast_type` inside `sa.text(...)` — write
-  `CAST(:name AS cast_type)`.
-- **Why:** `TextClause`'s regex is `(?<![:\w\x5c]):(\w+)(?!:)`; the trailing lookahead makes
-  `\w+` backtrack one character, registering the param as `valu` instead of `value`, so
+- **Rule:** Inside a migration's `sa.text(...)`, always write `CAST(:name AS type)` — never
+  `:name::type`, and never `.bindparams(name=sa.literal(v, sometype))` for the value itself.
+- **Why:** Two failures, one boundary, both caught RED/GREEN. `:name::type` — `TextClause`'s
+  regex backtracks its trailing lookahead, registering the param as `valu` not `value`, so
   `.bindparams(value=...)` raises `ArgumentError: ... doesn't define a bound parameter named
-  'value'` (migration 0012, 3.7 t2; caught RED/GREEN).
+  'value'` (migration 0012, 3.7 t2). `sa.literal(v, postgresql.JSONB)` as a bind VALUE binds
+  the `BindParameter` construct itself, not `v` — asyncpg then raises `DataError: ... object
+  has no attribute 'encode'` (migration 0010).
 - **How to apply:** Grep any new raw-SQL migration or test for `:\w+::` before running it.
+  For a JSONB literal, prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and
+  a plain dict (0009's pattern, unaffected by either trap); otherwise pre-serialize with
+  `json.dumps` and bind as text under `CAST(:x AS jsonb)`.
 
 ## A bare `alembic` CLI command targets the shared dev DB, not your worktree's test DB
 
@@ -352,26 +342,26 @@ Tooling and environment.
 
 # Permissions, roles, transitions
 
-## Zone scoping is not a permission check — a read path needs both
+## An access rule has ONE source, and every path that answers it derives from there
 
-- **Rule:** `require_permission(...)` answers "may this role do this at all"; `zone_filter`
-  answers "on whose rows". Every endpoint returning territory-scoped data needs BOTH,
-  including the small sibling endpoints.
-- **Why:** `GET /admin/users/{id}/permissions` passed the permission gate but was not
-  zone-scoped like the user card next to it, so a regional admin could read another region's
-  user through it (3.3b final review, `aa1d551`).
-- **How to apply:** Adding an endpoint next to a scoped one, copy its scoping, not just its
-  permission code. Add a cross-zone denial test.
-
-## A superuser bypass must be reflected in every path that REPORTS permissions
-
-- **Rule:** `sys_admin` skips the check in `require_permission` (decision #41) — so every
-  endpoint answering "what may I do" must special-case it too.
-- **Why:** `GET /auth/me` reported an empty `permissions[]` for a superuser holding no
-  personal grants: fully privileged in fact, powerless on screen, and the adminka would have
-  hidden every button (3.3a — `MeOut.is_superuser` plus the full registry).
-- **How to apply:** Any new "what can this user do" response gets the superuser branch, not
-  just the enforcement point.
+- **Rule:** Permission, zone and "which named official" are separate questions, and each has
+  exactly one source. Every path that answers a question — enforcing it, reporting it, or
+  merely reading the row — derives its answer from that source, never from a second list
+  written beside it.
+- **Why:** Three drifts, one class. `require_permission` answers "may this role at all",
+  `zone_filter` "on whose rows": `GET /admin/users/{id}/permissions` had the first and not
+  the second, so a regional admin read another region's user (3.3b, `aa1d551`). `sys_admin`
+  skips `require_permission` (decision #41), but `GET /auth/me` reported an empty
+  `permissions[]` for one — fully privileged in fact, powerless on screen (3.3a). And
+  `permits._readable_permit` admitted only the holder or `permits.view_any`, while
+  `add_signature` independently admitted the three required official signers — so the head,
+  chief forester and accountant could SIGN a permit they could not OPEN, and no permit was
+  signable through the UI at all (3.11a, found by an end-to-end run, not by any suite).
+- **How to apply:** Adding a path near a guarded one, copy its scoping, not just its
+  permission code, and add a cross-zone/cross-org denial test. When a read and a write guard
+  the same object, the read derives its rule from the write's own sources — the permits fix
+  intersects `required_purposes()` with `signers.required_role()` and reuses the write path's
+  organization equality.
 
 ## A role name from spec or plan prose is never a `roles.code` — «Раҳбар» is `executor_head`
 
@@ -490,6 +480,16 @@ Tooling and environment.
   `used_sb`, `if snapshot.norm is not None:` for `max_sb`/`remaining_sb`. Before adding a
   caller-side workaround for a gap in a shared function, check whether the gate reads what it
   claims to gate on: a condition never referenced inside its own block is the tell.
+
+## A cached fact must be re-validated wherever its own source can later change
+
+- **Rule:** A column deriving from X, once set trusted to diverge from X on purpose (an
+  assignment), must be RE-checked against X — not just checked for presence — wherever a
+  LATER feature could make X editable again.
+- **Why:** `assigned_org_id` derived from the contour's owner until assigned, then was
+  trusted unconditionally; a later task made RETURNED editable, so a corrected `contour_id`
+  onto another leshoz kept the FIRST leshoz assigned, invisible to either task alone (3.9b).
+- **How to apply:** Before trusting "already set", re-derive from source and compare.
 
 ## A reversed date period inverts a range predicate and hides the rows it should find
 

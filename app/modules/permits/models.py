@@ -285,6 +285,14 @@ class ForestTicket(Base):
     __table_args__ = (
         CheckConstraint(f"status IN {FOREST_TICKET_STATUSES}", name="status_valid"),
         CheckConstraint("valid_to >= valid_from", name="period_ordered"),
+        # `ERR-PERM-003` (plan `03.11b-permits-lifecycle` ruling 19): a second
+        # active ticket on one permit is a conflict, seeded by migration 0023.
+        Index(
+            "uq_forest_tickets_active",
+            "permit_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
     )
 
 

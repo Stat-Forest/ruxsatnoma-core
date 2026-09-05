@@ -107,7 +107,16 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
     db, applicant_client, draft_ready_for_submission
 ) -> None:
     """The signature is step 8 of one transaction: a refusal there must leave no
-    number allocated, no calculation stored and the status still DRAFT."""
+    number allocated, no calculation stored and the status still DRAFT.
+
+    Ruling 18 (в)'s negative pin: an envelope this broken (not even decodable
+    base64url JSON) never reaches the `document_sha256` comparison at all —
+    `eimzo.py::_unparseable_signature` hands back an empty `raw`, so
+    `signatures.service._raised_reason` has nothing to compare and leaves the
+    generic reason alone. A genuinely bad signature must never be told apart
+    from a stale package as anything OTHER than "signature_invalid" — the
+    paired positive is
+    `test_a_price_that_moved_after_signing_is_labeled_package_changed`."""
     from sqlalchemy import func, select
 
     from app.modules.norms.models import Calculation
@@ -119,7 +128,9 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert result.status_code == 422
-    assert result.json()["error"]["code"] == "ERR-SIGN-001"
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "signature_invalid"
 
     card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
     assert card["status"] == "DRAFT"
@@ -132,6 +143,48 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
         )
         == 0
     )
+
+
+async def test_a_price_that_moved_after_signing_is_labeled_package_changed(
+    applicant_client, draft_ready_for_submission, sheep_type_id
+) -> None:
+    """Ruling 18 (в)'s positive pin: a signature that is genuinely valid over
+    the bytes the applicant saw must not be reported as a bare cryptographic
+    failure once `submit` recomputes something else (`ERR-SIGN-001` with
+    `details.reason == "package_changed"`, not the bare, forgery-shaped
+    `"signature_invalid"`).
+
+    The herd moves between `GET /package` and `POST /submit` — a real edit
+    through the real route, the same mechanism a moving tariff or
+    `rule_parameter` uses (`submit`'s own `_price()` call reads whatever is
+    current when it runs) — rather than hand-editing the signed bytes, which
+    would prove nothing about the code path this ruling actually fixed. 60
+    head is still well inside `published_grazing_norm`'s MaxSB of 250, so
+    nothing here trips a blocking check; the only thing under test is the
+    stale signature."""
+    app_id = draft_ready_for_submission
+    pinfl = (await applicant_client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+    doc = (await applicant_client.get(f"/api/v1/applications/{app_id}/package")).content
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={"items": [{"livestock_type_id": str(sheep_type_id), "head_count": 60}]},
+    )
+    assert patched.status_code == 200, patched.text
+
+    result = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={
+            "pkcs7": encode_mock_signature(
+                document=doc, serial=f"SER-{uuid.uuid4().hex[:12]}", issuer="ISS-TEST", pinfl=pinfl
+            )
+        },
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "package_changed"
 
 
 async def test_a_blocking_check_refuses_here_though_the_precheck_only_reported_it(
@@ -404,6 +457,126 @@ async def test_a_replayed_key_returns_the_stored_response_and_not_a_second_numbe
         await db.scalar(select(NumberCounter.last_value).where(NumberCounter.scope == scope))
         == after_first
     )
+
+
+async def test_a_same_key_retry_after_a_refused_submission_replays_it_not_in_flight(
+    applicant_client,
+) -> None:
+    """The applicant-visible half of `core/idempotency.py`'s exception-path fix
+    (3.9b task 3, ANSWERED а, 2026-09-05). `_submit` above mints a FRESH key on
+    EVERY call, which is exactly how this defect stayed hidden: a route that
+    RAISED instead of returning left `response_status` NULL, so the very next
+    call with the SAME key hit 409 `in_flight` for the whole `IN_FLIGHT_TTL` —
+    even though the refusal (an incomplete draft, here) was the applicant's own
+    to fix, the entire point of reusing an idempotency key.
+
+    A SAME-key retry must replay the identical 400 `ERR-APP-001`; a DIFFERENT
+    key must proceed on its own merits rather than being caught up in the
+    first attempt's failure.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    key = str(uuid.uuid4())
+
+    first = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 400, first.text
+    assert first.json()["error"]["code"] == "ERR-APP-001"
+
+    replay = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert replay.status_code == 400, replay.text
+    assert replay.json() == first.json(), "the SAME key must replay, never hit in_flight"
+
+    retried = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert retried.status_code == 400, retried.text
+    assert retried.json()["error"]["code"] == "ERR-APP-001"
+
+
+async def test_a_same_key_retry_after_a_malformed_body_replays_the_422(
+    applicant_client,
+) -> None:
+    """The `RequestValidationError` handler's own half of the fix (3.9b task
+    3, fix round 1, 2026-09-05): `idempotency_context` is a SIBLING
+    dependency FastAPI resolves — and COMMITS — before it ever discovers a
+    missing `pkcs7` makes the body itself invalid. Without
+    `_settle_idempotency_record` closing the record here too, the SAME key
+    would answer 409 `in_flight` (or `fingerprint_mismatch` for a corrected
+    body) for the whole `IN_FLIGHT_TTL` instead of replaying this 422 — the
+    lockout through the OTHER door `domain_error_handler` alone left open.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    key = str(uuid.uuid4())
+
+    first = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={},  # missing the required `pkcs7` — fails BEFORE the endpoint runs
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 422, first.text
+    assert first.json()["error"]["code"] == "ERR-VAL-001"
+
+    replay = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={},
+        headers={"Idempotency-Key": key},
+    )
+    assert replay.status_code == 422, replay.text
+    assert replay.json() == first.json(), "the SAME key must replay, never hit in_flight"
+
+
+async def test_a_same_key_retry_after_a_server_error_is_not_locked_out(
+    monkeypatch, applicant_client
+) -> None:
+    """The catch-all `Exception` handler's own half of the fix: a 500 is the
+    SERVER's failure, not the request's, so `_settle_idempotency_record`
+    DELETES the marker instead of closing it — unlike the two refusal-replay
+    tests above, a retry with the SAME key must proceed FRESH, never replay
+    the 500 and never hit 409 `in_flight` either.
+
+    Simulated with a monkeypatch that makes `_assert_complete` raise a bare
+    `RuntimeError` instead of its own `ERR-APP-001` — a real, unhandled bug,
+    not a weakened handler — so the request genuinely reaches
+    `unhandled_handler`. The patch is undone before the retry so that call
+    exercises the real code path and its own, unrelated 400 refusal.
+    """
+    from app.modules.applications import service
+
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    key = str(uuid.uuid4())
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated bug")
+
+    monkeypatch.setattr(service, "_assert_complete", _boom)
+    first = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 500, first.text
+    monkeypatch.undo()
+
+    retry = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert retry.status_code != 409, retry.text
+    assert retry.status_code == 400, retry.text
+    assert retry.json()["error"]["code"] == "ERR-APP-001"
 
 
 async def test_an_incomplete_draft_is_refused_400_naming_the_missing_fields(

@@ -218,6 +218,75 @@ async def test_a_draft_that_has_moved_on_can_no_longer_be_patched(db, applicant_
     assert refused.json()["error"]["details"]["reason"] == "not_draft"
 
 
+async def test_the_owner_may_patch_a_returned_application(
+    db, applicant_client, submitted_application
+) -> None:
+    """`service._EDITABLE_STATUSES` deliberately holds `{DRAFT, RETURNED}`,
+    not `DRAFT` alone (3.9b task 1 review, Important finding): an application
+    is returned for correction precisely so the applicant can correct it, so
+    PATCH must reach RETURNED exactly as it reaches DRAFT. Do NOT narrow
+    `_EDITABLE_STATUSES` back to `DRAFT`-only — that would silently make a
+    "return for correction" a dead end nobody can act on.
+
+    Built by injecting the status directly, the same way
+    `test_assignment.py::test_a_resubmission_does_not_re_fire_auto_assignment`
+    does: Task 3's `/return` route does not exist yet. Once it ships, that
+    route is what will produce RETURNED for real; this injection stands in
+    for it, not a second, competing way to reach the state. The assertion
+    reads the change back through the response body, not merely a 200 — a
+    route that silently no-ops on a RETURNED application would answer 200
+    too.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import update
+
+    from app.modules.applications.models import Application
+
+    await db.execute(
+        update(Application)
+        .where(Application.id == _uuid.UUID(submitted_application))
+        .values(status="RETURNED")
+    )
+    await db.commit()
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{submitted_application}", json={"period_to": "2027-09-20"}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["period_to"] == "2027-09-20"
+
+    card = (await applicant_client.get(f"/api/v1/applications/{submitted_application}")).json()
+    assert card["period_to"] == "2027-09-20", "the PATCH must actually land, not just answer 200"
+
+
+async def test_a_stranger_still_cannot_patch_a_returned_application(
+    db, applicant_client, other_applicant_client, submitted_application
+) -> None:
+    """RETURNED becoming editable again (task 1 review finding) must not also
+    make it readable/writable by anyone but its owner — the SAME 404
+    `ERR-SYS-003` `test_a_stranger_cannot_patch_my_draft` already gets against
+    a DRAFT."""
+    import uuid as _uuid
+
+    from sqlalchemy import update
+
+    from app.modules.applications.models import Application
+
+    await db.execute(
+        update(Application)
+        .where(Application.id == _uuid.UUID(submitted_application))
+        .values(status="RETURNED")
+    )
+    await db.commit()
+
+    refused = await other_applicant_client.patch(
+        f"/api/v1/applications/{submitted_application}", json={"period_to": "2027-09-20"}
+    )
+    assert refused.status_code == 404
+    assert refused.json()["error"]["code"] == "ERR-SYS-003"
+
+
 async def test_a_representative_files_for_the_legal_entity_they_represent(
     db, representative_client, legal_applicant
 ) -> None:

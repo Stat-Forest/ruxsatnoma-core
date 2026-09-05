@@ -13,9 +13,16 @@ Two columns of `permits` are deliberately absent from every response here:
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_serializer,
+    model_validator,
+)
 
 # Spelled out rather than `Literal[*PERMIT_STATUSES]`: pyright rejects a starred
 # variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal` is exactly
@@ -189,6 +196,114 @@ class PermitSignatureOut(BaseModel):
 
     status: PermitStatus
     missing_signatures: list[str]
+
+
+class DecisionIn(BaseModel):
+    """The body `/suspend`, `/resume` and `/revoke` share (plan
+    `03.11b-permits-lifecycle`, `lifecycle_router.py` and Task 4's own route).
+
+    `legal_basis` and `doc_file_id` are optional at the SCHEMA level because
+    their true requirement is PER-ACT (ruling 6: a document is required for
+    `suspend`/`revoke`, and `PS-07` alone forces a non-blank `legal_basis`) —
+    only the service knows which act is running, and a schema-level
+    `Field(...)` cannot vary by the URL a body was posted to.
+    """
+
+    reason_item_id: uuid.UUID
+    legal_basis: Annotated[str | None, Field(max_length=2000)] = None
+    doc_file_id: uuid.UUID | None = None
+    pkcs7: Annotated[str, Field(min_length=1)]
+
+
+class DuplicateIn(BaseModel):
+    """`POST /permits/{id}/duplicates` — the нусха register (plan
+    `03.11b-permits-lifecycle` ruling 9). `reason` is the whole body: a
+    duplicate carries no document and no ERI signature of its own, because it
+    changes nothing about the permit — it points a new register row at the
+    SAME `pdf_file_id` (`service.issue_duplicate`'s own docstring).
+
+    `StringConstraints(strip_whitespace=True, ...)`, not a plain
+    `Field(min_length=1, ...)`: a reason of pure whitespace has a nonzero
+    length and would otherwise pass as if it said something.
+    """
+
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+
+
+class DuplicateOut(BaseModel):
+    """One row of the register — what both `POST` and `GET
+    /permits/{id}/duplicates` answer.
+
+    `file_id` is always the ORIGINAL permit's `pdf_file_id`: a duplicate is a
+    copy of that one document, never a re-render, so every row of one
+    permit's register names the identical file (ruling 9).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    permit_id: uuid.UUID
+    reason: str
+    file_id: uuid.UUID
+    issued_by: uuid.UUID
+    issued_at: datetime
+
+
+class ForestTicketIn(BaseModel):
+    """`POST /permits/{id}/forest-tickets` — one ўрмон чиптаси against an
+    ACTIVE permit (ВМҚ 506, plan `03.11b-permits-lifecycle` ruling 11).
+
+    `restrictions` is stored exactly as given and validated only as an
+    object with string keys — the real ВМҚ 506 field list is `tz/12` #34 and
+    inventing one now is ruling 11(б). The documented shape a caller is
+    expected to send:
+
+        {"fire_ban_days": [...], "allowed_tools": [...], "notes": "..."}
+
+    `valid_to >= valid_from` is checked HERE rather than left for the DB
+    CHECK (`forest_tickets.period_ordered`) to catch as an `IntegrityError`
+    a caller would have to decode — the same reasoning `gis.schemas`'
+    `_validate_period` already gives its own two callers (lesson: an enum-ish
+    or ordered pair guarded by a DB CHECK is validated in the schema too, so
+    the CHECK is never the first thing a caller meets).
+    """
+
+    valid_from: date
+    valid_to: date
+    restrictions: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _check_period(self) -> Self:
+        if self.valid_to < self.valid_from:
+            raise ValueError("valid_to must not be before valid_from")
+        return self
+
+
+# `models.FOREST_TICKET_STATUSES`, spelled out by hand for the same reason
+# `PermitStatus` above is: pyright rejects a starred variable inside `Literal`,
+# so a `Literal`'s members must be statically visible (lesson: an enum-ish
+# column has ONE source of truth — the tuple). `test_forest_tickets.py`'s own
+# guard test closes the gap.
+ForestTicketStatus = Literal["active", "expired", "revoked"]
+
+
+class ForestTicketOut(BaseModel):
+    """One row of the ВМҚ 506 register — what `POST` answers the moment a
+    ticket is issued, and what one row of `GET /permits/{id}/forest-tickets`
+    carries."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    number: str
+    permit_id: uuid.UUID
+    valid_from: date
+    valid_to: date
+    restrictions: dict[str, Any]
+    status: ForestTicketStatus
+    file_id: uuid.UUID | None
+    issued_by: uuid.UUID
+    created_at: datetime
 
 
 # The four words `tz/04` С12 and `design/03` fix for the public page, spelled out

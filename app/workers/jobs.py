@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core import settings_store
 from app.core.models import IdempotencyKey
 from app.core.time import business_today
+from app.modules.applications import jobs as applications_jobs
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Representation, Session
@@ -258,6 +259,25 @@ async def refund_sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[st
     return counts
 
 
+async def sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
+    """Remind an application's office before its SLA deadline and raise
+    RI-07 once it passes (plan `03.9b-applications-review` task 2).
+
+    Thin wrapper only — `applications.jobs.sla_sweep(db)` holds the actual
+    logic (both candidate queries, the once-only checks, the notification
+    and the audit trail), the same split `refund_sla_sweep` above has from
+    `payments.jobs.refund_sla_sweep`. This function's own job is the one
+    every other job in this file already does: open a session, run it,
+    commit. Same name as the module-level function it wraps, deliberately —
+    `refund_sla_sweep` above is the precedent."""
+    async with factory() as db:
+        counts = await applications_jobs.sla_sweep(db)
+        await db.commit()
+    if counts["reminded"] or counts["flagged"]:
+        logger.info("job.applications_sla_sweep", **counts)
+    return counts
+
+
 async def _drain_batches(
     factory: async_sessionmaker[AsyncSession],
     sweep: Callable[[AsyncSession, uuid.UUID | None], Awaitable[permits_jobs.SweepBatch]],
@@ -326,4 +346,40 @@ async def close_finished_permits(factory: async_sessionmaker[AsyncSession]) -> i
         factory,
         lambda db, after_id: permits_jobs.close_finished(db, after_id=after_id),
         name="close_finished_permits",
+    )
+
+
+async def expire_forest_tickets(factory: async_sessionmaker[AsyncSession]) -> int:
+    """The nightly ВМҚ 506 ticket expiry (plan `03.11b-permits-lifecycle` task 6,
+    ruling 14 revised).
+
+    A wrapper, like every job on this page: the decision lives in
+    `permits.jobs.expire_forest_tickets`, a STANDALONE sweep with its own
+    cursor — a ticket's period need not end when its permit's does, so this is
+    never folded into `expire_permits`'s own batch loop. A ticket's status and
+    its audit entry share one transaction; no notification (a ticket lapsing
+    on its own last day is the calendar, not an event).
+    """
+    return await _drain_batches(
+        factory,
+        lambda db, after_id: permits_jobs.expire_forest_tickets(db, after_id=after_id),
+        name="expire_forest_tickets",
+    )
+
+
+async def watch_stalled_permits(factory: async_sessionmaker[AsyncSession]) -> int:
+    """The nightly report of a permit whose whole period elapsed unsigned
+    (plan `03.11b-permits-lifecycle` task 7, ruling 16).
+
+    A wrapper, like every job on this page: the decision lives in
+    `permits.jobs.watch_stalled_permits`, which **moves nothing** — see its own
+    docstring for why (`tz/12` #16 is open with the Agency) and for where the
+    Agency's eventual answer changes this code. Only the notification and the
+    once-only check share a transaction; there is no status change and no
+    history row to make atomic with anything.
+    """
+    return await _drain_batches(
+        factory,
+        lambda db, after_id: permits_jobs.watch_stalled_permits(db, after_id=after_id),
+        name="watch_stalled_permits",
     )

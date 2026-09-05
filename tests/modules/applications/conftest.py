@@ -22,7 +22,8 @@ import secrets
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -35,6 +36,7 @@ from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
+from app.modules.applications import service as applications_service
 from app.modules.applications.permissions import APPLICATIONS_REVIEW
 from app.modules.auth.models import Applicant, Representation, Role, RolePermission, User
 from app.modules.gis.models import Contour, GisLayer
@@ -196,10 +198,29 @@ async def other_applicant_client(db: AsyncSession):
 
 
 @pytest.fixture
-async def hodim_client(db: AsyncSession, leshoz: Organization):
+async def hodim_user(db: AsyncSession, leshoz: Organization) -> User:
+    """A hodim (tz/03's «ходим», role `executor_staff`) actually IN the leshoz
+    that owns `published_contour` — the identity `hodim_client` below signs in
+    as, and a real candidate `assignment.choose_executor` (3.9b task 1) can
+    pick.
+
+    Plain `make_user(role_code="executor_staff", ...)`, not `_client_for`'s
+    personal-grant shape: `executor_staff`'s OWN `role_permissions` row already
+    carries `applications.review` (migration 0015), so a personal grant on top
+    would be redundant — and `hodim_client` below builds on this SAME row for
+    exactly one reason: a test requesting both must get ONE reviewer, never
+    two independently-created ones a tie-break in `choose_executor` could pick
+    between unpredictably.
+    """
+    return await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+
+
+@pytest.fixture
+async def hodim_client(db: AsyncSession, hodim_user: User):
     """The reviewer (tz/03's «ходим», role `executor_staff`) of the leshoz that
-    owns `published_contour` — the two share the `leshoz` fixture, which pytest
-    caches per test, so "the same zone" is a fact rather than a coincidence.
+    owns `published_contour`, signed in as `hodim_user` — the two share the
+    `leshoz` fixture, which pytest caches per test, so "the same zone" is a
+    fact rather than a coincidence.
 
     ONE permission, and it is exactly what migration 0015 grants
     `executor_staff`: `applications.review`. `applications.view_any` goes to
@@ -211,7 +232,7 @@ async def hodim_client(db: AsyncSession, leshoz: Organization):
     `service._holds_staff_read`, which accepts `applications.review` or
     `.decide` or `.view_any` — this fixture is what proves that.
     """
-    async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=leshoz.id):
+    async for client in _head_client(db, hodim_user):
         yield client
 
 
@@ -223,6 +244,47 @@ async def other_zone_hodim_client(db: AsyncSession, other_leshoz: Organization):
     nothing else, so a test that passes for one and fails for the other can
     only be about territory."""
     async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=other_leshoz.id):
+        yield client
+
+
+@pytest.fixture
+async def second_hodim_client(db: AsyncSession, leshoz: Organization):
+    """A SECOND reviewer in the SAME leshoz as `hodim_client` — task 7's
+    (3.9b) confirming person, whom maker-checker requires to be someone other
+    than whoever recorded the paper result.
+
+    `make_user(role_code="executor_staff", ...)`, never `_client_for`
+    (`hodim_user`'s own template, and the same reason: lesson — a
+    `_client_for` fixture inherits nothing from the real role's own
+    `role_permissions` row, so this fixture would prove nothing about the
+    production role holding `applications.review`). A distinct row from
+    `hodim_user`, so a distinct `users.id`, is the whole point: `service.
+    confirm_check` refuses a confirmer whose id equals the check's own
+    `created_by`."""
+    user = await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+    async for client in _head_client(db, user):
+        yield client
+
+
+@pytest.fixture
+async def gis_specialist_client(db: AsyncSession, leshoz: Organization):
+    """Task 5's `kind="gis"` caller — a real `gis_specialist` ROLE user
+    (migrations 0010/0011's `ROLE_GRANTS`: `gis.contours.manage`,
+    `gis.layers.manage`, `norms.manage` — none of which is "authorised to
+    write an application conclusion" or holds `applications.review`), zoned to
+    the SAME `leshoz` `hodim_client` shares.
+
+    **`_head_client`, never `_client_for`** (`hodim_client`'s own template,
+    line ~784): `_client_for`/`signed_in_with` build every actor under the
+    `executor_staff` ROLE, personal grants on top — and `executor_staff`'s OWN
+    `role_permissions` row already carries `applications.review` (migration
+    0015), which would silently let this fixture through `/recalculate`'s
+    `require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE)` and
+    prove nothing about a role that does not hold either. `make_user(...,
+    role_code="gis_specialist")` is what makes this the actor design/03 and
+    the fail-closed gap are actually about."""
+    user = await make_user(db, role_code="gis_specialist", organization_id=leshoz.id)
+    async for client in _head_client(db, user):
         yield client
 
 
@@ -345,6 +407,16 @@ async def draft_ready_for_submission(
         period_from="2027-05-01",
         period_to="2027-09-30",
     )
+
+
+@pytest.fixture
+async def draft_in_reviewerless_leshoz(draft_ready_for_submission: str) -> str:
+    """Ruling 7's empty case: `draft_ready_for_submission`'s own `leshoz` is a
+    FRESH organization every test (random code), so it is already reviewerless
+    unless the SAME test also pulls in `hodim_user`/`hodim_client` — this name
+    just states that intent explicitly for the one test exercising it, rather
+    than relying on the reader to notice an absence."""
+    return draft_ready_for_submission
 
 
 @pytest.fixture
@@ -596,7 +668,9 @@ async def overlapping_published_contour(
 
 
 @pytest.fixture
-async def submitted_application(applicant_client, draft_ready_for_submission: str) -> str:
+async def submitted_application(
+    applicant_client, draft_ready_for_submission: str, hodim_user: User
+) -> str:
     """`draft_ready_for_submission`, actually SUBMITTED — through `GET
     /package` + a real ERI over those exact bytes + `POST /submit`, never by
     writing `status='SUBMITTED'` on the row (lesson: build a fixture's
@@ -611,12 +685,44 @@ async def submitted_application(applicant_client, draft_ready_for_submission: st
     `_submit` is imported inside the body rather than at module scope: it lives
     in a test module, and a conftest importing one at collection time is a
     circularity waiting for the day that module wants a fixture from here.
+
+    `hodim_user` is a DEPENDENCY, not merely used by the body (3.9b task 1): a
+    fixture's own dependencies always resolve before its body runs, no matter
+    where a TEST lists them relative to `submitted_application` itself — the
+    one way to guarantee auto-assignment has a real candidate at the moment
+    `_submit` fires below. Without it, a test that also names `hodim_user`
+    directly (to assert it is the pick) would find it created only AFTER this
+    fixture's own submission already ran with nobody eligible (pytest resolves
+    independent fixtures in the order a test lists them — verified in the
+    lessons file). Harmless for every test that does not care who got picked.
     """
     from tests.modules.applications.test_submit import _submit
 
     result = await _submit(applicant_client, draft_ready_for_submission)
     assert result.status_code == 200, result.text
     return draft_ready_for_submission
+
+
+@pytest.fixture
+async def other_hodim_user(db: AsyncSession, leshoz: Organization) -> User:
+    """A SECOND hodim in the same leshoz as `hodim_user` — the manual
+    reassignment's target (`POST /assign`, 3.9b task 1), distinct from
+    whichever reviewer auto-assignment already picked for
+    `submitted_application`."""
+    return await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+
+
+@pytest.fixture
+async def sys_admin_client(db: AsyncSession):
+    """The superuser — the ONLY role migration 0015 grants
+    `applications.assign` (Task 1 ANSWERED (б), 2026-09-05). Zone-free like
+    every real `sys_admin` account (`_head_client`'s user carries no
+    `organization_id`/`region_id`), so it can reach `POST /assign` at any
+    leshoz — `require_permission` waves it through the gate before the code
+    check even runs (decision #41 ruling 2)."""
+    user = await make_user(db, role_code="sys_admin", pinfl=unique_pinfl())
+    async for client in _head_client(db, user):
+        yield client
 
 
 # --- Task 7: the head's decision ----------------------------------------------
@@ -925,6 +1031,60 @@ async def agency_grazing_norm(
 
 
 @pytest.fixture
+async def other_leshoz_published_contour(
+    db: AsyncSession, contours_layer: GisLayer, other_leshoz: Organization, approval_doc: MediaFile
+) -> Contour:
+    """A published contour owned by `other_leshoz` — the SECOND leshoz's own
+    plot. Final whole-branch review, Critical: the cross-leshoz resubmission
+    test PATCHes an application's `contour_id` onto this contour, so its
+    owning organization must genuinely differ from `published_contour`'s.
+    Same shape as `published_contour`/`agency_published_contour`; only the
+    owning organization differs."""
+    contour = await make_contour(db, contours_layer, other_leshoz)
+    await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    await db.flush()
+    return contour
+
+
+@pytest.fixture
+async def other_leshoz_grazing_norm(
+    db: AsyncSession,
+    other_leshoz_published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> uuid.UUID:
+    """`published_grazing_norm`, for `other_leshoz_published_contour` instead
+    of `published_contour` — a norm is per-contour, so re-pricing a
+    resubmission against the second leshoz's own plot (`submit`'s ruling-23
+    fresh pricing) needs its own published norm, or the cross-leshoz
+    reassignment under test is never reached: `submit` would refuse the
+    resubmission at `norms.service` first."""
+    effective_from = date(2020, 1, 1)
+    limit_params = await norm_params.load_limit_params(db, on_date=effective_from)
+    norm = Norm(
+        contour_id=other_leshoz_published_contour.id,
+        activity_type_id=grazing_activity_id,
+        yield_c_per_ha=Decimal("12.0"),
+        season={"windows": [{"from": "04-01", "to": "10-31"}]},
+        rotation={"rest_years": []},
+        max_sb=calculator.max_sb(
+            area_ha=CONTOUR_AREA_HA, yield_c_per_ha=Decimal("12.0"), params=limit_params
+        ),
+        effective_from=effective_from,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+    return norm.id
+
+
+@pytest.fixture
 async def application_in_review(hodim_client, submitted_application: str) -> str:
     """`submitted_application`, taken into work through the REAL route — never
     by writing `status='IN_REVIEW'` on the row (lesson: build a fixture's
@@ -936,6 +1096,37 @@ async def application_in_review(hodim_client, submitted_application: str) -> str
     result = await hodim_client.post(f"/api/v1/applications/{submitted_application}/start-review")
     assert result.status_code == 200, result.text
     return submitted_application
+
+
+@pytest.fixture
+async def approved_application(executor_head_client, application_in_review: str) -> str:
+    """`application_in_review`, carried through the REAL decision route —
+    never by writing `status='APPROVED'` on the row (lesson: build a fixture's
+    precondition through the real transition). Task 5's own
+    `test_recalculating_an_approved_application_is_refused` (ruling 17) is the
+    one caller, and all it needs is a `calculations`-CLOSED status; it does
+    not need the status to be literally `APPROVED`.
+
+    It will not literally BE `APPROVED` when this returns: 3.10a's
+    `payments.subscribers.on_application_approved` is registered on the same
+    bus and runs INSIDE `/approve`'s own transaction, so the row is already
+    `INVOICED` (backend/CLAUDE.md, `applications` section) — no client of this
+    route ever observes `APPROVED`, only the history has it. `INVOICED` sits in
+    `norms.service._APPLICATION_CLOSED_FOR_CALCULATION` beside `APPROVED`
+    itself, so the one thing the fixture's name promises — "closed to a
+    recalculation, whoever asks" — holds regardless.
+
+    `_decide` is `test_decision.py`'s own helper (fetch `GET /package`, sign
+    exactly those bytes, POST) — imported locally, the same reason
+    `submitted_application` above imports `_submit` locally: a conftest
+    importing a test module at collection time is a circularity waiting for
+    the day that module wants a fixture from here.
+    """
+    from tests.modules.applications.test_decision import _decide
+
+    result = await _decide(executor_head_client, application_in_review, "approve")
+    assert result.status_code == 200, result.text
+    return application_in_review
 
 
 @pytest.fixture
@@ -977,17 +1168,14 @@ async def application_in_review_at_agency(
     return application_id
 
 
-@pytest.fixture
-async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
-    """One ACTIVE item of the `rejection_reasons` classifier — RJ-03, «участка
-    вне границ лесного фонда», seeded by migration 0005 together with the other
-    fourteen.
+async def _rejection_reasons_item(db: AsyncSession, code: str) -> ClassifierItem:
+    """One ACTIVE item of the `rejection_reasons` classifier by its RJ-* code
+    — the fixed catalogue `tz/10` § 8.2 seeds through migration 0005 (fifteen
+    values) and 0025 (RJ-15's `kind`, "reject" -> "both").
 
-    Fetched, never created: `rejection_reasons` is a fixed catalogue whose
-    fifteen values come from `tz/10` § 8.2, and a private copy inserted per test
-    would leave rows in this shared, persistent database that
-    `GET /refs/classifiers/rejection_reasons` would then offer on a real
-    form."""
+    Fetched, never created: a private copy inserted per test would leave rows
+    in this shared, persistent database that `GET /refs/classifiers/
+    rejection_reasons` would then offer on a real form."""
     classifier_id = (
         await db.execute(select(Classifier.id).where(Classifier.code == "rejection_reasons"))
     ).scalar_one()
@@ -995,11 +1183,34 @@ async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
         await db.execute(
             select(ClassifierItem).where(
                 ClassifierItem.classifier_id == classifier_id,
-                ClassifierItem.code == "RJ-03",
+                ClassifierItem.code == code,
                 ClassifierItem.status == "active",
             )
         )
     ).scalar_one()
+
+
+@pytest.fixture
+async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
+    """RJ-03, «участок вне границ лесного фонда» — `kind="reject"`, task 7's
+    own rejection ground."""
+    return await _rejection_reasons_item(db, "RJ-03")
+
+
+@pytest.fixture
+async def rj_01_return_reason(db: AsyncSession) -> ClassifierItem:
+    """RJ-01, «документы неполны или не соответствуют требованиям» —
+    `kind="return"` (ruling 3), task 3's own (3.9b) valid return ground."""
+    return await _rejection_reasons_item(db, "RJ-01")
+
+
+@pytest.fixture
+async def rj_03_reject_reason(db: AsyncSession) -> ClassifierItem:
+    """The same RJ-03 row as `rejection_reason_item` above, under task 3's own
+    (3.9b) test name: a REFUSAL (`kind="reject"`), the negative control for
+    `test_a_return_requires_a_reason_of_the_right_type` — returning under it
+    would misdescribe the decision (ruling 3)."""
+    return await _rejection_reasons_item(db, "RJ-03")
 
 
 @pytest.fixture
@@ -1055,3 +1266,55 @@ async def head_with_exact_limits(db: AsyncSession):
             yield client
 
     return _make
+
+
+# --- Task 4 (3.9b): request for information and the SLA pause ----------------
+
+
+@dataclass
+class FrozenClock:
+    current: datetime
+
+    def advance(self, delta: timedelta) -> None:
+        self.current += delta
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> FrozenClock:
+    """`applications.service.request_info`/`respond_info` read the pause's two
+    endpoints through the module's own `_now()`, patched HERE — never
+    `app.core.time`, which those two functions have no reason to use at all
+    (`tests/modules/payments/conftest.py`'s identical fixture, over
+    `payme_router._now`, is the precedent). `.advance(...)` moves the clock
+    with no real wall-clock time passing, which is what lets
+    `test_answering_shifts_the_deadline_by_the_pause` prove ruling 8's
+    arithmetic without an actual three-day test run."""
+    clock = FrozenClock(current=datetime.now(UTC))
+    monkeypatch.setattr(applications_service, "_now", lambda: clock.current)
+    return clock
+
+
+@pytest.fixture
+async def vet_certificate_file(db: AsyncSession, applicant: Applicant) -> MediaFile:
+    """A `media_files` row standing in for the vet certificate an applicant
+    attaches through `respond-info` — the `gis/conftest.py::approval_doc`
+    pattern (own session not needed: nothing here is asserted after a
+    rollback the way `doc_type_item_id`'s classifier item is).
+
+    `uploaded_by` is `applicant`'s OWNER, not an arbitrary user:
+    `service._own_document_file` refuses a `file_ids` entry that is not the
+    CALLER's own upload, and `applicant_client` (built ON `applicant`, not
+    beside it — see that fixture's own docstring) is who calls `respond-info`
+    in every test that requests this fixture."""
+    assert applicant.owner_user_id is not None, "the `applicant` fixture always owns a real user"
+    file = MediaFile(
+        storage_key=f"t/{uuid.uuid4().hex}",
+        filename="vet-certificate.pdf",
+        content_type="application/pdf",
+        size_bytes=100,
+        sha256="0" * 64,
+        uploaded_by=applicant.owner_user_id,
+    )
+    db.add(file)
+    await db.flush()
+    return file

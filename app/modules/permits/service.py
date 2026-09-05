@@ -30,18 +30,21 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core import files, storage
+from app.core import files, numbers, storage
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
 from app.core.schemas import PageParams
 from app.core.time import business_today
+from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
+from app.modules.applications.schemas import ApplicationCreate
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -49,14 +52,17 @@ from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
 from app.modules.notifications import service as notifications
-from app.modules.permits import events, render, repo, signers
+from app.modules.permits import events, grounds, render, repo, signers
 from app.modules.permits.models import (
+    ForestTicket,
     Permit,
+    PermitDuplicate,
     PermitStatusHistory,
     PermitTemplate,
     QrCheckLog,
 )
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
+from app.modules.permits.schemas import DecisionIn, DuplicateIn, ForestTicketIn
 from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
@@ -86,6 +92,10 @@ PERMIT_READ = "permit.read"
 # archives them — it is the APPLICATION that reaches CLOSED (ruling 13).
 PERMIT_EXPIRE = "permit.expire"
 PERMIT_CLOSE_APPLICATION = "permit.close_application"
+# `jobs.expire_forest_tickets`'s own action (Task 6, ruling 14 revised) — a
+# STANDALONE sweep with its own cursor, never a third statement folded into
+# `expire_permits`'s own batch loop (that module's own docstring).
+FOREST_TICKET_EXPIRE = "forest_ticket.expire"
 
 # The permit's initial status, and the one it reaches when the last required
 # signature lands. Nothing else in this codebase may write `active` onto a permit:
@@ -1654,6 +1664,7 @@ async def set_status(
     reason_item_id: uuid.UUID | None = None,
     doc_file_id: uuid.UUID | None = None,
     correlation_id: str | None = None,
+    history_id: uuid.UUID | None = None,
 ) -> Permit:
     """Move a permit from one `tz/05` status to another: validate the edge, write
     the `permit_status_history` row, audit it, return the permit.
@@ -1682,6 +1693,17 @@ async def set_status(
     database, and a service-level existence check would be a second opinion that
     can only ever be more permissive than the constraint. The caller supplying
     them is inside this module (3.11b) or a level-4 module with its own route.
+
+    **`history_id` is this stage's one change to a contract 3.11a froze.**
+    `None` for every caller before 3.11b, so the `permit_status_history` row's
+    own `default=uuid7` still mints its primary key exactly as it always has —
+    every existing call site is untouched. `permits.decisions.decide` is the
+    one caller that passes a real value: it mints `history_id = uuid7()` itself,
+    hands that SAME id to `signatures.service.sign()` as `object_id` before
+    ever reaching here, and passes it again here so the row this call writes is
+    the very row that signature already points at. Minting it a second time
+    HERE — the obvious alternative — would anchor the signature to an id no
+    row on `permit_status_history` actually carries.
 
     Enforces NO permission and NO zone rule of its own — the same design as every
     other function on this page, and for the same reason
@@ -1724,6 +1746,13 @@ async def set_status(
     await repo.add_status_history(
         db,
         PermitStatusHistory(
+            # `history_id or uuid7()`, not the model's own `default=uuid7`: a
+            # `decide()` caller has already handed this SAME id to `sign()` as
+            # `object_id`, and passing it explicitly is what anchors that
+            # signature to the exact row being written here. Every other
+            # caller passes `None` and gets a freshly minted id, unchanged
+            # from before this parameter existed.
+            id=history_id or uuid7(),
             permit_id=permit.id,
             from_status=from_status,
             to_status=to_status,
@@ -1760,12 +1789,496 @@ async def set_status(
     return permit
 
 
+# --- Task 3: suspend and resume, the first two acts riding on `decide()` -----
+#
+# Thin on purpose (ruling 4, option а — the recommended one): each names the
+# act and the target status and hands `data`/`actor` straight to
+# `decisions.decide()`, which carries the whole order of checks (that module's
+# own docstring). `lifecycle_router.py`'s two routes call these rather than
+# `decisions.decide` directly, so a cross-module caller has exactly one path to
+# each act (backend/CLAUDE.md: "Cross-module calls only via the other module's
+# service") — stage 4.1's inspector-initiated suspension reaches the same act
+# through these, with its OWN `actor`, never `permits.decisions` directly.
+#
+# **The import below is function-local, deliberately** — the same idiom
+# `app/event_subscriptions.py::register_event_subscriptions` already uses to
+# break a cycle of this exact shape. `decisions.py` imports `service` at
+# module level (for `_assert_transition`, `set_status`, …), so a module-level
+# `import decisions` HERE would close that into a real cycle; deferred to call
+# time, after both modules have finished loading, it costs nothing and creates
+# none. `grounds` and `events` need no such deferral — neither imports this
+# module — so both stay in this file's ordinary top-level import list.
+
+
+async def suspend(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+) -> Permit:
+    """С13: suspend an ACTIVE permit on a named ground. See the section
+    docstring above for why this exists beside `lifecycle_router.py`'s route
+    rather than the route calling `decisions.decide` on its own."""
+    from app.modules.permits import decisions
+
+    return await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.SUSPEND,
+        to_status="suspended",
+        data=data,
+        actor=actor,
+        event_code=events.PERMIT_SUSPENDED,
+    )
+
+
+async def resume(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+) -> Permit:
+    """С13: resume a SUSPENDED permit, back to `active`. See `suspend` above."""
+    from app.modules.permits import decisions
+
+    return await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.RESUME,
+        to_status="active",
+        data=data,
+        actor=actor,
+        event_code=events.PERMIT_RESUMED,
+    )
+
+
+# --- Task 4: revoke, the third act riding on `decide()` ----------------------
+#
+# Bigger than `suspend`/`resume` by exactly one thing (ruling 14): a revoked
+# permit's live forest ticket goes down with it, in the SAME transaction. A
+# suspension must NOT do this — a suspended permit may still resume and use
+# the very same ticket — so the step lives here, AFTER `decide()` returns,
+# rather than inside `decisions.decide` itself, which would otherwise need a
+# fourth parameter naming the act just to know whether to run it.
+
+# `revoke_tickets_of`'s own action (whole-branch review fix): its two
+# siblings, `FOREST_TICKET_ISSUE` and `FOREST_TICKET_EXPIRE`, both audit —
+# the invariant is repo-wide (`backend/CLAUDE.md`'s audit invariant), not a
+# per-writer choice — so a ticket's audit trail must not end at issuance while
+# the ticket issuance produced no longer exists.
+FOREST_TICKET_REVOKE = "forest_ticket.revoke"
+
+
+async def revoke_tickets_of(db: AsyncSession, permit: Permit, *, actor: User) -> None:
+    """Revoke `permit`'s live forest ticket(s) (ruling 14).
+
+    `uq_forest_tickets_active` limits a permit to at most one `active` row, so
+    this is at most a one-row loop over `repo.live_forest_tickets` — Task 6's
+    move of Task 4's own stand-in bulk `UPDATE` into `repo` beside its
+    siblings (a move, not a rewrite: the end state for every row is
+    identical). `live_forest_tickets` takes its rows `FOR UPDATE`, which is
+    what keeps the guarantee identical rather than merely similar: a plain
+    SELECT would not wait on a row `jobs.expire_forest_tickets` is expiring
+    RIGHT NOW under its OWN lock, and revoking it once that sweep's
+    transaction commits would silently overwrite `expired` back to
+    `revoked` — the lost update the original bulk `UPDATE ...
+    WHERE status = 'active'` could never produce, because THAT statement's
+    WHERE clause is re-evaluated at write time. Blocking here until the
+    sweep resolves, then re-reading under the lock this function's own
+    docstring explains, reproduces the exact same guard.
+
+    `actor` IS read now (whole-branch review fix): `forest_tickets` still
+    carries no `revoked_by`-shaped column, but `audit_log.user_id` needs no
+    such column — it is the SAME shape `FOREST_TICKET_ISSUE`'s own audit call
+    already uses for `issued_by`'s actor, not a new one invented here.
+    """
+    for ticket in await repo.live_forest_tickets(db, permit.id):
+        ticket.status = "revoked"
+        await db.flush()
+        await audit.log(
+            db,
+            action=FOREST_TICKET_REVOKE,
+            user_id=actor.id,
+            object_type="forest_ticket",
+            object_id=ticket.id,
+            old_value={"status": "active"},
+            new_value={"status": "revoked"},
+        )
+
+
+async def revoke(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+) -> Permit:
+    """С13: cancel a permit for cause. Reachable from `active` AND from
+    `suspended` (`PERMIT_TRANSITIONS`); terminal but for 4.7's `archived`.
+
+    **No refund is created and no accountant is looked up** (ruling 15): a
+    refund is a manual accountant process the holder starts with their own
+    обращение (decision #12), `payments` is level 4 like this module, and the
+    `permit.revoked` notification template's own text is where the holder is
+    told they may ask for one. `start_refund` is deliberately absent from
+    `DecisionIn` — there is no such field to widen.
+
+    The permit's live forest ticket is revoked in this SAME transaction
+    (ruling 14), by a plain call AFTER `decide()` returns rather than a hook
+    inside it (see the section comment above). That ordering is safe because
+    `decide()` never commits on the success path this return relies on:
+    `get_db` is what commits the whole request, once, at the very end, and
+    the only commits `decide()` itself makes happen on a path that RAISES —
+    the signer-identity refusal it writes itself, or whichever refusal
+    `sign()` finds first. So `revoke_tickets_of` lands in exactly the same
+    still-open transaction the status change itself is sitting in.
+    """
+    from app.modules.permits import decisions
+
+    permit = await decisions.decide(
+        db,
+        permit_id,
+        act=grounds.REVOKE,
+        to_status="revoked",
+        data=data,
+        actor=actor,
+        event_code=events.PERMIT_REVOKED,
+    )
+    await revoke_tickets_of(db, permit, actor=actor)
+    return permit
+
+
+# --- Task 5: the duplicate (нусха) register -----------------------------------
+#
+# `permit_duplicates` was created by migration 0023 with no writer (3.11a's own
+# module docstring said so out loud): a lost or damaged paper copy needs a
+# COPY of the document, never a correction of one — `ERR-PERM-002` is what
+# refuses the path this section deliberately does NOT open.
+
+PERMIT_DUPLICATE = "permit.duplicate"
+
+# Spelled out rather than derived as "every status but two" (the brief's own
+# instruction): a seventh `permits.status` value must force whoever adds it to
+# decide whether a нусха of it makes sense, never fall silently into "yes"
+# through a NOT of a growing exclusion list.
+DUPLICABLE_PERMIT_STATUSES: frozenset[str] = frozenset(
+    {"active", "suspended", "expired", "revoked"}
+)
+
+
+async def issue_duplicate(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DuplicateIn, actor: User
+) -> PermitDuplicate:
+    """Register one нусха: a NEW `permit_duplicates` row pointing at the
+    permit's OWN `pdf_file_id` (ruling 9) — never a render, and never a
+    second file.
+
+    **Nothing here re-renders the document.** `permits.doc_hash` is frozen
+    over the bytes at `pdf_file_id` and all four ERI signatures are taken over
+    exactly those bytes (module docstring); a duplicate that produced a new
+    file would be a document the signatures do not cover — exactly what
+    `ERR-PERM-002` (registered by 3.11a, raised by nothing) exists to refuse.
+    This function never calls `render`, never touches `permits.doc_hash`, and
+    never writes `permits.pdf_file_id` — it only reads the one it already has.
+
+    **A consequence stated here rather than discovered later.** The QR baked
+    into those bytes at issuance was built from `PUBLIC_BASE_URL` (`qr_url`)
+    as it stood on the day of issuance, and a duplicate inherits it UNCHANGED
+    — correct or not. Permit `А № 000001` on the dev server was issued with a
+    QR pointing at the API host instead of the public site, and the only fix
+    was a whole successor permit: the original bytes, and therefore its QR,
+    could not be corrected without breaking `doc_hash` and every signature
+    over it. A нусха of a permit with a wrong QR carries that same wrong QR;
+    the remedy is still a new permit, never a re-render here.
+
+    **Zoned, like every other write path on this permit** (fix round 1 —
+    `issue_duplicate` originally checked neither): `_assert_organization_in_zone`
+    runs FIRST, before either domain check below, the same order `decide()`
+    (`decisions.py` step 2) and `issue` (`_assert_in_zone`) already use. An
+    out-of-zone `permits.issue`/`permits.manage` holder — both roles are
+    organization-scoped (migration 0019) but the route's permission gate
+    cannot see WHICH organization a target permit belongs to — must learn
+    nothing about the permit beyond "not yours": refusing them only after a
+    status/document check would leak whether the permit exists and what state
+    it is in to a caller with no zone claim over it at all.
+
+    Refuses `ERR-ACL-002` (403) when the actor's zone does not cover
+    `permit.organization_id`, and `ERR-PERM-001` with `details.reason`:
+
+      * `"not_duplicable"` — `permit.status` is not one of
+        `DUPLICABLE_PERMIT_STATUSES`. `pending_signatures` is refused because a
+        copy of an unsigned document is not a copy of a permit; `archived` is
+        4.7's terminal state, out of scope for a citizen's own paper copy.
+      * `"no_document"` — `pdf_file_id` is null. Defensive, not reachable
+        today: `issue` sets it in the same INSERT that creates the permit row
+        (module docstring), so every real permit already has one by the time
+        it could reach a duplicable status. The column stays nullable in the
+        schema regardless, and this refuses cleanly rather than crashing the
+        day that stops being true.
+
+    Audits `PERMIT_DUPLICATE` and notifies the holder with
+    `events.PERMIT_DUPLICATE_ISSUED`, through the same `_holder_recipient`
+    rule every other permit notification uses.
+    """
+    permit = await repo.permit_by_id(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    if permit.status not in DUPLICABLE_PERMIT_STATUSES:
+        raise err("ERR-PERM-001", details={"reason": "not_duplicable"})
+    if permit.pdf_file_id is None:
+        raise err("ERR-PERM-001", details={"reason": "no_document"})
+
+    duplicate = PermitDuplicate(
+        permit_id=permit.id,
+        reason=data.reason,
+        file_id=permit.pdf_file_id,
+        issued_by=actor.id,
+    )
+    await repo.add_duplicate(db, duplicate)
+
+    await notifications.notify(
+        db,
+        event_code=events.PERMIT_DUPLICATE_ISSUED,
+        recipient_user_id=await _holder_recipient(db, permit),
+        params={"permit_number": _permit_number(permit.series, permit.number)},
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+    )
+
+    await audit.log(
+        db,
+        action=PERMIT_DUPLICATE,
+        user_id=actor.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"duplicate_id": str(duplicate.id)},
+    )
+    return duplicate
+
+
+# --- Task 6: the forest ticket (ЧТ), ўрмон чиптаси, ВМҚ 506 ------------------
+#
+# `forest_tickets` was created by migration 0023 with no writer, same as
+# `permit_duplicates` before Task 5 — and this section is that writer and its
+# register. Both routes share `permits.manage` with suspend/resume/revoke
+# above rather than `issue_duplicate`'s wider pair: a ticket is issued and
+# revoked by the leshoz that MANAGES the permit, not merely by whoever forms
+# the document (ruling 2 — the gate Task 6's own brief left unnamed).
+
+FOREST_TICKET_ISSUE = "forest_ticket.issue"
+
+# Both characters are CYRILLIC — Ч is U+0427 and Т is U+0422, not the Latin
+# lookalikes. design/03 § Public numbers spells the ticket `ЧТ-{YEAR}-{NUMBER}`,
+# and 3.11a already paid once for a Latin/Cyrillic mix-up on `permit_series`.
+FOREST_TICKET_PREFIX = "ЧТ"
+
+
+async def issue_forest_ticket(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: ForestTicketIn, actor: User
+) -> ForestTicket:
+    """One ўрмон чиптаси against an in-force permit (ВМҚ 506, ruling 11).
+
+    **Zoned FIRST, before either domain check below** — the same order
+    `issue_duplicate` and `decisions.decide()` already use, and for the same
+    reason that fix exists (lesson): an out-of-zone `permits.manage` holder
+    must learn nothing about the permit beyond "not yours". Refusing them
+    only after a status/period check would leak whether the permit exists
+    and what state it is in to a caller with no zone claim over it at all.
+
+    Refuses `ERR-PERM-001` with `details.reason = "permit_not_active"` when
+    the permit is not `active` (ruling 12: a ticket only ever rides an
+    in-force permit); `ERR-VAL-001` with `details.reason =
+    "period_outside_permit"` when the requested period reaches outside the
+    permit's own (`ForestTicketIn`'s own model validator has already refused
+    an INVERTED period before either of these runs); `ERR-PERM-003` with
+    `details.reason = "active_ticket_exists"` when `uq_forest_tickets_active`
+    finds a second live ticket already there.
+
+    **The constraint is caught BY NAME** —
+    `getattr(cause, "constraint_name", None)`, never `exc.orig` or the raw
+    message (lesson: a bare `except IntegrityError` would report this
+    table's own FK violations as a ticket conflict too) — inside a
+    `begin_nested()` SAVEPOINT, so a caller that wants to keep using `db`
+    after this refusal (an audited denial, a later stage) is not left with
+    the whole transaction aborted at the database level for a statement this
+    function alone issued.
+    """
+    permit = await repo.permit_by_id_for_update(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    if permit.status != ACTIVE_STATUS:
+        raise err(
+            "ERR-PERM-001",
+            details={"reason": "permit_not_active", "status": permit.status},
+        )
+    if data.valid_from < permit.period_from or data.valid_to > permit.period_to:
+        raise err("ERR-VAL-001", details={"reason": "period_outside_permit"})
+
+    ticket = ForestTicket(
+        number=await numbers.next_public_number(db, FOREST_TICKET_PREFIX, business_today()),
+        permit_id=permit.id,
+        valid_from=data.valid_from,
+        valid_to=data.valid_to,
+        restrictions=data.restrictions,
+        status="active",
+        issued_by=actor.id,
+    )
+    try:
+        async with db.begin_nested():
+            await repo.add(db, ticket)
+    except IntegrityError as exc:
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "uq_forest_tickets_active":
+            raise
+        raise err("ERR-PERM-003", details={"reason": "active_ticket_exists"}) from exc
+
+    await audit.log(
+        db,
+        action=FOREST_TICKET_ISSUE,
+        user_id=actor.id,
+        object_type="forest_ticket",
+        object_id=ticket.id,
+        new_value={"number": ticket.number, "permit_id": str(permit.id)},
+    )
+    await notifications.notify(
+        db,
+        event_code=events.FOREST_TICKET_ISSUED,
+        recipient_user_id=await _holder_recipient(db, permit),
+        params={
+            "ticket_number": ticket.number,
+            "permit_number": _permit_number(permit.series, permit.number),
+            "valid_from": ticket.valid_from,
+            "valid_to": ticket.valid_to,
+        },
+        object_type="forest_ticket",
+        object_id=ticket.id,
+    )
+    return ticket
+
+
+async def list_forest_tickets(
+    db: AsyncSession, permit_id: uuid.UUID, *, actor: User
+) -> Sequence[ForestTicket]:
+    """`GET /permits/{id}/forest-tickets` — the permit's whole ВМҚ 506
+    register, newest first.
+
+    Gated the SAME way the route itself is (`permits.manage`), unlike
+    `list_duplicates`'s wider `_readable_permit` audience: a forest ticket is
+    management paperwork, not something this module opens to the permit's
+    holder or its other signatories. `permits.manage` is itself
+    organization-scoped (`executor_head`, migration 0019) but the route's
+    permission dependency cannot see WHICH leshoz a target permit belongs
+    to, so `_assert_organization_in_zone` runs here exactly as it does on
+    the write path above — the same rule `issue_forest_ticket`'s own
+    docstring gives for checking it first.
+    """
+    permit = await repo.permit_by_id(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    return await repo.forest_tickets(db, permit.id)
+
+
+# --- Task 8: extend a permit into a new application draft --------------------
+#
+# The route lives here, in `permits`, rather than under `applications`
+# (design/03 had it there): `applications` is level 3 and may not ask "does a
+# valid permit exist" (3.11a ruling 12), which is exactly the question
+# extending one is built on. `extend` itself never moves `permits.status` —
+# `service.set_status` stays the only writer of that column — it only opens a
+# new `applications` row, through `applications.service.create_draft`.
+
+PERMIT_EXTEND = "permit.extend"
+
+
+async def extend(db: AsyncSession, permit_id: uuid.UUID, *, actor: User):
+    """`POST /permits/{id}/extend` — a new DRAFT `kind='extension'` against a
+    permit still in force.
+
+    No `-> Application` on this signature, deliberately: the return type IS
+    `applications.models.Application` (inferred from `create_draft`'s own
+    annotation below), but spelling it here would import that model into a
+    level-4 module for a type hint alone — the same import `applications`'s
+    own docstring says a caller here must NEVER make.
+
+    **Whose authority gates this route.** The caller must be the permit's own
+    HOLDER (`_is_holder`, the same predicate the recipient signature line
+    uses) — not a hodim, not a `permits.manage`/`permits.view_any` holder:
+    extending is the citizen's own act, the same way filing the original
+    application was, and neither role checked anywhere else in this module
+    stands in for it. 404 `ERR-SYS-003`, not 403, for anyone else — the same
+    answer `_readable_permit` gives a stranger, so this route is not a
+    permit-existence oracle: a caller who is not the holder learns nothing
+    about whether `permit_id` names a real permit, an active one, or nothing
+    at all. This check runs BEFORE the status/period check below for exactly
+    that reason.
+
+    **Extendable = `active` and not yet past its period.** `permit.status !=
+    ACTIVE_STATUS or permit.period_to < business_today()` refuses an EXPIRED
+    (or suspended, or revoked) permit — applying for one of those is a fresh
+    application, never an extension, or «extension» would be a way around
+    both the duplicate guard `ex_applications_no_duplicate` enforces on a new
+    filing and the season checks a new filing meets.
+
+    **Locked** (`repo.permit_by_id_for_update`), the same as every other
+    write path this stage adds (`decisions.decide`'s step 1,
+    `issue_forest_ticket`): `applications_service.open_extension_of` below is
+    a check-then-write over the `applications` table, and without the lock
+    two concurrent clicks each pass the guard and each insert a draft. The
+    lock is what makes "two clicks, one extension" true under a race, not
+    merely when they happen to run one after another — a later reader must
+    not remove it as redundant. Lock order stays permit → application
+    (Global Constraints); this adds no new order, because the parent
+    application itself is only ever READ here, never locked or written.
+    """
+    permit = await repo.permit_by_id_for_update(db, permit_id)
+    if permit is None or not await _is_holder(db, permit, actor):
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    if permit.status != ACTIVE_STATUS or permit.period_to < business_today():
+        raise err(
+            "ERR-PERM-001",
+            details={"reason": "not_extendable", "status": permit.status},
+        )
+
+    existing = await applications_service.open_extension_of(db, permit.application_id)
+    if existing is not None:
+        raise err(
+            "ERR-APP-002",
+            details={
+                "reason": "extension_already_open",
+                "application_id": str(existing.id),
+            },
+        )
+
+    parent = await applications_service.get(db, permit.application_id)
+    assert parent is not None  # permits.application_id FKs applications
+
+    # `on_behalf` is the ACTOR's own relationship to this applicant, never
+    # copied from the parent's stored value: `_resolve_applicant` has exactly
+    # the same two branches `_is_holder` just admitted the caller through
+    # (the individual's own account, or an effective representation of a
+    # legal-entity applicant), so this asks the identical question. Copying
+    # the parent's `on_behalf` would refuse a representative lawfully
+    # extending a permit the citizen filed in person — and the reverse.
+    own = await auth_service.get_own_applicant(db, actor.id)
+    on_behalf = "self" if own is not None and own.id == permit.applicant_id else "legal"
+    draft = await applications_service.create_draft(
+        db,
+        ApplicationCreate(on_behalf=on_behalf, applicant_id=permit.applicant_id),
+        actor=actor,
+        kind=applications_service.KIND_EXTENSION,
+        parent_application_id=parent.id,
+    )
+    await audit.log(
+        db,
+        action=PERMIT_EXTEND,
+        user_id=actor.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"application_id": str(draft.id)},
+    )
+    return draft
+
+
 # --- the three read routes' service side -------------------------------------
 #
 # A SUCCESSFUL read is not audited: the audit invariant covers state-changing
 # actions, and a row per GET would let anyone holding a session write the trail
 # at will. A read DENIED on territory is audited (ruling T8-a) — see
-# `_readable_permit`, which is the one place both direct-access routes reach it.
+# `_readable_permit`, which is the one place every direct-access route reaches
+# it — the card, the PDF, and (Task 5) the duplicate register beside them.
 
 
 async def _holds_view_any(db: AsyncSession, actor: User) -> bool:
@@ -1784,24 +2297,90 @@ async def _holds_view_any(db: AsyncSession, actor: User) -> bool:
     return PERMITS_VIEW_ANY in await auth_repo.permission_codes(db, actor)
 
 
+async def _is_required_signer(db: AsyncSession, permit: Permit, actor: User) -> bool:
+    """Whether `actor` is one of the officials THIS permit's signatures name —
+    the read-side half of ruling 4, found missing by the verification run one
+    hour before the demo: `executor_head`, `chief_forester` and `accountant`
+    hold `permits.sign` and are exactly who `add_signature` lets attach a
+    signature, yet `_readable_permit` admitted only the holder and a
+    `permits.view_any` holder, so all three got the same 404 as a stranger and
+    could never open the very permit they are required to sign through the UI
+    (only a direct API call could reach them — `POST /permits/{id}/signatures`
+    itself carries no such gate).
+
+    Derived from the exact two sources `add_signature` itself reads, on
+    purpose, so read access cannot drift from write access the way this
+    defect did: `signatures_service.required_purposes` (ruling 7 — the
+    admin-editable requirement set; a purpose an operator has turned off opens
+    no read slot either, the same as it opens no write slot) intersected with
+    `signers.required_role` (ruling 4 — the purpose -> role map
+    `_signer_refusal` already applies on the write side). `RECIPIENT_PURPOSE`
+    maps to no role and is excluded by `required_role` returning `None` for
+    it; the holder is `_is_holder`'s question, asked first by the caller.
+
+    Organization is checked with the SAME strict equality `_signer_refusal`
+    uses on the write path — never the three-axis `Zone` predicate a
+    `permits.view_any` holder is scoped by. A signature answers "which named
+    official of which named organization attests to this document", not
+    "whose rows may I see", and there is no such thing as a republic-wide
+    leshoz head; a head of a different leshoz holding the identical role and
+    the identical `permits.sign` grant still gets nothing here, exactly as
+    they get `wrong_organization` if they try to sign it.
+
+    **Access does not expire at signing or at ACTIVE, and this is a
+    deliberate choice, not an oversight.** Nothing about a signer's identity
+    changes at either boundary: the same head who could read the permit to
+    sign it must still be able to open the very document their own signature
+    is on — to confirm the signature went through, and afterwards to consult
+    a permit they personally attested to (an audit, a dispute, 3.11b's
+    duplicate register). Ending access at either point would reproduce this
+    exact defect one step later — a head who can read a permit right up until
+    they sign it, then not — and would make a staff signer's access to a
+    document they signed WEAKER than the citizen holder's, who never loses
+    access to their own permit either (`_is_holder`, unconditional on
+    status). The alternative — checking `missing_purposes` here too — was
+    considered and rejected for exactly that reason.
+    """
+    role = await auth_service.role_code(db, actor)
+    if role is None or actor.organization_id != permit.organization_id:
+        return False
+    required = await signatures_service.required_purposes(db, OBJECT_TYPE)
+    return any(signers.required_role(purpose) == role for purpose in required)
+
+
 async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) -> Permit:
     """The permit `actor` is allowed to read, or a refusal.
 
-    Two refusals, on purpose, and the difference is what the caller already
-    knows:
+    THREE admissions, checked in this order, and the difference between the
+    two refusals below is what the caller already knows:
 
-      * a caller who is neither the holder nor a `permits.view_any` holder gets
-        `ERR-SYS-003` (404) — the same answer an id that never existed gets.
-        Anything else is a permit-existence oracle: a citizen could learn which
-        ids are real by which ones answer 403;
-      * a `permits.view_any` holder outside the permit's zone gets `ERR-ACL-002`
-        (403). This one is staff, the refusal IS territorial, and saying so is
-        what `_assert_organization_in_zone` says on the issuance path for the
-        same actor and the same leshoz.
+      * the holder (`_is_holder`) — the 4th signature line, checked first so a
+        citizen never depends on the zone: an applicant carries no zone at
+        all, and staff who also happen to hold a permit of their own in
+        another leshoz read it as its holder;
+      * a required official signer of THIS permit, in its own organization
+        (`_is_required_signer`) — the read-side half of ruling 4, added by
+        this fix: `executor_head`, `chief_forester` and `accountant` hold
+        `permits.sign` and are exactly who `add_signature` lets attach a
+        signature, and a caller who cannot even OPEN the permit can never
+        reach the sign screen a UI would put in front of that route;
+      * a `permits.view_any` holder, subject to the zone below.
 
-    The holder is checked FIRST so a citizen never depends on the zone: an
-    applicant carries no zone at all, and staff who also happen to hold a permit
-    of their own in another leshoz read it as its holder.
+    A caller admitted by neither gets `ERR-SYS-003` (404) — the same answer an
+    id that never existed gets. Anything else is a permit-existence oracle: a
+    citizen could learn which ids are real by which ones answer 403. This is
+    also what a wrong-organization official gets: `executor_head`,
+    `chief_forester` and `accountant` hold no `permits.view_any` (migration
+    0019), so a head of a DIFFERENT leshoz falls straight through
+    `_is_required_signer`'s organization check into this branch, refused like
+    a stranger rather than told territorially — the same shape
+    `test_a_staff_role_without_view_any_is_refused_like_a_stranger` already
+    pins for `gis_specialist`.
+
+    A `permits.view_any` holder outside the permit's zone gets `ERR-ACL-002`
+    (403) instead: this one is staff, the refusal IS territorial, and saying
+    so is what `_assert_organization_in_zone` says on the issuance path for
+    the same actor and the same leshoz.
 
     **The territorial refusal writes an RI-12 trail before it raises** (ruling
     T8-a, `tz/10`: «попытка доступа вне территориальных полномочий», High,
@@ -1811,14 +2390,20 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
     attempting to SIGN a permit outside their zone is already recorded
     (`_signer_refusal`'s `wrong_organization`); without this, stage 4.2's risk
     report would see who tried to sign one and miss who tried to look at one.
+    A wrong-organization SIGNER's read attempt is deliberately NOT given the
+    same RI-12 treatment here — `_signer_refusal` already records it the
+    moment that same person actually tries to sign, and a second trail on the
+    mere READ that precedes every sign attempt would double the indicator for
+    one event.
 
     **RI-12 coverage on reads is DIRECT ACCESS ONLY, and 4.2 needs to know it.**
     `GET /permits` cannot produce a territorial denial at all — nobody named a
     target, so `zone_filter` simply returns fewer rows and there is no attempt to
     record. This function is the whole of the indicator's read-side surface:
-    `GET /permits/{id}` and `GET /permits/{id}/pdf`, both of which come through
-    here. A probe that walks the LIST is invisible to RI-12 by construction and
-    is the rate limiter's problem, not the audit trail's.
+    `GET /permits/{id}`, `GET /permits/{id}/pdf` and (Task 5) `GET
+    /permits/{id}/duplicates`, all three of which come through here. A probe
+    that walks the LIST is invisible to RI-12 by construction and is the rate
+    limiter's problem, not the audit trail's.
 
     The other refusal is NOT audited, deliberately: a caller who holds no
     `permits.view_any` cannot be "outside their zone" — they have no zone claim
@@ -1829,6 +2414,8 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
     if permit is None:
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
     if await _is_holder(db, permit, actor):
+        return permit
+    if await _is_required_signer(db, permit, actor):
         return permit
     if not await _holds_view_any(db, actor):
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
@@ -1883,6 +2470,26 @@ async def permit_document(
     """
     permit = await _readable_permit(db, permit_id, actor=actor)
     return permit, await pdf_bytes(db, permit.id)
+
+
+async def list_duplicates(
+    db: AsyncSession, permit_id: uuid.UUID, *, actor: User
+) -> Sequence[PermitDuplicate]:
+    """`GET /permits/{id}/duplicates` — the register, newest first.
+
+    Gated by `_readable_permit`, the same as the other two direct-access read
+    routes — and DELIBERATELY not by `issue_duplicate`'s own two permissions.
+    Since `e7df057`, `_readable_permit` admits THREE sets: the holder, a
+    required official signer of THIS permit in its own organization, and a
+    `permits.view_any` holder in zone. An accountant or a prosecutor who may
+    open the permit is meant to see how many copies of it exist even though
+    neither may add one — the register's audience is strictly wider than the
+    POST's, on purpose. Re-deriving that list here, rather than calling the
+    one function that already answers it, is the exact shape of the defect
+    that commit fixed.
+    """
+    permit = await _readable_permit(db, permit_id, actor=actor)
+    return await repo.duplicates(db, permit.id)
 
 
 async def list_permits(

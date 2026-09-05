@@ -1274,6 +1274,39 @@ async def list_contours(
     return items, total
 
 
+async def list_contour_features(
+    db: AsyncSession,
+    *,
+    bbox: str | None = None,
+    organization_id: uuid.UUID | None = None,
+    actor: User,
+) -> dict[str, Any]:
+    """`GET /gis/contours/features` — the whole published contour layer as
+    GeoJSON, for a map to draw before anything is picked.
+
+    Visibility is `list_contours`' exactly, built the same way from the same
+    three zone axes: an applicant and a republic-wide staff member see every
+    published contour, a leshoz-scoped one sees their own. Deriving it here a
+    second time rather than sharing a helper is the one thing NOT done — the
+    filter is built by the same `zone_filter` call with the same columns, so a
+    change to who may see a contour cannot land on the list and miss the map.
+
+    No permission code, matching `list_contours` and `contour_card`: which
+    parcels exist and where they lie is what an applicant needs before they
+    can ask for anything, and all three answer published versions only.
+    """
+    parsed_bbox = _parse_bbox(bbox)
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Contour.organization_id,
+    )
+    return await repo.contour_features_geojson(
+        db, bbox=parsed_bbox, zone=zone, organization_id=organization_id
+    )
+
+
 async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
     """`GET /gis/contours/{id}` — the published version's geometry plus the
     same occupancy placeholder `list_contours` carries (ruling 14). Requires a

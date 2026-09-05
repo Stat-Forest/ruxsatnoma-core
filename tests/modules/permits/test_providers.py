@@ -26,7 +26,7 @@ from app.modules.admin.models import Organization
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.permits.models import Permit
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
-from tests.modules.permits.conftest import count_queries, make_permit_on_contour
+from tests.modules.permits.conftest import count_queries, make_permit_on_contour, sign_decision
 
 
 @pytest.fixture
@@ -353,3 +353,36 @@ def test_both_providers_are_registered_exactly_once() -> None:
 
     assert gis_service.OCCUPANCY_PROVIDERS.count(permits_service.occupancy_provider) == 1
     assert norms_service.LOAD_PROVIDERS.count(permits_service.load_provider) == 1
+
+
+async def test_a_suspension_frees_the_area_and_the_load(
+    db, active_permit, head_client, suspend_reason_id, resume_reason_id, order_file_id
+) -> None:
+    """Ruling 7: both providers count `active` and nothing else, so there is
+    nothing to recompute — and this is the test that says so out loud."""
+    from app.modules.permits import service
+
+    contour = active_permit.contour_id
+    before = (await service.occupancy_provider(db, [contour]))[contour]
+    load_before = await service.load_provider(
+        db, contour, active_permit.period_from, active_permit.period_to
+    )
+    assert before == active_permit.area_ha
+
+    await sign_decision(
+        head_client,
+        active_permit.id,
+        "suspend",
+        reason_item_id=suspend_reason_id,
+        doc_file_id=order_file_id,
+    )
+    assert (await service.occupancy_provider(db, [contour])).get(contour, Decimal("0")) == Decimal(
+        "0"
+    )
+
+    await sign_decision(head_client, active_permit.id, "resume", reason_item_id=resume_reason_id)
+    assert (await service.occupancy_provider(db, [contour]))[contour] == before
+    assert (
+        await service.load_provider(db, contour, active_permit.period_from, active_permit.period_to)
+        == load_before
+    )

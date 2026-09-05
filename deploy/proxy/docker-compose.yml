@@ -1,0 +1,29 @@
+# deploy/proxy/docker-compose.yml
+# The single TLS entry point for all three applications. It owns ports 80 and 443; no
+# application stack publishes a port at all.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data      # certificates — losing this volume re-issues them
+      - caddyconfig:/config
+      - caddylogs:/var/log/caddy
+    networks:
+      edge:
+        # Pinned so the api's --forwarded-allow-ips can name it exactly.
+        ipv4_address: 172.28.0.2
+
+volumes:
+  caddydata:
+  caddyconfig:
+  caddylogs:
+
+networks:
+  edge:
+    external: true
+    name: ruxsatnoma-edge

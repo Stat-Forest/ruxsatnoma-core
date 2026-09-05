@@ -15,7 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
 from app.modules.admin.models import Organization
-from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
+from app.modules.permits.models import (
+    ForestTicket,
+    Permit,
+    PermitDuplicate,
+    PermitStatusHistory,
+    PermitTemplate,
+)
 
 
 async def add(db: AsyncSession, obj: Base) -> None:
@@ -224,6 +230,29 @@ async def add_status_history(db: AsyncSession, row: PermitStatusHistory) -> None
     await db.flush()
 
 
+async def add_duplicate(db: AsyncSession, row: PermitDuplicate) -> None:
+    """One нусха register row (Task 5, ruling 9). Nothing supersedes or
+    updates a row here — a register only ever grows."""
+    db.add(row)
+    await db.flush()
+
+
+async def duplicates(db: AsyncSession, permit_id: uuid.UUID) -> Sequence[PermitDuplicate]:
+    """A permit's whole register, newest first — `(issued_at, id)` both
+    descending, the mirror of `status_history`'s ascending pair and for the
+    same reason: `issued_at` is `server_default=func.now()`, which in
+    PostgreSQL is transaction start time, so two duplicates issued in the
+    same transaction share it to the microsecond and `id` (uuid7, therefore
+    time-ordered) is what keeps the newest-first order stable.
+    """
+    rows = await db.execute(
+        select(PermitDuplicate)
+        .where(PermitDuplicate.permit_id == permit_id)
+        .order_by(PermitDuplicate.issued_at.desc(), PermitDuplicate.id.desc())
+    )
+    return rows.scalars().all()
+
+
 async def occupied_area_by_contour(
     db: AsyncSession, contour_ids: Sequence[uuid.UUID], *, status: str
 ) -> dict[uuid.UUID, Decimal]:
@@ -287,9 +316,14 @@ async def committed_sb_load(
 
 
 async def permits_ending_before(
-    db: AsyncSession, day: date, *, status: str, limit: int, after_id: uuid.UUID | None = None
+    db: AsyncSession,
+    day: date,
+    *,
+    statuses: Sequence[str],
+    limit: int,
+    after_id: uuid.UUID | None = None,
 ) -> list[Permit]:
-    """One BATCH of permits in `status` whose period has run out before `day`,
+    """One BATCH of permits in `statuses` whose period has run out before `day`,
     locked, in id order after `after_id`.
 
     `period_to < day` and never `<=`: `permits.period_to` is INCLUSIVE, so a
@@ -315,8 +349,17 @@ async def permits_ending_before(
     Permits, then applications: `service.add_signature` locks in that order and
     it is the only lock ordering anywhere in `app/` — a sweep that took an
     application lock first would close the cycle.
+
+    `suspended` joins `active` in the candidate set (Task 7, ruling 8):
+    `PERMIT_TRANSITIONS` has always allowed `suspended -> expired`, and without
+    it a permit suspended in June with a period ending in September would stay
+    `suspended` forever — its application never reaching `close_finished`
+    either.
     """
-    conditions: list[ColumnElement[bool]] = [Permit.status == status, Permit.period_to < day]
+    conditions: list[ColumnElement[bool]] = [
+        Permit.status.in_(statuses),
+        Permit.period_to < day,
+    ]
     if after_id is not None:
         conditions.append(Permit.id > after_id)
     rows = await db.execute(
@@ -352,4 +395,116 @@ async def permits_in_statuses(
     if after_id is not None:
         conditions.append(Permit.id > after_id)
     rows = await db.execute(select(Permit).where(*conditions).order_by(Permit.id).limit(limit))
+    return list(rows.scalars().all())
+
+
+async def stalled_permits(
+    db: AsyncSession, day: date, *, limit: int, after_id: uuid.UUID | None = None
+) -> list[Permit]:
+    """One BATCH of `pending_signatures` permits whose period ended before `day`
+    (Task 7, ruling 16), in id order after `after_id` — `permits_ending_before`'s
+    idiom for the keyset cursor, without that function's reason for `FOR UPDATE`.
+
+    No lock: unlike the expiry sweep, `jobs.watch_stalled_permits` never moves
+    the permit it reads — it only notifies, and the once-only guard is
+    `notifications.already_notified`, not a status change that would need one
+    row unavailable to concurrent readers while it commits. `period_to < day`,
+    never `<=`, the same INCLUSIVE reading `permits_ending_before` documents;
+    `day` is the caller's `business_today()`.
+    """
+    conditions: list[ColumnElement[bool]] = [
+        Permit.status == "pending_signatures",
+        Permit.period_to < day,
+    ]
+    if after_id is not None:
+        conditions.append(Permit.id > after_id)
+    rows = await db.execute(select(Permit).where(*conditions).order_by(Permit.id).limit(limit))
+    return list(rows.scalars().all())
+
+
+# --- Task 6: the forest ticket (ЧТ), ВМҚ 506 ----------------------------------
+
+
+async def forest_tickets(db: AsyncSession, permit_id: uuid.UUID) -> Sequence[ForestTicket]:
+    """A permit's whole ВМҚ 506 register, newest first — the same
+    `(created_at, id)` descending tie-break `duplicates` uses above and for
+    the same reason: `created_at` is `server_default=func.now()` (PostgreSQL
+    transaction start time), so two tickets issued in one transaction share
+    it to the microsecond and `id` (uuid7, therefore time-ordered) is what
+    keeps them in a stable order.
+    """
+    rows = await db.execute(
+        select(ForestTicket)
+        .where(ForestTicket.permit_id == permit_id)
+        .order_by(ForestTicket.created_at.desc(), ForestTicket.id.desc())
+    )
+    return rows.scalars().all()
+
+
+async def live_forest_tickets(db: AsyncSession, permit_id: uuid.UUID) -> Sequence[ForestTicket]:
+    """The permit's currently `active` tickets, for
+    `service.revoke_tickets_of` (ruling 14) to move to `revoked` in the SAME
+    transaction as the permit's own revocation. `uq_forest_tickets_active`'s
+    own guarantee is that there is at most one.
+
+    `FOR UPDATE` — the same read-check-write shape `permit_by_id_for_update`
+    and `permits_ending_before` already use, and for the same reason: a
+    plain SELECT never waits on another transaction's row lock, so a ticket
+    `jobs.expire_forest_tickets` is expiring RIGHT NOW under its OWN lock
+    would still read here as `active`, and writing `revoked` once that
+    sweep's transaction commits would silently overwrite `expired` back to
+    `revoked`. Blocking here until the sweep resolves, then re-reading under
+    the lock (`populate_existing`), is what makes this exactly as safe as
+    the bulk `UPDATE ... WHERE status = 'active'` it replaces — that
+    statement's own WHERE clause is re-evaluated at write time, which is the
+    property this FOR UPDATE reproduces by a different mechanism.
+    """
+    rows = await db.execute(
+        select(ForestTicket)
+        .where(ForestTicket.permit_id == permit_id, ForestTicket.status == "active")
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return rows.scalars().all()
+
+
+async def tickets_ending_before(
+    db: AsyncSession, day: date, *, limit: int, after_id: uuid.UUID | None = None
+) -> list[ForestTicket]:
+    """One BATCH of `active` tickets whose `valid_to` has run out before
+    `day`, locked, in id order after `after_id` — `jobs.expire_forest_tickets`'s
+    own keyset cursor (Task 6, ruling 14 revised: a STANDALONE sweep, not a
+    third statement folded into `expire_permits`'s own batch loop), the same
+    shape `permits_ending_before` above already uses for the permit sweep and
+    for the same reasons:
+
+    `valid_to < day`, never `<=`: `forest_tickets.valid_to` is INCLUSIVE, so a
+    ticket ending today is still in force today. `day` is the caller's
+    `business_today()` — Asia/Tashkent, never the server's own date.
+
+    `FOR UPDATE` because this is a read-check-write over rows another actor
+    (a revocation) can move at the same time; `populate_existing` is the ORM
+    half of that same guarantee — without it the loader keeps whatever an
+    instance already in the identity map was holding (lesson).
+
+    **`limit` + `after_id` is a keyset cursor, not a page number** — the same
+    reasoning `permits_ending_before` gives: those `FOR UPDATE` locks are
+    held until the caller commits, so the batch size bounds how long a swept
+    ticket is unavailable to anything else, and the cursor is what lets the
+    worker resume after a batch it could not finish.
+    """
+    conditions: list[ColumnElement[bool]] = [
+        ForestTicket.status == "active",
+        ForestTicket.valid_to < day,
+    ]
+    if after_id is not None:
+        conditions.append(ForestTicket.id > after_id)
+    rows = await db.execute(
+        select(ForestTicket)
+        .where(*conditions)
+        .order_by(ForestTicket.id)
+        .limit(limit)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     return list(rows.scalars().all())

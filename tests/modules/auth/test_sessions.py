@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.config import get_settings
+from app.core import settings_store
 from app.core.security import hash_token, new_token
 from app.core.time import business_today
 from app.main import create_app
@@ -75,8 +76,11 @@ async def test_expired_session_is_401(db):
 
 async def test_idle_timeout_revokes(db, engine):
     user = await make_user(db)
+    # Derived from the spec, not a literal: the default idle window is policy and
+    # has moved once already (30 -> 300 minutes).
+    idle_minutes = settings_store.SETTING_SPECS["session_idle_minutes"].default
     row, token, _ = await make_session(
-        db, user, last_seen_at=datetime.now(UTC) - timedelta(minutes=31)
+        db, user, last_seen_at=datetime.now(UTC) - timedelta(minutes=idle_minutes + 1)
     )
     await db.commit()
     app = create_app()

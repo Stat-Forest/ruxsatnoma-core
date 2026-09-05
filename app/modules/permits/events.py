@@ -53,6 +53,19 @@ PERMIT_EXPIRED = "permit.expired"
 # (`app/event_subscriptions.py`): flat, no dot. The dot is the tell, as above.
 PERMIT_DUE = "permit.due"
 
+# --- 3.11b (plan `03.11b-permits-lifecycle` ruling 18): suspend / resume / revoke /
+# duplicate / forest ticket / stalled signature. All six are new with this stage and
+# all six are seeded by migration 0023, `inapp` and `sms`, active. Five go to the
+# permit's HOLDER; `permit.unsigned_stalled` goes to the application's ASSIGNED
+# EXECUTOR instead — ruling 16's notify-only sweep for a permit whose period ran
+# out before anyone signed it.
+PERMIT_SUSPENDED = "permit.suspended"
+PERMIT_RESUMED = "permit.resumed"
+PERMIT_REVOKED = "permit.revoked"
+PERMIT_DUPLICATE_ISSUED = "permit.duplicate_issued"
+FOREST_TICKET_ISSUED = "forest_ticket.issued"
+PERMIT_UNSIGNED_STALLED = "permit.unsigned_stalled"
+
 NOTIFIED_EVENT_CODES: tuple[str, ...] = (
     PERMIT_ISSUED,
     PERMIT_SIGNED,
@@ -60,4 +73,10 @@ NOTIFIED_EVENT_CODES: tuple[str, ...] = (
     PERMIT_EXPIRING,
     PERMIT_EXPIRED,
     PERMIT_DUE,
+    PERMIT_SUSPENDED,
+    PERMIT_RESUMED,
+    PERMIT_REVOKED,
+    PERMIT_DUPLICATE_ISSUED,
+    FOREST_TICKET_ISSUED,
+    PERMIT_UNSIGNED_STALLED,
 )

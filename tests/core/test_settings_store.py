@@ -15,7 +15,7 @@ def _clear_cache():
 
 
 async def test_default_when_no_row(db):
-    assert await settings_store.get_int(db, "session_idle_minutes") == 30
+    assert await settings_store.get_int(db, "session_idle_minutes") == 300
     assert await settings_store.get_int(db, "login_max_attempts") == 5
 
 

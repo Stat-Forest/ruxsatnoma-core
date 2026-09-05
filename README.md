@@ -96,3 +96,83 @@ DATABASE_URL="$DATABASE_URL_TEST" uv run alembic upgrade head
 - **The `/check` page must be served before the first production permit is issued** (stage 3.11a, ruling F-1). The QR printed on every permit encodes `{PUBLIC_BASE_URL}/check?qr=<token>` — the front-end page a citizen reads, not `/api/v1/public/permits/check`, which is the JSON that page calls (requisite 24 exists so a scan lands on something readable, not on a raw object). That page is stage 6's and does not exist yet, so the URL 404s today. **This costs nothing until the first production permit exists and is uncorrectable from that moment on**: a permit is printed once and the URL on it cannot be changed afterwards — `permits.doc_hash` is frozen over those bytes and all four ERI signatures are taken over them. So: serve `/check` (even as a stub that reads the JSON route), or do not issue.
 - **`GET /api/v1/public/permits/check` is the first route the open internet reaches with no credentials** (stage 3.11a). `qr_check_log` deliberately records no IP address and no personal data, and `app/core/logging.py` drops that path's uvicorn access-log line for the same reason — that line would carry the visitor's IP **and** the printed QR token in plaintext, in a file no purge job covers. Two limits worth knowing: the filter reaches **uvicorn's logger and nothing further out**, so a deployment fronting the app with its own access logging (nginx, an ingress, a sidecar) must exclude the same path itself; and it is a prefix match on that one exact path, so a mixed-case or double-slashed variant is not filtered. The route's rate limit is its whole security control (CAPTCHA is the front end's, at stage 6) and it keys on `request.client.host` — behind a proxy that needs `--proxy-headers`/`--forwarded-allow-ips` **set to the proxy's own address**: unset, every citizen in the country shares one bucket; set to `*`, any client can spoof `X-Forwarded-For` for a fresh bucket per request and the control is gone entirely.
 - Running two or more app servers needs Redis for E-IMZO's shared challenge store (`design/04` §2.6) — this stage deliberately ships without it (one instance today; decision #36 already rejected Redis for jobs). The day a second instance joins, the challenge store is the first thing to break, and it breaks silently: a user gets `-20 challenge expired` at random, which reads like a client bug, not a missing dependency.
+
+## Dev deployment
+
+The Agency's dev server (stage 7.0, `docs/plans/07.0-deploy-dev.md`) runs all three
+applications, deployed from `chore/deploy-dev` branches — **not yet merged into
+`dev`/`main`** in any of the three repositories. See the plan and its execution ledger for
+the full story, including two rulings the plan did not anticipate (the office gateway
+terminates TLS itself).
+
+**Live URLs:**
+- https://dev.ruxsatnoma-urmon.uz — landing
+- https://dev-api.ruxsatnoma-urmon.uz — backend API
+- `dev-admin.ruxsatnoma-urmon.uz` — adminka, deployed but **not reachable from the
+  internet yet**: the gateway does not publish that hostname.
+
+**Server:** `93.188.80.86`, SSH on port `2213`, user `jahongir`. Four independent compose
+stacks live under that user's home — **not `/opt`**, because `sudo` on this server needs an
+interactive password and cannot run unattended:
+
+| Path | Contents |
+|---|---|
+| `~/ruxsatnoma-api` | this repository's `deploy/` output — the `api`, `db` (PostgreSQL/PostGIS) and `minio` services, plus the server's own `.env` |
+| `~/ruxsatnoma-proxy` | Caddy — the shared TLS entry point for all three sites |
+| `~/ruxsatnoma-admin` | the adminka's nginx + static bundle |
+| `~/ruxsatnoma-landing` | the landing's nginx + static bundle |
+
+**Reading logs:**
+```bash
+ssh -p 2213 jahongir@93.188.80.86
+cd ~/ruxsatnoma-api && docker compose -f docker-compose.deploy.yml logs -f api
+```
+(swap `api` for `db`/`minio`; the proxy's own logs are
+`cd ~/ruxsatnoma-proxy && docker compose logs -f caddy`.)
+
+**Running a migration by hand:**
+```bash
+cd ~/ruxsatnoma-api
+docker compose -f docker-compose.deploy.yml run --rm api alembic upgrade head
+```
+
+**Re-running `app.bootstrap`** (e.g. to create another `sys_admin`):
+```bash
+cd ~/ruxsatnoma-api
+docker compose -f docker-compose.deploy.yml run --rm api \
+  python -m app.bootstrap --login <login> --full-name "<Full Name>"
+```
+Save the printed one-time password and TOTP URI immediately — they are never shown again.
+The first `sys_admin`'s credentials already live in `~/admin-credentials.txt` (mode 600) on
+the server; deliberately never printed into a chat session or committed anywhere.
+
+**`.env` lives only on the server and is not recoverable from git.**
+`deploy/bootstrap-server.sh` renders it once from `deploy/.env.deploy.template` via
+`envsubst`, generating three secrets, and never overwrites an existing file — the database
+and MinIO passwords are baked into their volumes on first start, so regenerating it would
+lock the data away. If the server is lost, the volumes are lost with it: this stage
+deliberately ships with no backup (the dev database is disposable; the day it stops being
+disposable this becomes urgent).
+
+**Certificate renewal is a standing human duty — the single most important operational fact
+about this environment.** The office gateway (Kerio Control) terminates TLS itself and
+presents its own self-signed certificate, expired since 2022-09-04; a plain DNAT forward was
+requested and refused by the network team. Caddy still obtains and renews real Let's Encrypt
+certificates over the gateway's port-80 publication (`cert_issuer acme {
+disable_tlsalpn_challenge }` in `deploy/proxy/Caddyfile` is what makes issuance possible at
+all, since the gateway — not Caddy — answers port 443 and TLS-ALPN-01 can never reach us).
+Let's Encrypt certificates last 90 days and Caddy renews at ~60, but **nothing installs the
+renewed file on the gateway automatically** — a human must re-export it and hand it to the
+network team roughly every 60 days, or all three sites start showing a security warning the
+day the installed copy expires:
+```bash
+bash ~/ruxsatnoma-api/deploy/export-certs.sh --check   # report expiry dates, export nothing
+bash ~/ruxsatnoma-api/deploy/export-certs.sh           # export into ~/certs-for-gateway
+```
+
+**CI/CD exists but is not armed.** `.github/workflows/deploy.yml` here (and its equivalents
+in `ruxsatnoma-frontend` and `ruxsatnoma-landing`) will deploy on every push to `dev`, but no
+deploy key has been created and no secret registered on any repository's `dev` GitHub
+Environment — both need Oybek's explicit approval. Each workflow's header names the five
+secrets it needs (`DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_PORT`, `DEPLOY_USER`,
+`DEPLOY_PATH`). Until then, every deploy to this server is manual, the way the first one was.

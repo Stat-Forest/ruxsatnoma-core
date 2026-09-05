@@ -1,0 +1,151 @@
+name: Deploy — dev
+
+# Ships the backend to the Agency's dev server (dev-api.ruxsatnoma-urmon.uz).
+#
+# The server holds no repository credential: the runner streams the source it already
+# checked out with `git archive | ssh 'tar -x'`. `.env` is NOT in the archive, so the
+# server's own secrets survive every deploy.
+#
+# Required secrets on the `dev` environment:
+#   DEPLOY_SSH_KEY  — private key that logs into the server
+#   DEPLOY_HOST     — 93.188.80.86
+#   DEPLOY_PORT     — 2213
+#   DEPLOY_USER     — jahongir
+#   DEPLOY_PATH     — /home/jahongir/ruxsatnoma-api
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api-dev
+  cancel-in-progress: false # never interrupt a half-applied deploy
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Ship to dev
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load the SSH key
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Trust the server host key
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Ship the source
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          echo "Shipping $(git rev-parse --short HEAD) to $DEPLOY_HOST:$DEPLOY_PATH"
+          # Extract into a scratch dir first, then rsync --delete it onto DEPLOY_PATH. A plain
+          # `tar -x` only ever adds or overwrites — a file removed or renamed upstream (a
+          # migration revision, say) lingers on the server forever and gets COPY'd into the
+          # next image; this repository has already lived through a two-Alembic-head situation
+          # from stale revision files, so that is not hypothetical here.
+          # --exclude='.env' is load-bearing: .env lives only on the server, is not in git, and
+          # --delete would otherwise remove it, taking POSTGRES_PASSWORD/S3_SECRET_KEY with it
+          # — secrets baked into the db/minio volumes on first start, which would make the data
+          # unreachable.
+          TMP_DIR=$(ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mktemp -d")
+          git archive --format=tar.gz HEAD \
+            | ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+                "tar -xzf - -C '$TMP_DIR'"
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p '$DEPLOY_PATH' && rsync -a --delete --exclude='.env' '$TMP_DIR/' '$DEPLOY_PATH/' && rm -rf '$TMP_DIR'"
+
+      - name: Build, migrate and roll
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          COMPOSE="docker compose -f docker-compose.deploy.yml"
+
+          echo "Building (the old container keeps serving)…"
+          $COMPOSE build
+
+          echo "Starting db and minio…"
+          # --wait blocks until both report healthy (they already declare healthchecks in
+          # docker-compose.deploy.yml) instead of racing the migration against a still-starting
+          # database.
+          $COMPOSE up -d --wait db minio
+
+          echo "Applying migrations…"
+          # </dev/null is load-bearing, not decoration: this whole script arrives over ssh as
+          # `bash -s`'s stdin (below), and `docker compose run` inherits and consumes that same
+          # stdin by default. Without the redirect, everything after this line — the health
+          # check, image prune, `compose ps` — never runs, and the job still exits 0 whether or
+          # not the api came up. Reproduced locally; do not "clean this up".
+          $COMPOSE run --rm --no-deps api alembic upgrade head </dev/null
+
+          echo "Rolling containers…"
+          $COMPOSE up -d
+
+          # /health is liveness only; /health/ready also checks that PostGIS answers, which is
+          # what makes a deploy actually good. This is a plain in-container check over the
+          # compose network — the authoritative gate, unaffected by the edge gateway below.
+          echo "Health check…"
+          for i in $(seq 1 10); do
+            # Same stdin-swallowing hazard as the migration above — `exec -T` also inherits and
+            # consumes the remote script's stdin. Redirecting only one of the two moves the
+            # problem to the other; both need it.
+            if $COMPOSE exec -T api python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready').status==200 else 1)" </dev/null; then
+              echo "healthy"; break
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "health check failed"; $COMPOSE logs --tail=50 api; exit 1
+            fi
+            echo "attempt $i/10…"; sleep 6
+          done
+
+          docker image prune -f
+          $COMPOSE ps
+          REMOTE
+
+      - name: Verify the public endpoint
+        # Advisory only. The dev site sits behind a Kerio gateway that terminates TLS with its
+        # own expired certificate (-k is required just to get past that), and the gateway may
+        # not yet answer for a name it hasn't been given — a failure here says nothing about
+        # whether the deploy itself succeeded, so it must never fail the job. The internal
+        # health check above (inside the container, over the compose network) is the real gate.
+        continue-on-error: true
+        run: |
+          ok=0
+          for i in $(seq 1 5); do
+            if curl -fsk https://dev-api.ruxsatnoma-urmon.uz/health/ready >/dev/null; then
+              ok=1; break
+            fi
+            echo "retry $i/5…"; sleep 5
+          done
+          if [ "$ok" -eq 1 ]; then
+            echo "public endpoint reachable"
+          else
+            echo "::warning::Public endpoint unreachable through the gateway — this does not mean the deploy failed; the internal health check already confirmed the container is healthy. Check the gateway's published names if this persists."
+          fi

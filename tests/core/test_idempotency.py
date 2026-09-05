@@ -109,3 +109,50 @@ async def test_user_namespacing(db):
     await db.commit()
     c2 = await idempotency.begin(db, key=key, user_id=u2.id, method="POST", path="/x", body=b"b")
     assert c1.fresh and c2.fresh  # same key, different users — independent
+
+
+async def test_a_failed_attempt_closes_the_record_so_the_same_key_replays_and_a_new_key_succeeds(
+    db,
+):
+    """The production defect (3.9b task 3, ANSWERED а, 2026-09-05):
+    `IdempotencyContext.save()` was only ever called on the SUCCESS path, right
+    before a route returns — nothing wrote `response_status`/`response_body`
+    when the handler raised instead, so the marker `begin()` inserted was left
+    with `response_status IS NULL` and the very next call with the SAME key
+    fell through to `in_flight` for the whole `IN_FLIGHT_TTL`, even though the
+    refusal was the caller's to fix (a blocking check, a stale package,
+    `ERR-SIGN-001`).
+
+    This test simulates the fix's OTHER half — `app/main.py`'s
+    `domain_error_handler` calling `ctx.save()` on the exception path — by
+    closing the record as a FAILURE directly, the same write `save()` already
+    performs on success: `begin()` itself needs no change, its own
+    `row.response_status is not None` branch already does the right thing once
+    a failure closes the row instead of leaving it null.
+    """
+    user = await make_user(db)
+    key = uuid.uuid4()
+    ctx = await idempotency.begin(
+        db, key=key, user_id=user.id, method="POST", path="/x", body=b'{"a":1}'
+    )
+    assert ctx.fresh is True
+    # The route "raised" here instead of returning — the exception handler
+    # closes the record with the refusal's own status and body.
+    await ctx.save(db, status_code=422, body={"error": {"code": "ERR-VAL-001"}})
+    await db.commit()
+
+    # (1) The SAME key replays the stored FAILURE — never `in_flight`.
+    with pytest.raises(StoredIdempotentResponse) as exc:
+        await idempotency.begin(
+            db, key=key, user_id=user.id, method="POST", path="/x", body=b'{"a":1}'
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.body == {"error": {"code": "ERR-VAL-001"}}
+
+    # (2) A DIFFERENT key — the corrected retry a real client sends — proceeds
+    # fresh rather than being caught up in the first attempt's failure.
+    new_key = uuid.uuid4()
+    ctx2 = await idempotency.begin(
+        db, key=new_key, user_id=user.id, method="POST", path="/x", body=b'{"a":1}'
+    )
+    assert ctx2.fresh is True

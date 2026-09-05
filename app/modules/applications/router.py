@@ -37,15 +37,21 @@ from app.core.schemas import Page, PageParams
 from app.modules.applications import decision as service_decision
 from app.modules.applications import service
 from app.modules.applications.permissions import (
+    APPLICATIONS_ASSIGN,
     APPLICATIONS_CREATE,
     APPLICATIONS_DECIDE,
     APPLICATIONS_REVIEW,
 )
 from app.modules.applications.schemas import (
     ApplicationApproveIn,
+    ApplicationAssignIn,
+    ApplicationCalculationOut,
     ApplicationCancelIn,
     ApplicationCardOut,
+    ApplicationCheckIn,
     ApplicationCheckOut,
+    ApplicationConclusionIn,
+    ApplicationConclusionOut,
     ApplicationCreate,
     ApplicationDecisionOut,
     ApplicationDocumentIn,
@@ -53,13 +59,21 @@ from app.modules.applications.schemas import (
     ApplicationOut,
     ApplicationPatch,
     ApplicationRejectIn,
+    ApplicationRequestInfoIn,
+    ApplicationRespondInfoIn,
+    ApplicationReturnIn,
     ApplicationStatus,
     ApplicationSubmitIn,
     ApplicationTimelineOut,
     PrecheckCalculationOut,
     PrecheckOut,
 )
-from app.modules.auth.deps import get_current_user, idempotency_context, require_permission
+from app.modules.auth.deps import (
+    get_current_user,
+    idempotency_context,
+    require_any_permission,
+    require_permission,
+)
 from app.modules.auth.models import User
 
 # `applications.number` is `RX-<yyyy>-<seq>` (plan ruling 5а). Bounded because
@@ -421,6 +435,26 @@ async def cancel_application(
     )
 
 
+@router.post("/applications/{application_id}/clone", status_code=201)
+async def clone_application(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationOut:
+    """201 with a fresh DRAFT pre-filled from an application the caller owns,
+    in whatever status it holds — so a herder renewing next season's grazing
+    does not retype the plot, the activity or the herd.
+
+    `applications.create` is the gate, the same one `POST /applications`
+    itself uses: filing a fresh draft, pre-filled or not, is one right.
+    Ownership is the service's own check, so a holder of the code who does not
+    own the source gets 404 — never a 403, which would confirm the
+    application exists (`service.clone`'s own docstring has the field-by-field
+    account of what is carried over and what is deliberately left behind).
+    """
+    return ApplicationOut.model_validate(await service.clone(db, application_id, actor=actor))
+
+
 @router.get("/applications/{application_id}/timeline")
 async def get_application_timeline(
     application_id: uuid.UUID,
@@ -433,13 +467,227 @@ async def get_application_timeline(
     A SUBMISSION signature sits on its own `status_history` entry (ruling 25:
     the history row's id IS the signed object's id); the top-level `signatures`
     is the DECISION line, and is empty until task 7's approve/reject signs one.
-    `info_requests` is `[]` until 3.9b writes that table.
+    `info_requests` lists every pause this application has had, open or closed,
+    oldest first.
 
     404 `ERR-SYS-003` for an id that does not exist, for an application this
     caller has no claim on, and for one outside a staff caller's zone — the same
     answer to all three, as on the card.
     """
     return ApplicationTimelineOut.build(await service.timeline(db, application_id, actor=user))
+
+
+# --- Task 1 (3.9b): manual reassignment ----------------------------------------
+#
+# `applications.assign` is granted to `sys_admin` and to NOBODY else
+# (migration 0015's `ROLE_GRANTS`; Task 1 ANSWERED (б), 2026-09-05 —
+# reassignment is an administrator's action, logged and rare, not the leshoz
+# head's, whatever `design/03` and ruling 13's own prose still say). No zone
+# check on the route or in the service: the one role that can reach it at all
+# is already unrestricted nationwide (decision #41 ruling 2).
+
+
+@router.post("/applications/{application_id}/assign")
+async def assign_application(
+    application_id: uuid.UUID,
+    payload: ApplicationAssignIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_ASSIGN))],
+) -> ApplicationOut:
+    """Name who holds an application, superseding whatever assignment it has
+    now — or claiming one auto-assignment left with no reviewer.
+
+    403 `ERR-ACL-001` for anyone but `sys_admin`, from the dependency, before
+    the service is ever reached. 404 `ERR-SYS-003` for an id that does not
+    exist. 409 `ERR-APP-004` (`reason="no_organization"`) for a DRAFT with no
+    contour yet — unreachable once an application is genuinely SUBMITTED.
+    """
+    return ApplicationOut.model_validate(
+        await service.assign(
+            db, application_id, user_id=payload.user_id, reason=payload.reason, actor=actor
+        )
+    )
+
+
+# --- Task 3 (3.9b): return for correction --------------------------------------
+#
+# `applications.review` (hodim) OR `applications.decide` (the head) —
+# `require_any_permission`, because sending a package back for correction is
+# not the head's decision alone the way approve/reject are: the reviewer who
+# caught an incomplete filing sends it back before the head ever sees it. The
+# zone is the other half of the rule and lives in the service
+# (`service._assert_in_actor_zone`), exactly like start-review beside it.
+#
+# No `Idempotency-Key`: a replay finds the application no longer SUBMITTED or
+# IN_REVIEW (already RETURNED) and answers 409 — the same reasoning task 6's
+# two POSTs give for carrying none.
+
+
+@router.post("/applications/{application_id}/return")
+async def return_application(
+    application_id: uuid.UUID,
+    payload: ApplicationReturnIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[
+        User, Depends(require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE))
+    ],
+) -> ApplicationOut:
+    """SUBMITTED or IN_REVIEW -> RETURNED, with a typed reason, the fields to
+    fix and a legal basis — so the applicant can correct and resubmit.
+
+    422 `ERR-VAL-001`: `unknown_rejection_reason` for a `reason_item_id`
+    outside the `rejection_reasons` classifier; `reason_not_returnable` for
+    one that IS in it but types a refusal or a withdrawal rather than a return
+    (RJ-03 is a REFUSAL — returning under it would misdescribe the decision);
+    `fields_to_fix_required` for an empty object; `unknown_field` for a key
+    naming no real column of the application. 404 `ERR-SYS-003` for an id that
+    does not exist and for an application outside the caller's zone. 409
+    `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
+    """
+    return ApplicationOut.model_validate(
+        await service.return_to_applicant(
+            db,
+            application_id,
+            reason_item_id=payload.reason_item_id,
+            fields_to_fix=payload.fields_to_fix,
+            legal_basis=payload.legal_basis,
+            actor=actor,
+        )
+    )
+
+
+# --- Task 4 (3.9b): request for information and the SLA pause -----------------
+#
+# `request-info` carries `applications.review` alone — the same reviewer who
+# may take an application into work may ask it a question — with the zone
+# check living in the service exactly like `start-review` beside it.
+# `respond-info` carries `applications.create`, the applicant's own gate
+# (`patch_application`'s own reasoning above): ownership is the service's
+# check, so a stranger gets 404 rather than a 403 confirming the application
+# exists.
+#
+# No `Idempotency-Key` on either: a replayed `request-info` finds one already
+# open and answers 409 (the same reasoning `return`'s own comment gives); a
+# replayed `respond-info` finds the application no longer PENDING_INFO
+# (already IN_REVIEW) and answers 409 too.
+
+
+@router.post("/applications/{application_id}/request-info")
+async def request_info_application(
+    application_id: uuid.UUID,
+    payload: ApplicationRequestInfoIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationOut:
+    """SUBMITTED or IN_REVIEW -> PENDING_INFO, opening the `info_requests` row
+    that pauses the SLA clock (ruling 8) until `respond-info` closes it.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone. 409 `ERR-APP-004` in any status but SUBMITTED
+    or IN_REVIEW, and (`reason="info_request_already_open"`) for a second
+    request while one is already open — two open pauses would make the pause
+    arithmetic ambiguous.
+    """
+    return ApplicationOut.model_validate(
+        await service.request_info(db, application_id, message=payload.message, actor=actor)
+    )
+
+
+@router.post("/applications/{application_id}/respond-info")
+async def respond_info_application(
+    application_id: uuid.UUID,
+    payload: ApplicationRespondInfoIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationOut:
+    """The owner's own reply: PENDING_INFO -> IN_REVIEW, closing the newest
+    open `info_requests` row, attaching `file_ids` as `application_documents`,
+    and shifting `sla_deadline_at` forward by exactly the length of the pause
+    (ruling 8) — never re-derived, never left untouched.
+
+    404 `ERR-SYS-003` for a stranger. 409 `ERR-APP-004` in any status but
+    PENDING_INFO. 422 `ERR-VAL-001` for a `file_ids` entry that is missing,
+    archived or somebody else's upload.
+    """
+    return ApplicationOut.model_validate(
+        await service.respond_info(
+            db, application_id, text=payload.text, file_ids=payload.file_ids, actor=actor
+        )
+    )
+
+
+# --- Task 5 (3.9b): conclusions and recalculation ------------------------------
+#
+# `conclusion` takes `Depends(get_current_user)` rather than a fixed
+# `require_permission`: which permission it needs depends on the BODY's own
+# `kind`, decided per request inside `service.add_conclusion` (a route-level
+# dependency is resolved before the body is even parsed, so it cannot see
+# `kind` at all). Both branches — `applications.review` for `kind="executor"`,
+# `applications.conclude_gis` for `kind="gis"` (fix round 1, task 5) — are
+# documented on that function, zone-checked identically either way.
+#
+# `recalculate` DOES carry a route-level gate, `applications.review` OR
+# `.decide` — "the hodim or the head" (ruling 17, narrowed 2026-09-05: the GIS
+# specialist is not among them). The WHEN half — which statuses, and whose
+# calculation — is `norms.service.save_calculation`'s own guard
+# (`_assert_application_open_for_calculation`) and is not repeated here.
+#
+# Neither carries an `Idempotency-Key`: a repeat conclusion is a second row by
+# design (ruling 10), and a repeat recalculation is `calculations`' own
+# append-only "the newest wins" (ruling 11) — both replays are the SPECIFIED
+# behaviour, not the duplicate the mechanism exists to suppress.
+
+
+@router.post("/applications/{application_id}/conclusion", status_code=201)
+async def add_conclusion(
+    application_id: uuid.UUID,
+    payload: ApplicationConclusionIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(get_current_user)],
+) -> ApplicationConclusionOut:
+    """A specialist's written finding on the application (tz/04 С8) — the
+    hodim's `kind="executor"` (`applications.review`) or the GIS specialist's
+    `kind="gis"` (`applications.conclude_gis`, see `service.add_conclusion`).
+    Immutable: no PATCH, no DELETE anywhere in this module — a repeat
+    conclusion after rework is a new row (ruling 10).
+
+    403 `ERR-ACL-001` for a caller who does not hold the permission `kind`
+    requires. 404 `ERR-SYS-003` for an id that does not exist or an
+    application outside the caller's zone.
+    """
+    return ApplicationConclusionOut.model_validate(
+        await service.add_conclusion(
+            db,
+            application_id,
+            kind=payload.kind,
+            text=payload.text,
+            recommendation=payload.recommendation,
+            actor=actor,
+        )
+    )
+
+
+@router.post("/applications/{application_id}/recalculate")
+async def recalculate_application(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[
+        User, Depends(require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE))
+    ],
+) -> ApplicationCalculationOut:
+    """A new `calculations` row, priced off the application's current stored
+    fields against whatever `norms` reads as effective right now — for the
+    hodim or the head to call during review (ruling 17; tz/04 С5: after the
+    vet/cadastre checks, confirm the price or send it for recalculation).
+
+    409 `ERR-NORM-005` (`norms`' own state-conflict code, never
+    `ERR-APP-004`) once the application is APPROVED or beyond — by then the
+    figure has been billed and, once a permit exists, printed on a signed
+    document.
+    """
+    return ApplicationCalculationOut.build(
+        await service.recalculate(db, application_id, actor=actor)
+    )
 
 
 # --- Task 7: the head's decision -----------------------------------------------
@@ -540,4 +788,57 @@ async def reject_application(
             actor=actor,
         ),
         forwarded_to_organization=None,
+    )
+
+
+# --- Task 7 (3.9b): external checks — veterinary and cadastre -----------------
+#
+# Both routes carry `applications.review` alone — maker and confirmer are the
+# SAME role (tz/04 С5, the hodim), so unlike a maker/checker split across two
+# different codes there is only one to gate the route on; `service.
+# confirm_check`'s own identity comparison is what tells the two calls apart
+# (lesson: "A maker-checker route needs BOTH roles' permission" — here both
+# roles are the same one).
+
+
+@router.post("/applications/{application_id}/checks", status_code=201)
+async def add_application_check(
+    application_id: uuid.UUID,
+    payload: ApplicationCheckIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationCheckOut:
+    """Either `{check_type}` alone (calls the live vet/cadastre adapter) or
+    the paper fallback (`source="manual_fallback"`, `result`, `doc_file_id`) —
+    `service.add_check` tells them apart. A paper result is written with
+    `confirmed_by=None`; it is not usable until a DIFFERENT reviewer confirms
+    it through `POST .../checks/{id}/confirm` below (Oybek's ruling,
+    2026-09-05: the paper fallback is exactly the case a second pair of eyes
+    exists for).
+
+    404 `ERR-SYS-003` for an id that does not exist or an application outside
+    the caller's zone. 422 `ERR-VAL-001` for the paper shape missing `result`
+    or `doc_file_id`, or naming a `doc_file_id` that is missing or archived.
+    """
+    return ApplicationCheckOut.model_validate(
+        await service.add_check(db, application_id, payload, actor=actor)
+    )
+
+
+@router.post("/applications/{application_id}/checks/{check_id}/confirm")
+async def confirm_application_check(
+    application_id: uuid.UUID,
+    check_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationCheckOut:
+    """The second person a paper result needs. 409 `ERR-APP-004` refuses the
+    MAKER of the same row (`reason="maker_cannot_confirm_own_record"`), a row
+    that is not `source="manual_fallback"`, and one already confirmed.
+
+    404 `ERR-SYS-003` for an id that does not exist, an application outside
+    the caller's zone, or a `check_id` that does not belong to it.
+    """
+    return ApplicationCheckOut.model_validate(
+        await service.confirm_check(db, application_id, check_id, actor=actor)
     )

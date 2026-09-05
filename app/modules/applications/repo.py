@@ -17,21 +17,26 @@ ours to FETCH either, so `service.list_applications` obtains it from
 this file imports no other module's service (review I2)."""
 
 import uuid
-from datetime import date
+from collections.abc import Sequence
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
+from app.modules.applications.assignment import Candidate
 from app.modules.applications.models import (
     Application,
     ApplicationAssignment,
     ApplicationCheck,
+    ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
+    InfoRequest,
 )
+from app.modules.applications.sla import SLA_ACTIVE_STATUSES
 
 
 async def get_application(db: AsyncSession, application_id: uuid.UUID) -> Application | None:
@@ -149,6 +154,30 @@ async def delete_document(db: AsyncSession, document: ApplicationDocument) -> No
     await db.flush()
 
 
+async def list_conclusions(
+    db: AsyncSession, application_id: uuid.UUID
+) -> list[ApplicationConclusion]:
+    """EVERY conclusion row, oldest first (`uuid7` is time-ordered) — never
+    "the latest per kind": a repeat conclusion after rework is a NEW row and
+    the head reads the history (ruling 10), the same reason `list_checks`
+    beside it never collapses to one row per `check_type`."""
+    rows = await db.execute(
+        select(ApplicationConclusion)
+        .where(ApplicationConclusion.application_id == application_id)
+        .order_by(ApplicationConclusion.id)
+    )
+    return list(rows.scalars().all())
+
+
+async def add_conclusion(db: AsyncSession, conclusion: ApplicationConclusion) -> None:
+    """Stage and flush, then read the row back — `add_document`'s own shape:
+    `created_at` is a `server_default` and the 201 response serializes it
+    (lesson: the row in memory is not what Postgres stored)."""
+    db.add(conclusion)
+    await db.flush()
+    await db.refresh(conclusion)
+
+
 async def add_checks(db: AsyncSession, rows: list[ApplicationCheck]) -> None:
     """Insert one run's check rows and load their server defaults back.
 
@@ -178,6 +207,12 @@ async def list_checks(db: AsyncSession, application_id: uuid.UUID) -> list[Appli
         .order_by(ApplicationCheck.id)
     )
     return list(rows.scalars().all())
+
+
+async def get_check(db: AsyncSession, check_id: uuid.UUID) -> ApplicationCheck | None:
+    """`get_application`'s own shape (line ~42), for `confirm_check`'s single
+    row instead of `list_checks`' whole run."""
+    return await db.get(ApplicationCheck, check_id)
 
 
 def _zone_join_target(contour_organization_col: Any) -> Any:
@@ -341,6 +376,41 @@ async def active_overlapping(
     return rows.scalars().first()
 
 
+# 3.11b task 8 (`permits.service.extend`): the statuses in which an EXTENSION
+# still blocks a second one. Unlike `ACTIVE_STATUSES` above this INCLUDES
+# DRAFT — an extension nobody has submitted yet still occupies the "already
+# asked" slot, which is exactly the case the "two clicks" guard exists for —
+# and excludes only the five terminal ones (a rejected, cancelled, expired,
+# closed or archived extension blocks nothing, the same reasoning
+# `ACTIVE_STATUSES` applies to a fresh filing).
+OPEN_EXTENSION_STATUSES = ("DRAFT", *ACTIVE_STATUSES)
+
+
+async def open_extension_of(
+    db: AsyncSession, parent_application_id: uuid.UUID
+) -> Application | None:
+    """The still-open `kind='extension'` child of `parent_application_id`, if
+    one exists — `permits.service.extend`'s duplicate guard, in the same
+    shape as `active_overlapping` above: it exists to NAME the collision in
+    `ERR-APP-002`, not to pre-empt the insert. Here the guard needs no
+    pre-emption at all, because the caller locks the PARENT PERMIT
+    (`permit_by_id_for_update`) before reaching this read, so two concurrent
+    extend attempts on the same permit serialise on that lock rather than
+    racing each other to this SELECT.
+    """
+    rows = await db.execute(
+        select(Application)
+        .where(
+            Application.parent_application_id == parent_application_id,
+            Application.kind == "extension",
+            Application.status.in_(OPEN_EXTENSION_STATUSES),
+        )
+        .order_by(Application.id)
+        .limit(1)
+    )
+    return rows.scalars().first()
+
+
 # --- Task 6: the timeline's rows, and the assignment register -----------------
 
 
@@ -414,3 +484,139 @@ async def add_assignment(db: AsyncSession, row: ApplicationAssignment) -> None:
     `add_status_history`."""
     db.add(row)
     await db.flush()
+
+
+# --- Task 1 (3.9b): auto-assignment on submission ------------------------------
+
+
+async def get_active_assignment(
+    db: AsyncSession, application_id: uuid.UUID
+) -> ApplicationAssignment | None:
+    """The application's current assignment row, if it has one — the read half
+    of the claim/supersede decision `service._claim_assignment` makes (ruling
+    16.2), and the guard `submit`'s auto-assignment hook checks before running
+    at all (ruling 6: a resubmission must find one and skip)."""
+    rows = await db.execute(
+        select(ApplicationAssignment).where(
+            ApplicationAssignment.application_id == application_id,
+            ApplicationAssignment.is_active.is_(True),
+        )
+    )
+    return rows.scalars().first()
+
+
+async def review_candidates(
+    db: AsyncSession, eligible_user_ids: Sequence[uuid.UUID]
+) -> list[Candidate]:
+    """One `Candidate` per id in `eligible_user_ids`, carrying how many
+    applications each currently holds as an ACTIVE assignment.
+
+    WHO is eligible is `auth`'s question — a permission lookup the caller
+    (`service._auto_assign_on_submission`) resolves and hands down, the same
+    way `list_applications` receives `contour_organization_col` rather than
+    reaching into `gis` itself (review I2: this file imports no other
+    module's service). HOW LOADED each one already is, is this module's own
+    `application_assignments` table. Every id comes back — zero-count ones
+    included — so `assignment.choose_executor` sees the WHOLE pool ruling 7
+    asks it to tie-break over, not just the ones with an existing row.
+    """
+    if not eligible_user_ids:
+        return []
+    rows = await db.execute(
+        select(ApplicationAssignment.user_id, func.count())
+        .where(
+            ApplicationAssignment.user_id.in_(eligible_user_ids),
+            ApplicationAssignment.is_active.is_(True),
+        )
+        .group_by(ApplicationAssignment.user_id)
+    )
+    open_counts = {user_id: count for user_id, count in rows.all()}
+    return [
+        Candidate(user_id=user_id, open_count=open_counts.get(user_id, 0))
+        for user_id in eligible_user_ids
+    ]
+
+
+# --- Task 2: the SLA sweep's own two candidate sets --------------------------
+#
+# Both mirror `payments.repo.list_invoices_due_soon`/`list_refunds_past_due`
+# exactly: a status filter alone is what makes a second sweep run a no-op for
+# a row the first one already moved past this query's own WHERE clause
+# (decided, or paused into `PENDING_INFO`). `sla.SLA_ACTIVE_STATUSES` is the
+# same tuple `sla.is_overdue` reads — one source for "is the clock even
+# running" — and deliberately NOT this file's own `ACTIVE_STATUSES` above
+# (migration 0015's duplicate-guard set, a different question entirely: an
+# APPROVED/INVOICED/PAID application still occupies its plot, but its SLA
+# clock has already stopped).
+
+
+async def list_applications_sla_due_soon(
+    db: AsyncSession, *, now: datetime, before: datetime
+) -> Sequence[Application]:
+    """Every SLA-active application due in `[now, before]` — not yet overdue
+    (`list_applications_past_sla_deadline`'s own set) but inside
+    `applications.jobs.sla_sweep`'s reminder window."""
+    stmt = select(Application).where(
+        Application.status.in_(SLA_ACTIVE_STATUSES),
+        Application.sla_deadline_at >= now,
+        Application.sla_deadline_at <= before,
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+async def list_applications_past_sla_deadline(
+    db: AsyncSession, *, now: datetime
+) -> Sequence[Application]:
+    """Every SLA-active application whose deadline has already passed —
+    `applications.jobs.sla_sweep`'s candidate set for RI-07."""
+    stmt = select(Application).where(
+        Application.status.in_(SLA_ACTIVE_STATUSES), Application.sla_deadline_at < now
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+# --- Task 4: the request for information --------------------------------------
+
+
+async def get_open_info_request(db: AsyncSession, application_id: uuid.UUID) -> InfoRequest | None:
+    """The newest OPEN (`responded_at IS NULL`) `info_requests` row for this
+    application, or `None`.
+
+    `service.request_info` reads this as its own 409 guard ("a second open
+    request while one is already open" — ruling 8's pause arithmetic has no
+    way to tell which `responded_at` closes which `requested_at` once two are
+    open at once), and `service.respond_info` reads it as the row to close.
+    Both callers already hold the application's own row lock
+    (`get_application_for_update`), so this needs none of its own: two
+    concurrent calls on the same application serialise on THAT lock first."""
+    stmt = (
+        select(InfoRequest)
+        .where(InfoRequest.application_id == application_id, InfoRequest.responded_at.is_(None))
+        .order_by(InfoRequest.requested_at.desc(), InfoRequest.id.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def add_info_request(db: AsyncSession, info_request: InfoRequest) -> None:
+    """Stage and flush — mirrors `add_status_history`'s own shape, so the
+    caller's other pending writes in the same transaction (the `applications`
+    status UPDATE) surface together with this INSERT."""
+    db.add(info_request)
+    await db.flush()
+
+
+async def list_info_requests(db: AsyncSession, application_id: uuid.UUID) -> Sequence[InfoRequest]:
+    """Every `info_requests` row this application has ever had, oldest first —
+    open or closed alike, the same "the register is the record of who held it
+    when" reasoning `list_assignments` states for its own superseded rows.
+    `service.timeline`'s own consumer (final whole-branch review, IMPORTANT):
+    the pause is the one event on this branch that silently moves a
+    legally-consequential deadline, and it belongs in the only audit view an
+    inspector reads."""
+    stmt = (
+        select(InfoRequest)
+        .where(InfoRequest.application_id == application_id)
+        .order_by(InfoRequest.requested_at, InfoRequest.id)
+    )
+    return (await db.execute(stmt)).scalars().all()

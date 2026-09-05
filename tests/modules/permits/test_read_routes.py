@@ -121,6 +121,86 @@ async def test_staff_outside_the_zone_are_refused_with_the_territorial_code(
     assert result.json()["error"]["code"] == "ERR-ACL-002"
 
 
+# --- the read-side half of ruling 4: the three official signers -------------
+#
+# The defect this section pins: `executor_head`, `chief_forester` and
+# `accountant` hold `permits.sign` and are exactly who `add_signature` lets
+# attach a signature, but `_readable_permit` admitted only the holder and a
+# `permits.view_any` holder — so all three got the same 404 as a stranger and
+# could never open the permit they are required to sign through any UI, only
+# through a direct API call to the write route itself.
+
+
+async def test_the_head_reads_a_permit_they_are_required_to_sign(
+    head_client: Signer, issued_permit: Permit
+):
+    result = await head_client.client.get(f"{API}/permits/{issued_permit.id}")
+    assert result.status_code == 200, result.text
+    assert result.json()["id"] == str(issued_permit.id)
+
+
+async def test_the_chief_forester_reads_a_permit_they_are_required_to_sign(
+    chief_forester_client: Signer, issued_permit: Permit
+):
+    result = await chief_forester_client.client.get(f"{API}/permits/{issued_permit.id}")
+    assert result.status_code == 200, result.text
+    assert result.json()["id"] == str(issued_permit.id)
+
+
+async def test_the_accountant_reads_a_permit_they_are_required_to_sign(
+    accountant_client: Signer, issued_permit: Permit
+):
+    result = await accountant_client.client.get(f"{API}/permits/{issued_permit.id}")
+    assert result.status_code == 200, result.text
+    assert result.json()["id"] == str(issued_permit.id)
+
+
+async def test_a_same_role_signer_of_a_different_organization_still_cannot_read_it(
+    other_org_head_client: Signer, issued_permit: Permit
+):
+    """Same role, same `permits.sign` grant, wrong leshoz — `_is_required_signer`
+    checks the SAME strict `users.organization_id == permit.organization_id`
+    equality `_signer_refusal` uses on the write path (lesson: zone scoping is
+    not a permission check). `executor_head` holds no `permits.view_any`
+    either (migration 0019), so this falls through to the same 404 a stranger
+    gets, exactly like `test_a_staff_role_without_view_any_is_refused_like_a_stranger`."""
+    result = await other_org_head_client.client.get(f"{API}/permits/{issued_permit.id}")
+    assert result.status_code == 404
+    assert result.json()["error"]["code"] == "ERR-SYS-003"
+
+
+async def test_a_required_signer_still_reads_the_permit_once_it_is_active(
+    head_client: Signer, active_permit: Permit
+):
+    """Access does not expire at signing or at ACTIVE (`_is_required_signer`'s
+    own docstring): the head who signed `active_permit` can still open it
+    afterwards, the same way the holder never loses access to their own."""
+    result = await head_client.client.get(f"{API}/permits/{active_permit.id}")
+    assert result.status_code == 200, result.text
+
+
+async def test_a_required_signer_downloads_the_pdf_too(
+    accountant_client: Signer, issued_permit: Permit, permit_pdf: bytes
+):
+    """Both direct-access routes reach `_readable_permit` — pinned for the
+    zone branch by `test_a_cross_zone_pdf_read_writes_it_too`, and the same
+    must hold for the new admission."""
+    result = await accountant_client.client.get(f"{API}/permits/{issued_permit.id}/pdf")
+    assert result.status_code == 200, result.text
+    assert result.content == permit_pdf
+
+
+async def test_a_required_signers_read_writes_no_ri12_trail(
+    db: AsyncSession, chief_forester_client: Signer, issued_permit: Permit
+):
+    """Not the territorial branch: a same-organization required signer is not
+    "outside their zone" any more than the holder is, so an ordinary read
+    leaves no RI-12 row (mirrors `test_a_successful_read_writes_no_trail`)."""
+    result = await chief_forester_client.client.get(f"{API}/permits/{issued_permit.id}")
+    assert result.status_code == 200, result.text
+    assert await _ri12_entries(db, issued_permit) == []
+
+
 async def test_an_unknown_permit_id_is_a_404(zone_staff_client: httpx.AsyncClient):
     result = await zone_staff_client.get(f"{API}/permits/{uuid.uuid4()}")
     assert result.status_code == 404
