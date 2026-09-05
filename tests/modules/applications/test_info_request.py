@@ -79,3 +79,65 @@ async def test_the_response_files_become_application_documents(
     )
     card = (await hodim_client.get(f"/api/v1/applications/{application_in_review}")).json()
     assert any(d["file_id"] == str(vet_certificate_file.id) for d in card["documents"])
+
+
+async def test_an_info_response_document_is_not_accepted_as_benefit_proof(
+    hodim_client,
+    applicant_client,
+    application_in_review,
+    rj_01_return_reason,
+    benefit_category_item_id,
+    vet_certificate_file,
+) -> None:
+    """Fix round 1's Critical: the first draft filed every `respond-info`
+    attachment under "the first ACTIVE `doc_types` item", which resolved to
+    `benefit_proof` in every migrated database and was a REACHABLE BYPASS of
+    `_assert_benefit_documents`'s fail-closed guard — submit, `request-info`,
+    `respond-info` with an unrelated file, `return`, PATCH in a benefit claim,
+    resubmit, and the stray info-response document waved the claim through
+    with no real proof.
+
+    Migration `0025` now reserves a dedicated `info_response` code and
+    `service._info_response_doc_type` fails closed rather than falling back
+    to anything, so the exact same sequence must still be REFUSED — at the
+    same gate (`ERR-APP-003`/`benefit_claim_needs_a_document`)
+    `test_submit.py::test_a_benefit_claim_needs_a_document_of_the_benefit_
+    type_and_no_other` already proves for a document attached the ordinary
+    way. This is the negative nothing asserted before: an info-response
+    document is NOT a document of the benefit type, however it got attached.
+    """
+    from tests.modules.applications.test_submit import _submit
+
+    await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/request-info",
+        json={"message": "справку"},
+    )
+    answered = await applicant_client.post(
+        f"/api/v1/applications/{application_in_review}/respond-info",
+        json={"text": "вот", "file_ids": [str(vet_certificate_file.id)]},
+    )
+    assert answered.status_code == 200, answered.text
+
+    returned = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/return",
+        json={
+            "reason_item_id": str(rj_01_return_reason.id),
+            "fields_to_fix": {"benefit_category_item_id": "льгота не подтверждена документом"},
+            "legal_basis": "ВМҚ 290",
+        },
+    )
+    assert returned.status_code == 200, returned.text
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_in_review}",
+        json={"benefit_category_item_id": str(benefit_category_item_id)},
+    )
+    assert patched.status_code == 200, "a RETURNED application must be editable again"
+
+    resubmitted = await _submit(applicant_client, application_in_review)
+    assert resubmitted.status_code == 422, resubmitted.text
+    error = resubmitted.json()["error"]
+    assert error["code"] == "ERR-APP-003"
+    assert error["details"]["reason"] == "benefit_claim_needs_a_document", (
+        "the info-response document must not count as proof of the benefit claim"
+    )

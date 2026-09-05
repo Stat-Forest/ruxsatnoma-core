@@ -1,7 +1,7 @@
 """review_seeds
 
 Stage 3.9b's ONE migration (plan `03.9-3.11-parallel-run.md`, ruling 1: one
-revision per stage — task 2 owns it as the first task that needs it). Three
+revision per stage — task 2 owns it as the first task that needs it). Four
 independent things, none of them a new table:
 
 1. **Notification templates** for every event this stage's tasks notify on
@@ -33,6 +33,26 @@ independent things, none of them a new table:
    recover) before the column is closed to NULL — `checks.run_all` itself
    is corrected, in the same branch, to always pass one going forward.
 
+4. **One `doc_types` classifier item, `info_response`** — task 4's own,
+   amended in here after fix round 1 of that task's review. `respond_info`
+   attaches a citizen's reply to a request for information as an
+   `application_documents` row, whose `doc_type_item_id` is NOT NULL, and
+   `doc_types` carries no code of its own for this case — every other code
+   under it is either OURS (`BENEFIT_DOC_TYPE_CODE`, `0024`) or the Agency's,
+   added later through the admin CRUD. The first draft of task 4 picked "the
+   first ACTIVE `doc_types` item" instead of a fixed code, to avoid a
+   migration; that item is `benefit_proof` in every database today, and
+   `_assert_benefit_documents` treats ANY document of that type as proof of
+   a claimed benefit with no other check — submit, `request-info`,
+   `respond-info` with an unrelated file, `return`, PATCH in a
+   `benefit_category_item_id`, resubmit, and the stray info-response
+   document waves the claim through. Mirrors `0024_benefit_proof_doc_type.
+   py`'s own pattern exactly (resolve the classifier, `ON CONFLICT DO
+   NOTHING`, verify, symmetric downgrade) — and `service._info_response_doc_
+   type` now fails CLOSED if this row is missing, the same posture `_benefit_
+   doc_type` already has for its own code, rather than falling back to
+   anything.
+
 Revision ID: 0025
 Revises: 0022
 Create Date: 2026-09-05 00:00:00.000000
@@ -53,6 +73,15 @@ depends_on: str | Sequence[str] | None = None
 
 # `0005_admin_seeds.py::CLASSIFIERS`, the `rejection_reasons` row's fixed id.
 REJECTION_REASONS_CLASSIFIER_ID = "0198f100-0003-7000-8000-000000000001"
+
+# --- 4's own three constants (`0024_benefit_proof_doc_type.py`'s identical
+# idiom: a fixed id so the downgrade can name exactly the row the upgrade
+# wrote and no other; the code as a literal, not an imported constant, because
+# a migration is a frozen historical statement and must not change meaning if
+# `applications.service.INFO_RESPONSE_DOC_TYPE_CODE` is ever renamed).
+INFO_RESPONSE_ITEM_ID = "0198f100-0025-7000-8000-000000000001"
+DOC_TYPES_CLASSIFIER_CODE = "doc_types"
+INFO_RESPONSE_ITEM_CODE = "info_response"
 
 _BODIES: dict[str, dict[str, str]] = {
     "application.sla_approaching": {
@@ -166,9 +195,80 @@ def upgrade() -> None:
     )
     op.alter_column("application_checks", "created_by", nullable=False)
 
+    # --- 4. `doc_types`/`info_response` — task 4's reserved item, added by --
+    # fix round 1: see the module docstring's own item 4 for why this exists
+    # and why it is not merely a labelling nicety. Mirrors 0024's
+    # `benefit_proof` seed line for line: resolve the classifier (RAISE if
+    # missing, never a silent no-op INSERT), `ON CONFLICT DO NOTHING` against
+    # the partial unique index (an admin who has already created this code by
+    # hand is left alone, not collided with), then verify the row actually
+    # exists before declaring success.
+    classifier_id = conn.execute(
+        sa.text("SELECT id FROM classifiers WHERE code = :code").bindparams(
+            code=DOC_TYPES_CLASSIFIER_CODE
+        )
+    ).scalar()
+    if classifier_id is None:
+        raise RuntimeError(
+            f"classifier {DOC_TYPES_CLASSIFIER_CODE!r} is missing — 0005_admin_seeds.py seeds "
+            "it, so this database did not run the chain this revision depends on; seeding "
+            "nothing here would leave every respond-info attachment refused as "
+            "'doc_type_not_configured'"
+        )
+    conn.execute(
+        sa.text(
+            "INSERT INTO classifier_items "
+            "(id, classifier_id, code, name, valid_from, sort_order, status) VALUES "
+            "(CAST(:id AS uuid), CAST(:classifier_id AS uuid), :code, "
+            "jsonb_build_object('uz_cyrl', :cyr, 'ru', :ru, 'en', :en), "
+            "DATE '2026-01-01', 20, 'active') "
+            # The index is PARTIAL, so the conflict target must repeat its own
+            # WHERE clause or Postgres cannot infer it (0024's own comment).
+            "ON CONFLICT (classifier_id, code) WHERE status = 'active' DO NOTHING"
+        ).bindparams(
+            id=INFO_RESPONSE_ITEM_ID,
+            classifier_id=classifier_id,
+            code=INFO_RESPONSE_ITEM_CODE,
+            cyr="Қўшимча маълумот сўровига жавобан илова",
+            ru="Приложение в ответ на запрос дополнительной информации",
+            en="Response to an information request",
+        )
+    )
+    seeded = conn.execute(
+        sa.text(
+            "SELECT count(*) FROM classifier_items "
+            "WHERE classifier_id = CAST(:classifier_id AS uuid) "
+            "AND code = :code AND status = 'active'"
+        ).bindparams(classifier_id=classifier_id, code=INFO_RESPONSE_ITEM_CODE)
+    ).scalar()
+    if not seeded:
+        raise RuntimeError(
+            f"no active {INFO_RESPONSE_ITEM_CODE!r} item exists after this migration — the "
+            "insert was skipped by ON CONFLICT and nothing was there to conflict with, which "
+            "cannot both be true"
+        )
+
 
 def downgrade() -> None:
-    # --- 3, reversed first: application_checks' three columns ------------
+    # --- 4, reversed first: doc_types/info_response -----------------------
+    # The attachments FIRST — `application_documents.doc_type_item_id` is an
+    # FK to this row (0024's own comment, identical reasoning: "a downgrade
+    # must delete whatever its upgrade made possible").
+    op.execute(
+        sa.text(
+            "DELETE FROM application_documents WHERE doc_type_item_id = CAST(:id AS uuid)"
+        ).bindparams(id=INFO_RESPONSE_ITEM_ID)
+    )
+    # By ID, never by code: on a database where the upgrade's ON CONFLICT
+    # left an ADMIN-created row alone, this migration inserted nothing and
+    # owns nothing, so a delete by code would remove somebody else's row.
+    op.execute(
+        sa.text("DELETE FROM classifier_items WHERE id = CAST(:id AS uuid)").bindparams(
+            id=INFO_RESPONSE_ITEM_ID
+        )
+    )
+
+    # --- 3, reversed: application_checks' three columns ------------
     op.drop_constraint(
         op.f("fk_application_checks_confirmed_by_users"), "application_checks", type_="foreignkey"
     )

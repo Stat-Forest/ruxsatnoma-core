@@ -2303,20 +2303,17 @@ APPLICATION_RESPOND_INFO = "application.respond_info"
 # own withdrawal.
 NOTIFY_APPLICATION_INFO_REQUESTED = "application.info_requested"
 PENDING_INFO_STATUS = "PENDING_INFO"
-# `doc_types` carries no code of its own for a citizen's reply to a request
-# for information — every code under it is either OURS
-# (`BENEFIT_DOC_TYPE_CODE`) or the Agency's, added later through the admin
-# CRUD (CLAUDE.md) — and this stage takes exactly ONE migration, which seeds
-# no new classifier item (Global Constraints, ruling 15). `_info_response_doc_
-# type` below therefore does not look one up by a fixed, unseeded code (which
-# would fail-closed on every environment today, unlike `BENEFIT_DOC_TYPE_CODE`
-# — migration 0024 guarantees THAT one exists); it takes the first ACTIVE
-# `doc_types` item instead, deterministic because `admin_repo.
-# list_classifier_items` already orders by `(sort_order, code)`. Recorded on
-# the row itself is `INFO_RESPONSE_DOCUMENT_NOTE`, so the attachment explains
-# itself whichever bucket it lands in — a design choice made here, without a
-# ruling of its own, flagged for confirmation once the Agency's real
-# `doc_types` list exists.
+# The ONE `doc_types` item a `respond_info` attachment is filed under —
+# migration `0025` seeds it (fix round 1, after review found the first draft's
+# "first ACTIVE `doc_types` item" fallback was a REACHABLE BYPASS of
+# `_assert_benefit_documents`'s fail-closed benefit guard below: that fallback
+# resolved to `BENEFIT_DOC_TYPE_CODE` in every migrated database today, so an
+# unrelated `respond-info` attachment was indistinguishable from real benefit
+# proof the moment the application was returned, PATCHed with a benefit claim,
+# and resubmitted. A reserved, unambiguous code closes that path — never a
+# fallback to "the first item of some other type," here or anywhere `doc_
+# types` membership stands in for evidence.
+INFO_RESPONSE_DOC_TYPE_CODE = "info_response"
 INFO_RESPONSE_DOCUMENT_NOTE = "Attached in response to a request for information."
 
 
@@ -2331,16 +2328,18 @@ def _now() -> datetime:
 
 
 async def _info_response_doc_type(db: AsyncSession) -> ClassifierItem | None:
-    """The `doc_types` item a `respond_info` attachment is filed under — see
-    `INFO_RESPONSE_DOCUMENT_NOTE`'s own comment for why this is "the first
-    active one" rather than a fixed code. `None` only if `doc_types` itself is
-    gone or holds no active item at all, which migration 0024's `benefit_proof`
-    makes unreachable in any migrated database today."""
+    """The ACTIVE `doc_types` item whose code is `INFO_RESPONSE_DOC_TYPE_CODE`,
+    or `None` when it is missing or archived — `_benefit_doc_type`'s own shape,
+    read through `admin.repo` rather than a direct `classifier_items` query
+    (CLAUDE.md: reference data is read-only and reached through its owner).
+    `respond_info` FAILS CLOSED on `None`, exactly as `_assert_benefit_
+    documents` fails closed on `_benefit_doc_type` returning `None` — never a
+    fallback to some other item, which is the defect fix round 1 found."""
     classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
     if classifier is None:
         return None
     items = await admin_repo.list_classifier_items(db, classifier.id)
-    return items[0] if items else None
+    return next((item for item in items if item.code == INFO_RESPONSE_DOC_TYPE_CODE), None)
 
 
 async def request_info(
