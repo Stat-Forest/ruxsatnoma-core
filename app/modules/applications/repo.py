@@ -376,6 +376,41 @@ async def active_overlapping(
     return rows.scalars().first()
 
 
+# 3.11b task 8 (`permits.service.extend`): the statuses in which an EXTENSION
+# still blocks a second one. Unlike `ACTIVE_STATUSES` above this INCLUDES
+# DRAFT — an extension nobody has submitted yet still occupies the "already
+# asked" slot, which is exactly the case the "two clicks" guard exists for —
+# and excludes only the five terminal ones (a rejected, cancelled, expired,
+# closed or archived extension blocks nothing, the same reasoning
+# `ACTIVE_STATUSES` applies to a fresh filing).
+OPEN_EXTENSION_STATUSES = ("DRAFT", *ACTIVE_STATUSES)
+
+
+async def open_extension_of(
+    db: AsyncSession, parent_application_id: uuid.UUID
+) -> Application | None:
+    """The still-open `kind='extension'` child of `parent_application_id`, if
+    one exists — `permits.service.extend`'s duplicate guard, in the same
+    shape as `active_overlapping` above: it exists to NAME the collision in
+    `ERR-APP-002`, not to pre-empt the insert. Here the guard needs no
+    pre-emption at all, because the caller locks the PARENT PERMIT
+    (`permit_by_id_for_update`) before reaching this read, so two concurrent
+    extend attempts on the same permit serialise on that lock rather than
+    racing each other to this SELECT.
+    """
+    rows = await db.execute(
+        select(Application)
+        .where(
+            Application.parent_application_id == parent_application_id,
+            Application.kind == "extension",
+            Application.status.in_(OPEN_EXTENSION_STATUSES),
+        )
+        .order_by(Application.id)
+        .limit(1)
+    )
+    return rows.scalars().first()
+
+
 # --- Task 6: the timeline's rows, and the assignment register -----------------
 
 

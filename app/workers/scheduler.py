@@ -115,6 +115,41 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # Task 6's own STANDALONE sweep (ruling 14, revised): a ВМҚ 506 ticket's
+    # period need not end when its permit's does, so this is not folded into
+    # `expire_permits` above — ten minutes after the permit pair, same
+    # reasoning, same advisory lock.
+    sched.add_job(
+        _wrap(factory, jobs.expire_forest_tickets),
+        CronTrigger(hour=0, minute=40, timezone=TIMEZONE),
+        next_run_time=now,
+        id="expire_forest_tickets",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    # Task 7's own notify-only sweep (ruling 16), last in the nightly permit
+    # family: a permit that expired or was closed earlier tonight is out of
+    # `pending_signatures` already (it never was in it) and so is never ALSO
+    # reported as stalled — the two candidate sets (`active`/`suspended` for
+    # expiry, `pending_signatures` here) are disjoint by construction, but
+    # running last keeps the whole family's order legible as one story:
+    # expire, close, ticket-expire, then report what none of the above could
+    # touch.
+    #
+    # 00:45 is deliberately skipped — it belongs to `applications`' SLA sweep
+    # on the parallel `stage-3.9b-review` branch (`app/workers/scheduler.py`
+    # there), and this branch has no visibility into that file to avoid the
+    # collision any other way. Ten minutes after the ticket expiry above,
+    # not five, so the two branches' schedulers do not claim the same minute
+    # once merged.
+    sched.add_job(
+        _wrap(factory, jobs.watch_stalled_permits),
+        CronTrigger(hour=0, minute=50, timezone=TIMEZONE),
+        next_run_time=now,
+        id="watch_stalled_permits",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     # Every 10 seconds: an operator who just uploaded a leshoz should not wait
     # a minute for anything to start happening (plan 03.6a ruling 6). Cheap
     # when idle — one indexed SELECT ... FOR UPDATE SKIP LOCKED against

@@ -35,10 +35,11 @@ from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core import storage
+from app.core import files, storage
 from app.core.models import MediaFile, SystemSetting
 from app.core.settings_store import invalidate
 from app.main import create_app
+from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
@@ -46,7 +47,8 @@ from app.modules.gis.models import Contour, GisLayer
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
-from app.modules.permits import repo, service, signers
+from app.modules.notifications.models import Notification
+from app.modules.permits import decisions, grounds, repo, service, signers
 from app.modules.permits.models import Permit, PermitTemplate
 from app.modules.permits.permissions import PERMITS_ISSUE
 from tests.conftest import make_client
@@ -515,6 +517,11 @@ class Signer:
     user: User
     pinfl: str
     serial: str
+    # 3.11b: `sign_decision` (below) needs a session to read the permit and the
+    # ground BEFORE it can build the bytes it signs — the same `db` the test
+    # itself holds, carried on the `Signer` so a helper taking only `signer` can
+    # reach it (`_db_of`).
+    db: AsyncSession
 
 
 async def _signer_for(
@@ -553,7 +560,13 @@ async def _signer_for(
         _commit_pending_before_requests(client, db)
         # The serial is derived from the pinfl, so one signer always presents the
         # same certificate and two never collide on `uq_certificate_identity`.
-        yield Signer(client=client, user=user, pinfl=user.pinfl, serial=f"SER-{user.pinfl}")
+        yield Signer(client=client, user=user, pinfl=user.pinfl, serial=f"SER-{user.pinfl}", db=db)
+
+
+def _db_of(signer: Signer) -> AsyncSession:
+    """The session a `sign_decision` caller reads through — trivial, but named
+    so every call site says WHY a `Signer` carries a database session at all."""
+    return signer.db
 
 
 @pytest.fixture
@@ -885,3 +898,117 @@ async def make_permit_on_contour(
     db.add(permit)
     await db.flush()
     return permit
+
+
+# --- 3.11b: the signed decision -----------------------------------------------
+
+
+async def _reason_id(db: AsyncSession, code: str) -> uuid.UUID:
+    """One `permit_status_reasons` item's id, by its PS-* code — migration
+    0023's own seed, read the way `test_grounds.py::_item` already does."""
+    classifier = await admin_repo.get_classifier_by_code(db, grounds.CLASSIFIER_CODE)
+    assert classifier is not None, "migration 0023 must seed the classifier"
+    items = await admin_repo.list_classifier_items(db, classifier.id)
+    found = next((row for row in items if row.code == code), None)
+    assert found is not None, f"migration 0023 must seed {code}"
+    return found.id
+
+
+@pytest.fixture
+async def suspend_reason_id(db: AsyncSession) -> uuid.UUID:
+    """PS-01 «Инспекция натижаси бўйича» — a ground that suspends and revokes."""
+    return await _reason_id(db, "PS-01")
+
+
+@pytest.fixture
+async def resume_reason_id(db: AsyncSession) -> uuid.UUID:
+    """PS-06 «Сабаб бартараф этилди» — the only ground that resumes."""
+    return await _reason_id(db, "PS-06")
+
+
+@pytest.fixture
+async def revoke_reason_id(db: AsyncSession) -> uuid.UUID:
+    return await _reason_id(db, "PS-03")
+
+
+@pytest.fixture
+async def hodim_user(db: AsyncSession, leshoz: Organization) -> User:
+    """Whoever uploads the head's order — `files.save_upload` only needs an
+    actor to record as `uploaded_by`; this task does not litigate who."""
+    return await make_user(
+        db, role_code="executor_staff", organization_id=leshoz.id, pinfl=unique_pinfl()
+    )
+
+
+@pytest.fixture
+async def order_file_id(db: AsyncSession, hodim_user: User) -> uuid.UUID:
+    """The head's order, as a real `media_files` row — the service checks that
+    the file exists, is active and is a PDF before it takes the signature."""
+    stored = await files.save_upload(
+        db,
+        data=b"%PDF-1.7\n% order\n",
+        filename="buyruq.pdf",
+        content_type="application/pdf",
+        actor=hodim_user,
+    )
+    return stored.id
+
+
+# suspend -> suspended, resume -> active, revoke -> revoked: the test-side half
+# of `decisions.decide`'s own act/to_status split (`act` drives the ground and
+# document rules, `to_status` drives the `tz/05` edge).
+_TARGET: dict[str, str] = {
+    grounds.SUSPEND: "suspended",
+    grounds.RESUME: "active",
+    grounds.REVOKE: "revoked",
+}
+
+
+async def sign_decision(
+    signer: Signer,
+    permit_id: uuid.UUID,
+    act: str,
+    *,
+    reason_item_id: uuid.UUID,
+    doc_file_id: uuid.UUID | None = None,
+    legal_basis: str = "Лесхоз буйруғи №7",
+) -> httpx.Response:
+    """One decision attempt, signed over the canonical statement (ruling 3).
+
+    The envelope is built over `decisions.decision_document(...)` — the same
+    bytes the service will hand `sign()` — because `sign()` hashes what it is
+    handed and never trusts the envelope's own claim of what it covered. A
+    helper that signed anything else would test the mock rather than the route.
+    """
+    permit = await service.get(_db_of(signer), permit_id)
+    assert permit is not None
+    item = await admin_repo.get_classifier_item(_db_of(signer), reason_item_id)
+    assert item is not None
+    document = decisions.decision_document(
+        permit=permit,
+        to_status=_TARGET[act],
+        reason_code=item.code,
+        legal_basis=legal_basis,
+        doc_file_id=doc_file_id,
+    )
+    return await signer.client.post(
+        f"/api/v1/permits/{permit_id}/{act}",
+        json={
+            "reason_item_id": str(reason_item_id),
+            "legal_basis": legal_basis,
+            "doc_file_id": None if doc_file_id is None else str(doc_file_id),
+            "pkcs7": encode_mock_signature(
+                document=document, serial=signer.serial, issuer="ISS-1", pinfl=signer.pinfl
+            ),
+        },
+    )
+
+
+async def notification_rows(db: AsyncSession, *, object_id: uuid.UUID) -> list[Notification]:
+    """Every notification written about one object, newest last."""
+    rows = await db.execute(
+        select(Notification)
+        .where(Notification.object_id == object_id)
+        .order_by(Notification.created_at, Notification.id)
+    )
+    return list(rows.scalars().all())

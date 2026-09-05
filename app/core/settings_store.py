@@ -178,6 +178,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "permit_head,permit_chief_forester,permit_accountant,permit_recipient",
             "Purposes that must all be signed before a permit may become ACTIVE (C11)",
         ),
+        # `signatures._REQUIREMENT_SETTINGS["permit_decision"]` — the same data
+        # change that spec's own comment invites, for a second `object_type`. Its
+        # literal, "permit_decision", is `signers.DECISION_PURPOSE` repeated by
+        # hand: this module may not import a domain module to reach it
+        # (`app/core/` never imports domain modules).
+        SettingSpec(
+            "permit_decision_required_signatures",
+            str,
+            "permit_decision",
+            "Purpose that must be signed to change a permit's status (suspend/resume/revoke)",
+        ),
         SettingSpec(
             "payme_cashbox_key_hash",
             str,

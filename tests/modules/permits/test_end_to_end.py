@@ -537,7 +537,11 @@ def test_the_notified_set_is_exactly_what_this_module_can_send() -> None:
     """`permit.expiring` is seeded and nothing sends it yet — the reminder job
     is a later stage's. Listed here on purpose: the set is what a template must
     exist for, not what fired last night, and dropping the unsent one would let
-    the reminder ship with no text (recorded, not a defect)."""
+    the reminder ship with no text (recorded, not a defect).
+
+    The six 3.11b codes join the set in the same commit as migration 0023,
+    which seeds their templates (plan `03.11b-permits-lifecycle` ruling 18) —
+    none of them is sent by anything yet; that is later tasks of this stage."""
     assert set(events.NOTIFIED_EVENT_CODES) == {
         "permit.issued",
         "permit.signed",
@@ -545,4 +549,10 @@ def test_the_notified_set_is_exactly_what_this_module_can_send() -> None:
         "permit.expiring",
         "permit.expired",
         "permit.due",
+        "permit.suspended",
+        "permit.resumed",
+        "permit.revoked",
+        "permit.duplicate_issued",
+        "forest_ticket.issued",
+        "permit.unsigned_stalled",
     }

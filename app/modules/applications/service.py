@@ -40,6 +40,7 @@ from app.modules.applications import checks, repo, sla
 from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
+    APPLICATION_KINDS,
     Application,
     ApplicationAssignment,
     ApplicationCheck,
@@ -114,9 +115,12 @@ APPLICATION_DOCUMENT_DETACH = "application_document.detach"
 # through a state portal it never touched.
 CHANNEL_PORTAL = "portal"
 # `applications.kind`: an `extension` is a child of an existing application
-# (`parent_application_id`) and is 3.11b's `POST /permits/{id}/extend`. Every
-# application this module creates is `new`.
+# (`parent_application_id`), created only by `permits.service.extend`
+# (3.11b's `POST /permits/{id}/extend`) — a citizen files `POST /applications`
+# itself for a `new` one, never an `extension`; see `create_draft`'s own
+# docstring for why the split lives in the FUNCTION, not the wire schema.
 KIND_NEW = "new"
+KIND_EXTENSION = "extension"
 INITIAL_STATUS = "DRAFT"
 # `_own_draft_for_update`'s OTHER editable status (task 1, 3.9b): a returned
 # application becomes correctable again, per that function's own docstring,
@@ -335,6 +339,18 @@ async def current_calculation(db: AsyncSession, application_id: uuid.UUID) -> Ca
     through its service, never by querying `calculations` itself or
     importing `norms.repo` (module boundary, CLAUDE.md)."""
     return await norms_service.latest_calculation(db, application_id)
+
+
+async def open_extension_of(
+    db: AsyncSession, parent_application_id: uuid.UUID
+) -> Application | None:
+    """The still-open `kind='extension'` child of `parent_application_id`, or
+    `None`. Thin pass-through to `repo.open_extension_of`, the fourth public
+    function a level-4 caller may reach here (`get`, `current_calculation`,
+    `set_status`): `permits.service.extend`'s own duplicate guard, which may
+    not query `applications` directly (module boundary, CLAUDE.md) any more
+    than it may write `applications.status` directly."""
+    return await repo.open_extension_of(db, parent_application_id)
 
 
 async def set_status(
@@ -720,7 +736,14 @@ async def _resolve_applicant(
     return payload.applicant_id, representation.id
 
 
-async def create_draft(db: AsyncSession, payload: ApplicationCreate, *, actor: User) -> Application:
+async def create_draft(
+    db: AsyncSession,
+    payload: ApplicationCreate,
+    *,
+    actor: User,
+    kind: str = KIND_NEW,
+    parent_application_id: uuid.UUID | None = None,
+) -> Application:
     """`POST /applications` — an EMPTY draft, and deliberately so (ruling 7):
     tz/04 С3 autosaves a draft field by field, so everything except who is
     filing and for whom arrives later through `PATCH`.
@@ -731,7 +754,25 @@ async def create_draft(db: AsyncSession, payload: ApplicationCreate, *, actor: U
     not write this row even if asked. It is written all the same because a
     timeline that starts at `SUBMITTED` cannot say when the citizen began, and
     nothing else in the system will ever be in a position to add it.
+
+    `kind` and `parent_application_id` are PARAMETERS and NOT fields of
+    `ApplicationCreate`, on purpose (3.11b ruling 17): that model is the body
+    of the public `POST /applications` and forbids nothing it does not list
+    (`extra="forbid"`), so a field there is a field a citizen may set —
+    `kind="extension"` against any parent id, with no permit and no holder
+    behind it. Here they are supplied only by a server caller that has
+    already proved both (`permits.service.extend`, 3.11a ruling 12). They
+    default to today's behaviour, so `POST /applications` itself is
+    unchanged, and `applications` learns nothing about permits: an extension
+    is an application shape `APPLICATION_KINDS` has carried since migration
+    0015.
     """
+    if kind not in APPLICATION_KINDS:
+        # Before `flush()`: the `kind_valid` CHECK would otherwise surface a
+        # caller's typo as an `IntegrityError` — no handler maps it, so it
+        # would reach the client as a 500 (lesson: walk every caller-settable
+        # field that is an FK or an enum-ish column before `flush()`).
+        raise err("ERR-VAL-001", details={"reason": "unknown_kind"})
     applicant_id, representation_id = await _resolve_applicant(db, payload, actor=actor)
     application = Application(
         applicant_id=applicant_id,
@@ -740,7 +781,8 @@ async def create_draft(db: AsyncSession, payload: ApplicationCreate, *, actor: U
         representation_id=representation_id,
         status=INITIAL_STATUS,
         channel=CHANNEL_PORTAL,
-        kind=KIND_NEW,
+        kind=kind,
+        parent_application_id=parent_application_id,
     )
     db.add(application)
     await db.flush()

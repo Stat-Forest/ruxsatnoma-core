@@ -64,3 +64,36 @@ def required_role(purpose: str) -> str | None:
     prevent.
     """
     return PURPOSE_ROLES.get(purpose)
+
+
+# --- 3.11b: the signed decision (plan `03.11b-permits-lifecycle` ruling 4) ---
+#
+# `DECISION_PURPOSE_ROLES` is a SEPARATE map, beside `PURPOSE_ROLES` above and
+# deliberately never inside it. `permits.service.add_signature` reads
+# `PURPOSE_ROLES` (through `required_role`) to decide who may fill one of
+# form 1-ilova's four requisites — a decision purpose added there would become
+# signable ON THE PERMIT ITSELF, through the very route `add_signature`
+# already exposes, which is exactly the bug ruling 1 exists to avoid (a
+# decision signs the ATTEMPT — `permits.decisions.decide`'s own
+# `permit_status_history` row — never the permit).
+DECISION_PURPOSE = "permit_decision"
+
+DECISION_PURPOSE_ROLES: dict[str, str | None] = {
+    DECISION_PURPOSE: "executor_head",
+}
+
+
+def decision_role(purpose: str) -> str | None:
+    """The `roles.code` that must sign a permit DECISION (suspend/resume/
+    revoke) — `required_role`'s exact fail-closed shape (`None` refuses, never
+    passes), over `DECISION_PURPOSE_ROLES` rather than `PURPOSE_ROLES`. See
+    `permits.decisions._decision_signer_refusal`, which is the only caller.
+
+    Kept as its own function rather than folded into `required_role` over a
+    merged dict, for the same reason the two maps stay apart: merging them
+    would let a decision purpose answer a PERMIT-signature lookup (or vice
+    versa) the moment a future purpose string collided between the two, and
+    the two questions — "who signs form 1-ilova" and "who may decide this
+    permit's fate" — must never share an answer by accident.
+    """
+    return DECISION_PURPOSE_ROLES.get(purpose)

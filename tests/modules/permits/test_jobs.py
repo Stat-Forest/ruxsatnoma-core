@@ -15,9 +15,10 @@ and never touch geometry.
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
@@ -26,10 +27,16 @@ from app.modules.admin.models import Organization
 from app.modules.applications.models import Application, ApplicationStatusHistory
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.notifications.models import Notification
-from app.modules.permits import events
+from app.modules.permits import events, repo
 from app.modules.permits.models import Permit, PermitStatusHistory
+from tests.modules.auth.test_sessions import make_user
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
-from tests.modules.permits.conftest import make_permit_on_contour
+from tests.modules.permits.conftest import (
+    Signer,
+    make_permit_on_contour,
+    notification_rows,
+    sign_decision,
+)
 
 
 @pytest.fixture
@@ -225,20 +232,22 @@ async def test_the_expiry_sweep_is_idempotent(
     assert await _expired_history_count(db, active_permit_ending_yesterday) == 1
 
 
-async def test_the_expiry_sweep_leaves_a_permit_awaiting_signatures_alone(
+async def test_the_expiry_sweep_leaves_a_permit_awaiting_signatures_or_already_revoked_alone(
     db: AsyncSession,
     contour: Contour,
     version_id: uuid.UUID,
     leshoz: Organization,
     grazing_activity_id: uuid.UUID,
 ) -> None:
-    """Only `active` expires. A permit nobody finished signing never came into
-    force, so «муддати тугаган» would be a false statement about it on the public
-    check page — and `suspended`/`revoked` belong to 3.11b, which owns what
-    happens to a suspended permit whose period runs out."""
+    """`active` and `suspended` expire (Task 7, ruling 8); `pending_signatures`
+    and `revoked` do not. A permit nobody finished signing never came into
+    force, so «муддати тугаган» would be a false statement about it on the
+    public check page (`tz/12` #16 is the open question for that status, and
+    `watch_stalled_permits` is this stage's answer short of a status change);
+    `revoked` is already terminal but for 4.7's `archived`."""
     from app.modules.permits import jobs
 
-    for status in ("pending_signatures", "suspended", "revoked"):
+    for status in ("pending_signatures", "revoked"):
         permit = await _permit(
             db,
             contour=contour,
@@ -251,6 +260,37 @@ async def test_the_expiry_sweep_leaves_a_permit_awaiting_signatures_alone(
         await jobs.expire_permits(db)
         await db.refresh(permit)
         assert permit.status == status
+
+
+async def test_a_suspended_permit_expires_when_its_period_ends(
+    db: AsyncSession,
+    active_permit: Permit,
+    head_client: Signer,
+    suspend_reason_id: uuid.UUID,
+    order_file_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling 8 — the gap 3.11a's sweep docstring handed to this stage by name.
+    `suspended` now joins `active` in the candidate set: `PERMIT_TRANSITIONS`
+    has always allowed `suspended -> expired`, and without this a permit
+    suspended mid-season with a period ending later would stay `suspended`
+    forever, its application never reaching `close_finished` either."""
+    from app.modules.permits import jobs
+
+    await sign_decision(
+        head_client,
+        active_permit.id,
+        "suspend",
+        reason_item_id=suspend_reason_id,
+        doc_file_id=order_file_id,
+    )
+    monkeypatch.setattr(jobs, "business_today", lambda: active_permit.period_to + timedelta(days=1))
+    await jobs.expire_permits(db)
+    await db.refresh(active_permit)
+    assert active_permit.status == "expired"
+
+    rows = await repo.status_history(db, active_permit.id)
+    assert (rows[-1].from_status, rows[-1].to_status) == ("suspended", "expired")
 
 
 async def test_a_finished_permit_closes_its_application(
@@ -522,6 +562,81 @@ async def test_one_bad_row_does_not_cost_its_batch(
     assert doomed.status == "active", "the bad row rolled back alone"
     assert [p.status for p in permits if p.id != doomed.id] == ["expired", "expired"]
     assert await _expired_history_count(db, doomed) == 0
+
+
+async def test_a_failing_notification_does_not_poison_the_stalled_watchs_batch(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+    sentinel_permit: Permit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix round 1's SAVEPOINT on `watch_stalled_permits`, proven the way
+    `test_one_bad_row_does_not_cost_its_batch` proves it for `expire_permits`.
+    `notify()` does an unflushed `db.add()` before any statement runs, so a
+    raise inside it — the reviewer's own example, a later statement failing
+    after that `add()` — must cost only its own row. Without the SAVEPOINT the
+    whole Postgres transaction aborts, and the NEXT row's own
+    `already_notified` SELECT then raises `InFailedSQLTransactionError` too,
+    cascading through the rest of the batch and killing the whole cron run
+    instead of costing one row."""
+    from app.modules.notifications import service as notifications
+    from app.modules.permits import jobs
+
+    permits: list[Permit] = []
+    for _ in range(2):
+        permit = await _permit(
+            db,
+            contour=contour,
+            version_id=version_id,
+            org=leshoz,
+            activity_type_id=grazing_activity_id,
+            status="pending_signatures",
+            period_to=business_today() - timedelta(days=1),
+        )
+        application = await db.get(Application, permit.application_id)
+        assert application is not None
+        executor = await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+        application.assigned_user_id = executor.id
+        permits.append(permit)
+    await db.flush()
+
+    ordered = sorted(permits, key=lambda p: p.id)
+    assert sentinel_permit.id < ordered[0].id, "uuid7 ids must be time-ordered for the cursor"
+    # The FIRST row `stalled_permits` returns (ascending by id) — the ordering
+    # the reviewer's failure mode needs: a raise HERE must not stop the SECOND
+    # row's own `already_notified` read from ever running.
+    doomed_id = ordered[0].id
+    healthy_id = ordered[1].id
+    real_notify = notifications.notify
+
+    async def flaky(session: AsyncSession, **kwargs: Any) -> list[Notification]:
+        if kwargs.get("object_id") == doomed_id:
+            # A REAL failing statement, not a plain Python raise: a bare
+            # `raise RuntimeError(...)` here never touches Postgres, so
+            # without a SAVEPOINT there would be nothing to roll back and
+            # this test would pass whether or not the fix exists — exactly
+            # the "assertion that would pass either way" to avoid. Division
+            # by zero is a genuine `DataError` from Postgres itself, which
+            # aborts the surrounding transaction the same way the reviewer's
+            # own example (an outbox insert failing) would.
+            await session.execute(text("SELECT 1/0"))
+        return await real_notify(session, **kwargs)
+
+    monkeypatch.setattr(notifications, "notify", flaky)
+
+    batch = await jobs.watch_stalled_permits(db, after_id=sentinel_permit.id)
+    assert (batch.scanned, batch.processed, batch.failed) == (2, 1, 1)
+
+    healthy_rows = await notification_rows(db, object_id=healthy_id)
+    assert any(r.event_code == events.PERMIT_UNSIGNED_STALLED for r in healthy_rows), (
+        "the row AFTER the doomed one must still be notified — proof the batch's"
+        " transaction was not left poisoned by the row before it"
+    )
+    doomed_rows = await notification_rows(db, object_id=doomed_id)
+    assert not [r for r in doomed_rows if r.event_code == events.PERMIT_UNSIGNED_STALLED]
 
 
 async def test_the_closure_is_audited_as_a_job(db: AsyncSession, expired_permit: Permit) -> None:

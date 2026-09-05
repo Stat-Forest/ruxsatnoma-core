@@ -88,6 +88,12 @@ CERTIFICATE_STANDING_REASONS = frozenset(
 # most object types have no signature requirement at all.
 _REQUIREMENT_SETTINGS: dict[str, str] = {
     "permit": "permit_required_signatures",
+    # 3.11b: `permits.decisions` signs the ATTEMPT (a fresh `permit_status_history`
+    # row per call), never the permit, so this entry buys the same defence-in-depth
+    # `sign()`'s own docstring already gives "permit": a `decide()` that ever
+    # passed the wrong purpose string would be refused here, not merely by the
+    # caller's own (admin-unconfigurable) `signers.DECISION_PURPOSE_ROLES` map.
+    "permit_decision": "permit_decision_required_signatures",
 }
 
 

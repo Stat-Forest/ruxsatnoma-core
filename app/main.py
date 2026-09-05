@@ -45,6 +45,7 @@ from app.modules.payments.backoffice_router import router as payments_backoffice
 from app.modules.payments.payme_router import router as payme_router
 from app.modules.payments.refunds_router import router as refunds_router
 from app.modules.payments.router import router as payments_router
+from app.modules.permits.lifecycle_router import router as permits_lifecycle_router
 from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
 from app.modules.signatures.router import router as signatures_router
@@ -295,6 +296,7 @@ def create_app() -> FastAPI:
     app.include_router(refunds_router, prefix="/api/v1")
     app.include_router(payme_router, prefix="/api/v1")
     app.include_router(permits_router, prefix="/api/v1")
+    app.include_router(permits_lifecycle_router, prefix="/api/v1")
     # The anonymous QR check (С12). Under `permits` and not a `public` module,
     # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
     # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
