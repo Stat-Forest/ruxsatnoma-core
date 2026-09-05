@@ -77,6 +77,10 @@ ERRORS: dict[str, tuple[int, str]] = {
     # 4.8 `help`: a support ticket cannot make the requested transition, or
     # cannot accept a new message, in its current status (closed).
     "ERR-HELP-001": (409, "Недопустимое действие для текущего статуса обращения в поддержку"),
+    # Track B4 (4.5 search, 4.7 archive), plan `04.5-4.7-search-archive.md`.
+    "ERR-SRCH-001": (409, "Профиль поиска с таким именем уже существует"),
+    "ERR-ARCH-001": (409, "Объект не может быть архивирован в текущем статусе"),
+    "ERR-ARCH-002": (409, "Нарушена целостность архивной копии"),
 }
 
 

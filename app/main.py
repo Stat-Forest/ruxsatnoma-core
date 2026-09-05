@@ -30,6 +30,7 @@ from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
 from app.modules.applications.router import router as applications_router
+from app.modules.archive.router import router as archive_router
 from app.modules.auth.router import router as auth_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.gis.imports_router import router as gis_imports_router
@@ -56,6 +57,7 @@ from app.modules.permits.router import router as permits_router
 from app.modules.public.admin_router import router as public_admin_router
 from app.modules.public.router import router as public_router
 from app.modules.reports.router import router as reports_router
+from app.modules.search.router import router as search_router
 from app.modules.signatures.router import router as signatures_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -326,5 +328,8 @@ def create_app() -> FastAPI:
     # tickets (any authenticated user; staff triage under help.tickets.manage).
     app.include_router(help_router, prefix="/api/v1")
     app.include_router(help_admin_router, prefix="/api/v1")
+    # Track B4 (stage 4): two narrow level-5 readers, no other track's tables written.
+    app.include_router(search_router, prefix="/api/v1")
+    app.include_router(archive_router, prefix="/api/v1")
 
     return app
