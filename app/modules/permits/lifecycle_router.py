@@ -30,7 +30,14 @@ from app.modules.auth.deps import get_current_user, require_any_permission, requ
 from app.modules.auth.models import User
 from app.modules.permits import service
 from app.modules.permits.permissions import PERMITS_ISSUE, PERMITS_MANAGE
-from app.modules.permits.schemas import DecisionIn, DuplicateIn, DuplicateOut, PermitOut
+from app.modules.permits.schemas import (
+    DecisionIn,
+    DuplicateIn,
+    DuplicateOut,
+    ForestTicketIn,
+    ForestTicketOut,
+    PermitOut,
+)
 
 router = APIRouter(tags=["permits"])
 
@@ -156,3 +163,49 @@ async def list_permit_duplicates(
     """
     rows = await service.list_duplicates(db, permit_id, actor=actor)
     return [DuplicateOut.model_validate(row) for row in rows]
+
+
+# --- Task 6: the forest ticket (ЧТ), ВМҚ 506 ----------------------------------
+#
+# Back to `permits.manage`, the same gate `suspend`/`resume`/`revoke` carry
+# above — DELIBERATELY narrower than the duplicate pair just above it (ruling
+# 2, the gate Task 6's own brief left unnamed): a ticket is issued and revoked
+# by the leshoz that MANAGES the permit, not merely by whoever holds
+# `permits.issue`. `GET` carries the SAME dependency as `POST`, unlike the
+# duplicate register's open read: a forest ticket is management paperwork,
+# not something this module opens to the permit's holder or its other
+# signatories.
+
+
+@router.post("/permits/{permit_id}/forest-tickets", status_code=201)
+async def create_forest_ticket(
+    permit_id: uuid.UUID,
+    payload: ForestTicketIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
+) -> ForestTicketOut:
+    """ВМҚ 506: one ўрмон чиптаси against an ACTIVE permit (ruling 11).
+
+    409 `ERR-PERM-001` `permit_not_active` when the permit is not `active`;
+    422 `ERR-VAL-001` `period_outside_permit` when the requested period
+    reaches outside the permit's own; 409 `ERR-PERM-003`
+    `active_ticket_exists` when `uq_forest_tickets_active` already holds one
+    live ticket for this permit. 403 `ERR-ACL-002` outside the caller's
+    leshoz.
+    """
+    ticket = await service.issue_forest_ticket(db, permit_id, data=payload, actor=actor)
+    return ForestTicketOut.model_validate(ticket)
+
+
+@router.get("/permits/{permit_id}/forest-tickets")
+async def list_forest_tickets(
+    permit_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
+) -> list[ForestTicketOut]:
+    """The permit's whole ВМҚ 506 register, newest first. 404 `ERR-SYS-003`
+    for an id that does not exist; 403 `ERR-ACL-002` outside the caller's
+    leshoz.
+    """
+    rows = await service.list_forest_tickets(db, permit_id, actor=actor)
+    return [ForestTicketOut.model_validate(row) for row in rows]

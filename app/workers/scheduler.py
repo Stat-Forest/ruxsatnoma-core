@@ -104,6 +104,18 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # Task 6's own STANDALONE sweep (ruling 14, revised): a ВМҚ 506 ticket's
+    # period need not end when its permit's does, so this is not folded into
+    # `expire_permits` above — ten minutes after the permit pair, same
+    # reasoning, same advisory lock.
+    sched.add_job(
+        _wrap(factory, jobs.expire_forest_tickets),
+        CronTrigger(hour=0, minute=40, timezone=TIMEZONE),
+        next_run_time=now,
+        id="expire_forest_tickets",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     # Every 10 seconds: an operator who just uploaded a leshoz should not wait
     # a minute for anything to start happening (plan 03.6a ruling 6). Cheap
     # when idle — one indexed SELECT ... FOR UPDATE SKIP LOCKED against

@@ -49,7 +49,7 @@ from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.notifications import service as notifications
 from app.modules.permits import events, repo, service
-from app.modules.permits.models import Permit, PermitStatusHistory
+from app.modules.permits.models import ForestTicket, Permit, PermitStatusHistory
 
 logger = structlog.get_logger(__name__)
 
@@ -252,5 +252,75 @@ async def _close_one(db: AsyncSession, permit: Permit, *, correlation: str) -> N
         object_id=permit.id,
         old_value={"application_status": service.APPLICATION_PERMIT_ISSUED},
         new_value={"application_status": APPLICATION_CLOSED},
+        correlation_id=correlation,
+    )
+
+
+TICKET_EXPIRED_STATUS = "expired"
+
+
+async def expire_forest_tickets(
+    db: AsyncSession, *, limit: int = BATCH_SIZE, after_id: uuid.UUID | None = None
+) -> SweepBatch:
+    """Move tickets whose `valid_to` is past out of `active`.
+
+    A STANDALONE job with its own keyset cursor (ruling 14, revised) — not a
+    third statement folded into `expire_permits`'s own batch loop above. A
+    ВМҚ 506 ticket's period lives INSIDE the permit's (ruling 12) but need not
+    END when the permit's does, so a ticket can lapse while the permit under
+    it is still `active`; coupling the two sweeps would tie together two
+    lifecycles that only partially overlap. It needs no new advisory-lock
+    story either: the scheduler's `ADVISORY_LOCK` (decision #36) decides
+    WHICH CLUSTER INSTANCE runs, not which job does, so this registers beside
+    `expire_permits` and `close_finished_permits` under that same lock.
+
+    `valid_to < business_today()` — INCLUSIVE, like the permit's own period,
+    and Asia/Tashkent, never the server's date (lesson). No notification: a
+    ticket lapsing on its own last day is the calendar, not an event — the
+    same silence `expire_permits` does NOT keep for its own permit, because a
+    permit's holder has money and a document riding on it and a ticket's
+    holder has neither.
+
+    Same per-row SAVEPOINT as the permit sweep, so one bad row costs itself
+    and not its batch.
+    """
+    today = business_today()
+    rows = await repo.tickets_ending_before(db, today, limit=limit, after_id=after_id)
+    correlation = f"job:{uuid.uuid4()}"
+    # Read every id BEFORE any SAVEPOINT opens — see `expire_permits` for why
+    # an id read after a rollback is a `MissingGreenlet`, not a value.
+    ids = [ticket.id for ticket in rows]
+    processed = failed = 0
+    for ticket, ticket_id in zip(rows, ids, strict=True):
+        try:
+            async with db.begin_nested():
+                await _expire_one_ticket(db, ticket, correlation=correlation)
+        except Exception as exc:
+            failed += 1
+            logger.error(
+                "job.expire_forest_tickets.row_failed",
+                ticket_id=str(ticket_id),
+                error=repr(exc),
+                exc_info=True,
+            )
+        else:
+            processed += 1
+    return SweepBatch(
+        scanned=len(rows), processed=processed, failed=failed, last_id=ids[-1] if ids else None
+    )
+
+
+async def _expire_one_ticket(db: AsyncSession, ticket: ForestTicket, *, correlation: str) -> None:
+    """One ticket's whole expiry, inside the caller's SAVEPOINT."""
+    ticket.status = TICKET_EXPIRED_STATUS
+    await db.flush()
+    await audit.log(
+        db,
+        action=service.FOREST_TICKET_EXPIRE,
+        user_id=None,
+        object_type="forest_ticket",
+        object_id=ticket.id,
+        old_value={"status": "active"},
+        new_value={"status": TICKET_EXPIRED_STATUS},
         correlation_id=correlation,
     )

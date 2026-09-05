@@ -327,3 +327,21 @@ async def close_finished_permits(factory: async_sessionmaker[AsyncSession]) -> i
         lambda db, after_id: permits_jobs.close_finished(db, after_id=after_id),
         name="close_finished_permits",
     )
+
+
+async def expire_forest_tickets(factory: async_sessionmaker[AsyncSession]) -> int:
+    """The nightly ВМҚ 506 ticket expiry (plan `03.11b-permits-lifecycle` task 6,
+    ruling 14 revised).
+
+    A wrapper, like every job on this page: the decision lives in
+    `permits.jobs.expire_forest_tickets`, a STANDALONE sweep with its own
+    cursor — a ticket's period need not end when its permit's does, so this is
+    never folded into `expire_permits`'s own batch loop. A ticket's status and
+    its audit entry share one transaction; no notification (a ticket lapsing
+    on its own last day is the calendar, not an event).
+    """
+    return await _drain_batches(
+        factory,
+        lambda db, after_id: permits_jobs.expire_forest_tickets(db, after_id=after_id),
+        name="expire_forest_tickets",
+    )

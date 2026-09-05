@@ -29,11 +29,12 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_, update
+from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core import files, storage
+from app.core import files, numbers, storage
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
@@ -60,7 +61,7 @@ from app.modules.permits.models import (
     QrCheckLog,
 )
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
-from app.modules.permits.schemas import DecisionIn, DuplicateIn
+from app.modules.permits.schemas import DecisionIn, DuplicateIn, ForestTicketIn
 from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
@@ -90,6 +91,10 @@ PERMIT_READ = "permit.read"
 # archives them — it is the APPLICATION that reaches CLOSED (ruling 13).
 PERMIT_EXPIRE = "permit.expire"
 PERMIT_CLOSE_APPLICATION = "permit.close_application"
+# `jobs.expire_forest_tickets`'s own action (Task 6, ruling 14 revised) — a
+# STANDALONE sweep with its own cursor, never a third statement folded into
+# `expire_permits`'s own batch loop (that module's own docstring).
+FOREST_TICKET_EXPIRE = "forest_ticket.expire"
 
 # The permit's initial status, and the one it reaches when the last required
 # signature lands. Nothing else in this codebase may write `active` onto a permit:
@@ -1851,21 +1856,30 @@ async def resume(
 
 
 async def revoke_tickets_of(db: AsyncSession, permit: Permit, *, actor: User) -> None:
-    """Revoke `permit`'s live forest ticket (ruling 14).
+    """Revoke `permit`'s live forest ticket(s) (ruling 14).
 
-    A stand-in for Task 6's own register: `uq_forest_tickets_active` already
-    limits a permit to at most one `active` row, so there is never more than
-    one to touch, and this stays a plain two-statement query until Task 6
-    moves it into `repo` beside its siblings. `actor` is accepted but not
-    read yet — the register is expected to want it (an `issued_by`-shaped
-    trail of who revoked a ticket), and taking the parameter now means this
-    function's shape does not have to change again when Task 6 lands.
+    `uq_forest_tickets_active` limits a permit to at most one `active` row, so
+    this is at most a one-row loop over `repo.live_forest_tickets` — Task 6's
+    move of Task 4's own stand-in bulk `UPDATE` into `repo` beside its
+    siblings (a move, not a rewrite: the end state for every row is
+    identical). `live_forest_tickets` takes its rows `FOR UPDATE`, which is
+    what keeps the guarantee identical rather than merely similar: a plain
+    SELECT would not wait on a row `jobs.expire_forest_tickets` is expiring
+    RIGHT NOW under its OWN lock, and revoking it once that sweep's
+    transaction commits would silently overwrite `expired` back to
+    `revoked` — the lost update the original bulk `UPDATE ...
+    WHERE status = 'active'` could never produce, because THAT statement's
+    WHERE clause is re-evaluated at write time. Blocking here until the
+    sweep resolves, then re-reading under the lock this function's own
+    docstring explains, reproduces the exact same guard.
+
+    `actor` is accepted but not read: `forest_tickets` carries no
+    `revoked_by`-shaped column to write it to, and this stage's migration
+    (0023) is already closed — adding one is a later stage's call.
     """
-    await db.execute(
-        update(ForestTicket)
-        .where(ForestTicket.permit_id == permit.id, ForestTicket.status == "active")
-        .values(status="revoked")
-    )
+    for ticket in await repo.live_forest_tickets(db, permit.id):
+        ticket.status = "revoked"
+    await db.flush()
 
 
 async def revoke(
@@ -2013,6 +2027,130 @@ async def issue_duplicate(
         new_value={"duplicate_id": str(duplicate.id)},
     )
     return duplicate
+
+
+# --- Task 6: the forest ticket (ЧТ), ўрмон чиптаси, ВМҚ 506 ------------------
+#
+# `forest_tickets` was created by migration 0023 with no writer, same as
+# `permit_duplicates` before Task 5 — and this section is that writer and its
+# register. Both routes share `permits.manage` with suspend/resume/revoke
+# above rather than `issue_duplicate`'s wider pair: a ticket is issued and
+# revoked by the leshoz that MANAGES the permit, not merely by whoever forms
+# the document (ruling 2 — the gate Task 6's own brief left unnamed).
+
+FOREST_TICKET_ISSUE = "forest_ticket.issue"
+
+# Both characters are CYRILLIC — Ч is U+0427 and Т is U+0422, not the Latin
+# lookalikes. design/03 § Public numbers spells the ticket `ЧТ-{YEAR}-{NUMBER}`,
+# and 3.11a already paid once for a Latin/Cyrillic mix-up on `permit_series`.
+FOREST_TICKET_PREFIX = "ЧТ"
+
+
+async def issue_forest_ticket(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: ForestTicketIn, actor: User
+) -> ForestTicket:
+    """One ўрмон чиптаси against an in-force permit (ВМҚ 506, ruling 11).
+
+    **Zoned FIRST, before either domain check below** — the same order
+    `issue_duplicate` and `decisions.decide()` already use, and for the same
+    reason that fix exists (lesson): an out-of-zone `permits.manage` holder
+    must learn nothing about the permit beyond "not yours". Refusing them
+    only after a status/period check would leak whether the permit exists
+    and what state it is in to a caller with no zone claim over it at all.
+
+    Refuses `ERR-PERM-001` with `details.reason = "permit_not_active"` when
+    the permit is not `active` (ruling 12: a ticket only ever rides an
+    in-force permit); `ERR-VAL-001` with `details.reason =
+    "period_outside_permit"` when the requested period reaches outside the
+    permit's own (`ForestTicketIn`'s own model validator has already refused
+    an INVERTED period before either of these runs); `ERR-PERM-003` with
+    `details.reason = "active_ticket_exists"` when `uq_forest_tickets_active`
+    finds a second live ticket already there.
+
+    **The constraint is caught BY NAME** —
+    `getattr(cause, "constraint_name", None)`, never `exc.orig` or the raw
+    message (lesson: a bare `except IntegrityError` would report this
+    table's own FK violations as a ticket conflict too) — inside a
+    `begin_nested()` SAVEPOINT, so a caller that wants to keep using `db`
+    after this refusal (an audited denial, a later stage) is not left with
+    the whole transaction aborted at the database level for a statement this
+    function alone issued.
+    """
+    permit = await repo.permit_by_id_for_update(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    if permit.status != ACTIVE_STATUS:
+        raise err(
+            "ERR-PERM-001",
+            details={"reason": "permit_not_active", "status": permit.status},
+        )
+    if data.valid_from < permit.period_from or data.valid_to > permit.period_to:
+        raise err("ERR-VAL-001", details={"reason": "period_outside_permit"})
+
+    ticket = ForestTicket(
+        number=await numbers.next_public_number(db, FOREST_TICKET_PREFIX, business_today()),
+        permit_id=permit.id,
+        valid_from=data.valid_from,
+        valid_to=data.valid_to,
+        restrictions=data.restrictions,
+        status="active",
+        issued_by=actor.id,
+    )
+    try:
+        async with db.begin_nested():
+            await repo.add(db, ticket)
+    except IntegrityError as exc:
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "uq_forest_tickets_active":
+            raise
+        raise err("ERR-PERM-003", details={"reason": "active_ticket_exists"}) from exc
+
+    await audit.log(
+        db,
+        action=FOREST_TICKET_ISSUE,
+        user_id=actor.id,
+        object_type="forest_ticket",
+        object_id=ticket.id,
+        new_value={"number": ticket.number, "permit_id": str(permit.id)},
+    )
+    await notifications.notify(
+        db,
+        event_code=events.FOREST_TICKET_ISSUED,
+        recipient_user_id=await _holder_recipient(db, permit),
+        params={
+            "ticket_number": ticket.number,
+            "permit_number": _permit_number(permit.series, permit.number),
+            "valid_from": ticket.valid_from,
+            "valid_to": ticket.valid_to,
+        },
+        object_type="forest_ticket",
+        object_id=ticket.id,
+    )
+    return ticket
+
+
+async def list_forest_tickets(
+    db: AsyncSession, permit_id: uuid.UUID, *, actor: User
+) -> Sequence[ForestTicket]:
+    """`GET /permits/{id}/forest-tickets` — the permit's whole ВМҚ 506
+    register, newest first.
+
+    Gated the SAME way the route itself is (`permits.manage`), unlike
+    `list_duplicates`'s wider `_readable_permit` audience: a forest ticket is
+    management paperwork, not something this module opens to the permit's
+    holder or its other signatories. `permits.manage` is itself
+    organization-scoped (`executor_head`, migration 0019) but the route's
+    permission dependency cannot see WHICH leshoz a target permit belongs
+    to, so `_assert_organization_in_zone` runs here exactly as it does on
+    the write path above — the same rule `issue_forest_ticket`'s own
+    docstring gives for checking it first.
+    """
+    permit = await repo.permit_by_id(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
+    return await repo.forest_tickets(db, permit.id)
 
 
 # --- the three read routes' service side -------------------------------------

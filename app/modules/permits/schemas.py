@@ -13,9 +13,16 @@ Two columns of `permits` are deliberately absent from every response here:
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_serializer,
+    model_validator,
+)
 
 # Spelled out rather than `Literal[*PERMIT_STATUSES]`: pyright rejects a starred
 # variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal` is exactly
@@ -240,6 +247,63 @@ class DuplicateOut(BaseModel):
     file_id: uuid.UUID
     issued_by: uuid.UUID
     issued_at: datetime
+
+
+class ForestTicketIn(BaseModel):
+    """`POST /permits/{id}/forest-tickets` — one ўрмон чиптаси against an
+    ACTIVE permit (ВМҚ 506, plan `03.11b-permits-lifecycle` ruling 11).
+
+    `restrictions` is stored exactly as given and validated only as an
+    object with string keys — the real ВМҚ 506 field list is `tz/12` #34 and
+    inventing one now is ruling 11(б). The documented shape a caller is
+    expected to send:
+
+        {"fire_ban_days": [...], "allowed_tools": [...], "notes": "..."}
+
+    `valid_to >= valid_from` is checked HERE rather than left for the DB
+    CHECK (`forest_tickets.period_ordered`) to catch as an `IntegrityError`
+    a caller would have to decode — the same reasoning `gis.schemas`'
+    `_validate_period` already gives its own two callers (lesson: an enum-ish
+    or ordered pair guarded by a DB CHECK is validated in the schema too, so
+    the CHECK is never the first thing a caller meets).
+    """
+
+    valid_from: date
+    valid_to: date
+    restrictions: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _check_period(self) -> Self:
+        if self.valid_to < self.valid_from:
+            raise ValueError("valid_to must not be before valid_from")
+        return self
+
+
+# `models.FOREST_TICKET_STATUSES`, spelled out by hand for the same reason
+# `PermitStatus` above is: pyright rejects a starred variable inside `Literal`,
+# so a `Literal`'s members must be statically visible (lesson: an enum-ish
+# column has ONE source of truth — the tuple). `test_forest_tickets.py`'s own
+# guard test closes the gap.
+ForestTicketStatus = Literal["active", "expired", "revoked"]
+
+
+class ForestTicketOut(BaseModel):
+    """One row of the ВМҚ 506 register — what `POST` answers the moment a
+    ticket is issued, and what one row of `GET /permits/{id}/forest-tickets`
+    carries."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    number: str
+    permit_id: uuid.UUID
+    valid_from: date
+    valid_to: date
+    restrictions: dict[str, Any]
+    status: ForestTicketStatus
+    file_id: uuid.UUID | None
+    issued_by: uuid.UUID
+    created_at: datetime
 
 
 # The four words `tz/04` С12 and `design/03` fix for the public page, spelled out
