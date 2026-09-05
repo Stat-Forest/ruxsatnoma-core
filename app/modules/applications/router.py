@@ -434,6 +434,26 @@ async def cancel_application(
     )
 
 
+@router.post("/applications/{application_id}/clone", status_code=201)
+async def clone_application(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationOut:
+    """201 with a fresh DRAFT pre-filled from an application the caller owns,
+    in whatever status it holds — so a herder renewing next season's grazing
+    does not retype the plot, the activity or the herd.
+
+    `applications.create` is the gate, the same one `POST /applications`
+    itself uses: filing a fresh draft, pre-filled or not, is one right.
+    Ownership is the service's own check, so a holder of the code who does not
+    own the source gets 404 — never a 403, which would confirm the
+    application exists (`service.clone`'s own docstring has the field-by-field
+    account of what is carried over and what is deliberately left behind).
+    """
+    return ApplicationOut.model_validate(await service.clone(db, application_id, actor=actor))
+
+
 @router.get("/applications/{application_id}/timeline")
 async def get_application_timeline(
     application_id: uuid.UUID,

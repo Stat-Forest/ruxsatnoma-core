@@ -2705,6 +2705,116 @@ async def cancel(
     return application
 
 
+# Task 6, 3.9b. A flow verb like `APPLICATION_CANCEL` above, audited under its
+# own name for the same reason: it does more than move a status, it creates a
+# whole new row.
+APPLICATION_CLONE = "application.clone"
+
+
+async def clone(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
+    """`POST /applications/{id}/clone` — a fresh DRAFT pre-filled from an
+    application the caller owns, in WHATEVER status it holds: a herder
+    renewing next season's grazing should not have to retype the plot, the
+    activity or the herd every filing.
+
+    **The point of a clone is what it does NOT copy.** Everything the source
+    EARNED by being reviewed, priced, signed or decided stays behind — the
+    public `number`, `status` (always a fresh `DRAFT`), the frozen
+    `contour_version_id`, every timestamp, the SLA deadline, the assignment,
+    the documents, the checks, the calculation and the whole status history:
+    the clone's own timeline holds exactly the one `DRAFT` row this function
+    writes. Documents are excluded ON PURPOSE, not merely deferred: a
+    veterinary certificate has a validity period, and silently carrying last
+    year's into a new filing is exactly the kind of quiet error this system
+    exists to prevent — the applicant attaches a fresh one.
+
+    What copies is the request itself: who is filing and on whose authority
+    (`applicant_id`, `on_behalf`, `representation_id`), the plot and activity
+    (`contour_id`, `activity_type_id`), the declared period, area, quantity and
+    herd (`period_from`, `period_to`, `requested_area_ha`, `quantity`,
+    `items`) and the claimed `benefit_category_item_id`. The period comes
+    along with the rest of the request rather than being left for a mandatory
+    `PATCH`: `checks.REQUIRED_FOR_PRICING` refuses a submission missing it, and
+    a clone an applicant cannot submit without editing fields that did not
+    change (the plot, the herd) would save them nothing. `contour_version_id`
+    is deliberately NOT among them: the clone reprices against whichever
+    version is published at ITS OWN submission (ruling 22), never the one the
+    source was decided against.
+
+    `parent_application_id` is set to the SOURCE while `kind` stays `"new"`
+    (`KIND_NEW`): a clone is a brand-new filing that happens to remember where
+    it came from, not `extend` (`tz/12` #6) — that verb belongs to 3.11's
+    `POST /permits/{id}/extend`, on an already-ISSUED permit, and is out of
+    scope here.
+
+    The OWNER only, in ANY status — a stranger is told 404, the same answer
+    every other refusal in this module gives, never 403 (`_readable_
+    application`'s own reasoning: an application carries a citizen's name,
+    plot and herd from the moment it exists). Unlocked, deliberately unlike
+    `_own_application_for_update`: the source is only ever READ here, never
+    written, so there is nothing to serialise against a concurrent writer.
+
+    No event is published and no notification sent: nothing subscribes to a
+    clone and no template is seeded for one — inventing either here would be
+    exactly the mistake `events.NOTIFIED_EVENT_CODES`'s own note on
+    `application.cancelled` warns against.
+    """
+    source = await repo.get_application(db, application_id)
+    if source is None or source.applicant_id not in await _own_applicant_ids(db, actor):
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    application = Application(
+        applicant_id=source.applicant_id,
+        submitted_by_user_id=actor.id,
+        on_behalf=source.on_behalf,
+        representation_id=source.representation_id,
+        activity_type_id=source.activity_type_id,
+        contour_id=source.contour_id,
+        requested_area_ha=source.requested_area_ha,
+        period_from=source.period_from,
+        period_to=source.period_to,
+        quantity=source.quantity,
+        benefit_category_item_id=source.benefit_category_item_id,
+        status=INITIAL_STATUS,
+        channel=CHANNEL_PORTAL,
+        kind=KIND_NEW,
+        parent_application_id=source.id,
+    )
+    db.add(application)
+    await db.flush()
+    for item in await repo.list_items(db, source.id):
+        db.add(
+            ApplicationItem(
+                application_id=application.id,
+                livestock_type_id=item.livestock_type_id,
+                head_count=item.head_count,
+            )
+        )
+    await repo.add_status_history(
+        db,
+        ApplicationStatusHistory(
+            application_id=application.id,
+            from_status=None,
+            to_status=INITIAL_STATUS,
+            changed_by=actor.id,
+        ),
+    )
+    # `created_at`/`updated_at`/`requested_area_ha`/`quantity` all round-trip
+    # through Postgres defaults or `NUMERIC`'s own scale (the same lesson
+    # `create_draft` and `patch_draft` both carry) — refreshed before this row
+    # is serialized into the 201 response.
+    await db.refresh(application)
+    await audit.log(
+        db,
+        action=APPLICATION_CLONE,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        old_value={"parent_application_id": str(source.id)},
+        new_value=_snapshot(application, await repo.list_items(db, application.id)),
+    )
+    return application
+
+
 async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
     """`GET /applications/{id}/timeline` — the transitions, the assignments, the
     signatures and (from 3.9b) the information requests.
