@@ -160,12 +160,15 @@ async def test_the_paper_fallback_still_works_when_prod_refuses_the_live_adapter
     monkeypatch, hodim_client, application_in_review, vet_certificate_file
 ) -> None:
     """Ruling point 3, proven end to end: in `app_env=prod` the LIVE check is
-    refused (an uncaught `NotImplementedError` from `get_adapter()`, so
-    `app.main`'s generic handler answers 500 — never a silent fabricated
-    `pass`), and the paper fallback under maker-checker is what the office
-    uses instead. Only `vet`/`cadastre`'s OWN `get_settings` is patched, never
-    the app-wide one `hodim_client`'s session cookie and every other
-    dependency also read, so nothing else about this request changes."""
+    refused — final whole-branch review, IMPORTANT: `get_adapter()`'s bare
+    `NotImplementedError` is now caught at `service._external_check` and
+    turned into an honest 409 `ERR-APP-004` (`reason="live_check_unavailable"`),
+    never the uncaught `ERR-SYS-001` 500 with a traceback this used to pin as
+    correct — a crash sends the operator to file a bug instead of reaching for
+    the paper fallback that already exists. Only `vet`/`cadastre`'s OWN
+    `get_settings` is patched, never the app-wide one `hodim_client`'s session
+    cookie and every other dependency also read, so nothing else about this
+    request changes."""
     from app.modules.integrations.adapters import cadastre, vet
 
     monkeypatch.setattr(vet, "get_settings", _prod_settings)
@@ -175,7 +178,8 @@ async def test_the_paper_fallback_still_works_when_prod_refuses_the_live_adapter
         f"/api/v1/applications/{application_in_review}/checks",
         json={"check_type": "vet"},
     )
-    assert live.status_code == 500, live.text
+    assert live.status_code == 409, live.text
+    assert live.json()["error"]["details"]["reason"] == "live_check_unavailable"
 
     paper = await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/checks",

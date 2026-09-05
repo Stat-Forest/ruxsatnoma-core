@@ -2981,10 +2981,27 @@ async def _external_check(
     the shape `oneid.get_oneid_adapter`/`otp_sender.get_otp_sender` already
     use. A plain `if`/`else` rather than a dict of callables: the schema's
     `Literal["vet", "cadastre"]` already admits nothing else, and this way
-    every adapter's own result type stays visible to pyright."""
-    if check_type == "vet":
-        return await vet_adapter.get_adapter().check(application_id=application_id)
-    return await cadastre_adapter.get_adapter().check(application_id=application_id)
+    every adapter's own result type stays visible to pyright.
+
+    **Final whole-branch review**: `get_adapter()` raises a bare
+    `NotImplementedError` on two paths — `app_env=prod` refusing to answer
+    from a mock, or `*_MODE=real` naming a contract that has not been
+    written — and left uncaught here that reached `app.main`'s generic
+    handler as an unhandled `ERR-SYS-001` 500 with a traceback: a crash where
+    the ruling meant an honest refusal. Both paths leave the office with the
+    identical remedy, `add_check`'s `source="manual_fallback"` branch, so
+    both are translated the same way, into `ERR-APP-004` with a `reason` —
+    the same shape this module's other typed refusals on this exact route
+    already carry (`not_manual_fallback`, `already_confirmed`, ...)."""
+    try:
+        if check_type == "vet":
+            return await vet_adapter.get_adapter().check(application_id=application_id)
+        return await cadastre_adapter.get_adapter().check(application_id=application_id)
+    except NotImplementedError as exc:
+        raise err(
+            "ERR-APP-004",
+            details={"reason": "live_check_unavailable", "check_type": check_type},
+        ) from exc
 
 
 async def _assert_check_doc_active(db: AsyncSession, file_id: uuid.UUID) -> None:
