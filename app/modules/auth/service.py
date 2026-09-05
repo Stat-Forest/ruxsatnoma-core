@@ -1009,6 +1009,17 @@ async def list_user_ids_by_role_codes(
     return list(rows)
 
 
+async def user_ids_with_permission(
+    db: AsyncSession, permission_code: str, *, organization_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Active users of `organization_id` holding `permission_code`, by role or
+    by a personal grant — the org-wide counterpart of `permission_codes`
+    above, which answers the same question for one user already in hand. A
+    generic, module-agnostic lookup: `applications`' auto-assignment (3.9b
+    task 1) is the first caller, asking about its own `applications.review`."""
+    return await repo.user_ids_with_permission(db, permission_code, organization_id=organization_id)
+
+
 async def set_language(db: AsyncSession, user: User, language: str, *, ip: str | None) -> None:
     """Notification language (ruling 17). Not routed through the OTP-guarded contact
     change: switching UI language is not a contact change."""

@@ -116,7 +116,11 @@ async def test_check_type_check_rejects_a_bogus_value(db, applicant) -> None:
     db.add(app_row)
     await db.flush()
     check = ApplicationCheck(
-        application_id=app_row.id, check_type="gis_restrictions", result="pass", details={}
+        application_id=app_row.id,
+        check_type="gis_restrictions",
+        result="pass",
+        details={},
+        created_by=app_row.submitted_by_user_id,
     )
     db.add(check)
     with pytest.raises(IntegrityError, match="ck_application_checks_check_type_valid"):
@@ -137,7 +141,11 @@ async def test_check_type_check_accepts_every_check_type(db, applicant) -> None:
     await db.flush()
     for check_type in CHECK_TYPES:
         check = ApplicationCheck(
-            application_id=app_row.id, check_type=check_type, result="pass", details={}
+            application_id=app_row.id,
+            check_type=check_type,
+            result="pass",
+            details={},
+            created_by=app_row.submitted_by_user_id,
         )
         db.add(check)
         await db.flush()
@@ -155,7 +163,11 @@ async def test_result_check_rejects_a_bogus_value(db, applicant) -> None:
     db.add(app_row)
     await db.flush()
     check = ApplicationCheck(
-        application_id=app_row.id, check_type="gis_validity", result="unknown", details={}
+        application_id=app_row.id,
+        check_type="gis_validity",
+        result="unknown",
+        details={},
+        created_by=app_row.submitted_by_user_id,
     )
     db.add(check)
     with pytest.raises(IntegrityError, match="ck_application_checks_result_valid"):
@@ -179,7 +191,11 @@ async def test_result_check_accepts_every_result(db, applicant) -> None:
     await db.flush()
     for result in CHECK_RESULTS:
         check = ApplicationCheck(
-            application_id=app_row.id, check_type="gis_validity", result=result, details={}
+            application_id=app_row.id,
+            check_type="gis_validity",
+            result=result,
+            details={},
+            created_by=app_row.submitted_by_user_id,
         )
         db.add(check)
         await db.flush()
@@ -309,9 +325,12 @@ async def test_applications_permission_seeds(db) -> None:
     finding I3, which caught that ruling 16's prose named only `leadership` while
     tz/03's matrix gives «Т» to Раҳбар = `executor_head`). **Migration 0016 revoked
     leadership's half** once Oybek settled the question — decision #59, option а —
-    so the expected set below is the post-0016 state, not 0015's. The two guards in
-    `tests/test_permissions_registry.py` assert the same alignment across all three
-    stages that grant an approval code.
+    so the expected set below is the post-0016 state, not 0015's. **Task 5's fix
+    round 1 (controller ruling) added `conclude_gis -> gis_specialist`** via
+    migration 0025 — the code `kind="gis"` conclusions are gated on
+    (`app/modules/applications/permissions.py`; `gis`'s own registry had no
+    fit). The two guards in `tests/test_permissions_registry.py` assert the
+    same alignment across all three stages that grant an approval code.
 
     **`r.is_system` scopes this to the eleven `0003_auth` seeds**, the same
     filter `tests/test_permissions_registry.py` applies and for the same reason:
@@ -332,24 +351,34 @@ async def test_applications_permission_seeds(db) -> None:
         ("executor_head", "applications.decide"),
         ("prosecutor", "applications.view_any"),
         ("sys_admin", "applications.assign"),
+        ("gis_specialist", "applications.conclude_gis"),
     }
 
 
 def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> None:
-    """The one guard against `schemas.ApplicationStatus` and its three siblings
+    """The one guard against `schemas.ApplicationStatus` and its siblings
     drifting from the tuples `models.py` builds its CHECK constraints from
     (lesson: an enum-ish column has ONE source of truth). The members have to be
     written out — pyright rejects a starred variable inside `Literal` — so a
     value added on one side and forgotten on the other would be a 422 that
     should have been a 200, or an `IntegrityError` 500 that should have been a
-    422. `permits/test_models.py` carries the identical guard."""
+    422. `permits/test_models.py` carries the identical guard. Task 5 (3.9b)
+    adds `ConclusionKind`/`ConclusionRecommendation` beside the original four."""
     from typing import get_args
 
-    from app.modules.applications.models import APPLICATION_KINDS, CHANNELS, ON_BEHALF_VALUES
+    from app.modules.applications.models import (
+        APPLICATION_KINDS,
+        CHANNELS,
+        CONCLUSION_KINDS,
+        CONCLUSION_RECOMMENDATIONS,
+        ON_BEHALF_VALUES,
+    )
     from app.modules.applications.schemas import (
         ApplicationKind,
         ApplicationStatus,
         Channel,
+        ConclusionKind,
+        ConclusionRecommendation,
         OnBehalf,
     )
 
@@ -357,3 +386,5 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(OnBehalf)) == set(ON_BEHALF_VALUES)
     assert set(get_args(Channel)) == set(CHANNELS)
     assert set(get_args(ApplicationKind)) == set(APPLICATION_KINDS)
+    assert set(get_args(ConclusionKind)) == set(CONCLUSION_KINDS)
+    assert set(get_args(ConclusionRecommendation)) == set(CONCLUSION_RECOMMENDATIONS)

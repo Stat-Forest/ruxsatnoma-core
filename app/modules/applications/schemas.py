@@ -54,6 +54,22 @@ ApplicationStatus = Literal[
 OnBehalf = Literal["self", "legal"]
 Channel = Literal["portal", "mygov"]
 ApplicationKind = Literal["new", "extension"]
+# `application_conclusions.kind`/`.recommendation` (task 5, 3.9b) — the same
+# CHECK-backed-tuple shape as the four above, guarded by the same test.
+ConclusionKind = Literal["executor", "gis"]
+ConclusionRecommendation = Literal["approve", "reject"]
+
+# `POST /applications/{id}/checks` (task 7, 3.9b) — deliberate SUBSETS of
+# `models.CHECK_TYPES`/`CHECK_RESULTS`/`CHECK_SOURCES`, not their mirror, so
+# NOT added to `test_the_schema_literals_match_the_tuples_the_checks_are_
+# built_from`: this route only ever writes `check_type in ("vet", "cadastre")`
+# (the auto GIS/norm ones go through `checks.run_all` alone) and never
+# `result="skipped"` (that is `gis`/`norms`' own designed branch for an empty
+# reference layer — an unreachable vet/cadastre registry is the
+# manual-fallback path instead, ApplicationCheckIn's own docstring) or
+# `source="auto"` (reserved for `checks.run_all`).
+ExternalCheckType = Literal["vet", "cadastre"]
+CheckResult = Literal["pass", "fail", "warning"]
 
 # `application_items.head_count` is a plain integer column, so the only ceiling
 # it has is the one written here. Bounded for the same reason every integer
@@ -184,7 +200,13 @@ class ApplicationDocumentOut(BaseModel):
 class ApplicationCheckOut(BaseModel):
     """One check result — evidence, and evidence is a LIST: every run is kept
     and none is superseded (ruling 12), so a card shows the history rather than
-    "the latest per type"."""
+    "the latest per type".
+
+    `created_by`/`confirmed_by`/`confirmed_at` are task 7's maker-checker
+    columns (migration `0025`): every row names who created it, and only a
+    manual paper result that has actually been confirmed carries the other
+    two — `confirmed_by is None` is exactly "not usable yet" on the wire.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -194,6 +216,9 @@ class ApplicationCheckOut(BaseModel):
     details: Any
     source: str
     checked_at: datetime
+    created_by: uuid.UUID
+    confirmed_by: uuid.UUID | None
+    confirmed_at: datetime | None
 
 
 class ApplicationCalculationOut(BaseModel):
@@ -246,6 +271,25 @@ class ApplicationCalculationOut(BaseModel):
         )
 
 
+class ApplicationConclusionOut(BaseModel):
+    """One specialist's written finding (task 5, 3.9b; tz/04 С8) — as `POST
+    /applications/{id}/conclusion` answers the one it just wrote, and as the
+    card lists them.
+
+    Immutable (ruling 10): a correction is a NEW row, so — like
+    `ApplicationCheckOut` beside it — the card's `conclusions` is the FULL
+    list, never "the latest per kind"."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    author_id: uuid.UUID
+    kind: ConclusionKind
+    text: str
+    recommendation: ConclusionRecommendation | None
+    created_at: datetime
+
+
 class ApplicationOut(BaseModel):
     """The application's own columns — the response to create and patch, and one
     row of `GET /applications`.
@@ -289,13 +333,25 @@ class ApplicationOut(BaseModel):
 
 
 class ApplicationCardOut(ApplicationOut):
-    """`GET /applications/{id}` — the columns above, flat, plus the four things
+    """`GET /applications/{id}` — the columns above, flat, plus the six things
     that are not columns of `applications` at all."""
 
     items: list[ApplicationItemOut]
     documents: list[ApplicationDocumentOut]
     checks: list[ApplicationCheckOut]
     calculation: ApplicationCalculationOut | None
+    # Task 4 (3.9b), ruling 8: whether the SLA clock is running late RIGHT NOW —
+    # `sla.is_overdue`, computed by `service.get_card` because it needs both
+    # `status` (an OPEN pause suspends the clock whatever the stored deadline
+    # says) and the wall clock, neither of which a schema should read for
+    # itself. Not a column, so it belongs beside `calculation` here rather than
+    # on `ApplicationOut`, which also serves the list row and create/patch —
+    # design/03's own `sla_overdue=true` filter is a LIST feature nothing in
+    # this task adds.
+    sla_overdue: bool
+    # Task 5 (3.9b), tz/04 С8: every conclusion on record — "the rahbar sees
+    # both conclusions" — never just the newest per `kind` (ruling 10).
+    conclusions: list[ApplicationConclusionOut]
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> ApplicationCardOut:
@@ -314,9 +370,11 @@ class ApplicationCardOut(ApplicationOut):
                 "items": card["items"],
                 "documents": card["documents"],
                 "checks": card["checks"],
+                "conclusions": card["conclusions"],
                 "calculation": (
                     None if calculation is None else ApplicationCalculationOut.build(calculation)
                 ),
+                "sla_overdue": card["sla_overdue"],
             }
         )
 
@@ -440,6 +498,19 @@ class ApplicationCancelIn(BaseModel):
     reason: Annotated[str, Field(max_length=REASON_MAX_LENGTH)] | None = None
 
 
+class ApplicationAssignIn(BaseModel):
+    """`POST /applications/{id}/assign` — `sys_admin` only (Task 1 ANSWERED
+    (б), 2026-09-05). `reason` is restricted to the two HUMAN values
+    `application_assignments.reason`'s CHECK allows for a manual act —
+    `"auto"` is `assignment.py`'s own, never a client's to name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: uuid.UUID
+    reason: Literal["manual", "absence"]
+
+
 class TimelineSignatureRow(BaseModel):
     """One ERI signature as the timeline shows it.
 
@@ -507,6 +578,24 @@ class TimelineHistoryRow(BaseModel):
         )
 
 
+class TimelineInfoRequestRow(BaseModel):
+    """One row of the `info_requests` register — final whole-branch review,
+    IMPORTANT: the pause it records is the one event on this branch that
+    silently moves a legally-consequential deadline (`sla_deadline_at`), and
+    this is the only audit view that shows it happened at all. `responded_at`/
+    `response_text` are `None` for a still-open pause, the same shape the
+    table itself carries."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    requested_by: uuid.UUID
+    message: str
+    requested_at: datetime
+    responded_at: datetime | None
+    response_text: str | None
+
+
 class TimelineAssignmentRow(BaseModel):
     """One row of the assignment register — who held the application, from when,
     and whether they still do.
@@ -538,13 +627,14 @@ class ApplicationTimelineOut(BaseModel):
     each sits on its own `status_history` entry, which is the whole point of
     ruling 25 giving the history row and the signed object the same id.
 
-    `info_requests` is present and empty until 3.9b writes the table.
+    `info_requests` lists every pause this application has had, open or
+    closed, oldest first (final whole-branch review, IMPORTANT).
     """
 
     status_history: list[TimelineHistoryRow]
     assignments: list[TimelineAssignmentRow]
     signatures: list[TimelineSignatureRow]
-    info_requests: list[Any] = []
+    info_requests: list[TimelineInfoRequestRow]
 
     @classmethod
     def build(cls, timeline: dict[str, Any]) -> ApplicationTimelineOut:
@@ -557,7 +647,9 @@ class ApplicationTimelineOut(BaseModel):
                 TimelineAssignmentRow.model_validate(row) for row in timeline["assignments"]
             ],
             signatures=[TimelineSignatureRow.model_validate(row) for row in timeline["signatures"]],
-            info_requests=timeline["info_requests"],
+            info_requests=[
+                TimelineInfoRequestRow.model_validate(row) for row in timeline["info_requests"]
+            ],
         )
 
 
@@ -605,6 +697,113 @@ class ApplicationRejectIn(BaseModel):
     pkcs7: str
     reason_item_id: uuid.UUID
     legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+
+
+class ApplicationReturnIn(BaseModel):
+    """`POST /applications/{id}/return` — task 3 (3.9b): send an application
+    back for correction, with a typed reason, the fields to fix, and a legal
+    basis.
+
+    **No `pkcs7` here, unlike `ApplicationApproveIn`/`ApplicationRejectIn`** —
+    returning a package for correction is not a decision the state signs
+    (`applications.review`, the hodim's own permission, holds no ERI purpose
+    at all); only approve/reject spend one.
+
+    `legal_basis` is required with the same `min_length=1` as
+    `ApplicationRejectIn`'s own, closing the identical gap a plain `str` would
+    leave open. `fields_to_fix` is a JSON **OBJECT** — field name -> what is
+    wrong with it, e.g. `{"period_to": "срок выходит за пределы сезона
+    выпаса"}` — never a bare list of names, which would tell the applicant
+    WHAT to fix but not why; `ApplicationStatusHistory.fields_to_fix` and
+    `TimelineHistoryRow.fields_to_fix` are both `dict[str, Any] | None` for
+    exactly this shape. Pydantic checks the TYPE only — that it is non-empty
+    and that its keys name real columns of the application is the service's
+    own check (`service.return_to_applicant`), which needs the row to answer
+    "real column of THIS application".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason_item_id: uuid.UUID
+    fields_to_fix: dict[str, Any]
+    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+
+
+class ApplicationRequestInfoIn(BaseModel):
+    """`POST /applications/{id}/request-info` — task 4 (3.9b): the reviewer
+    asks the applicant for more information, opening the `info_requests` row
+    that pauses the SLA clock (`sla.py`, ruling 8) until `respond-info` closes
+    it.
+
+    `message` is required and non-empty (`min_length=1`, the same gap
+    `ApplicationRejectIn`'s own `legal_basis` closes) — a paused clock with
+    nothing asked for leaves the applicant with no way to answer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: Annotated[str, Field(min_length=1)]
+
+
+class ApplicationRespondInfoIn(BaseModel):
+    """`POST /applications/{id}/respond-info` — the applicant's own reply,
+    closing the newest open `info_requests` row and resuming the SLA clock by
+    the length of the pause (ruling 8).
+
+    `file_ids` names already-uploaded `media_files` rows — the bytes go
+    through `POST /files` first, the same two-step `ApplicationDocumentIn`
+    uses — and every one must be the caller's OWN active upload
+    (`service._own_document_file`). An empty list is a text-only reply and is
+    legal: not every request for information needs a document back.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: Annotated[str, Field(min_length=1)]
+    file_ids: list[uuid.UUID]
+
+
+class ApplicationConclusionIn(BaseModel):
+    """`POST /applications/{id}/conclusion` — task 5 (3.9b): a specialist's
+    written finding (tz/04 С8), immutable (ruling 10 — no PATCH, no DELETE; a
+    correction is a new row, never an edit of this one).
+
+    `kind` names WHICH specialist is writing and is not decoration:
+    `service.add_conclusion` gates each value on its own permission —
+    `"executor"` on `applications.review` (the hodim), and `"gis"` refused
+    with `ERR-ACL-001` for EVERY caller today, because `app/modules/gis/
+    permissions.py` registers no code yet that means "authorised to write an
+    application conclusion" (see that function's docstring — a gap for
+    `decisions.md`/`design/03`, not something this schema can paper over).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ConclusionKind
+    text: Annotated[str, Field(min_length=1)]
+    recommendation: ConclusionRecommendation | None = None
+
+
+class ApplicationCheckIn(BaseModel):
+    """`POST /applications/{id}/checks` — task 7 (3.9b), tz/04 С5: the
+    office's veterinary and cadastre checks against outside registries, and
+    the paper fallback for when one cannot be reached.
+
+    Two shapes, told apart by `service.add_check` rather than a
+    Literal-discriminated union: `check_type` alone calls the live adapter
+    (`vet`/`cadastre`); add `source="manual_fallback"` with both `result` and
+    `doc_file_id` to record a paper result instead (422 `ERR-VAL-001` if
+    either is missing). A paper result is maker-checker (ruling 5, Oybek's
+    choice 2026-09-05): it is written with `confirmed_by=None` and is not
+    usable until a DIFFERENT reviewer calls `POST .../checks/{id}/confirm`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    check_type: ExternalCheckType
+    source: Literal["manual_fallback"] | None = None
+    result: CheckResult | None = None
+    doc_file_id: uuid.UUID | None = None
 
 
 class ApplicationDecisionOut(ApplicationOut):

@@ -381,6 +381,13 @@ async def run_all(
             result=result,
             details=_jsonable(details),
             source=SOURCE_AUTO,
+            # `created_by` is NOT NULL (migration 0025): an auto check has no
+            # reviewer of its own, so it is attributed to the application's
+            # owner — the same actor `precheck`/`submit` already audit under
+            # (module boundary: this file never imports `service.py`, so it
+            # reads the id off the `Application` row it was already handed,
+            # never the caller's `actor`).
+            created_by=application.submitted_by_user_id,
         )
         for check_type, result, details in collected
     ]
