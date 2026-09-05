@@ -98,6 +98,10 @@ CASE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "closed": (),
     "archived": (),
 }
+# `decide_case`'s own, narrower source set — `appealed` reaches `decided`
+# through `resolve_appeal` only (see that function's docstring for why this
+# is not just `CASE_TRANSITIONS["appealed"]` read twice).
+DECIDABLE_CASE_STATUSES = ("opened", "explanation_requested", "explained")
 
 
 # --- permission/zone plumbing ------------------------------------------------
@@ -423,22 +427,52 @@ async def _resolve_act_organization(
     return actor.organization_id
 
 
+async def _relevant_contour_id(
+    db: AsyncSession,
+    *,
+    permit_id: uuid.UUID | None,
+    application_id: uuid.UUID | None,
+    task: InspectionTask | None,
+) -> uuid.UUID | None:
+    """Whichever contour this act is actually about — checked in the same
+    priority order the act's own subject fields are given in: a named permit,
+    a named application, or the task's own contour (a bare `contour_id` task
+    with no permit/application of its own — e.g. an unassigned patrol)."""
+    if permit_id is not None:
+        permit = await permits_service.get(db, permit_id)
+        if permit is not None:
+            return permit.contour_id
+    if application_id is not None:
+        application = await applications_service.get(db, application_id)
+        if application is not None and application.contour_id is not None:
+            return application.contour_id
+    if task is not None:
+        if task.contour_id is not None:
+            return task.contour_id
+        if task.permit_id is not None:
+            permit = await permits_service.get(db, task.permit_id)
+            if permit is not None:
+                return permit.contour_id
+        if task.application_id is not None:
+            application = await applications_service.get(db, task.application_id)
+            if application is not None and application.contour_id is not None:
+                return application.contour_id
+    return None
+
+
 async def _distance_to_relevant_contour(
     db: AsyncSession,
     *,
     permit_id: uuid.UUID | None,
+    application_id: uuid.UUID | None,
     task: InspectionTask | None,
     gps: tuple[float, float] | None,
 ) -> Decimal | None:
     if gps is None:
         return None
-    contour_id: uuid.UUID | None = None
-    if permit_id is not None:
-        permit = await permits_service.get(db, permit_id)
-        if permit is not None:
-            contour_id = permit.contour_id
-    elif task is not None and task.contour_id is not None:
-        contour_id = task.contour_id
+    contour_id = await _relevant_contour_id(
+        db, permit_id=permit_id, application_id=application_id, task=task
+    )
     if contour_id is None:
         return None
     return await gis_service.distance_to_contour_m(db, contour_id, lon=gps[0], lat=gps[1])
@@ -485,7 +519,9 @@ async def create_act(
         raise err("ERR-VAL-001", details={"reason": "unknown_checklist"})
     _assert_checklist_answers(checklist, answers)
 
-    distance = await _distance_to_relevant_contour(db, permit_id=permit_id, task=task, gps=gps)
+    distance = await _distance_to_relevant_contour(
+        db, permit_id=permit_id, application_id=application_id, task=task, gps=gps
+    )
     organization_id = await _resolve_act_organization(
         db, task=task, permit_id=permit_id, application_id=application_id, actor=actor
     )
@@ -592,7 +628,7 @@ async def update_act(
         act.gps = _gps_point(gps)
         task = await repo.get_task(db, act.task_id) if act.task_id is not None else None
         act.distance_to_contour_m = await _distance_to_relevant_contour(
-            db, permit_id=act.permit_id, task=task, gps=gps
+            db, permit_id=act.permit_id, application_id=act.application_id, task=task, gps=gps
         )
     if gps_accuracy_m is not None:
         act.gps_accuracy_m = gps_accuracy_m
@@ -963,13 +999,29 @@ async def decide_case(
     only** (plan ruling 2) — executing a `suspend`/`revoke` against the
     permit itself is a SEPARATE act on `permits`' own existing suspend/revoke
     routes, citing ground `PS-01` ("по результатам инспекции", migration
-    `0023`); this module does not call `permits.decisions.decide` itself."""
+    `0023`); this module does not call `permits.decisions.decide` itself.
+
+    **Source states are narrower here than `CASE_TRANSITIONS["appealed"]`
+    alone would allow** (lesson: "a status-transition table is ambiguous
+    wherever two source states share a target" — `decided` is reachable from
+    FOUR sources, and two different actions, `decide_case` and
+    `resolve_appeal`, can both drive `appealed -> decided`). Redeciding an
+    `appealed` case through THIS route would leave that appeal's own
+    `result`/`resolved_by`/`resolved_at` permanently unset while the case
+    already reads `decided` again — `resolve_appeal` is the one path out of
+    `appealed`, so this route refuses it explicitly rather than relying on
+    the generic transition table to catch it."""
     case = await repo.get_case(db, case_id)
     if case is None:
         raise err("ERR-SYS-003")
     if not await _holds(db, actor, CASES_MANAGE):
         raise err("ERR-ACL-001")
     await _assert_organization_in_zone(db, actor, case.organization_id)
+    if case.status not in DECIDABLE_CASE_STATUSES:
+        raise err(
+            "ERR-INSP-001",
+            details={"reason": "bad_transition", "from": case.status, "to": "decided"},
+        )
 
     await _move_case(db, case, to_status="decided", actor=actor, note=note)
     case.decision = decision
