@@ -307,6 +307,7 @@ async def already_notified(
     object_id: uuid.UUID,
     channel: str = "inapp",
     recipient_user_id: uuid.UUID | None = None,
+    params_match: Mapping[str, str] | None = None,
 ) -> bool:
     """Whether `object_id` already has a `channel` notification for `event_code`
     — the once-only check a periodic job needs before calling `notify()` again
@@ -321,13 +322,23 @@ async def already_notified(
     assigned executor and the organization's head): without it, the first
     recipient's own notification row would make every other recipient look
     already-notified. Omit it (every caller before this one) for the
-    original object-wide check."""
+    original object-wide check.
+
+    `params_match` narrows it FURTHER, to a notification whose stored
+    `params` carry these exact key/value pairs too (final whole-branch
+    review: `applications.jobs.sla_sweep`'s reminder must re-fire when a
+    closed `PENDING_INFO` pause moves `sla_deadline_at`, so its once-only key
+    folds the deadline's CURRENT value in — `notify()`'s caller already put it
+    in `params`, so no new column is needed to key on it). Optional and
+    additive: every caller before this one, and every other caller today,
+    omits it and gets the identical query."""
     return await repo.notification_exists(
         db,
         event_code=event_code,
         object_id=object_id,
         channel=channel,
         recipient_user_id=recipient_user_id,
+        params_match=params_match,
     )
 
 

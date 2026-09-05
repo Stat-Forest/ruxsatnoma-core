@@ -100,13 +100,25 @@ async def _remind_one(db: AsyncSession, application: Application, *, correlation
     """One due-soon application's whole body, run by the caller inside a
     SAVEPOINT (mirrors `payments.jobs._remind_about_one_invoice`). `True`
     when at least one recipient was actually reminded, `False` when every
-    resolved recipient already had one (or none could be resolved at all).
+    resolved recipient already had one for THIS deadline (or none could be
+    resolved at all).
 
     Each recipient carries its OWN `already_notified` check
     (`recipient_user_id=`): the executor's own notification row must not
-    make the head look already-reminded, or vice versa."""
+    make the head look already-reminded, or vice versa.
+
+    **Final whole-branch review, IMPORTANT.** The once-only key also carries
+    the deadline itself now (`params_match`), not merely the event/object/
+    recipient triple: `sla_deadline_at` moves forward every time a
+    `PENDING_INFO` pause closes (`service.respond_info`, `sla.shift_deadline`),
+    and without this a reminder sent against one deadline made every LATER
+    deadline on the same application look already-warned-about, forever — the
+    one notification the office got would go on naming a date a pause had
+    already moved past. `notify()`'s own `params` already carries the
+    deadline (below), so keying on its stored value needs no new column."""
     deadline = application.sla_deadline_at
     assert deadline is not None  # the candidate query's own WHERE clause
+    deadline_key = deadline.date().isoformat()
     params = {"application_number": application.number, "deadline": deadline.date()}
 
     sent = False
@@ -116,6 +128,7 @@ async def _remind_one(db: AsyncSession, application: Application, *, correlation
             event_code=NOTIFY_APPLICATION_SLA_APPROACHING,
             object_id=application.id,
             recipient_user_id=recipient_id,
+            params_match={"deadline": deadline_key},
         ):
             continue
         await notifications_service.notify(

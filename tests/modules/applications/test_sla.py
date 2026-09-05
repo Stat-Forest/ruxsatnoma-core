@@ -152,3 +152,77 @@ async def test_the_sweep_reminds_the_executor_and_the_head_not_the_applicant(
 
     assert counts == {executor_id: 1, org_head_id: 1}
     assert applicant_id not in counts
+
+
+async def test_a_reminder_re_fires_when_a_pause_moves_the_deadline(
+    db, application_due_in_two_days, hodim_client, applicant_client, frozen_clock
+) -> None:
+    """Final whole-branch review, IMPORTANT. `already_notified`'s once-only
+    key carried no time component at all, so the office was reminded AT MOST
+    ONCE per application, EVER — and the one reminder it got named a deadline
+    a later pause could already have moved past. `request_info`/
+    `respond_info` read the pause's two endpoints through the module's own
+    `_now()` (`frozen_clock`'s target, never `applications.jobs`'s own wall
+    clock, which the sweep still reads for real): advancing it by EXACTLY 24
+    hours between the two calls moves the shifted deadline's calendar DATE by
+    exactly one day, deterministically, whatever time of day the test happens
+    to run at — `sla.shift_deadline` adds the pause's length outright, and a
+    full day added to any UTC instant always lands on the next date."""
+    from sqlalchemy import func, select
+
+    from app.modules.applications import jobs
+    from app.modules.applications.models import Application
+    from app.modules.notifications.models import Notification
+
+    application = await db.get(Application, application_due_in_two_days)
+    assert application is not None
+    executor_id = application.assigned_user_id
+    assert executor_id is not None
+
+    async def _reminder_count() -> int:
+        return (
+            await db.scalar(
+                select(func.count())
+                .select_from(Notification)
+                .where(
+                    Notification.object_id == application_due_in_two_days,
+                    Notification.event_code == "application.sla_approaching",
+                    Notification.channel == "inapp",
+                    Notification.recipient_user_id == executor_id,
+                )
+            )
+        ) or 0
+
+    await jobs.sla_sweep(db)
+    await jobs.sla_sweep(db)
+    assert await _reminder_count() == 1, (
+        "a second sweep against the SAME deadline must not remind a second time"
+    )
+
+    asked = await hodim_client.post(
+        f"/api/v1/applications/{application_due_in_two_days}/request-info",
+        json={"message": "Уточните состав стада"},
+    )
+    assert asked.status_code == 200, asked.text
+
+    frozen_clock.advance(timedelta(hours=24))
+
+    answered = await applicant_client.post(
+        f"/api/v1/applications/{application_due_in_two_days}/respond-info",
+        json={"text": "Готово", "file_ids": []},
+    )
+    assert answered.status_code == 200, answered.text
+
+    # `respond_info` ran on `applicant_client`'s OWN session, over the same
+    # row this test's `db` session already holds in its identity map (the
+    # `db.get` above) — a bare re-query would hand `sla_sweep` back that
+    # SAME cached, now-stale object rather than the shifted deadline Postgres
+    # actually stored (lesson: "the row in memory is not what Postgres
+    # stored"). An explicit refresh is what makes the sweep see the moved
+    # deadline at all, not merely what this assertion is about.
+    await db.refresh(application)
+
+    await jobs.sla_sweep(db)
+    assert await _reminder_count() == 2, (
+        "a pause that moved the deadline forward must earn a fresh reminder"
+    )
