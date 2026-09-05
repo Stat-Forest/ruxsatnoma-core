@@ -286,7 +286,16 @@ def downgrade() -> None:
     # and this is a schema rollback correcting the reference a classifier row it
     # is about to remove leaves behind — never an in-place rewrite of what a
     # decision WAS, only of what it now points at once that classifier is gone.
-    op.execute("ALTER TABLE permit_status_history DISABLE TRIGGER ALL")
+    # `USER`, never `ALL`: `ALL` also targets Postgres's own internal
+    # `RI_ConstraintTrigger_*` FK triggers, and disabling those needs the table
+    # OWNER to be a superuser — true of the CI/dev bootstrap role this migration
+    # was verified under, false of a hardened production role, which gets
+    # `ERROR: permission denied: "RI_ConstraintTrigger_…" is a system trigger`
+    # and aborts the downgrade with the append-only trigger still armed. `USER`
+    # disables exactly `permit_status_history_append_only`, the one trigger this
+    # statement needs stood down (whole-branch review, verified against a
+    # non-superuser owner).
+    op.execute("ALTER TABLE permit_status_history DISABLE TRIGGER USER")
     op.execute(
         sa.text(
             "UPDATE permit_status_history SET reason_item_id = NULL"
@@ -295,7 +304,7 @@ def downgrade() -> None:
             ")"
         ).bindparams(id=CLASSIFIER_ID)
     )
-    op.execute("ALTER TABLE permit_status_history ENABLE TRIGGER ALL")
+    op.execute("ALTER TABLE permit_status_history ENABLE TRIGGER USER")
 
     # Items before the classifier, or the FK from classifier_items blocks it
     # (0005's downgrade shape).

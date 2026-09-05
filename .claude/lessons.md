@@ -80,9 +80,9 @@ Tooling and environment.
 - **How to apply:** Widening a constraint → data-cleanup statement in the downgrade. Seeding
   a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the template
   delete. Seeding a row an APPEND-ONLY table's column will FK to → wrap the nulling `UPDATE`:
-  `DISABLE TRIGGER ALL` → `UPDATE ... SET col = NULL` → `ENABLE TRIGGER ALL` → the `DELETE`
-  (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red in a task
-  that changed no migration, look for the event that task started emitting.
+  `DISABLE`/`ENABLE TRIGGER USER` (never `ALL`, superuser-only) around `UPDATE ... SET col = NULL`,
+  then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red
+  in a task that changed no migration, look for the event it started emitting.
 
 ## Multiple Alembic heads: resolve with an empty merge migration
 
