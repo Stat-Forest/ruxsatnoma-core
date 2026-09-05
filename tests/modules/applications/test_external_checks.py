@@ -16,9 +16,53 @@ confirms it through `POST .../checks/{id}/confirm` — the same rule stage
 here the same way: `hodim_client` and `second_hodim_client` hold the
 IDENTICAL permission (`applications.review`) and differ only in `users.id`,
 so a passing/failing pair can only be about identity, never permission.
+
+**Fix round 1 (2026-09-05 controller ruling)**: a mock verdict is written
+`source="external_api"` exactly like a genuine one — indistinguishable on the
+wire but for a buried `details.note` — so `get_adapter()` must refuse to
+ANSWER a check with a mock verdict once `app_env=prod`, not only once
+`VET_MODE`/`CADASTRE_MODE="real"`. Prod may still START in mock (nothing on
+`docs/plan.md` stage 5 schedules either as real); it may not answer from a
+fixture. `_prod_settings()` below builds a fully valid `app_env=prod`
+`Settings` the same way `tests/test_config.py::
+test_prod_accepts_custom_secret_key` does, and every test using it patches
+ONLY `vet.get_settings`/`cadastre.get_settings` — never the app-wide
+`app.config.get_settings` a whole HTTP request also depends on for cookies,
+CORS and every other adapter — so an already-issued session cookie stays
+valid across the call.
 """
 
 import pytest
+
+
+def _prod_settings():
+    """A fully valid `app_env=prod` `Settings` — `vet_mode`/`cadastre_mode`
+    left at their default `mock` (neither is in the prod mocked-adapter
+    list), everything else exactly as `test_config.py::
+    test_prod_accepts_custom_secret_key` fills it, so constructing it raises
+    nothing of its own."""
+    from app.config import Settings
+
+    return Settings(
+        app_env="prod",
+        secret_key="a-real-secret-value",
+        s3_secret_key="a-real-s3-secret-value",
+        oneid_mode="real",
+        eimzo_mode="real",
+        sms_mode="real",
+        email_mode="real",
+        payme_mode="real",
+        eskiz_email="bot@example.uz",
+        eskiz_password="a-real-eskiz-password",
+        eskiz_sender="4546",
+        eskiz_callback_secret="a-real-callback-secret",
+        public_base_url="https://ruxsatnoma.example.uz",
+        smtp_host="smtp.example.uz",
+        smtp_from="noreply@example.uz",
+        payme_merchant_id="a-real-merchant-id",
+        payme_cashbox_key="a-real-cashbox-key",
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+    )
 
 
 async def test_the_mock_veterinary_check_records_its_verdict(
@@ -67,6 +111,82 @@ async def test_the_real_cadastre_adapter_also_refuses_until_a_contract_exists(
             cadastre.get_adapter()
     finally:
         get_settings.cache_clear()
+
+
+async def test_a_mock_vet_adapter_is_refused_under_app_env_prod(monkeypatch) -> None:
+    """The controller's finding: with `vet_mode` outside the prod mocked-list,
+    a prod instance starts happily at `VET_MODE=mock` (its default) and
+    `MockVetAdapter.check()` would answer `result="pass"` exactly as a real
+    registry might — nothing on the wire tells them apart. `get_adapter()`
+    itself must refuse before that verdict is ever produced."""
+    from app.modules.integrations.adapters import vet
+
+    monkeypatch.setattr(vet, "get_settings", _prod_settings)
+    with pytest.raises(NotImplementedError, match="app_env=prod"):
+        vet.get_adapter()
+
+
+async def test_a_mock_cadastre_adapter_is_refused_under_app_env_prod(monkeypatch) -> None:
+    """`cadastre.py`'s own copy of the same refusal — a separate module and a
+    separate `*_mode` setting, so proven separately (`vet.py`'s own
+    `test_the_real_cadastre_adapter_also_refuses_until_a_contract_exists`
+    above is the same pairing for the `real`-mode refusal)."""
+    from app.modules.integrations.adapters import cadastre
+
+    monkeypatch.setattr(cadastre, "get_settings", _prod_settings)
+    with pytest.raises(NotImplementedError, match="app_env=prod"):
+        cadastre.get_adapter()
+
+
+async def test_mock_adapters_are_still_returned_under_dev(monkeypatch) -> None:
+    """The prod refusal above must not weaken dev: `mock` stays the working
+    default everywhere this whole suite already runs (`APP_ENV=dev` in
+    `.env`) — `test_the_mock_veterinary_check_records_its_verdict` proves this
+    at the HTTP level; this is the same fact at the adapter's own boundary,
+    for both modules explicitly."""
+    from app.config import get_settings
+    from app.modules.integrations.adapters import cadastre, vet
+
+    monkeypatch.setenv("APP_ENV", "dev")
+    get_settings.cache_clear()
+    try:
+        assert isinstance(vet.get_adapter(), vet.MockVetAdapter)
+        assert isinstance(cadastre.get_adapter(), cadastre.MockCadastreAdapter)
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_the_paper_fallback_still_works_when_prod_refuses_the_live_adapter(
+    monkeypatch, hodim_client, application_in_review, vet_certificate_file
+) -> None:
+    """Ruling point 3, proven end to end: in `app_env=prod` the LIVE check is
+    refused (an uncaught `NotImplementedError` from `get_adapter()`, so
+    `app.main`'s generic handler answers 500 — never a silent fabricated
+    `pass`), and the paper fallback under maker-checker is what the office
+    uses instead. Only `vet`/`cadastre`'s OWN `get_settings` is patched, never
+    the app-wide one `hodim_client`'s session cookie and every other
+    dependency also read, so nothing else about this request changes."""
+    from app.modules.integrations.adapters import cadastre, vet
+
+    monkeypatch.setattr(vet, "get_settings", _prod_settings)
+    monkeypatch.setattr(cadastre, "get_settings", _prod_settings)
+
+    live = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/checks",
+        json={"check_type": "vet"},
+    )
+    assert live.status_code == 500, live.text
+
+    paper = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/checks",
+        json={
+            "check_type": "vet",
+            "source": "manual_fallback",
+            "result": "pass",
+            "doc_file_id": str(vet_certificate_file.id),
+        },
+    )
+    assert paper.status_code == 201, paper.text
 
 
 async def test_a_paper_fallback_needs_a_document_and_a_second_person(

@@ -8,6 +8,13 @@ a real adapter here would be written against a contract nobody has read
 (`test_the_real_adapter_refuses_until_a_contract_exists`, `vet.py`'s own
 copy). Not to be confused with `gis` (this repository's own contour module,
 already real) — this is the EXTERNAL state cadastre `tz/09` lists separately.
+
+**`get_adapter()` also refuses the MOCK in `app_env=prod`** — `vet.py`'s own
+copy of the same fix-round-1 rule (2026-09-05 controller ruling, the
+2026-08-28 stage 3.2b entry ruling 2). `cadastre_mode` stays out of
+`Settings._forbid_default_secret_in_prod`'s mocked-adapter list so prod may
+still START with no cadastre contract, but it may not ANSWER a check from a
+fixture — see `vet.py`'s docstring for the full reasoning, identical here.
 """
 
 import uuid
@@ -42,9 +49,17 @@ class MockCadastreAdapter:
 
 
 def get_adapter() -> CadastreAdapter:
-    if get_settings().cadastre_mode == "mock":
-        return MockCadastreAdapter()
-    raise NotImplementedError(
-        "the cadastre/GIS source has no verified contract (tz/09 row 5, medium priority) — "
-        "a real adapter is written against one, never guessed"
-    )
+    settings = get_settings()
+    if settings.cadastre_mode == "real":
+        raise NotImplementedError(
+            "the cadastre/GIS source has no verified contract (tz/09 row 5, medium priority) — "
+            "a real adapter is written against one, never guessed"
+        )
+    if settings.app_env == "prod":
+        raise NotImplementedError(
+            "a mock cadastre adapter may not answer a live check in app_env=prod — "
+            "no verified contract exists to make it real, so a production check goes "
+            "through the paper fallback (source=manual_fallback) under maker-checker "
+            "instead of a fixture's fixed verdict"
+        )
+    return MockCadastreAdapter()

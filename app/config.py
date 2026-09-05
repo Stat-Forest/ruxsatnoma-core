@@ -61,11 +61,19 @@ class Settings(BaseSettings):
     payme_merchant_id: str | None = None
     payme_cashbox_key: str | None = None
     # External checks (stage 3.9b, tz/09 rows 5-6): both have "medium priority"
-    # and no verified contract, unlike the four systems above — `real` always
-    # raises `NotImplementedError` (integrations/adapters/vet.py, cadastre.py)
-    # and is deliberately absent from `_forbid_default_secret_in_prod`'s mocked
-    # list: forbidding mock here would make prod unable to start at all, for a
-    # check this stage cannot make real.
+    # and no verified contract, unlike the four systems above, and `docs/plan.md`
+    # stage 5 schedules neither as real — the gap is indefinite, not a countdown.
+    # Deliberately absent from `_forbid_default_secret_in_prod`'s mocked list:
+    # PROD MAY START in mock (blocking startup would block every deploy for an
+    # integration nothing schedules), but it must not be able to ANSWER a check
+    # from a fixture — `integrations/adapters/vet.py`/`cadastre.py`'s own
+    # `get_adapter()` refuses (raises `NotImplementedError`) whenever
+    # `app_env=prod`, mock or not, so a production check can only go through the
+    # paper fallback (`applications.service.add_check`'s `source=
+    # "manual_fallback"`, under maker-checker) — never a fixture's fixed
+    # verdict indistinguishable from a genuine registry answer. Fix round 1,
+    # 2026-09-05 controller ruling; the "prod refuses to start with any mock"
+    # rule itself is the 2026-08-28 stage 3.2b entry, ruling 2 — not decision #40.
     vet_mode: Literal["mock", "real"] = "mock"
     cadastre_mode: Literal["mock", "real"] = "mock"
 
