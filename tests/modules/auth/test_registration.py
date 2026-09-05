@@ -25,7 +25,7 @@ async def oneid_login(client, pinfl: str):
     r = await client.get(
         f"{API}/auth/oneid/callback", params={"code": encode_mock_code(prof), "state": state}
     )
-    assert r.status_code == 200
+    assert r.status_code == 303
     return r
 
 
@@ -60,8 +60,9 @@ async def test_full_registration_flow(db, engine):
     pinfl, phone = unique_pinfl(), unique_phone()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        login = await oneid_login(client, pinfl)
-        assert login.json()["registration_complete"] is False
+        await oneid_login(client, pinfl)
+        me = await client.get(f"{API}/auth/me")
+        assert me.json()["registration_complete"] is False
         token = await verified_phone_token(client, phone, db=db)
         r = await client.post(
             f"{API}/auth/complete-registration",

@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     permit_series: str = "А"
     workers_mode: Literal["embedded", "off"] = "embedded"
     oneid_redirect_uri: str = "http://localhost:8000/api/v1/auth/oneid/callback"
+    # Where the OneID callback sends the browser once the session cookies are
+    # set. It is a REDIRECT TARGET, not an origin to trust: the callback is
+    # reached by a browser returning from an identity provider, and answering
+    # it with a JSON body renders `{"user": ...}` as text on the screen.
+    admin_base_url: str = "http://localhost:5173"
     oneid_scope: str = "mock-scope"
     # Payme JSON-RPC server (stage 3.10a, design/04 §3). "mock" points at
     # Payme's own SANDBOX cashbox key, not a fake — see
