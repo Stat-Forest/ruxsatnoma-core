@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     payme_mode: Literal["mock", "real"] = "mock"
     payme_merchant_id: str | None = None
     payme_cashbox_key: str | None = None
+    # External checks (stage 3.9b, tz/09 rows 5-6): both have "medium priority"
+    # and no verified contract, unlike the four systems above — `real` always
+    # raises `NotImplementedError` (integrations/adapters/vet.py, cadastre.py)
+    # and is deliberately absent from `_forbid_default_secret_in_prod`'s mocked
+    # list: forbidding mock here would make prod unable to start at all, for a
+    # check this stage cannot make real.
+    vet_mode: Literal["mock", "real"] = "mock"
+    cadastre_mode: Literal["mock", "real"] = "mock"
 
     @model_validator(mode="after")
     def _forbid_default_secret_in_prod(self) -> Settings:

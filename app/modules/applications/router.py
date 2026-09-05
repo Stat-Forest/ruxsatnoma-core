@@ -48,6 +48,7 @@ from app.modules.applications.schemas import (
     ApplicationCalculationOut,
     ApplicationCancelIn,
     ApplicationCardOut,
+    ApplicationCheckIn,
     ApplicationCheckOut,
     ApplicationConclusionIn,
     ApplicationConclusionOut,
@@ -786,4 +787,57 @@ async def reject_application(
             actor=actor,
         ),
         forwarded_to_organization=None,
+    )
+
+
+# --- Task 7 (3.9b): external checks — veterinary and cadastre -----------------
+#
+# Both routes carry `applications.review` alone — maker and confirmer are the
+# SAME role (tz/04 С5, the hodim), so unlike a maker/checker split across two
+# different codes there is only one to gate the route on; `service.
+# confirm_check`'s own identity comparison is what tells the two calls apart
+# (lesson: "A maker-checker route needs BOTH roles' permission" — here both
+# roles are the same one).
+
+
+@router.post("/applications/{application_id}/checks", status_code=201)
+async def add_application_check(
+    application_id: uuid.UUID,
+    payload: ApplicationCheckIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationCheckOut:
+    """Either `{check_type}` alone (calls the live vet/cadastre adapter) or
+    the paper fallback (`source="manual_fallback"`, `result`, `doc_file_id`) —
+    `service.add_check` tells them apart. A paper result is written with
+    `confirmed_by=None`; it is not usable until a DIFFERENT reviewer confirms
+    it through `POST .../checks/{id}/confirm` below (Oybek's ruling,
+    2026-09-05: the paper fallback is exactly the case a second pair of eyes
+    exists for).
+
+    404 `ERR-SYS-003` for an id that does not exist or an application outside
+    the caller's zone. 422 `ERR-VAL-001` for the paper shape missing `result`
+    or `doc_file_id`, or naming a `doc_file_id` that is missing or archived.
+    """
+    return ApplicationCheckOut.model_validate(
+        await service.add_check(db, application_id, payload, actor=actor)
+    )
+
+
+@router.post("/applications/{application_id}/checks/{check_id}/confirm")
+async def confirm_application_check(
+    application_id: uuid.UUID,
+    check_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationCheckOut:
+    """The second person a paper result needs. 409 `ERR-APP-004` refuses the
+    MAKER of the same row (`reason="maker_cannot_confirm_own_record"`), a row
+    that is not `source="manual_fallback"`, and one already confirmed.
+
+    404 `ERR-SYS-003` for an id that does not exist, an application outside
+    the caller's zone, or a `check_id` that does not belong to it.
+    """
+    return ApplicationCheckOut.model_validate(
+        await service.confirm_check(db, application_id, check_id, actor=actor)
     )

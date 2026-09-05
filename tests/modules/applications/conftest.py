@@ -248,6 +248,25 @@ async def other_zone_hodim_client(db: AsyncSession, other_leshoz: Organization):
 
 
 @pytest.fixture
+async def second_hodim_client(db: AsyncSession, leshoz: Organization):
+    """A SECOND reviewer in the SAME leshoz as `hodim_client` — task 7's
+    (3.9b) confirming person, whom maker-checker requires to be someone other
+    than whoever recorded the paper result.
+
+    `make_user(role_code="executor_staff", ...)`, never `_client_for`
+    (`hodim_user`'s own template, and the same reason: lesson — a
+    `_client_for` fixture inherits nothing from the real role's own
+    `role_permissions` row, so this fixture would prove nothing about the
+    production role holding `applications.review`). A distinct row from
+    `hodim_user`, so a distinct `users.id`, is the whole point: `service.
+    confirm_check` refuses a confirmer whose id equals the check's own
+    `created_by`."""
+    user = await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+    async for client in _head_client(db, user):
+        yield client
+
+
+@pytest.fixture
 async def gis_specialist_client(db: AsyncSession, leshoz: Organization):
     """Task 5's `kind="gis"` caller — a real `gis_specialist` ROLE user
     (migrations 0010/0011's `ROLE_GRANTS`: `gis.contours.manage`,

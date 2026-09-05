@@ -59,6 +59,18 @@ ApplicationKind = Literal["new", "extension"]
 ConclusionKind = Literal["executor", "gis"]
 ConclusionRecommendation = Literal["approve", "reject"]
 
+# `POST /applications/{id}/checks` (task 7, 3.9b) — deliberate SUBSETS of
+# `models.CHECK_TYPES`/`CHECK_RESULTS`/`CHECK_SOURCES`, not their mirror, so
+# NOT added to `test_the_schema_literals_match_the_tuples_the_checks_are_
+# built_from`: this route only ever writes `check_type in ("vet", "cadastre")`
+# (the auto GIS/norm ones go through `checks.run_all` alone) and never
+# `result="skipped"` (that is `gis`/`norms`' own designed branch for an empty
+# reference layer — an unreachable vet/cadastre registry is the
+# manual-fallback path instead, ApplicationCheckIn's own docstring) or
+# `source="auto"` (reserved for `checks.run_all`).
+ExternalCheckType = Literal["vet", "cadastre"]
+CheckResult = Literal["pass", "fail", "warning"]
+
 # `application_items.head_count` is a plain integer column, so the only ceiling
 # it has is the one written here. Bounded for the same reason every integer
 # query parameter is (`core.schemas.PAGING_MAX`): an unbounded integer reaches
@@ -188,7 +200,13 @@ class ApplicationDocumentOut(BaseModel):
 class ApplicationCheckOut(BaseModel):
     """One check result — evidence, and evidence is a LIST: every run is kept
     and none is superseded (ruling 12), so a card shows the history rather than
-    "the latest per type"."""
+    "the latest per type".
+
+    `created_by`/`confirmed_by`/`confirmed_at` are task 7's maker-checker
+    columns (migration `0025`): every row names who created it, and only a
+    manual paper result that has actually been confirmed carries the other
+    two — `confirmed_by is None` is exactly "not usable yet" on the wire.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -198,6 +216,9 @@ class ApplicationCheckOut(BaseModel):
     details: Any
     source: str
     checked_at: datetime
+    created_by: uuid.UUID
+    confirmed_by: uuid.UUID | None
+    confirmed_at: datetime | None
 
 
 class ApplicationCalculationOut(BaseModel):
@@ -740,6 +761,28 @@ class ApplicationConclusionIn(BaseModel):
     kind: ConclusionKind
     text: Annotated[str, Field(min_length=1)]
     recommendation: ConclusionRecommendation | None = None
+
+
+class ApplicationCheckIn(BaseModel):
+    """`POST /applications/{id}/checks` — task 7 (3.9b), tz/04 С5: the
+    office's veterinary and cadastre checks against outside registries, and
+    the paper fallback for when one cannot be reached.
+
+    Two shapes, told apart by `service.add_check` rather than a
+    Literal-discriminated union: `check_type` alone calls the live adapter
+    (`vet`/`cadastre`); add `source="manual_fallback"` with both `result` and
+    `doc_file_id` to record a paper result instead (422 `ERR-VAL-001` if
+    either is missing). A paper result is maker-checker (ruling 5, Oybek's
+    choice 2026-09-05): it is written with `confirmed_by=None` and is not
+    usable until a DIFFERENT reviewer calls `POST .../checks/{id}/confirm`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    check_type: ExternalCheckType
+    source: Literal["manual_fallback"] | None = None
+    result: CheckResult | None = None
+    doc_file_id: uuid.UUID | None = None
 
 
 class ApplicationDecisionOut(ApplicationOut):

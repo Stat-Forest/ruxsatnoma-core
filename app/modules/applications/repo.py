@@ -209,6 +209,12 @@ async def list_checks(db: AsyncSession, application_id: uuid.UUID) -> list[Appli
     return list(rows.scalars().all())
 
 
+async def get_check(db: AsyncSession, check_id: uuid.UUID) -> ApplicationCheck | None:
+    """`get_application`'s own shape (line ~42), for `confirm_check`'s single
+    row instead of `list_checks`' whole run."""
+    return await db.get(ApplicationCheck, check_id)
+
+
 def _zone_join_target(contour_organization_col: Any) -> Any:
     """The organization an application's zone rule compares against:
     `assigned_org_id` while it has one, the contour's owner before a reviewer

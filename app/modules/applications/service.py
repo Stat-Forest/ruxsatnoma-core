@@ -42,6 +42,7 @@ from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_S
 from app.modules.applications.models import (
     Application,
     ApplicationAssignment,
+    ApplicationCheck,
     ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
@@ -55,6 +56,7 @@ from app.modules.applications.permissions import (
     APPLICATIONS_VIEW_ANY,
 )
 from app.modules.applications.schemas import (
+    ApplicationCheckIn,
     ApplicationCreate,
     ApplicationDocumentIn,
     ApplicationPatch,
@@ -65,6 +67,11 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
+from app.modules.integrations import service as integrations_service
+from app.modules.integrations.adapters import cadastre as cadastre_adapter
+from app.modules.integrations.adapters import vet as vet_adapter
+from app.modules.integrations.adapters.cadastre import CadastreCheckResult
+from app.modules.integrations.adapters.vet import VetCheckResult
 from app.modules.norms import service as norms_service
 from app.modules.norms.models import Calculation
 from app.modules.norms.schemas import CalculationIn
@@ -2869,3 +2876,168 @@ async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
         # 3.9b's, and empty by contract until then — see the docstring.
         "info_requests": [],
     }
+
+
+# --- Task 7 (3.9b): external checks — veterinary and cadastre ---------------
+#
+# tz/04 С5: after start-review, the office checks the application against the
+# veterinary registry and the cadastre. Both routes below carry
+# `applications.review` alone (router.py) — maker and confirmer are the SAME
+# role here, unlike `norms.service.publish_versioned`'s maker/checker split
+# across two different codes, so there is only one to gate on; the identity
+# comparison in `confirm_check` is what tells the two calls apart (lesson: "A
+# maker-checker route needs BOTH roles' permission").
+#
+# `check_type in ("vet", "cadastre")` only — the auto GIS/norm checks
+# (`gis_validity`, `norm_season`, ...) are `checks.run_all`'s alone, written
+# with `source="auto"`, and this route never touches them.
+
+APPLICATION_CHECK_ADD = "application_check.add"
+APPLICATION_CHECK_CONFIRM = "application_check.confirm"
+
+
+async def _external_check(
+    check_type: str, *, application_id: uuid.UUID
+) -> VetCheckResult | CadastreCheckResult:
+    """Dispatches to whichever adapter `ApplicationCheckIn.check_type` named —
+    `vet_adapter`/`cadastre_adapter`'s own `get_adapter()` factory, exactly
+    the shape `oneid.get_oneid_adapter`/`otp_sender.get_otp_sender` already
+    use. A plain `if`/`else` rather than a dict of callables: the schema's
+    `Literal["vet", "cadastre"]` already admits nothing else, and this way
+    every adapter's own result type stays visible to pyright."""
+    if check_type == "vet":
+        return await vet_adapter.get_adapter().check(application_id=application_id)
+    return await cadastre_adapter.get_adapter().check(application_id=application_id)
+
+
+async def _assert_check_doc_active(db: AsyncSession, file_id: uuid.UUID) -> None:
+    """Existence + active only — `gis.service._assert_approval_doc_active`'s
+    own shape (lesson: "An existence check is not a validity check"). The
+    scanned paper result may legitimately be uploaded by office staff other
+    than the one filing this check, so `_own_document_file`'s ownership
+    requirement does not apply here."""
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-VAL-001", details={"reason": "check_doc_not_found"})
+
+
+async def add_check(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    payload: ApplicationCheckIn,
+    *,
+    actor: User,
+) -> ApplicationCheck:
+    """`POST /applications/{id}/checks` — either calls the live vet/cadastre
+    adapter (`source="external_api"`), or records a paper result under
+    maker-checker (`source="manual_fallback"`, Oybek's ruling, 2026-09-05: the
+    paper fallback is exactly the case a second pair of eyes exists for). A
+    manual row is always written `confirmed_by=None`; `confirm_check` below is
+    the only path that ever sets it.
+
+    404 `ERR-SYS-003` for an id that does not exist or an application outside
+    the caller's zone — `_assert_in_actor_zone`, before anything is written,
+    the same two-part rule every staff write in this module applies (permission
+    is the route's, zone is here). 422 `ERR-VAL-001` for the manual shape
+    missing `result` or `doc_file_id`, or naming a `doc_file_id` that is
+    missing or archived.
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_CHECK_ADD)
+
+    if payload.source == "manual_fallback":
+        if payload.result is None or payload.doc_file_id is None:
+            raise err(
+                "ERR-VAL-001",
+                details={"reason": "manual_fallback_requires_result_and_doc_file_id"},
+            )
+        await _assert_check_doc_active(db, payload.doc_file_id)
+        row = ApplicationCheck(
+            application_id=application.id,
+            check_type=payload.check_type,
+            result=payload.result,
+            details={"source": "manual_fallback"},
+            source="manual_fallback",
+            doc_file_id=payload.doc_file_id,
+            created_by=actor.id,
+        )
+    else:
+        verdict = await _external_check(payload.check_type, application_id=application.id)
+        # Decision #46 ruling 9: a synchronous adapter call logs in the
+        # CALLER's transaction (mock-only today), never a separate session.
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system=payload.check_type,
+            endpoint=str(application.id),
+            meta={"result": verdict.result},
+        )
+        row = ApplicationCheck(
+            application_id=application.id,
+            check_type=payload.check_type,
+            result=verdict.result,
+            details=verdict.details,
+            source="external_api",
+            created_by=actor.id,
+        )
+    await repo.add_checks(db, [row])
+    await audit.log(
+        db,
+        action=APPLICATION_CHECK_ADD,
+        user_id=actor.id,
+        object_type="application_check",
+        object_id=row.id,
+        new_value={
+            "application_id": str(application.id),
+            "check_type": row.check_type,
+            "source": row.source,
+            "result": row.result,
+        },
+    )
+    return row
+
+
+async def confirm_check(
+    db: AsyncSession, application_id: uuid.UUID, check_id: uuid.UUID, *, actor: User
+) -> ApplicationCheck:
+    """`POST /applications/{id}/checks/{check_id}/confirm` — the SECOND
+    person a paper result needs before it is usable. Stage 3.7's tariff
+    maker-checker is the identical rule (`norms.service.publish_versioned`):
+    the maker of THIS row may not also be its confirmer.
+
+    404 `ERR-SYS-003` for an id that does not exist, an application outside
+    the caller's zone, or a `check_id` that does not belong to this
+    application. 409 `ERR-APP-004` for a row that is not
+    `source="manual_fallback"` (`reason="not_manual_fallback"` — there is
+    nothing to confirm on an automatic or external-api check), one already
+    confirmed (`reason="already_confirmed"`), or a confirmer who is also its
+    own maker (`reason="maker_cannot_confirm_own_record"`).
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_CHECK_CONFIRM)
+
+    check = await repo.get_check(db, check_id)
+    if check is None or check.application_id != application.id:
+        raise err("ERR-SYS-003", details={"check": str(check_id)})
+    if check.source != "manual_fallback":
+        raise err("ERR-APP-004", details={"reason": "not_manual_fallback"})
+    if check.confirmed_by is not None:
+        raise err("ERR-APP-004", details={"reason": "already_confirmed"})
+    if check.created_by == actor.id:
+        raise err("ERR-APP-004", details={"reason": "maker_cannot_confirm_own_record"})
+
+    check.confirmed_by = actor.id
+    check.confirmed_at = datetime.now(UTC)
+    await audit.log(
+        db,
+        action=APPLICATION_CHECK_CONFIRM,
+        user_id=actor.id,
+        object_type="application_check",
+        object_id=check.id,
+        new_value={"confirmed_by": str(actor.id)},
+    )
+    return check
