@@ -15,9 +15,10 @@ and never touch geometry.
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
@@ -28,8 +29,14 @@ from app.modules.gis.models import Contour, GisLayer
 from app.modules.notifications.models import Notification
 from app.modules.permits import events, repo
 from app.modules.permits.models import Permit, PermitStatusHistory
+from tests.modules.auth.test_sessions import make_user
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
-from tests.modules.permits.conftest import Signer, make_permit_on_contour, sign_decision
+from tests.modules.permits.conftest import (
+    Signer,
+    make_permit_on_contour,
+    notification_rows,
+    sign_decision,
+)
 
 
 @pytest.fixture
@@ -555,6 +562,81 @@ async def test_one_bad_row_does_not_cost_its_batch(
     assert doomed.status == "active", "the bad row rolled back alone"
     assert [p.status for p in permits if p.id != doomed.id] == ["expired", "expired"]
     assert await _expired_history_count(db, doomed) == 0
+
+
+async def test_a_failing_notification_does_not_poison_the_stalled_watchs_batch(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+    sentinel_permit: Permit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix round 1's SAVEPOINT on `watch_stalled_permits`, proven the way
+    `test_one_bad_row_does_not_cost_its_batch` proves it for `expire_permits`.
+    `notify()` does an unflushed `db.add()` before any statement runs, so a
+    raise inside it — the reviewer's own example, a later statement failing
+    after that `add()` — must cost only its own row. Without the SAVEPOINT the
+    whole Postgres transaction aborts, and the NEXT row's own
+    `already_notified` SELECT then raises `InFailedSQLTransactionError` too,
+    cascading through the rest of the batch and killing the whole cron run
+    instead of costing one row."""
+    from app.modules.notifications import service as notifications
+    from app.modules.permits import jobs
+
+    permits: list[Permit] = []
+    for _ in range(2):
+        permit = await _permit(
+            db,
+            contour=contour,
+            version_id=version_id,
+            org=leshoz,
+            activity_type_id=grazing_activity_id,
+            status="pending_signatures",
+            period_to=business_today() - timedelta(days=1),
+        )
+        application = await db.get(Application, permit.application_id)
+        assert application is not None
+        executor = await make_user(db, role_code="executor_staff", organization_id=leshoz.id)
+        application.assigned_user_id = executor.id
+        permits.append(permit)
+    await db.flush()
+
+    ordered = sorted(permits, key=lambda p: p.id)
+    assert sentinel_permit.id < ordered[0].id, "uuid7 ids must be time-ordered for the cursor"
+    # The FIRST row `stalled_permits` returns (ascending by id) — the ordering
+    # the reviewer's failure mode needs: a raise HERE must not stop the SECOND
+    # row's own `already_notified` read from ever running.
+    doomed_id = ordered[0].id
+    healthy_id = ordered[1].id
+    real_notify = notifications.notify
+
+    async def flaky(session: AsyncSession, **kwargs: Any) -> list[Notification]:
+        if kwargs.get("object_id") == doomed_id:
+            # A REAL failing statement, not a plain Python raise: a bare
+            # `raise RuntimeError(...)` here never touches Postgres, so
+            # without a SAVEPOINT there would be nothing to roll back and
+            # this test would pass whether or not the fix exists — exactly
+            # the "assertion that would pass either way" to avoid. Division
+            # by zero is a genuine `DataError` from Postgres itself, which
+            # aborts the surrounding transaction the same way the reviewer's
+            # own example (an outbox insert failing) would.
+            await session.execute(text("SELECT 1/0"))
+        return await real_notify(session, **kwargs)
+
+    monkeypatch.setattr(notifications, "notify", flaky)
+
+    batch = await jobs.watch_stalled_permits(db, after_id=sentinel_permit.id)
+    assert (batch.scanned, batch.processed, batch.failed) == (2, 1, 1)
+
+    healthy_rows = await notification_rows(db, object_id=healthy_id)
+    assert any(r.event_code == events.PERMIT_UNSIGNED_STALLED for r in healthy_rows), (
+        "the row AFTER the doomed one must still be notified — proof the batch's"
+        " transaction was not left poisoned by the row before it"
+    )
+    doomed_rows = await notification_rows(db, object_id=doomed_id)
+    assert not [r for r in doomed_rows if r.event_code == events.PERMIT_UNSIGNED_STALLED]
 
 
 async def test_the_closure_is_audited_as_a_job(db: AsyncSession, expired_permit: Permit) -> None:

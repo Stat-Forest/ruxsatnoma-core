@@ -227,43 +227,52 @@ async def watch_stalled_permits(
     today = business_today()
     rows = await repo.stalled_permits(db, today, limit=limit, after_id=after_id)
     correlation = f"job:{uuid.uuid4()}"
+    # Read every id BEFORE any SAVEPOINT opens — see `expire_permits` for why
+    # an id read after a rollback is a `MissingGreenlet`, not a value.
+    ids = [permit.id for permit in rows]
     processed = failed = 0
-    last_id: uuid.UUID | None = None
-    for permit in rows:
-        last_id = permit.id
+    for permit, permit_id in zip(rows, ids, strict=True):
+        if await notifications.already_notified(
+            db, event_code=events.PERMIT_UNSIGNED_STALLED, object_id=permit_id
+        ):
+            continue
+        application = await applications_service.get(db, permit.application_id)
+        if application is None or application.assigned_user_id is None:
+            logger.info("job.watch_stalled_permits.unassigned", permit_id=str(permit_id))
+            continue
         try:
-            if await notifications.already_notified(
-                db, event_code=events.PERMIT_UNSIGNED_STALLED, object_id=permit.id
-            ):
-                continue
-            application = await applications_service.get(db, permit.application_id)
-            if application is None or application.assigned_user_id is None:
-                logger.info(
-                    "job.watch_stalled_permits.unassigned",
-                    permit_id=str(permit.id),
+            # A SAVEPOINT, like every write in this file's other sweeps
+            # (module docstring): `notify()` does an unflushed `db.add()`
+            # before any statement runs, so a later failure inside it (an
+            # outbox insert for a non-`inapp` channel, say) would otherwise
+            # abort the WHOLE transaction — and the next row's own
+            # `already_notified` SELECT would then raise
+            # `InFailedSQLTransactionError` too, cascading through the rest
+            # of the batch instead of costing only this row.
+            async with db.begin_nested():
+                await notifications.notify(
+                    db,
+                    event_code=events.PERMIT_UNSIGNED_STALLED,
+                    recipient_user_id=application.assigned_user_id,
+                    params={"permit_number": service._permit_number(permit.series, permit.number)},
+                    object_type=service.OBJECT_TYPE,
+                    object_id=permit_id,
+                    correlation_id=correlation,
                 )
-                continue
-            await notifications.notify(
-                db,
-                event_code=events.PERMIT_UNSIGNED_STALLED,
-                recipient_user_id=application.assigned_user_id,
-                params={"permit_number": service._permit_number(permit.series, permit.number)},
-                object_type=service.OBJECT_TYPE,
-                object_id=permit.id,
-                correlation_id=correlation,
-            )
         except Exception as exc:
             # `repr`, never f"{exc}" — see `expire_permits` for why.
             failed += 1
             logger.error(
                 "job.watch_stalled_permits.row_failed",
-                permit_id=str(permit.id),
+                permit_id=str(permit_id),
                 error=repr(exc),
                 exc_info=True,
             )
         else:
             processed += 1
-    return SweepBatch(scanned=len(rows), processed=processed, failed=failed, last_id=last_id)
+    return SweepBatch(
+        scanned=len(rows), processed=processed, failed=failed, last_id=ids[-1] if ids else None
+    )
 
 
 async def close_finished(
