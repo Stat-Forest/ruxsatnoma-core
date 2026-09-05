@@ -28,14 +28,18 @@ Plan `03.11b-permits-lifecycle`, rulings 5, 18 and 19. Four things and no more:
    'active'`, mirrored in `ForestTicket.__table_args__` in the same commit
    so `test_autogenerate_diff_empty` sees no drift.
 
-`down_revision = "0022"`: `dev` forked at `0016` and rejoined at
-`merge_0018_0020`, and this stage's own migration `0024` (3.9a-flow) already
-took the next number off that merge point — `0023` is reserved for this
-stage alone (`plans/03.9-3.11-parallel-run.md`), confirmed free by
-`git fetch` before this file was created.
+`down_revision = "0025"`: `dev` forked at `0016` into `0017`/`0018` (3.10a) and
+`0019`/`0020` (3.11a), rejoined by the empty `merge_0018_0020`; `0024`
+(3.9a-flow) took the next number off that merge point, and `0022`
+(3.10b) followed it. `0023` was reserved for this stage alone
+(`plans/03.9-3.11-parallel-run.md`), confirmed free by `git fetch` before
+this file was created, and originally chained directly off `0022` — the
+same parent stage 3.9b's own `0025` chose. 3.9b merged into `dev` first
+(PR #42), so this file was re-pointed from `0022` to `0025` to keep a
+single head: the chain now runs `0022` -> `0025` -> `0023`.
 
 Revision ID: 0023
-Revises: 0022
+Revises: 0025
 Create Date: 2026-09-05 09:00:00.000000
 """
 
@@ -49,7 +53,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "0023"
-down_revision: str | Sequence[str] | None = "0022"
+down_revision: str | Sequence[str] | None = "0025"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
