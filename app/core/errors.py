@@ -63,6 +63,11 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-SYS-005": (409, "Конфликт Idempotency-Key"),
     "ERR-SYS-006": (429, "Слишком много запросов"),
     "ERR-VAL-001": (422, "Ошибка валидации входных данных"),
+    # 4.6 `public`: a citizen appeal cannot make the requested status transition.
+    "ERR-PUB-001": (409, "Недопустимый переход статуса обращения"),
+    # 4.8 `help`: a support ticket cannot make the requested transition, or
+    # cannot accept a new message, in its current status (closed).
+    "ERR-HELP-001": (409, "Недопустимое действие для текущего статуса обращения в поддержку"),
 }
 
 

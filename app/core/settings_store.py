@@ -211,6 +211,35 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             20,
             "Working days from a refund request to its control deadline (tz/08; RI-07 past it)",
         ),
+        # 4.6 `public`: three more anonymous surfaces, same reasoning as the QR
+        # check and the norms estimate above — one bucket per abuse shape. The
+        # submit path is the tightest (it writes a row); the status check next
+        # (still walkable by number, R3); open data is a cheap, cacheable read.
+        SettingSpec(
+            "ratelimit_public_appeal_submit_per_minute",
+            int,
+            5,
+            "Per-IP limit for the anonymous POST /public/appeals",
+        ),
+        SettingSpec(
+            "ratelimit_public_appeal_status_per_minute",
+            int,
+            20,
+            "Per-IP limit for the anonymous GET /public/appeals/check",
+        ),
+        SettingSpec(
+            "ratelimit_public_open_data_per_minute",
+            int,
+            60,
+            "Per-IP limit for the anonymous open-data reads (layers, features, stats)",
+        ),
+        # 4.8 `help`: the one anonymous route this module has.
+        SettingSpec(
+            "ratelimit_public_help_faq_per_minute",
+            int,
+            60,
+            "Per-IP limit for the anonymous GET /help/faq",
+        ),
     )
 }
 
