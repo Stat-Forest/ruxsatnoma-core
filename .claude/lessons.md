@@ -63,20 +63,26 @@ Tooling and environment.
 - **How to apply:** New model file → registry import → `alembic revision --autogenerate`
   → the diff must be non-empty and must contain your tables.
 
-## A downgrade must delete whatever its upgrade made possible
+## A downgrade must delete whatever its upgrade made possible — and an append-only referrer blocks even the nulling UPDATE
 
 - **Rule:** A migration that widens a CHECK, or seeds a row other tables will reference,
-  owes its `downgrade()` the matching `DELETE` — written when the migration is written,
-  not when someone finally hits it.
-- **Why:** Two shapes, both already red in CI: `0006` widened `otp_codes.purpose` and
-  restored the narrow CHECK against rows that already violated it; `0010` seeded the
-  `gis.import.finished` template and deleted only the template, so
-  `fk_notifications_template_id_notification_templates` broke the round-trip the moment
-  task 7 actually sent the event — in a task that touched no migration.
-- **How to apply:** Widening a constraint → data-cleanup statement in the downgrade.
-  Seeding a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the
-  template delete. When the round-trip goes red in a task that changed no migration, look
-  for the event that task started emitting.
+  owes its `downgrade()` the matching `DELETE` — written when the migration is written, not
+  when someone finally hits it. If the table holding the FK is append-only, its own trigger
+  blocks even the `UPDATE ... SET col = NULL` a plain FK-clearing `DELETE` would need first.
+- **Why:** Three shapes, one class. `0006` widened `otp_codes.purpose` and restored the
+  narrow CHECK against rows that already violated it; `0010` seeded `gis.import.finished`
+  and deleted only the template, breaking the round-trip via
+  `fk_notifications_template_id_notification_templates` the moment task 7 sent the event —
+  in a task that touched no migration. `0023` (3.11b) seeds `permit_status_reasons`, which
+  `permit_status_history.reason_item_id` FKs to: a bare `DELETE` on the classifier hits that
+  FK, and nulling it first with a bare `UPDATE` hits the table's OWN append-only trigger —
+  invisible against an EMPTY database, real once one real decision has been signed.
+- **How to apply:** Widening a constraint → data-cleanup statement in the downgrade. Seeding
+  a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the template
+  delete. Seeding a row an APPEND-ONLY table's column will FK to → wrap the nulling `UPDATE`:
+  `DISABLE TRIGGER ALL` → `UPDATE ... SET col = NULL` → `ENABLE TRIGGER ALL` → the `DELETE`
+  (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red in a task
+  that changed no migration, look for the event that task started emitting.
 
 ## Multiple Alembic heads: resolve with an empty merge migration
 
@@ -107,26 +113,20 @@ Tooling and environment.
 - **How to apply:** If `alembic check` is suddenly dirty on a machine that just recreated
   its volumes, check for those schemas before suspecting the models.
 
-## `sa.literal(value, JSONB)` inside `.bindparams()` binds the wrong object
+## A raw `sa.text()` bind touching a Postgres cast has two separate traps
 
-- **Rule:** For a JSONB literal in a raw migration `sa.text(...)`, pre-serialize with
-  `json.dumps` and bind it as text with an explicit `CAST(:x AS jsonb)` — never pass
-  `sa.literal(value, postgresql.JSONB)` as the keyword value.
-- **Why:** `.bindparams(key=sa.literal(v, type_))` binds the `BindParameter` construct
-  itself, not `v`; asyncpg then raises `DataError: ... object has no attribute 'encode'`
-  (migration 0010, caught RED/GREEN, never reached a database).
-- **How to apply:** Prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and a
-  plain dict (0009's pattern, unaffected); otherwise `json.dumps` + `CAST`.
-
-## A bind param immediately followed by `::` loses its last letter in `sa.text()`
-
-- **Rule:** Never write `:name::cast_type` inside `sa.text(...)` — write
-  `CAST(:name AS cast_type)`.
-- **Why:** `TextClause`'s regex is `(?<![:\w\x5c]):(\w+)(?!:)`; the trailing lookahead makes
-  `\w+` backtrack one character, registering the param as `valu` instead of `value`, so
+- **Rule:** Inside a migration's `sa.text(...)`, always write `CAST(:name AS type)` — never
+  `:name::type`, and never `.bindparams(name=sa.literal(v, sometype))` for the value itself.
+- **Why:** Two failures, one boundary, both caught RED/GREEN. `:name::type` — `TextClause`'s
+  regex backtracks its trailing lookahead, registering the param as `valu` not `value`, so
   `.bindparams(value=...)` raises `ArgumentError: ... doesn't define a bound parameter named
-  'value'` (migration 0012, 3.7 t2; caught RED/GREEN).
+  'value'` (migration 0012, 3.7 t2). `sa.literal(v, postgresql.JSONB)` as a bind VALUE binds
+  the `BindParameter` construct itself, not `v` — asyncpg then raises `DataError: ... object
+  has no attribute 'encode'` (migration 0010).
 - **How to apply:** Grep any new raw-SQL migration or test for `:\w+::` before running it.
+  For a JSONB literal, prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and
+  a plain dict (0009's pattern, unaffected by either trap); otherwise pre-serialize with
+  `json.dumps` and bind as text under `CAST(:x AS jsonb)`.
 
 ## A bare `alembic` CLI command targets the shared dev DB, not your worktree's test DB
 
