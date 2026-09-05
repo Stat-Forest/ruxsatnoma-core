@@ -58,8 +58,8 @@ async def test_list_shows_defaults(db):
     assert r.status_code == 200
     rows = {row["key"]: row for row in r.json()}
     assert set(rows) == set(settings_store.SETTING_SPECS)
-    assert rows["session_idle_minutes"]["value"] == 30
-    assert rows["session_idle_minutes"]["default"] == 30
+    assert rows["session_idle_minutes"]["value"] == 300
+    assert rows["session_idle_minutes"]["default"] == 300
     assert rows["session_idle_minutes"]["overridden"] is False
     assert rows["session_idle_minutes"]["description"]
 
@@ -90,7 +90,7 @@ async def test_update_setting_persists_and_invalidates_cache(db):
             .limit(1)
         )
     ).scalar_one()
-    assert entry.old_value == {"value": 30} and entry.new_value == {"value": 45}
+    assert entry.old_value == {"value": 300} and entry.new_value == {"value": 45}
 
 
 async def test_update_rejects_bad_value(db):
