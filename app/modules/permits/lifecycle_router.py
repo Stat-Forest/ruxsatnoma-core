@@ -26,6 +26,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.modules.applications.permissions import APPLICATIONS_CREATE
+from app.modules.applications.schemas import ApplicationOut
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
 from app.modules.permits import service
@@ -209,3 +211,38 @@ async def list_forest_tickets(
     """
     rows = await service.list_forest_tickets(db, permit_id, actor=actor)
     return [ForestTicketOut.model_validate(row) for row in rows]
+
+
+# --- Task 8: extend a permit into a new application draft --------------------
+#
+# `applications.create` — the HOLDER's own gate (migration 0015), the same
+# permission `POST /applications` itself carries — never `permits.manage` or
+# `permits.issue`: extending is the citizen's act, not a staff one, and the
+# service's own `_is_holder` check (run first, `service.extend`'s docstring)
+# is what actually decides whose permit this is. A hodim holding neither
+# permits permission still cannot reach this route by holding
+# `applications.create` alone, because `applications.create` names no
+# permit at all.
+
+
+@router.post("/permits/{permit_id}/extend", status_code=201)
+async def extend_permit(
+    permit_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationOut:
+    """С13: file a new DRAFT `kind='extension'` application against a permit
+    still in force — never an edit of the issued document itself
+    (`service.extend`'s own docstring: nothing about an issued permit is
+    mutable).
+
+    404 `ERR-SYS-003` for an id that does not exist or that this caller is
+    not the holder of — the same answer either gets, so the route is not a
+    permit-existence oracle. 409 `ERR-PERM-001` `not_extendable` when the
+    permit is not `active` or its period has already ended (applied for
+    afresh instead, never extended). 409 `ERR-APP-002`
+    `extension_already_open` with the existing draft's id when one is
+    already open against this permit.
+    """
+    application = await service.extend(db, permit_id, actor=actor)
+    return ApplicationOut.model_validate(application)

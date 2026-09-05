@@ -44,6 +44,7 @@ from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
+from app.modules.applications.schemas import ApplicationCreate
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -2151,6 +2152,107 @@ async def list_forest_tickets(
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
     await _assert_organization_in_zone(db, actor, permit.organization_id)
     return await repo.forest_tickets(db, permit.id)
+
+
+# --- Task 8: extend a permit into a new application draft --------------------
+#
+# The route lives here, in `permits`, rather than under `applications`
+# (design/03 had it there): `applications` is level 3 and may not ask "does a
+# valid permit exist" (3.11a ruling 12), which is exactly the question
+# extending one is built on. `extend` itself never moves `permits.status` —
+# `service.set_status` stays the only writer of that column — it only opens a
+# new `applications` row, through `applications.service.create_draft`.
+
+PERMIT_EXTEND = "permit.extend"
+
+
+async def extend(db: AsyncSession, permit_id: uuid.UUID, *, actor: User):
+    """`POST /permits/{id}/extend` — a new DRAFT `kind='extension'` against a
+    permit still in force.
+
+    No `-> Application` on this signature, deliberately: the return type IS
+    `applications.models.Application` (inferred from `create_draft`'s own
+    annotation below), but spelling it here would import that model into a
+    level-4 module for a type hint alone — the same import `applications`'s
+    own docstring says a caller here must NEVER make.
+
+    **Whose authority gates this route.** The caller must be the permit's own
+    HOLDER (`_is_holder`, the same predicate the recipient signature line
+    uses) — not a hodim, not a `permits.manage`/`permits.view_any` holder:
+    extending is the citizen's own act, the same way filing the original
+    application was, and neither role checked anywhere else in this module
+    stands in for it. 404 `ERR-SYS-003`, not 403, for anyone else — the same
+    answer `_readable_permit` gives a stranger, so this route is not a
+    permit-existence oracle: a caller who is not the holder learns nothing
+    about whether `permit_id` names a real permit, an active one, or nothing
+    at all. This check runs BEFORE the status/period check below for exactly
+    that reason.
+
+    **Extendable = `active` and not yet past its period.** `permit.status !=
+    ACTIVE_STATUS or permit.period_to < business_today()` refuses an EXPIRED
+    (or suspended, or revoked) permit — applying for one of those is a fresh
+    application, never an extension, or «extension» would be a way around
+    both the duplicate guard `ex_applications_no_duplicate` enforces on a new
+    filing and the season checks a new filing meets.
+
+    **Locked** (`repo.permit_by_id_for_update`), the same as every other
+    write path this stage adds (`decisions.decide`'s step 1,
+    `issue_forest_ticket`): `applications_service.open_extension_of` below is
+    a check-then-write over the `applications` table, and without the lock
+    two concurrent clicks each pass the guard and each insert a draft. The
+    lock is what makes "two clicks, one extension" true under a race, not
+    merely when they happen to run one after another — a later reader must
+    not remove it as redundant. Lock order stays permit → application
+    (Global Constraints); this adds no new order, because the parent
+    application itself is only ever READ here, never locked or written.
+    """
+    permit = await repo.permit_by_id_for_update(db, permit_id)
+    if permit is None or not await _is_holder(db, permit, actor):
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    if permit.status != ACTIVE_STATUS or permit.period_to < business_today():
+        raise err(
+            "ERR-PERM-001",
+            details={"reason": "not_extendable", "status": permit.status},
+        )
+
+    existing = await applications_service.open_extension_of(db, permit.application_id)
+    if existing is not None:
+        raise err(
+            "ERR-APP-002",
+            details={
+                "reason": "extension_already_open",
+                "application_id": str(existing.id),
+            },
+        )
+
+    parent = await applications_service.get(db, permit.application_id)
+    assert parent is not None  # permits.application_id FKs applications
+
+    # `on_behalf` is the ACTOR's own relationship to this applicant, never
+    # copied from the parent's stored value: `_resolve_applicant` has exactly
+    # the same two branches `_is_holder` just admitted the caller through
+    # (the individual's own account, or an effective representation of a
+    # legal-entity applicant), so this asks the identical question. Copying
+    # the parent's `on_behalf` would refuse a representative lawfully
+    # extending a permit the citizen filed in person — and the reverse.
+    own = await auth_service.get_own_applicant(db, actor.id)
+    on_behalf = "self" if own is not None and own.id == permit.applicant_id else "legal"
+    draft = await applications_service.create_draft(
+        db,
+        ApplicationCreate(on_behalf=on_behalf, applicant_id=permit.applicant_id),
+        actor=actor,
+        kind=applications_service.KIND_EXTENSION,
+        parent_application_id=parent.id,
+    )
+    await audit.log(
+        db,
+        action=PERMIT_EXTEND,
+        user_id=actor.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"application_id": str(draft.id)},
+    )
+    return draft
 
 
 # --- the three read routes' service side -------------------------------------
