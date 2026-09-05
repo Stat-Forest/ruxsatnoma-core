@@ -15,7 +15,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
 
 # Spelled out rather than `Literal[*PERMIT_STATUSES]`: pyright rejects a starred
 # variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal` is exactly
@@ -206,6 +206,40 @@ class DecisionIn(BaseModel):
     legal_basis: Annotated[str | None, Field(max_length=2000)] = None
     doc_file_id: uuid.UUID | None = None
     pkcs7: Annotated[str, Field(min_length=1)]
+
+
+class DuplicateIn(BaseModel):
+    """`POST /permits/{id}/duplicates` — the нусха register (plan
+    `03.11b-permits-lifecycle` ruling 9). `reason` is the whole body: a
+    duplicate carries no document and no ERI signature of its own, because it
+    changes nothing about the permit — it points a new register row at the
+    SAME `pdf_file_id` (`service.issue_duplicate`'s own docstring).
+
+    `StringConstraints(strip_whitespace=True, ...)`, not a plain
+    `Field(min_length=1, ...)`: a reason of pure whitespace has a nonzero
+    length and would otherwise pass as if it said something.
+    """
+
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+
+
+class DuplicateOut(BaseModel):
+    """One row of the register — what both `POST` and `GET
+    /permits/{id}/duplicates` answer.
+
+    `file_id` is always the ORIGINAL permit's `pdf_file_id`: a duplicate is a
+    copy of that one document, never a re-render, so every row of one
+    permit's register names the identical file (ruling 9).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    permit_id: uuid.UUID
+    reason: str
+    file_id: uuid.UUID
+    issued_by: uuid.UUID
+    issued_at: datetime
 
 
 # The four words `tz/04` С12 and `design/03` fix for the public page, spelled out

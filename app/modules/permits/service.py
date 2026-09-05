@@ -54,12 +54,13 @@ from app.modules.permits import events, grounds, render, repo, signers
 from app.modules.permits.models import (
     ForestTicket,
     Permit,
+    PermitDuplicate,
     PermitStatusHistory,
     PermitTemplate,
     QrCheckLog,
 )
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
-from app.modules.permits.schemas import DecisionIn
+from app.modules.permits.schemas import DecisionIn, DuplicateIn
 from app.modules.signatures import service as signatures_service
 
 # Audit action codes: "<object>.<verb>" in English, and the constant lives with the
@@ -1905,12 +1906,109 @@ async def revoke(
     return permit
 
 
+# --- Task 5: the duplicate (нусха) register -----------------------------------
+#
+# `permit_duplicates` was created by migration 0023 with no writer (3.11a's own
+# module docstring said so out loud): a lost or damaged paper copy needs a
+# COPY of the document, never a correction of one — `ERR-PERM-002` is what
+# refuses the path this section deliberately does NOT open.
+
+PERMIT_DUPLICATE = "permit.duplicate"
+
+# Spelled out rather than derived as "every status but two" (the brief's own
+# instruction): a seventh `permits.status` value must force whoever adds it to
+# decide whether a нусха of it makes sense, never fall silently into "yes"
+# through a NOT of a growing exclusion list.
+DUPLICABLE_PERMIT_STATUSES: frozenset[str] = frozenset(
+    {"active", "suspended", "expired", "revoked"}
+)
+
+
+async def issue_duplicate(
+    db: AsyncSession, permit_id: uuid.UUID, *, data: DuplicateIn, actor: User
+) -> PermitDuplicate:
+    """Register one нусха: a NEW `permit_duplicates` row pointing at the
+    permit's OWN `pdf_file_id` (ruling 9) — never a render, and never a
+    second file.
+
+    **Nothing here re-renders the document.** `permits.doc_hash` is frozen
+    over the bytes at `pdf_file_id` and all four ERI signatures are taken over
+    exactly those bytes (module docstring); a duplicate that produced a new
+    file would be a document the signatures do not cover — exactly what
+    `ERR-PERM-002` (registered by 3.11a, raised by nothing) exists to refuse.
+    This function never calls `render`, never touches `permits.doc_hash`, and
+    never writes `permits.pdf_file_id` — it only reads the one it already has.
+
+    **A consequence stated here rather than discovered later.** The QR baked
+    into those bytes at issuance was built from `PUBLIC_BASE_URL` (`qr_url`)
+    as it stood on the day of issuance, and a duplicate inherits it UNCHANGED
+    — correct or not. Permit `А № 000001` on the dev server was issued with a
+    QR pointing at the API host instead of the public site, and the only fix
+    was a whole successor permit: the original bytes, and therefore its QR,
+    could not be corrected without breaking `doc_hash` and every signature
+    over it. A нусха of a permit with a wrong QR carries that same wrong QR;
+    the remedy is still a new permit, never a re-render here.
+
+    Refuses `ERR-PERM-001` with `details.reason`:
+
+      * `"not_duplicable"` — `permit.status` is not one of
+        `DUPLICABLE_PERMIT_STATUSES`. `pending_signatures` is refused because a
+        copy of an unsigned document is not a copy of a permit; `archived` is
+        4.7's terminal state, out of scope for a citizen's own paper copy.
+      * `"no_document"` — `pdf_file_id` is null. Defensive, not reachable
+        today: `issue` sets it in the same INSERT that creates the permit row
+        (module docstring), so every real permit already has one by the time
+        it could reach a duplicable status. The column stays nullable in the
+        schema regardless, and this refuses cleanly rather than crashing the
+        day that stops being true.
+
+    Audits `PERMIT_DUPLICATE` and notifies the holder with
+    `events.PERMIT_DUPLICATE_ISSUED`, through the same `_holder_recipient`
+    rule every other permit notification uses.
+    """
+    permit = await repo.permit_by_id(db, permit_id)
+    if permit is None:
+        raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    if permit.status not in DUPLICABLE_PERMIT_STATUSES:
+        raise err("ERR-PERM-001", details={"reason": "not_duplicable"})
+    if permit.pdf_file_id is None:
+        raise err("ERR-PERM-001", details={"reason": "no_document"})
+
+    duplicate = PermitDuplicate(
+        permit_id=permit.id,
+        reason=data.reason,
+        file_id=permit.pdf_file_id,
+        issued_by=actor.id,
+    )
+    await repo.add_duplicate(db, duplicate)
+
+    await notifications.notify(
+        db,
+        event_code=events.PERMIT_DUPLICATE_ISSUED,
+        recipient_user_id=await _holder_recipient(db, permit),
+        params={"permit_number": _permit_number(permit.series, permit.number)},
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+    )
+
+    await audit.log(
+        db,
+        action=PERMIT_DUPLICATE,
+        user_id=actor.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"duplicate_id": str(duplicate.id)},
+    )
+    return duplicate
+
+
 # --- the three read routes' service side -------------------------------------
 #
 # A SUCCESSFUL read is not audited: the audit invariant covers state-changing
 # actions, and a row per GET would let anyone holding a session write the trail
 # at will. A read DENIED on territory is audited (ruling T8-a) — see
-# `_readable_permit`, which is the one place both direct-access routes reach it.
+# `_readable_permit`, which is the one place every direct-access route reaches
+# it — the card, the PDF, and (Task 5) the duplicate register beside them.
 
 
 async def _holds_view_any(db: AsyncSession, actor: User) -> bool:
@@ -2032,9 +2130,10 @@ async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: Use
     `GET /permits` cannot produce a territorial denial at all — nobody named a
     target, so `zone_filter` simply returns fewer rows and there is no attempt to
     record. This function is the whole of the indicator's read-side surface:
-    `GET /permits/{id}` and `GET /permits/{id}/pdf`, both of which come through
-    here. A probe that walks the LIST is invisible to RI-12 by construction and
-    is the rate limiter's problem, not the audit trail's.
+    `GET /permits/{id}`, `GET /permits/{id}/pdf` and (Task 5) `GET
+    /permits/{id}/duplicates`, all three of which come through here. A probe
+    that walks the LIST is invisible to RI-12 by construction and is the rate
+    limiter's problem, not the audit trail's.
 
     The other refusal is NOT audited, deliberately: a caller who holds no
     `permits.view_any` cannot be "outside their zone" — they have no zone claim
@@ -2101,6 +2200,26 @@ async def permit_document(
     """
     permit = await _readable_permit(db, permit_id, actor=actor)
     return permit, await pdf_bytes(db, permit.id)
+
+
+async def list_duplicates(
+    db: AsyncSession, permit_id: uuid.UUID, *, actor: User
+) -> Sequence[PermitDuplicate]:
+    """`GET /permits/{id}/duplicates` — the register, newest first.
+
+    Gated by `_readable_permit`, the same as the other two direct-access read
+    routes — and DELIBERATELY not by `issue_duplicate`'s own two permissions.
+    Since `e7df057`, `_readable_permit` admits THREE sets: the holder, a
+    required official signer of THIS permit in its own organization, and a
+    `permits.view_any` holder in zone. An accountant or a prosecutor who may
+    open the permit is meant to see how many copies of it exist even though
+    neither may add one — the register's audience is strictly wider than the
+    POST's, on purpose. Re-deriving that list here, rather than calling the
+    one function that already answers it, is the exact shape of the defect
+    that commit fixed.
+    """
+    permit = await _readable_permit(db, permit_id, actor=actor)
+    return await repo.duplicates(db, permit.id)
 
 
 async def list_permits(

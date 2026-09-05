@@ -15,7 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
 from app.modules.admin.models import Organization
-from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
+from app.modules.permits.models import (
+    Permit,
+    PermitDuplicate,
+    PermitStatusHistory,
+    PermitTemplate,
+)
 
 
 async def add(db: AsyncSession, obj: Base) -> None:
@@ -222,6 +227,29 @@ async def add_status_history(db: AsyncSession, row: PermitStatusHistory) -> None
     0019's trigger). A correction is a new row, never an UPDATE."""
     db.add(row)
     await db.flush()
+
+
+async def add_duplicate(db: AsyncSession, row: PermitDuplicate) -> None:
+    """One нусха register row (Task 5, ruling 9). Nothing supersedes or
+    updates a row here — a register only ever grows."""
+    db.add(row)
+    await db.flush()
+
+
+async def duplicates(db: AsyncSession, permit_id: uuid.UUID) -> Sequence[PermitDuplicate]:
+    """A permit's whole register, newest first — `(issued_at, id)` both
+    descending, the mirror of `status_history`'s ascending pair and for the
+    same reason: `issued_at` is `server_default=func.now()`, which in
+    PostgreSQL is transaction start time, so two duplicates issued in the
+    same transaction share it to the microsecond and `id` (uuid7, therefore
+    time-ordered) is what keeps the newest-first order stable.
+    """
+    rows = await db.execute(
+        select(PermitDuplicate)
+        .where(PermitDuplicate.permit_id == permit_id)
+        .order_by(PermitDuplicate.issued_at.desc(), PermitDuplicate.id.desc())
+    )
+    return rows.scalars().all()
 
 
 async def occupied_area_by_contour(
