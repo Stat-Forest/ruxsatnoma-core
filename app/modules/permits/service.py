@@ -1949,7 +1949,19 @@ async def issue_duplicate(
     over it. A нусха of a permit with a wrong QR carries that same wrong QR;
     the remedy is still a new permit, never a re-render here.
 
-    Refuses `ERR-PERM-001` with `details.reason`:
+    **Zoned, like every other write path on this permit** (fix round 1 —
+    `issue_duplicate` originally checked neither): `_assert_organization_in_zone`
+    runs FIRST, before either domain check below, the same order `decide()`
+    (`decisions.py` step 3) and `issue` (`_assert_in_zone`) already use. An
+    out-of-zone `permits.issue`/`permits.manage` holder — both roles are
+    organization-scoped (migration 0019) but the route's permission gate
+    cannot see WHICH organization a target permit belongs to — must learn
+    nothing about the permit beyond "not yours": refusing them only after a
+    status/document check would leak whether the permit exists and what state
+    it is in to a caller with no zone claim over it at all.
+
+    Refuses `ERR-ACL-002` (403) when the actor's zone does not cover
+    `permit.organization_id`, and `ERR-PERM-001` with `details.reason`:
 
       * `"not_duplicable"` — `permit.status` is not one of
         `DUPLICABLE_PERMIT_STATUSES`. `pending_signatures` is refused because a
@@ -1969,6 +1981,7 @@ async def issue_duplicate(
     permit = await repo.permit_by_id(db, permit_id)
     if permit is None:
         raise err("ERR-SYS-003", details={"permit": str(permit_id)})
+    await _assert_organization_in_zone(db, actor, permit.organization_id)
     if permit.status not in DUPLICABLE_PERMIT_STATUSES:
         raise err("ERR-PERM-001", details={"reason": "not_duplicable"})
     if permit.pdf_file_id is None:

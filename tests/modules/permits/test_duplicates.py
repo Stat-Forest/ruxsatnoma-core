@@ -87,3 +87,31 @@ async def test_the_holder_sees_their_own_register_and_a_stranger_does_not(
         f"/api/v1/permits/{active_permit.id}/duplicates"
     )
     assert theirs.status_code == 404  # the same answer the card gives, not an oracle
+
+
+async def test_a_hodim_from_another_leshoz_cannot_duplicate(
+    active_permit, other_zone_hodim_client
+) -> None:
+    """Fix round 1 — `issue_duplicate` originally checked no zone at all.
+    `other_zone_hodim_client`: `permits.issue`, held personally by an
+    `executor_staff` zoned to a DIFFERENT leshoz — the mirror of
+    `test_issue.py::test_a_hodim_from_another_leshoz_cannot_issue`. Refused
+    BEFORE the status/document checks (`_assert_organization_in_zone` runs
+    first in `issue_duplicate`), so an out-of-zone caller learns nothing about
+    this permit beyond "not yours"."""
+    refused = await other_zone_hodim_client.post(
+        f"/api/v1/permits/{active_permit.id}/duplicates", json={"reason": "х"}
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"]["code"] == "ERR-ACL-002"
+
+
+async def test_an_in_zone_head_can_duplicate(active_permit, head_client) -> None:
+    """The zone check must refuse the wrong organization without refusing
+    everyone: `head_client` is `executor_head` (holds `permits.manage`
+    through the role, migration 0019), zoned to `leshoz` — the permit's own
+    organization — so this must still succeed."""
+    created = await head_client.client.post(
+        f"/api/v1/permits/{active_permit.id}/duplicates", json={"reason": "х"}
+    )
+    assert created.status_code == 201, created.text
