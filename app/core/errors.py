@@ -54,6 +54,12 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-SIGN-002": (409, "Эта подпись уже проставлена"),
     "ERR-SIGN-003": (422, "Не хватает подписей"),
     "ERR-SIGN-004": (409, "Конфликт состояния сертификата или подписи"),
+    # 4.1 inspections: task/act/case state-conflict (a bad transition, or an
+    # action against a row already past the point it applies to).
+    "ERR-INSP-001": (409, "Недопустимый переход статуса инспекции"),
+    # A checklist answer set that does not satisfy the checklist's own
+    # required questions.
+    "ERR-INSP-002": (422, "Чек-лист заполнен не полностью"),
     "ERR-INT-001": (503, "Внешний сервис не ответил"),
     "ERR-INT-002": (502, "Внешний сервис вернул ошибку"),
     "ERR-SYS-001": (500, "Внутренняя ошибка сервера"),

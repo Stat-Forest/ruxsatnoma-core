@@ -239,6 +239,34 @@ async def version_detail(
     return result.one_or_none()
 
 
+async def distance_to_published_version_m(
+    db: AsyncSession, contour_id: uuid.UUID, *, lon: float, lat: float
+) -> Decimal | None:
+    """Metres from `(lon, lat)` to the contour's PUBLISHED version geometry, or
+    `None` when there is none — the predicate runs entirely inside PostGIS
+    (`ST_Distance` over `::geography`, so the great-circle distance is used
+    rather than a planar approximation), never in Python (module convention:
+    'gis.repo and gis.checks build SQL, PostGIS answers it'), the same
+    `::geography` idiom `insert_version`'s own area computation and
+    `checks._intersections` already use.
+
+    `inspections` (level 5) is the caller (`gis.service.distance_to_contour_m`)
+    — an inspector's GPS fix compared against the plot they are checking.
+    `lon`/`lat` are bound values, never interpolated (this is a `text()` query,
+    same reasoning as `checks._intersections`'s own nosec)."""
+    meters = (
+        await db.execute(
+            text(
+                "SELECT ST_Distance("
+                "geom::geography, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography"
+                ") FROM contour_versions WHERE contour_id = :contour_id AND status = 'published'"
+            ),
+            {"lon": lon, "lat": lat, "contour_id": contour_id},
+        )
+    ).scalar_one_or_none()
+    return None if meters is None else Decimal(str(meters))
+
+
 async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
     """The leshoz a contour is filed under, or None if there is no such contour.
     Identity only — no version, no geometry."""
