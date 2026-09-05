@@ -116,6 +116,22 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # Task 7's own notify-only sweep (ruling 16), five minutes after the ticket
+    # expiry above and last in the nightly permit family: a permit that expired
+    # or was closed earlier tonight is out of `pending_signatures` already (it
+    # never was in it) and so is never ALSO reported as stalled — the two
+    # candidate sets (`active`/`suspended` for expiry, `pending_signatures`
+    # here) are disjoint by construction, but running last keeps the whole
+    # family's order legible as one story: expire, close, ticket-expire, then
+    # report what none of the above could touch.
+    sched.add_job(
+        _wrap(factory, jobs.watch_stalled_permits),
+        CronTrigger(hour=0, minute=45, timezone=TIMEZONE),
+        next_run_time=now,
+        id="watch_stalled_permits",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     # Every 10 seconds: an operator who just uploaded a leshoz should not wait
     # a minute for anything to start happening (plan 03.6a ruling 6). Cheap
     # when idle — one indexed SELECT ... FOR UPDATE SKIP LOCKED against

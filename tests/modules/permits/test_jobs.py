@@ -26,10 +26,10 @@ from app.modules.admin.models import Organization
 from app.modules.applications.models import Application, ApplicationStatusHistory
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.notifications.models import Notification
-from app.modules.permits import events
+from app.modules.permits import events, repo
 from app.modules.permits.models import Permit, PermitStatusHistory
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
-from tests.modules.permits.conftest import make_permit_on_contour
+from tests.modules.permits.conftest import Signer, make_permit_on_contour, sign_decision
 
 
 @pytest.fixture
@@ -225,20 +225,22 @@ async def test_the_expiry_sweep_is_idempotent(
     assert await _expired_history_count(db, active_permit_ending_yesterday) == 1
 
 
-async def test_the_expiry_sweep_leaves_a_permit_awaiting_signatures_alone(
+async def test_the_expiry_sweep_leaves_a_permit_awaiting_signatures_or_already_revoked_alone(
     db: AsyncSession,
     contour: Contour,
     version_id: uuid.UUID,
     leshoz: Organization,
     grazing_activity_id: uuid.UUID,
 ) -> None:
-    """Only `active` expires. A permit nobody finished signing never came into
-    force, so «муддати тугаган» would be a false statement about it on the public
-    check page — and `suspended`/`revoked` belong to 3.11b, which owns what
-    happens to a suspended permit whose period runs out."""
+    """`active` and `suspended` expire (Task 7, ruling 8); `pending_signatures`
+    and `revoked` do not. A permit nobody finished signing never came into
+    force, so «муддати тугаган» would be a false statement about it on the
+    public check page (`tz/12` #16 is the open question for that status, and
+    `watch_stalled_permits` is this stage's answer short of a status change);
+    `revoked` is already terminal but for 4.7's `archived`."""
     from app.modules.permits import jobs
 
-    for status in ("pending_signatures", "suspended", "revoked"):
+    for status in ("pending_signatures", "revoked"):
         permit = await _permit(
             db,
             contour=contour,
@@ -251,6 +253,37 @@ async def test_the_expiry_sweep_leaves_a_permit_awaiting_signatures_alone(
         await jobs.expire_permits(db)
         await db.refresh(permit)
         assert permit.status == status
+
+
+async def test_a_suspended_permit_expires_when_its_period_ends(
+    db: AsyncSession,
+    active_permit: Permit,
+    head_client: Signer,
+    suspend_reason_id: uuid.UUID,
+    order_file_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling 8 — the gap 3.11a's sweep docstring handed to this stage by name.
+    `suspended` now joins `active` in the candidate set: `PERMIT_TRANSITIONS`
+    has always allowed `suspended -> expired`, and without this a permit
+    suspended mid-season with a period ending later would stay `suspended`
+    forever, its application never reaching `close_finished` either."""
+    from app.modules.permits import jobs
+
+    await sign_decision(
+        head_client,
+        active_permit.id,
+        "suspend",
+        reason_item_id=suspend_reason_id,
+        doc_file_id=order_file_id,
+    )
+    monkeypatch.setattr(jobs, "business_today", lambda: active_permit.period_to + timedelta(days=1))
+    await jobs.expire_permits(db)
+    await db.refresh(active_permit)
+    assert active_permit.status == "expired"
+
+    rows = await repo.status_history(db, active_permit.id)
+    assert (rows[-1].from_status, rows[-1].to_status) == ("suspended", "expired")
 
 
 async def test_a_finished_permit_closes_its_application(

@@ -316,9 +316,14 @@ async def committed_sb_load(
 
 
 async def permits_ending_before(
-    db: AsyncSession, day: date, *, status: str, limit: int, after_id: uuid.UUID | None = None
+    db: AsyncSession,
+    day: date,
+    *,
+    statuses: Sequence[str],
+    limit: int,
+    after_id: uuid.UUID | None = None,
 ) -> list[Permit]:
-    """One BATCH of permits in `status` whose period has run out before `day`,
+    """One BATCH of permits in `statuses` whose period has run out before `day`,
     locked, in id order after `after_id`.
 
     `period_to < day` and never `<=`: `permits.period_to` is INCLUSIVE, so a
@@ -344,8 +349,17 @@ async def permits_ending_before(
     Permits, then applications: `service.add_signature` locks in that order and
     it is the only lock ordering anywhere in `app/` — a sweep that took an
     application lock first would close the cycle.
+
+    `suspended` joins `active` in the candidate set (Task 7, ruling 8):
+    `PERMIT_TRANSITIONS` has always allowed `suspended -> expired`, and without
+    it a permit suspended in June with a period ending in September would stay
+    `suspended` forever — its application never reaching `close_finished`
+    either.
     """
-    conditions: list[ColumnElement[bool]] = [Permit.status == status, Permit.period_to < day]
+    conditions: list[ColumnElement[bool]] = [
+        Permit.status.in_(statuses),
+        Permit.period_to < day,
+    ]
     if after_id is not None:
         conditions.append(Permit.id > after_id)
     rows = await db.execute(
@@ -378,6 +392,30 @@ async def permits_in_statuses(
     whole districts at a time.
     """
     conditions: list[ColumnElement[bool]] = [Permit.status.in_(statuses)]
+    if after_id is not None:
+        conditions.append(Permit.id > after_id)
+    rows = await db.execute(select(Permit).where(*conditions).order_by(Permit.id).limit(limit))
+    return list(rows.scalars().all())
+
+
+async def stalled_permits(
+    db: AsyncSession, day: date, *, limit: int, after_id: uuid.UUID | None = None
+) -> list[Permit]:
+    """One BATCH of `pending_signatures` permits whose period ended before `day`
+    (Task 7, ruling 16), in id order after `after_id` — `permits_ending_before`'s
+    idiom for the keyset cursor, without that function's reason for `FOR UPDATE`.
+
+    No lock: unlike the expiry sweep, `jobs.watch_stalled_permits` never moves
+    the permit it reads — it only notifies, and the once-only guard is
+    `notifications.already_notified`, not a status change that would need one
+    row unavailable to concurrent readers while it commits. `period_to < day`,
+    never `<=`, the same INCLUSIVE reading `permits_ending_before` documents;
+    `day` is the caller's `business_today()`.
+    """
+    conditions: list[ColumnElement[bool]] = [
+        Permit.status == "pending_signatures",
+        Permit.period_to < day,
+    ]
     if after_id is not None:
         conditions.append(Permit.id > after_id)
     rows = await db.execute(select(Permit).where(*conditions).order_by(Permit.id).limit(limit))

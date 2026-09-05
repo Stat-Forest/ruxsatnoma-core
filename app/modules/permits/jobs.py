@@ -101,12 +101,17 @@ async def expire_permits(
     `period_to` is INCLUSIVE: the comparison is `period_to < today`, so a permit
     ending today is still in force today and expires tomorrow morning.
 
-    Only `active` is swept. `pending_signatures` never came into force (C11), so
-    «муддати тугаган» would be a false statement about it on the public check
-    page; `suspended` and `revoked` are 3.11b's, which owns what a period ending
-    means for a permit already out of use. `permits_ending_before` takes the
-    candidates `FOR UPDATE`, so a permit revoked while this sweep waited drops
-    out of the result instead of being expired on top of the revocation.
+    `active` and `suspended` are both swept (Task 7, ruling 8):
+    `pending_signatures` never came into force (C11), so «муддати тугаган» would
+    be a false statement about it on the public check page — `tz/12` #16 is the
+    open question for THAT status, and `watch_stalled_permits` below is what
+    this stage does about it, deliberately short of a status change. `suspended`
+    joins `active` because `PERMIT_TRANSITIONS` has always allowed `suspended ->
+    expired`: without it a permit suspended mid-season would stay `suspended`
+    forever once its period ran out, and its application would never reach
+    `close_finished` either. `permits_ending_before` takes the candidates
+    `FOR UPDATE`, so a permit revoked while this sweep waited drops out of the
+    result instead of being expired on top of the revocation.
 
     One row's status change, its history row, the holder's notification and its
     audit entry share a SAVEPOINT: all four land or none of them do, so a permit
@@ -115,7 +120,7 @@ async def expire_permits(
     """
     today = business_today()
     rows = await repo.permits_ending_before(
-        db, today, status=service.ACTIVE_STATUS, limit=limit, after_id=after_id
+        db, today, statuses=(service.ACTIVE_STATUS, "suspended"), limit=limit, after_id=after_id
     )
     correlation = f"job:{uuid.uuid4()}"
     # Read every id BEFORE any SAVEPOINT opens. Rolling one back restores the
@@ -148,6 +153,12 @@ async def expire_permits(
 
 async def _expire_one(db: AsyncSession, permit: Permit, *, correlation: str) -> None:
     """One permit's whole expiry, inside the caller's SAVEPOINT."""
+    # Captured BEFORE the write below. `active` and `suspended` both reach here
+    # now (ruling 8) — the literal `service.ACTIVE_STATUS` this used to hard-code
+    # would file `active -> expired` on a permit that was actually `suspended`, a
+    # false statement on an append-only timeline that cannot be corrected
+    # afterwards.
+    from_status = permit.status
     permit.status = EXPIRED_STATUS
     # Flushes the status change with it, which is what makes a second run
     # inside this same transaction find nothing (the idempotency test runs
@@ -156,7 +167,7 @@ async def _expire_one(db: AsyncSession, permit: Permit, *, correlation: str) -> 
         db,
         PermitStatusHistory(
             permit_id=permit.id,
-            from_status=service.ACTIVE_STATUS,
+            from_status=from_status,
             to_status=EXPIRED_STATUS,
             # No actor: `tz/05` and design/02 both make EXPIRED the job's,
             # not a person's. `changed_by` is nullable for exactly this.
@@ -178,10 +189,81 @@ async def _expire_one(db: AsyncSession, permit: Permit, *, correlation: str) -> 
         user_id=None,
         object_type=service.OBJECT_TYPE,
         object_id=permit.id,
-        old_value={"status": service.ACTIVE_STATUS},
+        old_value={"status": from_status},
         new_value={"status": EXPIRED_STATUS},
         correlation_id=correlation,
     )
+
+
+async def watch_stalled_permits(
+    db: AsyncSession, *, limit: int = BATCH_SIZE, after_id: uuid.UUID | None = None
+) -> SweepBatch:
+    """Report — and ONLY report — a permit whose whole period elapsed unsigned.
+
+    **This job moves nothing, and that is the design** (ruling 16). `tz/12` #16
+    is open with the Agency: a paid permit whose recipient never signs can be
+    neither revoked nor expired, its application never closes, and the citizen's
+    money is frozen. 3.11a made the state honest; this makes it VISIBLE. It does
+    not answer the question, because the answer changes what a signature means
+    and no engineer may decide that.
+
+    **Where the Agency's answer lands.** Whichever of `tz/12` #16's three
+    options is chosen, it is (1) a new edge out of `pending_signatures` in
+    `service.PERMIT_TRANSITIONS`, and (2) a `service.set_status(...)` call in
+    this loop, beside the notification. Nothing else in this module changes.
+
+    **The trap, so nobody takes the obvious shortcut instead.** Adding
+    `pending_signatures -> revoked` so a head can cancel a mis-issued permit
+    makes things WORSE: `permits.application_id` is UNIQUE, so the application
+    would then be PAID with a revoked permit attached and no second permit ever
+    issuable. Unwedging that way needs a re-issuance story, which needs the
+    uniqueness relaxed, which is the invariant this module rests on.
+
+    Once-only is a read before the write — `notifications.already_notified` —
+    because unlike the expiry sweep, this job's candidate set does not shrink
+    when the work is done. No assigned executor means nobody to tell: log and
+    skip, the shape `subscribers.on_payment_confirmed` already uses.
+    """
+    today = business_today()
+    rows = await repo.stalled_permits(db, today, limit=limit, after_id=after_id)
+    correlation = f"job:{uuid.uuid4()}"
+    processed = failed = 0
+    last_id: uuid.UUID | None = None
+    for permit in rows:
+        last_id = permit.id
+        try:
+            if await notifications.already_notified(
+                db, event_code=events.PERMIT_UNSIGNED_STALLED, object_id=permit.id
+            ):
+                continue
+            application = await applications_service.get(db, permit.application_id)
+            if application is None or application.assigned_user_id is None:
+                logger.info(
+                    "job.watch_stalled_permits.unassigned",
+                    permit_id=str(permit.id),
+                )
+                continue
+            await notifications.notify(
+                db,
+                event_code=events.PERMIT_UNSIGNED_STALLED,
+                recipient_user_id=application.assigned_user_id,
+                params={"permit_number": service._permit_number(permit.series, permit.number)},
+                object_type=service.OBJECT_TYPE,
+                object_id=permit.id,
+                correlation_id=correlation,
+            )
+        except Exception as exc:
+            # `repr`, never f"{exc}" — see `expire_permits` for why.
+            failed += 1
+            logger.error(
+                "job.watch_stalled_permits.row_failed",
+                permit_id=str(permit.id),
+                error=repr(exc),
+                exc_info=True,
+            )
+        else:
+            processed += 1
+    return SweepBatch(scanned=len(rows), processed=processed, failed=failed, last_id=last_id)
 
 
 async def close_finished(

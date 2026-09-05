@@ -345,3 +345,21 @@ async def expire_forest_tickets(factory: async_sessionmaker[AsyncSession]) -> in
         lambda db, after_id: permits_jobs.expire_forest_tickets(db, after_id=after_id),
         name="expire_forest_tickets",
     )
+
+
+async def watch_stalled_permits(factory: async_sessionmaker[AsyncSession]) -> int:
+    """The nightly report of a permit whose whole period elapsed unsigned
+    (plan `03.11b-permits-lifecycle` task 7, ruling 16).
+
+    A wrapper, like every job on this page: the decision lives in
+    `permits.jobs.watch_stalled_permits`, which **moves nothing** — see its own
+    docstring for why (`tz/12` #16 is open with the Agency) and for where the
+    Agency's eventual answer changes this code. Only the notification and the
+    once-only check share a transaction; there is no status change and no
+    history row to make atomic with anything.
+    """
+    return await _drain_batches(
+        factory,
+        lambda db, after_id: permits_jobs.watch_stalled_permits(db, after_id=after_id),
+        name="watch_stalled_permits",
+    )
