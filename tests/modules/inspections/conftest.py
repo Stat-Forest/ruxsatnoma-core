@@ -176,7 +176,11 @@ async def make_permit(
     pipeline `tests/modules/permits/conftest.py::active_permit` drives is out
     of proportion here (the same "insert directly" convention this codebase's
     own `make_paid_application` uses for an APPLICATION at the status this
-    module's tests actually need)."""
+    module's tests actually need). `snapshot` still carries `issued_at`: every
+    permit `service.issue` ever produces has it (`service._snapshot` writes it
+    unconditionally, requisite 3), and `PermitCardOut.build` reads it for
+    `document_date` — an empty snapshot here would be a permit shape `issue`
+    itself can never create."""
     permit = Permit(
         series="Т",
         number=uuid.uuid4().int % 2_000_000_000 + 1,
@@ -192,7 +196,7 @@ async def make_permit(
         amount=Decimal("1000000.00"),
         status=status,
         qr_token=uuid.uuid4().hex,
-        snapshot={},
+        snapshot={"issued_at": date.today().isoformat()},
     )
     db.add(permit)
     await db.flush()
