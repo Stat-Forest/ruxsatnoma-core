@@ -12,9 +12,15 @@ from tests.modules.gis.conftest import leshoz as leshoz
 
 
 async def test_list_regions_returns_a_region_we_created(db: AsyncSession):
+    """`flush`, not `commit`: `list_regions` reads through this SAME session, so
+    autoflush already makes the row visible to it, and `regions` is reference
+    data seeded once and read everywhere (`test_refs_api.py::test_regions_list`
+    counts all fourteen) — a `commit` here would outlive the `db` fixture's own
+    rollback and leave a fifteenth row in the shared, persistent test database
+    forever."""
     region = Region(code=f"r-{uuid.uuid4().hex[:8]}", name={"uz_cyrl": "Тест вилояти"})
     db.add(region)
-    await db.commit()
+    await db.flush()
 
     regions = await service.list_regions(db)
     assert any(r.id == region.id for r in regions)
