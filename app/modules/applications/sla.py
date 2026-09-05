@@ -12,10 +12,11 @@ from datetime import datetime, timedelta
 # yet with `start_review`) and `IN_REVIEW` (a reviewer is actively working
 # it). Every other status means the clock is either PAUSED (`PENDING_INFO` —
 # the applicant, not the office, is who is being waited on; `RETURNED` is
-# the same shape, and `submit()` gives it a fresh deadline on resubmission
-# rather than needing a pause of its own) or DECIDED/terminal (`APPROVED`,
-# `REJECTED`, `CANCELLED` and everything downstream of them) — none of
-# those can be "overdue" in the sense RI-07 means it.
+# the same shape, and `submit()` deliberately KEEPS the existing
+# `submitted_at`/`sla_deadline_at` on a resubmission rather than giving it a
+# fresh one — ruling 16.1, `service.submit` itself) or DECIDED/terminal
+# (`APPROVED`, `REJECTED`, `CANCELLED` and everything downstream of them) —
+# none of those can be "overdue" in the sense RI-07 means it.
 SLA_ACTIVE_STATUSES = ("SUBMITTED", "IN_REVIEW")
 
 

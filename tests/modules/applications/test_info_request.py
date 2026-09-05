@@ -54,7 +54,15 @@ async def test_answering_shifts_the_deadline_by_the_pause(
 
 
 async def test_a_second_open_request_is_refused(hodim_client, application_in_review) -> None:
-    """Two open pauses make the arithmetic ambiguous — refuse rather than guess."""
+    """Two open pauses make the arithmetic ambiguous — refuse rather than guess.
+
+    Final whole-branch review, MINOR: asserting only the status code passes
+    even with the `info_request_already_open` guard deleted outright, because
+    `_assert_transition` supplies an identical 409 (`bad_transition`) once the
+    application is already PENDING_INFO — proved by the reviewer disabling the
+    guard and watching all five tests in this file stay green. The `reason`
+    is what tells the two 409s apart, and only asserting it pins the guard
+    this test is actually named for."""
     await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/request-info",
         json={"message": "первый"},
@@ -64,6 +72,7 @@ async def test_a_second_open_request_is_refused(hodim_client, application_in_rev
         json={"message": "второй"},
     )
     assert second.status_code == 409
+    assert second.json()["error"]["details"]["reason"] == "info_request_already_open"
 
 
 async def test_the_response_files_become_application_documents(
