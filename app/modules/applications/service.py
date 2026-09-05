@@ -36,7 +36,7 @@ from app.core.time import business_today
 from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import ClassifierItem, Organization
-from app.modules.applications import checks, repo
+from app.modules.applications import checks, repo, sla
 from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
@@ -45,6 +45,7 @@ from app.modules.applications.models import (
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
+    InfoRequest,
 )
 from app.modules.applications.permissions import (
     APPLICATIONS_DECIDE,
@@ -941,14 +942,26 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
     Both keys are present and empty/null from task 3, before anything can write
     either: they are a contract 3.10a and 3.11a already read
     (`card["calculation"]["amount"]`), not a placeholder a later task adds.
+
+    `sla_overdue` (task 4, 3.9b, ruling 8) is computed HERE, not on the schema:
+    `sla.is_overdue` needs both `status` (an OPEN pause suspends the clock
+    whatever the stored deadline says) and the wall clock. A `DRAFT` or a
+    decided/terminal application has no deadline at all, and `False` is the
+    honest answer for it — never overdue, having never been timed.
     """
     application = await _readable_application(db, application_id, actor=actor)
+    deadline = application.sla_deadline_at
     return {
         "application": application,
         "items": await repo.list_items(db, application.id),
         "documents": await repo.list_documents(db, application.id),
         "checks": await repo.list_checks(db, application.id),
         "calculation": await current_calculation(db, application.id),
+        "sla_overdue": (
+            False
+            if deadline is None
+            else sla.is_overdue(application.status, deadline, datetime.now(UTC))
+        ),
     }
 
 
@@ -2276,6 +2289,204 @@ async def return_to_applicant(
         params={"application_number": application.number},
         object_type="application",
         object_id=application.id,
+    )
+    return application
+
+
+# --- Task 4 (3.9b): request for information and the SLA pause ---------------
+
+APPLICATION_REQUEST_INFO = "application.request_info"
+APPLICATION_RESPOND_INFO = "application.respond_info"
+# `notification_templates.event_code` — DOTTED, seeded by migration 0025
+# (task 2's own), sent by `request_info` alone: `respond_info` is the
+# applicant's own act and notifies nobody, the same shape `cancel` gives its
+# own withdrawal.
+NOTIFY_APPLICATION_INFO_REQUESTED = "application.info_requested"
+PENDING_INFO_STATUS = "PENDING_INFO"
+# `doc_types` carries no code of its own for a citizen's reply to a request
+# for information — every code under it is either OURS
+# (`BENEFIT_DOC_TYPE_CODE`) or the Agency's, added later through the admin
+# CRUD (CLAUDE.md) — and this stage takes exactly ONE migration, which seeds
+# no new classifier item (Global Constraints, ruling 15). `_info_response_doc_
+# type` below therefore does not look one up by a fixed, unseeded code (which
+# would fail-closed on every environment today, unlike `BENEFIT_DOC_TYPE_CODE`
+# — migration 0024 guarantees THAT one exists); it takes the first ACTIVE
+# `doc_types` item instead, deterministic because `admin_repo.
+# list_classifier_items` already orders by `(sort_order, code)`. Recorded on
+# the row itself is `INFO_RESPONSE_DOCUMENT_NOTE`, so the attachment explains
+# itself whichever bucket it lands in — a design choice made here, without a
+# ruling of its own, flagged for confirmation once the Agency's real
+# `doc_types` list exists.
+INFO_RESPONSE_DOCUMENT_NOTE = "Attached in response to a request for information."
+
+
+def _now() -> datetime:
+    """The wall clock `request_info`/`respond_info` read the pause's two
+    endpoints through — patched by `tests/modules/applications/conftest.py::
+    frozen_clock`, exactly as `payments.payme_router._now` is (`payments/
+    conftest.py`'s own `frozen_clock`). Ruling 8's arithmetic must be provable
+    against a controlled clock: a test cannot wait three real days to prove a
+    three-day pause shifts the deadline by three days."""
+    return datetime.now(UTC)
+
+
+async def _info_response_doc_type(db: AsyncSession) -> ClassifierItem | None:
+    """The `doc_types` item a `respond_info` attachment is filed under — see
+    `INFO_RESPONSE_DOCUMENT_NOTE`'s own comment for why this is "the first
+    active one" rather than a fixed code. `None` only if `doc_types` itself is
+    gone or holds no active item at all, which migration 0024's `benefit_proof`
+    makes unreachable in any migrated database today."""
+    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
+    if classifier is None:
+        return None
+    items = await admin_repo.list_classifier_items(db, classifier.id)
+    return items[0] if items else None
+
+
+async def request_info(
+    db: AsyncSession, application_id: uuid.UUID, *, message: str, actor: User
+) -> Application:
+    """`POST /applications/{id}/request-info` — SUBMITTED or IN_REVIEW ->
+    PENDING_INFO, opening the `info_requests` row that pauses the SLA clock
+    (ruling 8) until `respond_info` closes it.
+
+    **`applications.review`, zone-checked** — the route's own `require_
+    permission` plus `_assert_in_actor_zone` here, exactly `start_review`'s own
+    two-part rule beside it: the permission answers "may this role at all",
+    the zone answers "on whose rows".
+
+    A second `request-info` while one is already open is `ERR-APP-004`
+    (`reason="info_request_already_open"`): two open pauses have no
+    `responded_at` to pair unambiguously with a `requested_at`, which is
+    exactly the arithmetic `sla.shift_deadline` depends on staying 1:1.
+    Checked BEFORE `_assert_transition` and independently of it — being
+    PENDING_INFO already implies an open row (nothing else in this module
+    writes one), so a bare `_assert_transition` would answer that repeat call
+    with the generic `bad_transition` and hide the actual reason; every OTHER
+    illegal source status still falls through to it unchanged.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone — the same answer to both, as on every staff
+    route in this module. 409 `ERR-APP-004` in any status but SUBMITTED or
+    IN_REVIEW.
+    """
+    application = await repo.get_application_for_update(db, application_id)
+    if application is None:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    # Before the status check, and before anything is written: this commits
+    # its RI-12 trail and raises 404 on a territorial refusal.
+    await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_REQUEST_INFO)
+
+    if await repo.get_open_info_request(db, application.id) is not None:
+        raise err("ERR-APP-004", details={"reason": "info_request_already_open"})
+    _assert_transition(application, PENDING_INFO_STATUS)
+
+    await repo.add_info_request(
+        db,
+        InfoRequest(
+            application_id=application.id,
+            requested_by=actor.id,
+            message=message,
+            requested_at=_now(),
+        ),
+    )
+    await _apply_transition(
+        db,
+        application,
+        to_status=PENDING_INFO_STATUS,
+        action=APPLICATION_REQUEST_INFO,
+        actor=actor,
+        reason=message,
+    )
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_INFO_REQUESTED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": application.number},
+        object_type="application",
+        object_id=application.id,
+    )
+    return application
+
+
+async def respond_info(
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    text: str,
+    file_ids: list[uuid.UUID],
+    actor: User,
+) -> Application:
+    """`POST /applications/{id}/respond-info` — the OWNER's own reply:
+    PENDING_INFO -> IN_REVIEW, closing the newest open `info_requests` row,
+    attaching `file_ids` as `application_documents`, and RESUMING the SLA
+    clock by shifting `sla_deadline_at` forward by exactly the length of the
+    pause (ruling 8, `sla.shift_deadline`) — never re-derived from a fresh
+    count, and never left untouched, which would let the days the office spent
+    waiting on the applicant count against it.
+
+    `_own_application_for_update` is the ownership half (404 for a stranger);
+    `_assert_transition` is the status half — PENDING_INFO is the only source
+    this route may leave from, so an application no longer paused is
+    `ERR-APP-004` (`reason="bad_transition"`).
+
+    Every `file_ids` entry is checked exactly as `add_document` checks its own
+    `file_id` (`_own_document_file`): it must be the caller's OWN ACTIVE
+    upload, never merely an id that exists. An empty list attaches nothing —
+    a text-only reply is legal.
+    """
+    application = await _own_application_for_update(db, application_id, actor=actor)
+    _assert_transition(application, IN_REVIEW_STATUS)
+
+    info_request = await repo.get_open_info_request(db, application.id)
+    # An application only reaches PENDING_INFO through `request_info`, which
+    # never returns without opening exactly one, unclosed, request — the
+    # invariant is this module's own two writers, not user input.
+    assert info_request is not None, (
+        "PENDING_INFO with no open info_requests row — request_info's own invariant broke"
+    )
+    now = _now()
+    info_request.responded_at = now
+    info_request.response_text = text
+
+    if file_ids:
+        doc_type = await _info_response_doc_type(db)
+        if doc_type is None:
+            raise err("ERR-APP-003", details={"reason": "doc_type_not_configured"})
+        for file_id in file_ids:
+            file = await _own_document_file(db, file_id, actor=actor)
+            document = ApplicationDocument(
+                application_id=application.id,
+                doc_type_item_id=doc_type.id,
+                file_id=file.id,
+                uploaded_by=actor.id,
+                note=INFO_RESPONSE_DOCUMENT_NOTE,
+            )
+            await repo.add_document(db, document)
+            await audit.log(
+                db,
+                action=APPLICATION_DOCUMENT_ATTACH,
+                user_id=actor.id,
+                object_type="application_document",
+                object_id=document.id,
+                new_value={
+                    "application_id": str(application.id),
+                    "doc_type_item_id": str(document.doc_type_item_id),
+                    "file_id": str(document.file_id),
+                },
+            )
+
+    if application.sla_deadline_at is not None:
+        application.sla_deadline_at = sla.shift_deadline(
+            application.sla_deadline_at, paused_for=now - info_request.requested_at
+        )
+    await _apply_transition(
+        db,
+        application,
+        to_status=IN_REVIEW_STATUS,
+        action=APPLICATION_RESPOND_INFO,
+        actor=actor,
+        reason=text,
     )
     return application
 

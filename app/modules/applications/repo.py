@@ -33,6 +33,7 @@ from app.modules.applications.models import (
     ApplicationDocument,
     ApplicationItem,
     ApplicationStatusHistory,
+    InfoRequest,
 )
 from app.modules.applications.sla import SLA_ACTIVE_STATUSES
 
@@ -506,3 +507,34 @@ async def list_applications_past_sla_deadline(
         Application.status.in_(SLA_ACTIVE_STATUSES), Application.sla_deadline_at < now
     )
     return (await db.execute(stmt)).scalars().all()
+
+
+# --- Task 4: the request for information --------------------------------------
+
+
+async def get_open_info_request(db: AsyncSession, application_id: uuid.UUID) -> InfoRequest | None:
+    """The newest OPEN (`responded_at IS NULL`) `info_requests` row for this
+    application, or `None`.
+
+    `service.request_info` reads this as its own 409 guard ("a second open
+    request while one is already open" — ruling 8's pause arithmetic has no
+    way to tell which `responded_at` closes which `requested_at` once two are
+    open at once), and `service.respond_info` reads it as the row to close.
+    Both callers already hold the application's own row lock
+    (`get_application_for_update`), so this needs none of its own: two
+    concurrent calls on the same application serialise on THAT lock first."""
+    stmt = (
+        select(InfoRequest)
+        .where(InfoRequest.application_id == application_id, InfoRequest.responded_at.is_(None))
+        .order_by(InfoRequest.requested_at.desc(), InfoRequest.id.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def add_info_request(db: AsyncSession, info_request: InfoRequest) -> None:
+    """Stage and flush — mirrors `add_status_history`'s own shape, so the
+    caller's other pending writes in the same transaction (the `applications`
+    status UPDATE) surface together with this INSERT."""
+    db.add(info_request)
+    await db.flush()

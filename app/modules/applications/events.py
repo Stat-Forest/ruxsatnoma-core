@@ -86,4 +86,5 @@ NOTIFIED_EVENT_CODES = (
     "application.rejected",
     "application.sla_approaching",
     "application.returned",
+    "application.info_requested",
 )

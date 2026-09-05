@@ -289,13 +289,22 @@ class ApplicationOut(BaseModel):
 
 
 class ApplicationCardOut(ApplicationOut):
-    """`GET /applications/{id}` — the columns above, flat, plus the four things
+    """`GET /applications/{id}` — the columns above, flat, plus the five things
     that are not columns of `applications` at all."""
 
     items: list[ApplicationItemOut]
     documents: list[ApplicationDocumentOut]
     checks: list[ApplicationCheckOut]
     calculation: ApplicationCalculationOut | None
+    # Task 4 (3.9b), ruling 8: whether the SLA clock is running late RIGHT NOW —
+    # `sla.is_overdue`, computed by `service.get_card` because it needs both
+    # `status` (an OPEN pause suspends the clock whatever the stored deadline
+    # says) and the wall clock, neither of which a schema should read for
+    # itself. Not a column, so it belongs beside `calculation` here rather than
+    # on `ApplicationOut`, which also serves the list row and create/patch —
+    # design/03's own `sla_overdue=true` filter is a LIST feature nothing in
+    # this task adds.
+    sla_overdue: bool
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> ApplicationCardOut:
@@ -317,6 +326,7 @@ class ApplicationCardOut(ApplicationOut):
                 "calculation": (
                     None if calculation is None else ApplicationCalculationOut.build(calculation)
                 ),
+                "sla_overdue": card["sla_overdue"],
             }
         )
 
@@ -648,6 +658,40 @@ class ApplicationReturnIn(BaseModel):
     reason_item_id: uuid.UUID
     fields_to_fix: dict[str, Any]
     legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+
+
+class ApplicationRequestInfoIn(BaseModel):
+    """`POST /applications/{id}/request-info` — task 4 (3.9b): the reviewer
+    asks the applicant for more information, opening the `info_requests` row
+    that pauses the SLA clock (`sla.py`, ruling 8) until `respond-info` closes
+    it.
+
+    `message` is required and non-empty (`min_length=1`, the same gap
+    `ApplicationRejectIn`'s own `legal_basis` closes) — a paused clock with
+    nothing asked for leaves the applicant with no way to answer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: Annotated[str, Field(min_length=1)]
+
+
+class ApplicationRespondInfoIn(BaseModel):
+    """`POST /applications/{id}/respond-info` — the applicant's own reply,
+    closing the newest open `info_requests` row and resuming the SLA clock by
+    the length of the pause (ruling 8).
+
+    `file_ids` names already-uploaded `media_files` rows — the bytes go
+    through `POST /files` first, the same two-step `ApplicationDocumentIn`
+    uses — and every one must be the caller's OWN active upload
+    (`service._own_document_file`). An empty list is a text-only reply and is
+    legal: not every request for information needs a document back.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: Annotated[str, Field(min_length=1)]
+    file_ids: list[uuid.UUID]
 
 
 class ApplicationDecisionOut(ApplicationOut):

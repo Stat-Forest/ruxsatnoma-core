@@ -22,7 +22,8 @@ import secrets
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -35,6 +36,7 @@ from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
+from app.modules.applications import service as applications_service
 from app.modules.applications.permissions import APPLICATIONS_REVIEW
 from app.modules.auth.models import Applicant, Representation, Role, RolePermission, User
 from app.modules.gis.models import Contour, GisLayer
@@ -1138,3 +1140,55 @@ async def head_with_exact_limits(db: AsyncSession):
             yield client
 
     return _make
+
+
+# --- Task 4 (3.9b): request for information and the SLA pause ----------------
+
+
+@dataclass
+class FrozenClock:
+    current: datetime
+
+    def advance(self, delta: timedelta) -> None:
+        self.current += delta
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> FrozenClock:
+    """`applications.service.request_info`/`respond_info` read the pause's two
+    endpoints through the module's own `_now()`, patched HERE — never
+    `app.core.time`, which those two functions have no reason to use at all
+    (`tests/modules/payments/conftest.py`'s identical fixture, over
+    `payme_router._now`, is the precedent). `.advance(...)` moves the clock
+    with no real wall-clock time passing, which is what lets
+    `test_answering_shifts_the_deadline_by_the_pause` prove ruling 8's
+    arithmetic without an actual three-day test run."""
+    clock = FrozenClock(current=datetime.now(UTC))
+    monkeypatch.setattr(applications_service, "_now", lambda: clock.current)
+    return clock
+
+
+@pytest.fixture
+async def vet_certificate_file(db: AsyncSession, applicant: Applicant) -> MediaFile:
+    """A `media_files` row standing in for the vet certificate an applicant
+    attaches through `respond-info` — the `gis/conftest.py::approval_doc`
+    pattern (own session not needed: nothing here is asserted after a
+    rollback the way `doc_type_item_id`'s classifier item is).
+
+    `uploaded_by` is `applicant`'s OWNER, not an arbitrary user:
+    `service._own_document_file` refuses a `file_ids` entry that is not the
+    CALLER's own upload, and `applicant_client` (built ON `applicant`, not
+    beside it — see that fixture's own docstring) is who calls `respond-info`
+    in every test that requests this fixture."""
+    assert applicant.owner_user_id is not None, "the `applicant` fixture always owns a real user"
+    file = MediaFile(
+        storage_key=f"t/{uuid.uuid4().hex}",
+        filename="vet-certificate.pdf",
+        content_type="application/pdf",
+        size_bytes=100,
+        sha256="0" * 64,
+        uploaded_by=applicant.owner_user_id,
+    )
+    db.add(file)
+    await db.flush()
+    return file

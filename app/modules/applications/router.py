@@ -55,6 +55,8 @@ from app.modules.applications.schemas import (
     ApplicationOut,
     ApplicationPatch,
     ApplicationRejectIn,
+    ApplicationRequestInfoIn,
+    ApplicationRespondInfoIn,
     ApplicationReturnIn,
     ApplicationStatus,
     ApplicationSubmitIn,
@@ -525,6 +527,66 @@ async def return_application(
             fields_to_fix=payload.fields_to_fix,
             legal_basis=payload.legal_basis,
             actor=actor,
+        )
+    )
+
+
+# --- Task 4 (3.9b): request for information and the SLA pause -----------------
+#
+# `request-info` carries `applications.review` alone — the same reviewer who
+# may take an application into work may ask it a question — with the zone
+# check living in the service exactly like `start-review` beside it.
+# `respond-info` carries `applications.create`, the applicant's own gate
+# (`patch_application`'s own reasoning above): ownership is the service's
+# check, so a stranger gets 404 rather than a 403 confirming the application
+# exists.
+#
+# No `Idempotency-Key` on either: a replayed `request-info` finds one already
+# open and answers 409 (the same reasoning `return`'s own comment gives); a
+# replayed `respond-info` finds the application no longer PENDING_INFO
+# (already IN_REVIEW) and answers 409 too.
+
+
+@router.post("/applications/{application_id}/request-info")
+async def request_info_application(
+    application_id: uuid.UUID,
+    payload: ApplicationRequestInfoIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_REVIEW))],
+) -> ApplicationOut:
+    """SUBMITTED or IN_REVIEW -> PENDING_INFO, opening the `info_requests` row
+    that pauses the SLA clock (ruling 8) until `respond-info` closes it.
+
+    404 `ERR-SYS-003` for an id that does not exist and for an application
+    outside the caller's zone. 409 `ERR-APP-004` in any status but SUBMITTED
+    or IN_REVIEW, and (`reason="info_request_already_open"`) for a second
+    request while one is already open — two open pauses would make the pause
+    arithmetic ambiguous.
+    """
+    return ApplicationOut.model_validate(
+        await service.request_info(db, application_id, message=payload.message, actor=actor)
+    )
+
+
+@router.post("/applications/{application_id}/respond-info")
+async def respond_info_application(
+    application_id: uuid.UUID,
+    payload: ApplicationRespondInfoIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> ApplicationOut:
+    """The owner's own reply: PENDING_INFO -> IN_REVIEW, closing the newest
+    open `info_requests` row, attaching `file_ids` as `application_documents`,
+    and shifting `sla_deadline_at` forward by exactly the length of the pause
+    (ruling 8) — never re-derived, never left untouched.
+
+    404 `ERR-SYS-003` for a stranger. 409 `ERR-APP-004` in any status but
+    PENDING_INFO. 422 `ERR-VAL-001` for a `file_ids` entry that is missing,
+    archived or somebody else's upload.
+    """
+    return ApplicationOut.model_validate(
+        await service.respond_info(
+            db, application_id, text=payload.text, file_ids=payload.file_ids, actor=actor
         )
     )
 
