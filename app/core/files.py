@@ -28,6 +28,12 @@ ALLOWED_TYPES: dict[str, tuple[bytes, ...]] = {
     "image/png": (b"\x89PNG\r\n\x1a\n",),
     "image/jpeg": (b"\xff\xd8\xff",),
     "image/webp": (b"RIFF",),  # + b"WEBP" at offset 8, checked below
+    # MP4's own magic is not a leading prefix (the `ftyp` box sits at offset 4,
+    # preceded by its own big-endian size field) — an empty tuple here means
+    # "no prefix to check", the same idiom gis's own `text/csv` uses, and the
+    # REAL check is the `ftyp` branch in `_magic_ok` below (stage 4.1:
+    # inspection act video attachments, tz/04 С15's "фото/видео").
+    "video/mp4": (),
 }
 
 INLINE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
@@ -144,16 +150,21 @@ async def read_capped(file: UploadFile, cap_bytes: int, content_length: int | No
 
 
 def _magic_ok(content_type: str, data: bytes, allowed: Mapping[str, tuple[bytes, ...]]) -> bool:
-    """An EMPTY prefix tuple means "this type has no reliable magic" and passes —
-    the only such entry today is gis's `text/csv` (a CSV starts with whatever its
-    first column header happens to be), where the real gate is the parser itself.
-    `any()` over an empty tuple is False, so without this branch such a type
-    could never be uploaded at all."""
+    """An EMPTY prefix tuple means "no LEADING prefix to check" — two different
+    reasons today. gis's own `text/csv` truly has none (a CSV starts with
+    whatever its first column header happens to be) and trusts the parser
+    instead. `video/mp4`'s magic (`ftyp`) is real but not at offset 0 — it
+    follows a 4-byte big-endian box-size field the encoder controls — so it is
+    checked in its own branch below, the same shape `image/webp`'s offset-8
+    `WEBP` check already uses. `any()` over an empty tuple is False, so without
+    this branch such a type could never be uploaded at all."""
     prefixes = allowed[content_type]
     if prefixes and not any(data.startswith(p) for p in prefixes):
         return False
     if content_type == "image/webp":
         return data[8:12] == b"WEBP"
+    if content_type == "video/mp4":
+        return data[4:8] == b"ftyp"
     return True
 
 

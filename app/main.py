@@ -34,6 +34,7 @@ from app.modules.auth.router import router as auth_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
+from app.modules.inspections.router import router as inspections_router
 from app.modules.norms.calc_router import router as norms_calc_router
 from app.modules.norms.public_router import router as norms_public_router
 from app.modules.norms.refs_router import router as norms_refs_router
@@ -301,5 +302,6 @@ def create_app() -> FastAPI:
     # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
     # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
     app.include_router(permits_public_router, prefix="/api/v1")
+    app.include_router(inspections_router, prefix="/api/v1")
 
     return app
