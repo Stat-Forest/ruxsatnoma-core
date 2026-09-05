@@ -411,6 +411,34 @@ async def _reconcile_status(db: AsyncSession, cert: Certificate, live_status: st
     await db.flush()
 
 
+def _raised_reason(
+    verdict: Verdict, *, doc_hash: str, content_changed_reason: str | None
+) -> str | None:
+    """The reason `sign()` puts in the RAISED error's `details` — `verdict.reason`
+    itself, unless the caller opted into a friendlier name for one specific,
+    provable case.
+
+    `"signature_invalid"` is the mock adapter's one ambiguous verdict:
+    `eimzo.py::_verify_envelope` returns it both for an envelope it could not
+    decode at all (a genuine forgery or corruption — `verdict.record["raw"]`
+    stays `{}`, no `document_sha256` to compare) and for one that decoded
+    fine, named a real certificate, and simply declares a `document_sha256`
+    for bytes OTHER than the ones `sign()` just hashed into `doc_hash` — a
+    signature that is honestly valid, over a package that has since changed.
+    `raw["document_sha256"]` is only ever present in the second case, so its
+    mere presence plus a mismatch against `doc_hash` IS the proof, not a
+    guess: nothing here is inferred from the absence of evidence, only
+    compared against evidence the envelope itself supplied. Every other
+    reason (an unowned certificate, a missing purpose, a revoked
+    certificate…) returns unchanged."""
+    if content_changed_reason is None or verdict.reason != "signature_invalid":
+        return verdict.reason
+    original_hash = verdict.record.get("raw", {}).get("document_sha256")
+    if original_hash is not None and original_hash != doc_hash:
+        return content_changed_reason
+    return verdict.reason
+
+
 async def sign(
     db: AsyncSession,
     *,
@@ -420,6 +448,7 @@ async def sign(
     document: bytes,
     pkcs7: str,
     user: User,
+    content_changed_reason: str | None = None,
 ) -> Signature:
     """Attach a signature to `(object_type, object_id, purpose)`.
 
@@ -466,6 +495,31 @@ async def sign(
     ALWAYS, valid or not (ruling 8: a failed attempt is evidence) -> audit ->
     if the verdict itself is invalid, commit that evidence and only THEN
     raise.
+
+    **`content_changed_reason` (applications ruling 18, 2026-09-05) is an
+    opt-in relabelling of the RAISED error only — it never touches what gets
+    STORED.** `verdict.reason == "signature_invalid"` is the mock adapter's
+    one genuinely ambiguous answer: `eimzo.py::_verify_envelope` returns it
+    both for an envelope it could not decode at all (`raw` stays `{}`, no
+    certificate, no claimed hash — a real forgery or corruption) and for one
+    that decoded perfectly, named a real certificate, and simply carries a
+    `document_sha256` for DIFFERENT bytes than the ones just hashed into
+    `doc_hash` — a signature that is honestly valid over a package that has
+    since changed. The two are told apart by that one fact: `raw` (copied
+    verbatim into `verdict.record["raw"]`) exposes the ORIGINAL claimed hash,
+    still there precisely because the envelope decoded — nothing is
+    inferred, only compared. When a caller passes this reason AND that
+    comparison finds a mismatch, the DomainError's `details.reason` is
+    swapped to it; the stored `signatures.verification` row, its
+    `verification_status`, and the audit entry's `basis` all keep the honest
+    `"signature_invalid"` finding, exactly as before — evidence is never
+    rewritten to read friendlier than what was actually found. Every OTHER
+    reason (an unowned certificate, a missing purpose, a revoked
+    certificate…) is untouched by this parameter, and every caller that
+    leaves it `None` — every caller today except `applications`' `submit`
+    and `_sign_decision` — gets today's exact behaviour, byte for byte:
+    this is why the three permit-object `signature_invalid` tests in
+    `tests/modules/signatures/` needed no change at all.
     """
     required = await required_purposes(db, object_type)
     if required and purpose not in required:
@@ -663,9 +717,18 @@ async def sign(
         # Early-commit pattern: the failed attempt IS the evidence (ruling 8)
         # and stage 4.2's risk reporting reads it — a raise before this commit
         # would roll the row and the audit entry back together with the very
-        # exception they exist to explain.
+        # exception they exist to explain. `_raised_reason` only ever changes
+        # what THIS raise says, never `verification`/`basis` above, which is
+        # already committed with the honest `verdict.reason`.
         await db.commit()
-        raise err("ERR-SIGN-001", details={"reason": verdict.reason})
+        raise err(
+            "ERR-SIGN-001",
+            details={
+                "reason": _raised_reason(
+                    verdict, doc_hash=doc_hash, content_changed_reason=content_changed_reason
+                )
+            },
+        )
 
     return signature
 

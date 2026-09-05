@@ -1261,6 +1261,13 @@ async def precheck(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
 # valid signature and a resubmission collides with nothing.
 SUBMISSION_OBJECT_TYPE = "application_submission"
 SUBMISSION_PURPOSE = "application_submit"
+# Ruling 18 (в), the second half (2026-09-05): `signatures.service.sign()`'s
+# `content_changed_reason` opt-in, passed at both places this module signs a
+# freshly re-priced package (`submit` below and `decision._sign_decision`) —
+# never at any OTHER `sign()` call in the codebase, which is exactly why this
+# constant lives here and not in `signatures`. See `_package_bytes`' and
+# `package`'s own docstrings for what "the package" is and why it can drift.
+STALE_PACKAGE_REASON = "package_changed"
 # Ruling 17, beside the constants above: a flow verb audits under its own name.
 APPLICATION_SUBMIT = "application.submit"
 # `notification_templates.event_code`, seeded by migration 0009 — DOTTED, and a
@@ -1334,16 +1341,19 @@ def _package_bytes(
     through `_canonical_decimal`, everything else out of `input_snapshot`,
     which both carry in the same shape.
 
-    **RULING 23 — a stale package is an accepted 3.9a exposure, and this is the
+    **RULING 23 — a stale package is an accepted exposure, and this is the
     function it starts in.** The amount comes from `norms.service.preview`,
     which prices at `business_today()` against whatever tariffs and БҲМ are
     effective right then. So a tariff or `rule_parameter` published between the
     `GET /package` and the `POST /submit`, a norm published or archived, or
-    plain midnight in Tashkent, changes these bytes — and the applicant then
-    meets `ERR-SIGN-001` for something they did not do. Oybek chose option (в)
-    on 2026-09-02: leave it, and fix it in 3.9b with the whole review flow in
-    view. Do NOT "fix" it here by caching the package or by dropping the
-    amount from it; both are 3.9b's call to make.
+    plain midnight in Tashkent, changes these bytes. **Ruling 18 (в),
+    2026-09-05: accepted permanently — do NOT "fix" it here by caching the
+    package or by dropping the amount from it** — but no longer left
+    unexplained: `submit` and `decision._sign_decision` both pass
+    `STALE_PACKAGE_REASON` into `signatures.service.sign()`, so a signer whose
+    package genuinely moved out from under them meets
+    `details.reason == "package_changed"` rather than a bare
+    `"signature_invalid"` indistinguishable from a forged one.
 
     **`contour_version_id` is the version these bytes NAME, and which version
     that is depends on whether the application has frozen one yet.** `package`
@@ -1580,11 +1590,16 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     `norms.service.preview` at `business_today()`, exactly as `submit` does a
     moment later, and NOTHING freezes the answer in between. A tariff or
     `rule_parameter` published between the two calls, a norm published or
-    archived, or midnight in Tashkent, changes the bytes — and the applicant
-    signs one package while the server verifies against another, meeting
-    `ERR-SIGN-001` for something they did not do. Accepted for 3.9a (Oybek's
-    choice, option в, 2026-09-02) and 3.9b's to fix; do not cache the package
-    or drop the amount from it here.
+    archived, or midnight in Tashkent, changes the bytes — and the signer
+    signs one package while the server verifies against another. **Accepted
+    permanently by ruling 18 (в), 2026-09-05** — no cache, no freeze, no
+    dropping the amount — but the two callers that sign what this route just
+    served (`submit` and `decision._sign_decision`) both pass
+    `content_changed_reason=STALE_PACKAGE_REASON` into `sign()`, so a signer
+    who did nothing wrong meets `details.reason == "package_changed"` rather
+    than the bare, indistinguishable-from-forgery `"signature_invalid"`. Do
+    not cache the package or drop the amount from it here — that is exactly
+    what was decided against.
     """
     application = await _readable_application(db, application_id, actor=actor)
     await _assert_complete(db, application)
@@ -1630,9 +1645,24 @@ async def submit(
     package is priced afresh HERE, and the bytes the client signed came from a
     separate `GET /package` call priced at its own moment. A tariff, a
     `rule_parameter`, a norm or the Tashkent date moving in between makes the
-    two disagree and the applicant meets `ERR-SIGN-001` for something they did
-    not do. Accepted for 3.9a; 3.9b decides between freezing the package and
-    dropping the amount from it.
+    two disagree and the applicant's signature no longer verifies against what
+    `submit` just recomputed.
+
+    **RULING 18 (в), 2026-09-05: the exposure itself is accepted, permanently —
+    no freeze table, no TTL, no migration — but `sign()` is told about it.**
+    Passing `content_changed_reason=STALE_PACKAGE_REASON` does not stop this
+    from happening; it only tells the difference apart in what gets raised.
+    `signatures.service.sign()` already has both halves of that comparison in
+    hand — the bytes it just hashed and the hash the envelope actually
+    signed — so when they disagree under an otherwise-valid signature, the
+    422 carries `details.reason == "package_changed"` instead of the bare
+    `"signature_invalid"` a genuinely broken or forged signature still gets.
+    The applicant meets "the price changed while you were signing, please
+    re-open the form" instead of a cryptographic error for something they did
+    not do; `test_submit.py`'s
+    `test_a_price_that_moved_after_signing_is_labeled_package_changed` pins it,
+    and the paired `test_an_invalid_signature_refuses_the_submission_whole`
+    pins the negative — a genuinely bad signature keeps the generic reason.
     """
     # Step 0. Minted before anything is written, because it is what step 8
     # signs and what step 11 stores as the history row's primary key (ruling
@@ -1680,6 +1710,7 @@ async def submit(
         document=_package_bytes(application, priced, contour_version_id=version.id),
         pkcs7=pkcs7,
         user=actor,
+        content_changed_reason=STALE_PACKAGE_REASON,
     )
 
     # Step 9, ruling 8: EXACTLY ONE calculation per application, written here

@@ -107,7 +107,16 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
     db, applicant_client, draft_ready_for_submission
 ) -> None:
     """The signature is step 8 of one transaction: a refusal there must leave no
-    number allocated, no calculation stored and the status still DRAFT."""
+    number allocated, no calculation stored and the status still DRAFT.
+
+    Ruling 18 (в)'s negative pin: an envelope this broken (not even decodable
+    base64url JSON) never reaches the `document_sha256` comparison at all —
+    `eimzo.py::_unparseable_signature` hands back an empty `raw`, so
+    `signatures.service._raised_reason` has nothing to compare and leaves the
+    generic reason alone. A genuinely bad signature must never be told apart
+    from a stale package as anything OTHER than "signature_invalid" — the
+    paired positive is
+    `test_a_price_that_moved_after_signing_is_labeled_package_changed`."""
     from sqlalchemy import func, select
 
     from app.modules.norms.models import Calculation
@@ -119,7 +128,9 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert result.status_code == 422
-    assert result.json()["error"]["code"] == "ERR-SIGN-001"
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "signature_invalid"
 
     card = (await applicant_client.get(f"/api/v1/applications/{app_id}")).json()
     assert card["status"] == "DRAFT"
@@ -132,6 +143,48 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
         )
         == 0
     )
+
+
+async def test_a_price_that_moved_after_signing_is_labeled_package_changed(
+    applicant_client, draft_ready_for_submission, sheep_type_id
+) -> None:
+    """Ruling 18 (в)'s positive pin: a signature that is genuinely valid over
+    the bytes the applicant saw must not be reported as a bare cryptographic
+    failure once `submit` recomputes something else (`ERR-SIGN-001` with
+    `details.reason == "package_changed"`, not the bare, forgery-shaped
+    `"signature_invalid"`).
+
+    The herd moves between `GET /package` and `POST /submit` — a real edit
+    through the real route, the same mechanism a moving tariff or
+    `rule_parameter` uses (`submit`'s own `_price()` call reads whatever is
+    current when it runs) — rather than hand-editing the signed bytes, which
+    would prove nothing about the code path this ruling actually fixed. 60
+    head is still well inside `published_grazing_norm`'s MaxSB of 250, so
+    nothing here trips a blocking check; the only thing under test is the
+    stale signature."""
+    app_id = draft_ready_for_submission
+    pinfl = (await applicant_client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+    doc = (await applicant_client.get(f"/api/v1/applications/{app_id}/package")).content
+
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={"items": [{"livestock_type_id": str(sheep_type_id), "head_count": 60}]},
+    )
+    assert patched.status_code == 200, patched.text
+
+    result = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={
+            "pkcs7": encode_mock_signature(
+                document=doc, serial=f"SER-{uuid.uuid4().hex[:12]}", issuer="ISS-TEST", pinfl=pinfl
+            )
+        },
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "package_changed"
 
 
 async def test_a_blocking_check_refuses_here_though_the_precheck_only_reported_it(
