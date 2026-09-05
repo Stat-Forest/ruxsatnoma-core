@@ -31,6 +31,7 @@ from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
 from app.modules.applications.router import router as applications_router
 from app.modules.auth.router import router as auth_router
+from app.modules.dashboard.router import router as dashboard_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
@@ -42,6 +43,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.oversight.router import router as oversight_router
 from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
 from app.modules.payments.refunds_router import router as refunds_router
@@ -307,5 +309,8 @@ def create_app() -> FastAPI:
     # Level 5 reader (design/01 rule 5) — stage 4.3, no event subscriptions
     # (nothing else in the system needs to react to a report's lifecycle).
     app.include_router(reports_router, prefix="/api/v1")
+    # 4.2/4.4 — level-5 readers, no writes of their own beyond an audit trail.
+    app.include_router(oversight_router, prefix="/api/v1")
+    app.include_router(dashboard_router, prefix="/api/v1")
 
     return app

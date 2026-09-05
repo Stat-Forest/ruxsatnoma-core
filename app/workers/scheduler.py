@@ -174,6 +174,21 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
         misfire_grace_time=3600,
         coalesce=True,
     )
+    # 4.2 `oversight` (plan `04.2-4.4-oversight-dashboard`, ruling c): every 5
+    # minutes, matching `alert_dead_outbox`'s own cadence above — `tz/09`
+    # promises the internal recording stays immediate while RN itself is
+    # disconnected. `harvest_candidates` is a plain sequential scan over
+    # `audit_log` (no index added there — see migration 0028's docstring),
+    # cheap at today's volumes; revisit the cadence or add an index once
+    # `audit_log` is large.
+    sched.add_job(
+        _wrap(factory, jobs.oversight_sweep),
+        IntervalTrigger(minutes=5, timezone=TIMEZONE),
+        next_run_time=now,
+        id="oversight_sweep",
+        misfire_grace_time=300,
+        coalesce=True,
+    )
     return sched
 
 
