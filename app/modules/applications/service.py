@@ -531,12 +531,37 @@ async def _effective_organization(db: AsyncSession, application: Application) ->
 
     `repo._zone_join_target` is this same rule as SQL, for the paged list that
     cannot resolve one row at a time. The two must move together.
+
+    `effective_organization` below is the public, id-taking form of this rule,
+    for a level-4 caller that may not import this module's models.
     """
     if application.assigned_org_id is not None:
         return application.assigned_org_id
     if application.contour_id is None:
         return None
     return await gis_service.contour_organization(db, application.contour_id)
+
+
+async def effective_organization(db: AsyncSession, application_id: uuid.UUID) -> uuid.UUID | None:
+    """Which leshoz an application belongs to, by id — the public form of
+    `_effective_organization` and a fourth name on this module's surface beside
+    `get` / `current_calculation` / `set_status`.
+
+    Added for `tz/12` #35 (2026-09-05): an invoice belongs to a leshoz only
+    through its application, so `payments` has to ask this question to place
+    one in a zone. It takes an ID and not an `Application` deliberately — a
+    level-4 module may not import this module's models, so a signature naming
+    that type would push every caller into breaking the boundary rule to
+    satisfy a type checker.
+
+    `None` means the application cannot be placed in any zone at all (a draft
+    that names no contour and has no assignment). Every caller must treat that
+    as a refusal for a zoned actor, never as "visible to everyone".
+    """
+    application = await repo.get_application(db, application_id)
+    if application is None:
+        return None
+    return await _effective_organization(db, application)
 
 
 async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
@@ -604,7 +629,7 @@ async def _assert_in_actor_zone(
     application`'s read rule and `start_review`'s write rule ask the identical
     question, and a second copy is a second place to forget that a null
     `assigned_org_id` means "read the contour's owner instead"
-    (`_effective_organization`). `action` is the caller's OWN flow-verb constant
+    (`effective_organization`). `action` is the caller's OWN flow-verb constant
     (ruling 17), so the journal says whether the refused attempt was a read or
     an attempt to take the application into work — the refusal itself is
     identical.
@@ -967,7 +992,7 @@ async def list_applications(
     independently). `organization_col` is `Organization.id` and not
     `Application.assigned_org_id`, because the row joined is the EFFECTIVE
     organization — assigned, or the contour's owner while the application is
-    still unassigned (`repo._zone_join_target`, `_effective_organization`).
+    still unassigned (`repo._zone_join_target`, `effective_organization`).
 
     The contour half of that join is `gis.service.contour_organization_column`,
     called HERE and handed to the repo as an expression: cross-module calls

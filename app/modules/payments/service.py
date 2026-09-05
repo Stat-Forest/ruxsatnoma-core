@@ -50,10 +50,12 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import numbers
+from app.core.abac import Zone, zone_of
 from app.core.errors import err
 from app.core.events import Event, publish
 from app.core.time import TASHKENT, business_today
 from app.modules.admin import repo as admin_repo
+from app.modules.admin.models import Organization as OrganizationRow
 from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
@@ -420,8 +422,53 @@ async def _holds_payments_view(db: AsyncSession, actor: User) -> bool:
     return PAYMENTS_VIEW in await auth_repo.permission_codes(db, actor)
 
 
+def _organization_in_zone(zone: Zone, org: OrganizationRow) -> bool:
+    """Per-row equivalent of `zone_filter`'s SQL for ONE organization row — a
+    LOCAL copy of the identical helper in `gis.service` and `norms.service`,
+    for the same reason they keep their own: it is not part of either module's
+    declared public surface, and a level-4 module may not import it."""
+    if zone.region_id is not None and zone.region_id != org.region_id:
+        return False
+    if zone.district_id is not None and zone.district_id != org.district_id:
+        return False
+    if zone.organization_id is not None and zone.organization_id != org.id:
+        return False
+    return True
+
+
+async def _zone_covers_application(
+    db: AsyncSession, application_id: uuid.UUID, *, actor: User
+) -> bool:
+    """Whether this actor's territory contains the invoice's application.
+
+    `tz/12` #35, answered by Oybek on 2026-09-05: an accountant belongs to a
+    leshoz. Until then `payments.view` alone opened any invoice in the country
+    and the same predicate guarded the pay-intent route, so an accountant of
+    one leshoz could open AND PAY another's — the one place in the system where
+    territorial scoping did not hold.
+
+    An empty zone still means the whole republic, which is what `sys_admin` has
+    and what a CENTRAL accountant is given deliberately: the answer makes the
+    republic-wide case an explicit empty zone rather than the only behaviour
+    available.
+
+    **Fails closed.** An application nothing can place in a zone — no assigned
+    organization and no contour — is refused to a zoned actor rather than
+    shown. That state exists (a draft names no contour), and "unplaceable"
+    must never read as "everyone's".
+    """
+    zone = zone_of(actor)
+    if zone == Zone(None, None, None):
+        return True
+    organization_id = await applications_service.effective_organization(db, application_id)
+    if organization_id is None:
+        return False
+    org = await admin_repo.get_organization(db, organization_id)
+    return org is not None and _organization_in_zone(zone, org)
+
+
 async def _may_act_on_invoices_of(
-    db: AsyncSession, applicant_id: uuid.UUID, *, actor: User
+    db: AsyncSession, application_id: uuid.UUID, applicant_id: uuid.UUID, *, actor: User
 ) -> bool:
     """`payments.view` (or sys_admin) sees or pays any invoice; otherwise the
     actor must OWN the same applicant identity the invoice's application
@@ -435,7 +482,12 @@ async def _may_act_on_invoices_of(
     representation gap Task 2 deliberately carried to this task is closed
     for reads too, not just for paying."""
     if await _holds_payments_view(db, actor):
-        return True
+        # A permission says WHETHER, a zone says WHERE — and zone scoping is
+        # not a permission check (lesson). Staff pass both or neither.
+        return await _zone_covers_application(db, application_id, actor=actor)
+    # The citizen's own branch is deliberately untouched by the zone: ownership
+    # is not territorial, and a zone rule reaching it would hide a person's own
+    # bill from them.
     own_applicant = await auth_service.get_own_applicant(db, actor.id)
     if own_applicant is not None and own_applicant.id == applicant_id:
         return True
@@ -455,7 +507,7 @@ async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, acto
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
-    if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(db, application.id, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
     return invoice
 
@@ -471,7 +523,7 @@ async def list_invoices_for_actor(
     application = await applications_service.get(db, application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(db, application.id, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     return await repo.list_invoices_by_application(db, application_id, limit=limit, offset=offset)
 
@@ -529,7 +581,7 @@ async def create_pay_intent(
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
-    if not await _may_act_on_invoices_of(db, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(db, application.id, application.applicant_id, actor=actor):
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
     if invoice.status != "pending":
         raise err("ERR-PAY-004", details={"invoice": str(invoice_id), "status": invoice.status})
