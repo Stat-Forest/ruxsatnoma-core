@@ -162,6 +162,45 @@ async def test_paying_a_cancelled_invoice_is_refused(applicant_client, cancelled
     assert result.json()["error"]["code"] == "ERR-PAY-004"
 
 
+async def test_a_same_key_retry_after_a_refused_pay_intent_replays_it_not_in_flight(
+    applicant_client, paid_invoice
+):
+    """This route is `core/idempotency.py`'s live incident report verbatim:
+    "get the payment link" is exactly `POST /invoices/{id}/pay-intents`.
+    The mechanism fixed generically in `app/main.py`'s three exception
+    handlers (3.9b task 3, ANSWERED а, 2026-09-05) is proven end-to-end only
+    on `applications/submit`'s own suite so far — this closes the gap for
+    the route the incident actually named. `paid_invoice` refuses with 409
+    `ERR-PAY-004` (`create_pay_intent`'s own status check, not a validation
+    error), which is exactly the DomainError path `domain_error_handler`
+    settles.
+    """
+    key = str(uuid.uuid4())
+    first = await applicant_client.post(
+        f"/api/v1/invoices/{paid_invoice.id}/pay-intents",
+        json={"provider": "payme"},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 409, first.text
+    assert first.json()["error"]["code"] == "ERR-PAY-004"
+
+    replay = await applicant_client.post(
+        f"/api/v1/invoices/{paid_invoice.id}/pay-intents",
+        json={"provider": "payme"},
+        headers={"Idempotency-Key": key},
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json() == first.json(), "the SAME key must replay, never hit in_flight"
+
+    retried = await applicant_client.post(
+        f"/api/v1/invoices/{paid_invoice.id}/pay-intents",
+        json={"provider": "payme"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert retried.status_code == 409, retried.text
+    assert retried.json()["error"]["code"] == "ERR-PAY-004"
+
+
 # --- ownership ruling: an effective representative may act too --------------
 # Task 2 shipped the invoice routes admitting only the applicant's own
 # `owner_user_id`, leaving a legal entity's non-owner representative unable
