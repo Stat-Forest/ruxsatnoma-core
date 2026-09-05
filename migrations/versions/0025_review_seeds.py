@@ -53,6 +53,24 @@ independent things, none of them a new table:
    doc_type` already has for its own code, rather than falling back to
    anything.
 
+5. **One role grant, `applications.conclude_gis` -> `gis_specialist`** — task
+   5's own, amended in here after fix round 1 of that task's review. The
+   first draft of task 5 found no code in `gis`'s own registry that meant
+   "authorised to write an application conclusion" (only `gis.contours.
+   manage`, `.approve` and `gis.layers.manage`, none of them a fit) and
+   failed the `kind=gis` branch CLOSED rather than invent one — `docs/
+   design/03-api-kontrakty.md:202` and `docs/tz/03-roli.md:17` both grant the
+   GIS specialist application conclusions in as many words, so a route
+   nobody can reach was a capability the design promises and the system
+   refuses. The controller ruling: register a REAL code, owned by
+   `applications` (the thing it authorises is a write on an APPLICATION,
+   the same reason `review`/`decide`/`assign` live there too), and reject
+   reusing `gis.contours.approve` — that would let a pure contour editor
+   write conclusions on applications, a different authority. Mirrors
+   `0015_applications.py`'s own `ROLE_GRANTS` idiom exactly (`INSERT INTO
+   role_permissions ... SELECT id, :code FROM roles WHERE code = :role ON
+   CONFLICT DO NOTHING`), and the downgrade removes exactly this one grant.
+
 Revision ID: 0025
 Revises: 0022
 Create Date: 2026-09-05 00:00:00.000000
@@ -82,6 +100,14 @@ REJECTION_REASONS_CLASSIFIER_ID = "0198f100-0003-7000-8000-000000000001"
 INFO_RESPONSE_ITEM_ID = "0198f100-0025-7000-8000-000000000001"
 DOC_TYPES_CLASSIFIER_CODE = "doc_types"
 INFO_RESPONSE_ITEM_CODE = "info_response"
+
+# Fix round 1, task 5 (controller ruling): the ONE new permission this
+# revision grants — `0015_applications.py`'s own `ROLE_GRANTS` shape, kept as
+# a list so a future amendment of this same migration (this stage's "one
+# revision" house rule) can append to it the identical way 0015 lists five.
+ROLE_GRANTS: list[tuple[str, str]] = [
+    ("gis_specialist", "applications.conclude_gis"),
+]
 
 _BODIES: dict[str, dict[str, str]] = {
     "application.sla_approaching": {
@@ -248,9 +274,27 @@ def upgrade() -> None:
             "cannot both be true"
         )
 
+    # --- 5. `applications.conclude_gis` -> `gis_specialist` — fix round 1 --
+    # Mirrors `0015_applications.py`'s own `ROLE_GRANTS` loop exactly: SELECT
+    # the role by CODE (a nonexistent role would silently insert zero rows
+    # otherwise — the exact silent-failure shape `.claude/lessons.md` warns
+    # about), `ON CONFLICT DO NOTHING` against the composite PK
+    # `(role_id, permission_code)`.
+    for role, code in ROLE_GRANTS:
+        op.execute(
+            sa.text(
+                "INSERT INTO role_permissions (role_id, permission_code) "
+                "SELECT id, :code FROM roles WHERE code = :role "
+                "ON CONFLICT DO NOTHING"
+            ).bindparams(code=code, role=role)
+        )
+
 
 def downgrade() -> None:
-    # --- 4, reversed first: doc_types/info_response -----------------------
+    # --- 5, reversed first: `applications.conclude_gis` -------------------
+    op.execute("DELETE FROM role_permissions WHERE permission_code = 'applications.conclude_gis'")
+
+    # --- 4, reversed: doc_types/info_response -------------------------------
     # The attachments FIRST — `application_documents.doc_type_item_id` is an
     # FK to this row (0024's own comment, identical reasoning: "a downgrade
     # must delete whatever its upgrade made possible").

@@ -601,7 +601,8 @@ async def respond_info_application(
 # `kind`, decided per request inside `service.add_conclusion` (a route-level
 # dependency is resolved before the body is even parsed, so it cannot see
 # `kind` at all). Both branches — `applications.review` for `kind="executor"`,
-# fail-closed for `kind="gis"` — are documented on that function.
+# `applications.conclude_gis` for `kind="gis"` (fix round 1, task 5) — are
+# documented on that function, zone-checked identically either way.
 #
 # `recalculate` DOES carry a route-level gate, `applications.review` OR
 # `.decide` — "the hodim or the head" (ruling 17, narrowed 2026-09-05: the GIS
@@ -623,9 +624,10 @@ async def add_conclusion(
     actor: Annotated[User, Depends(get_current_user)],
 ) -> ApplicationConclusionOut:
     """A specialist's written finding on the application (tz/04 С8) — the
-    hodim's `kind="executor"`, or `kind="gis"` (refused today, see
-    `service.add_conclusion`). Immutable: no PATCH, no DELETE anywhere in this
-    module — a repeat conclusion after rework is a new row (ruling 10).
+    hodim's `kind="executor"` (`applications.review`) or the GIS specialist's
+    `kind="gis"` (`applications.conclude_gis`, see `service.add_conclusion`).
+    Immutable: no PATCH, no DELETE anywhere in this module — a repeat
+    conclusion after rework is a new row (ruling 10).
 
     403 `ERR-ACL-001` for a caller who does not hold the permission `kind`
     requires. 404 `ERR-SYS-003` for an id that does not exist or an

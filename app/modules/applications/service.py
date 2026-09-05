@@ -49,6 +49,7 @@ from app.modules.applications.models import (
     InfoRequest,
 )
 from app.modules.applications.permissions import (
+    APPLICATIONS_CONCLUDE_GIS,
     APPLICATIONS_DECIDE,
     APPLICATIONS_REVIEW,
     APPLICATIONS_VIEW_ANY,
@@ -2533,30 +2534,35 @@ async def add_conclusion(
         zone-checked (`_assert_in_actor_zone`, the same two-part rule
         `request_info` applies beside it: the permission answers "may this
         role at all", the zone answers "on whose rows").
-      * `kind="gis"` — `design/03` grants the GIS specialist their own
-        conclusion ("formally only 'K' on an application, but the role
-        description includes conclusions, and a conclusion does not mutate
-        the application"), but `app/modules/gis/permissions.py` registers no
-        code that means "authorised to write an application conclusion" —
-        only `gis.contours.manage`, `gis.contours.approve` and
-        `gis.layers.manage` exist there (migration 0010's `ROLE_GRANTS` for
-        `gis_specialist`), and none of the three fits. **FAILS CLOSED**:
-        refused with `ERR-ACL-001` for every caller, including the real
-        `gis_specialist` role holding both of its own grants — never widened
-        onto an `applications.*` code invented for this route, and never a
-        role-string comparison at this site. This is a gap for
-        `decisions.md`/`design/03` to close explicitly with a real
-        permission code, not something this route can paper over.
+      * `kind="gis"` — gated on `applications.conclude_gis`, then
+        zone-checked exactly like the `executor` branch above (fix round 1,
+        task 5: the controller ruling that closed the gap the first draft of
+        this function flagged). `app/modules/gis/permissions.py` registers no
+        code that fits — only `gis.contours.manage`, `.approve` and
+        `gis.layers.manage`, and `gis.contours.approve` was rejected
+        explicitly (it would let a pure contour editor write conclusions on
+        applications, a different authority) — so the code is owned HERE, by
+        `applications`, the same reason `review`/`decide`/`assign` are too:
+        the thing it authorises is a write on an APPLICATION, not on a
+        contour. tz/03's matrix gives the GIS specialist unzoned "K" (read)
+        on every application, but that answers WHO may look, not WHO may
+        write a finding into its record — every other staff write in this
+        module pairs its permission with the actor's own zone (lesson: zone
+        scoping is not a permission check), and a written conclusion is a
+        write, so this one is zoned the same way.
     """
     if kind == "executor":
         if not await _holds(db, actor, APPLICATIONS_REVIEW):
             raise err("ERR-ACL-001", details={"permission": APPLICATIONS_REVIEW})
+    elif kind == "gis":
+        if not await _holds(db, actor, APPLICATIONS_CONCLUDE_GIS):
+            raise err("ERR-ACL-001", details={"permission": APPLICATIONS_CONCLUDE_GIS})
     else:
-        # The schema's `Literal["executor", "gis"]` admits nothing else.
-        raise err(
-            "ERR-ACL-001",
-            details={"reason": "gis_conclusion_permission_not_yet_defined"},
-        )
+        # The schema's `Literal["executor", "gis"]` admits nothing else; kept
+        # as a fail-closed default rather than an `assert`, which pyright
+        # would accept but a bypassed/loosened schema would then reach as a
+        # 500 instead of a 403.
+        raise err("ERR-ACL-001", details={"reason": "unknown_conclusion_kind"})
 
     application = await repo.get_application(db, application_id)
     if application is None:

@@ -1,30 +1,32 @@
 """Conclusions and recalculation (plan 03.9b task 5).
 
 `POST /applications/{id}/conclusion` records a specialist's written finding —
-`kind="executor"` (the hodim, `applications.review`) or `kind="gis"` — on the
-record for the head to read before deciding (tz/04 С8). Conclusions are
-immutable (ruling 10): a correction is a new row, never an edit.
+`kind="executor"` (the hodim, `applications.review`) or `kind="gis"` (the GIS
+specialist, `applications.conclude_gis`) — on the record for the head to read
+before deciding (tz/04 С8). Conclusions are immutable (ruling 10): a
+correction is a new row, never an edit.
 
 `POST /applications/{id}/recalculate` writes a new `calculations` row through
 `norms.service.save_calculation`, which already carries its own actor- and
 status-dependent guard (`_assert_application_open_for_calculation`) — this
 route re-implements none of it (ruling 17).
 
-**`kind="gis"` is refused today, not merely untested.** Task 5's own brief
-promised the route to "hodim or the GIS specialist", but
-`app/modules/gis/permissions.py` registers no code that means "authorised to
-write an application conclusion" — only `gis.contours.manage`,
-`gis.contours.approve` and `gis.layers.manage` (migration 0010's
-`ROLE_GRANTS` for `gis_specialist`), and none of the three fits. Per the
-brief's own instruction, this fails CLOSED — `ERR-ACL-001` for every caller,
-including the real `gis_specialist` role holding both of its own grants
-(`gis_specialist_client` below) — rather than being gated on a widened
-`applications.*` code invented for this route. `test_a_gis_conclusion_is_
-refused_pending_a_permission_code` pins that, in place of the brief's own
-`test_both_specialists_put_their_conclusions_on_the_record`, whose `kind="gis"`
-half assumed a permission that does not exist. This is a gap for
-`decisions.md`/`design/03` to close explicitly with a real code, not something
-this test suite can paper over.
+**`kind="gis"` was fail-closed until fix round 1.** The first draft of this
+task found no code in `gis`'s own registry (`app/modules/gis/permissions.py`
+registers only `gis.contours.manage`, `.approve` and `gis.layers.manage`,
+none of them a fit) and refused `kind="gis"` for every caller rather than
+widen one, flagging the gap for `decisions.md`/`design/03` to close. The
+controller ruling closed it: `applications.conclude_gis` is now a real code
+(owned by `applications`, the same reason `review`/`decide`/`assign` are
+too — the thing it authorises is a write on an APPLICATION), granted to
+`gis_specialist` by migration `0025` (amended, not a new revision — the
+branch is unmerged and this stage's own house rule is one revision per
+stage). `gis.contours.approve` was rejected as a stand-in: it would let a
+pure contour editor write conclusions on applications, a different
+authority. `test_both_specialists_put_their_conclusions_on_the_record` below
+is the brief's own Step-1 test, restored now that the route is reachable;
+`test_a_plain_hodim_cannot_write_a_gis_conclusion` pins that the new code
+actually gates — holding `applications.review` alone is not enough.
 """
 
 import uuid
@@ -35,34 +37,34 @@ from app.modules.applications import service
 from app.modules.norms.models import Calculation
 
 
-async def test_an_executor_conclusion_is_recorded(
-    hodim_client, executor_head_client, application_in_review
+async def test_both_specialists_put_their_conclusions_on_the_record(
+    hodim_client, gis_specialist_client, executor_head_client, application_in_review
 ) -> None:
-    """tz/04 С8: the head sees the hodim's conclusion before deciding."""
-    result = await hodim_client.post(
+    """tz/04 С8: the head sees both conclusions before deciding."""
+    a = await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/conclusion",
         json={"text": "Комплект полный", "kind": "executor", "recommendation": "approve"},
     )
-    assert result.status_code == 201, result.text
+    assert a.status_code == 201, a.text
+
+    b = await gis_specialist_client.post(
+        f"/api/v1/applications/{application_in_review}/conclusion",
+        json={"text": "Контур свободен", "kind": "gis", "recommendation": "approve"},
+    )
+    assert b.status_code == 201, b.text
 
     card = (await executor_head_client.get(f"/api/v1/applications/{application_in_review}")).json()
-    assert {c["kind"] for c in card["conclusions"]} == {"executor"}
-    assert card["conclusions"][0]["text"] == "Комплект полный"
-    assert card["conclusions"][0]["recommendation"] == "approve"
+    assert {c["kind"] for c in card["conclusions"]} == {"executor", "gis"}
 
 
-async def test_a_gis_conclusion_is_refused_pending_a_permission_code(
-    gis_specialist_client, application_in_review
+async def test_a_plain_hodim_cannot_write_a_gis_conclusion(
+    hodim_client, application_in_review
 ) -> None:
-    """`gis_specialist_client` is a real `gis_specialist` ROLE user, holding
-    every grant migrations 0010/0011 actually give that role (`gis.contours.
-    manage`, `gis.layers.manage`, `norms.manage` — and, notably, NOT
-    `applications.review`) — proving the gap is in the REGISTRY, not in one
-    fixture's grant list. `design/03` grants the GIS specialist their own
-    conclusion, but no permission code exists yet to gate it, so
-    `service.add_conclusion` fails closed rather than widening an
-    `applications.*` code invented for this route."""
-    result = await gis_specialist_client.post(
+    """`hodim_client` holds `applications.review` — enough for `kind="executor"`
+    (proven above) but nothing else. `applications.conclude_gis` is its own
+    code precisely so holding the OTHER one does not also open this branch;
+    resolving by code, never by "any staff permission will do"."""
+    result = await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/conclusion",
         json={"text": "Контур свободен", "kind": "gis", "recommendation": "approve"},
     )
@@ -152,13 +154,15 @@ async def test_recalculating_an_approved_application_is_refused(
 async def test_the_gis_specialist_cannot_recalculate(
     gis_specialist_client, application_in_review
 ) -> None:
-    """Owner decision, 2026-09-05: `/recalculate` is narrowed to "hodim or
-    head" — the GIS specialist writes their own `kind="gis"` conclusion
-    instead (design/03), never a re-price. The route-level
-    `require_any_permission(APPLICATIONS_REVIEW, APPLICATIONS_DECIDE)` answers
-    this with a legible 403 before `norms.service.save_calculation` is ever
-    reached — never the confusing 404 an unguarded route would give a
-    non-entitled caller."""
+    """Owner decision, 2026-09-05, unmoved by fix round 1: `/recalculate`
+    stays narrowed to "hodim or head" even now that the GIS specialist has a
+    real permission for their OWN route — `applications.conclude_gis` is not
+    in `_APPLICATION_RECALCULATE_CODES` and must not be added there. The GIS
+    specialist writes their `kind="gis"` conclusion instead (design/03),
+    never a re-price. The route-level `require_any_permission(APPLICATIONS_
+    REVIEW, APPLICATIONS_DECIDE)` answers this with a legible 403 before
+    `norms.service.save_calculation` is ever reached — never the confusing
+    404 an unguarded route would give a non-entitled caller."""
     result = await gis_specialist_client.post(
         f"/api/v1/applications/{application_in_review}/recalculate"
     )
