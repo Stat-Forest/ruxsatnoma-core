@@ -163,6 +163,82 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
     return result.scalar_one_or_none()
 
 
+async def list_versions(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    *,
+    zone: Any,
+    status: str | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[ContourVersion], int]:
+    """Every version of ONE contour, oldest first — draft through archived —
+    the discoverability gap `contour_card` (published only) never closed: a
+    specialist's own draft and review submission, and the version a rahbar
+    must approve, had no route at all (task defect 4a). `zone` is whatever
+    `abac.zone_filter` built off `Organization.region_id`/`district_id` and
+    `Contour.organization_id` — the SAME three columns `list_contours` checks
+    — so a version outside the actor's own zone is invisible here exactly as
+    a published contour outside it is invisible there; `status`, when given,
+    narrows to one (`?status=review` is "awaiting my approval"). Geometry is
+    never selected here (module docstring) — `version_detail` below is the
+    only place one version's own shape crosses into Python."""
+    conditions: list[Any] = [ContourVersion.contour_id == contour_id, zone]
+    if status is not None:
+        conditions.append(ContourVersion.status == status)
+    joined = (
+        select(ContourVersion.id)
+        .join(Contour, Contour.id == ContourVersion.contour_id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
+    rows = await db.execute(
+        select(ContourVersion)
+        .join(Contour, Contour.id == ContourVersion.contour_id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(*conditions)
+        .order_by(ContourVersion.version_no)
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars().all()), total
+
+
+async def version_detail(
+    db: AsyncSession, contour_id: uuid.UUID, version_id: uuid.UUID, *, zone: Any
+) -> Any | None:
+    """One version's full detail, geometry included (`ST_AsGeoJSON`, computed
+    in SQL — only the resulting STRING crosses into Python, module docstring)
+    — the other half of defect 4a: `VersionOut` carries no geometry at all,
+    so nothing could fetch one non-published version by id to actually look
+    at it. `zone` is the SAME condition `list_versions` applies; a version
+    outside it is indistinguishable from one that does not exist, matching
+    `contour_card`'s own not-found shape."""
+    result = await db.execute(
+        select(
+            ContourVersion.id,
+            ContourVersion.contour_id,
+            ContourVersion.version_no,
+            ContourVersion.status,
+            ContourVersion.source,
+            ContourVersion.area_ha,
+            ContourVersion.declared_area_ha,
+            ContourVersion.accuracy_m,
+            ContourVersion.survey_date,
+            ContourVersion.effective_from,
+            ContourVersion.approval_doc_id,
+            ContourVersion.approved_by,
+            ContourVersion.published_at,
+            func.ST_AsGeoJSON(ContourVersion.geom).label("geometry"),
+        )
+        .join(Contour, Contour.id == ContourVersion.contour_id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(ContourVersion.id == version_id, ContourVersion.contour_id == contour_id, zone)
+    )
+    return result.one_or_none()
+
+
 async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
     """The leshoz a contour is filed under, or None if there is no such contour.
     Identity only — no version, no geometry."""

@@ -133,6 +133,15 @@ class VersionOut(BaseModel):
         return _trim_decimal(value)
 
 
+class VersionDetailOut(VersionOut):
+    """`GET /gis/contours/{id}/versions/{version_id}` — task defect 4a's other
+    half: `VersionOut` alone carries no geometry, so a version id handed over
+    out of band still could not actually be looked at. Adds exactly one field
+    over the list row."""
+
+    geometry: dict[str, Any]
+
+
 class VersionPatch(BaseModel):
     """Draft-only metadata edits (service 409s otherwise). Geometry is never
     patched in place — a changed shape is a new version, by design."""

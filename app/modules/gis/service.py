@@ -1359,6 +1359,71 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
     }
 
 
+async def list_versions(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    *,
+    status: str | None,
+    params: PageParams,
+    actor: User,
+) -> tuple[list[ContourVersion], int]:
+    """`GET /gis/contours/{id}/versions` — task defect 4a: a contour version
+    awaiting approval had no route listing it at all, so the rahbar who must
+    approve it, and the specialist tracking their own submission, could only
+    be handed a version id out of band. Zone-scoped by the SAME three columns
+    `list_contours` checks (`Organization.region_id`/`district_id`,
+    `Contour.organization_id`) — a version outside the actor's zone stays
+    invisible here exactly as a published contour outside it is invisible on
+    the public list. Every status shows unless `status` narrows it; oldest
+    first, so the history reads in the order it was actually edited."""
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Contour.organization_id,
+    )
+    return await repo.list_versions(
+        db, contour_id, zone=zone, status=status, offset=params.offset, limit=params.page_size
+    )
+
+
+async def version_detail(
+    db: AsyncSession, contour_id: uuid.UUID, version_id: uuid.UUID, *, actor: User
+) -> dict[str, Any]:
+    """`GET /gis/contours/{id}/versions/{version_id}` — the other half of
+    defect 4a: `VersionOut` carries no geometry at all, so even a version id
+    handed over by hand could not actually be looked at. Same zone condition
+    as `list_versions`; a version outside it answers `ERR-SYS-003`, the same
+    not-found shape `contour_card` uses for a contour with no published
+    version — existence outside your own zone is not information this route
+    hands out."""
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Contour.organization_id,
+    )
+    row = await repo.version_detail(db, contour_id, version_id, zone=zone)
+    if row is None:
+        raise err("ERR-SYS-003")
+    return {
+        "id": row.id,
+        "contour_id": row.contour_id,
+        "version_no": row.version_no,
+        "status": row.status,
+        "source": row.source,
+        "area_ha": row.area_ha,
+        "declared_area_ha": row.declared_area_ha,
+        "accuracy_m": row.accuracy_m,
+        "survey_date": row.survey_date,
+        "effective_from": row.effective_from,
+        "approval_doc_id": row.approval_doc_id,
+        "approved_by": row.approved_by,
+        "published_at": row.published_at,
+        "geometry": json.loads(row.geometry),
+    }
+
+
 # --- The public surface for levels 3+ (this module's own docstring) ----------
 #
 # `published_version` lives in `repo` and `run_checks` in `checks`, and
