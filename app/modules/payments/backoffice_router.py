@@ -54,7 +54,7 @@ from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import PAGING_MAX, Page
-from app.modules.auth.deps import idempotency_context, require_permission
+from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service, statement_service
 from app.modules.payments.backoffice_schemas import (
@@ -69,7 +69,7 @@ from app.modules.payments.backoffice_schemas import (
     StatementLineOut,
     StatementOut,
 )
-from app.modules.payments.models import RECONCILIATION_STATUSES
+from app.modules.payments.models import MANUAL_CONFIRMATION_STATUSES, RECONCILIATION_STATUSES
 from app.modules.payments.permissions import PAYMENTS_CONFIRM, PAYMENTS_MANAGE, PAYMENTS_VIEW
 from app.modules.payments.statement_parser import OPTIONAL_FIELDS, REQUIRED_FIELDS
 
@@ -80,6 +80,7 @@ _KNOWN_FIELDS = frozenset(REQUIRED_FIELDS) | frozenset(OPTIONAL_FIELDS)
 # `RECONCILIATION_STATUSES` widens what this query parameter accepts with no
 # second edit required here.
 _STATUS_PATTERN = "^(" + "|".join(RECONCILIATION_STATUSES) + ")$"
+_MANUAL_CONFIRMATION_STATUS_PATTERN = "^(" + "|".join(MANUAL_CONFIRMATION_STATUSES) + ")$"
 
 
 def _parse_column_map(raw: str) -> dict[str, str]:
@@ -286,6 +287,37 @@ async def resolve_reconciliation(
 # minting a marker row. The routes that DO need one are those whose replay
 # would create a second row nothing refuses (`POST /payments/bank-statements`
 # above, `POST /invoices/{id}/pay-intents`).
+
+
+@router.get("/manual-confirmations", response_model=Page[ManualConfirmationOut])
+async def list_manual_confirmations(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    # Both roles that can act on a filing need to find it: the maker tracking
+    # their own submission (`payments.manage`) and the checker whose worklist
+    # this IS (`payments.confirm`) — task defect 4b, the maker previously
+    # handed the invoice id to the checker by hand.
+    actor: Annotated[User, Depends(require_any_permission(PAYMENTS_MANAGE, PAYMENTS_CONFIRM))],
+    status: Annotated[
+        str, Query(pattern=_MANUAL_CONFIRMATION_STATUS_PATTERN)
+    ] = MANUAL_CONFIRMATION_STATUSES[0],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
+) -> Any:
+    """The checker's own worklist: every `pending_check` filing by default,
+    oldest first — mirrors `list_reconciliations`'s open-by-default shape —
+    or `?status=confirmed`/`?status=rejected` for what has already been
+    decided. Zone-scoped like every list in this system (fails closed);
+    `backoffice_service.list_manual_confirmations`'s own docstring explains
+    why that happens per row rather than in this query."""
+    rows, total = await backoffice_service.list_manual_confirmations(
+        db, status=status, limit=limit, offset=offset, actor=actor
+    )
+    return Page[ManualConfirmationOut](
+        items=[ManualConfirmationOut.model_validate(row) for row in rows],
+        total=total,
+        page=offset // limit + 1,
+        page_size=limit,
+    )
 
 
 @router.post("/manual-confirmations", status_code=201, response_model=FiledManualConfirmationOut)

@@ -521,6 +521,25 @@ async def get_pending_manual_confirmation(
     ).first()
 
 
+async def list_manual_confirmations(
+    db: AsyncSession, *, status: str | None
+) -> Sequence[ManualPaymentConfirmation]:
+    """Every manual confirmation, oldest first — `GET /payments/manual-
+    confirmations`, task defect 4b: the maker had no way to hand the checker
+    anything but the invoice id by hand. No pagination here: this table
+    carries no `organization_id` of its own, so zone scoping happens in the
+    SERVICE, per row, through each row's invoice (`backoffice_service`'s own
+    zone helper — the same per-row shape decision #70 already established
+    for exactly this application-only relationship); the service slices the
+    page only after that filter, which a SQL `OFFSET`/`LIMIT` here could not
+    honour correctly."""
+    stmt = select(ManualPaymentConfirmation)
+    if status is not None:
+        stmt = stmt.where(ManualPaymentConfirmation.status == status)
+    rows = await db.scalars(stmt.order_by(ManualPaymentConfirmation.created_at))
+    return list(rows)
+
+
 # --- 3.10b task 9: refunds -----------------------------------------------
 
 

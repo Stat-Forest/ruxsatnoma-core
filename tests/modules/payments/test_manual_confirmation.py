@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
 from app.main import create_app
+from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User
@@ -739,3 +740,126 @@ async def test_a_sys_admin_may_not_check_its_own_filing(
         assert row.checker_id is None
         await db.refresh(pending_invoice)
         assert pending_invoice.status == "pending"
+
+
+# --- Task defect 4b: a pending confirmation was undiscoverable ---------------
+#
+# No route listed pending manual confirmations, so the maker handed the
+# invoice id to the checker by hand — the payments-side twin of gis's own
+# undiscoverable contour version (task defect 4a), fixed as one pattern:
+# `GET /payments/manual-confirmations`, permission-gated on either role that
+# can act on a filing, zone-scoped like every other list.
+
+
+async def test_the_checker_finds_a_pending_filing_without_being_handed_the_id(
+    payments_view_client, head_client, pending_invoice: Invoice, bank_doc: MediaFile
+):
+    filed = await _file_via_http(payments_view_client, pending_invoice, bank_doc)
+
+    # Default `?status=` is `pending_check` — the checker's own worklist.
+    listed = await head_client.get(MANUAL_CONFIRMATIONS)
+    assert listed.status_code == 200, listed.text
+    ids = {item["id"] for item in listed.json()["items"]}
+    assert filed["id"] in ids
+
+    confirmed = await head_client.post(f"{MANUAL_CONFIRMATIONS}/{filed['id']}/confirm")
+    assert confirmed.status_code == 200, confirmed.text
+
+    # Confirmed, it drops off the default (pending) worklist and shows under
+    # its own status instead — never silently disappearing.
+    after = await head_client.get(MANUAL_CONFIRMATIONS)
+    assert filed["id"] not in {item["id"] for item in after.json()["items"]}
+    resolved = await head_client.get(f"{MANUAL_CONFIRMATIONS}?status=confirmed")
+    assert filed["id"] in {item["id"] for item in resolved.json()["items"]}
+
+
+async def test_the_maker_can_also_list_their_own_filing(
+    payments_view_client, pending_invoice: Invoice, bank_doc: MediaFile
+):
+    """Both roles that can act on a filing need to find it (mirrors gis's
+    `require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE)`)."""
+    filed = await _file_via_http(payments_view_client, pending_invoice, bank_doc)
+    listed = await payments_view_client.get(MANUAL_CONFIRMATIONS)
+    assert filed["id"] in {item["id"] for item in listed.json()["items"]}
+
+
+async def test_a_stranger_with_neither_role_is_refused(applicant_client):
+    response = await applicant_client.get(MANUAL_CONFIRMATIONS)
+    assert response.status_code == 403, response.text
+
+
+async def test_manual_confirmations_are_zone_scoped(
+    db: AsyncSession, bank_doc: MediaFile, applicant
+):
+    """A filing whose invoice's application belongs to one leshoz stays
+    invisible to a maker/checker zoned to a DIFFERENT one, exactly the shape
+    `test_invoice_zone.py` proves for reading and paying the invoice itself
+    (decision #70). Built locally rather than importing that file's fixtures:
+    this needs BOTH an `accountant` (maker) and an `executor_head` (checker)
+    zoned to the SAME leshoz, which that file has no reason to define."""
+    from contextlib import asynccontextmanager
+
+    from app.db import uuid7
+    from tests.modules.payments.conftest import _new_approved_application
+
+    async def _leshoz(label: str) -> Organization:
+        existing_agency = (
+            await db.execute(select(Organization).where(Organization.kind == "agency"))
+        ).scalar_one_or_none()
+        agency = existing_agency
+        if agency is None:
+            agency = Organization(
+                id=uuid7(),
+                code=f"A{uuid.uuid4().hex[:8]}",
+                kind="agency",
+                name={"uz_cyrl": "Агентлик", "uz_latn": "Agentlik"},
+            )
+            db.add(agency)
+            await db.flush()
+        org = Organization(
+            id=uuid7(),
+            parent_id=agency.id,
+            code=f"L{uuid.uuid4().hex[:8]}",
+            kind="leshoz",
+            name={"uz_cyrl": label, "uz_latn": label},
+        )
+        db.add(org)
+        await db.flush()
+        return org
+
+    @asynccontextmanager
+    async def _role_client_in(role_code: str, org: Organization):
+        user = await make_user(db, role_code=role_code, organization_id=org.id)
+        _, token, csrf = await make_session(db, user)
+        await db.commit()
+        async with make_client(create_app(), lifespan=True) as client:
+            auth_client(client, token, csrf)
+            _commit_pending_before_requests(client, db)
+            yield client
+
+    home = await _leshoz("Burchmulla-4b")
+    away = await _leshoz("Chimyon-4b")
+
+    application = await _new_approved_application(db, applicant)
+    application.assigned_org_id = home.id
+    await db.flush()
+    home_invoice = Invoice(
+        application_id=application.id,
+        number=f"INV-2027-{uuid.uuid4().hex[:6]}",
+        amount=Decimal("100.00"),
+        status="pending",
+    )
+    db.add(home_invoice)
+    await db.flush()
+    await db.commit()
+
+    async with _role_client_in("accountant", home) as home_maker:
+        filed = await _file_via_http(home_maker, home_invoice, bank_doc)
+
+    async with _role_client_in("executor_head", away) as away_checker:
+        away_listed = await away_checker.get(MANUAL_CONFIRMATIONS)
+        assert filed["id"] not in {item["id"] for item in away_listed.json()["items"]}
+
+    async with _role_client_in("executor_head", home) as home_checker:
+        home_listed = await home_checker.get(MANUAL_CONFIRMATIONS)
+        assert filed["id"] in {item["id"] for item in home_listed.json()["items"]}

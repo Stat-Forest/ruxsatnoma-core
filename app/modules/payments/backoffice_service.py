@@ -30,10 +30,12 @@ from typing import Any, NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.abac import Zone, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
 from app.core.time import add_working_days, business_today
 from app.modules.admin import repo as admin_repo
+from app.modules.admin.models import Organization as OrganizationRow
 from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
@@ -545,6 +547,81 @@ async def _confirm_and_pay(
             object_type="invoice",
             object_id=invoice.id,
         )
+
+
+# The safety bound below `list_manual_confirmations` scans per zoned request —
+# a maker files these ONE AT A TIME (never a bulk import, unlike bank
+# statement lines), so a real worklist is small; this only stops a runaway
+# scan from becoming a request nobody can answer, and is not a real page a
+# leshoz would ever approach.
+_MANUAL_CONFIRMATIONS_ZONE_SCAN_CAP = 500
+
+
+def _organization_in_zone(zone: Zone, org: OrganizationRow) -> bool:
+    """Per-row equivalent of `zone_filter`'s SQL for ONE organization row — a
+    LOCAL copy of the identical helper in `payments.service`/`gis.service`/
+    `norms.service`, for the same reason they each keep their own: it is not
+    part of any module's declared public surface, so this file (a sibling
+    inside the SAME module) does not reach into `service.py`'s private name
+    either."""
+    if zone.region_id is not None and zone.region_id != org.region_id:
+        return False
+    if zone.district_id is not None and zone.district_id != org.district_id:
+        return False
+    if zone.organization_id is not None and zone.organization_id != org.id:
+        return False
+    return True
+
+
+async def _confirmation_in_zone(
+    db: AsyncSession, confirmation: ManualPaymentConfirmation, *, zone: Zone
+) -> bool:
+    """Whether a manual confirmation's own invoice sits inside this zone —
+    `payments.service._zone_covers_application`'s own reasoning (decision
+    #70: an invoice belongs to a leshoz only through its application), given
+    a starting POINT of a `manual_payment_confirmations` row rather than an
+    invoice id, since that is what `list_manual_confirmations` iterates.
+    Fails closed: an invoice this table no longer names, or an application
+    that cannot be placed in any zone at all, is excluded for a zoned actor
+    rather than shown (an unplaceable row must never read as "everyone's")."""
+    invoice = await repo.get_invoice(db, confirmation.invoice_id)
+    if invoice is None:
+        return False
+    organization_id = await applications_service.effective_organization(db, invoice.application_id)
+    if organization_id is None:
+        return False
+    org = await admin_repo.get_organization(db, organization_id)
+    return org is not None and _organization_in_zone(zone, org)
+
+
+async def list_manual_confirmations(
+    db: AsyncSession, *, status: str | None, limit: int, offset: int, actor: Any
+) -> tuple[list[ManualPaymentConfirmation], int]:
+    """`GET /payments/manual-confirmations` — task defect 4b: the maker had
+    no way to hand the checker anything but the invoice id by hand, so a
+    pending filing was discoverable only out of band. Defaults to
+    `pending_check` (the checker's own worklist, oldest first — mirrors
+    `list_reconciliations`'s open-by-default shape); `status` narrows or
+    widens it to any of `MANUAL_CONFIRMATION_STATUSES`.
+
+    Zone-scoped like every other list in this system (fails closed), but
+    PER ROW rather than by `abac.zone_filter` in SQL: `manual_payment_
+    confirmations` carries no organization column of its own, and
+    `payments` may not join into `applications`' tables to build one (module
+    boundary) — the same reason `_may_act_on_invoices_of` checks a single
+    invoice per row instead of a joined query. A republic-wide actor (empty
+    zone: `sys_admin`, a central accountant) skips the scan entirely and
+    paginates in SQL, the common case costing no extra query at all — the
+    same short-circuit `_zone_covers_application` itself uses."""
+    rows = list(await repo.list_manual_confirmations(db, status=status))
+    zone = zone_of(actor)
+    if zone != Zone(None, None, None):
+        visible = []
+        for row in rows[:_MANUAL_CONFIRMATIONS_ZONE_SCAN_CAP]:
+            if await _confirmation_in_zone(db, row, zone=zone):
+                visible.append(row)
+        rows = visible
+    return rows[offset : offset + limit], len(rows)
 
 
 # --- Task 9: refunds -----------------------------------------------------
