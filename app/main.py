@@ -31,6 +31,7 @@ from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
 from app.modules.applications.router import router as applications_router
 from app.modules.auth.router import router as auth_router
+from app.modules.dashboard.router import router as dashboard_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
@@ -41,6 +42,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.oversight.router import router as oversight_router
 from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
 from app.modules.payments.refunds_router import router as refunds_router
@@ -301,5 +303,8 @@ def create_app() -> FastAPI:
     # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
     # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
     app.include_router(permits_public_router, prefix="/api/v1")
+    # 4.2/4.4 — level-5 readers, no writes of their own beyond an audit trail.
+    app.include_router(oversight_router, prefix="/api/v1")
+    app.include_router(dashboard_router, prefix="/api/v1")
 
     return app
