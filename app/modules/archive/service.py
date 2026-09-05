@@ -127,30 +127,36 @@ async def archive_object(
     object_id: uuid.UUID,
     retention_until: date | None,
 ) -> ArchiveItem:
+    # Zone BEFORE status, on both branches — the same order `permits.service`
+    # settled on after its own review found `issue_duplicate` checking status
+    # first and telling an out-of-zone caller more than "not yours" (decision
+    # #69): existence (404) is unavoidably first, since the organization to
+    # check against comes off the row itself, but everything after that is
+    # zone, then eligibility, never the reverse.
     if object_type == "application":
         application = await applications_service.get(db, object_id)
         if application is None:
             raise err("ERR-SYS-003")
+        organization_id = application.assigned_org_id
+        await _assert_in_zone(db, actor, organization_id)
         if application.status not in _ELIGIBLE_APPLICATION_STATUSES:
             raise err(
                 "ERR-ARCH-001",
                 details={"reason": "not_archivable_status", "status": application.status},
             )
-        organization_id = application.assigned_org_id
-        await _assert_in_zone(db, actor, organization_id)
         snapshot = _snapshot_application(application)
         target_status = "ARCHIVED"
     elif object_type == "permit":
         permit = await permits_service.get(db, object_id)
         if permit is None:
             raise err("ERR-SYS-003")
+        organization_id = permit.organization_id
+        await _assert_in_zone(db, actor, organization_id)
         if permit.status not in _ELIGIBLE_PERMIT_STATUSES:
             raise err(
                 "ERR-ARCH-001",
                 details={"reason": "not_archivable_status", "status": permit.status},
             )
-        organization_id = permit.organization_id
-        await _assert_in_zone(db, actor, organization_id)
         snapshot = _snapshot_permit(permit)
         target_status = "archived"
     else:  # pragma: no cover — the router's Literal already refuses this

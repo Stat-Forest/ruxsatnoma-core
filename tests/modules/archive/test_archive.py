@@ -77,6 +77,25 @@ async def test_zone_scoped_actor_cannot_archive_another_orgs_application(db, les
         assert resp.json()["error"]["code"] == "ERR-ACL-002"
 
 
+async def test_zone_wins_over_status_when_both_would_refuse(db, leshoz, other_leshoz):
+    """Zone is checked BEFORE eligibility (fix round, this track's own review):
+    an out-of-zone actor must learn only "not yours", never anything about the
+    object's status — the same ordering `permits.service` settled on after
+    `issue_duplicate` originally leaked the opposite way (decision #69)."""
+    application = await make_application(
+        db,
+        org=other_leshoz,
+        status="DRAFT",
+        applicant_name="A A",  # also status-ineligible
+    )
+    await db.commit()
+
+    async for client in _client_for(db, ARCHIVE_MANAGE, organization_id=leshoz.id):
+        resp = await client.post(f"/api/v1/archive/application/{application.id}", json={})
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "ERR-ACL-002"
+
+
 async def test_zone_scoped_actor_does_not_see_another_orgs_item_in_the_list(
     db, leshoz, other_leshoz
 ):
