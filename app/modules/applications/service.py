@@ -2928,8 +2928,13 @@ async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
     Both are read through `signatures.service.get_for_object` — never by
     querying that module's table (module boundary, CLAUDE.md).
 
-    `info_requests` is `[]` and present: the table exists and nothing writes it
-    before 3.9b, so shipping the key now means 3.9b widens the DATA and not the
+    **`info_requests` is populated (final whole-branch review, IMPORTANT)**:
+    open or closed, oldest first (`repo.list_info_requests`). The pause it
+    records is the one event on this branch that silently moves a
+    legally-consequential deadline (`sla_deadline_at`, `sla.shift_deadline`),
+    and this is the only audit view an inspector or the applicant reads — a
+    deadline that jumped with no explanation anywhere in the timeline was the
+    actual defect the empty list used to hide, not merely an unfinished
     contract.
     """
     application = await _readable_application(db, application_id, actor=actor)
@@ -2950,8 +2955,7 @@ async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
         "signatures": await signatures_service.get_for_object(
             db, object_type=DECISION_OBJECT_TYPE, object_id=application.id
         ),
-        # 3.9b's, and empty by contract until then — see the docstring.
-        "info_requests": [],
+        "info_requests": await repo.list_info_requests(db, application.id),
     }
 
 

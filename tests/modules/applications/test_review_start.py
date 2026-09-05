@@ -181,7 +181,7 @@ async def test_the_timeline_resolves_the_submission_signature_to_its_own_entry(
 
     assert by_status["DRAFT"]["signatures"] == []
     assert timeline["signatures"] == [], "no decision signature exists yet"
-    assert timeline["info_requests"] == [], "the key is a contract 3.9b widens"
+    assert timeline["info_requests"] == [], "no request-info has been opened on this application"
 
 
 async def test_the_out_of_zone_refusal_is_territorial_and_leaves_an_ri_12_trail(

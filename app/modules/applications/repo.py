@@ -569,3 +569,19 @@ async def add_info_request(db: AsyncSession, info_request: InfoRequest) -> None:
     status UPDATE) surface together with this INSERT."""
     db.add(info_request)
     await db.flush()
+
+
+async def list_info_requests(db: AsyncSession, application_id: uuid.UUID) -> Sequence[InfoRequest]:
+    """Every `info_requests` row this application has ever had, oldest first —
+    open or closed alike, the same "the register is the record of who held it
+    when" reasoning `list_assignments` states for its own superseded rows.
+    `service.timeline`'s own consumer (final whole-branch review, IMPORTANT):
+    the pause is the one event on this branch that silently moves a
+    legally-consequential deadline, and it belongs in the only audit view an
+    inspector reads."""
+    stmt = (
+        select(InfoRequest)
+        .where(InfoRequest.application_id == application_id)
+        .order_by(InfoRequest.requested_at, InfoRequest.id)
+    )
+    return (await db.execute(stmt)).scalars().all()

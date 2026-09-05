@@ -141,3 +141,47 @@ async def test_an_info_response_document_is_not_accepted_as_benefit_proof(
     assert error["details"]["reason"] == "benefit_claim_needs_a_document", (
         "the info-response document must not count as proof of the benefit claim"
     )
+
+
+async def test_the_timeline_lists_the_pause_open_and_then_closed(
+    hodim_client, applicant_client, application_in_review
+) -> None:
+    """Final whole-branch review, IMPORTANT: the pause is the one event on
+    this branch that silently moves a legally-consequential deadline
+    (`sla_deadline_at`), and it used to appear NOWHERE in the only audit view
+    — `GET /timeline`'s `info_requests` stayed `[]` by contract even after
+    task 4 started writing the table. An inspector reading the timeline while
+    the pause was open would have seen no explanation at all for a stalled
+    file; one reading it afterwards would have seen no explanation for why
+    the deadline had moved."""
+    opened = (
+        await hodim_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    assert opened["info_requests"] == []
+
+    await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/request-info",
+        json={"message": "Уточните состав стада"},
+    )
+
+    while_open = (
+        await applicant_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    assert len(while_open["info_requests"]) == 1
+    pending = while_open["info_requests"][0]
+    assert pending["message"] == "Уточните состав стада"
+    assert pending["responded_at"] is None, "still open — nothing has answered it yet"
+
+    await applicant_client.post(
+        f"/api/v1/applications/{application_in_review}/respond-info",
+        json={"text": "40 голов", "file_ids": []},
+    )
+
+    after_close = (
+        await hodim_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    assert len(after_close["info_requests"]) == 1, "the same row, closed, not a second one"
+    closed = after_close["info_requests"][0]
+    assert closed["id"] == pending["id"]
+    assert closed["response_text"] == "40 голов"
+    assert closed["responded_at"] is not None

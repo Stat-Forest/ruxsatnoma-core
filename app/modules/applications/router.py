@@ -467,7 +467,8 @@ async def get_application_timeline(
     A SUBMISSION signature sits on its own `status_history` entry (ruling 25:
     the history row's id IS the signed object's id); the top-level `signatures`
     is the DECISION line, and is empty until task 7's approve/reject signs one.
-    `info_requests` is `[]` until 3.9b writes that table.
+    `info_requests` lists every pause this application has had, open or closed,
+    oldest first.
 
     404 `ERR-SYS-003` for an id that does not exist, for an application this
     caller has no claim on, and for one outside a staff caller's zone — the same

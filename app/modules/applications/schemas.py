@@ -578,6 +578,24 @@ class TimelineHistoryRow(BaseModel):
         )
 
 
+class TimelineInfoRequestRow(BaseModel):
+    """One row of the `info_requests` register — final whole-branch review,
+    IMPORTANT: the pause it records is the one event on this branch that
+    silently moves a legally-consequential deadline (`sla_deadline_at`), and
+    this is the only audit view that shows it happened at all. `responded_at`/
+    `response_text` are `None` for a still-open pause, the same shape the
+    table itself carries."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    requested_by: uuid.UUID
+    message: str
+    requested_at: datetime
+    responded_at: datetime | None
+    response_text: str | None
+
+
 class TimelineAssignmentRow(BaseModel):
     """One row of the assignment register — who held the application, from when,
     and whether they still do.
@@ -609,13 +627,14 @@ class ApplicationTimelineOut(BaseModel):
     each sits on its own `status_history` entry, which is the whole point of
     ruling 25 giving the history row and the signed object the same id.
 
-    `info_requests` is present and empty until 3.9b writes the table.
+    `info_requests` lists every pause this application has had, open or
+    closed, oldest first (final whole-branch review, IMPORTANT).
     """
 
     status_history: list[TimelineHistoryRow]
     assignments: list[TimelineAssignmentRow]
     signatures: list[TimelineSignatureRow]
-    info_requests: list[Any] = []
+    info_requests: list[TimelineInfoRequestRow]
 
     @classmethod
     def build(cls, timeline: dict[str, Any]) -> ApplicationTimelineOut:
@@ -628,7 +647,9 @@ class ApplicationTimelineOut(BaseModel):
                 TimelineAssignmentRow.model_validate(row) for row in timeline["assignments"]
             ],
             signatures=[TimelineSignatureRow.model_validate(row) for row in timeline["signatures"]],
-            info_requests=timeline["info_requests"],
+            info_requests=[
+                TimelineInfoRequestRow.model_validate(row) for row in timeline["info_requests"]
+            ],
         )
 
 
