@@ -406,6 +406,50 @@ async def test_a_replayed_key_returns_the_stored_response_and_not_a_second_numbe
     )
 
 
+async def test_a_same_key_retry_after_a_refused_submission_replays_it_not_in_flight(
+    applicant_client,
+) -> None:
+    """The applicant-visible half of `core/idempotency.py`'s exception-path fix
+    (3.9b task 3, ANSWERED а, 2026-09-05). `_submit` above mints a FRESH key on
+    EVERY call, which is exactly how this defect stayed hidden: a route that
+    RAISED instead of returning left `response_status` NULL, so the very next
+    call with the SAME key hit 409 `in_flight` for the whole `IN_FLIGHT_TTL` —
+    even though the refusal (an incomplete draft, here) was the applicant's own
+    to fix, the entire point of reusing an idempotency key.
+
+    A SAME-key retry must replay the identical 400 `ERR-APP-001`; a DIFFERENT
+    key must proceed on its own merits rather than being caught up in the
+    first attempt's failure.
+    """
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    app_id = created.json()["id"]
+    key = str(uuid.uuid4())
+
+    first = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 400, first.text
+    assert first.json()["error"]["code"] == "ERR-APP-001"
+
+    replay = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": key},
+    )
+    assert replay.status_code == 400, replay.text
+    assert replay.json() == first.json(), "the SAME key must replay, never hit in_flight"
+
+    retried = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert retried.status_code == 400, retried.text
+    assert retried.json()["error"]["code"] == "ERR-APP-001"
+
+
 async def test_an_incomplete_draft_is_refused_400_naming_the_missing_fields(
     applicant_client, published_contour
 ) -> None:

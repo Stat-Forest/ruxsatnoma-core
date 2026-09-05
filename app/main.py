@@ -153,10 +153,24 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
-        return JSONResponse(
-            status_code=exc.http_status,
-            content=_error_body(request, exc.code, exc.message, exc.details),
-        )
+        body = _error_body(request, exc.code, exc.message, exc.details)
+        # 3.9b task 3 (ANSWERED а, 2026-09-05): close the idempotency record on
+        # the EXCEPTION path too, mirroring `IdempotencyContext.save()`'s own
+        # success-path call. `auth.deps.idempotency_context` stashes `ctx` on
+        # `request.state` right after `begin()` returns it; a route that never
+        # reached that dependency (or whose ctx.save() already ran) leaves the
+        # attribute unset, so this is a no-op there. The route's own `db` is
+        # already rolled back and closed by this point (`get_db`'s `except
+        # BaseException: await session.rollback(); raise` already ran), so the
+        # write goes through a FRESH session and commits it itself — mirroring
+        # the commit `begin()` performs on a fresh insert, so the closed record
+        # is visible to the very next retry with the SAME key.
+        ctx = getattr(request.state, "idempotency_ctx", None)
+        if ctx is not None:
+            async with request.app.state.session_factory() as fresh_db:
+                await ctx.save(fresh_db, status_code=exc.http_status, body=body)
+                await fresh_db.commit()
+        return JSONResponse(status_code=exc.http_status, content=body)
 
     @app.exception_handler(StoredIdempotentResponse)
     async def stored_idempotent_handler(request: Request, exc: StoredIdempotentResponse):

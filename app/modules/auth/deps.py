@@ -219,7 +219,17 @@ async def idempotency_context(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> IdempotencyContext:
     """Idempotency-Key header → context (design/03: mandatory on critical POSTs).
-    Routes that declare this dependency must call ctx.save() before returning."""
+    Routes that declare this dependency must call ctx.save() before returning.
+
+    Stashed on `request.state.idempotency_ctx` right after `begin()` returns it
+    (3.9b task 3, ANSWERED а, 2026-09-05): `app/main.py`'s `domain_error_handler`
+    reads it back to close the record on the EXCEPTION path too. Without this,
+    a route that raised instead of returning left `response_status` NULL
+    forever, and `begin()`'s own `in_flight` branch then refused every retry
+    with the SAME key for the whole `IN_FLIGHT_TTL` — even a corrected retry
+    that would have succeeded (`core/idempotency.py`'s own module docstring
+    and `main.py`'s handler carry the other half of this fix).
+    """
     raw = request.headers.get("Idempotency-Key")
     if raw is None:
         raise err("ERR-VAL-001", details={"reason": "idempotency_key_required"})
@@ -228,6 +238,8 @@ async def idempotency_context(
     except ValueError:
         raise err("ERR-VAL-001", details={"reason": "idempotency_key_not_uuid"}) from None
     body = await _fingerprint_body(request)
-    return await begin(
+    ctx = await begin(
         db, key=key, user_id=user.id, method=request.method, path=request.url.path, body=body
     )
+    request.state.idempotency_ctx = ctx
+    return ctx
