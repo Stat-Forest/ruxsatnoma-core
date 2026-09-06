@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import DomainError, err
 from app.core.models import MediaFile
@@ -357,6 +358,253 @@ async def create_version(
         new_value={"contour_id": str(contour_id), "version_no": version_no},
     )
     return version
+
+
+# --- Split: one parent contour into two subcontours (decision #91) ----------
+#
+# `POST /gis/contours/{parent_id}/split`, `CONTOURS_MANAGE` (the same
+# permission `create_contour`/`create_version` require — the specialist draws
+# a split themselves; the two resulting drafts are approved later through the
+# ordinary lifecycle, same as any other new version). Replaces the adminka's
+# own client-composed `createContour` + `createVersion`, twice, which decision
+# #91's own text names as "not atomic": a failure between the two calls left
+# one new contour and no second, with nothing telling the operator which half
+# actually happened.
+#
+# **The parent's own row and its published version are untouched by this
+# call.** Decision #91 chose "the parent stays" over "replace the parent's
+# geometry with two new contours" precisely so a permit issued before the
+# split keeps pointing at something that still exists and can be read; this
+# function does not go further and archive or edit that published version
+# either — it stays published, at its own area and geometry, exactly as
+# `create_contour` left every other contour it never touches. Two
+# consequences follow from leaving it alone rather than superseding it:
+#
+#   1. `ERR-GIS-005 active_permit_on_parent` below refuses a split while the
+#      occupancy seam reports ANY active permit against the parent, so by the
+#      time a split succeeds nothing live still depends on the parent's
+#      geometry meaning "the whole area" — only closed history does, and
+#      closed history is exactly what decision #91 says must keep reading.
+#   2. The two new subcontours' geometry sits entirely INSIDE the parent's
+#      still-published one, so `checks._overlap` (parent vs. child, both
+#      published) WOULD fail if a specialist tried to publish a child version
+#      without first archiving the parent's own — `archive_version`, already
+#      on this router, is how that is done today, deliberately a SEPARATE,
+#      auditable act by the rahbar (`CONTOURS_APPROVE`) rather than something
+#      this call does silently on the specialist's behalf. Documented here,
+#      not fixed here: retiring the parent's published version the moment a
+#      split is confirmed useful would also make undoing a split (decision
+#      #91's own "an undo is deleting two children") no longer a plain
+#      delete, since the parent's version would need un-archiving too. Left
+#      for whoever wires the adminka's own split screen to decide, informed
+#      by how operators actually use this endpoint.
+#
+# Every one of the four checks below is a distinct, named refusal (task
+# brief): `already_split`/`parent_not_published`/`active_permit_on_parent`
+# share `ERR-GIS-005` (409) — a conflict with the PARENT's own current state,
+# the exact category that code already covers for `create_contour`/
+# `create_version`/the lifecycle actions; the geometry-partition failures
+# below share the new `ERR-GIS-006` (422) — a defect in the SUBMITTED
+# GEOMETRY, not a state conflict, mirroring how `ERR-GIS-001`/`ERR-VAL-001`
+# already carry several named `reason`s apiece rather than minting one code
+# per distinct mistake a caller can make.
+
+
+async def split_contour(
+    db: AsyncSession,
+    parent_id: uuid.UUID,
+    *,
+    actor: User,
+    piece_a: Mapping[str, Any],
+    piece_b: Mapping[str, Any],
+    source: str,
+    accuracy_m: Decimal | None = None,
+    survey_date: date | None = None,
+    effective_from: date | None = None,
+) -> tuple[Contour, ContourVersion, Contour, ContourVersion]:
+    """Create both subcontours and their first (draft) versions, or neither.
+
+    **Geometry is computed CLIENT-SIDE, validated SERVER-SIDE.** The adminka's
+    `splitContour.ts` already cuts a polygon with a line (buffer the line into
+    a thin blade, subtract it with `@turf/difference`), tested six ways —
+    re-deriving that in PostGIS would duplicate an already-tested algorithm
+    for no gain, and PostGIS ships no dedicated "split by line" primitive of
+    its own to begin with (SFCGAL's `ST_Split` is not part of this project's
+    stack). What atomicity actually needs is not a second cutting engine —
+    it is ONE place that persists both pieces together or not at all, and a
+    check that neither piece is wrong in a way the client's own turf logic
+    could not have caught (a stale drawing, a bug, or a client that skips
+    validation entirely). `repo.split_partition_metrics` is that check: it
+    normalises both submitted pieces through the SAME pipeline
+    `insert_version` stores through, then asks PostGIS whether they
+    genuinely partition the parent's own published geometry — no gap, no
+    overlap beyond this module's own tolerance setting
+    (`gis_overlap_tolerance_m2`, the same one `checks._overlap` already
+    reads: ruling 15's "a shared border is a touch of zero area" applies to
+    two subcontours' shared edge exactly as it applies to two unrelated
+    contours').
+
+    Refusals, checked in this order (identity/state first, the one
+    PostGIS round trip last):
+
+    - `ERR-GIS-005 already_split` — `parent_id` already has at least one
+      child. A second split would leave the hierarchy ambiguous about which
+      pair of subcontours is the authoritative one.
+    - `ERR-GIS-005 parent_not_published` — nothing to partition yet: a draft
+      or never-drawn contour has no geometry of record for the two pieces to
+      reconstruct.
+    - `ERR-GIS-005 active_permit_on_parent` — the occupancy seam
+      (`occupancy_ha`, filled by `permits.service.occupancy_provider` per
+      `app/event_subscriptions.py`; ZERO through this seam with nothing
+      registered, never read as "safe to split") reports non-zero occupancy:
+      something live still depends on the parent meaning the whole area, so
+      the split is refused rather than leaving that permit's occupancy
+      pointing at a footprint now nominally divided in two. This is the one
+      check on this list that reaches `permits` at all, and it does so
+      ONLY through this pre-existing provider registry, never by importing
+      `permits.repo`/`.models` (module layering, `docs/design/01`).
+    - `ERR-GIS-006 piece_zero_area` — a submitted piece normalises to nothing
+      (`repo.split_partition_metrics` reports `None` for its area).
+    - `ERR-GIS-006 pieces_overlap` — the two pieces' mutual intersection
+      exceeds tolerance: not a shared border, a real overlap.
+    - `ERR-GIS-006 pieces_do_not_cover_parent` — the two pieces' union misses
+      part of the parent, or extends outside it, beyond tolerance (the SAME
+      number catches both directions of mismatch — see
+      `repo.split_partition_metrics`'s own docstring).
+
+    Malformed GeoJSON in either piece surfaces as `ERR-GIS-001
+    unreadable_geometry` — the exact code/reason `create_version` already
+    uses for the same PostGIS parse failure (`ST_GeomFromGeoJSON`'s SQLSTATE
+    class XX raise), never a split-specific code for what is the same defect
+    everywhere else in this module.
+
+    Once every check passes, both subcontours and their first versions are
+    created through `create_contour`/`create_version` THEMSELVES — never a
+    parallel insert path — so a split produces identity rows and audit
+    entries (`contour.create` × 2, `contour_version.create` × 2)
+    indistinguishable from two hand-drawn subcontours, and any future change
+    to either function (a new validation, a new audit field) covers a split
+    automatically. Both new versions start `draft`, like any other new
+    version — the Draft → Review → Approved → Published lifecycle is not
+    bypassed; a specialist still submits each for review and a rahbar still
+    approves and publishes each, independently (one piece can be published
+    before the other, and either can be sent back for rework without
+    disturbing its sibling). One extra audit row, `contour.split`, ties the
+    two pairs together under the parent's own id — without it, confirming
+    "these two contours came from the same split" would mean correlating
+    four separate rows by timestamp alone.
+
+    A failure anywhere in this sequence — a duplicate `number`
+    (`ERR-GIS-005 number_taken`, from `create_contour`'s own existing
+    handling) or anything else — raises immediately and creates nothing:
+    `get_db` rolls back the WHOLE transaction on any exception (`app/core/
+    deps.py`), so a duplicate number on the SECOND piece undoes the first
+    piece's already-flushed insert too. This is what makes the endpoint
+    atomic without a manual two-phase undo: nothing here ever needs to know
+    how to reverse a partial split, because a partial split can never reach
+    the response.
+    """
+    parent = await repo.contour_by_id(db, parent_id)
+    if parent is None:
+        raise err("ERR-SYS-003")
+    await _assert_in_zone(db, actor, parent.organization_id)
+    if await repo.has_children(db, parent_id):
+        raise err("ERR-GIS-005", details={"reason": "already_split"})
+    parent_version = await repo.published_version(db, parent_id)
+    if parent_version is None:
+        raise err("ERR-GIS-005", details={"reason": "parent_not_published"})
+    occupied_ha, _source = await occupancy_ha(db, parent_id)
+    if occupied_ha > Decimal("0"):
+        raise err("ERR-GIS-005", details={"reason": "active_permit_on_parent"})
+
+    tolerance = await settings_store.get_int(db, "gis_overlap_tolerance_m2")
+    try:
+        metrics = await repo.split_partition_metrics(
+            db,
+            parent_version_id=parent_version.id,
+            piece_a_geojson=piece_a["geom"],
+            piece_b_geojson=piece_b["geom"],
+        )
+    except DBAPIError as exc:
+        # Same reasoning as `create_version`'s own clause: a genuine PostGIS
+        # parse failure (malformed GeoJSON) poisons the session, so raise
+        # immediately and touch `db` no further on this path.
+        raise err("ERR-GIS-001", details={"reason": "unreadable_geometry"}) from exc
+    if metrics["area_a_m2"] is None:
+        raise err("ERR-GIS-006", details={"reason": "piece_zero_area", "piece": "a"})
+    if metrics["area_b_m2"] is None:
+        raise err("ERR-GIS-006", details={"reason": "piece_zero_area", "piece": "b"})
+    # Both areas above are real (neither `None`), so `repo.split_partition_metrics`'
+    # own CASE logic guarantees these two are too — never independently `None`
+    # while both pieces are non-empty. The assert is for pyright's narrowing,
+    # not a real runtime possibility.
+    intersection_m2, mismatch_m2 = metrics["intersection_m2"], metrics["mismatch_m2"]
+    assert intersection_m2 is not None and mismatch_m2 is not None
+    if intersection_m2 > tolerance:
+        raise err(
+            "ERR-GIS-006",
+            details={"reason": "pieces_overlap", "area_m2": float(intersection_m2)},
+        )
+    if mismatch_m2 > tolerance:
+        raise err(
+            "ERR-GIS-006",
+            details={"reason": "pieces_do_not_cover_parent", "area_m2": float(mismatch_m2)},
+        )
+
+    child_a = await create_contour(
+        db,
+        layer_id=parent.layer_id,
+        organization_id=parent.organization_id,
+        number=piece_a["number"],
+        kind="subcontour",
+        parent_id=parent.id,
+        actor=actor,
+    )
+    child_b = await create_contour(
+        db,
+        layer_id=parent.layer_id,
+        organization_id=parent.organization_id,
+        number=piece_b["number"],
+        kind="subcontour",
+        parent_id=parent.id,
+        actor=actor,
+    )
+    version_a = await create_version(
+        db,
+        child_a.id,
+        actor=actor,
+        geojson=piece_a["geom"],
+        source=source,
+        declared_area_ha=piece_a.get("declared_area_ha"),
+        accuracy_m=accuracy_m,
+        survey_date=survey_date,
+        effective_from=effective_from,
+    )
+    version_b = await create_version(
+        db,
+        child_b.id,
+        actor=actor,
+        geojson=piece_b["geom"],
+        source=source,
+        declared_area_ha=piece_b.get("declared_area_ha"),
+        accuracy_m=accuracy_m,
+        survey_date=survey_date,
+        effective_from=effective_from,
+    )
+    await audit.log(
+        db,
+        action="contour.split",
+        user_id=actor.id,
+        object_type="contour",
+        object_id=parent.id,
+        new_value={
+            "piece_a_contour_id": str(child_a.id),
+            "piece_a_version_id": str(version_a.id),
+            "piece_b_contour_id": str(child_b.id),
+            "piece_b_version_id": str(version_b.id),
+        },
+    )
+    return child_a, version_a, child_b, version_b
 
 
 async def update_version(

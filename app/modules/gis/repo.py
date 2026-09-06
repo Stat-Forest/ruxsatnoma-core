@@ -64,6 +64,22 @@ def _geom_source_sql(
     return _WKB_SOURCE, {"wkb": wkb, "srid": srid}
 
 
+def _normalized_geom_sql(source_sql: str) -> str:
+    """The one normalisation pipeline every incoming geometry passes through
+    before it is stored OR compared: `ST_Force2D` drops a Z/M dimension a
+    source might carry, `ST_MakeValid` repairs self-intersections,
+    `ST_CollectionExtract(..., 3)` keeps polygonal parts only (a
+    `GeometryCollection` the repair can produce), and `ST_Multi` makes the
+    result a MULTIPOLYGON whether the input was a `Polygon` or already a
+    `MultiPolygon`. Factored out of `insert_version` so `split_partition_metrics`
+    below can compare two candidate pieces against the SAME repaired shape a
+    version would actually be stored as — never a second normalisation that
+    could quietly disagree with the first (this module's own "one
+    reprojection engine" reasoning, decision #13, applied to geometry repair
+    instead of geometry transform)."""
+    return f"ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_Force2D({source_sql})), 3))"
+
+
 async def insert_version(
     db: AsyncSession,
     *,
@@ -103,13 +119,13 @@ async def insert_version(
                 " ROUND((ST_Area(g::geography)/10000.0)::numeric, 4),"
                 " :declared_area_ha, :source, :accuracy_m, :survey_date, :effective_from,"
                 " :approval_doc_id, :import_id, :status, :created_by"
-                " FROM (SELECT ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_Force2D("
+                " FROM (SELECT "
                 # Bandit flags this as B608 (string-built SQL) on the pattern
                 # alone; `geom_sql` is always one of the two module constants
                 # above, chosen by an `if`, never caller input — every actual
                 # value crosses the wire bound, through `geom_params` below.
                 # Same reasoning (and the same nosec) as `checks._intersections`.
-                f"   {geom_sql})), 3)) AS g) AS n"  # nosec B608
+                f"{_normalized_geom_sql(geom_sql)} AS g) AS n"  # nosec B608
                 " WHERE g IS NOT NULL AND NOT ST_IsEmpty(g)"
                 " RETURNING id"
             ),
@@ -161,6 +177,108 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
         )
     )
     return result.scalar_one_or_none()
+
+
+async def has_children(db: AsyncSession, parent_id: uuid.UUID) -> bool:
+    """Whether ANY contour already names `parent_id` as its `parent_id` — the
+    precondition `service.split_contour` refuses on (decision #91: a split
+    contour that already has children is already split; a second split would
+    leave the hierarchy ambiguous about which pair of subcontours a later
+    reader should trust)."""
+    result = await db.execute(select(Contour.id).where(Contour.parent_id == parent_id).limit(1))
+    return result.first() is not None
+
+
+# The two candidate pieces of a split, each bound under its OWN name —
+# `_geom_source_sql` above always calls its single geometry parameter
+# `:geojson`, which `split_partition_metrics` cannot reuse as-is: it compares
+# TWO client-supplied geometries in ONE query, so each needs a distinct bind
+# parameter. Same reasoning as `_GEOJSON_SOURCE`/`_WKB_SOURCE`: both are fixed
+# module constants, chosen by no caller input, so building the query text
+# around them carries no injection risk of its own.
+_SPLIT_PIECE_A_SOURCE = "ST_SetSRID(ST_GeomFromGeoJSON(:geojson_a), 4326)"
+_SPLIT_PIECE_B_SOURCE = "ST_SetSRID(ST_GeomFromGeoJSON(:geojson_b), 4326)"
+
+
+async def split_partition_metrics(
+    db: AsyncSession,
+    *,
+    parent_version_id: uuid.UUID,
+    piece_a_geojson: dict[str, Any],
+    piece_b_geojson: dict[str, Any],
+) -> dict[str, Decimal | None]:
+    """The geometric partition test behind `service.split_contour`: whether
+    two client-submitted pieces, normalised through the exact SAME pipeline
+    `insert_version` itself stores a geometry through (`_normalized_geom_sql`),
+    actually reconstruct the parent version's own geometry with no gap and no
+    double-covered area.
+
+    This never RE-DERIVES the cut: the adminka's `splitContour.ts` already
+    owns that algorithm, tested six ways over a buffer/difference — PostGIS is
+    asked to check the client's ANSWER here, never to recompute the question,
+    so this module gains no second geometry-cutting engine that could quietly
+    disagree with the front end's (`service.split_contour`'s own docstring
+    explains the choice).
+
+    Four areas come back, in m² over `geography` (`::numeric`, this module's
+    own convention — a real `Decimal`, never a Python `float`): each piece on
+    its own, their mutual intersection (near zero for two pieces that only
+    share a border — ruling 15's "a shared border is a touch of zero area"
+    applies here exactly as it does to `checks._overlap`), and the symmetric
+    difference between their UNION and the parent's geometry (near zero only
+    when the two pieces, together, cover the parent exactly — a gap between
+    them and a piece straying outside the parent boundary both show up as the
+    SAME non-zero number, because either failure leaves geometry on one side
+    of the comparison that is not on the other).
+
+    A piece whose normalised geometry collapses to nothing (a line, a point,
+    an empty collection) reports `None` for its own area AND for both figures
+    that need it (`intersection_m2`, `mismatch_m2`) — `service.split_contour`
+    reads `None` as `piece_zero_area` without this function ever handing a
+    NULL geometry to `ST_Area`/`ST_Intersection`/`ST_SymDifference`, every one
+    of which would otherwise turn a NULL geometry into a NULL area instead of
+    the number this contract promises for the cases where both pieces ARE
+    real.
+    """
+    row = (
+        (
+            await db.execute(
+                text(
+                    "WITH pieces AS ("
+                    "  SELECT"
+                    f"    {_normalized_geom_sql(_SPLIT_PIECE_A_SOURCE)} AS a,"  # nosec B608
+                    f"    {_normalized_geom_sql(_SPLIT_PIECE_B_SOURCE)} AS b"  # nosec B608
+                    "), parent AS ("
+                    "  SELECT geom AS g FROM contour_versions WHERE id = :parent_version_id"
+                    ")"
+                    " SELECT"
+                    "   CASE WHEN pieces.a IS NULL OR ST_IsEmpty(pieces.a) THEN NULL"
+                    "        ELSE ST_Area(pieces.a::geography)::numeric END AS area_a_m2,"
+                    "   CASE WHEN pieces.b IS NULL OR ST_IsEmpty(pieces.b) THEN NULL"
+                    "        ELSE ST_Area(pieces.b::geography)::numeric END AS area_b_m2,"
+                    "   CASE WHEN pieces.a IS NULL OR pieces.b IS NULL"
+                    "             OR ST_IsEmpty(pieces.a) OR ST_IsEmpty(pieces.b) THEN NULL"
+                    "        ELSE ST_Area(ST_Intersection(pieces.a, pieces.b)::geography)::numeric"
+                    "        END AS intersection_m2,"
+                    "   CASE WHEN pieces.a IS NULL OR pieces.b IS NULL"
+                    "             OR ST_IsEmpty(pieces.a) OR ST_IsEmpty(pieces.b) THEN NULL"
+                    "        ELSE ST_Area(ST_SymDifference("
+                    "               ST_Union(pieces.a, pieces.b), parent.g"
+                    "             )::geography)::numeric"
+                    "        END AS mismatch_m2"
+                    " FROM pieces, parent"
+                ),
+                {
+                    "parent_version_id": parent_version_id,
+                    "geojson_a": json.dumps(piece_a_geojson),
+                    "geojson_b": json.dumps(piece_b_geojson),
+                },
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return dict(row)
 
 
 async def list_versions(

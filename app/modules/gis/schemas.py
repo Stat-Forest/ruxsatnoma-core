@@ -152,6 +152,53 @@ class VersionPatch(BaseModel):
     effective_from: date | None = None
 
 
+class SplitPieceIn(BaseModel):
+    """One of the two subcontours `POST /gis/contours/{parent_id}/split`
+    produces. Narrowed to what the caller actually decides: the adminka's
+    `splitContour.ts` already computed `geom` client-side (decision #91,
+    `gis.service.split_contour`'s own docstring on why the cut itself stays
+    client-side); everything else about the new contour — `layer_id`,
+    `organization_id`, `kind`, `parent_id` — is derived from the parent and is
+    never re-typed by the caller the way a plain `POST /gis/contours` would
+    require."""
+
+    number: str
+    geom: dict[str, Any]
+    declared_area_ha: Decimal | None = None
+
+
+class SplitIn(BaseModel):
+    """`POST /gis/contours/{parent_id}/split`. `source`/`accuracy_m`/
+    `survey_date`/`effective_from` describe how the split itself was carried
+    out — one drawing act, producing both pieces at once — so they are
+    supplied ONCE, unlike `declared_area_ha` (each piece's own source-file or
+    on-screen figure), which genuinely differs per piece."""
+
+    piece_a: SplitPieceIn
+    piece_b: SplitPieceIn
+    source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
+    accuracy_m: Decimal | None = None
+    survey_date: date | None = None
+    effective_from: date | None = None
+
+
+class SplitPieceOut(BaseModel):
+    contour: ContourOut
+    version: VersionOut
+
+
+class SplitOut(BaseModel):
+    """`POST /gis/contours/{parent_id}/split` response. `parent_id` is echoed
+    back for convenience only — the parent's own row is untouched by this call
+    (decision #91: it stays exactly as it was, published version included;
+    see `gis.service.split_contour`'s own docstring for what that does and
+    does not mean for the parent's occupancy and its own topology checks)."""
+
+    parent_id: uuid.UUID
+    piece_a: SplitPieceOut
+    piece_b: SplitPieceOut
+
+
 class ApproveIn(BaseModel):
     """`POST .../approve`. `approval_doc_id` stays optional HERE (not a
     required field) on purpose: a missing id must reach the caller as this
