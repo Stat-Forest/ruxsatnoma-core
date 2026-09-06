@@ -1,11 +1,17 @@
 name: CI
 
 on:
-  # Long-lived branches only. A feature branch is covered by `pull_request`, so listing
-  # every branch here ran CI twice on each push to a branch with an open PR — 42 of the 49
-  # duplicated commits in the first week of September were exactly that pair.
+  # `main` only — every other branch is already covered without a push trigger, and adding
+  # one back means running the same commit twice:
+  #   * a feature branch is covered by `pull_request` (listing every branch here ran CI twice
+  #     on each push to a branch with an open PR — 42 of the 49 duplicated commits in the
+  #     first week of September were that pair);
+  #   * `dev` is covered by deploy.yml's `Gate` job, which calls this workflow through
+  #     `workflow_call` and blocks the deploy when it fails. A push trigger here ran `lint`
+  #     and `test` a second time on every merge commit.
+  # `main` has no deploy and therefore no gate, so it keeps its push run.
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
   workflow_call:
 
