@@ -7,6 +7,7 @@ from sqlalchemy import ColumnElement, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.schemas import PageParams
+from app.modules.admin.models import Organization
 from app.modules.inspections.models import (
     Checklist,
     InspectionAct,
@@ -54,7 +55,15 @@ async def list_tasks(
     status: str | None,
     params: PageParams,
 ) -> tuple[Sequence[InspectionTask], int]:
-    stmt = select(InspectionTask).where(scope)
+    # Outer join: `organization_id` is nullable (an org-less patrol) and the
+    # scope's own `zone_filter` may reference `Organization.region_id`/
+    # `.district_id` for a region- or district-scoped viewer — the same join
+    # `search`/`reports`/`dashboard` add for exactly this reason.
+    stmt = (
+        select(InspectionTask)
+        .outerjoin(Organization, Organization.id == InspectionTask.organization_id)
+        .where(scope)
+    )
     if status is not None:
         stmt = stmt.where(InspectionTask.status == status)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
@@ -95,7 +104,12 @@ async def list_acts(
     result: str | None,
     params: PageParams,
 ) -> tuple[Sequence[InspectionAct], int]:
-    stmt = select(InspectionAct).where(scope)
+    # Outer join for the same reason as `list_tasks` above.
+    stmt = (
+        select(InspectionAct)
+        .outerjoin(Organization, Organization.id == InspectionAct.organization_id)
+        .where(scope)
+    )
     if result is not None:
         stmt = stmt.where(InspectionAct.result == result)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
@@ -140,7 +154,12 @@ async def list_cases(
     status: str | None,
     params: PageParams,
 ) -> tuple[Sequence[ViolationCase], int]:
-    stmt = select(ViolationCase).where(scope)
+    # Outer join for the same reason as `list_tasks` above.
+    stmt = (
+        select(ViolationCase)
+        .outerjoin(Organization, Organization.id == ViolationCase.organization_id)
+        .where(scope)
+    )
     if status is not None:
         stmt = stmt.where(ViolationCase.status == status)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
