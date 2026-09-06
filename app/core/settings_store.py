@@ -252,6 +252,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             60,
             "Per-IP limit for the anonymous GET /help/faq",
         ),
+        # С22 (`tz/12` #42, decision #98, ruling #20): the prosecutor's (and every
+        # other `search.use` holder's) watermarked export is capped at this many
+        # rows per file — "≤10 000, configurable" verbatim. The export never
+        # errors past the cap; it truncates and reports `total_matched` alongside
+        # `row_count` so a caller can SEE it was cut, never guess.
+        SettingSpec(
+            "search_export_max_rows",
+            int,
+            10000,
+            "Maximum rows in one search/oversight export (С22, ruling #20)",
+        ),
     )
 }
 

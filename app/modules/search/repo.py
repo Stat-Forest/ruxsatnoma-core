@@ -10,9 +10,9 @@ a `similarity()` tiebreak for ordering — `pg_trgm`/`unaccent` are both
 extensions already installed by migration `0001`, so this costs no schema
 change to any table, including this module's own.
 
-This file, plus `saved_filters` CRUD below, is the entire read surface:
-`applications`/`permits`/`applicants` are read here directly and never
-written."""
+This file, plus `saved_filters`/`export_jobs` CRUD below, is the entire read
+surface: `applications`/`permits`/`applicants` are read here directly and
+never written."""
 
 import uuid
 from typing import Any
@@ -24,7 +24,7 @@ from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant
 from app.modules.permits.models import Permit
-from app.modules.search.models import SavedFilter
+from app.modules.search.models import ExportJob, SavedFilter
 
 
 def _text_filter(pattern: str, *columns: Any) -> Any:
@@ -109,6 +109,11 @@ async def search_applications(
             Application.assigned_org_id,
             Applicant.name.label("applicant_name"),
             Application.created_at,
+            # Not part of `SearchResultOut` (`GET /search` never surfaced this
+            # column and keeps not doing so) — used only by the export
+            # renderer, which prints a human-readable organization rather
+            # than a bare UUID. The LEFT JOIN above already makes it nullable.
+            Organization.name.label("organization_name"),
         )
         .join(Applicant, Applicant.id == Application.applicant_id)
         .outerjoin(Organization, Organization.id == effective_org_col)
@@ -174,6 +179,8 @@ async def search_permits(
             Permit.organization_id,
             Applicant.name.label("applicant_name"),
             Permit.created_at,
+            # Export-only, same reasoning as `search_applications` above.
+            Organization.name.label("organization_name"),
         )
         .join(Applicant, Applicant.id == Permit.applicant_id)
         .join(Organization, Organization.id == Permit.organization_id)
@@ -222,3 +229,29 @@ async def list_saved_filters(
 async def delete_saved_filter(db: AsyncSession, row: SavedFilter) -> None:
     await db.delete(row)
     await db.flush()
+
+
+# --- export_jobs (С22) ---------------------------------------------------
+
+
+async def create_export_job(db: AsyncSession, row: ExportJob) -> ExportJob:
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def export_job_by_id(db: AsyncSession, job_id: uuid.UUID) -> ExportJob | None:
+    return await db.get(ExportJob, job_id)
+
+
+async def list_export_jobs(db: AsyncSession, *, user_id: uuid.UUID) -> list[ExportJob]:
+    """The caller's OWN export history only — an export is a private working
+    file, not a shared profile, so `saved_filters.shared`'s visibility rule
+    does not apply here (plan header: an export is handed to someone
+    OUTSIDE the screen by the operator who ran it, not browsed by peers)."""
+    rows = await db.execute(
+        select(ExportJob)
+        .where(ExportJob.user_id == user_id)
+        .order_by(ExportJob.created_at.desc(), ExportJob.id.desc())
+    )
+    return list(rows.scalars().all())
