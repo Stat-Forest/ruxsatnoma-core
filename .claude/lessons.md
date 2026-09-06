@@ -103,20 +103,25 @@ Tooling and environment.
 - **How to apply:** If `alembic check` is suddenly dirty on a machine that just recreated
   its volumes, check for those schemas before suspecting the models.
 
-## A raw `sa.text()` bind touching a Postgres cast has two separate traps
+## A raw `sa.text()` query has sharp edges neither asyncpg nor pyright will catch early
 
 - **Rule:** Inside a migration's `sa.text(...)`, always write `CAST(:name AS type)` — never
   `:name::type`, and never `.bindparams(name=sa.literal(v, sometype))` for the value itself.
-- **Why:** Two failures, one boundary, both caught RED/GREEN. `:name::type` — `TextClause`'s
-  regex backtracks its trailing lookahead, registering the param as `valu` not `value`, so
-  `.bindparams(value=...)` raises `ArgumentError: ... doesn't define a bound parameter named
-  'value'` (migration 0012, 3.7 t2). `sa.literal(v, postgresql.JSONB)` as a bind VALUE binds
-  the `BindParameter` construct itself, not `v` — asyncpg then raises `DataError: ... object
-  has no attribute 'encode'` (migration 0010).
-- **How to apply:** Grep any new raw-SQL migration or test for `:\w+::` before running it.
-  For a JSONB literal, prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and
-  a plain dict (0009's pattern, unaffected by either trap); otherwise pre-serialize with
-  `json.dumps` and bind as text under `CAST(:x AS jsonb)`.
+  Build a dict from its `Result` with a comprehension — `{row[0]: row[1] for row in
+  rows.all()}` — never `dict(rows.all())`.
+- **Why:** three traps, one boundary. `:name::type` — `TextClause`'s regex backtracks its
+  trailing lookahead, registering the param as `valu` not `value`, so `.bindparams(value=...)`
+  raises `ArgumentError: ... doesn't define a bound parameter named 'value'` (migration 0012,
+  3.7 t2). `sa.literal(v, postgresql.JSONB)` as a bind VALUE binds the `BindParameter`
+  construct itself, not `v` — asyncpg then raises `DataError: ... object has no attribute
+  'encode'` (migration 0010). And that same raw query's rows are `Row[Any]`, so
+  `dict(rows.all())` matches the wrong `dict()` overload and pyright reports `reportCallIssue`
+  on code that runs correctly (migration 0012 tests, 3.7 t2) — a TYPED `select(Col.a, Col.b)`
+  does not trip it.
+- **How to apply:** Grep any new raw-SQL migration or test for `:\w+::` before running it. For
+  a JSONB literal, prefer `op.bulk_insert` with `sa.column(..., postgresql.JSONB())` and a
+  plain dict (0009's pattern), otherwise pre-serialize with `json.dumps` and bind as text under
+  `CAST(:x AS jsonb)`. Reserve `dict(rows.all())` for a typed `select(...)`.
 
 ## A bare `alembic` CLI command targets the shared dev DB, not your worktree's test DB
 
@@ -280,23 +285,26 @@ Tooling and environment.
   `on_date`) must say in its docstring that `business_today()` is where it comes from.
   Storage stays UTC `timestamptz`; only the *calendar-day decision* is Tashkent.
 
-## The row in memory is not what Postgres stored
+## A row in memory is not what Postgres stored — in your own session, or a different one
 
-- **Rule:** After `flush()`, `await db.refresh(row)` before returning or serializing it,
-  whenever the response reads a column the DB itself decides — an `onupdate=func.now()` after an
-  UPDATE, or a caller-supplied value in a fixed-scale `NUMERIC` after an INSERT.
-- **Why:** SQLAlchemy fetches `onupdate` via `RETURNING` on an INSERT but leaves it expired
-  after a plain UPDATE — reading it outside the session's async context raises
-  `MissingGreenlet` (`notifications.service.archive_template`, on `updated_at`). The INSERT
-  side is the mirror: implicit `RETURNING` covers only what the DB generates
-  (`server_default`, identity), so posting `"1.5"` into `Tariff.coefficient numeric(12,6)`
-  left the in-memory row showing `"1.5"` while Postgres held `"1.500000"` (3.7 t3).
+- **Rule:** `await db.refresh(row)` before trusting an in-memory row: in your OWN session
+  after `flush()`/`commit()`, when what you serialize is a column the DB itself decides
+  (`onupdate=func.now()`, a caller value in a fixed-scale `NUMERIC`); in a DIFFERENT session
+  (the app's, from a test), before ASSERTING on a row a request may have changed.
+- **Why:** one mechanism, two directions. SQLAlchemy fetches `onupdate` via `RETURNING` on
+  INSERT but leaves it expired after a plain UPDATE — reading it outside the session's async
+  context raises `MissingGreenlet` (`archive_template`, on `updated_at`); the INSERT side is
+  the mirror, since implicit `RETURNING` covers only what the DB generates, so posting `"1.5"`
+  into `Tariff.coefficient numeric(12,6)` left the row showing `"1.5"` while Postgres held
+  `"1.500000"` (3.7 t3). Cross-session it fails silently instead: `service.get(db, id)` is
+  `db.get`, no SELECT for a row already in the identity map, so two permits tests asserted
+  `status == "PAID"` after the app had written `PERMIT_ISSUED` (3.11a t4).
 - **How to apply:** Refresh whenever a service both mutates/creates such a column AND returns
-  that same row — an existing archive-path precedent without a read-back does not cover you.
-- **On the way out:** a `Decimal` field backed by `NUMERIC(p,s)` also needs a
-  `field_serializer` doing `format(value, "f").rstrip("0").rstrip(".")`
-  (`gis.schemas._trim_decimal`) — `declared_area_ha` returns `Decimal('2.6000')` for a posted
-  `"2.6"`. Never `Decimal.normalize()`: `Decimal('100.0000').normalize()` is `Decimal('1E+2')`.
+  it — an existing archive-path precedent without a read-back does not cover you. Route test
+  assertions through ONE refreshing helper (`permits/test_signatures.py::_reread`). A
+  `Decimal` field backed by `NUMERIC(p,s)` also needs a `field_serializer` doing
+  `format(value, "f").rstrip("0").rstrip(".")` (`_trim_decimal`) — never `Decimal.normalize()`:
+  `Decimal('100.0000').normalize()` is `Decimal('1E+2')`.
 
 ## `Decimal` ordering comparisons raise on NaN, not just construction
 
@@ -363,36 +371,25 @@ Tooling and environment.
   intersects `required_purposes()` with `signers.required_role()` and reuses the write path's
   organization equality.
 
-## A role name from spec or plan prose is never a `roles.code` — «Раҳбар» is `executor_head`
+## A role's identity and its grants have ONE source — the seeding migration, never a name or a docstring standing in for it
 
-- **Rule:** Before seeding any role-based grant, read `0003_auth.py` for the actual
-  `roles.code`. There is no `rahbar` code. **«Раҳбар» — the approver «Т» in `tz/03`'s
-  matrix — is `executor_head`** («Ваколатли шахс», the leshoz head); `leadership` is
-  «Агентлик раҳбарияти» and holds view+export, plus `norms.publish` alone (ВМҚ 689).
-- **Why:** two failures, one class. `plans/03.6a-gis-core.md` used `rahbar`; `INSERT …
-  SELECT … WHERE code = 'rahbar'` inserts zero rows silently, so `gis.contours.approve`
-  reached nobody and every "the rahbar approves" test passed for the wrong reason
-  (3.6a t1). Then 3.6a/3.7 resolved the word to `leadership`, so migrations 0010/0011
-  gave approval to agency leadership and the leshoz head could approve neither a contour
-  nor a norm in its own leshoz — invisible for two stages, fixed by 0016 (decision #59).
-- **How to apply:** Any role grant → `tests/test_permissions_registry.py`'s two guards
-  already assert the whole `leadership`/`executor_head` split; extend them rather than
-  re-deriving the matrix. A wrong code inserts zero rows, never an error.
-
-## A `_client_for` fixture's permission list must mirror the PRODUCTION role's grants
-
-- **Rule:** When a migration grants a ROLE several codes, a fixture standing in for that role
-  via `_client_for(db, ...)` must list ALL of them — that branch builds the user under
-  `role_code="executor_staff"` with only the personal grants given, inheriting nothing from
-  the real role's `role_permissions` row, whatever the fixture is named.
-- **Why:** `leadership_client` (3.7 t4) was written with `NORMS_APPROVE, NORMS_MANAGE` under
-  the docstring "approves, never publishes" — true of the default `norms_publish_scope=central`
-  OUTCOME, wrong about the GRANT (0011 gives `leadership` `norms.publish` too; ruling 16's
-  point is that the SETTING blocks it). Both brief-verbatim tests failed outright: the one
-  asserting `ERR-ACL-002` got `ERR-ACL-001` — the route's dependency rejecting the request
-  before the service's scope check ever ran.
-- **How to apply:** Check what the role holds in its seeding migration, not the fixture's
-  docstring — a docstring can describe the common-case OUTCOME while omitting a GRANT.
+- **Rule:** Before seeding a role-based grant, or writing a `_client_for(db, ...)` fixture for
+  a role, read the actual migration — `0003_auth.py` for `roles.code`, the granting migration
+  for what it holds — never a plan's role name, never a fixture's docstring.
+- **Why:** two shapes, one cause. A WRONG CODE seeds nothing, silently:
+  `plans/03.6a-gis-core.md` used `rahbar`, but there is no such `roles.code` — **«Раҳбар» is
+  `executor_head`** («Ваколатли шахс», the leshoz head), not `leadership` («Агентлик
+  раҳбарияти», view+export plus `norms.publish` alone). `INSERT … WHERE code = 'rahbar'`
+  inserted zero rows, so `gis.contours.approve` reached nobody and "the rahbar approves"
+  passed for the wrong reason (3.6a t1); resolving the word to `leadership` then left the
+  leshoz head unable to approve anything in its own leshoz for two stages, fixed by 0016
+  (decision #59). A MIRRORED GRANT goes stale instead: `leadership_client` (3.7 t4) held
+  `NORMS_APPROVE, NORMS_MANAGE` under "approves, never publishes" — true of the OUTCOME,
+  wrong about the GRANT (0011 gives `leadership` `norms.publish` too) — a test expecting
+  `ERR-ACL-002` got `ERR-ACL-001`.
+- **How to apply:** Any role grant or fixture → `test_permissions_registry.py`'s two guards
+  already assert the `leadership`/`executor_head` split, extend them. A wrong seed inserts
+  zero rows, never an error; a docstring can describe the OUTCOME while omitting a GRANT.
 
 ## A maker-checker route needs BOTH roles' permission — the service tells them apart
 
@@ -522,35 +519,52 @@ Tooling and environment.
   whether its caller already has an evidence-then-raise tail the helper could feed via a
   `replace`-able result object instead.
 
+## A cap borrowed from a sibling module inherits its volume assumption, not its shape
+
+- **Rule:** Copying a size/count cap from another module, re-justify the volume it assumes —
+  a cap the source could defend does not transfer with the number alone.
+- **Why:** The invoice register borrowed a 500-row zone-scan cap from the manual-confirmations
+  queue ("a maker files these one at a time, a real worklist is small") — invoices are the
+  system's core document, generated per approved application nationwide. Past 500 a leshoz saw
+  ZERO of its own invoices, permanently, and the total silently undercounted — the failure
+  hides data rather than leaking it, so nothing alarmed.
+- **How to apply:** Reusing a cap, ask whether the source's own justification holds for the
+  new caller; where the real count can exceed it, count/page in SQL, never truncate silently.
+
+## A module's hard-coded claim about another module rots silently — its own tests will not catch it
+
+- **Rule:** A hard-coded fact about ANOTHER module's state ("not merged yet", "no such table")
+  needs a check that fails once the fact goes stale — never a comment trusted to be re-read.
+- **Why:** `dashboard/service.py` hard-codes `OMITTED_TILES` saying `inspections` "is not
+  merged into `dev` yet" — true when written; `inspections` has since merged with 21 routes and
+  a real `violation_cases` table the dashboard still refuses to count. Its tests pass because
+  they assert `omitted` is reported HONESTLY — nothing asserts the REASON still holds.
+- **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
+  fails once that module ships, or tie it to a tracked ticket.
+
 ---
 
 # PostGIS
 
-## `ST_Intersects` alone reports every shared border as an overlap
+## A geometric predicate lies at its edges — decide the degenerate case explicitly
 
-- **Rule:** A "do these overlap" predicate over real polygons is never plain
-  `ST_Intersects`/`ST_Overlaps` — compute the intersection AREA and compare it to a named,
-  configurable tolerance.
-- **Why:** Two neighbouring published contours sharing a fence line are the NORMAL case on
-  real cadastral data; `ST_Intersects` is `true` for a zero-area shared border exactly as for
-  a genuine double-booking, so the spec's own `ST_Overlaps` check would have refused to
-  publish valid neighbours (decision #24's correction).
+- **Rule:** A "do these overlap" check over real polygons never trusts the bare boolean —
+  compute the intersection AREA against a named tolerance. A containment check whose
+  reference layer might still be EMPTY needs a THIRD outcome, `skipped`, decided up front.
+- **Why:** two edges, one naivety. `ST_Intersects`/`ST_Overlaps` is `true` for a zero-area
+  shared border exactly as for a genuine double-booking — two neighbouring published contours
+  sharing a fence line are the NORMAL case on real cadastral data, so the spec's own
+  `ST_Overlaps` check would have refused to publish valid neighbours (decision #24's
+  correction). And `gis.checks._within_fund` against an empty fund-boundary layer would
+  report EVERY contour as `outside_forest_fund` — a hard fail blocking every publication for
+  as long as the Agency's delivery is pending (plan ruling 9) — so without an explicit
+  `skipped`/`layer_empty` branch, not one contour could have published this month.
 - **How to apply:** `gis.checks._intersections` computes
   `ST_Area(ST_Intersection(a,b)::geography)` against `gis_overlap_tolerance_m2` (default
-  100 m²), proven by `test_checks.py`'s `draft_version_touching_it` vs
-  `draft_version_overlapping_it`. Norms' own territory checks are the next candidate.
-
-## An empty layer makes a containment check meaningless — decide what "no data" means first
-
-- **Rule:** A topology/containment check against a layer that might still be empty needs a
-  THIRD outcome — `skipped`, never `pass` or `fail` — decided at design time.
-- **Why:** `gis.checks._within_fund` would report every contour as `outside_forest_fund` — a
-  hard fail blocking every publication — for as long as the Agency's fund-boundary delivery
-  is pending (plan ruling 9). Without the `skipped`/`layer_empty` branch (straight from
-  `count(*) == 0` in the same query) not one contour could have published this month; the
-  check turns itself on the day the data lands, with no code change.
-- **How to apply:** Any check whose reference set is a layer this project does not yet control
-  the population of gets an explicit empty-set branch, returned as its own named result.
+  100 m²), proven by `draft_version_touching_it` vs `draft_version_overlapping_it`. Any check
+  whose reference set is a layer this project does not yet control the population of gets its
+  own `count(*) == 0` branch, returned as a named result — the check turns itself on the day
+  the data lands, no code change.
 
 ---
 
@@ -587,6 +601,17 @@ Tooling and environment.
   with explicit `page = offset // limit + 1`, `page_size = limit`. Any envelope with an
   `Any`-typed field that might hold an ORM row needs `SomeOut.model_validate(row)` at the
   call site.
+
+## Two paging conventions in one codebase, and the wrong one fails silently
+
+- **Rule:** Reuse the project's one paging convention (`PageParams`, `?page=&page_size=`); a
+  route that must diverge (`norms`'s `?limit=&offset=`) calls that out at the route itself.
+- **Why:** FastAPI ignores an unknown query parameter, so paging `norms` the way every other
+  route pages gets NO error — it returns page one, forever. No mocked front-end test catches
+  it either, since the mock answers whatever the client sends.
+- **How to apply:** Before adding a list endpoint, grep for the existing paging convention and
+  reuse it; a deliberately different one needs a docstring callout and a test proving the
+  wrong convention is at least detectable, not silently wrong.
 
 ## A cap checked after reading the body is not a cap — and an anonymous route must cap what it PERSISTS
 
@@ -654,26 +679,22 @@ Tooling and environment.
 - **How to apply:** New destination → grep `app/workers/outbox.py` for the registering import
   → add it → extend the subprocess registration test.
 
-## Never echo an outbound payload into a raised exception
+## A sender's own diagnostics must never carry what it was sending
 
-- **Rule:** A sender may report the transport failure (status code, provider error code) —
-  never the message body it was trying to send.
-- **Why:** `outbox_messages.last_error` is admin-visible via `/admin/integrations/*` AND
-  logged, so a sender formatting the payload into its exception leaks live OTP codes to
-  anyone holding the admin outbox permission.
-- **How to apply:** Every new sender raises with transport metadata only, plus a test
-  asserting the code is NOT in `str(exc)`.
-
-## Never ask a provider for a callback you cannot correlate
-
-- **Rule:** Only request a delivery report for a send that has a stored row to correlate it
-  against; pass an explicit "no callback" flag otherwise.
-- **Why:** `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender` passed a
+- **Rule:** A sender may report the TRANSPORT failure (status code, provider error code) in a
+  raised exception — never the payload's contents. And it may request a delivery-report
+  callback only for a send that has a stored row to correlate it against — pass an explicit
+  "no callback" flag otherwise.
+- **Why:** two shapes into the same admin-visible sinks. `outbox_messages.last_error` is
+  admin-visible via `/admin/integrations/*` AND logged, so a sender formatting the payload
+  into its exception would leak live OTP codes to anyone holding the admin outbox permission.
+  And `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender` passed a
   throwaway uuid as the reference, so at `sms_mode=real` EVERY OTP would produce an
   `inbound_dead_letters` row holding the recipient's phone number, forever — no purge job
-  covers dead letters and the DLQ's triage purpose would drown (3.5 final review).
-- **How to apply:** Wiring a provider callback, ask what the DLQ does with a report matching
-  nothing — and remove the cause rather than filtering it.
+  covers dead letters, and the DLQ's triage purpose would drown (3.5 final review).
+- **How to apply:** Every new sender raises with transport metadata only, plus a test
+  asserting the code is NOT in `str(exc)`. Wiring a provider callback, ask what the DLQ does
+  with a report matching nothing — and remove the cause rather than filtering it.
 
 ## `str.format` on admin-authored text is an attribute-access hole
 
@@ -716,16 +737,6 @@ Tooling and environment.
 - **How to apply:** Scope every assertion by the ids your fixture created. Run any new
   negative test twice in a row, and as part of the FULL suite — this class is invisible in
   isolation. Do not reorder the conftest collection hook.
-
-## The `db` fixture session and the app's session never see each other's current state
-
-- **Rule:** Refresh a row before ASSERTING on it if a request may have changed it; the write
-  direction (`_commit_pending_before_requests`) is the conftest-plumbing entry below.
-- **Why:** Silent — `service.get(db, id)` is `db.get`, NO SELECT for a row already in the identity
-  map — so two permits tests asserted `status == "PAID"` after the app wrote `PERMIT_ISSUED` (3.11a t4).
-- **How to apply:** Route every assertion on an app-mutable row through ONE refreshing helper —
-  a remembered `db.refresh` is what failed twice (`permits/test_signatures.py::_reread`).
-
 
 ## A module's test conftest needs plumbing copied from an existing one, not just fixtures
 
@@ -806,17 +817,6 @@ Tooling and environment.
   the currently-in-force figure and for `business_today`. Never "fix" such a test by
   recomputing the expectation from whatever row is in force — that passes against a WRONG
   tariff, the opposite of what the test is for.
-
-## `dict(rows.all())` on a raw `text()` query passes at runtime, fails pyright
-
-- **Rule:** Build a dict from a raw-SQL `Result` with a comprehension —
-  `{row[0]: row[1] for row in rows.all()}` — never `dict(rows.all())`.
-- **Why:** A `text()` query's rows are `Row[Any]`; pyright cannot confirm the 2-tuple arity,
-  matches the wrong `dict()` overload (`Iterable[list[bytes]]`) and reports `reportCallIssue`
-  on code that runs correctly (migration 0012 tests, 3.7 t2). The identical call over a TYPED
-  `select(Col.a, Col.b)` does not trip it — SQLAlchemy infers the arity statically there.
-- **How to apply:** Comprehension for raw SQL; reserve `dict(rows.all())` for a typed
-  `select(...)`.
 
 ## An uncommitted test setup on the same session gets committed for real by an expected refusal
 
