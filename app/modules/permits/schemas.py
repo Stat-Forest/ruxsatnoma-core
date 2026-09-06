@@ -24,6 +24,8 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.schemas import LocalizedName
+
 # Spelled out rather than `Literal[*PERMIT_STATUSES]`: pyright rejects a starred
 # variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal` is exactly
 # where a type checker has to see the members statically. `models.PERMIT_STATUSES`
@@ -362,6 +364,12 @@ class PublicCheckCard(BaseModel):
 
     found: Literal[True] = True
     status: PublicStatus
+    # The same status in every language the interfaces offer — the one field on
+    # this card that is computed rather than quoted from the printed document,
+    # and therefore the one that may be localized (stage 7.3, finding F6).
+    # `service.PUBLIC_STATUS_LABELS_I18N` is its single source of truth, and
+    # `status` above is that map's Cyrillic column, so the two can never disagree.
+    status_label: LocalizedName
     valid_from: date
     valid_to: date
     organization: str
