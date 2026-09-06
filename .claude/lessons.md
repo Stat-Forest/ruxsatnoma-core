@@ -711,6 +711,21 @@ Tooling and environment.
 
 # Tests and the shared test DB
 
+## A check-then-create against a shared resource is a race the day the suite runs `-n 4`
+
+- **Rule:** "Look, then create" against MinIO, a volume or a catalog must treat the
+  already-exists answer as SUCCESS. Prove it with a CONCURRENT test: a sequential
+  idempotency test never reaches the create branch at all.
+- **Why:** `storage.ensure_bucket` did `head_bucket` → on `ClientError` → `create_bucket`.
+  On a FRESH MinIO — every CI run — four xdist workers 404 together, all four create, and
+  the losers got an uncaught `BucketAlreadyOwnedByYou`: `ERROR at setup` on an unrelated
+  test, and a red CI accusing whichever branch was in front of it. Never reproduced
+  locally, where the bucket already exists and the create is never reached (2026-09-06).
+- **How to apply:** Any `ensure_*` or first touch of a fresh volume → catch the
+  exists-codes (`app/core/storage.py::_BUCKET_ALREADY_THERE`), and copy
+  `test_ensure_bucket_survives_four_of_itself_at_once`: gather four calls against a
+  uniquely named bucket, never delete the shared one.
+
 ## The test DB is shared, persistent, and never empty — including the spot you picked
 
 - **Rule:** A test may only touch rows it created. No unscoped `UPDATE`/`DELETE`, no assuming
