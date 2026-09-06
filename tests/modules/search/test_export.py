@@ -23,6 +23,24 @@ from tests.modules.search.conftest import _client_for, _client_with_role, make_a
 API = "/api/v1"
 
 
+def _pdf_text(content: bytes) -> str:
+    """Extract a PDF's text with every run of whitespace removed.
+
+    `extract_text()` reconstructs words from glyph positions, so where a run is
+    kerned it inserts a space that was never in the source: on a CI container
+    "Test User" comes back as "T est User" purely because a different font is
+    installed there. Comparing without whitespace asserts what the test means —
+    the characters reached the document — instead of asserting which fonts the
+    machine happens to have.
+    """
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(content)).pages)
+    return "".join(text.split())
+
+
+def _squeezed(value: str) -> str:
+    return "".join(value.split())
+
+
 async def test_export_requires_the_permission(db: AsyncSession, leshoz: Organization):
     async for client in _client_with_role(db, "inspector"):  # a role search.use is NOT granted to
         resp = await client.post(
@@ -78,11 +96,11 @@ async def test_the_watermark_carries_the_operators_full_name_and_the_date_pdf(
         assert file_resp.headers["content-type"] == "application/pdf"
         assert file_resp.content.startswith(b"%PDF")
 
-        text_content = "\n".join(
-            page.extract_text() or "" for page in PdfReader(io.BytesIO(file_resp.content)).pages
+        text_content = _pdf_text(file_resp.content)
+        assert _squeezed(user.full_name) in text_content, (
+            "the operator's name did not survive into the file"
         )
-        assert user.full_name in text_content, "the operator's name did not survive into the file"
-        assert business_today().isoformat() in text_content, (
+        assert _squeezed(business_today().isoformat()) in text_content, (
             "the date did not survive into the file"
         )
 
@@ -164,11 +182,9 @@ async def test_a_zone_scoped_operators_export_contains_only_their_own_zones_rows
         assert body["row_count"] == 1, "a zone-scoped export must not see another zone's rows"
 
         file_resp = await client.get(f"{API}/search/exports/{body['id']}/file")
-        text_content = "\n".join(
-            page.extract_text() or "" for page in PdfReader(io.BytesIO(file_resp.content)).pages
-        )
-        assert "Belongs To My Zone" in text_content
-        assert "Belongs To Another Zone" not in text_content, (
+        text_content = _pdf_text(file_resp.content)
+        assert _squeezed("Belongs To My Zone") in text_content
+        assert _squeezed("Belongs To Another Zone") not in text_content, (
             "search export leaked another organization's application"
         )
 
