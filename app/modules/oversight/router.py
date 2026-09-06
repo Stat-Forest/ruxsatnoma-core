@@ -49,8 +49,10 @@ async def list_risk_indicators(
     `code` — `code=RI-07` is the SLA-violation register, `RI-01` the manual-PAID
     register, `RI-10` permits activated without payment, `RI-12` cross-zone
     access attempts, `RI-03` overlapping active permits on one contour,
-    `RI-04` retroactive tariff/norm changes. Export-with-watermark is
-    `search`'s `export_jobs` (design/02), not built here — see the plan."""
+    `RI-04` retroactive tariff/norm changes. The watermarked export is built
+    (decision #98) as `search`'s `POST /search/exports` — `applications`/
+    `permits` result sets, not this list; exporting a risk-indicator page
+    itself is not something ruling #20 asked for and is not built here."""
     items, total = await service.list_risk_indicators(
         db,
         actor=user,

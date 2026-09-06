@@ -39,6 +39,7 @@ dev = [
     "pyright>=1.1.411",
     "types-aiobotocore-s3>=3.9.0",
     "shapely>=2.1",
+    "pypdf>=5.0",
 ]
 
 [tool.pyright]
