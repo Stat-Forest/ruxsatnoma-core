@@ -2555,3 +2555,17 @@ async def list_permits(
         offset=params.offset,
         limit=params.page_size,
     )
+
+
+async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str, Any]]:
+    """Anonymous open-data read (4.6 `public`, design/01 rule 2: cross-module
+    calls go through this service, never `permits.repo` directly). Returns
+    every organization with at least one `active` permit — `public.service`
+    applies k-anonymity suppression and region grouping; this module hands
+    back the raw counts only, unfiltered, since it has no opinion on what
+    "too few to publish" means outside its own walls."""
+    rows = await repo.active_stats_by_organization(db)
+    return [
+        {"organization_id": org_id, "active_count": count, "active_area_ha": area}
+        for org_id, count, area in rows
+    ]

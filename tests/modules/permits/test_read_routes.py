@@ -80,6 +80,63 @@ async def test_the_card_carries_the_signatures_and_the_timeline(
     # `GET /signatures?object_type=permit&object_id=` answers the full row.
     assert "signature_value" not in body["signatures"][0]
     assert body["missing_signatures"] == []
+    # `document_date` is the frozen `snapshot["issued_at"]` (`service._snapshot`'s
+    # requisite 3, "Берилган сана", Tashkent-local) — never `issued_at]` (the
+    # activation timestamp, UTC), the demo-sprint defect (`docs/status.md`).
+    assert body["document_date"] == active_permit.snapshot["issued_at"]
+
+
+async def test_document_date_is_the_frozen_document_date_not_the_activation_day(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    paid_application: Application,
+    hodim_client: httpx.AsyncClient,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    holder_client: Signer,
+) -> None:
+    """The demo-sprint defect, reproduced: `docs/status.md` "`Berilgan sana`
+    renders in UTC while the signatures beside it render in local time, so a
+    permit issued late in the evening shows yesterday's date." `issued_at` (the
+    card's other date-like field) is stamped by `_activate` on the day the LAST
+    signature lands, which can be a different calendar day than the one
+    `_snapshot` froze into the document at ISSUANCE (`business_today()`,
+    Tashkent) — a citizen may take days to gather four signatures. Frozen five
+    days apart here (issuance patched well into the past, activation left
+    real) — a one-day gap would be indistinguishable from the UTC/Tashkent
+    offset itself near midnight, exactly the ambiguity this fix removes, so
+    the test needs a gap no clock straddling can produce by coincidence — to
+    prove `document_date` reads the DOCUMENT's own day and never drifts to the
+    activation day, unlike `issued_at`."""
+    from datetime import timedelta
+
+    from app.core.time import business_today
+    from app.modules.permits import service
+    from tests.modules.permits.conftest import sign_permit
+
+    issuance_day = business_today() - timedelta(days=5)
+    monkeypatch.setattr(service, "business_today", lambda: issuance_day)
+    result = await hodim_client.post(f"/api/v1/applications/{paid_application.id}/permit")
+    assert result.status_code == 201, result.text
+    monkeypatch.undo()  # activation below must stamp the REAL day, not issuance_day
+
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+    pdf = await service.pdf_bytes(db, permit.id)
+    for signer, purpose in (
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+        (accountant_client, "permit_accountant"),
+        (holder_client, "permit_recipient"),
+    ):
+        signed = await sign_permit(signer, permit.id, purpose, pdf)
+        assert signed.status_code == 200, signed.text
+
+    card = await holder_client.client.get(f"{API}/permits/{permit.id}")
+    body = card.json()
+    assert body["document_date"] == issuance_day.isoformat()
+    assert body["document_date"] != body["issued_at"][:10]
 
 
 async def test_staff_in_zone_read_a_permit_they_do_not_hold(

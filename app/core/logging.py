@@ -22,7 +22,18 @@ CORRELATION_ID_KEY = "correlation_id"
 #
 # Dropping the line loses nothing: the module keeps its OWN count of every call
 # in `qr_check_log`, deliberately without the identifying half.
-SILENT_ACCESS_LOG_PATHS = ("/api/v1/public/permits/check",)
+#
+# 4.6 `public` adds two more paths, same reasoning: `POST /public/appeals`
+# writes an anonymous citizen's contact info in its BODY (uvicorn's access
+# log never sees a body, so this one is about the IP alone, matching the QR
+# check); `GET /public/appeals/check` takes that same contact as a QUERY
+# STRING (`?phone=`/`?email=`) — exactly what this filter exists to keep out
+# of a plaintext log. The open-data routes carry no personal data at all and
+# are deliberately NOT here — their access pattern is worth keeping for ops.
+SILENT_ACCESS_LOG_PATHS = (
+    "/api/v1/public/permits/check",
+    "/api/v1/public/appeals",
+)
 
 
 class _SilentPathFilter(logging.Filter):

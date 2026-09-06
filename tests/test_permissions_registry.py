@@ -50,6 +50,15 @@ UNGRANTED_BY_DESIGN = frozenset(
         "admin.settings.manage",
         "auth.sessions.revoke_any",
         "auth.users.manage",
+        # 4.6/4.8 (`public`/`help`, plan `04.6-4.8-public-help.md`): who triages
+        # citizen appeals, FAQ content and support tickets is an Agency
+        # org-chart question `tz/03`'s matrix does not answer — filed as an
+        # open item rather than guessed at. Reachable only through the
+        # `sys_admin` bypass until a role is chosen and this migration-grant
+        # gap is closed deliberately.
+        "public.appeals.manage",
+        "help.faq.manage",
+        "help.tickets.manage",
     }
 )
 

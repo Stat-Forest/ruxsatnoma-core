@@ -10,16 +10,17 @@ and `return-to-review` require `CONTOURS_APPROVE` (the rahbar —
 'Zone scoping is not a permission check — a read path needs both')."""
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
-from app.modules.auth.deps import get_current_user, require_permission
+from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import checks, service
+from app.modules.gis.models import VERSION_STATUSES
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import (
     ApproveIn,
@@ -30,10 +31,15 @@ from app.modules.gis.schemas import (
     ContourOut,
     ContourPatch,
     FeatureCollectionOut,
+    VersionDetailOut,
     VersionIn,
     VersionOut,
     VersionPatch,
 )
+
+# `?status=` on the version list below — same shape as
+# `payments.backoffice_router._STATUS_PATTERN` for the discrepancy register.
+_VERSION_STATUS_PATTERN = "^(" + "|".join(VERSION_STATUSES) + ")$"
 
 router = APIRouter(prefix="/gis", tags=["gis"])
 
@@ -131,6 +137,39 @@ async def patch_contour(
         db, contour_id, actor=user, **payload.model_dump(exclude_unset=True)
     )
     return ContourOut.model_validate(contour, from_attributes=True)
+
+
+@router.get("/contours/{contour_id}/versions", response_model=Page[VersionOut])
+async def list_versions(
+    contour_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    # Both roles that can act on a version need to find it: the specialist
+    # tracking their own draft/review submission (`CONTOURS_MANAGE`) and the
+    # rahbar who must approve it (`CONTOURS_APPROVE`) — task defect 4a.
+    user: Annotated[User, Depends(require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE))],
+    params: Annotated[PageParams, Depends()],
+    status: Annotated[str | None, Query(pattern=_VERSION_STATUS_PATTERN)] = None,
+) -> Any:
+    items, total = await service.list_versions(
+        db, contour_id, status=status, params=params, actor=user
+    )
+    return Page[VersionOut](
+        items=[VersionOut.model_validate(item, from_attributes=True) for item in items],
+        total=total,
+        page=params.page,
+        page_size=params.page_size,
+    )
+
+
+@router.get("/contours/{contour_id}/versions/{version_id}", response_model=VersionDetailOut)
+async def get_version(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE))],
+) -> Any:
+    detail = await service.version_detail(db, contour_id, version_id, actor=user)
+    return VersionDetailOut.model_validate(detail)
 
 
 @router.post("/contours/{contour_id}/versions", status_code=201)

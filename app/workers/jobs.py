@@ -21,6 +21,7 @@ from app.modules.gis import import_service as gis_import_service
 from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
 from app.modules.notifications.models import Notification
+from app.modules.oversight import jobs as oversight_jobs
 from app.modules.payments import jobs as payments_jobs
 from app.modules.payments import statement_service as payments_statement_service
 from app.modules.permits import jobs as permits_jobs
@@ -275,6 +276,22 @@ async def sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]
         await db.commit()
     if counts["reminded"] or counts["flagged"]:
         logger.info("job.applications_sla_sweep", **counts)
+    return counts
+
+
+async def oversight_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]:
+    """Harvest already-tagged `audit_log` rows into `risk_indicators`, then run
+    the one direct detector, RI-03 (plan `04.2-4.4-oversight-dashboard`).
+
+    Thin wrapper only — `oversight.jobs.sweep(db, correlation_id=...)` holds
+    the actual logic, the same split `refund_sla_sweep`/`sla_sweep` above have
+    from their own modules' `jobs.py`."""
+    correlation_id = f"job:{uuid.uuid4()}"
+    async with factory() as db:
+        counts = await oversight_jobs.sweep(db, correlation_id=correlation_id)
+        await db.commit()
+    if counts["harvested"] or counts["overlaps_raised"]:
+        logger.info("job.oversight_sweep", **counts)
     return counts
 
 

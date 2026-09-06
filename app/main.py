@@ -30,10 +30,15 @@ from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
 from app.modules.applications.router import router as applications_router
+from app.modules.archive.router import router as archive_router
 from app.modules.auth.router import router as auth_router
+from app.modules.dashboard.router import router as dashboard_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
 from app.modules.gis.router import router as gis_router
+from app.modules.help.admin_router import router as help_admin_router
+from app.modules.help.router import router as help_router
+from app.modules.inspections.router import router as inspections_router
 from app.modules.norms.calc_router import router as norms_calc_router
 from app.modules.norms.public_router import router as norms_public_router
 from app.modules.norms.refs_router import router as norms_refs_router
@@ -41,6 +46,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.oversight.router import router as oversight_router
 from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
 from app.modules.payments.refunds_router import router as refunds_router
@@ -48,6 +54,10 @@ from app.modules.payments.router import router as payments_router
 from app.modules.permits.lifecycle_router import router as permits_lifecycle_router
 from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
+from app.modules.public.admin_router import router as public_admin_router
+from app.modules.public.router import router as public_router
+from app.modules.reports.router import router as reports_router
+from app.modules.search.router import router as search_router
 from app.modules.signatures.router import router as signatures_router
 
 # HTTPException с этими статусами — по коду из каталога ERR-*; остальные статусы
@@ -301,5 +311,25 @@ def create_app() -> FastAPI:
     # which is level 5 and stage 4.6 — plan 03.11a ruling 15; the PATH is
     # `design/03`'s own, so 4.6 inherits a working route rather than a rival.
     app.include_router(permits_public_router, prefix="/api/v1")
+    app.include_router(inspections_router, prefix="/api/v1")
+    # Level 5 reader (design/01 rule 5) — stage 4.3, no event subscriptions
+    # (nothing else in the system needs to react to a report's lifecycle).
+    app.include_router(reports_router, prefix="/api/v1")
+    # 4.2/4.4 — level-5 readers, no writes of their own beyond an audit trail.
+    app.include_router(oversight_router, prefix="/api/v1")
+    app.include_router(dashboard_router, prefix="/api/v1")
+    # 4.6 `public`: citizen appeals (anonymous submit/check + staff triage) and
+    # open data (anonymous, k-anonymity-suppressed). Anonymous routes here
+    # follow permits_public_router's own precedent: rate limit instead of
+    # auth, and the two appeal routes are silenced in app/core/logging.py.
+    app.include_router(public_router, prefix="/api/v1")
+    app.include_router(public_admin_router, prefix="/api/v1")
+    # 4.8 `help`: FAQ (anonymous read, staff-managed write) and support
+    # tickets (any authenticated user; staff triage under help.tickets.manage).
+    app.include_router(help_router, prefix="/api/v1")
+    app.include_router(help_admin_router, prefix="/api/v1")
+    # Track B4 (stage 4): two narrow level-5 readers, no other track's tables written.
+    app.include_router(search_router, prefix="/api/v1")
+    app.include_router(archive_router, prefix="/api/v1")
 
     return app

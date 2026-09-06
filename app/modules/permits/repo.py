@@ -508,3 +508,23 @@ async def tickets_ending_before(
         .execution_options(populate_existing=True)
     )
     return list(rows.scalars().all())
+
+
+async def active_stats_by_organization(db: AsyncSession) -> list[tuple[uuid.UUID, int, Decimal]]:
+    """`(organization_id, active_count, active_area_ha)` for every organization
+    holding at least one `active` permit (4.6 `public`'s open-data aggregate —
+    the anonymous surface never sees a single permit row, only this sum).
+    `area_ha` is the permit's own frozen figure (design/02 § permits), not a
+    live GIS read — an open-data number should not move under the same permit
+    because a contour was re-surveyed.
+    """
+    rows = await db.execute(
+        select(
+            Permit.organization_id,
+            func.count(Permit.id),
+            func.coalesce(func.sum(Permit.area_ha), 0),
+        )
+        .where(Permit.status == "active")
+        .group_by(Permit.organization_id)
+    )
+    return [(row[0], row[1], row[2]) for row in rows.all()]

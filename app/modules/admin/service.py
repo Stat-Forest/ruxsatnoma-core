@@ -16,7 +16,7 @@ from app.core.errors import err
 from app.core.models import SystemSetting
 from app.core.time import business_today
 from app.modules.admin import repo
-from app.modules.admin.models import Classifier, ClassifierItem, Organization
+from app.modules.admin.models import Classifier, ClassifierItem, Organization, Region
 from app.modules.admin.schemas import (
     ClassifierIn,
     ClassifierItemIn,
@@ -42,6 +42,34 @@ async def _classifier_or_404(db: AsyncSession, code: str) -> Classifier:
     if classifier is None:
         raise err("ERR-SYS-003", details={"classifier": code})
     return classifier
+
+
+async def list_regions(db: AsyncSession) -> list[Region]:
+    """Thin pass-through (4.6 `public`'s open-data stats need region names to
+    group by, and cross-module reads go through THIS service, never
+    `admin.repo` directly — design/01 rule 2). No rule to apply: identical
+    reasoning to why `GET /refs/*` calls the repo straight from its own
+    router, just on the other side of the module boundary."""
+    return await repo.list_regions(db)
+
+
+# The whole country tops out at roughly ninety leshozes (plan `03.6a` note); a
+# caller needing "every organization of a kind" is asking a reference-data
+# question, not a paged-listing one, so this is not `repo.list_organizations`'
+# own `limit=20` default.
+_ALL_ORGANIZATIONS_LIMIT = 1000
+
+
+async def list_organizations(
+    db: AsyncSession, *, kind: str | None = None, status: str | None = "active"
+) -> list[Organization]:
+    """Thin pass-through, unpaged (see `_ALL_ORGANIZATIONS_LIMIT`) — the open-data
+    aggregate (4.6 `public`) needs every organization of a kind to group permit
+    counts by region, not one page of them."""
+    rows, _total = await repo.list_organizations(
+        db, kind=kind, status=status, limit=_ALL_ORGANIZATIONS_LIMIT
+    )
+    return rows
 
 
 async def organization_or_404(db: AsyncSession, org_id: uuid.UUID) -> Organization:

@@ -56,10 +56,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
 from app.core.models import MediaFile
+from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
 from app.modules.applications.events import APPLICATION_APPROVED
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, User
+from app.modules.gis.models import GisLayer
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
 from app.modules.norms.schemas import CalculationIn
@@ -584,4 +586,156 @@ async def test_a_calculation_cannot_be_attached_to_an_application_through_the_wr
     ).all()
     assert [row.id for row in after] == [row.id for row in before], (
         "an append-only table: a row that slipped past the guard could never be removed"
+    )
+
+
+# --- task defect 5: gis's occupancy reader against TWO real permits ----------
+#
+# `gis.service.list_contours`/`contour_card` read `permits.occupancy_provider`
+# (registered in `app/event_subscriptions.py`) for `s_available_ha`/
+# `over_allocated`. Every existing test of that reading side fakes the
+# provider (`tests/modules/gis/test_read_api.py`), and every existing test of
+# the WRITING side (two applications, two permits) never reads gis back
+# afterwards — so nothing had ever driven a contour through gis, applications,
+# payments AND permits together and then asked gis what it now believes. This
+# is exactly the seam the demo's own over-allocation defect lives on: two
+# permits issued over one parcel, each perfectly legal on its own module's
+# terms.
+
+
+async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
+    db: AsyncSession,
+    hodim_client: httpx.AsyncClient,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    applicant_client: httpx.AsyncClient,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+):
+    from datetime import date
+
+    from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+    from tests.modules.permits.conftest import (
+        GRAZING_HERD,
+        calculation_input_snapshot,
+        unique_pinfl,
+    )
+
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db,
+        contour.id,
+        random_box_wkt(),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        area_ha=Decimal("50.0000"),
+    )
+    await db.commit()
+
+    async def _paid_application_requesting(area_ha: Decimal) -> Application:
+        user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+        applicant = Applicant(
+            kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id
+        )
+        db.add(applicant)
+        await db.flush()
+        application = Application(
+            applicant_id=applicant.id,
+            submitted_by_user_id=user.id,
+            on_behalf="self",
+            activity_type_id=grazing_activity_id,
+            contour_id=contour.id,
+            contour_version_id=version.id,
+            requested_area_ha=area_ha,
+            period_from=date(2027, 5, 1),
+            period_to=date(2027, 9, 30),
+            status="APPROVED",
+            channel="portal",
+            assigned_org_id=leshoz.id,
+        )
+        db.add(application)
+        await db.flush()
+        db.add(
+            Calculation(
+                application_id=application.id,
+                contour_id=contour.id,
+                activity_type_id=grazing_activity_id,
+                rule_code_version=RULE_CODE_VERSION,
+                input_snapshot=calculation_input_snapshot(GRAZING_HERD),
+                used_sb=Decimal("10.0000"),
+                amount=Decimal("500000.00"),
+                breakdown={"total": "500000.00"},
+            )
+        )
+        await db.flush()
+        await db.commit()
+        return application
+
+    async def _issue_and_activate(application: Application) -> None:
+        app_id = application.id
+        await publish(db, Event(name=APPLICATION_APPROVED, payload={"application_id": app_id}))
+        await db.commit()
+        invoice = await payments_service.invoice_for_application(db, app_id)
+        assert invoice is not None
+        await db.refresh(invoice)
+        transaction = ProviderTransaction(
+            invoice_id=invoice.id,
+            provider="payme",
+            external_id=f"journey-{uuid.uuid4().hex[:12]}",
+            amount=invoice.amount,
+            state="2",
+            performed_at=datetime.now(UTC),
+            payload={},
+        )
+        db.add(transaction)
+        await db.flush()
+        await payments_service.confirm_payment(db, invoice=invoice, transaction=transaction)
+        await db.commit()
+
+        issued = await hodim_client.post(f"{API}/applications/{app_id}/permit")
+        assert issued.status_code == 201, issued.text
+        permit_id = uuid.UUID(issued.json()["id"])
+        pdf = (await accountant_client.client.get(f"{API}/permits/{permit_id}/pdf")).content
+
+        applicant_row = await db.get(Applicant, application.applicant_id)
+        assert applicant_row is not None and applicant_row.owner_user_id is not None
+        holder_user = await db.get(User, applicant_row.owner_user_id)
+        assert holder_user is not None
+        async for holder in _signer_for(db, role_code="applicant", user=holder_user):
+            for signer, purpose in (
+                (head_client, "permit_head"),
+                (chief_forester_client, "permit_chief_forester"),
+                (accountant_client, "permit_accountant"),
+                (holder, signers.RECIPIENT_PURPOSE),
+            ):
+                result = await sign_permit(signer, permit_id, purpose, pdf)
+                assert result.status_code == 200, (purpose, result.text)
+
+    # Two independently unremarkable applications — 30 + 30 ga on a 50 ga
+    # contour. Neither the applications module, the payments module nor the
+    # permits module has any reason to refuse either one: each is priced,
+    # paid and signed on its own terms, and no single module reads the
+    # other's allocation at all (module boundary rule).
+    first = await _paid_application_requesting(Decimal("30.0000"))
+    second = await _paid_application_requesting(Decimal("30.0000"))
+    await _issue_and_activate(first)
+    await _issue_and_activate(second)
+
+    card = await applicant_client.get(f"{API}/gis/contours/{contour.id}")
+    assert card.status_code == 200, card.text
+    body = card.json()
+    assert body["occupancy_source"] == "permits"
+    assert body["occupied_ha"] == "60.0000", (
+        "permits.occupancy_provider should already count both real, active "
+        "permits — if this drops to one, the seam between issuance and the "
+        "occupancy provider broke, not gis's own arithmetic"
+    )
+    assert body["s_available_ha"] == "0", "defect 2's floor: never a negative available area"
+    assert body["over_allocated"] is True, (
+        "defect 2's explicit signal: 60 ga committed on a 50 ga contour is a "
+        "real over-allocation across TWO real permits, not a fabricated "
+        "provider in a unit test — the exact shape the demo hit live"
     )
