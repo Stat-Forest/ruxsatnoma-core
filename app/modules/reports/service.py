@@ -26,9 +26,11 @@ from app.core.schemas import PageParams
 from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
+from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.reports import render, repo
 from app.modules.reports.models import Report, ReportForm
+from app.modules.reports.permissions import REPORTS_ACCEPT
 from app.modules.reports.rules import check_rows
 from app.modules.reports.signers import REPORT_APPROVE_PURPOSE, required_role
 from app.modules.signatures import service as signatures_service
@@ -116,6 +118,40 @@ async def _assert_report_signer(db: AsyncSession, report: Report, actor: User) -
         )
         await db.commit()
         raise err("ERR-SIGN-001", details={"reason": "signer_not_authorized"})
+
+
+async def _assert_may_return_centrally(db: AsyncSession, report: Report, actor: User) -> None:
+    """The `head_approved` branch of `return_report` needs `reports.accept`
+    itself, not merely something the route's `require_any_permission(
+    reports.sign, reports.accept)` gate accepted for the OTHER branch.
+
+    That `any` gate is honest for `submitted` (which legitimately needs
+    `reports.sign`, checked by identity in `_assert_report_signer`) and wrong
+    for this one: every executor_head nationally holds `reports.sign`, so
+    without this check any of them could reach here and return ANY report
+    system-wide, recorded as a return "by the centre" they never issued.
+    Unlike the signer check, this is a plain PRIVILEGE question — `reports.
+    accept` is central-only by construction (migration 0027's seed) and
+    carries no per-organization identity of its own — so this mirrors
+    `require_permission(REPORTS_ACCEPT)` exactly, `auth.deps._authorize`'s
+    sys_admin bypass included (decision #41 ruling 2), rather than
+    reimplementing a narrower rule.
+    """
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return
+    held = await auth_repo.permission_codes(db, actor)
+    if REPORTS_ACCEPT not in held:
+        await audit.log(
+            db,
+            action=REPORT_RETURN,
+            user_id=actor.id,
+            object_type=OBJECT_TYPE,
+            object_id=report.id,
+            result="denied",
+            basis=REPORTS_ACCEPT,
+        )
+        await db.commit()
+        raise err("ERR-ACL-001", details={"permission": REPORTS_ACCEPT})
 
 
 def _report_bytes(report: Report) -> bytes:
@@ -470,9 +506,12 @@ async def return_report(
     `sign_report` — `reports.sign` alone is not enough, see
     `_assert_report_signer`); `head_approved` is returned by the central
     office (`returned_by="center"`) — `reports.accept` is central-only by
-    construction (migration 0027's seed), so no further identity check is
-    needed there the way `permits.manage`'s org check is needed for a role
-    every leshoz has one of."""
+    construction (migration 0027's seed), but the ROUTE gates this whole
+    action on `require_any_permission(reports.sign, reports.accept)` for the
+    `submitted` branch's sake, so a `reports.sign` holder (every executor_head
+    nationally) reaches this branch too and needs its OWN check that the
+    actor actually holds `reports.accept` — see `_assert_may_return_centrally`.
+    """
     report = await repo.get_report_for_update(db, report_id)
     if report is None:
         raise err("ERR-SYS-003", details={"report_id": str(report_id)})
@@ -481,6 +520,7 @@ async def return_report(
         await _assert_report_signer(db, report, actor)
         returned_by = "head"
     elif report.status == "head_approved":
+        await _assert_may_return_centrally(db, report, actor)
         returned_by = "center"
     else:
         raise err("ERR-REP-001", details={"reason": "not_returnable", "status": report.status})

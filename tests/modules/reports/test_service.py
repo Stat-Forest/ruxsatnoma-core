@@ -400,3 +400,102 @@ async def test_return_then_resubmit(
     report = await service.submit_report(db, report.id, hodim)
     assert report.status == "submitted"
     assert report.returned_by is None
+
+
+async def _head_approved_report(
+    db: AsyncSession,
+    *,
+    grazing_form: ReportForm,
+    leshoz: Organization,
+    hodim: User,
+    head: User,
+    period_start,
+    period_end,
+) -> Report:
+    """create -> generate -> submit -> sign — one step short of
+    `_approved_report`, the `head_approved` state `return_report`'s
+    central-office branch needs."""
+    report = await service.create_report(
+        db,
+        form_id=grazing_form.id,
+        organization_id=leshoz.id,
+        period_start=period_start,
+        period_end=period_end,
+        actor=hodim,
+    )
+    report = await service.generate_report(db, report.id, hodim)
+    report = await service.submit_report(db, report.id, hodim)
+
+    assert head.pinfl is not None
+    document = service._report_bytes(report)
+    pkcs7 = encode_mock_signature(
+        document=document, serial=f"SER-{head.pinfl}", issuer="ISS-1", pinfl=head.pinfl
+    )
+    return await service.sign_report(db, report.id, pkcs7=pkcs7, actor=head)
+
+
+async def test_return_head_approved_refuses_reports_sign_only_actor(
+    db: AsyncSession,
+    grazing_form: ReportForm,
+    leshoz: Organization,
+    other_leshoz: Organization,
+):
+    """The ROUTE gates `/return` on `require_any_permission(reports.sign,
+    reports.accept)` because the `submitted` branch legitimately needs
+    `reports.sign` (`_assert_report_signer`'s identity check). This proves
+    the `head_approved` branch is not fooled by that `any` admission: an
+    executor_head from a DIFFERENT organization holds `reports.sign` by role
+    and passes the route, but holds no `reports.accept` and must be refused
+    here — with `ERR-ACL-001`, not a bare 403."""
+    hodim = await _own_hodim(db, leshoz)
+    head = await _own_head(db, leshoz)
+    report = await _head_approved_report(
+        db,
+        grazing_form=grazing_form,
+        leshoz=leshoz,
+        hodim=hodim,
+        head=head,
+        period_start=date(2029, 1, 1),
+        period_end=date(2029, 3, 31),
+    )
+
+    stranger_head = await _own_head(db, other_leshoz)
+    with pytest.raises(DomainError) as exc:
+        await service.return_report(db, report.id, comment="not yours", actor=stranger_head)
+    assert exc.value.code == "ERR-ACL-001"
+    assert exc.value.details is not None
+    assert exc.value.details["permission"] == "reports.accept"
+
+    # Refused, not returned: the report itself is untouched.
+    report_row = await db.get(Report, report.id)
+    assert report_row is not None
+    assert report_row.status == "head_approved"
+    assert report_row.returned_by is None
+
+
+async def test_return_head_approved_by_reports_accept_holder(
+    db: AsyncSession,
+    grazing_form: ReportForm,
+    leshoz: Organization,
+    central_admin_user: User,
+):
+    """The legitimate path: a `reports.accept` holder (central office) still
+    returns a `head_approved` report, recorded as a return by the centre."""
+    hodim = await _own_hodim(db, leshoz)
+    head = await _own_head(db, leshoz)
+    report = await _head_approved_report(
+        db,
+        grazing_form=grazing_form,
+        leshoz=leshoz,
+        hodim=hodim,
+        head=head,
+        period_start=date(2029, 4, 1),
+        period_end=date(2029, 6, 30),
+    )
+
+    returned = await service.return_report(
+        db, report.id, comment="needs a correction", actor=central_admin_user
+    )
+    assert returned.status == "returned"
+    assert returned.returned_by == "center"
+    assert returned.returned_comment == "needs a correction"

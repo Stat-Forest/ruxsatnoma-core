@@ -51,7 +51,7 @@ class ReportFormOut(BaseModel):
     name: dict[str, str]
     activity_type_id: uuid.UUID | None
     period_type: str
-    columns: list[dict[str, Any]]
+    columns: list[ReportFormColumn]
     rules: list[dict[str, Any]]
     schedule: dict[str, Any]
     status: str
