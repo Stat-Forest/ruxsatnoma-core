@@ -55,6 +55,7 @@ async def search_applications(
     db: AsyncSession,
     *,
     scope: Any,
+    contour_organization_col: Any,
     q: str | None,
     status: str | None,
     organization_id: uuid.UUID | None,
@@ -64,21 +65,35 @@ async def search_applications(
 ) -> tuple[list[Row], int]:
     """One page of applications matching `scope` and the given filters, with
     the total. `scope` is `abac.zone_filter`'s expression built by the
-    service over `Organization.region_id/district_id` + `Application.
-    assigned_org_id` — required, exactly as `permits.repo.list_permits`
-    documents for its own `scope` argument: a read of this table with no
-    scope at all is every application in the country.
+    service over `Organization.region_id/district_id` + the application's
+    EFFECTIVE organization — `assigned_org_id` once a reviewer has taken it
+    into work, else the contour's own owner (`applications.service.list_
+    applications`'s own documented reasoning for why `Organization.id` is
+    joined through `contour_organization_col`, never `Application.
+    assigned_org_id` alone: `assigned_org_id` is null for every DRAFT and
+    stays null through SUBMITTED, so scoping on it alone made a zone-scoped
+    searcher unable to find their OWN leshoz's unassigned applications at
+    all — the exact seam `dashboard`/`oversight` avoid by sharing this same
+    `gis_service.contour_organization_column` call, seam audit 2026-09-06).
+
+    `contour_organization_col` is built by the SERVICE (`gis_service.
+    contour_organization_column`) and handed down as an expression, matching
+    `applications.service.list_applications`'s own split: a repo calling
+    another module's service would invert the layering even where the
+    boundary rule itself is satisfied (that function's own review I2).
 
     LEFT JOINs `organizations` (unlike `permits.repo.list_permits`'s INNER
-    JOIN): `assigned_org_id` is nullable, and an unassigned row must still be
-    visible to a republic-wide actor (`zone_filter` returns `true()` for one,
-    which does not depend on the join at all) while correctly disappearing
-    for a zone-scoped one (whose `zone_filter` condition compares against a
-    NULL `Organization` column through the LEFT JOIN and evaluates false)."""
+    JOIN): the effective-organization expression can still be NULL (an
+    application naming no contour yet), and such a row must stay visible to
+    a republic-wide actor (`zone_filter` returns `true()` for one, which does
+    not depend on the join at all) while correctly disappearing for a
+    zone-scoped one (whose `zone_filter` condition compares against a NULL
+    `Organization` column through the LEFT JOIN and evaluates false)."""
+    effective_org_col = func.coalesce(Application.assigned_org_id, contour_organization_col)
     conditions: list[Any] = [scope]
     for column, value in (
         (Application.status, status),
-        (Application.assigned_org_id, organization_id),
+        (effective_org_col, organization_id),
         (Application.activity_type_id, activity_type_id),
     ):
         if value is not None:
@@ -96,7 +111,7 @@ async def search_applications(
             Application.created_at,
         )
         .join(Applicant, Applicant.id == Application.applicant_id)
-        .outerjoin(Organization, Organization.id == Application.assigned_org_id)
+        .outerjoin(Organization, Organization.id == effective_org_col)
         .where(*conditions)
     )
     total = (
