@@ -2,6 +2,7 @@
 scoping, and the reversed-period guard (`ERR-VAL-001`, reused rather than a
 module error code of its own)."""
 
+import uuid
 from datetime import UTC, date, datetime
 
 from sqlalchemy import select
@@ -10,7 +11,15 @@ from app.modules.dashboard.permissions import DASHBOARD_VIEW
 from app.modules.gis.models import ContourVersion
 from app.modules.permits.models import Permit
 from tests.modules.gis.conftest import _client_for, make_contour, make_version, random_box_wkt
+from tests.modules.gis.conftest import approval_doc as approval_doc  # noqa: F401
 from tests.modules.gis.conftest import contours_layer as contours_layer  # noqa: F401
+from tests.modules.inspections.conftest import application as application  # noqa: F401
+from tests.modules.inspections.conftest import (
+    default_checklist_id as default_checklist_id,  # noqa: F401,E501
+)
+from tests.modules.inspections.conftest import inspector as inspector  # noqa: F401
+from tests.modules.inspections.conftest import inspector_client as inspector_client  # noqa: F401
+from tests.modules.inspections.conftest import vt_01 as vt_01  # noqa: F401
 from tests.modules.oversight.conftest import make_bare_application
 from tests.modules.permits.conftest import grazing_activity_id as grazing_activity_id  # noqa: F401
 from tests.modules.permits.conftest import make_permit_on_contour
@@ -47,9 +56,15 @@ async def _issue_within_period(db, *, contour, org, activity_type_id, status="ac
     return permit
 
 
-async def test_kpi_counts_own_zone_and_names_the_omitted_tiles(
+async def test_kpi_counts_own_zone_and_has_no_omitted_tiles(
     db, leshoz, other_leshoz, contours_layer, grazing_activity_id
 ):
+    """`inspections_count`/`violations_count` used to be the two names in
+    `omitted` — stale the moment 4.1 `inspections` merged (seam audit,
+    2026-09-06: `repo.inspections_kpi` gives both a real source). Every KPI
+    tile now has one, so `omitted` is empty; `test_kpi_inspections_tile_is_
+    zone_scoped` below proves the two new counts themselves, not just their
+    absence from `omitted`."""
     contour = await make_contour(db, contours_layer, leshoz)
     await _issue_within_period(
         db, contour=contour, org=leshoz, activity_type_id=grazing_activity_id
@@ -69,8 +84,80 @@ async def test_kpi_counts_own_zone_and_names_the_omitted_tiles(
         body = response.json()
         assert body["permits"]["issued_count"] == 1
         assert body["permits"]["active_count"] == 1
-        assert any("inspections_count" in item for item in body["omitted"])
-        assert any("violations_count" in item for item in body["omitted"])
+        assert body["omitted"] == []
+        assert body["inspections"] == {"inspections_count": 0, "violations_count": 0}
+
+
+async def test_kpi_inspections_tile_is_zone_scoped(
+    db,
+    leshoz,
+    other_leshoz,
+    application,
+    inspector,
+    inspector_client,
+    default_checklist_id,
+    vt_01,
+):
+    """Cross-module: a real field act signed as a violation
+    (`inspections`, 4.1) must move `dashboard`'s new `inspections`/
+    `violations_count` tiles (4.4) — and stay OUT of a different
+    leshoz's own KPI, the same zone_filter every other tile here uses.
+    Nothing before this seam audit ever ran these two modules together."""
+    from app.modules.inspections import repo as inspections_repo
+    from app.modules.inspections import service as inspections_service
+    from app.modules.integrations.adapters.eimzo import encode_mock_signature
+
+    created = await inspector_client.post(
+        f"{API}/inspections/acts",
+        json={
+            "application_id": str(application.id),
+            "occurred_at": "2027-06-01T10:00:00Z",
+            "checklist_id": str(default_checklist_id),
+            "answers": {"activity_matches": True, "within_contour": False},
+            "result": "violation",
+        },
+    )
+    assert created.status_code == 201, created.text
+    act_id = created.json()["id"]
+    act = await inspections_repo.get_act(db, uuid.UUID(act_id))
+    assert act is not None
+
+    pkcs7 = encode_mock_signature(
+        document=inspections_service._act_package_bytes(act),
+        serial=f"SN-{inspector.pinfl}",
+        issuer="ISS-1",
+        pinfl=inspector.pinfl,
+    )
+    signed = await inspector_client.post(
+        f"{API}/inspections/acts/{act_id}/sign",
+        json={"pkcs7": pkcs7, "violation_type_item_id": str(vt_01)},
+    )
+    assert signed.status_code == 200, signed.text
+    assert await inspections_repo.case_for_act(db, act.id) is not None
+
+    async for client in _client_for_zoned(db, leshoz.id):
+        response = await client.get(
+            f"{API}/dashboard/kpi",
+            params={"period_from": PERIOD_FROM.isoformat(), "period_to": PERIOD_TO.isoformat()},
+        )
+        assert response.status_code == 200
+        assert response.json()["inspections"] == {
+            "inspections_count": 1,
+            "violations_count": 1,
+        }
+
+    # The other leshoz's own dashboard must see neither — `zone_filter`,
+    # not a filter this tile happens to skip.
+    async for client in _client_for_zoned(db, other_leshoz.id):
+        response = await client.get(
+            f"{API}/dashboard/kpi",
+            params={"period_from": PERIOD_FROM.isoformat(), "period_to": PERIOD_TO.isoformat()},
+        )
+        assert response.status_code == 200
+        assert response.json()["inspections"] == {
+            "inspections_count": 0,
+            "violations_count": 0,
+        }
 
 
 async def test_kpi_reversed_period_is_refused(db, leshoz):

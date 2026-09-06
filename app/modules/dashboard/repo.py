@@ -1,7 +1,7 @@
 """Dashboard repository. Level-5 reader (design/01 rule 5): direct read-only
-`select()` access to `applications`/`permits`/`payments`/`gis` tables.
-`dashboard` has no table of its own (design/02: "queries over the other
-tables")."""
+`select()` access to `applications`/`permits`/`payments`/`gis`/`inspections`
+tables. `dashboard` has no table of its own (design/02: "queries over the
+other tables")."""
 
 import uuid
 from datetime import date, datetime, time
@@ -17,6 +17,7 @@ from app.modules.applications.models import Application
 from app.modules.applications.sla import SLA_ACTIVE_STATUSES
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour, ContourVersion
+from app.modules.inspections.models import InspectionAct, ViolationCase
 from app.modules.payments.models import Allocation, Invoice
 from app.modules.permits.models import Permit
 
@@ -329,6 +330,92 @@ async def published_contours_in_scope(
         .where(zone_clause, ContourVersion.status == "published")
     )
     return [(row[0], row[1]) for row in (await db.execute(stmt)).all()]
+
+
+# --- Inspections (4.1) --------------------------------------------------------
+
+
+async def inspections_kpi(
+    db: AsyncSession,
+    *,
+    actor_zone: Zone,
+    filter_zone: Zone,
+    period_from: date,
+    period_to: date,
+) -> tuple[int, int]:
+    """`(inspections_count, violations_count)` — signed field acts occurring
+    in the period, and the violation cases those SAME acts opened, both
+    zone-scoped.
+
+    Both counts are filtered by the ACT's `occurred_at` (the real-world visit
+    date), never `violation_cases.created_at` (the row's own insert time) —
+    consistent with `inspections_count`'s own period column, and correct for
+    the same reason `permits_kpi` filters by `issued_at`, not by whatever
+    moment a later admin action happened to touch the row: an act signed a
+    few days after the visit it records must count toward the period the
+    VIOLATION occurred in, not the period the paperwork was filed in.
+
+    Outer join, not `payments_kpi`'s inner one: `inspection_acts.
+    organization_id`/`violation_cases.organization_id` are nullable (an
+    "activity without a permit" patrol act may resolve to no organization at
+    all — `inspections/models.py`'s own docstring), so an inner join would
+    silently drop those rows from every viewer's count, zone-scoped or not.
+    `zone_filter` still excludes them for a zone-scoped viewer on its own
+    (a NULL joined column fails every equality test), which is the same
+    fail-closed posture `search`'s own `outerjoin(Organization, ...)` on
+    `applications.assigned_org_id` already uses.
+
+    No `activity_type_id` parameter, matching `payments_kpi`/
+    `published_contours_in_scope` above: an inspection act's activity type
+    would have to be resolved through whichever of `permit_id`/
+    `application_id` it names (and neither, for a bare patrol), which is a
+    second cross-module resolution this tile does not need to invent."""
+    start, end = _day_bounds(period_from, period_to)
+
+    act_zone_clause = _combined(
+        actor_zone,
+        filter_zone,
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=InspectionAct.organization_id,
+    )
+    inspections_count = (
+        await db.execute(
+            select(func.count()).select_from(
+                select(InspectionAct.id)
+                .outerjoin(Organization, Organization.id == InspectionAct.organization_id)
+                .where(
+                    act_zone_clause,
+                    InspectionAct.status == "signed",
+                    InspectionAct.occurred_at.between(start, end),
+                )
+                .subquery()
+            )
+        )
+    ).scalar_one()
+
+    case_zone_clause = _combined(
+        actor_zone,
+        filter_zone,
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=ViolationCase.organization_id,
+    )
+    violations_count = (
+        await db.execute(
+            select(func.count()).select_from(
+                select(ViolationCase.id)
+                .outerjoin(Organization, Organization.id == ViolationCase.organization_id)
+                .join(InspectionAct, InspectionAct.id == ViolationCase.act_id)
+                .where(
+                    case_zone_clause,
+                    InspectionAct.occurred_at.between(start, end),
+                )
+                .subquery()
+            )
+        )
+    ).scalar_one()
+    return inspections_count, violations_count
 
 
 # --- Territory-slice drill-down (k-anonymity) --------------------------------

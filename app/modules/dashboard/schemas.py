@@ -52,6 +52,11 @@ class RiskIndicatorsKpiOut(BaseModel):
     by_level: dict[str, int]
 
 
+class InspectionsKpiOut(BaseModel):
+    inspections_count: int
+    violations_count: int
+
+
 class KpiOut(BaseModel):
     period: PeriodOut
     permits: PermitsKpiOut
@@ -62,10 +67,12 @@ class KpiOut(BaseModel):
     sla: SlaKpiOut
     rejections: list[RejectionRowOut]
     risk_indicators: RiskIndicatorsKpiOut
-    # Tiles `tz/04` С21 names that this track could not build for lack of a
+    inspections: InspectionsKpiOut
+    # Tiles `tz/04` С21 names that this module cannot yet build for lack of a
     # real source (track brief's own rule: no plausible constant, leave it
-    # out and say so) — currently `inspections`/`violations`, since the 4.1
-    # `inspections` module is a sibling track not yet merged into `dev`.
+    # out and say so instead). Empty today — `inspections`/`violations` were
+    # the two names here until `repo.inspections_kpi` gave them a real source
+    # (seam audit, 2026-09-06).
     omitted: list[str]
 
 
