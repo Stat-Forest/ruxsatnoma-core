@@ -36,8 +36,19 @@ REQUIRED_BULLETS = ("- **Rule:**", "- **Why:**", "- **How to apply:**")
 # (3.7 produced ~10); once it runs out, a new lesson has to be paid for by merging two
 # old ones. That is the intended periodic consolidation, not an accident — raise these
 # numbers only as a deliberate decision, never to unblock a commit.
+#
+# Raised from 900 to 1000 lines on 2026-09-06 (Oybek, in chat), as exactly such a
+# decision and not to unblock anything. The line cap had done its job and then started
+# costing lessons: a session found a real defect, wrote the lesson, and could not record
+# it. The consolidation that followed searched all 55 entries of an already-consolidated
+# file and found only FIVE honest merges — a much lower yield than the 1217→900 pass,
+# which is what a file with little padding left looks like. Meanwhile the codebase went
+# from the 13 modules this cap was chosen against to 20, and more modules mean more
+# genuinely distinct classes of gotcha rather than more duplicates to squeeze out.
+# `MAX_ENTRIES` deliberately stays at 60: at ~15 lines an entry the two caps still bind
+# at about the same point, so the ratchet keeps working.
 MAX_ENTRIES = 60
-MAX_LINES = 900
+MAX_LINES = 1000
 
 # The four numbers above are also stated in prose, in `lessons.md`'s header and in the
 # skill — three copies, exactly the "two sources of truth" shape `lessons.md`'s own
