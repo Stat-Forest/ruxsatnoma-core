@@ -1331,11 +1331,33 @@ async def missing_signatures(db: AsyncSession, permit_id: uuid.UUID) -> list[str
 # `active` and `expired` — `suspended` and `revoked` are 3.11b's — but the map is
 # complete now, because it is what 3.11b lands on rather than something it has to
 # invent alongside its transitions.
+# С12's four words, in every language the interfaces offer. The Cyrillic column
+# is the one the spec quotes and the one `PublicStatus` pins; the other two exist
+# because this page is the ONE surface a citizen reaches with no account, and
+# stage 7.3 (finding F6) watched a scanned QR render «амалда» in the middle of an
+# otherwise Latin page.
+#
+# Only the STATUS is localized here, and that is the whole of the ruling. The
+# organization and the activity on the same card come from the permit's
+# `snapshot` and are the document's own words in the document's own language
+# (`DOCUMENT_LANGUAGE`, `tz/13`: «на государственном языке») — a public check
+# verifies a PRINTED permit, so restating its text in another alphabet would make
+# the page disagree with the paper in the inspector's hand. A status is not on
+# the paper: it is computed at read time, and it is the one thing here that may
+# be said in the reader's own language.
+PUBLIC_STATUS_LABELS_I18N: dict[str, dict[str, str]] = {
+    "active": {"uz_latn": "amalda", "uz_cyrl": "амалда", "ru": "действует"},
+    "suspended": {"uz_latn": "toʻxtatilgan", "uz_cyrl": "тўхтатилган", "ru": "приостановлено"},
+    "expired": {"uz_latn": "muddati tugagan", "uz_cyrl": "муддати тугаган", "ru": "срок истёк"},
+    "revoked": {"uz_latn": "bekor qilingan", "uz_cyrl": "бекор қилинган", "ru": "аннулировано"},
+}
+
+# DERIVED, never typed a second time: `PublicStatus`'s `Literal` is checked
+# against this map's values, so two spellings of one legal status could otherwise
+# pass every test while a citizen read one on the page and an inspector the other
+# (lesson: an enum-ish value has ONE source of truth).
 PUBLIC_STATUS_LABELS: dict[str, str] = {
-    "active": "амалда",
-    "suspended": "тўхтатилган",
-    "expired": "муддати тугаган",
-    "revoked": "бекор қилинган",
+    status: label[DOCUMENT_LANGUAGE] for status, label in PUBLIC_STATUS_LABELS_I18N.items()
 }
 
 # The two statuses that are NOT public, each for its own reason — spelled out
@@ -1526,6 +1548,7 @@ async def public_check(
     return {
         "found": True,
         "status": label,
+        "status_label": PUBLIC_STATUS_LABELS_I18N[permit.status],
         "valid_from": permit.period_from,
         "valid_to": permit.period_to,
         "organization": _from_snapshot(permit.snapshot, "leshoz_name") or NOT_STATED,
