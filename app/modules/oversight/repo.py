@@ -1,7 +1,8 @@
 """Oversight repository. Level-5 reader (design/01 rule 5): direct read-only
 `select()` access to any table is allowed here — `applications`, `permits`,
-`payments` and `gis` models are imported for SELECT only, never for a write
-and never re-exported for another module to import from here."""
+`payments`, `gis`, `inspections` and `reports` models are imported for SELECT
+only, never for a write and never re-exported for another module to import
+from here."""
 
 import uuid
 from datetime import date, datetime
@@ -13,12 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.abac import Zone, zone_filter
 from app.modules.admin.models import Organization
-from app.modules.applications.models import Application
+from app.modules.applications.models import Application, ApplicationStatusHistory
 from app.modules.audit.models import AuditLog
 from app.modules.gis import service as gis_service
+from app.modules.inspections.models import InspectionAct
 from app.modules.oversight.models import OversightEvent, RiskIndicator
 from app.modules.payments.models import Invoice, Refund
-from app.modules.permits.models import Permit
+from app.modules.permits.models import Permit, PermitStatusHistory
+from app.modules.reports.models import Report
 
 
 async def insert_event(
@@ -198,6 +201,40 @@ _REFUND_ORG = (
     .where(Refund.id == RiskIndicator.object_id)
 )
 
+# `signatures.service.sign()` raises RI-05 under whichever `object_type` ITS
+# caller passed — the four below (seam audit, 2026-09-06: the original four
+# above pre-date `inspections`/`reports`, both level-5 siblings built in the
+# same parallel wave that could not see this file). Each DOES have a knowable
+# per-leshoz owner — `inspection_acts.organization_id`/`reports.
+# organization_id` are direct columns, not "no natural organization" the way
+# a `tariff`/`rule_parameter`/bare `certificate` genuinely has none of — so
+# leaving them unmapped hid RI-05 (and any future RI code tagged the same
+# way) from every zone-scoped viewer, on exactly the object types a
+# leshoz-scoped prosecutor or head most needs to see it for: their own
+# inspector's act, their own head's decision, their own submission, their
+# own report.
+_INSPECTION_ACT_ORG = select(InspectionAct.organization_id).where(
+    InspectionAct.id == RiskIndicator.object_id
+)
+_REPORT_ORG = select(Report.organization_id).where(Report.id == RiskIndicator.object_id)
+_APPLICATION_SUBMISSION_ORG = (
+    select(
+        func.coalesce(
+            Application.assigned_org_id,
+            gis_service.contour_organization_column(Application.contour_id),
+        )
+    )
+    .select_from(ApplicationStatusHistory)
+    .join(Application, Application.id == ApplicationStatusHistory.application_id)
+    .where(ApplicationStatusHistory.id == RiskIndicator.object_id)
+)
+_PERMIT_DECISION_ORG = (
+    select(Permit.organization_id)
+    .select_from(PermitStatusHistory)
+    .join(Permit, Permit.id == PermitStatusHistory.permit_id)
+    .where(PermitStatusHistory.id == RiskIndicator.object_id)
+)
+
 
 def _resolved_organization_id() -> Any:
     """One SQL expression naming the organization a `risk_indicators` row
@@ -207,6 +244,16 @@ def _resolved_organization_id() -> Any:
         (RiskIndicator.object_type == "application", _APPLICATION_ORG.scalar_subquery()),
         (RiskIndicator.object_type == "invoice", _INVOICE_ORG.scalar_subquery()),
         (RiskIndicator.object_type == "refund", _REFUND_ORG.scalar_subquery()),
+        (RiskIndicator.object_type == "inspection_act", _INSPECTION_ACT_ORG.scalar_subquery()),
+        (RiskIndicator.object_type == "report", _REPORT_ORG.scalar_subquery()),
+        (
+            RiskIndicator.object_type == "application_submission",
+            _APPLICATION_SUBMISSION_ORG.scalar_subquery(),
+        ),
+        (
+            RiskIndicator.object_type == "permit_decision",
+            _PERMIT_DECISION_ORG.scalar_subquery(),
+        ),
         else_=None,
     )
 

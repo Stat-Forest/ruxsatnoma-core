@@ -326,7 +326,19 @@ async def get_task(db: AsyncSession, task_id: uuid.UUID, *, actor: User) -> Insp
 
 async def _task_scope(db: AsyncSession, actor: User) -> ColumnElement[bool]:
     if await _holds(db, actor, VIEW_ANY) or await _holds(db, actor, TASKS_MANAGE):
-        return zone_filter(zone_of(actor), organization_col=InspectionTask.organization_id)
+        # region_col/district_col matter for a region- or district-scoped
+        # viewer with no organization_id of their own (`admin.users_service.
+        # create_user` can produce one) — every sibling reader
+        # (search/reports/dashboard/archive) supplies all three columns for
+        # exactly this reason; supplying organization_col alone made
+        # `zone_filter` raise for such a viewer (fail-closed, but a 500,
+        # not a scoped result).
+        return zone_filter(
+            zone_of(actor),
+            region_col=Organization.region_id,
+            district_col=Organization.district_id,
+            organization_col=InspectionTask.organization_id,
+        )
     return InspectionTask.assigned_to == actor.id
 
 
@@ -590,7 +602,14 @@ async def act_card(db: AsyncSession, act_id: uuid.UUID, *, actor: User) -> dict[
 
 async def _act_scope(db: AsyncSession, actor: User) -> ColumnElement[bool]:
     if await _holds(db, actor, VIEW_ANY):
-        return zone_filter(zone_of(actor), organization_col=InspectionAct.organization_id)
+        # See `_task_scope`'s comment: region_col/district_col are required
+        # for a region- or district-scoped viewer.
+        return zone_filter(
+            zone_of(actor),
+            region_col=Organization.region_id,
+            district_col=Organization.district_id,
+            organization_col=InspectionAct.organization_id,
+        )
     return InspectionAct.inspector_id == actor.id
 
 
@@ -877,7 +896,16 @@ async def case_card(db: AsyncSession, case_id: uuid.UUID, *, actor: User) -> dic
 
 async def _case_scope(db: AsyncSession, actor: User) -> ColumnElement[bool]:
     if await _holds(db, actor, VIEW_ANY) or await _holds(db, actor, CASES_MANAGE):
-        return zone_filter(zone_of(actor), organization_col=ViolationCase.organization_id)
+        # See `_task_scope`'s comment: region_col/district_col are required
+        # for a region- or district-scoped viewer (a prosecutor scoped to
+        # their oblast, e.g. — `oversight`'s own zone handling assumes this
+        # is a real actor shape).
+        return zone_filter(
+            zone_of(actor),
+            region_col=Organization.region_id,
+            district_col=Organization.district_id,
+            organization_col=ViolationCase.organization_id,
+        )
     own_applicant = await auth_repo.get_own_applicant(db, actor.id)
     if own_applicant is not None:
         return ViolationCase.applicant_id == own_applicant.id

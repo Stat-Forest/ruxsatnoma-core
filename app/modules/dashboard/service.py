@@ -2,12 +2,17 @@
 tiles and the republic -> region -> district -> organization -> contour
 drill-down, with k-anonymity suppression at every level (plan ruling d).
 
-Every tile below has a real, named source (`repo.py`'s own docstrings); two
-С21 names this stage — inspections and violations — could not be built for
-lack of one (`inspections`, a sibling 4.1 track, is not merged into `dev` yet)
-and are reported as `omitted`, never filled with a plausible constant (the
-track brief's own rule, already applied once when the applicant's dashboard
-was built)."""
+Every tile has a real, named source (`repo.py`'s own docstrings). `inspections_
+count`/`violations_count` were the two С21 names this stage could not build at
+first (`inspections`, a sibling 4.1 track, had not merged into `dev` yet); both
+now have a real source (`repo.inspections_kpi`) since `inspections` merged, so
+`OMITTED_TILES` — the two-line claim that they still did not — was itself
+stale (seam audit, 2026-09-06: `inspections` has been on `dev` with 21 routes
+and a real `violation_cases` table since before this module's own branch cut).
+`omitted` stays as a real field on `KpiOut` for whatever the NEXT tile this
+module cannot yet build turns out to be — never filled with a plausible
+constant instead (the track brief's own rule, already applied once when the
+applicant's dashboard was built)."""
 
 import uuid
 from datetime import UTC, date, datetime, timedelta
@@ -23,10 +28,7 @@ from app.modules.dashboard import repo
 from app.modules.gis import service as gis_service
 from app.modules.oversight import service as oversight_service
 
-OMITTED_TILES = (
-    "inspections_count: the 4.1 `inspections` module is not merged into `dev` yet",
-    "violations_count: same reason (inspections.violation_cases does not exist)",
-)
+OMITTED_TILES: tuple[str, ...] = ()
 
 
 def _filter_zone(
@@ -141,6 +143,13 @@ async def get_kpi(
     by_code, by_level = await oversight_service.risk_indicator_counts(
         db, actor=actor, period_from=period_from, period_to=period_to
     )
+    inspections_count, violations_count = await repo.inspections_kpi(
+        db,
+        actor_zone=actor_zone,
+        filter_zone=filter_zone,
+        period_from=period_from,
+        period_to=period_to,
+    )
 
     return {
         "period": {"period_from": period_from, "period_to": period_to},
@@ -165,6 +174,10 @@ async def get_kpi(
         "sla": {"active_count": active_sla, "overdue_count": overdue_sla},
         "rejections": [{"reason_item_id": rid, "count": count} for rid, count in reasons],
         "risk_indicators": {"by_code": by_code, "by_level": by_level},
+        "inspections": {
+            "inspections_count": inspections_count,
+            "violations_count": violations_count,
+        },
         "omitted": list(OMITTED_TILES),
     }
 

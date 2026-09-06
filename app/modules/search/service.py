@@ -14,6 +14,7 @@ two functions rather than one UNION query."""
 import uuid
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,7 @@ from app.modules.applications.models import Application
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.models import User
+from app.modules.gis import service as gis_service
 from app.modules.permits.models import Permit
 from app.modules.search import repo
 from app.modules.search.models import SavedFilter
@@ -40,12 +42,19 @@ PROFILE_UPDATE = "search.profile_update"
 PROFILE_DELETE = "search.profile_delete"
 
 
-def _application_scope(zone: Zone) -> Any:
+def _application_scope(zone: Zone, contour_organization_col: Any) -> Any:
+    """`organization_col` is the application's EFFECTIVE organization
+    (`assigned_org_id`, or the contour's owner while still unassigned) —
+    never `Application.assigned_org_id` alone, matching `applications.
+    service.list_applications`'s own documented reasoning: `assigned_org_id`
+    is null for every DRAFT and stays null through SUBMITTED, so scoping on
+    it alone hid a zone-scoped searcher's own leshoz's unassigned
+    applications with no error and no signal (seam audit, 2026-09-06)."""
     return zone_filter(
         zone,
         region_col=Organization.region_id,
         district_col=Organization.district_id,
-        organization_col=Application.assigned_org_id,
+        organization_col=func.coalesce(Application.assigned_org_id, contour_organization_col),
     )
 
 
@@ -75,9 +84,14 @@ async def search(
     cannot reach here."""
     zone = zone_of(actor)
     if kind == "applications":
+        # Built here and handed down as an expression, not called from the
+        # repo: cross-module calls live in the service layer
+        # (`applications.service.list_applications`'s own review I2).
+        contour_organization_col = gis_service.contour_organization_column(Application.contour_id)
         rows, total = await repo.search_applications(
             db,
-            scope=_application_scope(zone),
+            scope=_application_scope(zone, contour_organization_col),
+            contour_organization_col=contour_organization_col,
             q=q,
             status=status,
             organization_id=organization_id,
