@@ -25,6 +25,13 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-GIS-003": (422, "Пересечение со слоем ограничений или охраны"),
     "ERR-GIS-004": (422, "Ошибка формата файла импорта"),
     "ERR-GIS-005": (409, "Конфликт состояния GIS-объекта"),
+    # `gis.service.split_contour` (decision #91): the two client-supplied
+    # pieces, normalised the same way `insert_version` normalises any
+    # geometry, do not reconstruct the parent's own published boundary — a
+    # gap, an overlap beyond the module's own tolerance, or a piece that
+    # collapses to nothing. Never `ERR-GIS-005`: this is a defect in the
+    # SUBMITTED GEOMETRY itself, not a conflict with the parent's STATE.
+    "ERR-GIS-006": (422, "Части не образуют точное разделение родительского контура"),
     "ERR-NORM-001": (422, "На контуре нет утверждённой нормы"),
     "ERR-NORM-002": (422, "Превышен остаток лимита"),
     "ERR-NORM-003": (422, "Период не соответствует сезону или ротации"),
@@ -50,10 +57,19 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-PERM-001": (409, "Недопустимый переход статуса разрешения"),
     "ERR-PERM-002": (409, "Документ уже подписан и не может быть перевыпущен"),
     "ERR-PERM-003": (409, "Конфликт состояния лесного билета"),
+    "ERR-REP-001": (409, "Конфликт состояния отчёта"),
+    "ERR-REP-002": (422, "Отчёт не проходит логические проверки"),
+    "ERR-REP-003": (422, "Форма отчёта не может быть использована"),
     "ERR-SIGN-001": (422, "Ошибка подписания"),
     "ERR-SIGN-002": (409, "Эта подпись уже проставлена"),
     "ERR-SIGN-003": (422, "Не хватает подписей"),
     "ERR-SIGN-004": (409, "Конфликт состояния сертификата или подписи"),
+    # 4.1 inspections: task/act/case state-conflict (a bad transition, or an
+    # action against a row already past the point it applies to).
+    "ERR-INSP-001": (409, "Недопустимый переход статуса инспекции"),
+    # A checklist answer set that does not satisfy the checklist's own
+    # required questions.
+    "ERR-INSP-002": (422, "Чек-лист заполнен не полностью"),
     "ERR-INT-001": (503, "Внешний сервис не ответил"),
     "ERR-INT-002": (502, "Внешний сервис вернул ошибку"),
     "ERR-SYS-001": (500, "Внутренняя ошибка сервера"),
@@ -63,6 +79,15 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-SYS-005": (409, "Конфликт Idempotency-Key"),
     "ERR-SYS-006": (429, "Слишком много запросов"),
     "ERR-VAL-001": (422, "Ошибка валидации входных данных"),
+    # 4.6 `public`: a citizen appeal cannot make the requested status transition.
+    "ERR-PUB-001": (409, "Недопустимый переход статуса обращения"),
+    # 4.8 `help`: a support ticket cannot make the requested transition, or
+    # cannot accept a new message, in its current status (closed).
+    "ERR-HELP-001": (409, "Недопустимое действие для текущего статуса обращения в поддержку"),
+    # Track B4 (4.5 search, 4.7 archive), plan `04.5-4.7-search-archive.md`.
+    "ERR-SRCH-001": (409, "Профиль поиска с таким именем уже существует"),
+    "ERR-ARCH-001": (409, "Объект не может быть архивирован в текущем статусе"),
+    "ERR-ARCH-002": (409, "Нарушена целостность архивной копии"),
 }
 
 

@@ -36,7 +36,7 @@ async def test_create_role_requires_manage_not_view(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/roles",
-            json={"code": f"role-{uuid.uuid4().hex[:8]}", "name": {"uz_cyrl": "Х"}},
+            json={"code": f"role-{uuid.uuid4().hex[:8]}", "name": {"uz_cyrl": "Х", "uz_latn": "X"}},
         )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-ACL-001"
@@ -63,7 +63,7 @@ async def test_list_roles_shows_seeded_roles_and_permission_codes(db):
 async def test_list_roles_holders_count_excludes_deleted(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"holders-{suffix}", name={"uz_cyrl": "Х"})
+    role = Role(code=f"holders-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(role)
     await db.flush()
     await make_user(db, role_code=role.code)  # active holder
@@ -92,8 +92,8 @@ async def test_create_role(db):
             f"{API}/admin/roles",
             json={
                 "code": f"newrole-{suffix}",
-                "name": {"uz_cyrl": "Янги роль"},
-                "description": {"uz_cyrl": "Тавсиф"},
+                "name": {"uz_cyrl": "Янги роль", "uz_latn": "Yangi rol"},
+                "description": {"uz_cyrl": "Тавсиф", "uz_latn": "Tavsif"},
                 "max_approve_amount": "500000.00",
                 "max_approve_area": "12.5",
             },
@@ -121,7 +121,7 @@ async def test_create_role(db):
 async def test_create_role_duplicate_code(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"dup-{suffix}", name={"uz_cyrl": "Х"})
+    role = Role(code=f"dup-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(role)
     await db.flush()
     await db.commit()
@@ -130,7 +130,8 @@ async def test_create_role_duplicate_code(db):
     async with make_client(app, lifespan=True) as client:
         auth_client(client, token, csrf)
         r = await client.post(
-            f"{API}/admin/roles", json={"code": f"dup-{suffix}", "name": {"uz_cyrl": "Й"}}
+            f"{API}/admin/roles",
+            json={"code": f"dup-{suffix}", "name": {"uz_cyrl": "Й", "uz_latn": "Y"}},
         )
     assert r.status_code == 422, r.text
     assert r.json()["error"]["details"]["reason"] == "duplicate_code"
@@ -141,7 +142,7 @@ async def test_create_role_copy_from_copies_codes_and_limits(db):
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
     source = Role(
         code=f"src-{suffix}",
-        name={"uz_cyrl": "Асл"},
+        name={"uz_cyrl": "Асл", "uz_latn": "Asl"},
         max_approve_amount=Decimal("250000.00"),
         max_approve_area=Decimal("7.25"),
     )
@@ -159,7 +160,7 @@ async def test_create_role_copy_from_copies_codes_and_limits(db):
             f"{API}/admin/roles",
             json={
                 "code": f"copy-{suffix}",
-                "name": {"uz_cyrl": "Нусха"},
+                "name": {"uz_cyrl": "Нусха", "uz_latn": "Nusxa"},
                 "copy_from": source.code,
             },
         )
@@ -180,7 +181,7 @@ async def test_create_role_copy_from_unknown_code_is_404(db):
             f"{API}/admin/roles",
             json={
                 "code": f"badcopy-{uuid.uuid4().hex[:8]}",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
                 "copy_from": "does-not-exist",
             },
         )
@@ -192,7 +193,7 @@ async def test_create_role_copy_from_unknown_code_is_404(db):
 async def test_patch_role_renames(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"patch-{suffix}", name={"uz_cyrl": "Эски"})
+    role = Role(code=f"patch-{suffix}", name={"uz_cyrl": "Эски", "uz_latn": "Eski"})
     db.add(role)
     await db.flush()
     await db.commit()
@@ -202,7 +203,7 @@ async def test_patch_role_renames(db):
         auth_client(client, token, csrf)
         r = await client.patch(
             f"{API}/admin/roles/{role.id}",
-            json={"name": {"uz_cyrl": "Янги"}, "max_approve_amount": "999.99"},
+            json={"name": {"uz_cyrl": "Янги", "uz_latn": "Yangi"}, "max_approve_amount": "999.99"},
         )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -224,7 +225,7 @@ async def test_patch_role_renames(db):
 async def test_set_role_permissions_rejects_unknown_code(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"setperm-{suffix}", name={"uz_cyrl": "Х"})
+    role = Role(code=f"setperm-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(role)
     await db.flush()
     await db.commit()
@@ -262,7 +263,7 @@ async def test_set_role_permissions_rejects_applicant_role(db):
 async def test_set_role_permissions_audits_old_and_new(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"setperm2-{suffix}", name={"uz_cyrl": "Х"})
+    role = Role(code=f"setperm2-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(role)
     await db.flush()
     db.add(RolePermission(role_id=role.id, permission_code=USERS_VIEW))
@@ -293,7 +294,7 @@ async def test_set_role_permissions_audits_old_and_new(db):
 async def test_archive_role_blocked_by_active_holder(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"inuse-{suffix}", name={"uz_cyrl": "Х"})
+    role = Role(code=f"inuse-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(role)
     await db.flush()
     await make_user(db, role_code=role.code)
@@ -310,7 +311,7 @@ async def test_archive_role_blocked_by_active_holder(db):
 async def test_archive_role_not_blocked_by_deleted_holder(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"delheld-{suffix}", name={"uz_cyrl": "Х"})
+    role = Role(code=f"delheld-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(role)
     await db.flush()
     holder = await make_user(db, role_code=role.code)
@@ -342,7 +343,7 @@ async def test_archive_system_role_rejected(db):
 async def test_archived_role_rejected_by_create_user(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"arch-{suffix}", name={"uz_cyrl": "Х"}, status="archived")
+    role = Role(code=f"arch-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"}, status="archived")
     db.add(role)
     await db.flush()
     await db.commit()
@@ -361,7 +362,7 @@ async def test_archived_role_rejected_by_create_user(db):
 async def test_archived_role_rejected_by_patch_user(db):
     suffix = uuid.uuid4().hex[:8]
     _, token, csrf = await signed_in_with(db, USERS_MANAGE)
-    role = Role(code=f"arch2-{suffix}", name={"uz_cyrl": "Х"}, status="archived")
+    role = Role(code=f"arch2-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"}, status="archived")
     db.add(role)
     await db.flush()
     target = await make_user(db)
@@ -469,7 +470,9 @@ async def test_role_not_found_is_404(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         auth_client(client, token, csrf)
-        r = await client.patch(f"{API}/admin/roles/{missing_id}", json={"name": {"uz_cyrl": "Х"}})
+        r = await client.patch(
+            f"{API}/admin/roles/{missing_id}", json={"name": {"uz_cyrl": "Х", "uz_latn": "X"}}
+        )
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "ERR-SYS-003"
     assert r.json()["error"]["details"] == {"role": str(missing_id)}

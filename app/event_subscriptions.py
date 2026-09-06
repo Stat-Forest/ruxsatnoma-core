@@ -75,6 +75,7 @@ def register_event_subscriptions() -> None:
     with no subscribers at all.
     """
     from app.core.events import subscribe
+    from app.modules.oversight import service as oversight_service
     from app.modules.permits import subscribers as permits_subscribers
 
     events.subscribe(
@@ -84,6 +85,22 @@ def register_event_subscriptions() -> None:
         application_events.APPLICATION_CANCELLED, payments_subscribers.on_application_cancelled
     )
     subscribe(PAYMENT_CONFIRMED, permits_subscribers.on_payment_confirmed)
+
+    # 4.2 `oversight`: a THIRD subscriber on some of these names, beside the
+    # two above — `core.events.subscribe` supports more than one handler per
+    # event name (a plain list), and nothing here changes what
+    # `payments`/`permits` already do. Turns all five into `oversight_events`
+    # rows (design/02 § oversight); no module above is modified to produce
+    # this — see `oversight.service.record_event`'s own docstring.
+    for name in (
+        application_events.APPLICATION_SUBMITTED,
+        application_events.APPLICATION_APPROVED,
+        application_events.APPLICATION_REJECTED,
+        application_events.APPLICATION_CANCELLED,
+    ):
+        events.subscribe(name, oversight_service.record_event)
+    subscribe(PAYMENT_CONFIRMED, oversight_service.record_event)
+
     _register_providers()
 
 

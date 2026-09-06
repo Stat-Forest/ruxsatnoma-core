@@ -27,7 +27,7 @@ async def test_sys_admin_needs_no_grants(db, agency):
                 "kind": "territorial",
                 "parent_id": str(agency.id),
                 "code": f"su-{suffix}",
-                "name": {"uz_cyrl": "Ҳудудий бошқарма"},
+                "name": {"uz_cyrl": "Ҳудудий бошқарма", "uz_latn": "Hududiy boshqarma"},
             },
         )
     assert r.status_code == 201, r.text
@@ -47,7 +47,7 @@ async def test_sys_admin_actions_are_still_audited(db, agency):
                 "kind": "territorial",
                 "parent_id": str(agency.id),
                 "code": f"su-a-{suffix}",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
         )
     entry = (
@@ -74,7 +74,7 @@ async def test_other_roles_still_need_the_code(db, agency):
                 "kind": "territorial",
                 "parent_id": str(agency.id),
                 "code": "denied-1",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
         )
     assert r.status_code == 403

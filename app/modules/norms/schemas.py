@@ -431,8 +431,9 @@ class PublicActivityTypeOut(BaseModel):
     to render herd inputs) and `name`. Never `quantity_unit`/`status`, which
     the general, authenticated `/refs/*` router already answers and this
     anonymous surface has no reason to repeat. `name` carries whatever
-    languages the row has — `en`/`uz_cyrl` today (`tz/12` #31: no Latin-script
-    Uzbek yet) — returned as-is, never invented."""
+    languages the row has — `uz_latn` since migration `0032`'s backfill
+    (decision #90, closing `tz/12` #31's backend half) — returned as-is,
+    never invented."""
 
     model_config = ConfigDict(from_attributes=True)
 

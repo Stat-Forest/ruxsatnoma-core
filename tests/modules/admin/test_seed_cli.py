@@ -19,13 +19,17 @@ def district_rows(suffix: str) -> list[dict]:
             "code": f"beruniy-{suffix}",
             "soato_code": "1735204",
             "region_code": "karakalpakstan",
-            "name": {"uz_cyrl": "Беруний тумани", "en": "Beruniy district"},
+            "name": {
+                "uz_cyrl": "Беруний тумани",
+                "uz_latn": "Beruniy tumani",
+                "en": "Beruniy district",
+            },
             "sort_order": 10,
         },
         {
             "code": f"nukus-{suffix}",
             "region_code": "karakalpakstan",
-            "name": {"uz_cyrl": "Нукус тумани"},
+            "name": {"uz_cyrl": "Нукус тумани", "uz_latn": "Nukus tumani"},
         },
     ]
 
@@ -38,14 +42,14 @@ def organization_rows(suffix: str, agency_code: str) -> list[dict]:
             "kind": "territorial",
             "parent_code": agency_code,
             "region_code": "karakalpakstan",
-            "name": {"uz_cyrl": "Ҳудудий бошқарма"},
+            "name": {"uz_cyrl": "Ҳудудий бошқарма", "uz_latn": "Hududiy boshqarma"},
         },
         {
             "code": f"leshoz-{suffix}",
             "kind": "leshoz",
             "parent_code": f"territorial-{suffix}",
             "region_code": "karakalpakstan",
-            "name": {"uz_cyrl": "Нукус ДЎХ"},
+            "name": {"uz_cyrl": "Нукус ДЎХ", "uz_latn": "Nukus DOʻX"},
             "stir": "200388105",
             "requisites": {"account": "40012186035209704220", "mfo": "00014"},
         },
@@ -58,7 +62,7 @@ async def test_districts_created_then_updated(db):
     created, updated = await seed_districts(db, rows)
     assert (created, updated) == (2, 0)
 
-    rows[0]["name"] = {"uz_cyrl": "Беруний тумани (янги)"}
+    rows[0]["name"] = {"uz_cyrl": "Беруний тумани (янги)", "uz_latn": "Beruniy tumani (yangi)"}
     created, updated = await seed_districts(db, rows)
     assert (created, updated) == (0, 2)
 
@@ -142,7 +146,7 @@ async def test_organizations_reject_an_archived_parent(db, agency):
         code=f"archived-{suffix}",
         kind="territorial",
         parent_id=agency.id,
-        name={"uz_cyrl": "Архив"},
+        name={"uz_cyrl": "Архив", "uz_latn": "Arxiv"},
         status="archived",
     )
     db.add(archived)
@@ -153,7 +157,7 @@ async def test_organizations_reject_an_archived_parent(db, agency):
             "code": f"leshoz-{suffix}",
             "kind": "leshoz",
             "parent_code": archived.code,
-            "name": {"uz_cyrl": "Тест"},
+            "name": {"uz_cyrl": "Тест", "uz_latn": "Test"},
         }
     ]
     with pytest.raises(DomainError) as excinfo:
@@ -168,7 +172,13 @@ async def test_organizations_reject_a_second_root(db, agency):
     with pytest.raises(DomainError) as excinfo:
         await seed_organizations(
             db,
-            [{"code": "another-agency", "kind": "agency", "name": {"uz_cyrl": "Х"}}],
+            [
+                {
+                    "code": "another-agency",
+                    "kind": "agency",
+                    "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+                }
+            ],
         )
     assert excinfo.value.details is not None
     assert excinfo.value.details["reason"] == "root already exists"
@@ -188,13 +198,13 @@ async def test_organizations_reject_a_kind_change(db, agency):
                 "code": f"mover-{suffix}",
                 "kind": "leshoz",
                 "parent_code": agency.code,
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
             {
                 "code": f"sibling-{suffix}",
                 "kind": "leshoz",
                 "parent_code": agency.code,
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
         ],
     )
@@ -206,7 +216,7 @@ async def test_organizations_reject_a_kind_change(db, agency):
                     "code": f"mover-{suffix}",
                     "kind": "bolim",  # bolim is valid under a leshoz — the sibling
                     "parent_code": f"sibling-{suffix}",
-                    "name": {"uz_cyrl": "Х (бўлим)"},
+                    "name": {"uz_cyrl": "Х (бўлим)", "uz_latn": "X (boʻlim)"},
                 }
             ],
         )
@@ -232,13 +242,13 @@ async def test_organizations_reject_a_reparent_cycle(db, agency):
                 "code": f"top-{suffix}",
                 "kind": "territorial",
                 "parent_code": agency.code,
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
             {
                 "code": f"child-{suffix}",
                 "kind": "leshoz",
                 "parent_code": f"top-{suffix}",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
         ],
     )
@@ -250,7 +260,7 @@ async def test_organizations_reject_a_reparent_cycle(db, agency):
                     "code": f"top-{suffix}",
                     "kind": "territorial",
                     "parent_code": f"child-{suffix}",  # top's own child
-                    "name": {"uz_cyrl": "Х"},
+                    "name": {"uz_cyrl": "Х", "uz_latn": "X"},
                 }
             ],
         )
@@ -281,7 +291,7 @@ async def test_organizations_reject_an_unvalidated_name_shape(db, agency):
             "code": f"badname2-{suffix}",
             "kind": "leshoz",
             "parent_code": agency.code,
-            "name": {"uz_cyrl": "Номи", "fr": "Nom"},  # fr is not a known locale
+            "name": {"uz_cyrl": "Номи", "uz_latn": "Nomi", "fr": "Nom"},  # fr is not a known locale
         }
     ]
     with pytest.raises(DomainError):
@@ -295,7 +305,7 @@ async def test_organizations_reject_non_object_requisites(db, agency):
             "code": f"badreq-{suffix}",
             "kind": "leshoz",
             "parent_code": agency.code,
-            "name": {"uz_cyrl": "Х"},
+            "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             "requisites": "not-an-object",
         }
     ]
@@ -312,7 +322,7 @@ async def test_organizations_reject_a_malformed_stir(db, agency):
             "code": f"badstir-{suffix}",
             "kind": "leshoz",
             "parent_code": agency.code,
-            "name": {"uz_cyrl": "Х"},
+            "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             "stir": "not-nine-digits",
         }
     ]
@@ -331,7 +341,7 @@ async def test_organizations_reject_a_non_ascii_digit_stir(db, agency):
             "code": f"arabicstir-{suffix}",
             "kind": "leshoz",
             "parent_code": agency.code,
-            "name": {"uz_cyrl": "Х"},
+            "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             "stir": "١٢٣٤٥٦٧٨٩",
         }
     ]
@@ -363,7 +373,9 @@ def test_main_reports_a_domain_error_as_one_line_not_a_traceback(tmp_path, monke
     must reach the operator as a one-line message and exit(1), not a raw traceback."""
     bad_file = tmp_path / "districts.json"
     bad_file.write_text(
-        json.dumps([{"code": "x", "name": {"uz_cyrl": "Х"}, "region_code": "atlantis"}]),
+        json.dumps(
+            [{"code": "x", "name": {"uz_cyrl": "Х", "uz_latn": "X"}, "region_code": "atlantis"}]
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(sys, "argv", ["python -m app.seed", "districts", str(bad_file)])

@@ -205,6 +205,10 @@ async def test_mutation_from_own_origin_is_accepted(db):
 def _cors_allowlist(monkeypatch):
     """Configures the adminka's origin as the sole allowlisted one (ruling 3)."""
     monkeypatch.setenv("CORS_ORIGINS", f'["{ADMIN_ORIGIN}"]')
+    # A non-empty cors_origins is the deployed-cross-origin signal the config
+    # guard reads (app/config.py, final review of stage 6.6, finding 2) — it
+    # refuses the default localhost admin_base_url once that signal is set.
+    monkeypatch.setenv("ADMIN_BASE_URL", ADMIN_ORIGIN)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

@@ -92,10 +92,11 @@ REJECTED_STATUS = "REJECTED"
 # check).
 REJECTION_CLASSIFIER_CODE = "rejection_reasons"
 
-# The language every `classifier_items.name` is guaranteed to carry (design/02
-# principle 3) — the fallback when the recipient's own language has no
-# translation of the reason.
-FALLBACK_LANGUAGE = "uz_cyrl"
+# The language every `classifier_items.name` is guaranteed to carry — the
+# fallback when the recipient's own language has no translation of the reason.
+# uz_latn, not uz_cyrl: decision #90 flipped which language `LocalizedName`
+# requires, so uz_latn is now the one every row has (uz_cyrl is optional).
+FALLBACK_LANGUAGE = "uz_latn"
 
 # What a forward writes into the bounce row's `reason_text` (controller minor 4).
 # A STABLE TOKEN, never a sentence: `reason_text` surfaces on the
@@ -571,9 +572,9 @@ async def reject(
         params={
             "application_number": application.number,
             # The reason as the citizen reads it. `classifier_items.name` is
-            # multilingual and `uz_cyrl` is the one key design/02 guarantees, so
-            # it is the fallback — never `item.code`, which would render as
-            # «Причина: RJ-03».
+            # multilingual and `uz_latn` is the one key `LocalizedName` guarantees
+            # (decision #90), so it is the fallback — never `item.code`, which
+            # would render as «Причина: RJ-03».
             "reason": item.name.get(language) or item.name[FALLBACK_LANGUAGE],
         },
     )

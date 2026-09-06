@@ -37,10 +37,11 @@ async def test_first_login_creates_applicant_user(db, engine):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         r = await oneid_login(client, prof)
-        assert r.status_code == 200
+        assert r.status_code == 303
         assert "session" in r.cookies and "csrf_token" in r.cookies
-        assert r.json()["user"]["full_name"] == "ONEID USER"
-        assert r.json()["role"]["code"] == "applicant"
+        me = (await client.get(f"{API}/auth/me")).json()
+        assert me["user"]["full_name"] == "ONEID USER"
+        assert me["role"]["code"] == "applicant"
     from app.db import make_session_factory
 
     async with make_session_factory(engine)() as fresh:
@@ -54,9 +55,9 @@ async def test_second_login_reuses_user(db, engine):
     pinfl = unique_pinfl()
     app = create_app()
     async with make_client(app, lifespan=True) as client:
-        assert (await oneid_login(client, profile(pinfl))).status_code == 200
+        assert (await oneid_login(client, profile(pinfl))).status_code == 303
     async with make_client(app, lifespan=True) as client:
-        assert (await oneid_login(client, profile(pinfl))).status_code == 200
+        assert (await oneid_login(client, profile(pinfl))).status_code == 303
     from app.db import make_session_factory
 
     async with make_session_factory(engine)() as fresh:
@@ -74,8 +75,9 @@ async def test_prosecutor_logs_in_with_own_role(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         r = await oneid_login(client, profile(pinfl, full_name="PROSECUTOR X"))
-    assert r.status_code == 200
-    assert r.json()["role"]["code"] == "prosecutor"
+        assert r.status_code == 303
+        me = await client.get(f"{API}/auth/me")
+    assert me.json()["role"]["code"] == "prosecutor"
 
 
 async def test_blocked_user_denied(db):
@@ -90,7 +92,7 @@ async def test_blocked_user_denied(db):
     assert r.json()["error"]["code"] == "ERR-AUTH-001"
 
 
-async def test_state_mismatch_403(db):
+async def test_state_mismatch_redirects_to_login_not_a_json_error(db):
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         await client.get(f"{API}/auth/oneid/authorize")
@@ -98,8 +100,45 @@ async def test_state_mismatch_403(db):
             f"{API}/auth/oneid/callback",
             params={"code": encode_mock_code(profile(unique_pinfl())), "state": "forged"},
         )
-    assert r.status_code == 403
-    assert r.json()["error"]["code"] == "ERR-AUTH-006"
+    assert r.status_code == 303
+    assert r.headers["location"] == "http://localhost:5173/login?error=oneid"
+    assert "session" not in r.cookies
+
+
+async def test_callback_redirects_to_the_adminka_with_session_cookies(db, engine, monkeypatch):
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("ADMIN_BASE_URL", "https://admin.example.uz")
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r = await oneid_login(client, profile(unique_pinfl()))
+        assert r.status_code == 303
+        assert r.headers["location"] == "https://admin.example.uz/auth/oneid/return"
+        assert "session" in r.cookies and "csrf_token" in r.cookies
+        # The cookies are real, not decoration: the session they carry works.
+        me = await client.get(f"{API}/auth/me")
+        assert me.status_code == 200
+        assert me.json()["role"]["code"] == "applicant"
+    get_settings.cache_clear()
+
+
+async def test_callback_with_a_bad_state_redirects_to_login_not_a_json_error(db, monkeypatch):
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("ADMIN_BASE_URL", "https://admin.example.uz")
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        await client.get(f"{API}/auth/oneid/authorize")
+        r = await client.get(
+            f"{API}/auth/oneid/callback",
+            params={"code": encode_mock_code(profile(unique_pinfl())), "state": "not-the-state"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "https://admin.example.uz/login?error=oneid"
+        assert "session" not in r.cookies
+    get_settings.cache_clear()
 
 
 async def test_provider_error_maps_to_502(db):

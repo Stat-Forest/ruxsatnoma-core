@@ -5,11 +5,11 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.deps import get_db
-from app.core.errors import err
 from app.core.ratelimit import rate_limit
 from app.core.security import new_token
 from app.core.time import business_today
@@ -58,8 +58,9 @@ def _set_session_cookies(response: Response, token: str, csrf: str) -> None:
 
 async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> MeOut:
     """Shared by every session-returning/profile-returning route: GET /auth/me,
-    /auth/mfa/verify, /auth/oneid/callback, /auth/eimzo/login,
-    /auth/complete-registration, and PATCH /auth/me — all return the same shape.
+    /auth/mfa/verify, /auth/eimzo/login, /auth/complete-registration, and
+    PATCH /auth/me — all return the same shape. /auth/oneid/callback answers a
+    browser with a redirect instead (see its own docstring) and does not call this.
 
     sys_admin passes require_permission without consulting codes (ruling 2), so its
     `permissions` here is the whole registry rather than its (usually empty) personal
@@ -186,28 +187,35 @@ async def oneid_authorize(response: Response) -> OneIdAuthorizeOut:
     return OneIdAuthorizeOut(redirect_url=url)
 
 
-@router.get("/oneid/callback", response_model=MeOut)
+@router.get("/oneid/callback")
 async def oneid_callback(
     code: str,
     state: str,
     request: Request,
-    response: Response,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> MeOut:
+) -> RedirectResponse:
+    """Answers a BROWSER, not an API client — hence a redirect rather than
+    `MeOut`. The session cookies are set on the returned response object, not
+    on an injected `Response`: FastAPI only merges the injected one's headers
+    into a body it serialises itself, so setting them there and returning this
+    object would send the browser on with no session at all."""
+    settings = get_settings()
+    admin = settings.admin_base_url.rstrip("/")
     expected = request.cookies.get("oneid_state")
     if not expected or not secrets.compare_digest(state, expected):
-        raise err("ERR-AUTH-006")
+        # A failed state check is the user's problem to see, not a JSON body:
+        # they are in a browser, mid-redirect, with nothing to parse it.
+        return RedirectResponse(f"{admin}/login?error=oneid", status_code=303)
     user, _row, token, csrf = await service.login_via_oneid(
         db,
         code=code,
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("User-Agent"),
     )
+    response = RedirectResponse(f"{admin}/auth/oneid/return", status_code=303)
     response.delete_cookie("oneid_state")
     _set_session_cookies(response, token, csrf)
-    role = await repo.get_role(db, user.role_id)
-    assert role is not None
-    return await _me_out(db, user, role, csrf)
+    return response
 
 
 @router.post(

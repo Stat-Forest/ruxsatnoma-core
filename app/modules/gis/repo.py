@@ -64,6 +64,22 @@ def _geom_source_sql(
     return _WKB_SOURCE, {"wkb": wkb, "srid": srid}
 
 
+def _normalized_geom_sql(source_sql: str) -> str:
+    """The one normalisation pipeline every incoming geometry passes through
+    before it is stored OR compared: `ST_Force2D` drops a Z/M dimension a
+    source might carry, `ST_MakeValid` repairs self-intersections,
+    `ST_CollectionExtract(..., 3)` keeps polygonal parts only (a
+    `GeometryCollection` the repair can produce), and `ST_Multi` makes the
+    result a MULTIPOLYGON whether the input was a `Polygon` or already a
+    `MultiPolygon`. Factored out of `insert_version` so `split_partition_metrics`
+    below can compare two candidate pieces against the SAME repaired shape a
+    version would actually be stored as — never a second normalisation that
+    could quietly disagree with the first (this module's own "one
+    reprojection engine" reasoning, decision #13, applied to geometry repair
+    instead of geometry transform)."""
+    return f"ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_Force2D({source_sql})), 3))"
+
+
 async def insert_version(
     db: AsyncSession,
     *,
@@ -103,13 +119,13 @@ async def insert_version(
                 " ROUND((ST_Area(g::geography)/10000.0)::numeric, 4),"
                 " :declared_area_ha, :source, :accuracy_m, :survey_date, :effective_from,"
                 " :approval_doc_id, :import_id, :status, :created_by"
-                " FROM (SELECT ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_Force2D("
+                " FROM (SELECT "
                 # Bandit flags this as B608 (string-built SQL) on the pattern
                 # alone; `geom_sql` is always one of the two module constants
                 # above, chosen by an `if`, never caller input — every actual
                 # value crosses the wire bound, through `geom_params` below.
                 # Same reasoning (and the same nosec) as `checks._intersections`.
-                f"   {geom_sql})), 3)) AS g) AS n"  # nosec B608
+                f"{_normalized_geom_sql(geom_sql)} AS g) AS n"  # nosec B608
                 " WHERE g IS NOT NULL AND NOT ST_IsEmpty(g)"
                 " RETURNING id"
             ),
@@ -161,6 +177,212 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
         )
     )
     return result.scalar_one_or_none()
+
+
+async def has_children(db: AsyncSession, parent_id: uuid.UUID) -> bool:
+    """Whether ANY contour already names `parent_id` as its `parent_id` — the
+    precondition `service.split_contour` refuses on (decision #91: a split
+    contour that already has children is already split; a second split would
+    leave the hierarchy ambiguous about which pair of subcontours a later
+    reader should trust)."""
+    result = await db.execute(select(Contour.id).where(Contour.parent_id == parent_id).limit(1))
+    return result.first() is not None
+
+
+# The two candidate pieces of a split, each bound under its OWN name —
+# `_geom_source_sql` above always calls its single geometry parameter
+# `:geojson`, which `split_partition_metrics` cannot reuse as-is: it compares
+# TWO client-supplied geometries in ONE query, so each needs a distinct bind
+# parameter. Same reasoning as `_GEOJSON_SOURCE`/`_WKB_SOURCE`: both are fixed
+# module constants, chosen by no caller input, so building the query text
+# around them carries no injection risk of its own.
+_SPLIT_PIECE_A_SOURCE = "ST_SetSRID(ST_GeomFromGeoJSON(:geojson_a), 4326)"
+_SPLIT_PIECE_B_SOURCE = "ST_SetSRID(ST_GeomFromGeoJSON(:geojson_b), 4326)"
+
+
+async def split_partition_metrics(
+    db: AsyncSession,
+    *,
+    parent_version_id: uuid.UUID,
+    piece_a_geojson: dict[str, Any],
+    piece_b_geojson: dict[str, Any],
+) -> dict[str, Decimal | None]:
+    """The geometric partition test behind `service.split_contour`: whether
+    two client-submitted pieces, normalised through the exact SAME pipeline
+    `insert_version` itself stores a geometry through (`_normalized_geom_sql`),
+    actually reconstruct the parent version's own geometry with no gap and no
+    double-covered area.
+
+    This never RE-DERIVES the cut: the adminka's `splitContour.ts` already
+    owns that algorithm, tested six ways over a buffer/difference — PostGIS is
+    asked to check the client's ANSWER here, never to recompute the question,
+    so this module gains no second geometry-cutting engine that could quietly
+    disagree with the front end's (`service.split_contour`'s own docstring
+    explains the choice).
+
+    Four areas come back, in m² over `geography` (`::numeric`, this module's
+    own convention — a real `Decimal`, never a Python `float`): each piece on
+    its own, their mutual intersection (near zero for two pieces that only
+    share a border — ruling 15's "a shared border is a touch of zero area"
+    applies here exactly as it does to `checks._overlap`), and the symmetric
+    difference between their UNION and the parent's geometry (near zero only
+    when the two pieces, together, cover the parent exactly — a gap between
+    them and a piece straying outside the parent boundary both show up as the
+    SAME non-zero number, because either failure leaves geometry on one side
+    of the comparison that is not on the other).
+
+    A piece whose normalised geometry collapses to nothing (a line, a point,
+    an empty collection) reports `None` for its own area AND for both figures
+    that need it (`intersection_m2`, `mismatch_m2`) — `service.split_contour`
+    reads `None` as `piece_zero_area` without this function ever handing a
+    NULL geometry to `ST_Area`/`ST_Intersection`/`ST_SymDifference`, every one
+    of which would otherwise turn a NULL geometry into a NULL area instead of
+    the number this contract promises for the cases where both pieces ARE
+    real.
+    """
+    row = (
+        (
+            await db.execute(
+                text(
+                    "WITH pieces AS ("
+                    "  SELECT"
+                    f"    {_normalized_geom_sql(_SPLIT_PIECE_A_SOURCE)} AS a,"  # nosec B608
+                    f"    {_normalized_geom_sql(_SPLIT_PIECE_B_SOURCE)} AS b"  # nosec B608
+                    "), parent AS ("
+                    "  SELECT geom AS g FROM contour_versions WHERE id = :parent_version_id"
+                    ")"
+                    " SELECT"
+                    "   CASE WHEN pieces.a IS NULL OR ST_IsEmpty(pieces.a) THEN NULL"
+                    "        ELSE ST_Area(pieces.a::geography)::numeric END AS area_a_m2,"
+                    "   CASE WHEN pieces.b IS NULL OR ST_IsEmpty(pieces.b) THEN NULL"
+                    "        ELSE ST_Area(pieces.b::geography)::numeric END AS area_b_m2,"
+                    "   CASE WHEN pieces.a IS NULL OR pieces.b IS NULL"
+                    "             OR ST_IsEmpty(pieces.a) OR ST_IsEmpty(pieces.b) THEN NULL"
+                    "        ELSE ST_Area(ST_Intersection(pieces.a, pieces.b)::geography)::numeric"
+                    "        END AS intersection_m2,"
+                    "   CASE WHEN pieces.a IS NULL OR pieces.b IS NULL"
+                    "             OR ST_IsEmpty(pieces.a) OR ST_IsEmpty(pieces.b) THEN NULL"
+                    "        ELSE ST_Area(ST_SymDifference("
+                    "               ST_Union(pieces.a, pieces.b), parent.g"
+                    "             )::geography)::numeric"
+                    "        END AS mismatch_m2"
+                    " FROM pieces, parent"
+                ),
+                {
+                    "parent_version_id": parent_version_id,
+                    "geojson_a": json.dumps(piece_a_geojson),
+                    "geojson_b": json.dumps(piece_b_geojson),
+                },
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return dict(row)
+
+
+async def list_versions(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    *,
+    zone: Any,
+    status: str | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[ContourVersion], int]:
+    """Every version of ONE contour, oldest first — draft through archived —
+    the discoverability gap `contour_card` (published only) never closed: a
+    specialist's own draft and review submission, and the version a rahbar
+    must approve, had no route at all (task defect 4a). `zone` is whatever
+    `abac.zone_filter` built off `Organization.region_id`/`district_id` and
+    `Contour.organization_id` — the SAME three columns `list_contours` checks
+    — so a version outside the actor's own zone is invisible here exactly as
+    a published contour outside it is invisible there; `status`, when given,
+    narrows to one (`?status=review` is "awaiting my approval"). Geometry is
+    never selected here (module docstring) — `version_detail` below is the
+    only place one version's own shape crosses into Python."""
+    conditions: list[Any] = [ContourVersion.contour_id == contour_id, zone]
+    if status is not None:
+        conditions.append(ContourVersion.status == status)
+    joined = (
+        select(ContourVersion.id)
+        .join(Contour, Contour.id == ContourVersion.contour_id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
+    rows = await db.execute(
+        select(ContourVersion)
+        .join(Contour, Contour.id == ContourVersion.contour_id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(*conditions)
+        .order_by(ContourVersion.version_no)
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars().all()), total
+
+
+async def version_detail(
+    db: AsyncSession, contour_id: uuid.UUID, version_id: uuid.UUID, *, zone: Any
+) -> Any | None:
+    """One version's full detail, geometry included (`ST_AsGeoJSON`, computed
+    in SQL — only the resulting STRING crosses into Python, module docstring)
+    — the other half of defect 4a: `VersionOut` carries no geometry at all,
+    so nothing could fetch one non-published version by id to actually look
+    at it. `zone` is the SAME condition `list_versions` applies; a version
+    outside it is indistinguishable from one that does not exist, matching
+    `contour_card`'s own not-found shape."""
+    result = await db.execute(
+        select(
+            ContourVersion.id,
+            ContourVersion.contour_id,
+            ContourVersion.version_no,
+            ContourVersion.status,
+            ContourVersion.source,
+            ContourVersion.area_ha,
+            ContourVersion.declared_area_ha,
+            ContourVersion.accuracy_m,
+            ContourVersion.survey_date,
+            ContourVersion.effective_from,
+            ContourVersion.approval_doc_id,
+            ContourVersion.approved_by,
+            ContourVersion.published_at,
+            func.ST_AsGeoJSON(ContourVersion.geom).label("geometry"),
+        )
+        .join(Contour, Contour.id == ContourVersion.contour_id)
+        .join(Organization, Organization.id == Contour.organization_id)
+        .where(ContourVersion.id == version_id, ContourVersion.contour_id == contour_id, zone)
+    )
+    return result.one_or_none()
+
+
+async def distance_to_published_version_m(
+    db: AsyncSession, contour_id: uuid.UUID, *, lon: float, lat: float
+) -> Decimal | None:
+    """Metres from `(lon, lat)` to the contour's PUBLISHED version geometry, or
+    `None` when there is none — the predicate runs entirely inside PostGIS
+    (`ST_Distance` over `::geography`, so the great-circle distance is used
+    rather than a planar approximation), never in Python (module convention:
+    'gis.repo and gis.checks build SQL, PostGIS answers it'), the same
+    `::geography` idiom `insert_version`'s own area computation and
+    `checks._intersections` already use.
+
+    `inspections` (level 5) is the caller (`gis.service.distance_to_contour_m`)
+    — an inspector's GPS fix compared against the plot they are checking.
+    `lon`/`lat` are bound values, never interpolated (this is a `text()` query,
+    same reasoning as `checks._intersections`'s own nosec)."""
+    meters = (
+        await db.execute(
+            text(
+                "SELECT ST_Distance("
+                "geom::geography, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography"
+                ") FROM contour_versions WHERE contour_id = :contour_id AND status = 'published'"
+            ),
+            {"lon": lon, "lat": lat, "contour_id": contour_id},
+        )
+    ).scalar_one_or_none()
+    return None if meters is None else Decimal(str(meters))
 
 
 async def contour_organization(db: AsyncSession, contour_id: uuid.UUID) -> uuid.UUID | None:
@@ -371,6 +593,41 @@ async def claim_pending_import(db: AsyncSession) -> GisImport | None:
 
 async def import_by_id(db: AsyncSession, import_id: uuid.UUID) -> GisImport | None:
     return await db.get(GisImport, import_id)
+
+
+async def list_imports(
+    db: AsyncSession, *, zone: Any, status: str | None, offset: int, limit: int
+) -> tuple[list[GisImport], int]:
+    """Every import batch, newest first — the same discoverability gap
+    `list_versions` closes for contour versions (task defect 4a), one route
+    smaller (task defect 4b): a batch awaiting `CONTOURS_APPROVE` had no route
+    listing it at all, so the specialist who filed it and the rahbar who must
+    approve it could only be handed its id out of band. `zone` is whatever
+    `abac.zone_filter` built off `Organization.region_id`/`district_id` and
+    `GisImport.organization_id` — the same three-axis check `list_contours`
+    and `list_versions` apply, joined here even though `GisImport` already
+    carries `organization_id` directly, because a region- or district-scoped
+    actor still needs the join to `organizations` to be checked at all.
+    `status`, when given, narrows to one (`?status=review` is "awaiting my
+    approval")."""
+    conditions: list[Any] = [zone]
+    if status is not None:
+        conditions.append(GisImport.status == status)
+    joined = (
+        select(GisImport.id)
+        .join(Organization, Organization.id == GisImport.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
+    rows = await db.execute(
+        select(GisImport)
+        .join(Organization, Organization.id == GisImport.organization_id)
+        .where(*conditions)
+        .order_by(GisImport.created_at.desc(), GisImport.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars().all()), total
 
 
 async def contour_numbers(db: AsyncSession, organization_id: uuid.UUID) -> set[str]:

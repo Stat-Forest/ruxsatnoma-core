@@ -5,20 +5,33 @@ from typing import Annotated, Self
 from fastapi import Query
 from pydantic import BaseModel, RootModel, model_validator
 
-# design/02 principle 3: uz_cyrl is the fallback language and is always required.
+# Uzbek Latin is the system's base language (decision #18); every other one falls
+# back to it, and the public site renders in it. uz_cyrl is optional.
 LOCALES = ("uz_cyrl", "uz_latn", "ru", "kaa", "en")
 
 
 class LocalizedName(RootModel[dict[str, str]]):
-    """`{"uz_cyrl": "Номи", "ru": "Название"}` — validated, not free-form jsonb."""
+    """`{"uz_latn": "Nomi", "ru": "Название"}` — validated, not free-form jsonb.
+
+    Decision #90: this used to require `uz_cyrl` and not `uz_latn` at all, which
+    directly contradicted the already-merged announcements form (it required
+    `uz_latn`) and, as data, left `gis_layers` with no Latin name for any of its
+    fifteen rows. The flip could not land alone — every row written under the old
+    rule has `uz_cyrl` and had no guarantee of `uz_latn` — so migration `0032`
+    backfills `uz_latn` from `uz_cyrl` everywhere first (deterministic: Uzbek
+    Cyrillic -> Latin is a well-defined mapping) and this validator changes in
+    its wake, in the same commit. A database migrated before `0032` will start
+    rejecting writes to any row it did not cover — that migration's own docstring
+    lists every column it backfills.
+    """
 
     @model_validator(mode="after")
     def _check(self) -> Self:
         unknown = set(self.root) - set(LOCALES)
         if unknown:
             raise ValueError(f"unknown locales: {sorted(unknown)}")
-        if not self.root.get("uz_cyrl", "").strip():
-            raise ValueError("uz_cyrl is required and must not be blank")
+        if not self.root.get("uz_latn", "").strip():
+            raise ValueError("uz_latn is required and must not be blank")
         return self
 
 

@@ -25,14 +25,17 @@ async def test_create_classifier_and_item(db):
         auth_client(client, token, csrf)
         created = await client.post(
             f"{API}/admin/classifiers",
-            json={"code": f"cargo-{suffix}", "name": {"uz_cyrl": "Юк турлари"}},
+            json={
+                "code": f"cargo-{suffix}",
+                "name": {"uz_cyrl": "Юк турлари", "uz_latn": "Yuk turlari"},
+            },
         )
         assert created.status_code == 201, created.text
         item = await client.post(
             f"{API}/admin/classifiers/cargo-{suffix}/items",
             json={
                 "code": "C-01",
-                "name": {"uz_cyrl": "Биринчи"},
+                "name": {"uz_cyrl": "Биринчи", "uz_latn": "Birinchi"},
                 "props": {"required": True},
                 "valid_from": "2026-01-01",
             },
@@ -48,7 +51,7 @@ async def test_add_item_with_valid_to_before_valid_from_is_422_not_500(db):
     the service must catch this as a domain error (finding 4)."""
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"badperiod-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"badperiod-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     await db.commit()
@@ -59,7 +62,7 @@ async def test_add_item_with_valid_to_before_valid_from_is_422_not_500(db):
             f"{API}/admin/classifiers/badperiod-{suffix}/items",
             json={
                 "code": "B-01",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
                 "valid_from": "2026-06-01",
                 "valid_to": "2026-01-01",
             },
@@ -71,13 +74,13 @@ async def test_add_item_with_valid_to_before_valid_from_is_422_not_500(db):
 async def test_patch_item_with_valid_to_before_valid_from_is_422_not_500(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"badpatch-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"badpatch-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     item = ClassifierItem(
         classifier_id=classifier.id,
         code="B-02",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         valid_from=date(2026, 6, 1),
     )
     db.add(item)
@@ -96,14 +99,14 @@ async def test_patch_item_with_valid_to_before_valid_from_is_422_not_500(db):
 async def test_duplicate_active_item_code_rejected(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"dup-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"dup-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     db.add(
         ClassifierItem(
             classifier_id=classifier.id,
             code="D-01",
-            name={"uz_cyrl": "Х"},
+            name={"uz_cyrl": "Х", "uz_latn": "X"},
             valid_from=date(2026, 1, 1),
         )
     )
@@ -114,7 +117,11 @@ async def test_duplicate_active_item_code_rejected(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/classifiers/dup-{suffix}/items",
-            json={"code": "D-01", "name": {"uz_cyrl": "Х"}, "valid_from": "2026-02-01"},
+            json={
+                "code": "D-01",
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+                "valid_from": "2026-02-01",
+            },
         )
     assert r.status_code == 422
     assert r.json()["error"]["details"]["reason"] == "already active"
@@ -123,13 +130,13 @@ async def test_duplicate_active_item_code_rejected(db):
 async def test_supersede_creates_a_new_version(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"tar-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"tar-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     old = ClassifierItem(
         classifier_id=classifier.id,
         code="T-01",
-        name={"uz_cyrl": "Эски"},
+        name={"uz_cyrl": "Эски", "uz_latn": "Eski"},
         props={"modifier": "0.5"},
         valid_from=date(2026, 1, 1),
     )
@@ -144,7 +151,7 @@ async def test_supersede_creates_a_new_version(db):
             f"{API}/admin/classifier-items/{old.id}/supersede",
             json={
                 "code": "T-01",
-                "name": {"uz_cyrl": "Янги"},
+                "name": {"uz_cyrl": "Янги", "uz_latn": "Yangi"},
                 "props": {"modifier": "0.7"},
                 "valid_from": "2026-07-01",
             },
@@ -165,13 +172,13 @@ async def test_supersede_creates_a_new_version(db):
 async def test_supersede_requires_a_later_start(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"early-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"early-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     old = ClassifierItem(
         classifier_id=classifier.id,
         code="E-01",
-        name={"uz_cyrl": "Эски"},
+        name={"uz_cyrl": "Эски", "uz_latn": "Eski"},
         valid_from=date(2026, 6, 1),
     )
     db.add(old)
@@ -183,7 +190,11 @@ async def test_supersede_requires_a_later_start(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/classifier-items/{old.id}/supersede",
-            json={"code": "E-01", "name": {"uz_cyrl": "Янги"}, "valid_from": "2026-05-01"},
+            json={
+                "code": "E-01",
+                "name": {"uz_cyrl": "Янги", "uz_latn": "Yangi"},
+                "valid_from": "2026-05-01",
+            },
         )
     assert r.status_code == 422
     assert r.json()["error"]["details"]["reason"] == "valid_from must be later"
@@ -195,13 +206,13 @@ async def test_supersede_rejects_an_already_archived_item(db):
     superseding a closed value is meaningless; adding a new item is the right move."""
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"reopen-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"reopen-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     old = ClassifierItem(
         classifier_id=classifier.id,
         code="R-01",
-        name={"uz_cyrl": "Эски"},
+        name={"uz_cyrl": "Эски", "uz_latn": "Eski"},
         valid_from=date(2026, 1, 1),
     )
     db.add(old)
@@ -217,7 +228,11 @@ async def test_supersede_rejects_an_already_archived_item(db):
 
         r = await client.post(
             f"{API}/admin/classifier-items/{old.id}/supersede",
-            json={"code": "R-01", "name": {"uz_cyrl": "Янги"}, "valid_from": "2026-07-01"},
+            json={
+                "code": "R-01",
+                "name": {"uz_cyrl": "Янги", "uz_latn": "Yangi"},
+                "valid_from": "2026-07-01",
+            },
         )
     assert r.status_code == 422, r.text
     assert r.json()["error"]["details"]["reason"] == "already archived"
@@ -245,13 +260,13 @@ async def test_supersede_requires_a_start_later_than_the_old_valid_to(db):
     item's `valid_from` — otherwise the two periods would overlap."""
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"overlap-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"overlap-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     old = ClassifierItem(
         classifier_id=classifier.id,
         code="O-01",
-        name={"uz_cyrl": "Эски"},
+        name={"uz_cyrl": "Эски", "uz_latn": "Eski"},
         valid_from=date(2026, 1, 1),
         valid_to=date(2026, 8, 1),
     )
@@ -265,7 +280,11 @@ async def test_supersede_requires_a_start_later_than_the_old_valid_to(db):
         # Later than old.valid_from but NOT later than old.valid_to — must be rejected.
         r = await client.post(
             f"{API}/admin/classifier-items/{old.id}/supersede",
-            json={"code": "O-01", "name": {"uz_cyrl": "Янги"}, "valid_from": "2026-05-01"},
+            json={
+                "code": "O-01",
+                "name": {"uz_cyrl": "Янги", "uz_latn": "Yangi"},
+                "valid_from": "2026-05-01",
+            },
         )
     assert r.status_code == 422, r.text
     assert r.json()["error"]["details"]["reason"] == "valid_from must be later"
@@ -274,13 +293,13 @@ async def test_supersede_requires_a_start_later_than_the_old_valid_to(db):
 async def test_archive_item_removes_it_from_refs(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"arch-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"arch-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     item = ClassifierItem(
         classifier_id=classifier.id,
         code="A-01",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         valid_from=date(2026, 1, 1),
     )
     db.add(item)
@@ -303,13 +322,13 @@ async def test_archived_item_with_future_valid_to_disappears_from_refs(db):
     must also check `status` for a "what's current" (no `on_date`) query."""
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"future-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"future-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     item = ClassifierItem(
         classifier_id=classifier.id,
         code="F-01",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         valid_from=date(2026, 1, 1),
         valid_to=date(2030, 1, 1),  # far future: date range alone would keep it visible
     )
@@ -333,13 +352,13 @@ async def test_explicit_on_date_today_matches_omitted_for_future_valid_to(db):
     bug. An explicit `on_date=<today>` has to agree with omitting the parameter."""
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"todayparam-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"todayparam-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     item = ClassifierItem(
         classifier_id=classifier.id,
         code="T-01",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         valid_from=date(2026, 1, 1),
         valid_to=date(2030, 1, 1),  # far future: date range alone would keep it visible
     )
@@ -368,13 +387,13 @@ async def test_archive_same_day_valid_from_does_not_500(db):
     archive."""
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"sameday-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"sameday-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     item = ClassifierItem(
         classifier_id=classifier.id,
         code="S-01",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         valid_from=business_today(),
     )
     db.add(item)
@@ -392,13 +411,13 @@ async def test_archive_same_day_valid_from_does_not_500(db):
 async def test_patch_item_audits_old_and_new(db):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, CLASSIFIERS_MANAGE)
-    classifier = Classifier(code=f"patch-{suffix}", name={"uz_cyrl": "Х"})
+    classifier = Classifier(code=f"patch-{suffix}", name={"uz_cyrl": "Х", "uz_latn": "X"})
     db.add(classifier)
     await db.flush()
     item = ClassifierItem(
         classifier_id=classifier.id,
         code="P-01",
-        name={"uz_cyrl": "Эски"},
+        name={"uz_cyrl": "Эски", "uz_latn": "Eski"},
         valid_from=date(2026, 1, 1),
     )
     db.add(item)
@@ -409,7 +428,8 @@ async def test_patch_item_audits_old_and_new(db):
     async with make_client(app, lifespan=True) as client:
         auth_client(client, token, csrf)
         r = await client.patch(
-            f"{API}/admin/classifier-items/{item.id}", json={"name": {"uz_cyrl": "Янги"}}
+            f"{API}/admin/classifier-items/{item.id}",
+            json={"name": {"uz_cyrl": "Янги", "uz_latn": "Yangi"}},
         )
     assert r.status_code == 200
     entry = (
@@ -432,6 +452,10 @@ async def test_items_of_unknown_classifier_is_404(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/classifiers/no-such/items",
-            json={"code": "X", "name": {"uz_cyrl": "Х"}, "valid_from": "2026-01-01"},
+            json={
+                "code": "X",
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+                "valid_from": "2026-01-01",
+            },
         )
     assert r.status_code == 404

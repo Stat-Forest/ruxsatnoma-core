@@ -133,6 +133,15 @@ class VersionOut(BaseModel):
         return _trim_decimal(value)
 
 
+class VersionDetailOut(VersionOut):
+    """`GET /gis/contours/{id}/versions/{version_id}` — task defect 4a's other
+    half: `VersionOut` alone carries no geometry, so a version id handed over
+    out of band still could not actually be looked at. Adds exactly one field
+    over the list row."""
+
+    geometry: dict[str, Any]
+
+
 class VersionPatch(BaseModel):
     """Draft-only metadata edits (service 409s otherwise). Geometry is never
     patched in place — a changed shape is a new version, by design."""
@@ -141,6 +150,53 @@ class VersionPatch(BaseModel):
     accuracy_m: Decimal | None = None
     survey_date: date | None = None
     effective_from: date | None = None
+
+
+class SplitPieceIn(BaseModel):
+    """One of the two subcontours `POST /gis/contours/{parent_id}/split`
+    produces. Narrowed to what the caller actually decides: the adminka's
+    `splitContour.ts` already computed `geom` client-side (decision #91,
+    `gis.service.split_contour`'s own docstring on why the cut itself stays
+    client-side); everything else about the new contour — `layer_id`,
+    `organization_id`, `kind`, `parent_id` — is derived from the parent and is
+    never re-typed by the caller the way a plain `POST /gis/contours` would
+    require."""
+
+    number: str
+    geom: dict[str, Any]
+    declared_area_ha: Decimal | None = None
+
+
+class SplitIn(BaseModel):
+    """`POST /gis/contours/{parent_id}/split`. `source`/`accuracy_m`/
+    `survey_date`/`effective_from` describe how the split itself was carried
+    out — one drawing act, producing both pieces at once — so they are
+    supplied ONCE, unlike `declared_area_ha` (each piece's own source-file or
+    on-screen figure), which genuinely differs per piece."""
+
+    piece_a: SplitPieceIn
+    piece_b: SplitPieceIn
+    source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
+    accuracy_m: Decimal | None = None
+    survey_date: date | None = None
+    effective_from: date | None = None
+
+
+class SplitPieceOut(BaseModel):
+    contour: ContourOut
+    version: VersionOut
+
+
+class SplitOut(BaseModel):
+    """`POST /gis/contours/{parent_id}/split` response. `parent_id` is echoed
+    back for convenience only — the parent's own row is untouched by this call
+    (decision #91: it stays exactly as it was, published version included;
+    see `gis.service.split_contour`'s own docstring for what that does and
+    does not mean for the parent's occupancy and its own topology checks)."""
+
+    parent_id: uuid.UUID
+    piece_a: SplitPieceOut
+    piece_b: SplitPieceOut
 
 
 class ApproveIn(BaseModel):
@@ -300,7 +356,15 @@ class ContourListItem(BaseModel):
     placeholder, shared with `ContourCardOut` below: `s_available_ha`
     degrades to the full `area_ha` until something registers an
     `OCCUPANCY_PROVIDERS` entry, and `occupancy_source` says so explicitly so
-    a front-end can never mistake the placeholder for a measurement."""
+    a front-end can never mistake the placeholder for a measurement.
+
+    `s_available_ha` is floored at zero (`gis.service._available_ha`) — a
+    negative "available area" is meaningless to a consumer asking how much
+    can still be requested. `over_allocated` is the explicit signal for the
+    case that floor would otherwise hide: `occupied_ha` already exceeding
+    `area_ha` (two permits issued over the whole parcel is a real,
+    demo-witnessed state, not a display bug) — named rather than left for a
+    reader to notice by subtracting two other fields themselves."""
 
     id: uuid.UUID
     number: str
@@ -308,6 +372,7 @@ class ContourListItem(BaseModel):
     area_ha: Decimal
     occupied_ha: Decimal
     s_available_ha: Decimal
+    over_allocated: bool
     occupancy_source: str
 
     @field_serializer("area_ha", "s_available_ha")
@@ -321,7 +386,8 @@ class ContourCardOut(BaseModel):
     `occupied_ha` is intentionally NOT run through `_trim_decimal`: it is a
     computed sum, not a value round-tripped through a NUMERIC column, and
     keeping its full 4-dp precision (`"0.0000"`, not `"0"`) is what makes it
-    read as a real figure rather than a rounded-away one."""
+    read as a real figure rather than a rounded-away one. `s_available_ha`/
+    `over_allocated` — see `ContourListItem`'s own docstring, the same shape."""
 
     id: uuid.UUID
     number: str
@@ -332,6 +398,7 @@ class ContourCardOut(BaseModel):
     geometry: dict[str, Any]
     occupied_ha: Decimal
     s_available_ha: Decimal
+    over_allocated: bool
     occupancy_source: str
 
     @field_serializer("area_ha", "s_available_ha")

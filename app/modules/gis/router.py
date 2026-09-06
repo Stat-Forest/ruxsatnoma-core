@@ -5,21 +5,25 @@ permission gate matches `gis_client` in the test fixtures); `submit-review` is
 `CONTOURS_MANAGE` too (the specialist hands their own draft on), as is
 `return-to-draft` (they take it back), while `approve`/`publish`/`archive`
 and `return-to-review` require `CONTOURS_APPROVE` (the rahbar —
-`rahbar_client` in the tests). Every write below is ALSO zone-scoped through
-`service._assert_in_zone`, a separate gate from the permission check (lesson:
-'Zone scoping is not a permission check — a read path needs both')."""
+`rahbar_client` in the tests). `POST .../split` (decision #91) is
+`CONTOURS_MANAGE` too — the specialist splits, exactly the way they draw and
+edit; the two resulting drafts go through approval like any other new
+version. Every write below is ALSO zone-scoped through `service._assert_in_zone`,
+a separate gate from the permission check (lesson: 'Zone scoping is not a
+permission check — a read path needs both')."""
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
-from app.modules.auth.deps import get_current_user, require_permission
+from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import checks, service
+from app.modules.gis.models import VERSION_STATUSES
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import (
     ApproveIn,
@@ -30,10 +34,18 @@ from app.modules.gis.schemas import (
     ContourOut,
     ContourPatch,
     FeatureCollectionOut,
+    SplitIn,
+    SplitOut,
+    SplitPieceOut,
+    VersionDetailOut,
     VersionIn,
     VersionOut,
     VersionPatch,
 )
+
+# `?status=` on the version list below — same shape as
+# `payments.backoffice_router._STATUS_PATTERN` for the discrepancy register.
+_VERSION_STATUS_PATTERN = "^(" + "|".join(VERSION_STATUSES) + ")$"
 
 router = APIRouter(prefix="/gis", tags=["gis"])
 
@@ -131,6 +143,82 @@ async def patch_contour(
         db, contour_id, actor=user, **payload.model_dump(exclude_unset=True)
     )
     return ContourOut.model_validate(contour, from_attributes=True)
+
+
+@router.post("/contours/{parent_id}/split", status_code=201)
+async def split_contour(
+    parent_id: uuid.UUID,
+    payload: SplitIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+) -> SplitOut:
+    """Decision #91: one parent, two subcontours, atomically — replaces the
+    adminka's own client-composed `createContour` + `createVersion`, twice.
+    See `service.split_contour`'s own docstring for the full refusal list and
+    why the geometry itself stays client-computed."""
+    child_a, version_a, child_b, version_b = await service.split_contour(
+        db,
+        parent_id,
+        actor=user,
+        piece_a={
+            "number": payload.piece_a.number,
+            "geom": payload.piece_a.geom,
+            "declared_area_ha": payload.piece_a.declared_area_ha,
+        },
+        piece_b={
+            "number": payload.piece_b.number,
+            "geom": payload.piece_b.geom,
+            "declared_area_ha": payload.piece_b.declared_area_ha,
+        },
+        source=payload.source,
+        accuracy_m=payload.accuracy_m,
+        survey_date=payload.survey_date,
+        effective_from=payload.effective_from,
+    )
+    return SplitOut(
+        parent_id=parent_id,
+        piece_a=SplitPieceOut(
+            contour=ContourOut.model_validate(child_a, from_attributes=True),
+            version=VersionOut.model_validate(version_a, from_attributes=True),
+        ),
+        piece_b=SplitPieceOut(
+            contour=ContourOut.model_validate(child_b, from_attributes=True),
+            version=VersionOut.model_validate(version_b, from_attributes=True),
+        ),
+    )
+
+
+@router.get("/contours/{contour_id}/versions", response_model=Page[VersionOut])
+async def list_versions(
+    contour_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    # Both roles that can act on a version need to find it: the specialist
+    # tracking their own draft/review submission (`CONTOURS_MANAGE`) and the
+    # rahbar who must approve it (`CONTOURS_APPROVE`) — task defect 4a.
+    user: Annotated[User, Depends(require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE))],
+    params: Annotated[PageParams, Depends()],
+    status: Annotated[str | None, Query(pattern=_VERSION_STATUS_PATTERN)] = None,
+) -> Any:
+    items, total = await service.list_versions(
+        db, contour_id, status=status, params=params, actor=user
+    )
+    return Page[VersionOut](
+        items=[VersionOut.model_validate(item, from_attributes=True) for item in items],
+        total=total,
+        page=params.page,
+        page_size=params.page_size,
+    )
+
+
+@router.get("/contours/{contour_id}/versions/{version_id}", response_model=VersionDetailOut)
+async def get_version(
+    contour_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE))],
+) -> Any:
+    detail = await service.version_detail(db, contour_id, version_id, actor=user)
+    return VersionDetailOut.model_validate(detail)
 
 
 @router.post("/contours/{contour_id}/versions", status_code=201)

@@ -205,3 +205,71 @@ async def test_submit_review_cannot_drive_the_rework_edge_it_shares_a_target_wit
     details = resp.json()["error"]["details"]
     assert details["reason"] == "bad_transition"
     assert (details["from"], details["to"]) == ("approved", "review")
+
+
+# --- Task defect 4a: a contour version awaiting approval was undiscoverable --
+#
+# No route listed a contour's non-published versions and none fetched one by
+# id, so the only way a rahbar learned a version was awaiting them was an id
+# handed over out of band; `VersionOut` also carried no geometry, so even a
+# handed-over id could not actually be looked at.
+
+
+async def test_the_specialist_lists_and_fetches_their_own_draft_version(
+    gis_client, contour_with_draft
+):
+    cid, vid = contour_with_draft
+    listed = await gis_client.get(f"/api/v1/gis/contours/{cid}/versions")
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert body["total"] == 1
+    assert body["items"][0]["id"] == str(vid)
+    assert body["items"][0]["status"] == "draft"
+    assert "geometry" not in body["items"][0]  # the list stays geometry-free, like ContourListItem
+
+    detail = await gis_client.get(f"/api/v1/gis/contours/{cid}/versions/{vid}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["id"] == str(vid)
+    assert detail.json()["geometry"]["type"] in ("Polygon", "MultiPolygon")
+
+
+async def test_the_rahbar_finds_what_is_awaiting_approval_by_status(
+    rahbar_client, contour_with_draft, contour_in_review
+):
+    """`?status=review` is "awaiting my approval" — the draft from a SEPARATE
+    contour must not appear beside it."""
+    review_cid, review_vid = contour_in_review
+    draft_cid, _draft_vid = contour_with_draft
+    resp = await rahbar_client.get(f"/api/v1/gis/contours/{review_cid}/versions?status=review")
+    assert resp.status_code == 200, resp.text
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert ids == {str(review_vid)}
+
+    empty = await rahbar_client.get(f"/api/v1/gis/contours/{draft_cid}/versions?status=review")
+    assert empty.json()["items"] == []
+
+
+async def test_version_list_and_detail_are_zone_scoped(org_scoped_rahbar_client, contour_in_review):
+    """`contour_in_review` sits under `leshoz`; `org_scoped_rahbar_client` is
+    zoned to a DIFFERENT organization (`other_leshoz`) — the same shape
+    `test_approve_is_refused_outside_the_actors_zone` above proves for the
+    write path. A version outside the actor's zone is invisible on the list
+    and answers not-found on the direct fetch, never a stranger's geometry."""
+    cid, vid = contour_in_review
+    listed = await org_scoped_rahbar_client.get(f"/api/v1/gis/contours/{cid}/versions")
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["items"] == []
+
+    detail = await org_scoped_rahbar_client.get(f"/api/v1/gis/contours/{cid}/versions/{vid}")
+    assert detail.status_code == 404, detail.text
+    assert detail.json()["error"]["code"] == "ERR-SYS-003"
+
+
+async def test_version_routes_refuse_a_caller_with_neither_manage_nor_approve(
+    applicant_client, contour_with_draft
+):
+    cid, vid = contour_with_draft
+    assert (await applicant_client.get(f"/api/v1/gis/contours/{cid}/versions")).status_code == 403
+    assert (
+        await applicant_client.get(f"/api/v1/gis/contours/{cid}/versions/{vid}")
+    ).status_code == 403

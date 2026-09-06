@@ -1,5 +1,7 @@
 """Adapter seam: mock codecs, factories, prod guard lives in test_config."""
 
+import urllib.parse
+
 import pytest
 
 from app.modules.integrations.adapters.eimzo import (
@@ -9,12 +11,14 @@ from app.modules.integrations.adapters.eimzo import (
     get_eimzo_adapter,
 )
 from app.modules.integrations.adapters.oneid import (
+    MOCK_DEMO_PROFILE,
     MockOneId,
     OneIdError,
     OneIdLegalInfo,
     OneIdProfile,
     encode_mock_code,
     get_oneid_adapter,
+    provider_authorize_url,
 )
 from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
 
@@ -108,9 +112,49 @@ async def test_oneid_profile_new_fields_roundtrip():
     assert restored == profile
 
 
-def test_authorize_url_carries_scope():
-    url = MockOneId().authorize_url(state="s", redirect_uri="http://cb", scope="ext")
+async def test_mock_authorize_url_is_self_referential():
+    """Before this, ONEID_MODE=mock's `authorize_url` returned the REAL
+    sso.egov.uz URL — a browser (as opposed to a pytest client manufacturing
+    `code` directly) that followed it landed on the state portal's error page
+    with no route back (final review of stage 6.6, finding 1). It must instead
+    point back at our own callback so the whole chain is walkable."""
+    adapter = MockOneId()
+    url = adapter.authorize_url(state="s", redirect_uri="http://testserver/cb", scope="ext")
+    assert url.startswith("http://testserver/cb?")
+    assert "sso.egov.uz" not in url
+    assert "state=s" in url
+    parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    assert parsed["state"] == ["s"]
+    profile = await adapter.exchange_code(parsed["code"][0])
+    assert profile == MOCK_DEMO_PROFILE
+    # Obviously a demo, and not a shape any real citizen's PINFL could take.
+    assert profile.pinfl == "99999999999999"
+    assert "MOCK" in profile.full_name and "DEMO" in profile.full_name
+
+
+def test_real_oneid_provider_url_shape_is_preserved():
+    """`oneid_mode=real` still raises `NotImplementedError` (get_oneid_adapter,
+    unaffected by this fix) — but the sso.egov.uz request shape the real
+    adapter will need at stage 5.1 must survive the mock fix intact."""
+    url = provider_authorize_url(state="s", redirect_uri="http://cb", scope="ext")
+    assert url.startswith("https://sso.egov.uz/sso/oauth/Authorization.do?")
     assert "scope=ext" in url
+    assert "state=s" in url
+    assert "redirect_uri=http%3A%2F%2Fcb" in url
+
+
+def test_oneid_real_mode_still_unimplemented(monkeypatch):
+    """`get_oneid_adapter()`'s real-mode branch — untouched by this fix, and
+    verified so: the mock-mode self-referential URL must never leak into it."""
+    from app.config import get_settings
+
+    monkeypatch.setenv("ONEID_MODE", "real")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(NotImplementedError):
+            get_oneid_adapter()
+    finally:
+        get_settings.cache_clear()
 
 
 async def test_old_snapshot_without_new_fields_still_parses():

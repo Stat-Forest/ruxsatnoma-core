@@ -66,4 +66,8 @@ async def test_downgrade_upgrade_roundtrip(engine):
     await asyncio.to_thread(command.upgrade, cfg, "head")
     async with engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-    assert version == "0023"
+    # The head is pinned as a literal on purpose: a second head is invisible to
+    # every other test (conftest's migrator is session-scoped and autouse, so a
+    # branch point kills the whole suite rather than one case). Move this in the
+    # SAME commit as the migration that moves the head.
+    assert version == "0032"

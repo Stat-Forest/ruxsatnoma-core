@@ -190,3 +190,130 @@ async def test_the_owner_sees_their_own_invoice_regardless_of_zone(
     response = await owner_client.get(f"/api/v1/invoices/{invoice_in_home_leshoz.id}")
 
     assert response.status_code == 200
+
+
+# --- backend-gaps finding 3: `GET /invoices` with no `application_id` -------
+#
+# Before this, `GET /invoices` answered a filtered lookup only — an
+# accountant's screen could show one application's own invoices but never
+# browse the whole register. The browse-all path is staff-only and carries
+# the SAME territorial scoping decision #70 gave the by-application path,
+# because `invoices` still has no `organization_id` of its own: an accountant
+# outside the invoice's leshoz must not see it on the register either.
+
+
+async def test_a_plain_applicant_cannot_browse_the_invoice_register(
+    owner_client: httpx.AsyncClient,
+) -> None:
+    """Omitting `application_id` is the register; a citizen has no republic
+    to browse, so it is staff-only, `ERR-ACL-001` for anyone else."""
+    response = await owner_client.get("/api/v1/invoices")
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_a_republic_wide_accountant_browses_every_invoice(
+    payments_view_client: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
+) -> None:
+    response = await payments_view_client.get("/api/v1/invoices")
+
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["items"]}
+    assert str(invoice_in_home_leshoz.id) in ids
+
+
+async def test_an_accountant_of_another_leshoz_does_not_see_it_on_the_register(
+    other_accountant: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
+) -> None:
+    response = await other_accountant.get("/api/v1/invoices")
+
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["items"]}
+    assert str(invoice_in_home_leshoz.id) not in ids
+
+
+async def test_the_accountant_of_that_leshoz_sees_it_on_the_register(
+    home_accountant: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
+) -> None:
+    response = await home_accountant.get("/api/v1/invoices")
+
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["items"]}
+    assert str(invoice_in_home_leshoz.id) in ids
+
+
+async def test_the_register_fails_closed_for_an_unplaceable_application(
+    home_accountant: httpx.AsyncClient, invoice: Invoice
+) -> None:
+    """`invoice`'s own application names neither an `assigned_org_id` nor a
+    contour, so `applications.service.effective_organization` (decision #70)
+    resolves it to `None` — `_zone_covers_application`'s fail-closed branch,
+    reached here through the browse-all path for the first time. A zoned
+    accountant must not see an unplaceable invoice on the register any more
+    than an out-of-zone one: "unplaceable" must never read as "everyone's"."""
+    response = await home_accountant.get("/api/v1/invoices")
+
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["items"]}
+    assert str(invoice.id) not in ids
+
+
+async def test_the_register_can_be_narrowed_by_status(
+    payments_view_client: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
+) -> None:
+    matching = await payments_view_client.get(
+        "/api/v1/invoices", params={"status": invoice_in_home_leshoz.status}
+    )
+    assert matching.status_code == 200, matching.text
+    assert str(invoice_in_home_leshoz.id) in {item["id"] for item in matching.json()["items"]}
+
+    other_status = "paid" if invoice_in_home_leshoz.status != "paid" else "cancelled"
+    narrowed = await payments_view_client.get("/api/v1/invoices", params={"status": other_status})
+    assert narrowed.status_code == 200, narrowed.text
+    assert str(invoice_in_home_leshoz.id) not in {item["id"] for item in narrowed.json()["items"]}
+
+
+async def test_application_id_still_takes_the_original_ownership_path(
+    home_accountant: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
+) -> None:
+    """Given `?application_id=`, the route is unchanged: this is still the
+    same 404-not-403 ownership check `test_an_accountant_of_another_leshoz_
+    cannot_list_the_application_invoices` above proves, not the new
+    permission gate."""
+    response = await home_accountant.get(
+        "/api/v1/invoices", params={"application_id": str(invoice_in_home_leshoz.application_id)}
+    )
+    assert response.status_code == 200, response.text
+    assert {item["id"] for item in response.json()["items"]} == {str(invoice_in_home_leshoz.id)}
+
+
+async def test_application_id_with_status_narrows_instead_of_ignoring_it(
+    home_accountant: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
+) -> None:
+    """`?application_id=&status=` together (backend-gaps review, 2026-09-06):
+    `list_invoices_by_application` used to take no `status` at all, so this
+    combination silently returned every invoice for the application
+    regardless of `status` — no error, no hint. A matching `status` still
+    finds it; a non-matching one now excludes it instead of ignoring the
+    filter."""
+    matching = await home_accountant.get(
+        "/api/v1/invoices",
+        params={
+            "application_id": str(invoice_in_home_leshoz.application_id),
+            "status": invoice_in_home_leshoz.status,
+        },
+    )
+    assert matching.status_code == 200, matching.text
+    assert {item["id"] for item in matching.json()["items"]} == {str(invoice_in_home_leshoz.id)}
+
+    other_status = "paid" if invoice_in_home_leshoz.status != "paid" else "cancelled"
+    narrowed = await home_accountant.get(
+        "/api/v1/invoices",
+        params={
+            "application_id": str(invoice_in_home_leshoz.application_id),
+            "status": other_status,
+        },
+    )
+    assert narrowed.status_code == 200, narrowed.text
+    assert narrowed.json()["items"] == []

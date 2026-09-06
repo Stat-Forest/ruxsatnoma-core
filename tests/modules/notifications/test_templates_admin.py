@@ -19,7 +19,7 @@ def _payload(event_code: str, channel: str = "inapp") -> dict:
     return {
         "event_code": event_code,
         "channel": channel,
-        "body": {"uz_cyrl": "Матн {x}", "ru": "Текст {x}"},
+        "body": {"uz_cyrl": "Матн {x}", "uz_latn": "Matn {x}", "ru": "Текст {x}"},
     }
 
 
