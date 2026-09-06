@@ -99,13 +99,21 @@ _ORGANIZATION_ROWS = [
     {
         "code": "agency",
         "kind": "agency",
-        "name": {"uz_cyrl": "Ўрмон хўжалиги агентлиги", "en": "Forestry Agency"},
+        "name": {
+            "uz_cyrl": "Ўрмон хўжалиги агентлиги",
+            "uz_latn": "Oʻrmon xoʻjaligi agentligi",
+            "en": "Forestry Agency",
+        },
     },
     {
         "code": BURCHMULLA_CODE,
         "kind": "leshoz",
         "parent_code": "agency",
-        "name": {"uz_cyrl": "Бурчмулла ДЎХ", "en": "Burchmulla forestry"},
+        "name": {
+            "uz_cyrl": "Бурчмулла ДЎХ",
+            "uz_latn": "Burchmulla DOʻX",
+            "en": "Burchmulla forestry",
+        },
     },
 ]
 

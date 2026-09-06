@@ -73,19 +73,19 @@ async def test_full_round_trip(
         json={
             "code": form_code,
             "version": 1,
-            "name": {"uz_cyrl": "2-илова"},
+            "name": {"uz_cyrl": "2-илова", "uz_latn": "2-ilova"},
             "activity_type_id": str(grazing_activity_id),
             "period_type": "quarter",
             "columns": [
                 {
                     "code": "total_amount",
-                    "label": {"uz_cyrl": "Сумма"},
+                    "label": {"uz_cyrl": "Сумма", "uz_latn": "Summa"},
                     "source": "auto",
                     "type": "money",
                 },
                 {
                     "code": "paid_amount",
-                    "label": {"uz_cyrl": "Тўланган"},
+                    "label": {"uz_cyrl": "Тўланган", "uz_latn": "Toʻlangan"},
                     "source": "auto",
                     "type": "money",
                 },

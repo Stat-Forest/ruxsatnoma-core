@@ -12,7 +12,11 @@ async def test_a_fire_ban_is_created_with_its_period_and_published(
         "/api/v1/gis/layers/fire_bans/features",
         json={
             "geom": restrictions_polygon,
-            "name": {"uz_cyrl": "Ёнғин тақиқи", "ru": "Пожарный запрет"},
+            "name": {
+                "uz_cyrl": "Ёнғин тақиқи",
+                "uz_latn": "Yongʻin taqiqi",
+                "ru": "Пожарный запрет",
+            },
             "valid_from": str(date.today()),
             "valid_to": str(date.today() + timedelta(days=30)),
             "props": {"order_no": "12-ф"},

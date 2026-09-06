@@ -7,11 +7,11 @@ import uuid
 def _payload(code: str) -> dict:
     return {
         "code": code,
-        "name": {"uz_cyrl": "Тест чек-листи"},
+        "name": {"uz_cyrl": "Тест чек-листи", "uz_latn": "Test chek-listi"},
         "items": [
             {
                 "code": "q1",
-                "question": {"uz_cyrl": "Савол 1?"},
+                "question": {"uz_cyrl": "Савол 1?", "uz_latn": "Savol 1?"},
                 "type": "bool",
                 "required": True,
             }

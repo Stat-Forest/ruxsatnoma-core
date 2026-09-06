@@ -24,8 +24,8 @@ async def make_announcement(db, *, created_by, **overrides) -> Announcement:
     `make_session`'s pattern (tests/modules/auth/test_sessions.py) for setup that
     doesn't need to go through the admin API under test."""
     fields = {
-        "title": {"uz_cyrl": "Эълон"},
-        "body": {"uz_cyrl": "Матн"},
+        "title": {"uz_cyrl": "Эълон", "uz_latn": "Eʼlon"},
+        "body": {"uz_cyrl": "Матн", "uz_latn": "Matn"},
         "status": "published",
         "publish_from": datetime.now(UTC) - timedelta(minutes=1),
         "created_by": created_by,
@@ -50,8 +50,8 @@ async def test_create_draft_attaches_files_and_audits(db):
         r = await client.post(
             f"{API}/admin/announcements",
             json={
-                "title": {"uz_cyrl": "Эълон"},
-                "body": {"uz_cyrl": "Матн"},
+                "title": {"uz_cyrl": "Эълон", "uz_latn": "Eʼlon"},
+                "body": {"uz_cyrl": "Матн", "uz_latn": "Matn"},
                 "file_ids": [file_id],
             },
         )
@@ -80,8 +80,8 @@ async def test_create_rejects_unknown_file_ids(db):
         r = await client.post(
             f"{API}/admin/announcements",
             json={
-                "title": {"uz_cyrl": "Э"},
-                "body": {"uz_cyrl": "М"},
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
                 "file_ids": [str(uuid.uuid4())],
             },
         )
@@ -101,8 +101,8 @@ async def test_create_dedupes_repeated_file_ids(db):
         r = await client.post(
             f"{API}/admin/announcements",
             json={
-                "title": {"uz_cyrl": "Э"},
-                "body": {"uz_cyrl": "М"},
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
                 "file_ids": [file_id, file_id],
             },
         )
@@ -122,7 +122,11 @@ async def test_patch_replaces_file_ids(db):
         ]
         created = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э"}, "body": {"uz_cyrl": "М"}, "file_ids": [file_a]},
+            json={
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
+                "file_ids": [file_a],
+            },
         )
         ann_id = created.json()["id"]
         r = await client.patch(f"{API}/admin/announcements/{ann_id}", json={"file_ids": [file_b]})
@@ -138,7 +142,10 @@ async def test_publish_sets_publish_from_and_audits(db):
         auth_client(client, token, csrf)
         created = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э"}, "body": {"uz_cyrl": "М"}},
+            json={
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
+            },
         )
         assert created.json()["publish_from"] is None
         ann_id = created.json()["id"]
@@ -169,8 +176,8 @@ async def test_publish_rejects_bad_window(db):
         created = await client.post(
             f"{API}/admin/announcements",
             json={
-                "title": {"uz_cyrl": "Э"},
-                "body": {"uz_cyrl": "М"},
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
                 "publish_from": now.isoformat(),
                 "publish_to": (now - timedelta(hours=1)).isoformat(),
             },
@@ -189,12 +196,15 @@ async def test_patch_archived_is_rejected(db):
         auth_client(client, token, csrf)
         created = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э"}, "body": {"uz_cyrl": "М"}},
+            json={
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
+            },
         )
         ann_id = created.json()["id"]
         await client.post(f"{API}/admin/announcements/{ann_id}/archive")
         r = await client.patch(
-            f"{API}/admin/announcements/{ann_id}", json={"title": {"uz_cyrl": "Я"}}
+            f"{API}/admin/announcements/{ann_id}", json={"title": {"uz_cyrl": "Я", "uz_latn": "Ya"}}
         )
     assert r.status_code == 422
     assert r.json()["error"]["details"]["reason"] == "archived"
@@ -208,13 +218,19 @@ async def test_archive_from_draft_and_from_published(db):
         auth_client(client, token, csrf)
         draft = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э1"}, "body": {"uz_cyrl": "М1"}},
+            json={
+                "title": {"uz_cyrl": "Э1", "uz_latn": "E1"},
+                "body": {"uz_cyrl": "М1", "uz_latn": "M1"},
+            },
         )
         r_from_draft = await client.post(f"{API}/admin/announcements/{draft.json()['id']}/archive")
 
         published = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э2"}, "body": {"uz_cyrl": "М2"}},
+            json={
+                "title": {"uz_cyrl": "Э2", "uz_latn": "E2"},
+                "body": {"uz_cyrl": "М2", "uz_latn": "M2"},
+            },
         )
         pub_id = published.json()["id"]
         await client.post(f"{API}/admin/announcements/{pub_id}/publish")
@@ -234,7 +250,10 @@ async def test_admin_routes_require_permission(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э"}, "body": {"uz_cyrl": "М"}},
+            json={
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
+            },
         )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-ACL-001"
@@ -389,7 +408,11 @@ async def test_file_access_granted_via_announcement_then_revoked_after_archive(d
         ]
         created = await client.post(
             f"{API}/admin/announcements",
-            json={"title": {"uz_cyrl": "Э"}, "body": {"uz_cyrl": "М"}, "file_ids": [file_id]},
+            json={
+                "title": {"uz_cyrl": "Э", "uz_latn": "E"},
+                "body": {"uz_cyrl": "М", "uz_latn": "M"},
+                "file_ids": [file_id],
+            },
         )
         assert created.status_code == 201, created.text
         ann_id = created.json()["id"]

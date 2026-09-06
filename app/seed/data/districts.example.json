@@ -3,13 +3,18 @@
     "code": "nukus-city",
     "soato_code": "1735401",
     "region_code": "karakalpakstan",
-    "name": {"uz_cyrl": "Нукус шаҳри", "ru": "город Нукус", "en": "Nukus city"},
+    "name": {
+      "uz_cyrl": "Нукус шаҳри",
+      "uz_latn": "Nukus shahri",
+      "ru": "город Нукус",
+      "en": "Nukus city"
+    },
     "sort_order": 10
   },
   {
     "code": "beruniy",
     "region_code": "karakalpakstan",
-    "name": {"uz_cyrl": "Беруний тумани", "en": "Beruniy district"},
+    "name": { "uz_cyrl": "Беруний тумани", "uz_latn": "Beruniy tumani", "en": "Beruniy district" },
     "sort_order": 20
   }
 ]

@@ -52,7 +52,7 @@ async def test_get_organization_returns_the_admin_shape_with_requisites(db, agen
     org = Organization(
         kind="leshoz",
         code=f"getone-{suffix}",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         parent_id=agency.id,
         stir="200388105",
         requisites={"account": "40012186035209704220"},
@@ -89,7 +89,11 @@ async def test_create_requires_permission(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/organizations",
-            json={"kind": "agency", "code": "a-1", "name": {"uz_cyrl": "Агентлик"}},
+            json={
+                "kind": "agency",
+                "code": "a-1",
+                "name": {"uz_cyrl": "Агентлик", "uz_latn": "Agentlik"},
+            },
         )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-ACL-001"
@@ -104,7 +108,11 @@ async def test_create_requires_csrf_header(db):
         client.cookies.set("csrf_token", csrf)
         r = await client.post(
             f"{API}/admin/organizations",
-            json={"kind": "agency", "code": "a-2", "name": {"uz_cyrl": "Агентлик"}},
+            json={
+                "kind": "agency",
+                "code": "a-2",
+                "name": {"uz_cyrl": "Агентлик", "uz_latn": "Agentlik"},
+            },
         )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-AUTH-006"
@@ -123,7 +131,7 @@ async def test_create_leshoz_under_the_agency(db, agency):
                 "kind": "leshoz",
                 "parent_id": str(agency.id),
                 "code": f"leshoz-{suffix}",
-                "name": {"uz_cyrl": "Нукус ДЎХ"},
+                "name": {"uz_cyrl": "Нукус ДЎХ", "uz_latn": "Nukus DOʻX"},
                 "stir": "200388105",
                 "requisites": {"account": "40012186035209704220"},
             },
@@ -153,7 +161,11 @@ async def test_second_agency_is_rejected_with_a_domain_error(db, agency):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/organizations",
-            json={"kind": "agency", "code": "second-agency", "name": {"uz_cyrl": "Х"}},
+            json={
+                "kind": "agency",
+                "code": "second-agency",
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+            },
         )
     assert r.status_code == 422
     assert r.json()["error"]["details"]["reason"] == "root already exists"
@@ -173,7 +185,7 @@ async def test_wrong_parent_kind_rejected(db, agency):
                 "kind": "bolak",
                 "parent_id": str(agency.id),
                 "code": f"bolak-{suffix}",
-                "name": {"uz_cyrl": "Бўлак"},
+                "name": {"uz_cyrl": "Бўлак", "uz_latn": "Boʻlak"},
             },
         )
     assert r.status_code == 422
@@ -189,7 +201,11 @@ async def test_non_agency_without_parent_rejected(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/organizations",
-            json={"kind": "leshoz", "code": "rootless-leshoz", "name": {"uz_cyrl": "ДЎХ"}},
+            json={
+                "kind": "leshoz",
+                "code": "rootless-leshoz",
+                "name": {"uz_cyrl": "ДЎХ", "uz_latn": "DOʻX"},
+            },
         )
     assert r.status_code == 422
     assert r.json()["error"]["details"]["reason"] == "parent required"
@@ -202,7 +218,7 @@ async def test_duplicate_code_rejected(db, agency):
         Organization(
             kind="leshoz",
             code=f"dup-{suffix}",
-            name={"uz_cyrl": "Х"},
+            name={"uz_cyrl": "Х", "uz_latn": "X"},
             parent_id=agency.id,
         )
     )
@@ -217,7 +233,7 @@ async def test_duplicate_code_rejected(db, agency):
                 "kind": "leshoz",
                 "parent_id": str(agency.id),
                 "code": f"dup-{suffix}",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
             },
         )
     assert r.status_code == 422
@@ -228,12 +244,18 @@ async def test_reparent_into_own_subtree_rejected(db, agency):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
     territorial = Organization(
-        kind="territorial", code=f"t-{suffix}", name={"uz_cyrl": "Х"}, parent_id=agency.id
+        kind="territorial",
+        code=f"t-{suffix}",
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
+        parent_id=agency.id,
     )
     db.add(territorial)
     await db.flush()
     leshoz = Organization(
-        kind="leshoz", code=f"l-{suffix}", name={"uz_cyrl": "Х"}, parent_id=territorial.id
+        kind="leshoz",
+        code=f"l-{suffix}",
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
+        parent_id=territorial.id,
     )
     db.add(leshoz)
     await db.flush()
@@ -256,7 +278,7 @@ async def test_patch_updates_and_audits_old_value(db, agency):
     org = Organization(
         kind="leshoz",
         code=f"p-{suffix}",
-        name={"uz_cyrl": "Эски ном"},
+        name={"uz_cyrl": "Эски ном", "uz_latn": "Eski nom"},
         parent_id=agency.id,
     )
     db.add(org)
@@ -268,7 +290,10 @@ async def test_patch_updates_and_audits_old_value(db, agency):
         auth_client(client, token, csrf)
         r = await client.patch(
             f"{API}/admin/organizations/{org.id}",
-            json={"name": {"uz_cyrl": "Янги ном"}, "requisites": {"mfo": "00014"}},
+            json={
+                "name": {"uz_cyrl": "Янги ном", "uz_latn": "Yangi nom"},
+                "requisites": {"mfo": "00014"},
+            },
         )
     assert r.status_code == 200
     assert r.json()["name"]["uz_cyrl"] == "Янги ном"
@@ -290,14 +315,17 @@ async def test_archive_blocked_while_active_children_exist(db, agency):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
     territorial = Organization(
-        kind="territorial", code=f"ar-{suffix}", name={"uz_cyrl": "Х"}, parent_id=agency.id
+        kind="territorial",
+        code=f"ar-{suffix}",
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
+        parent_id=agency.id,
     )
     db.add(territorial)
     await db.flush()
     child = Organization(
         kind="leshoz",
         code=f"ar-child-{suffix}",
-        name={"uz_cyrl": "Х"},
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
         parent_id=territorial.id,
     )
     db.add(child)
@@ -332,7 +360,7 @@ async def test_create_rejects_malformed_stir_with_422_not_500(db, agency):
                 "kind": "leshoz",
                 "parent_id": str(agency.id),
                 "code": f"badstir-{suffix}",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
                 "stir": "12345",
             },
         )
@@ -344,7 +372,10 @@ async def test_patch_rejects_malformed_stir_with_422_not_500(db, agency):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
     org = Organization(
-        kind="leshoz", code=f"patchstir-{suffix}", name={"uz_cyrl": "Х"}, parent_id=agency.id
+        kind="leshoz",
+        code=f"patchstir-{suffix}",
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
+        parent_id=agency.id,
     )
     db.add(org)
     await db.flush()
@@ -377,7 +408,7 @@ async def test_create_rejects_non_ascii_digit_stir_with_422_not_500(db, agency):
                 "kind": "leshoz",
                 "parent_id": str(agency.id),
                 "code": f"arabicstir-{suffix}",
-                "name": {"uz_cyrl": "Х"},
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
                 "stir": "١٢٣٤٥٦٧٨٩",  # nine Arabic-Indic digits, not ASCII 0-9
             },
         )
@@ -392,7 +423,8 @@ async def test_unknown_organization_is_404(db):
     async with make_client(app, lifespan=True) as client:
         auth_client(client, token, csrf)
         r = await client.patch(
-            f"{API}/admin/organizations/{uuid.uuid4()}", json={"name": {"uz_cyrl": "Х"}}
+            f"{API}/admin/organizations/{uuid.uuid4()}",
+            json={"name": {"uz_cyrl": "Х", "uz_latn": "X"}},
         )
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "ERR-SYS-003"

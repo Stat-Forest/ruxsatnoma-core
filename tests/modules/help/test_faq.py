@@ -15,8 +15,8 @@ async def test_public_faq_lists_only_published_items(db):
         created = await client.post(
             f"{API}/admin/help/faq",
             json={
-                "question": {"uz_cyrl": "Савол?"},
-                "answer": {"uz_cyrl": "Жавоб."},
+                "question": {"uz_cyrl": "Савол?", "uz_latn": "Savol?"},
+                "answer": {"uz_cyrl": "Жавоб.", "uz_latn": "Javob."},
                 "sort_order": 1,
             },
         )
@@ -44,7 +44,10 @@ async def test_faq_write_requires_a_session(db):
     async with make_client(create_app(), lifespan=True) as client:
         r = await client.post(
             f"{API}/admin/help/faq",
-            json={"question": {"uz_cyrl": "Q"}, "answer": {"uz_cyrl": "A"}},
+            json={
+                "question": {"uz_cyrl": "Q", "uz_latn": "Q"},
+                "answer": {"uz_cyrl": "A", "uz_latn": "A"},
+            },
         )
     assert r.status_code == 401
 
@@ -57,7 +60,10 @@ async def test_faq_write_requires_the_permission(db):
         auth_client(client, token, csrf)
         r = await client.post(
             f"{API}/admin/help/faq",
-            json={"question": {"uz_cyrl": "Q"}, "answer": {"uz_cyrl": "A"}},
+            json={
+                "question": {"uz_cyrl": "Q", "uz_latn": "Q"},
+                "answer": {"uz_cyrl": "A", "uz_latn": "A"},
+            },
         )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-ACL-001"

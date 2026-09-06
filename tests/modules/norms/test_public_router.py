@@ -211,7 +211,10 @@ async def test_public_activity_types_answers_anonymously_with_id_code_name(
     assert len(items) >= 6  # the seeded catalog, migration 0005
     grazing = next(item for item in items if item["code"] == "grazing")
     assert set(grazing) == {"id", "code", "name"}
-    assert set(grazing["name"]) <= {"en", "uz_cyrl"}, "no Latin-script Uzbek yet (tz/12 #31)"
+    # migration 0032 (decision #90) backfilled uz_latn, closing tz/12 #31's backend
+    # half — the row now carries whatever languages it had before plus uz_latn.
+    assert set(grazing["name"]) <= {"en", "uz_cyrl", "uz_latn"}
+    assert "uz_latn" in grazing["name"]
 
 
 async def test_public_livestock_types_answers_anonymously_with_id_code_name(

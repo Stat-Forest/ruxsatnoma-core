@@ -24,7 +24,9 @@ from app.modules.notifications.schemas import TemplateIn
 
 logger = structlog.get_logger(__name__)
 
-FALLBACK_LANGUAGE = "uz_cyrl"
+# uz_latn, not uz_cyrl: decision #90 makes uz_latn the one language every
+# `LocalizedName` (`TemplateIn.body`/`.subject` included) is guaranteed to carry.
+FALLBACK_LANGUAGE = "uz_latn"
 # Deliberately narrower than str.format: only {snake_case}. An admin-authored
 # template must not be able to reach attributes ({x.__class__}) or indexes,
 # and a missing key must not raise inside a business transaction (ruling 9).

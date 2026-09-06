@@ -1,6 +1,6 @@
 """API shapes for inspections. `LocalizedName` (core/schemas) is used for every
 piece of admin-authored text (checklist name, each question) — the same
-uz_cyrl-fallback rule every other module's reference data follows."""
+uz_latn-required rule every other module's reference data follows (decision #90)."""
 
 import uuid
 from datetime import date, datetime

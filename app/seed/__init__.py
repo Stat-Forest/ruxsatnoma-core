@@ -32,10 +32,10 @@ _STIR_RE = re.compile(r"^[0-9]{9}$")
 
 
 def _validated_name(code: str, raw: Any) -> dict[str, Any]:
-    """The write API enforces `LocalizedName` (ruling 13: `uz_cyrl` required, only
-    known locales) via Pydantic; the seed CLI bypassed that and stored `name` as
-    free-form JSONB — a file with `"name": "Нукус"` or a stray locale key would be
-    written and then break `/refs` on read."""
+    """The write API enforces `LocalizedName` (ruling 13: `uz_latn` required since
+    decision #90, only known locales) via Pydantic; the seed CLI bypassed that and
+    stored `name` as free-form JSONB — a file with `"name": "Нукус"` or a stray
+    locale key would be written and then break `/refs` on read."""
     try:
         return LocalizedName.model_validate(raw).root
     except ValidationError as exc:

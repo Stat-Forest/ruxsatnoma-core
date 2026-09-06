@@ -36,7 +36,12 @@ from weasyprint import HTML  # noqa: E402 - must follow the dyld fix-up above
 
 def _label(column: dict[str, Any]) -> str:
     label = column.get("label") or {}
-    return str(label.get("ru") or label.get("uz_cyrl") or column.get("code", ""))
+    # ru first (an internal administrative export, plan "scope cuts"'s own
+    # audience), then whichever Uzbek script the column actually has — uz_latn
+    # is the one `LocalizedName` guarantees since decision #90, uz_cyrl is not.
+    return str(
+        label.get("ru") or label.get("uz_cyrl") or label.get("uz_latn") or column.get("code", "")
+    )
 
 
 def render_excel(report: Report, form: ReportForm) -> bytes:
