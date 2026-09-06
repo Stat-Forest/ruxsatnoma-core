@@ -5,9 +5,12 @@ permission gate matches `gis_client` in the test fixtures); `submit-review` is
 `CONTOURS_MANAGE` too (the specialist hands their own draft on), as is
 `return-to-draft` (they take it back), while `approve`/`publish`/`archive`
 and `return-to-review` require `CONTOURS_APPROVE` (the rahbar —
-`rahbar_client` in the tests). Every write below is ALSO zone-scoped through
-`service._assert_in_zone`, a separate gate from the permission check (lesson:
-'Zone scoping is not a permission check — a read path needs both')."""
+`rahbar_client` in the tests). `POST .../split` (decision #91) is
+`CONTOURS_MANAGE` too — the specialist splits, exactly the way they draw and
+edit; the two resulting drafts go through approval like any other new
+version. Every write below is ALSO zone-scoped through `service._assert_in_zone`,
+a separate gate from the permission check (lesson: 'Zone scoping is not a
+permission check — a read path needs both')."""
 
 import uuid
 from typing import Annotated, Any
@@ -31,6 +34,9 @@ from app.modules.gis.schemas import (
     ContourOut,
     ContourPatch,
     FeatureCollectionOut,
+    SplitIn,
+    SplitOut,
+    SplitPieceOut,
     VersionDetailOut,
     VersionIn,
     VersionOut,
@@ -137,6 +143,49 @@ async def patch_contour(
         db, contour_id, actor=user, **payload.model_dump(exclude_unset=True)
     )
     return ContourOut.model_validate(contour, from_attributes=True)
+
+
+@router.post("/contours/{parent_id}/split", status_code=201)
+async def split_contour(
+    parent_id: uuid.UUID,
+    payload: SplitIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
+) -> SplitOut:
+    """Decision #91: one parent, two subcontours, atomically — replaces the
+    adminka's own client-composed `createContour` + `createVersion`, twice.
+    See `service.split_contour`'s own docstring for the full refusal list and
+    why the geometry itself stays client-computed."""
+    child_a, version_a, child_b, version_b = await service.split_contour(
+        db,
+        parent_id,
+        actor=user,
+        piece_a={
+            "number": payload.piece_a.number,
+            "geom": payload.piece_a.geom,
+            "declared_area_ha": payload.piece_a.declared_area_ha,
+        },
+        piece_b={
+            "number": payload.piece_b.number,
+            "geom": payload.piece_b.geom,
+            "declared_area_ha": payload.piece_b.declared_area_ha,
+        },
+        source=payload.source,
+        accuracy_m=payload.accuracy_m,
+        survey_date=payload.survey_date,
+        effective_from=payload.effective_from,
+    )
+    return SplitOut(
+        parent_id=parent_id,
+        piece_a=SplitPieceOut(
+            contour=ContourOut.model_validate(child_a, from_attributes=True),
+            version=VersionOut.model_validate(version_a, from_attributes=True),
+        ),
+        piece_b=SplitPieceOut(
+            contour=ContourOut.model_validate(child_b, from_attributes=True),
+            version=VersionOut.model_validate(version_b, from_attributes=True),
+        ),
+    )
 
 
 @router.get("/contours/{contour_id}/versions", response_model=Page[VersionOut])

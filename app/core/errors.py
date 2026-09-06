@@ -25,6 +25,13 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-GIS-003": (422, "Пересечение со слоем ограничений или охраны"),
     "ERR-GIS-004": (422, "Ошибка формата файла импорта"),
     "ERR-GIS-005": (409, "Конфликт состояния GIS-объекта"),
+    # `gis.service.split_contour` (decision #91): the two client-supplied
+    # pieces, normalised the same way `insert_version` normalises any
+    # geometry, do not reconstruct the parent's own published boundary — a
+    # gap, an overlap beyond the module's own tolerance, or a piece that
+    # collapses to nothing. Never `ERR-GIS-005`: this is a defect in the
+    # SUBMITTED GEOMETRY itself, not a conflict with the parent's STATE.
+    "ERR-GIS-006": (422, "Части не образуют точное разделение родительского контура"),
     "ERR-NORM-001": (422, "На контуре нет утверждённой нормы"),
     "ERR-NORM-002": (422, "Превышен остаток лимита"),
     "ERR-NORM-003": (422, "Период не соответствует сезону или ротации"),
