@@ -6,6 +6,7 @@ from app.modules.notifications import service
 
 BODY = {
     "uz_cyrl": "Ариза {application_number} қабул қилинди",
+    "uz_latn": "Ariza {application_number} qabul qilindi",
     "ru": "Заявка {application_number} принята",
 }
 
@@ -14,8 +15,10 @@ def test_renders_in_the_requested_language():
     assert service.render(BODY, {"application_number": "RX-1"}, "ru") == "Заявка RX-1 принята"
 
 
-def test_falls_back_to_uz_cyrl_when_the_language_is_absent():
-    assert service.render(BODY, {"application_number": "RX-1"}, "en").startswith("Ариза RX-1")
+def test_falls_back_to_uz_latn_when_the_language_is_absent():
+    # decision #90: FALLBACK_LANGUAGE is uz_latn, the one language every
+    # LocalizedName is guaranteed to carry — not uz_cyrl, which is now optional.
+    assert service.render(BODY, {"application_number": "RX-1"}, "en").startswith("Ariza RX-1")
 
 
 def test_missing_placeholder_is_left_literal_and_does_not_raise():

@@ -15,24 +15,30 @@ def test_localized_name_accepts_known_locales():
     # dataclass_transform constructor typing has no way to see that (general pydantic
     # v2 limitation, not specific to this type — same pattern as tests/test_config.py).
     holder = Holder(
-        name={"uz_cyrl": "Номи", "ru": "Название", "en": "Name"}  # pyright: ignore
+        name={"uz_latn": "Nomi", "ru": "Название", "en": "Name"}  # pyright: ignore
     )
-    assert holder.name.root["uz_cyrl"] == "Номи"
+    assert holder.name.root["uz_latn"] == "Nomi"
 
 
-def test_localized_name_requires_uz_cyrl():
+def test_localized_name_accepts_uz_latn_alone_with_no_uz_cyrl():
+    # Decision #90: uz_cyrl is now optional — a name with only uz_latn is valid.
+    holder = Holder(name={"uz_latn": "Nomi"})  # pyright: ignore[reportArgumentType]
+    assert "uz_cyrl" not in holder.name.root
+
+
+def test_localized_name_requires_uz_latn():
     with pytest.raises(ValidationError):
-        Holder(name={"ru": "Название"})  # pyright: ignore[reportArgumentType]
+        Holder(name={"uz_cyrl": "Номи"})  # pyright: ignore[reportArgumentType]
 
 
 def test_localized_name_rejects_empty_fallback():
     with pytest.raises(ValidationError):
-        Holder(name={"uz_cyrl": "   "})  # pyright: ignore[reportArgumentType]
+        Holder(name={"uz_latn": "   "})  # pyright: ignore[reportArgumentType]
 
 
 def test_localized_name_rejects_unknown_locale():
     with pytest.raises(ValidationError):
-        Holder(name={"uz_cyrl": "Номи", "fr": "Nom"})  # pyright: ignore[reportArgumentType]
+        Holder(name={"uz_latn": "Nomi", "fr": "Nom"})  # pyright: ignore[reportArgumentType]
 
 
 def test_page_envelope_shape():
