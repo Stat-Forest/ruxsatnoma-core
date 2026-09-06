@@ -3,10 +3,12 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import asyncpg
 import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.models_registry  # noqa: F401  # populate Base.metadata for migration tests
@@ -14,6 +16,87 @@ from app.config import get_settings
 from app.db import make_engine, make_session_factory
 
 os.environ.setdefault("WORKERS_MODE", "off")  # lifespans in tests must not spawn workers
+
+
+def _use_a_database_of_this_workers_own() -> None:
+    """Under `pytest -n N`, give every xdist worker its own test database.
+
+    Serial runs are untouched: with no PYTEST_XDIST_WORKER in the environment
+    this returns immediately and the suite uses DATABASE_URL_TEST as written.
+    Under xdist, worker `gw3` gets `<that URL>_gw3` — created on demand by
+    `_migrated_test_db` below.
+
+    The suite CANNOT share one database across workers. Nothing here rolls a
+    test back (the `db` fixture just opens a session), the schema carries
+    partial unique indexes and append-only triggers, and
+    `test_migrations.py::test_downgrade_upgrade_roundtrip` drops every table in
+    the database it runs against — one worker would be wiping the tables
+    another is mid-INSERT on. The per-worktree split CLAUDE.md already
+    describes is the same fix one level up; this one nests inside it, so two
+    worktrees running in parallel still never meet (`..._311` yields
+    `..._311_gw0`, not `..._gw0`).
+
+    Both variables move, not just the test one: a fixture that builds the app
+    without monkeypatching DATABASE_URL would otherwise reach the DEV database,
+    which is shared by every worker and every worktree at once.
+
+    Module level, not a fixture: `Settings` is `lru_cache`d, so the environment
+    has to be right before the FIRST `get_settings()` call anywhere. Importing
+    `app.config` does not construct it, and the root conftest is imported
+    before any test module or package conftest, so this is early enough.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")  # "gw0", "gw1", ...; unset when serial
+    if not worker:
+        return
+    url = make_url(get_settings().database_url_test)
+    per_worker = url.set(database=f"{url.database}_{worker}").render_as_string(hide_password=False)
+    os.environ["DATABASE_URL_TEST"] = per_worker
+    os.environ["DATABASE_URL"] = per_worker
+    get_settings.cache_clear()
+
+
+_use_a_database_of_this_workers_own()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--fresh-db",
+        action="store_true",
+        help="Drop and re-create this run's test database before migrating it. "
+        "`make test` passes it; a single-file debug run normally should not.",
+    )
+
+
+async def _create_test_database(url_str: str, *, fresh: bool) -> None:
+    """Create the test database if it is missing; with `fresh`, re-create it.
+
+    A run inherits whatever the previous run left behind — the suite never
+    truncates, and its GIS fixtures place RANDOM boxes. Enough leftover
+    polygons and a new box lands on an old one: `ERR-GIS-002` from a fixture
+    that has nothing to do with geometry, or an overlap sweep that counts a
+    permit written days ago. `--fresh-db` buys determinism for the price of a
+    migrate-from-scratch (~15s, and every worker pays it in parallel).
+    """
+    url = make_url(url_str)
+    assert url.database and "test" in url.database, (
+        f"refusing to touch {url.database!r}: a test database must have 'test' in its name"
+    )
+    admin_dsn = (
+        url.set(drivername="postgresql", database="postgres")
+        .render_as_string(hide_password=False)
+        .replace("+asyncpg", "")
+    )
+    conn = await asyncpg.connect(admin_dsn)
+    try:
+        exists = await conn.fetchval("select 1 from pg_database where datname = $1", url.database)
+        if exists and fresh:
+            # FORCE (PG 13+) evicts a connection an earlier crashed run may have left.
+            await conn.execute(f'DROP DATABASE "{url.database}" WITH (FORCE)')
+            exists = None
+        if not exists:
+            await conn.execute(f'CREATE DATABASE "{url.database}"')
+    finally:
+        await conn.close()
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -30,16 +113,21 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-async def _migrated_test_db() -> None:
-    """Bring the test DB to head before any test runs.
+async def _migrated_test_db(request: pytest.FixtureRequest) -> None:
+    """Create this run's test DB if needed, then bring it to head.
 
     Test collection is alphabetical, so tests/modules/... collects before
     tests/test_migrations.py — without this, a test touching a migrated
     table can run before that table exists. Mirrors the upgrade-to-head
     call test_migrations.py makes itself (idempotent, so no conflict).
+
+    Session-scoped and autouse, so under xdist it runs once per worker — which
+    is exactly where the worker's own database has to come into existence.
     """
+    url = get_settings().database_url_test
+    await _create_test_database(url, fresh=bool(request.config.getoption("--fresh-db")))
     cfg = Config("alembic.ini")
-    cfg.attributes["sqlalchemy_url"] = get_settings().database_url_test
+    cfg.attributes["sqlalchemy_url"] = url
     await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
