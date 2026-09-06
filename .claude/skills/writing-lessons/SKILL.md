@@ -103,7 +103,7 @@ make lessons-check
 ```
 
 Fails on a missing bullet, an entry past the 24-line ceiling, or the file past its cap
-of 60 entries / 900 lines; lists anything over the 12-line budget. Being on that list is
+of 60 entries / 1000 lines; lists anything over the 12-line budget. Being on that list is
 fine only if you deleted entries to earn it. The same check runs as a pre-commit hook,
 inside `make check`, and in CI's `lint` job — so a malformed entry stops your commit and
 then the PR. Catch it here instead.

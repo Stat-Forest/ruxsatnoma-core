@@ -26,7 +26,7 @@ ones — may go past that, and never past 24. Over 12 while deleting nothing mea
 writing a story: the incident is evidence, so name the error and the file, and drop the
 retelling of how it was found.
 
-**The file itself is capped at 60 entries / 900 lines.** Short entries still add up, and
+**The file itself is capped at 60 entries / 1000 lines.** Short entries still add up, and
 reading cost is how many times how long. Once the cap is reached a new lesson has to be
 paid for by merging two old ones of the same class, or by deleting one whose trap a check
 has since made impossible — that is the point, not an obstacle. A pre-commit hook,
