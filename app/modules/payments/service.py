@@ -76,7 +76,7 @@ from app.modules.payments.models import (
     ProviderTransaction,
     Reconciliation,
 )
-from app.modules.payments.permissions import PAYMENTS_VIEW
+from app.modules.payments.permissions import PAYMENTS_CONFIRM, PAYMENTS_VIEW
 
 logger = structlog.get_logger(__name__)
 
@@ -409,6 +409,29 @@ async def cancel_invoice_for_application(
     return invoice
 
 
+async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
+    """Holds a permission that entitles its holder to READ invoices —
+    `payments.view`, or `payments.confirm`, or the superuser gate.
+
+    `payments.confirm` is here because of the stage 7.3 walkthrough (finding
+    F13): the checker of a manual `PAID` could list the confirmations awaiting
+    them and could open neither the invoice being confirmed nor the bank
+    document behind it, so the second pair of eyes in a four-eyes control was
+    asked to approve blind. A permission answers "whether", the zone still
+    answers "whose" — `_may_act_on_invoices_of` applies
+    `_zone_covers_application` to both codes alike, so a head reads their own
+    leshoz's invoices and no one else's.
+
+    **Reads only.** `create_pay_intent` shares `_may_act_on_invoices_of` and
+    deliberately does NOT accept this wider set: raising a payment link is
+    `payments.view`'s, and the caller marks which question it is asking with
+    `read_only`."""
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    codes = await auth_repo.permission_codes(db, actor)
+    return PAYMENTS_VIEW in codes or PAYMENTS_CONFIRM in codes
+
+
 async def _holds_payments_view(db: AsyncSession, actor: User) -> bool:
     """Holds `payments.view`, or is the superuser that passes every permission
     gate (decision #41 ruling 2) — the same two-branch shape
@@ -483,9 +506,16 @@ async def _zone_covers_application(
 
 
 async def _may_act_on_invoices_of(
-    db: AsyncSession, application_id: uuid.UUID, applicant_id: uuid.UUID, *, actor: User
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    applicant_id: uuid.UUID,
+    *,
+    actor: User,
+    read_only: bool = False,
 ) -> bool:
-    """`payments.view` (or sys_admin) sees or pays any invoice; otherwise the
+    """`payments.view` (or sys_admin) sees or pays any invoice; a
+    `payments.confirm` holder SEES one (`read_only=True`, finding F13) and
+    still may not raise a payment link with it; otherwise the
     actor must OWN the same applicant identity the invoice's application
     belongs to, OR hold an EFFECTIVE REPRESENTATION of it (task 5's
     ownership ruling) — matched on `applicant_id`, never
@@ -496,7 +526,8 @@ async def _may_act_on_invoices_of(
     pay-intent route (`create_pay_intent`) — one rule, three callers, so the
     representation gap Task 2 deliberately carried to this task is closed
     for reads too, not just for paying."""
-    if await _holds_payments_view(db, actor):
+    staff = _holds_payments_read if read_only else _holds_payments_view
+    if await staff(db, actor):
         # A permission says WHETHER, a zone says WHERE — and zone scoping is
         # not a permission check (lesson). Staff pass both or neither.
         return await _zone_covers_application(db, application_id, actor=actor)
@@ -522,7 +553,9 @@ async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, acto
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
-    if not await _may_act_on_invoices_of(db, application.id, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(
+        db, application.id, application.applicant_id, actor=actor, read_only=True
+    ):
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
     return invoice
 
@@ -565,14 +598,14 @@ async def list_invoices_for_actor(
         if application is None:
             raise err("ERR-SYS-003", details={"application": str(application_id)})
         if not await _may_act_on_invoices_of(
-            db, application.id, application.applicant_id, actor=actor
+            db, application.id, application.applicant_id, actor=actor, read_only=True
         ):
             raise err("ERR-SYS-003", details={"application": str(application_id)})
         return await repo.list_invoices_by_application(
             db, application_id, status=status, limit=limit, offset=offset
         )
 
-    if not await _holds_payments_view(db, actor):
+    if not await _holds_payments_read(db, actor):
         raise err("ERR-ACL-001")
     zone = zone_of(actor)
     if zone == Zone(None, None, None):

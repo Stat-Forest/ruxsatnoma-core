@@ -2348,6 +2348,27 @@ async def _is_required_signer(db: AsyncSession, permit: Permit, actor: User) -> 
     return any(signers.required_role(purpose) == role for purpose in required)
 
 
+async def _signs_permits_of_own_organization(db: AsyncSession, actor: User) -> bool:
+    """Whether `actor`'s ROLE is named by any required signature purpose — the
+    half of `_is_required_signer` that does not depend on a particular permit,
+    so `list_permits` can ask it once and turn the rest into a WHERE clause.
+
+    Deliberately shares `_is_required_signer`'s two sources rather than
+    restating them: a purpose an operator turns off closes the read slot in the
+    list at the same moment it closes it on the card. What stays behind in the
+    caller is the organization equality, because that is the part a filter can
+    express — and it is the SAME strict equality, never `zone_filter`, for the
+    reason `_is_required_signer` gives at length: there is no republic-wide
+    leshoz head."""
+    if actor.organization_id is None:
+        return False
+    role = await auth_service.role_code(db, actor)
+    if role is None:
+        return False
+    required = await signatures_service.required_purposes(db, OBJECT_TYPE)
+    return any(signers.required_role(purpose) == role for purpose in required)
+
+
 async def _readable_permit(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) -> Permit:
     """The permit `actor` is allowed to read, or a refusal.
 
@@ -2506,10 +2527,17 @@ async def list_permits(
 ) -> tuple[list[Permit], int]:
     """`GET /permits` — one page of the permits `actor` may see, plus the total.
 
-    The scope is the UNION of the two things `_readable_permit` admits one at a
-    time, so the list can never disagree with the card: the caller's own permits
-    (`auth.service.own_applicant_ids`, the same set `_is_holder` tests membership
-    in), OR — for a `permits.view_any` holder — everything inside their zone. A
+    The scope is the UNION of the three things `_readable_permit` admits one at
+    a time, so the list can never disagree with the card: the caller's own
+    permits (`auth.service.own_applicant_ids`, the same set `_is_holder` tests
+    membership in), OR the permits of their own organization when their role is
+    one this document's signatures name (`_signs_permits_of_own_organization`'s half of
+    `_is_required_signer`), OR — for a `permits.view_any` holder — everything
+    inside their zone. **The middle clause is the stage 7.3 fix**: the card
+    gained `_is_required_signer` and this list did not, so a leshoz head whose
+    leshoz held three permits was answered `200` with an empty list while the
+    card for the same permit answered `200` — the sentence above was untrue for
+    exactly as long as the two disagreed. A
     republic-wide staff member's `zone_filter` is `true()` and they see the lot;
     a zone-scoped one sees their own leshoz, and a permit outside it is simply
     absent rather than refused, because a filter has no way to answer 403.
@@ -2532,6 +2560,8 @@ async def list_permits(
     holder_ids = await auth_service.own_applicant_ids(db, actor.id)
     if holder_ids:
         scope.append(Permit.applicant_id.in_(holder_ids))
+    if await _signs_permits_of_own_organization(db, actor):
+        scope.append(Permit.organization_id == actor.organization_id)
     if await _holds_view_any(db, actor):
         scope.append(
             zone_filter(

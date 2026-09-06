@@ -446,6 +446,64 @@ async def test_staff_outside_the_zone_see_nothing_of_it(
     assert result.json()["total"] == 0
 
 
+# --- the list half of ruling 4's read side ------------------------------------
+#
+# The defect these pin, found by the stage 7.3 walkthrough: the card was fixed
+# for the three official signers (`_is_required_signer`, above) and the LIST was
+# not, so `list_permits`' own docstring — "the scope is the UNION of the two
+# things `_readable_permit` admits one at a time, so the list can never disagree
+# with the card" — became untrue the moment `_readable_permit` began admitting a
+# third. On dev a leshoz head whose leshoz held three permits got `200` with an
+# empty list, no menu entry, and a card that answered "no permit exists" for the
+# by-application URL the UI uses. A signer who cannot FIND the permit cannot
+# reach the sign screen, which is the same defect the card fix closed, one step
+# earlier.
+
+
+async def test_the_head_finds_in_the_list_the_permit_they_must_sign(
+    head_client: Signer, issued_permit: Permit
+):
+    result = await head_client.client.get(
+        f"{API}/permits", params={"contour_id": str(issued_permit.contour_id)}
+    )
+    assert result.status_code == 200, result.text
+    assert [row["id"] for row in result.json()["items"]] == [str(issued_permit.id)]
+
+
+async def test_the_chief_forester_finds_in_the_list_the_permit_they_must_sign(
+    chief_forester_client: Signer, issued_permit: Permit
+):
+    result = await chief_forester_client.client.get(
+        f"{API}/permits", params={"contour_id": str(issued_permit.contour_id)}
+    )
+    assert result.status_code == 200, result.text
+    assert [row["id"] for row in result.json()["items"]] == [str(issued_permit.id)]
+
+
+async def test_the_accountant_finds_in_the_list_the_permit_they_must_sign(
+    accountant_client: Signer, issued_permit: Permit
+):
+    result = await accountant_client.client.get(
+        f"{API}/permits", params={"contour_id": str(issued_permit.contour_id)}
+    )
+    assert result.status_code == 200, result.text
+    assert [row["id"] for row in result.json()["items"]] == [str(issued_permit.id)]
+
+
+async def test_a_same_role_signer_of_another_organization_still_sees_nothing(
+    other_org_head_client: Signer, issued_permit: Permit
+):
+    """The list mirrors the card's own strict organization equality, never the
+    three-axis zone predicate: there is no republic-wide leshoz head, and a head
+    of a different leshoz gets an empty list here exactly as they get a 404 on
+    the card."""
+    result = await other_org_head_client.client.get(
+        f"{API}/permits", params={"contour_id": str(issued_permit.contour_id)}
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["total"] == 0
+
+
 async def test_every_filter_narrows_the_list(
     zone_staff_client: httpx.AsyncClient, issued_permit: Permit
 ):

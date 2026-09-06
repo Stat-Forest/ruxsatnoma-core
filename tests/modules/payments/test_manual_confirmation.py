@@ -863,3 +863,45 @@ async def test_manual_confirmations_are_zone_scoped(
     async with _role_client_in("executor_head", home) as home_checker:
         home_listed = await home_checker.get(MANUAL_CONFIRMATIONS)
         assert filed["id"] in {item["id"] for item in home_listed.json()["items"]}
+
+
+# --- the checker's own read (stage 7.3, finding F13) -------------------------
+#
+# The defect these pin: the checker could list the confirmations awaiting them
+# (`GET /payments/manual-confirmations`, 200) and could open NEITHER the invoice
+# the confirmation is about (404) NOR the register (403 `payments.view`). So the
+# second pair of eyes in a four-eyes control was asked to approve a payment
+# without being able to see the invoice it pays, the application behind it, or
+# the bank document that is the whole of the evidence. Measured on dev during
+# the С1–С27 walkthrough, as `demo_executor_head`, on their own leshoz's invoice.
+
+
+async def test_the_checker_opens_the_invoice_they_are_asked_to_confirm(
+    head_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    result = await head_client.get(f"{API}/invoices/{pending_invoice.id}")
+    assert result.status_code == 200, result.text
+    assert result.json()["id"] == str(pending_invoice.id)
+
+
+async def test_the_checker_browses_the_invoice_register(
+    head_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    result = await head_client.get(f"{API}/invoices")
+    assert result.status_code == 200, result.text
+    assert str(pending_invoice.id) in {row["id"] for row in result.json()["items"]}
+
+
+async def test_the_checkers_read_does_not_become_a_write(
+    head_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    """`payments.confirm` buys the checker a READ of what they confirm and
+    nothing else: raising a payment link is still `payments.view`'s, and the
+    refusal stays the 404 a stranger gets rather than a 403 that would confirm
+    the invoice exists."""
+    result = await head_client.post(
+        f"{API}/invoices/{pending_invoice.id}/pay-intents",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={"provider": "payme"},
+    )
+    assert result.status_code == 404, result.text
