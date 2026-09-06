@@ -477,6 +477,41 @@ async def import_by_id(db: AsyncSession, import_id: uuid.UUID) -> GisImport | No
     return await db.get(GisImport, import_id)
 
 
+async def list_imports(
+    db: AsyncSession, *, zone: Any, status: str | None, offset: int, limit: int
+) -> tuple[list[GisImport], int]:
+    """Every import batch, newest first — the same discoverability gap
+    `list_versions` closes for contour versions (task defect 4a), one route
+    smaller (task defect 4b): a batch awaiting `CONTOURS_APPROVE` had no route
+    listing it at all, so the specialist who filed it and the rahbar who must
+    approve it could only be handed its id out of band. `zone` is whatever
+    `abac.zone_filter` built off `Organization.region_id`/`district_id` and
+    `GisImport.organization_id` — the same three-axis check `list_contours`
+    and `list_versions` apply, joined here even though `GisImport` already
+    carries `organization_id` directly, because a region- or district-scoped
+    actor still needs the join to `organizations` to be checked at all.
+    `status`, when given, narrows to one (`?status=review` is "awaiting my
+    approval")."""
+    conditions: list[Any] = [zone]
+    if status is not None:
+        conditions.append(GisImport.status == status)
+    joined = (
+        select(GisImport.id)
+        .join(Organization, Organization.id == GisImport.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
+    rows = await db.execute(
+        select(GisImport)
+        .join(Organization, Organization.id == GisImport.organization_id)
+        .where(*conditions)
+        .order_by(GisImport.created_at.desc(), GisImport.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.scalars().all()), total
+
+
 async def contour_numbers(db: AsyncSession, organization_id: uuid.UUID) -> set[str]:
     """Every contour number already taken inside one organization — read ONCE
     per import so the `/2`, `/3` suffixing of ruling 11 is decided in Python

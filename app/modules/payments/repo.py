@@ -335,12 +335,25 @@ async def list_invoices_due_soon(
 
 
 async def list_invoices_by_application(
-    db: AsyncSession, application_id: uuid.UUID, *, limit: int, offset: int
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    status: str | None = None,
+    limit: int,
+    offset: int,
 ) -> tuple[list[Invoice], int]:
     """Every invoice ever raised for `application_id` (not just the in-force
     one) — a cancelled/expired invoice is still part of the application's own
-    history, not something a read route should hide."""
-    stmt = select(Invoice).where(Invoice.application_id == application_id)
+    history, not something a read route should hide. `status`, when given,
+    narrows to one of `INVOICE_STATUSES` (backend-gaps review, 2026-09-06):
+    before this parameter existed, `GET /invoices?application_id=&status=`
+    silently dropped `status` on this branch and returned every invoice for
+    the application regardless of it — no error, no hint, the combination
+    simply untested."""
+    conditions = [Invoice.application_id == application_id]
+    if status is not None:
+        conditions.append(Invoice.status == status)
+    stmt = select(Invoice).where(*conditions)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     rows = (
         await db.execute(
@@ -348,6 +361,40 @@ async def list_invoices_by_application(
         )
     ).scalars()
     return list(rows), total
+
+
+async def list_invoices(
+    db: AsyncSession, *, status: str | None, limit: int, offset: int
+) -> tuple[list[Invoice], int]:
+    """The whole register, newest first — `GET /invoices` with no
+    `?application_id=` (backend-gaps finding 3): an accountant's screen was a
+    lookup box with no way to browse. `invoices` carries no `organization_id`
+    of its own (it belongs to a leshoz only through its application), so
+    territorial scoping is NOT applied here — `payments.service.
+    list_invoices_for_actor` does it per row, the same way `backoffice_
+    service.list_manual_confirmations` already does for a table in the same
+    position. `status`, when given, narrows to one of `INVOICE_STATUSES`."""
+    conditions = [] if status is None else [Invoice.status == status]
+    stmt = select(Invoice).where(*conditions)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Invoice.issued_at.desc(), Invoice.id.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def list_invoices_matching(db: AsyncSession, *, status: str | None) -> Sequence[Invoice]:
+    """Every invoice matching `status` (all of them, if `None`), newest
+    first, with NO limit/offset — `payments.service._scan_invoices_in_zone`'s
+    own full scan (backend-gaps review, 2026-09-06), not a page: that
+    function's own docstring explains why a zone-scoped register read needs
+    the whole matching set rather than a capped or paginated one, given
+    `invoices` has no zone column of its own to filter or count on in SQL."""
+    conditions = [] if status is None else [Invoice.status == status]
+    stmt = select(Invoice).where(*conditions).order_by(Invoice.issued_at.desc(), Invoice.id.desc())
+    return (await db.execute(stmt)).scalars().all()
 
 
 # --- 3.10b: bank statements, their lines and the reconciliation register ------
@@ -360,6 +407,28 @@ async def add_statement(db: AsyncSession, statement: BankStatement) -> None:
 
 async def get_statement(db: AsyncSession, statement_id: uuid.UUID) -> BankStatement | None:
     return await db.get(BankStatement, statement_id)
+
+
+async def list_statements(
+    db: AsyncSession, *, status: str | None, limit: int, offset: int
+) -> tuple[list[BankStatement], int]:
+    """`GET /payments/bank-statements` with no id (backend-gaps finding 3):
+    every imported statement, newest first — headers only, no lines (a list
+    row has no use for a per-line page; `GET /payments/bank-statements/{id}`
+    is where those live). No zone scoping, matching `get_statement`'s own
+    docstring: a bank statement belongs to the accounting department, not to
+    a leshoz, and carries no `organization_id` to scope on."""
+    conditions = [] if status is None else [BankStatement.status == status]
+    stmt = select(BankStatement).where(*conditions)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(BankStatement.created_at.desc(), BankStatement.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
 
 
 async def claim_pending_statement(db: AsyncSession) -> BankStatement | None:

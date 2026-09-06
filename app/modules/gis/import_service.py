@@ -27,9 +27,12 @@ from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, InternalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core import files, settings_store, storage
+from app.core.abac import zone_filter, zone_of
 from app.core.errors import DomainError, err
 from app.core.models import MediaFile
+from app.core.schemas import PageParams
 from app.modules.admin import repo as admin_repo
+from app.modules.admin.models import Organization
 from app.modules.audit import service as audit
 from app.modules.gis import importer, repo
 
@@ -828,3 +831,28 @@ async def get_import(db: AsyncSession, import_id: uuid.UUID, *, actor: Any) -> G
         raise err("ERR-SYS-003")
     await gis_service._assert_in_zone(db, actor, row.organization_id)
     return row
+
+
+async def list_imports(
+    db: AsyncSession, *, status: str | None, params: PageParams, actor: Any
+) -> tuple[list[GisImport], int]:
+    """`GET /gis/imports` — the same discoverability gap `gis.service.
+    list_versions` closes for contour versions (task defect 4a), one route
+    smaller (task defect 4b): a batch awaiting `CONTOURS_APPROVE` had no route
+    listing it at all, so the specialist who filed it and the rahbar who must
+    approve it could only be handed its id out of band. Zone-scoped by the
+    SAME three columns `list_versions`/`list_contours` check
+    (`Organization.region_id`/`district_id`, here `GisImport.organization_id`
+    directly rather than through a `Contour` join, since the batch itself
+    carries the column) — a batch outside the actor's zone stays invisible
+    here exactly as an out-of-zone version does there. Newest first, so the
+    rahbar's own worklist reads with the freshest upload on top."""
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=GisImport.organization_id,
+    )
+    return await repo.list_imports(
+        db, zone=zone, status=status, offset=params.offset, limit=params.page_size
+    )

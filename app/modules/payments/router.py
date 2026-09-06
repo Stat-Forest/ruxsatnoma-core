@@ -1,13 +1,20 @@
-"""Read routes over `invoices` — `GET /invoices/{id}` and `GET
-/invoices?application_id=` — plus `POST /invoices/{id}/pay-intents` (task 5),
-our own side of starting a payment. An invoice itself is issued and
+"""Read routes over `invoices` — `GET /invoices/{id}` and `GET /invoices`
+(with or without `?application_id=`) — plus `POST /invoices/{id}/pay-intents`
+(task 5), our own side of starting a payment. An invoice itself is issued and
 cancelled only by `subscribers.py`, in reaction to an `applications` event,
 never by a direct client action.
 
 No `require_permission` gate on any of the three routes: a `payments.view`
 holder acts on any invoice, but so must a plain applicant (or an effective
 representative) acting on their OWN — the authorization decision lives
-inside `service.py`, exactly like `notifications.service.mark_read`."""
+inside `service.py`, exactly like `notifications.service.mark_read`.
+
+`GET /invoices` without `?application_id=` is the register itself
+(backend-gaps finding 3): before this, only a filtered or by-id lookup
+existed, so an accountant's screen could show one application's invoices but
+never browse the whole book. That path is staff-only and zone-scoped
+(decision #70) — `service.list_invoices_for_actor`'s own docstring carries
+the reasoning; this router stays a thin pass-through for both."""
 
 import uuid
 from typing import Annotated, Any
@@ -21,9 +28,12 @@ from app.core.schemas import PAGING_MAX, Page
 from app.modules.auth.deps import get_current_user, idempotency_context
 from app.modules.auth.models import User
 from app.modules.payments import service
+from app.modules.payments.models import INVOICE_STATUSES
 from app.modules.payments.schemas import InvoiceOut, PayIntentIn, PayIntentOut
 
 router = APIRouter(tags=["payments"])
+
+_INVOICE_STATUS_PATTERN = "^(" + "|".join(INVOICE_STATUSES) + ")$"
 
 
 @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
@@ -37,9 +47,14 @@ async def get_invoice(
 
 @router.get("/invoices", response_model=Page[InvoiceOut])
 async def list_invoices(
-    application_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(get_current_user)],
+    # Optional (backend-gaps finding 3): given, this is the original
+    # application-scoped read; omitted, it is the register itself, gated in
+    # the service to `payments.view` holders only — see this file's own
+    # module docstring and `service.list_invoices_for_actor`'s.
+    application_id: uuid.UUID | None = None,
+    status: Annotated[str | None, Query(pattern=_INVOICE_STATUS_PATTERN)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     # `le=PAGING_MAX` like every other paged route: `offset` is bound into SQL as a
     # bigint, so an unbounded one reaches asyncpg as `DataError: value out of int64
@@ -49,7 +64,7 @@ async def list_invoices(
     offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
     items, total = await service.list_invoices_for_actor(
-        db, application_id, actor=actor, limit=limit, offset=offset
+        db, application_id, actor=actor, status=status, limit=limit, offset=offset
     )
     return Page[InvoiceOut](
         items=[InvoiceOut.model_validate(item) for item in items],

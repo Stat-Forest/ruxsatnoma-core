@@ -20,7 +20,7 @@ from app.core import settings_store
 from app.core.models import SystemSetting
 from app.modules.audit.models import AuditLog
 from app.modules.gis.models import GisImport
-from tests.modules.gis.conftest import random_box_wkt
+from tests.modules.gis.conftest import make_import, random_box_wkt
 
 CAP_KEY = "gis_import_max_mb"
 
@@ -343,3 +343,67 @@ async def test_a_different_upload_under_the_same_key_is_a_conflict(
     )
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "ERR-SYS-005"
+
+
+# --- backend-gaps finding 1 (task defect 4b): a batch had no LIST route -----
+#
+# The smaller half of the version-discovery gap `test_lifecycle.py`'s own
+# task-defect-4a section closes: `GET /gis/imports/{id}` existed, but nothing
+# enumerated past batches, so a specialist's own upload and the batch a rahbar
+# must approve were discoverable only by an id handed over out of band.
+
+
+async def test_the_specialist_and_the_rahbar_both_list_a_pending_batch(
+    gis_client, rahbar_client, pending_import
+):
+    """Both roles that can act on a batch need to find it — the specialist
+    tracking their own upload (`CONTOURS_MANAGE`) and the rahbar whose
+    worklist this is (`CONTOURS_APPROVE`), the same `require_any_permission`
+    shape `list_versions` already uses."""
+    for client in (gis_client, rahbar_client):
+        response = await client.get("/api/v1/gis/imports")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        ids = {item["id"] for item in body["items"]}
+        assert str(pending_import.id) in ids
+
+
+async def test_the_rahbar_narrows_the_list_by_status(
+    rahbar_client, db, contours_layer, leshoz, gis_user
+):
+    """`?status=review` is "awaiting my approval" — a `pending` batch from a
+    separate upload must not appear beside it."""
+    review_batch = await make_import(
+        db, layer=contours_layer, org=leshoz, started_by=gis_user, data=b"{}"
+    )
+    review_batch.status = "review"
+    await db.flush()
+    await db.commit()
+    pending_batch = await make_import(
+        db, layer=contours_layer, org=leshoz, started_by=gis_user, data=b"{}"
+    )
+
+    response = await rahbar_client.get("/api/v1/gis/imports?status=review")
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["items"]}
+    assert str(review_batch.id) in ids
+    assert str(pending_batch.id) not in ids
+
+
+async def test_the_import_list_is_zone_scoped(org_scoped_rahbar_client, pending_import):
+    """`pending_import` sits under `leshoz`; `org_scoped_rahbar_client` is
+    zoned to a DIFFERENT organization (`other_leshoz`) — the same shape
+    `test_version_list_and_detail_are_zone_scoped` proves for contour
+    versions. A batch outside the actor's zone is invisible on the list."""
+    response = await org_scoped_rahbar_client.get("/api/v1/gis/imports")
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["items"]}
+    assert str(pending_import.id) not in ids
+
+
+async def test_the_import_list_refuses_a_caller_with_neither_manage_nor_approve(
+    applicant_client,
+):
+    response = await applicant_client.get("/api/v1/gis/imports")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "ERR-ACL-001"

@@ -436,6 +436,21 @@ def _organization_in_zone(zone: Zone, org: OrganizationRow) -> bool:
     return True
 
 
+# `list_invoices_for_actor`'s browse-all path (backend-gaps finding 3) used
+# to scan only the `_INVOICES_ZONE_SCAN_CAP` newest rows per request when the
+# actor was zone-scoped, mirroring `backoffice_service.
+# _MANUAL_CONFIRMATIONS_ZONE_SCAN_CAP`. That sibling's own justification —
+# "a maker files these one at a time, a real worklist is small" — does not
+# transfer here: invoices are the system's core document, issued once per
+# approved application NATIONWIDE, so a fixed window was not a safety bound,
+# it was a silent, permanent blind spot. Once national volume for a status
+# passed the cap, a leshoz whose own invoices were not among the nationally
+# newest `_INVOICES_ZONE_SCAN_CAP` saw none of them, on no page, ever — and
+# `total` undercounted to match (backend-gaps review, 2026-09-06). Fixed by
+# scanning the full matching-status set instead of a fixed window — see
+# `_scan_invoices_in_zone`.
+
+
 async def _zone_covers_application(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> bool:
@@ -513,19 +528,100 @@ async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, acto
 
 
 async def list_invoices_for_actor(
-    db: AsyncSession, application_id: uuid.UUID, *, actor: User, limit: int, offset: int
+    db: AsyncSession,
+    application_id: uuid.UUID | None,
+    *,
+    actor: User,
+    status: str | None = None,
+    limit: int,
+    offset: int,
 ) -> tuple[list[Invoice], int]:
-    """`GET /invoices?application_id=`'s authorization — same rule as
+    """`GET /invoices` — with `?application_id=`, the original rule: same
+    ownership-or-representation-or-staff-in-zone check as
     `get_invoice_for_actor`, applied to the application rather than one
-    invoice, and the same 404-not-403 reasoning: a stranger asking about an
+    invoice, and the same 404-not-403 reasoning (a stranger asking about an
     application that is not theirs cannot tell it apart from one that does
-    not exist at all."""
-    application = await applications_service.get(db, application_id)
-    if application is None:
-        raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if not await _may_act_on_invoices_of(db, application.id, application.applicant_id, actor=actor):
-        raise err("ERR-SYS-003", details={"application": str(application_id)})
-    return await repo.list_invoices_by_application(db, application_id, limit=limit, offset=offset)
+    not exist at all).
+
+    Without it (backend-gaps finding 3), the register itself: a `payments.
+    view` holder browses every invoice, not one application's own — the
+    citizen's branch above has no republic to browse, so this half is
+    staff-only, `ERR-ACL-001` for anyone else, the same shape
+    `list_manual_confirmations`/`list_reconciliations` already gate on
+    `PAYMENTS_VIEW`/`PAYMENTS_CONFIRM`. Zone-scoped like every other list in
+    this system (decision #70, fails closed): an empty zone (a central
+    accountant, `sys_admin`) pages straight out of SQL — the common case
+    costs no extra query — a leshoz-scoped one goes through
+    `_scan_invoices_in_zone`, which walks the WHOLE matching-status set and
+    filters it per row through the SAME `_zone_covers_application` the
+    single-invoice routes use, because `invoices` carries no
+    `organization_id` of its own to filter on in SQL (the same reason
+    `list_manual_confirmations` scans instead of filtering). See that
+    function's own docstring for why this is a full scan rather than a
+    capped one, and what that costs. Always still reachable by id or by
+    `?application_id=` regardless."""
+    if application_id is not None:
+        application = await applications_service.get(db, application_id)
+        if application is None:
+            raise err("ERR-SYS-003", details={"application": str(application_id)})
+        if not await _may_act_on_invoices_of(
+            db, application.id, application.applicant_id, actor=actor
+        ):
+            raise err("ERR-SYS-003", details={"application": str(application_id)})
+        return await repo.list_invoices_by_application(
+            db, application_id, status=status, limit=limit, offset=offset
+        )
+
+    if not await _holds_payments_view(db, actor):
+        raise err("ERR-ACL-001")
+    zone = zone_of(actor)
+    if zone == Zone(None, None, None):
+        return await repo.list_invoices(db, status=status, limit=limit, offset=offset)
+    visible = await _scan_invoices_in_zone(db, status=status, actor=actor)
+    return visible[offset : offset + limit], len(visible)
+
+
+async def _scan_invoices_in_zone(
+    db: AsyncSession, *, status: str | None, actor: User
+) -> list[Invoice]:
+    """The full per-row zone scan `list_invoices_for_actor`'s browse-all path
+    needs: every invoice matching `status` (all of them, if `None`), newest
+    first, filtered through `_zone_covers_application` — because `invoices`
+    carries no `organization_id` of its own to filter on in SQL, and
+    `payments` may not join into `applications`' tables to build one (module
+    boundary).
+
+    **No fixed window.** An earlier version capped this at the
+    `_INVOICES_ZONE_SCAN_CAP` most recent rows, mirroring
+    `backoffice_service._MANUAL_CONFIRMATIONS_ZONE_SCAN_CAP` — cheap, but
+    wrong: that sibling's cap holds because a maker files those confirmations
+    ONE AT A TIME, so a real worklist stays small, and invoices do not share
+    that property — they are the system's core document, issued once per
+    approved application NATIONWIDE. Once national volume for a status
+    passed the cap, a leshoz's own invoice older than the window became
+    invisible on this route FOREVER, on every page, with `total` silently
+    undercounting to match (backend-gaps review, 2026-09-06) — not a
+    performance trade-off, a correctness bug. So this reads the whole
+    matching-status set in one query rather than a bounded one: for a table
+    with no zone column and no cross-module join available, that is the only
+    way to answer BOTH "which of these are mine" and "how many" correctly.
+
+    **The honest cost.** This trades a bounded-but-wrong-forever read for one
+    whose cost grows with national invoice volume for the given `status`,
+    still one query plus one `_zone_covers_application` await per row (the
+    same per-row shape the capped version already had). Reading every row in
+    a single query is deliberately cheaper here than chunking it: an
+    OFFSET-paginated re-scan would ask Postgres to re-sort the same
+    unindexed matching set from scratch on every batch, which costs MORE
+    overall than one sort, not less. If national invoice volume per status
+    ever makes this scan itself too slow, the durable fix is a denormalized
+    zone/organization column on `invoices` (a schema change, its own
+    reviewed plan) — not a smaller cap here, which is the exact bug this
+    replaces."""
+    rows = await repo.list_invoices_matching(db, status=status)
+    return [
+        row for row in rows if await _zone_covers_application(db, row.application_id, actor=actor)
+    ]
 
 
 async def create_pay_intent(

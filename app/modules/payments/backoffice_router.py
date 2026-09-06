@@ -67,9 +67,14 @@ from app.modules.payments.backoffice_schemas import (
     ReconciliationResolveIn,
     StatementAccepted,
     StatementLineOut,
+    StatementListItem,
     StatementOut,
 )
-from app.modules.payments.models import MANUAL_CONFIRMATION_STATUSES, RECONCILIATION_STATUSES
+from app.modules.payments.models import (
+    BANK_STATEMENT_STATUSES,
+    MANUAL_CONFIRMATION_STATUSES,
+    RECONCILIATION_STATUSES,
+)
 from app.modules.payments.permissions import PAYMENTS_CONFIRM, PAYMENTS_MANAGE, PAYMENTS_VIEW
 from app.modules.payments.statement_parser import OPTIONAL_FIELDS, REQUIRED_FIELDS
 
@@ -81,6 +86,7 @@ _KNOWN_FIELDS = frozenset(REQUIRED_FIELDS) | frozenset(OPTIONAL_FIELDS)
 # second edit required here.
 _STATUS_PATTERN = "^(" + "|".join(RECONCILIATION_STATUSES) + ")$"
 _MANUAL_CONFIRMATION_STATUS_PATTERN = "^(" + "|".join(MANUAL_CONFIRMATION_STATUSES) + ")$"
+_STATEMENT_STATUS_PATTERN = "^(" + "|".join(BANK_STATEMENT_STATUSES) + ")$"
 
 
 def _parse_column_map(raw: str) -> dict[str, str]:
@@ -159,6 +165,30 @@ async def create_bank_statement(
     accepted = StatementAccepted(id=row.id, status=row.status)
     await ctx.save(db, status_code=202, body=accepted.model_dump(mode="json"))
     return accepted
+
+
+@router.get("/bank-statements", response_model=Page[StatementListItem])
+async def list_bank_statements(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    status: Annotated[str | None, Query(pattern=_STATEMENT_STATUS_PATTERN)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
+) -> Any:
+    """The register itself (backend-gaps finding 3): every import, newest
+    first, `?status=` narrowing to one. Headers only, no lines — `GET
+    /bank-statements/{id}` below is where those live. No zone scoping, same
+    reasoning as that route: a bank statement belongs to the accounting
+    department, not to a leshoz."""
+    rows, total = await statement_service.list_statements(
+        db, status=status, limit=limit, offset=offset
+    )
+    return Page[StatementListItem](
+        items=[StatementListItem.model_validate(row) for row in rows],
+        total=total,
+        page=offset // limit + 1,
+        page_size=limit,
+    )
 
 
 @router.get("/bank-statements/{statement_id}", response_model=StatementOut)
