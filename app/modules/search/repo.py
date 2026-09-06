@@ -152,7 +152,17 @@ async def search_permits(
     ):
         if value is not None:
             conditions.append(column == value)
-    display_number = (Permit.series + "-" + cast(Permit.number, String)).label("number")
+    # The number EXACTLY as the document, the permit card, every notification and
+    # the public check page print it — `permits.service._permit_number`'s own
+    # `f"{series} № {number:06d}"`, rendered in SQL so it is both what a result
+    # row shows and what `q` is matched against (stage 7.3, finding F21).
+    # Before this it was `"<series>-<number>"`, so a permit printed as
+    # `А № 000003` was found by `А-3` and by nothing a person would ever type.
+    # The padded form contains the bare digits, so `000003` and `3` both match
+    # it as substrings — no extra clause is needed for either.
+    display_number = (Permit.series + " № " + func.lpad(cast(Permit.number, String), 6, "0")).label(
+        "number"
+    )
     if q:
         conditions.append(_text_filter(q, display_number, Applicant.name, Applicant.phone))
 
