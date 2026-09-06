@@ -60,6 +60,29 @@ class StatementLineOut(BaseModel):
         return str(value)
 
 
+class StatementListItem(BaseModel):
+    """One row of `GET /payments/bank-statements` (backend-gaps finding 3) —
+    the header only, no lines: a list of statements has no use for one
+    statement's per-line page, which is what `GET /payments/bank-statements/
+    {id}` (`StatementOut` below) still carries. Same fields as `StatementOut`
+    minus `column_map` (upload-time plumbing, not something a register reads)
+    and `lines`/`lines_total`."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    source: str
+    format: str
+    file_id: uuid.UUID | None
+    statement_date: date
+    period_from: date | None
+    period_to: date | None
+    status: str
+    stats: dict[str, Any]
+    error_report: dict[str, Any] | None
+    created_at: datetime
+
+
 class StatementOut(BaseModel):
     """`GET /payments/bank-statements/{id}` — the header plus a page of its
     lines. `stats` counts what was imported, skipped and how each line was

@@ -630,3 +630,48 @@ async def test_the_status_route_reports_the_statement_and_its_lines(
     assert body["lines_total"] == 1
     assert body["lines"][0]["match_status"] == "matched"
     assert body["lines"][0]["amount"] == "2060000.00"
+
+
+# --- backend-gaps finding 3: `GET /payments/bank-statements` (the register) -
+#
+# Before this, only `GET /payments/bank-statements/{id}` existed — an
+# accountant's screen could poll one upload it already knew the id of but
+# never browse the book of imports. No zone scoping (same reasoning as the
+# by-id route's own docstring): a bank statement belongs to the accounting
+# department, not to a leshoz.
+
+
+async def test_the_register_lists_an_uploaded_statement(payments_view_client, db):
+    created = await upload(payments_view_client, csv_bytes(row()))
+    statement_id = created.json()["id"]
+    await drain(db)
+
+    response = await payments_view_client.get("/api/v1/payments/bank-statements")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    ids = {item["id"] for item in body["items"]}
+    assert statement_id in ids
+    listed = next(item for item in body["items"] if item["id"] == statement_id)
+    assert listed["status"] == "parsed"
+    assert "lines" not in listed  # headers only — a list row carries no lines
+
+
+async def test_the_register_can_be_narrowed_by_status(payments_view_client, db):
+    created = await upload(payments_view_client, csv_bytes(row()))
+    statement_id = created.json()["id"]
+    await drain(db)
+
+    matching = await payments_view_client.get(
+        "/api/v1/payments/bank-statements", params={"status": "parsed"}
+    )
+    assert statement_id in {item["id"] for item in matching.json()["items"]}
+
+    narrowed = await payments_view_client.get(
+        "/api/v1/payments/bank-statements", params={"status": "pending"}
+    )
+    assert statement_id not in {item["id"] for item in narrowed.json()["items"]}
+
+
+async def test_an_applicant_may_not_browse_the_statement_register(applicant_client):
+    response = await applicant_client.get("/api/v1/payments/bank-statements")
+    assert response.status_code == 403

@@ -1,9 +1,13 @@
-"""Geodata import: the multipart upload and the batch's status.
+"""Geodata import: the multipart upload, the batch's status, and the list of
+past/pending batches.
 
-Both routes are `CONTOURS_MANAGE` (the GIS specialist draws, edits AND imports,
-but never approves — the batch's own approve/publish arrive in Task 8) and both
-are ALSO zone-scoped in the service on `organization_id`, a separate gate from
-the permission check (lesson: "Zone scoping is not a permission check").
+The upload and status routes are `CONTOURS_MANAGE` (the GIS specialist draws,
+edits AND imports, but never approves — the batch's own approve/publish arrive
+in Task 8); the list route additionally accepts `CONTOURS_APPROVE` (the rahbar
+who must find a batch awaiting their own decision — backend-gaps finding 1,
+the same shape as `gis.router.list_versions`'s task defect 4a). All three are
+ALSO zone-scoped in the service on `organization_id`, a separate gate from the
+permission check (lesson: "Zone scoping is not a permission check").
 
 `POST /gis/imports` additionally requires an `Idempotency-Key` — a retried
 upload must replay its 202, never queue a second batch (see the route's own
@@ -23,21 +27,27 @@ import json
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, Query, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, settings_store
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
-from app.modules.auth.deps import idempotency_context, require_permission
+from app.core.schemas import Page, PageParams
+from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import import_service
 from app.modules.gis import service as gis_service
+from app.modules.gis.models import IMPORT_STATUSES
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import ImportAccepted, ImportOut, PublishImportOut
 
 router = APIRouter(prefix="/gis", tags=["gis"])
+
+# `?status=` on the batch list below — same shape as
+# `gis.router._VERSION_STATUS_PATTERN`.
+_IMPORT_STATUS_PATTERN = "^(" + "|".join(IMPORT_STATUSES) + ")$"
 
 
 def _parse_attributes(raw: str) -> dict[str, Any]:
@@ -111,6 +121,27 @@ async def create_import(
     accepted = ImportAccepted(import_id=row.id)
     await ctx.save(db, status_code=202, body=accepted.model_dump(mode="json"))
     return accepted
+
+
+@router.get("/imports", response_model=Page[ImportOut])
+async def list_imports(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    # Both roles that can act on a batch need to find it: the specialist
+    # tracking their own upload (`CONTOURS_MANAGE`) and the rahbar whose
+    # worklist this is (`CONTOURS_APPROVE`) — backend-gaps finding 1, the
+    # smaller half of task defect 4a (`gis.router.list_versions` is the
+    # other half, already shipped).
+    user: Annotated[User, Depends(require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE))],
+    params: Annotated[PageParams, Depends()],
+    status: Annotated[str | None, Query(pattern=_IMPORT_STATUS_PATTERN)] = None,
+) -> Any:
+    items, total = await import_service.list_imports(db, status=status, params=params, actor=user)
+    return Page[ImportOut](
+        items=[ImportOut.model_validate(item, from_attributes=True) for item in items],
+        total=total,
+        page=params.page,
+        page_size=params.page_size,
+    )
 
 
 @router.get("/imports/{import_id}")

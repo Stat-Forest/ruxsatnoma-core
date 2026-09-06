@@ -577,3 +577,14 @@ async def get_statement(
         raise err("ERR-SYS-003")
     lines, total = await repo.list_statement_lines(db, statement_id, limit=limit, offset=offset)
     return row, lines, total
+
+
+async def list_statements(
+    db: AsyncSession, *, status: str | None, limit: int, offset: int
+) -> tuple[list[BankStatement], int]:
+    """`GET /payments/bank-statements` with no id (backend-gaps finding 3):
+    the register itself — every import, newest first, `?status=` narrowing to
+    one of `BANK_STATEMENT_STATUSES`. Headers only; a list row carries no
+    lines (`repo.list_statements`'s own docstring). No zone scoping, the same
+    reasoning `get_statement` already states."""
+    return await repo.list_statements(db, status=status, limit=limit, offset=offset)
