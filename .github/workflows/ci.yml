@@ -1,10 +1,20 @@
 name: CI
 
 on:
+  # Long-lived branches only. A feature branch is covered by `pull_request`, so listing
+  # every branch here ran CI twice on each push to a branch with an open PR — 42 of the 49
+  # duplicated commits in the first week of September were exactly that pair.
   push:
-    branches: ['**']
+    branches: [main, dev]
   pull_request:
   workflow_call:
+
+concurrency:
+  # A superseded PR run has nothing left to prove, so cancel it. Push and workflow_call runs
+  # are never cancelled: the `workflow_call` one is deploy.yml's gate, and cancelling that
+  # would let an unverified commit reach the server.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
