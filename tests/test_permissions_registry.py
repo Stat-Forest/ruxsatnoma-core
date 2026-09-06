@@ -163,3 +163,60 @@ async def test_executor_head_can_approve_what_tz03_says_it_can(db) -> None:
     held = {row[0] for row in rows}
     for code in ("gis.contours.approve", "norms.approve", "applications.decide"):
         assert code in held, f"executor_head must hold {code} (tz/03 4-илова, decision #59)"
+
+
+# Decision #95 (Oybek, 2026-09-06), answering `tz/12` #48: **the prosecutor reads
+# everything and writes nothing.** The ruling's standing half is a rule about the
+# FUTURE — "a module that adds a read permission adds it to `prosecutor` in the
+# same migration" — and a rule about the future is worth exactly as much as the
+# check that enforces it. This is that check.
+#
+# What made it necessary: the stage 7.3 walkthrough found `payments.view`
+# ungranted (finding F20), so the prosecutor could read applications and permits
+# and got a 403 on the money — which С22 lists among the things they inspect.
+# Nothing failed; the register simply refused, in a role nobody exercises daily.
+READ_CODE_SUFFIXES = (".view", ".view_any")
+
+PROSECUTOR = "prosecutor"
+
+
+async def _codes_of_role(db, role_code: str) -> set[str]:
+    rows = await db.execute(
+        text(
+            "SELECT rp.permission_code FROM role_permissions rp "
+            "JOIN roles r ON r.id = rp.role_id WHERE r.code = :role AND r.is_system"
+        ).bindparams(role=role_code)
+    )
+    return {row[0] for row in rows}
+
+
+async def test_the_prosecutor_holds_every_read_permission(db) -> None:
+    """`search.use` and `dashboard.view` are held too; the suffix rule is what can
+    be checked mechanically, and every code it matches must reach this role.
+
+    A new `*.view`/`*.view_any` code that fails here is not this test being
+    strict — it is a module having decided, silently, that oversight may not see
+    its rows.
+    """
+    reads = {code for code in _declared_permission_codes() if code.endswith(READ_CODE_SUFFIXES)}
+    assert len(reads) >= 8, (
+        f"the suffix rule matched only {sorted(reads)} — has the naming changed?"
+    )
+    missing = reads - await _codes_of_role(db, PROSECUTOR)
+    assert not missing, (
+        f"read permissions the prosecutor does not hold: {sorted(missing)}. Decision #95: a module "
+        "that adds a read permission grants it to `prosecutor` in the same migration."
+    )
+
+
+async def test_the_prosecutor_holds_no_permission_that_writes(db) -> None:
+    """The other half of the same ruling, and the half a "grant the role more"
+    change loses quietly. Anything not matching the read suffixes is a write or a
+    capability; `search.use` is the one non-suffix read and is named here rather
+    than left to a broader pattern that would let a real write slip through."""
+    allowed_non_read = {"search.use"}
+    held = await _codes_of_role(db, PROSECUTOR)
+    writes = {c for c in held if not c.endswith(READ_CODE_SUFFIXES)} - allowed_non_read
+    assert not writes, (
+        f"the prosecutor is read-only (С22, decision #95) but holds: {sorted(writes)}"
+    )
