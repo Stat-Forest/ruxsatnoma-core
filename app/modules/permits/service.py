@@ -39,7 +39,7 @@ from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
 from app.core.schemas import PageParams
-from app.core.time import business_today
+from app.core.time import TASHKENT, business_today
 from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
@@ -104,6 +104,15 @@ FOREST_TICKET_EXPIRE = "forest_ticket.expire"
 INITIAL_STATUS = "pending_signatures"
 ACTIVE_STATUS = "active"
 
+# Ruling #102: the status an extension's OWN activation moves its PARENT permit
+# out of `active` into — see `_close_parent_permit_if_extension`, the only writer
+# of this status onto a permit that is not itself the one being extended.
+# "expired" reads correctly here (the parent's occupancy of its contour is over,
+# superseded by the extension) and needs no signed ground the way "revoked"
+# would: this is a system consequence of the EXTENSION's own four signatures
+# landing, not a human decision made ABOUT the parent.
+PARENT_CLOSED_STATUS = "expired"
+
 # `tz/05`'s permit state machine, verbatim, plus the one row `tz/05` does not
 # have: `pending_signatures`, which this project added because C11 makes a permit
 # legally real only once all 3+1 signatures are on it. Every one of
@@ -137,15 +146,21 @@ APPLICATION_PERMIT_ISSUED = "PERMIT_ISSUED"
 
 # `tz/13` field 19 is «Статус оплаты и дата». The STATUS is what this module can
 # state on its own authority — issuance runs from `PAID` and from nothing else, so
-# the word is a constant rather than a lookup. The DATE half is not stored here and
-# is not on the document: it lives in `payments`, which this module may not read
-# (design/01 rule 3), and `applications.service` exposes no paid-at. Printing the
-# issuance date in its place would put a wrong date on a legal document.
+# the word is a constant rather than a lookup.
 #
-# Ruling T3-b, and the part that needs saying out loud: because the snapshot is
-# immutable and is never re-derived, every permit issued BEFORE a lawful source for
-# that date exists carries «Тўланган» with no date PERMANENTLY. Adding the accessor
-# later fixes the permits issued after it, and none of the ones issued before.
+# **The DATE half (ruling #118, closing ruling T3-b's open question).** The exact
+# source `tz/12` #17 asked for — the PAID row's own `occurred_at` in
+# `application_status_history` — needs an additive accessor on
+# `applications.service` that does not exist on this branch, and `permits` may not
+# reach that table any other way (module boundary, `CLAUDE.md`). What IS already
+# public and already read by `issue()` below is `applications_service.get(...)`,
+# and `applications.service.set_status`'s OWN docstring establishes the fact this
+# leans on: that function "touches ONLY `applications.status`", so `updated_at`
+# right after the INVOICED -> PAID move (`payments.service`'s own confirmation,
+# the only writer of that transition) IS the moment payment was confirmed — the
+# same reasoning that docstring already spells out for a caller reading
+# `updated_at` off its return value. `issue()` refuses before PAID, so nothing
+# else has legitimately touched the row between that transition and this snapshot.
 PAYMENT_STATUS_PAID = "Тўланган"
 
 # The document's language. `tz/13`'s note: «на государственном языке» — the permit
@@ -462,6 +477,7 @@ async def _snapshot(
     sb_load: Decimal | None,
     calculation_id: uuid.UUID,
     calculation_input: Any,
+    paid_at: datetime,
 ) -> dict[str, Any]:
     """Form 1-ilova's requisites (`tz/13` § 1-илова, ruling 14), gathered once and
     never read from their sources again.
@@ -483,10 +499,10 @@ async def _snapshot(
       `application_items` (ruling T3-f — see `_livestock_rows`). Requisite 11 is
       composed from the registry and prints `NOT_STATED` when it holds nothing,
       never refusing an issuance (ruling T3-g — see `_holder_address`).
-      Requisite 19 ships
-      as the payment STATUS with no date (ruling T3-b): there is no lawful source
-      for the date, so a permit issued before one exists carries «Тўланган» with no
-      date PERMANENTLY — the snapshot is immutable and is never re-derived.
+      Requisite 19 carries BOTH halves of «Статус оплаты и дата» (ruling #118,
+      closing T3-b's open question) — `payment_status` and `payment_date`,
+      the date read from `paid_at` (see the parameter's own note on where that
+      comes from and its one known imprecision).
     - **5-7 (ўрмон бўлими / айланма / бўлак) have no data source.** `organizations`
       can EXPRESS them — `kind` runs down to `bolim`, `aylanma`, `bolak` — but
       nothing populates those rows and every contour hangs off its leshoz, because
@@ -516,6 +532,21 @@ async def _snapshot(
     7), and `issue` resolves each through `_required` before calling this — so a
     missing requisite is named at its SOURCE rather than reaching the renderer as
     an unfilled placeholder it cannot attribute.
+
+    **`paid_at` is `applications.updated_at`, read by `issue()` off the SAME
+    `PAID` application this whole snapshot is built from — not a `payments`
+    table `permits` may not read (design/01 rule 3), and not the precise
+    `application_status_history` PAID row `tz/12` #17 named as the exact
+    source, which needs an accessor `applications.service` does not expose on
+    this branch.** `applications.service.set_status` "touches ONLY
+    `applications.status`" (its own docstring), and `issue()` refuses anything
+    but `PAID`, so nothing legitimate has touched this row between the
+    INVOICED -> PAID transition and issuance — `updated_at` at this point IS
+    that transition's timestamp. The one imprecision this accepts, stated so a
+    later reader does not mistake it for a bug: a FUTURE write that touches the
+    application between payment and issuance (none exists today) would move
+    this date forward without moving the real payment — the day one is added,
+    revisit this note before trusting `updated_at` here again.
     """
     applicant = await auth_service.get_applicant(db, applicant_id)
     if applicant is None:
@@ -572,6 +603,10 @@ async def _snapshot(
         "period_to": period_to.isoformat(),
         "amount": _money(amount),
         "payment_status": PAYMENT_STATUS_PAID,
+        # Ruling #118. Tashkent calendar date, like every other date on this
+        # form (`issued_at` above) — `paid_at` is UTC storage, never the date
+        # half printed as-is.
+        "payment_date": paid_at.astimezone(TASHKENT).date().isoformat(),
         # Not printed: the link back to the calculation this amount came from.
         "calculation_id": str(calculation_id),
     }
@@ -731,6 +766,9 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         sb_load=calculation.used_sb,
         calculation_id=calculation.id,
         calculation_input=calculation.input_snapshot,
+        # Ruling #118 — see `_snapshot`'s own docstring for why `updated_at`
+        # off this SAME `PAID` application is the lawful source `permits` has.
+        paid_at=application.updated_at,
     )
 
     # 5. The QR token is a SECRET, not an identifier (ruling 8): never derived
@@ -1021,6 +1059,13 @@ async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
     18 is the same distinction on the application side — `tz/05` defines
     PERMIT_ISSUED as «сформировано **и подписано**», so the application moves
     here too, in this same step, and never at issuance.
+
+    **Ruling #102, added here rather than at issuance.** If this permit is an
+    extension's, its PARENT stops being `active` in this same step — see
+    `_close_parent_permit_if_extension`'s own docstring for why ACTIVATION and
+    not issuance is the only correct moment (the short version: issuance would
+    collide with ruling #99, under which a permit may sit in
+    `pending_signatures` indefinitely).
     """
     permit.status = ACTIVE_STATUS
     permit.issued_at = datetime.now(UTC)
@@ -1033,6 +1078,7 @@ async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
             changed_by=actor.id,
         ),
     )
+    await _close_parent_permit_if_extension(db, permit, actor=actor)
     # Ruling 18. `set_status` is the ONE way a level-4 module moves an
     # application (its own docstring): it validates PAID -> PERMIT_ISSUED against
     # tz/05, locks the row, writes the history entry and audits it.
@@ -1050,6 +1096,68 @@ async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
         },
         object_type=OBJECT_TYPE,
         object_id=permit.id,
+    )
+
+
+async def _close_parent_permit_if_extension(
+    db: AsyncSession, permit: Permit, *, actor: User
+) -> None:
+    """Ruling #102: an extension closes the permit it replaces the moment IT
+    becomes ACTIVE — never at issuance. Call this from `_activate`, and only
+    from there, on the permit that is itself becoming ACTIVE right now.
+
+    **Why ACTIVE and not issuance.** Closing the parent at issuance would
+    collide with ruling #99: a permit can sit in `pending_signatures`
+    indefinitely (nothing times out a citizen's own signature), so an
+    extension stuck there would leave the holder with the OLD permit already
+    closed and the NEW one not yet in force — the state removing a valid
+    document because its own staff had not signed. Closing on ACTIVE means the
+    only overlap is the window while the extension itself is unsigned, and
+    during it the holder keeps exactly one working permit (proven by
+    `test_an_unsigned_extension_leaves_the_parent_untouched_and_active`).
+
+    **The chain to the parent, staying inside the module boundary the whole
+    way** (`permits` is level 4 and may reach `applications` only through its
+    service, never its tables — `CLAUDE.md`): this permit's own application
+    names `kind` and `parent_application_id` (`applications_service.get`,
+    already public); the PARENT's permit is then found by
+    `repo.permit_by_application` on that id — a lookup this module already
+    owns — never by a second trip through `applications` for a permit id that
+    does not exist as one of its columns.
+
+    **Guarded to a real effect only.** Not an extension, or an extension with
+    no `parent_application_id` (unreachable through `service.extend`, guarded
+    here anyway rather than trusted): nothing to close. A parent that is not
+    `active` — already `expired`, `suspended` or `revoked` — is left alone
+    too: both occupancy providers count `active` and nothing else (module
+    docstring), so a non-active parent already occupies no area and needs no
+    second closing; forcing one would also risk an illegal `PERMIT_TRANSITIONS`
+    edge (`suspended -> expired` is legal, but this function has no business
+    overriding a human's own suspension of the parent).
+
+    Routed through `set_status` — never a direct field write the way
+    `_activate` handles its OWN transition — because closing a DIFFERENT
+    permit is exactly the ordinary case that function exists for: it locks the
+    parent's row, validates the edge, writes its history entry and audits it,
+    all in one call.
+    """
+    application = await applications_service.get(db, permit.application_id)
+    if application is None or application.kind != applications_service.KIND_EXTENSION:
+        return
+    if application.parent_application_id is None:
+        return
+    parent_permit = await repo.permit_by_application(db, application.parent_application_id)
+    if parent_permit is None or parent_permit.status != ACTIVE_STATUS:
+        return
+    await set_status(
+        db,
+        parent_permit.id,
+        to_status=PARENT_CLOSED_STATUS,
+        actor=actor,
+        reason=(
+            "Ёпилди: ушбу контурга берилган муддати узайтирилган рухсатнома "
+            f"({_permit_number(permit.series, permit.number)}) фаоллашди"
+        ),
     )
 
 

@@ -25,6 +25,7 @@ SNAPSHOT = {
     "sb_load": "40.0000",
     "amount": "2060000.00",
     "payment_status": "Тўланган",
+    "payment_date": "2027-04-01",
 }
 LAYOUT = '<html><body><h1>{{ series }} № {{ number }}</h1><img src="{{ qr }}"></body></html>'
 

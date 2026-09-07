@@ -159,13 +159,10 @@
     <tr><th>Шартли бош (СБ) юкламаси</th><td>{{ sb_load }}</td></tr>
     <tr><th>Фойдаланиш муддати</th><td>{{ period_from }} — {{ period_to }}</td></tr>
     <tr><th>Рухсатнома суммаси, сўм</th><td>{{ amount }}</td></tr>
-    <!-- tz/13 requisite 19 is «Статус оплаты и дата». Only the STATUS half is
-         printed: the payment DATE lives in `payments`, which `permits` may not
-         read (design/01 rule 3 — both are level 4), and `applications.service`
-         exposes no paid-at. Printing the issuance date in its place would put a
-         wrong date on a legal document. Add the date here and to the snapshot
-         together, the day a lawful source for it exists. -->
-    <tr><th>Тўлов ҳолати</th><td>{{ payment_status }}</td></tr>
+    <!-- tz/13 requisite 19, «Статус оплаты и дата» (ruling #118): both halves,
+         `permits/service.py::_snapshot`'s own docstring explains the date's
+         source and its one accepted imprecision. -->
+    <tr><th>Тўлов ҳолати ва санаси</th><td>{{ payment_status }}, {{ payment_date }}</td></tr>
   </table>
 
   <table class="signatures">
