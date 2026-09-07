@@ -22,17 +22,21 @@ national-oversight read alongside these same three roles, so it stands in for th
 non-existent code here.
 
 Revision ID: 0039
-Revises: 0042
+Revises: 0038
 Create Date: 2026-09-07 17:46:53.411656
 
-Integration note: this revision was authored on parent `0038`. At integration
-`dev` had already grown its own `0040 -> 0041 -> 0042` chain off `0038` (see
-that chain's own note in `0040`), producing two heads. `0039` keeps its id —
-it was already applied to a long-lived local database under the old parent,
-and renumbering would have needed a hand-edit of `alembic_version` on every
-machine that ran it — but its `down_revision` is re-pointed here from `0038`
-to `0042`, so the merged chain reads `0038 -> 0040 -> 0041 -> 0042 -> 0039`
-with a single head, `0039`.
+Integration note, corrected 2026-09-08: this revision was authored on parent
+`0038`, and `dev` had independently grown its own `0040 -> 0041 -> 0042`
+chain off `0037` (see that chain's own note in `0040`), producing two heads,
+`0039` and `0042`. An earlier ruling re-pointed `0039`'s `down_revision` from
+`0038` to `0042` to collapse the two branches into one line without a merge
+revision — that was wrong: Alembic stores only the current head and never
+walks back for an ancestor spliced in underneath an already-applied
+revision, so a `dev` database already at `0042` would apply `0039` alone on
+its next `upgrade head` and never gain `0038`'s two catalog columns. This
+migration's `down_revision` is restored to its original `0038`; the two
+heads are reconciled properly by `merge_0039_0042_...`'s own
+`down_revision = ("0039", "0042")`.
 
 """
 
@@ -43,7 +47,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "0039"
-down_revision: str | None = "0042"
+down_revision: str | None = "0038"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

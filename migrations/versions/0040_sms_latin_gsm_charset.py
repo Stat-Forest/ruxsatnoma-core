@@ -29,22 +29,25 @@ history that says nothing happened. Archived rows are left alone on purpose:
 they record what was actually sent.
 
 `0038` and `0039` were taken by the parallel 7.6 and 7.7 branches, which is why this
-was authored as `0040` on a `0037` parent. At integration the two heads (`0039` and
-this branch's `0042`) were reconciled by re-pointing `0039`'s `down_revision` at
-`0042` rather than by `alembic merge heads` — `0039` had already been applied to a
-long-lived local database under its old parent, and a merge revision would have
-renumbered nothing while a plain renumber of `0039` would have needed a hand-edit
-of `alembic_version` on every machine that ran it. That repoint only works if this
-migration sits between `0038` and `0039` rather than beside them, so `0040`'s own
-`down_revision` was moved from `0037` to `0038` in the same integration commit —
-the chain is not monotonic (see `../CLAUDE.md`), and the highest number is never
-the head.
+was authored as `0040` on its original `0037` parent, growing its own
+`0040 -> 0041 -> 0042` chain alongside 7.7's `0038 -> 0039`, two heads off `0037`.
+
+Integration note, corrected 2026-09-08: an earlier ruling reconciled the two
+heads by re-pointing `0039`'s `down_revision` at `0042` and this migration's own
+`down_revision` from `0037` to `0038`, to fold both branches into one line
+without a merge revision. That was wrong — Alembic stores only the current head
+and never walks back for an ancestor spliced in underneath an already-applied
+revision, so a `dev` database already at `0042` (via the ORIGINAL `0037 -> 0040`
+edge) would apply `0039` alone on its next `upgrade head` and never gain `0038`'s
+two catalog columns; see `0039`'s own note. `down_revision` is restored here to
+its original `0037`; the two heads are reconciled properly by a merge revision,
+`merge_0039_0042_...`, whose `down_revision = ("0039", "0042")`.
 
 `tests/modules/notifications/test_sms_gsm_charset.py` is what keeps the next
 seeded SMS template inside the set.
 
 Revision ID: 0040
-Revises: 0038
+Revises: 0037
 Create Date: 2026-09-07 21:00:00.000000
 
 """
@@ -56,7 +59,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "0040"
-down_revision: str | Sequence[str] | None = "0038"
+down_revision: str | Sequence[str] | None = "0037"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
