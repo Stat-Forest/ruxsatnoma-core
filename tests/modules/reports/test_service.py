@@ -3,7 +3,7 @@ plain `User` rows (`make_user`), no HTTP. See `conftest.py`'s own docstring
 for why this is the primary coverage shape for this module."""
 
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -19,7 +19,7 @@ from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.reports import forms_seed, service
 from app.modules.reports.models import Report, ReportForm
 from tests.modules.auth.test_sessions import make_user
-from tests.modules.reports.conftest import make_report_permit
+from tests.modules.reports.conftest import make_report_permit, make_signed_act
 
 
 async def _own_hodim(db: AsyncSession, org: Organization) -> User:
@@ -191,7 +191,118 @@ async def test_generate_report_reads_matching_permits(
     assert len(rows) == 1
     assert rows[0]["total_amount"] == "2060000.00"
     assert rows[0]["paid_amount"] == "2060000.00"
-    assert rows[0]["inspection_result"] is None  # scope cut — 4.1 not merged here
+    # #105/#106: no acts and no refund on this permit — empty/zero, never
+    # `None` printed as text (`render.py` writes the raw value into the
+    # cell) and never blank (a reader must be able to tell "checked, zero"
+    # from "not computed").
+    assert rows[0]["inspection_result"] == ""
+    assert rows[0]["refunded_amount"] == "0.00"
+
+
+async def test_generate_report_lists_every_act_result_in_chronological_order(
+    db: AsyncSession,
+    grazing_form: ReportForm,
+    leshoz: Organization,
+    contours_layer: GisLayer,
+    approval_doc,
+    grazing_activity_id: uuid.UUID,
+    default_checklist_id: uuid.UUID,
+    vt_01: uuid.UUID,
+):
+    """Decision #105: every SIGNED act's result, comma-separated, oldest
+    first — never "latest" (a corrected May violation must not vanish
+    because September was clean) and never "worst" (must not hide that it
+    was corrected). Acts are created out of chronological order here on
+    purpose, so passing proves the column sorts by `occurred_at`, not by
+    insertion order."""
+    period_from, period_to = date(2027, 5, 1), date(2027, 5, 31)
+    permit = await make_report_permit(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=grazing_activity_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    await make_signed_act(
+        db,
+        permit=permit,
+        org=leshoz,
+        checklist_id=default_checklist_id,
+        occurred_at=datetime(2027, 5, 25, 9, 0, tzinfo=UTC),
+        result="warning",
+    )
+    await make_signed_act(
+        db,
+        permit=permit,
+        org=leshoz,
+        checklist_id=default_checklist_id,
+        occurred_at=datetime(2027, 5, 5, 9, 0, tzinfo=UTC),
+        result="violation",
+        violation_type_item_id=vt_01,
+    )
+    await make_signed_act(
+        db,
+        permit=permit,
+        org=leshoz,
+        checklist_id=default_checklist_id,
+        occurred_at=datetime(2027, 5, 15, 9, 0, tzinfo=UTC),
+        result="compliant",
+    )
+
+    hodim = await _own_hodim(db, leshoz)
+    report = await service.create_report(
+        db,
+        form_id=grazing_form.id,
+        organization_id=leshoz.id,
+        period_start=date(2027, 4, 1),
+        period_end=date(2027, 6, 30),
+        actor=hodim,
+    )
+    report = await service.generate_report(db, report.id, hodim)
+    rows = report.data["rows"]
+    assert len(rows) == 1
+    assert rows[0]["inspection_result"] == "violation, compliant, warning"
+
+
+async def test_generate_report_shows_paid_and_refunded_separately(
+    db: AsyncSession,
+    grazing_form: ReportForm,
+    leshoz: Organization,
+    contours_layer: GisLayer,
+    approval_doc,
+    grazing_activity_id: uuid.UUID,
+):
+    """Decision #106: a refund never nets against `paid_amount` — a printed
+    report for a past month must never change retroactively. Both figures
+    are present and independent."""
+    period_from, period_to = date(2027, 5, 1), date(2027, 5, 31)
+    await make_report_permit(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=grazing_activity_id,
+        period_from=period_from,
+        period_to=period_to,
+        paid_amount=Decimal("2060000.00"),
+        refunded_amount=Decimal("500000.00"),
+    )
+    hodim = await _own_hodim(db, leshoz)
+    report = await service.create_report(
+        db,
+        form_id=grazing_form.id,
+        organization_id=leshoz.id,
+        period_start=date(2027, 4, 1),
+        period_end=date(2027, 6, 30),
+        actor=hodim,
+    )
+    report = await service.generate_report(db, report.id, hodim)
+    rows = report.data["rows"]
+    assert len(rows) == 1
+    assert rows[0]["paid_amount"] == "2060000.00"
+    assert rows[0]["refunded_amount"] == "500000.00"
 
 
 async def test_generate_report_refused_once_submitted(

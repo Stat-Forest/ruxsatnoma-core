@@ -1,5 +1,8 @@
-"""`archive` — a level-5 reader with one write action (design/01 rule 5). Every
-route requires `archive.manage`; the zone restriction lives in `service.py`."""
+"""`archive` — a level-5 reader with one write action (design/01 rule 5). Reads
+(the register, one item) require `archive.view`; archiving and verifying
+require `archive.manage` (F23, `docs/plans/07.3-findings.md`: the two used to
+share one code, which meant a read-only role could never get the read without
+also getting the write). The zone restriction lives in `service.py`."""
 
 import uuid
 from typing import Annotated
@@ -10,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
 from app.modules.archive import service
-from app.modules.archive.permissions import ARCHIVE_MANAGE
+from app.modules.archive.permissions import ARCHIVE_MANAGE, ARCHIVE_VIEW
 from app.modules.archive.schemas import (
     ArchivableObjectType,
     ArchiveItemOut,
@@ -36,7 +39,7 @@ router = APIRouter(tags=["archive"])
 @router.get("/archive", response_model=Page[ArchiveItemOut])
 async def list_archive_items(
     db: Annotated[AsyncSession, Depends(get_db)],
-    actor: Annotated[User, Depends(require_permission(ARCHIVE_MANAGE))],
+    actor: Annotated[User, Depends(require_permission(ARCHIVE_VIEW))],
     params: Annotated[PageParams, Depends()],
     object_type: ArchivableObjectType | None = None,
     filter_status: Annotated[ArchiveItemStatus | None, Query(alias="status")] = None,
@@ -60,7 +63,7 @@ async def verify_archive_item(
 async def get_archive_item(
     item_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    actor: Annotated[User, Depends(require_permission(ARCHIVE_MANAGE))],
+    actor: Annotated[User, Depends(require_permission(ARCHIVE_VIEW))],
 ) -> ArchiveItemOut:
     item = await service.get_item(db, actor, item_id)
     return ArchiveItemOut.model_validate(item)

@@ -1,10 +1,26 @@
 name: CI
 
 on:
+  # `main` only — every other branch is already covered without a push trigger, and adding
+  # one back means running the same commit twice:
+  #   * a feature branch is covered by `pull_request` (listing every branch here ran CI twice
+  #     on each push to a branch with an open PR — 42 of the 49 duplicated commits in the
+  #     first week of September were that pair);
+  #   * `dev` is covered by deploy.yml's `Gate` job, which calls this workflow through
+  #     `workflow_call` and blocks the deploy when it fails. A push trigger here ran `lint`
+  #     and `test` a second time on every merge commit.
+  # `main` has no deploy and therefore no gate, so it keeps its push run.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_call:
+
+concurrency:
+  # A superseded PR run has nothing left to prove, so cancel it. Push and workflow_call runs
+  # are never cancelled: the `workflow_call` one is deploy.yml's gate, and cancelling that
+  # would let an unverified commit reach the server.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -62,6 +78,10 @@ jobs:
             -c "CREATE DATABASE ruxsatnoma_test OWNER ruxsatnoma"
           PGPASSWORD=ruxsatnoma psql -h localhost -U ruxsatnoma -d ruxsatnoma_test \
             -c "CREATE EXTENSION IF NOT EXISTS postgis"
-      - run: uv run pytest -q
+      # -n 4 mirrors `make test`. Each worker migrates a database of its own,
+      # named after DATABASE_URL_TEST (tests/conftest.py) and created on the
+      # spot -- the CREATE DATABASE above covers only a serial run. No
+      # --fresh-db here: the `services:` postgres is new for every job.
+      - run: uv run pytest -q -n 4
         env:
           WORKERS_MODE: 'off'

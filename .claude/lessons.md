@@ -93,6 +93,14 @@ Tooling and environment.
   alone, reading like a chain bug (0011, 3.7 t1; `merge_0018_0020`, 3.9b/3.11b).
 - **How to apply:** `alembic merge heads -m "merge"`; `make heads` is the gate — grep the
   test for the previous head string, since no task brief lists that file.
+- **The mirror, 2026-09-07 — the Rule above was not followed, and this is the cost:** 3.11b
+  re-pointed `0023`'s `down_revision` from `0022` to `0025` by hand before merging. A database
+  that had ALREADY passed `0023` under the old parent never runs `0025` at all — `upgrade head`
+  walks forward from the recorded revision and never back for an ancestor spliced in underneath.
+  Symptom: `alembic_version = 0035` while `application_checks.created_by` does not exist, so
+  `POST /applications/{id}/submit` 500s. **A recorded revision does not prove a schema.** Dev
+  escaped it (built after the splice); a long-lived local DB did not. Reconciling means replaying
+  that migration's `upgrade()` by hand — `stamp` back plus `upgrade` re-runs everything after it.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
@@ -439,28 +447,29 @@ Tooling and environment.
 
 ## A precondition shared by several steps belongs in ONE function every step calls
 
-- **Rule:** When several endpoints each perform one step of a shared transition, a
-  precondition belonging to the WHOLE transition — "is this even a valid target for this
-  workflow" — lives in one function all of them call, never only in the step a well-behaved
-  caller reaches first. And a transition whose loop moves zero child rows is refused, not
-  advanced.
+- **Rule:** A precondition belonging to a WHOLE transition lives in one function every step
+  calls, never only in the step a well-behaved caller reaches first — and a transition whose
+  loop moves zero child rows is refused, not advanced.
 - **Why:** `submit_import_review` alone got the "refuse a non-contour batch" guard;
-  `approve_import`/`publish_import` still gated on `row.status`. Since `CONTOURS_APPROVE` is a
-  DIFFERENT permission from `CONTOURS_MANAGE`, a rahbar-only actor could call `/approve`
-  directly on a freshly-parsed batch — never able to call submit-review at all — and both
-  loops found zero rows and still advanced the status (3.6a t8; reproduced with the fix
-  stashed, 200 instead of 409).
+  `approve_import`/`publish_import` still gated on `row.status`, and `CONTOURS_APPROVE` is a
+  DIFFERENT permission — so a rahbar-only actor called `/approve` on a freshly-parsed batch,
+  both loops moved zero rows, and the status advanced anyway (3.6a t8; 200 instead of 409).
 - **How to apply:** Factor the shared preamble — row lookup, zone check, validity check,
   status check — into one function. A loop finding nothing is not evidence that nothing
   needed to happen.
+- **The mirror, 7.4 F3 — widening that one function is a decision about every caller.**
+  Ruling #113 added `address` to `checks.missing_for_pricing`, correct by that function's own
+  contract; `service.precheck` reads the SAME list to decide whether there is a price to
+  report, so an address-less citizen reached the wizard's last step with no amount and would
+  have signed an ERI signature over a package whose cost was never shown. Green in every
+  track's own suite; found only on the integration branch. List the callers before you add.
 - **The same discipline on inputs:** before reporting a versioned-row creator done, walk
   every caller-settable field that is an FK or half of a period pair and confirm EACH has a
   service guard ahead of `flush()`. Task 4 guarded `contour_id`/`approval_doc_id` while
   `activity_type_id`, `geobotanic_doc_id` and `effective_to < effective_from` reached
-  `flush()` as `ERR-SYS-001`/500 — and the same gap sat in the SHARED `create_versioned`
-  (`POST /tariffs` with a garbage id was a 500 too). `add_classifier_item`'s
-  `valid_to < valid_from` is the period template, `_assert_doc_active` the FK one — reuse the
-  same helper per meaning, never a near-identical second copy.
+  `flush()` as `ERR-SYS-001`/500 — the same gap sat in the SHARED `create_versioned`.
+  `add_classifier_item`'s `valid_to < valid_from` is the period template, `_assert_doc_active`
+  the FK one — reuse the same helper per meaning, never a near-identical second copy.
 
 ## A gate that reads only ONE of the two things it guards is bundling two concerns
 
@@ -711,6 +720,21 @@ Tooling and environment.
 
 # Tests and the shared test DB
 
+## A check-then-create against a shared resource is a race the day the suite runs `-n 4`
+
+- **Rule:** "Look, then create" against MinIO, a volume or a catalog must treat the
+  already-exists answer as SUCCESS. Prove it with a CONCURRENT test: a sequential
+  idempotency test never reaches the create branch at all.
+- **Why:** `storage.ensure_bucket` did `head_bucket` → on `ClientError` → `create_bucket`.
+  On a FRESH MinIO — every CI run — four xdist workers 404 together, all four create, and
+  the losers got an uncaught `BucketAlreadyOwnedByYou`: `ERROR at setup` on an unrelated
+  test, and a red CI accusing whichever branch was in front of it. Never reproduced
+  locally, where the bucket already exists and the create is never reached (2026-09-06).
+- **How to apply:** Any `ensure_*` or first touch of a fresh volume → catch the
+  exists-codes (`app/core/storage.py::_BUCKET_ALREADY_THERE`), and copy
+  `test_ensure_bucket_survives_four_of_itself_at_once`: gather four calls against a
+  uniquely named bucket, never delete the shared one.
+
 ## The test DB is shared, persistent, and never empty — including the spot you picked
 
 - **Rule:** A test may only touch rows it created. No unscoped `UPDATE`/`DELETE`, no assuming
@@ -847,6 +871,20 @@ Tooling and environment.
 - **How to apply:** Prefer typed test parameters generally; narrow a fixture's nullable
   attribute explicitly at the call site (`assert a_user.pinfl is not None`) instead of
   leaving the parameter unannotated to dodge the check.
+
+## An assertion over rendered output is testing this machine's fonts, not your code
+
+- **Rule:** Reading text back out of a PDF, squeeze the whitespace from BOTH sides
+  (`"".join(s.split())`). Never assert a substring against `extract_text()` verbatim.
+- **Why:** the С22 watermark tests passed on macOS and failed in CI with
+  `assert 'Test User' in '... T est User — 2026-09-07'`. `extract_text()` rebuilds words
+  from glyph positions and inserts a space wherever a run is kerned — and which runs are
+  kerned depends on the fonts in the image; the negative assertion fails OPEN the same
+  way, a leaked name slipping past on a space (2026-09-07). Mirror the same evening in the
+  adminka: a mock using jsdom's `Blob` passed on Node 25, failed on CI's Node 22.
+- **How to apply:** any test reading back what WeasyPrint produced —
+  `tests/modules/search/test_export.py::_pdf_text` is the helper. Green locally and red in
+  CI: reproduce the CI runtime first (a `node:22` container did it here).
 
 ---
 

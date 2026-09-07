@@ -33,11 +33,13 @@ dependencies = [
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.6",
     "ruff>=0.6",
     "pre-commit>=3.7",
     "pyright>=1.1.411",
     "types-aiobotocore-s3>=3.9.0",
     "shapely>=2.1",
+    "pypdf>=5.0",
 ]
 
 [tool.pyright]

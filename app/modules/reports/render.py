@@ -69,7 +69,7 @@ def render_excel(report: Report, form: ReportForm) -> bytes:
 
 def render_pdf(report: Report, form: ReportForm) -> bytes:
     """A plain HTML table -> PDF, default fonts, no PDF/A. Landscape-shaped
-    by CSS alone (`@page`) — 2-ilova's 28 columns need the width."""
+    by CSS alone (`@page`) — 2-ilova's 29 columns need the width."""
     columns = form.columns
     header_cells = "".join(f"<th>{html.escape(_label(column))}</th>" for column in columns)
     body_rows: list[str] = []

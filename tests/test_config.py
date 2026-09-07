@@ -44,6 +44,7 @@ def test_prod_accepts_custom_secret_key():
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
         eskiz_callback_secret="a-real-callback-secret",
+        eskiz_callback_base_url="https://ruxsatnoma.example.uz",
         public_base_url="https://ruxsatnoma.example.uz",
         smtp_host="smtp.example.uz",
         smtp_from="noreply@example.uz",
@@ -97,6 +98,7 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("ESKIZ_PASSWORD", "real-eskiz-password-for-prod-guard-test")
     monkeypatch.setenv("ESKIZ_SENDER", "4546")
     monkeypatch.setenv("ESKIZ_CALLBACK_SECRET", "real-callback-secret-for-prod-guard-test")
+    monkeypatch.setenv("ESKIZ_CALLBACK_BASE_URL", "https://ruxsatnoma.example.uz")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ruxsatnoma.example.uz")
     monkeypatch.setenv("SMTP_HOST", "smtp.example.uz")
     monkeypatch.setenv("SMTP_FROM", "noreply@example.uz")
@@ -131,12 +133,13 @@ def test_email_mode_real_requires_smtp_host_and_from():
         )
 
 
-def test_sms_mode_real_requires_a_reachable_public_base_url():
+def test_sms_mode_real_requires_a_reachable_eskiz_callback_base_url():
     """The one Eskiz setting the guard used to miss, and the only one whose default
     (`http://localhost:8000`) is a working-looking value: a prod deploy that sets
     the four credentials and forgets the base URL still SENDS every SMS while every
     delivery report goes nowhere, leaving each notification at `sent` forever with
-    no error anywhere (final whole-branch review of 3.5, finding 6)."""
+    no error anywhere (final whole-branch review of 3.5, finding 6; retargeted from
+    `public_base_url` onto its own field by ruling #124)."""
 
     def _settings(**overrides: str) -> Settings:
         return Settings(
@@ -149,12 +152,44 @@ def test_sms_mode_real_requires_a_reachable_public_base_url():
             _env_file=None,  # pyright: ignore[reportCallIssue]
         )
 
-    with pytest.raises(ValidationError, match="public_base_url"):
+    with pytest.raises(ValidationError, match="eskiz_callback_base_url"):
         _settings()  # the default, http://localhost:8000, looks configured but is not
+    with pytest.raises(ValidationError, match="eskiz_callback_base_url"):
+        _settings(eskiz_callback_base_url="http://127.0.0.1:8000")
+    # public_base_url supplied too — see the next test for what happens when it
+    # is NOT: ruling #124's own guard would otherwise refuse this construction
+    # for an unrelated reason and this assertion would never prove its own point.
+    settings = _settings(
+        eskiz_callback_base_url="https://ruxsatnoma.uz", public_base_url="https://ruxsatnoma.uz"
+    )
+    assert settings.eskiz_callback_base_url == "https://ruxsatnoma.uz"
+
+
+def test_public_base_url_must_be_reachable_once_the_eskiz_callback_is():
+    """Ruling #124's own guard, same shape as `admin_base_url`'s below: the two
+    fields were ONE setting (`PUBLIC_BASE_URL`) until stage 7.0, so a deploy that
+    configures the callback and simply forgets its former sibling must not fall
+    through to a local-looking QR default — a permit's QR is rendered once and is
+    unfixable afterwards. Unconditional on `sms_mode`, deliberately: printing a
+    permit needs no SMS at all."""
     with pytest.raises(ValidationError, match="public_base_url"):
-        _settings(public_base_url="http://127.0.0.1:8000")
-    assert _settings(public_base_url="https://ruxsatnoma.uz").public_base_url == (
-        "https://ruxsatnoma.uz"
+        Settings(
+            eskiz_callback_base_url="https://ruxsatnoma.example.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )  # the default, http://localhost:8000, looks configured but is not
+    with pytest.raises(ValidationError, match="public_base_url"):
+        Settings(
+            eskiz_callback_base_url="https://ruxsatnoma.example.uz",
+            public_base_url="http://127.0.0.1:8000",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+    assert (
+        Settings(
+            eskiz_callback_base_url="https://ruxsatnoma.example.uz",
+            public_base_url="https://ruxsatnoma.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        ).public_base_url
+        == "https://ruxsatnoma.uz"
     )
 
 
@@ -224,3 +259,4 @@ def test_env_example_is_a_working_env_file(tmp_path, monkeypatch):
     assert settings.smtp_starttls is True
     assert settings.eskiz_base_url.startswith("https://")
     assert settings.public_base_url.startswith("http")
+    assert settings.eskiz_callback_base_url.startswith("http")

@@ -252,6 +252,29 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             60,
             "Per-IP limit for the anonymous GET /help/faq",
         ),
+        # С22 (`tz/12` #42, decision #98, ruling #20): the prosecutor's (and every
+        # other `search.use` holder's) watermarked export is capped at this many
+        # rows per file — "≤10 000, configurable" verbatim. The export never
+        # errors past the cap; it truncates and reports `total_matched` alongside
+        # `row_count` so a caller can SEE it was cut, never guess.
+        SettingSpec(
+            "search_export_max_rows",
+            int,
+            10000,
+            "Maximum rows in one search/oversight export (С22, ruling #20)",
+        ),
+        # Ruling #104: RI-14 «long active with no inspection» — the strictest
+        # of three options Oybek was offered, and his own text names the
+        # consequence: at 30 days it fires often, and an indicator that always
+        # fires stops being read. A setting, not a constant, is what lets that
+        # be tuned without a deploy once there is real inspection volume to
+        # judge it by.
+        SettingSpec(
+            "oversight_ri14_no_inspection_days",
+            int,
+            30,
+            "Days an active permit may run with no inspection act before RI-14 fires",
+        ),
     )
 }
 

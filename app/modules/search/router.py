@@ -5,9 +5,10 @@ here (same split every other module's router/service pair uses)."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import files
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
 from app.modules.auth.deps import require_permission
@@ -15,6 +16,8 @@ from app.modules.auth.models import User
 from app.modules.search import service
 from app.modules.search.permissions import SEARCH_USE
 from app.modules.search.schemas import (
+    ExportCreate,
+    ExportJobOut,
     SavedFilterIn,
     SavedFilterOut,
     SavedFilterPatch,
@@ -97,3 +100,59 @@ async def delete_profile(
     actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
 ) -> None:
     await service.delete_saved_filter(db, actor, profile_id)
+
+
+# --- export (С22) ----------------------------------------------------------
+#
+# Gated on `search.use`, the SAME code `GET /search` itself requires — an
+# export shows nothing a search result page does not already, so a second
+# permission code would only be a second place for the two to drift apart
+# (`.claude/lessons.md` "An access rule has ONE source").
+
+
+@router.post("/search/exports", response_model=ExportJobOut, status_code=status.HTTP_201_CREATED)
+async def create_export(
+    data: ExportCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> ExportJobOut:
+    job = await service.create_export(db, actor, data)
+    return ExportJobOut.model_validate(job)
+
+
+@router.get("/search/exports", response_model=list[ExportJobOut])
+async def list_exports(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> list[ExportJobOut]:
+    rows = await service.list_export_jobs(db, actor)
+    return [ExportJobOut.model_validate(row) for row in rows]
+
+
+@router.get("/search/exports/{job_id}", response_model=ExportJobOut)
+async def get_export(
+    job_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> ExportJobOut:
+    job = await service.get_export_job(db, actor, job_id)
+    return ExportJobOut.model_validate(job)
+
+
+@router.get("/search/exports/{job_id}/file")
+async def download_export(
+    job_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+) -> Response:
+    job, data = await service.get_export_file(db, actor, job_id)
+    media_type = service.EXPORT_MEDIA_TYPE[job.format]
+    filename = f"export-{job.kind}-{job.id}.{job.format}"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": files.content_disposition("attachment", filename),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

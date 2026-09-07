@@ -192,3 +192,78 @@ async def test_zone_scoped_actor_does_not_see_another_orgs_permit(
         ids = {row["id"] for row in resp.json()["items"]}
         assert str(mine.id) in ids
         assert str(theirs.id) not in ids
+
+
+# --- a permit is searched by the number a person is actually shown ------------
+#
+# Stage 7.3 finding F21: `search_permits` built its display number as
+# `"<series>-<number>"`, so a permit whose document, whose card and whose public
+# check page all read `А № 000003` was found by typing `А-3` and by nothing
+# else. A prosecutor or an inspector types what is on the paper.
+
+
+async def test_a_permit_is_found_by_the_number_printed_on_it(
+    db: AsyncSession,
+    leshoz: Organization,
+    contours_layer,
+    grazing_activity_id: uuid.UUID,
+    approval_doc,
+):
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    permit = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version.id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+    )
+    await db.commit()
+
+    printed = f"{permit.series} № {permit.number:06d}"
+    padded = f"{permit.number:06d}"
+
+    async for client in _client_for(db, SEARCH_USE, organization_id=leshoz.id):
+        for query in (printed, padded, str(permit.number)):
+            resp = await client.get(
+                "/api/v1/search", params={"kind": "permits", "q": query, "page_size": 100}
+            )
+            assert resp.status_code == 200, resp.text
+            ids = {row["id"] for row in resp.json()["items"]}
+            assert str(permit.id) in ids, query
+
+
+async def test_the_search_result_shows_the_printed_number_not_an_internal_form(
+    db: AsyncSession,
+    leshoz: Organization,
+    contours_layer,
+    grazing_activity_id: uuid.UUID,
+    approval_doc,
+):
+    """`permits.service._permit_number` is what the document and every
+    notification print; a result list spelling the same identifier a second way
+    is how a person decides they found a different permit."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    permit = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version.id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+    )
+    await db.commit()
+
+    async for client in _client_for(db, SEARCH_USE, organization_id=leshoz.id):
+        resp = await client.get(
+            "/api/v1/search",
+            params={"kind": "permits", "q": f"{permit.number:06d}", "page_size": 100},
+        )
+        row = next(r for r in resp.json()["items"] if r["id"] == str(permit.id))
+        assert row["number"] == f"{permit.series} № {permit.number:06d}"

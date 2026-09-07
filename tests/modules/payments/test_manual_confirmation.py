@@ -863,3 +863,103 @@ async def test_manual_confirmations_are_zone_scoped(
     async with _role_client_in("executor_head", home) as home_checker:
         home_listed = await home_checker.get(MANUAL_CONFIRMATIONS)
         assert filed["id"] in {item["id"] for item in home_listed.json()["items"]}
+
+
+# --- the checker's own read (stage 7.3, finding F13) -------------------------
+#
+# The defect these pin: the checker could list the confirmations awaiting them
+# (`GET /payments/manual-confirmations`, 200) and could open NEITHER the invoice
+# the confirmation is about (404) NOR the register (403 `payments.view`). So the
+# second pair of eyes in a four-eyes control was asked to approve a payment
+# without being able to see the invoice it pays, the application behind it, or
+# the bank document that is the whole of the evidence. Measured on dev during
+# the С1–С27 walkthrough, as `demo_executor_head`, on their own leshoz's invoice.
+
+
+async def test_the_checker_opens_the_invoice_they_are_asked_to_confirm(
+    head_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    result = await head_client.get(f"{API}/invoices/{pending_invoice.id}")
+    assert result.status_code == 200, result.text
+    assert result.json()["id"] == str(pending_invoice.id)
+
+
+async def test_the_checker_browses_the_invoice_register(
+    head_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    result = await head_client.get(f"{API}/invoices")
+    assert result.status_code == 200, result.text
+    assert str(pending_invoice.id) in {row["id"] for row in result.json()["items"]}
+
+
+async def test_the_checkers_read_does_not_become_a_write(
+    head_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    """`payments.confirm` buys the checker a READ of what they confirm and
+    nothing else: raising a payment link is still `payments.view`'s, and the
+    refusal stays the 404 a stranger gets rather than a 403 that would confirm
+    the invoice exists."""
+    result = await head_client.post(
+        f"{API}/invoices/{pending_invoice.id}/pay-intents",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={"provider": "payme"},
+    )
+    assert result.status_code == 404, result.text
+
+
+# --- the prosecutor reads the money too (decision #95, tz/12 #48) ------------
+#
+# The stage 7.3 walkthrough measured `demo_prosecutor` reading applications and
+# permits fine and getting `403 ERR-ACL-001 {"permission":"payments.view"}` on
+# `GET /payments/allocations`. С22 lists «платежи (инвойсы, транзакции,
+# распределение, сверка, refund)» among what the prosecutor inspects, so half of
+# what oversight exists to look at was invisible to it.
+#
+# Built under the PRODUCTION `prosecutor` role, never a client with the code
+# bolted on: what is under test is the role's own grants, which is exactly what
+# a `user_permissions` shortcut would stop proving (lesson).
+
+
+@pytest.fixture
+async def prosecutor_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
+    user = await make_user(db, role_code="prosecutor")
+    async for client in _client_for(db, user):
+        yield client
+
+
+async def test_the_prosecutor_reads_the_invoice_register(
+    prosecutor_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    result = await prosecutor_client.get(f"{API}/invoices")
+    assert result.status_code == 200, result.text
+    assert str(pending_invoice.id) in {row["id"] for row in result.json()["items"]}
+
+
+async def test_the_prosecutor_reads_one_invoice_and_its_allocations(
+    prosecutor_client: httpx.AsyncClient, pending_invoice: Invoice
+):
+    card = await prosecutor_client.get(f"{API}/invoices/{pending_invoice.id}")
+    assert card.status_code == 200, card.text
+    ledger = await prosecutor_client.get(
+        f"{API}/payments/allocations", params={"invoice_id": str(pending_invoice.id)}
+    )
+    assert ledger.status_code == 200, ledger.text
+
+
+async def test_the_prosecutor_still_writes_nothing(
+    prosecutor_client: httpx.AsyncClient, pending_invoice: Invoice, bank_doc: uuid.UUID
+):
+    """С22: «Попытка write → 403». Reading everything must not become doing
+    anything — this is the half of the ruling that a "grant the role more" change
+    can quietly lose."""
+    filed = await prosecutor_client.post(
+        MANUAL_CONFIRMATIONS,
+        json={
+            "invoice_id": str(pending_invoice.id),
+            "amount": "100.00",
+            "paid_at": "2026-09-06T05:00:00Z",
+            "bank_doc_file_id": str(bank_doc),
+        },
+    )
+    assert filed.status_code == 403, filed.text
+    assert filed.json()["error"]["code"] == "ERR-ACL-001"

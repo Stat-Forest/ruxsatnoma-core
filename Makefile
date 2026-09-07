@@ -64,7 +64,14 @@ type:               ## Type-check (CI's `lint` job)
 	uv run pyright
 
 test:               ## Full test suite (needs `make up`; CI's `test` job)
-	uv run pytest -q
+	# -n 4: the suite is I/O-bound on PostgreSQL and MinIO, so four workers cut
+	# it from ~14 min to ~3 (measured 2026-09-06). Each worker migrates a test
+	# DB of its own -- tests/conftest.py derives its name from DATABASE_URL_TEST.
+	# --fresh-db re-creates those DBs first: fixtures place random polygons and
+	# never clean up, so leftovers from the last run turn into ERR-GIS-002 in
+	# fixtures that have nothing to do with geometry. Debugging one file is
+	# faster without either flag: uv run pytest tests/modules/<x>/test_y.py
+	uv run pytest -q -n 4 --fresh-db
 
 security:           ## Security scan (bandit), same args as CI and pre-commit
 	# Run via uvx: bandit is a linter, not an app dependency, so it stays out of

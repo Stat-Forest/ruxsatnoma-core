@@ -13,11 +13,41 @@ uv sync
 docker compose up -d          # PostgreSQL 16 + PostGIS, MinIO; test DB auto-created
 uv run alembic upgrade head
 uv run uvicorn app.main:create_app --factory --reload
-uv run pytest -v              # integration tests need docker up
+uv run pytest -v              # integration tests need docker up (serial; one DB)
+make test                     # what CI runs: -n 4 --fresh-db, ~3 min instead of ~14
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                # type check (standard mode, decision #39)
 uv run python -m app.seed organizations app/seed/data/organizations.example.json   # reference data
 ```
+
+### Running the suite in parallel
+
+`make test` runs `pytest -n 4 --fresh-db`; the same `-n 4` is in CI. Measured
+2026-09-06 on this machine: **832s serial -> 169s on four workers** (1832 tests).
+Most of that time is not computation — the suite waits on PostgreSQL and MinIO
+round-trips (CPU was busy 37% of the wall clock), which is exactly what
+parallelising buys back. Eight workers reach 133s, only 21% better than four,
+so four is where the curve flattens.
+
+Two things make it work, both in `tests/conftest.py`:
+
+- **A database per worker.** `_use_a_database_of_this_workers_own()` rewrites
+  DATABASE_URL_TEST (and DATABASE_URL) to `<base>_gw0`, `<base>_gw1`, ... and
+  `_migrated_test_db` creates and migrates each on demand. Nothing here rolls a
+  test back, and `test_migrations.py` drops every table in its database — two
+  workers on one database would wipe each other's tables mid-INSERT. This nests
+  inside the per-worktree split in `../CLAUDE.md`: a worktree whose test DB is
+  `..._311` gets `..._311_gw0`, so parallel sessions still never meet.
+- **`--fresh-db`.** Fixtures place random polygons and never clean up. Left to
+  accumulate, a new box eventually lands on an old one and the failure surfaces
+  as `ERR-GIS-002` in a fixture that has nothing to do with geometry, or as an
+  overlap sweep counting a permit from a previous run. Re-creating the database
+  costs ~7s per worker, in parallel, and is why the suite is green rather than
+  8-failed-42-errors flaky.
+
+Debugging one file is still fastest serial and on the existing database:
+`uv run pytest tests/modules/permits/test_issue.py`. `PYTEST_XDIST_WORKER` is
+unset there, so no rewriting happens at all.
 
 ## Hard rules
 

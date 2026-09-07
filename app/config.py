@@ -28,8 +28,24 @@ class Settings(BaseSettings):
     eimzo_mode: Literal["mock", "real"] = "mock"
     sms_mode: Literal["mock", "real"] = "mock"
     email_mode: Literal["mock", "real"] = "mock"
-    # Externally reachable origin — Eskiz posts delivery reports back to it.
+    # Ruling #124. Until stage 7.0 this was ONE setting serving two unrelated
+    # consumers — a citizen's browser (the printed QR) and Eskiz's own server
+    # (a delivery-report callback) — because both lived on the same host. They
+    # do not anymore, so each has its own field:
+    #
+    # `public_base_url` — the PUBLIC SITE a citizen's browser opens. Read by
+    # `permits.service.qr_url`, and by nothing else: a permit's QR is rendered
+    # exactly once and is UNFIXABLE afterwards (a permit was already issued
+    # with a QR pointing at the API host instead of the public site, and the
+    # only remedy was a whole successor permit) — this is the setting that
+    # must never be wrong.
     public_base_url: str = "http://localhost:8000"
+    # `eskiz_callback_base_url` — OUR OWN API's externally reachable origin.
+    # Eskiz posts delivery reports to
+    # {ESKIZ_CALLBACK_BASE_URL}/api/v1/webhooks/eskiz/{ESKIZ_CALLBACK_SECRET}
+    # (`integrations/adapters/sms.py::EskizSmsSender.callback_url`) — a machine
+    # endpoint, never opened by a person, and therefore never the QR's host.
+    eskiz_callback_base_url: str = "http://localhost:8000"
     eskiz_base_url: str = "https://notify.eskiz.uz"
     eskiz_email: str = ""
     eskiz_password: str = ""
@@ -108,15 +124,34 @@ class Settings(BaseSettings):
                 "sms_mode=real requires eskiz_email, eskiz_password, eskiz_sender "
                 "and eskiz_callback_secret"
             )
-        if self.sms_mode == "real" and _is_local_origin(self.public_base_url):
+        if self.sms_mode == "real" and _is_local_origin(self.eskiz_callback_base_url):
             # The only Eskiz setting whose DEFAULT looks like a working value. Get it
             # wrong and SMS still goes out while every delivery report is posted into
             # the void: each notification sits at `sent` forever, with no error
             # anywhere to say so.
             raise ValueError(
-                "sms_mode=real requires public_base_url to be the externally reachable "
-                "origin — Eskiz posts its delivery reports back to it, and a local "
-                f"origin loses every one of them silently (got {self.public_base_url!r})"
+                "sms_mode=real requires eskiz_callback_base_url to be the externally "
+                "reachable origin — Eskiz posts its delivery reports back to it, and a "
+                f"local origin loses every one of them silently (got "
+                f"{self.eskiz_callback_base_url!r})"
+            )
+        if not _is_local_origin(self.eskiz_callback_base_url) and _is_local_origin(
+            self.public_base_url
+        ):
+            # Ruling #124's own guard, same shape as the one above (and as
+            # admin_base_url's below): the two fields were ONE setting until
+            # stage 7.0, so a deploy that configures the callback and simply
+            # forgets its sibling — habit, from when one value covered both —
+            # must not fall through to public_base_url's local-looking
+            # default. That default silently bakes a broken QR into every
+            # permit issued from that point on, and unlike a lost delivery
+            # report, a QR cannot be corrected after the fact — this refusal
+            # is unconditional (no sms_mode gate), because printing a permit
+            # needs no SMS at all.
+            raise ValueError(
+                "public_base_url must be the externally reachable origin once "
+                "eskiz_callback_base_url is — a permit's QR is rendered once and "
+                f"can never be corrected afterwards (got {self.public_base_url!r})"
             )
         cors_names_a_deployed_origin = any(
             not _is_local_origin(origin) for origin in self.cors_origins

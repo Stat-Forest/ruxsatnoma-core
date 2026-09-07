@@ -56,12 +56,40 @@ async def test_another_applicant_cannot_read_my_draft(
 
 
 async def test_a_hodim_outside_the_zone_does_not_see_the_application(
+    submitted_application: str,
+    hodim_client,
+    other_zone_hodim_client,
+) -> None:
+    """The zone half of the read rule, on a SUBMITTED application — a DRAFT
+    would prove nothing about ZONE, because ruling #110 refuses staff there
+    for an entirely different reason (ownership, before the zone is even
+    consulted; see `test_a_draft_is_invisible_to_staff_of_any_zone` below)."""
+    app_id = submitted_application
+
+    assert (await hodim_client.get(f"/api/v1/applications/{app_id}")).status_code == 200
+    assert (await other_zone_hodim_client.get(f"/api/v1/applications/{app_id}")).status_code == 404
+
+
+async def test_a_draft_is_invisible_to_staff_of_any_zone(
     applicant_client,
     published_contour,
     grazing_activity_id,
     hodim_client,
-    other_zone_hodim_client,
+    prosecutor_client,
 ) -> None:
+    """Ruling #110 (`tz/12` #26): `GET /applications/{id}` admitted in-zone
+    staff in EVERY status, DRAFT included — a draft is an unsent letter, and
+    until the citizen submits, nobody in the office has business reading it.
+
+    404, not 403 (the same existence-oracle reasoning `_readable_application`
+    already states for ownership): the caller must not learn that an id names
+    a real, still-unfiled application. Two staff shapes, on purpose —
+    `hodim_client` is IN-ZONE (the case a bare zone check would wave through)
+    and `prosecutor_client` is ZONE-FREE (the case that skips the zone check
+    entirely and would otherwise read every citizen's draft nationwide);
+    ruling #110 refuses both for the identical reason, checked before either
+    kind of zone question is even asked.
+    """
     created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
     app_id = created.json()["id"]
     await applicant_client.patch(
@@ -72,8 +100,20 @@ async def test_a_hodim_outside_the_zone_does_not_see_the_application(
         },
     )
 
-    assert (await hodim_client.get(f"/api/v1/applications/{app_id}")).status_code == 200
-    assert (await other_zone_hodim_client.get(f"/api/v1/applications/{app_id}")).status_code == 404
+    in_zone = await hodim_client.get(f"/api/v1/applications/{app_id}")
+    assert in_zone.status_code == 404, "in-zone staff still may not read a DRAFT they do not own"
+    assert in_zone.json()["error"]["code"] == "ERR-SYS-003"
+
+    zone_free = await prosecutor_client.get(f"/api/v1/applications/{app_id}")
+    assert zone_free.status_code == 404, "view_any is zone-free, not ownership-free"
+
+    mine = await applicant_client.get(f"/api/v1/applications/{app_id}")
+    assert mine.status_code == 200, "the owner reads their own draft throughout"
+
+    submitted = await applicant_client.get(f"/api/v1/applications/{app_id}/timeline")
+    assert submitted.status_code == 200, (
+        "every _readable_application route agrees, not just the card"
+    )
 
 
 async def test_the_card_carries_the_keys_every_later_task_reads(
@@ -152,22 +192,26 @@ async def test_the_list_shows_my_own_applications_and_not_a_strangers(
 
 
 async def test_the_list_is_zoned_for_staff_before_anyone_is_assigned(
-    applicant_client, published_contour, grazing_activity_id, hodim_client, other_zone_hodim_client
+    submitted_application: str,
+    published_contour,
+    hodim_client,
+    other_zone_hodim_client,
 ) -> None:
     """`assigned_org_id` is null until `start-review` writes the assignment
     (ruling 14), so the zone rule has to reach the CONTOUR's owner — otherwise a
     hodim's work queue is empty of exactly the applications they are supposed to
     pick up. The card next door resolves that per row; this proves the paged
-    query resolves it the same way."""
-    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
-    app_id = created.json()["id"]
-    await applicant_client.patch(
-        f"/api/v1/applications/{app_id}",
-        json={
-            "contour_id": str(published_contour.id),
-            "activity_type_id": str(grazing_activity_id),
-        },
-    )
+    query resolves it the same way.
+
+    **SUBMITTED, not DRAFT** (ruling #110): a DRAFT is invisible to staff
+    everywhere now, list included — `list_applications`'s own "can never
+    disagree with the card" promise excludes `INITIAL_STATUS` from the staff
+    scope for exactly that reason. "Before anyone is assigned" therefore
+    starts at SUBMITTED here: auto-assignment only ever runs inside
+    `start_review`, never at submission itself, so `submitted_application` is
+    still genuinely unassigned.
+    """
+    app_id = submitted_application
 
     mine = await hodim_client.get(
         "/api/v1/applications", params={"contour_id": str(published_contour.id)}

@@ -29,13 +29,15 @@ Public surface for the event bus (`subscribers.py`, registered in
   function performs no check of its own beyond resolving the recipient
   account.
 - `record_reversal(db, *, invoice, transaction, reason) -> None` (3.10b task
-  8, ruling 15) — the mirror of `confirm_payment` for money that came BACK:
-  Payme cancelled an already-performed transaction. It RECORDS the reversal
-  (negating `correction` entries, an open `reconciliations` row, RI-01 and,
-  when a permit exists, RI-10) and deliberately moves neither the invoice nor
-  the application. Called from `payme.py`'s state-`2` branch ONLY. See the
-  KNOWN GAP paragraph in the public-surface comment below for the whole shape
-  of what shipped and what stays open.
+  8, ruling 15; ruling #112 added the notify) — the mirror of `confirm_payment`
+  for money that came BACK: Payme cancelled an already-performed transaction.
+  It RECORDS the reversal (negating `correction` entries, an open
+  `reconciliations` row, RI-01 and, when a permit exists, RI-10 plus a
+  notification to that permit's `executor_head`) and deliberately moves
+  neither the invoice nor the application, and deliberately does not suspend
+  the permit either — that stays a person's call. Called from `payme.py`'s
+  state-`2` branch ONLY. See the KNOWN GAP paragraph in the public-surface
+  comment below for the whole shape of what shipped and what stays open.
 
 `get_invoice_for_actor`/`list_invoices_for_actor`/`create_pay_intent` are
 this module's OWN router-facing functions (they take an HTTP `actor: User`,
@@ -76,7 +78,7 @@ from app.modules.payments.models import (
     ProviderTransaction,
     Reconciliation,
 )
-from app.modules.payments.permissions import PAYMENTS_VIEW
+from app.modules.payments.permissions import PAYMENTS_CONFIRM, PAYMENTS_VIEW
 
 logger = structlog.get_logger(__name__)
 
@@ -104,6 +106,16 @@ REVERSAL_RECORD = "payment.reversal_record"
 # issuance; here it is a permit that already exists over money that came back.
 RISK_INDICATOR_UNCONFIRMED_PAID = "RI-01"
 RISK_INDICATOR_PERMIT_WITHOUT_PAYMENT = "RI-10"
+
+# Ruling #112: who at the leshoz `record_reversal` notifies when RI-10 fires —
+# the person who could actually act on it, `permits.manage`'s own holder
+# (`permits/permissions.py`: suspend/resume/revoke, granted to `executor_head`
+# alone). A LITERAL, not an import of `app.modules.permits.permissions`: that
+# module is level 4, the same level as this one (`design/01` rule 3), and the
+# comment on `repo.permit_organization_for_application` already keeps this
+# module's one read of `permits` to raw SQL for exactly that reason — a
+# permission CODE is no different a cross-level dependency than a model class.
+_PERMIT_DECISION_PERMISSION = "permits.manage"
 
 # design/03 §"Public numbers": every invoice number starts with this prefix.
 INVOICE_NUMBER_PREFIX = "INV"
@@ -184,7 +196,11 @@ ALLOCATION_ENTRY_CORRECTION = ALLOCATION_ENTRY_TYPES[2]
 #   провайдера/банка» — the provider withdrew a confirmation the invoice still
 #   bears); and RI-10 too («Разрешение активировано без оплаты») when a permit
 #   in a LIVE status — `pending_signatures`, `active` or `suspended`, never a
-#   `revoked` or `expired` one — already exists for that application.
+#   `revoked` or `expired` one — already exists for that application. Ruling
+#   #112 (7.4d) added the last piece the RI-10 branch was missing: a direct
+#   `notify()` to that permit's own `executor_head`, so the decision RI-10
+#   flags actually reaches a person instead of waiting for the prosecutor's
+#   next sweep or an operator who happens to open the register.
 #
 #   **What is STILL OPEN, and is not a defect in the code below.** The invoice
 #   stays `paid` and the application stays `PAID`, so this function still
@@ -409,6 +425,29 @@ async def cancel_invoice_for_application(
     return invoice
 
 
+async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
+    """Holds a permission that entitles its holder to READ invoices —
+    `payments.view`, or `payments.confirm`, or the superuser gate.
+
+    `payments.confirm` is here because of the stage 7.3 walkthrough (finding
+    F13): the checker of a manual `PAID` could list the confirmations awaiting
+    them and could open neither the invoice being confirmed nor the bank
+    document behind it, so the second pair of eyes in a four-eyes control was
+    asked to approve blind. A permission answers "whether", the zone still
+    answers "whose" — `_may_act_on_invoices_of` applies
+    `_zone_covers_application` to both codes alike, so a head reads their own
+    leshoz's invoices and no one else's.
+
+    **Reads only.** `create_pay_intent` shares `_may_act_on_invoices_of` and
+    deliberately does NOT accept this wider set: raising a payment link is
+    `payments.view`'s, and the caller marks which question it is asking with
+    `read_only`."""
+    if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
+        return True
+    codes = await auth_repo.permission_codes(db, actor)
+    return PAYMENTS_VIEW in codes or PAYMENTS_CONFIRM in codes
+
+
 async def _holds_payments_view(db: AsyncSession, actor: User) -> bool:
     """Holds `payments.view`, or is the superuser that passes every permission
     gate (decision #41 ruling 2) — the same two-branch shape
@@ -483,9 +522,16 @@ async def _zone_covers_application(
 
 
 async def _may_act_on_invoices_of(
-    db: AsyncSession, application_id: uuid.UUID, applicant_id: uuid.UUID, *, actor: User
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    applicant_id: uuid.UUID,
+    *,
+    actor: User,
+    read_only: bool = False,
 ) -> bool:
-    """`payments.view` (or sys_admin) sees or pays any invoice; otherwise the
+    """`payments.view` (or sys_admin) sees or pays any invoice; a
+    `payments.confirm` holder SEES one (`read_only=True`, finding F13) and
+    still may not raise a payment link with it; otherwise the
     actor must OWN the same applicant identity the invoice's application
     belongs to, OR hold an EFFECTIVE REPRESENTATION of it (task 5's
     ownership ruling) — matched on `applicant_id`, never
@@ -496,7 +542,8 @@ async def _may_act_on_invoices_of(
     pay-intent route (`create_pay_intent`) — one rule, three callers, so the
     representation gap Task 2 deliberately carried to this task is closed
     for reads too, not just for paying."""
-    if await _holds_payments_view(db, actor):
+    staff = _holds_payments_read if read_only else _holds_payments_view
+    if await staff(db, actor):
         # A permission says WHETHER, a zone says WHERE — and zone scoping is
         # not a permission check (lesson). Staff pass both or neither.
         return await _zone_covers_application(db, application_id, actor=actor)
@@ -522,7 +569,9 @@ async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, acto
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
-    if not await _may_act_on_invoices_of(db, application.id, application.applicant_id, actor=actor):
+    if not await _may_act_on_invoices_of(
+        db, application.id, application.applicant_id, actor=actor, read_only=True
+    ):
         raise err("ERR-SYS-003", details={"invoice": str(invoice_id)})
     return invoice
 
@@ -565,14 +614,14 @@ async def list_invoices_for_actor(
         if application is None:
             raise err("ERR-SYS-003", details={"application": str(application_id)})
         if not await _may_act_on_invoices_of(
-            db, application.id, application.applicant_id, actor=actor
+            db, application.id, application.applicant_id, actor=actor, read_only=True
         ):
             raise err("ERR-SYS-003", details={"application": str(application_id)})
         return await repo.list_invoices_by_application(
             db, application_id, status=status, limit=limit, offset=offset
         )
 
-    if not await _holds_payments_view(db, actor):
+    if not await _holds_payments_read(db, actor):
         raise err("ERR-ACL-001")
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
@@ -892,8 +941,14 @@ async def record_reversal(
        the invoice is still `paid`), plus a second one carrying **RI-10**
        («Разрешение активировано без оплаты», critical) when a permit already
        exists for this application in a LIVE status (`repo.
-       permit_exists_for_application` — a `revoked` or `expired` permit does
-       not raise it).
+       permit_organization_for_application` — a `revoked` or `expired` permit
+       does not raise it). Ruling #112: when RI-10 fires, `notify()` also
+       tells the permit's own `executor_head` (`permits.manage`'s holder) —
+       raising the indicator only, with nobody told, would leave a human
+       decision waiting on somebody happening to read the register.
+       Automatic suspension stays OUT of scope on purpose: a provider-side
+       glitch would then switch off an honest holder's permit with nobody in
+       the loop, which is the ruling's own reasoning, verbatim.
 
     **What it does NOT do, and why.** It does not move the invoice off `paid`
     and it does not move the application off `PAID`.
@@ -1012,13 +1067,16 @@ async def record_reversal(
     )
 
     # A LIVE permit for this application means money has gone back from
-    # something already issued — `tz/10`'s RI-10 verbatim. A read-only EXISTS,
+    # something already issued — `tz/10`'s RI-10 verbatim. A read-only SELECT,
     # never a call into `permits` (both modules are level 4): see
-    # `repo.permit_exists_for_application`'s own comment for the boundary
-    # argument, for which statuses count (a `revoked` or `expired` permit does
-    # NOT — an RI-10 on either is a false positive on a CRITICAL indicator),
-    # and for what drops if the trade is ever re-decided.
-    if await repo.permit_exists_for_application(db, invoice.application_id):
+    # `repo.permit_organization_for_application`'s own comment for the
+    # boundary argument, for which statuses count (a `revoked` or `expired`
+    # permit does NOT — an RI-10 on either is a false positive on a CRITICAL
+    # indicator), and for what drops if the trade is ever re-decided.
+    permit_organization_id = await repo.permit_organization_for_application(
+        db, invoice.application_id
+    )
+    if permit_organization_id is not None:
         await audit.log(
             db,
             action=REVERSAL_RECORD,
@@ -1034,3 +1092,35 @@ async def record_reversal(
             basis="a permit exists for an application whose payment was reversed",
             extra={"risk_indicator": RISK_INDICATOR_PERMIT_WITHOUT_PAYMENT},
         )
+
+        # Ruling #112: raising RI-10 tells the prosecutor eventually (via
+        # `oversight.sweep`'s harvest, on its own schedule); it tells nobody
+        # at the leshoz AT ALL. `permits.manage`'s holder — `executor_head`,
+        # who alone may suspend/resume/revoke — is who has to decide, so they
+        # are who is notified, directly, in this same transaction.
+        recipients = await auth_service.user_ids_with_permission(
+            db, _PERMIT_DECISION_PERMISSION, organization_id=permit_organization_id
+        )
+        if not recipients:
+            # Fails closed on the SIDE EFFECT, not on the record: an
+            # organization with nobody holding `permits.manage` is a data
+            # problem this function cannot fix, and the RI-10 row above
+            # still stands for the prosecutor to find.
+            logger.warning(
+                "payments.reversal_notify_no_recipient",
+                invoice_id=str(invoice.id),
+                organization_id=str(permit_organization_id),
+            )
+        for recipient_id in recipients:
+            await notifications_service.notify(
+                db,
+                event_code=events.PAYMENT_REVERSED,
+                recipient_user_id=recipient_id,
+                params={
+                    "invoice_number": invoice.number,
+                    "reversed_amount": reversed_amount,
+                    "reason": reason,
+                },
+                object_type="invoice",
+                object_id=invoice.id,
+            )

@@ -58,6 +58,7 @@ CHECK = "/api/v1/public/permits/check"
 CARD_FIELDS = {
     "found",
     "status",
+    "status_label",
     "valid_from",
     "valid_to",
     "organization",
@@ -597,3 +598,44 @@ def test_the_public_checks_access_log_line_is_dropped():
     assert installed[0].filter(record(f"{CHECK}?series=A&number=1")) is False
     assert installed[0].filter(record("/api/v1/permits/x/signatures")) is True
     assert installed[0].filter(record("/health/ready")) is True
+
+
+# --- the status in the reader's own language (stage 7.3, finding F6) ---------
+#
+# `status` is quoted from С12 in Uzbek Cyrillic and stays that way; so do
+# `organization` and `activity_type`, which come from the permit's SNAPSHOT and
+# are the document's own words in the document's own language
+# (`DOCUMENT_LANGUAGE`, `tz/13`: «на государственном языке»). What a citizen
+# scanning a QR on a Latin page could not read is the one field that is COMPUTED
+# rather than quoted — the status — so that one, and only that one, gains a
+# localized twin.
+
+
+async def test_the_card_carries_the_status_in_every_ui_language(
+    client: httpx.AsyncClient, active_permit: Permit
+):
+    body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
+    label = body["status_label"]
+    assert set(label) == {"uz_latn", "uz_cyrl", "ru"}
+    assert label["uz_latn"] == "amalda"
+    assert label["ru"] == "действует"
+
+
+async def test_the_localized_status_never_disagrees_with_the_quoted_one(
+    client: httpx.AsyncClient, active_permit: Permit
+):
+    """One source of truth: the Cyrillic member of the localized map IS
+    `status`. Two spellings of a legal status on one page is the defect a
+    localized twin could most easily introduce."""
+    body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
+    assert body["status_label"]["uz_cyrl"] == body["status"]
+
+
+def test_every_public_status_has_a_label_in_every_language():
+    """The same shape as `test_every_permit_status_has_a_decided_public_answer`:
+    a status without a localized label would fall through to a blank on the one
+    page the whole internet can reach."""
+    for status, label in service.PUBLIC_STATUS_LABELS_I18N.items():
+        assert set(label) == {"uz_latn", "uz_cyrl", "ru"}, status
+        assert all(text.strip() for text in label.values()), status
+    assert set(service.PUBLIC_STATUS_LABELS_I18N) == set(service.PUBLIC_STATUS_LABELS)
