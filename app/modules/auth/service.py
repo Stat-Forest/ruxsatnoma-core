@@ -50,9 +50,18 @@ _DUMMY_HASH = hash_password("dummy-timing-equalizer")
 
 
 async def issue_session(
-    db: AsyncSession, user: User, *, ip: str | None, user_agent: str | None
+    db: AsyncSession,
+    user: User,
+    *,
+    ip: str | None,
+    user_agent: str | None,
+    oneid_access_token: str | None = None,
 ) -> tuple[Session, str, str]:
-    """Create a session row; returns (row, raw token for the cookie, csrf token)."""
+    """Create a session row; returns (row, raw token for the cookie, csrf token).
+
+    `oneid_access_token` is supplied only by the OneID login and is what
+    `logout_session` hands to `one_log_out`; every other caller leaves it
+    None."""
     hours = await settings_store.get_int(db, "session_absolute_hours")
     token, csrf = new_token(), new_token()
     row = Session(
@@ -62,6 +71,7 @@ async def issue_session(
         expires_at=datetime.now(UTC) + timedelta(hours=hours),
         ip=ip,
         user_agent=user_agent,
+        oneid_access_token=oneid_access_token,
     )
     await repo.add(db, row)
     await audit.log(
@@ -86,9 +96,13 @@ async def login_or_create_by_pinfl(
     phone: str | None,
     ip: str | None,
     user_agent: str | None,
+    oneid_access_token: str | None = None,
 ) -> tuple[User, Session, str, str]:
     """Shared core of OneID/E-IMZO logins (ruling 5): any-role entry by pinfl,
-    auto-creating an applicant account on first contact."""
+    auto-creating an applicant account on first contact.
+
+    `oneid_access_token` reaches the session row so our logout can end the
+    OneID session too; the E-IMZO caller leaves it None."""
     user = await repo.get_user_by_pinfl(db, pinfl)
     now = datetime.now(UTC)
     if user is not None and user.status != "active":
@@ -127,7 +141,9 @@ async def login_or_create_by_pinfl(
     if snapshot is not None:
         user.oneid_profile = snapshot
     user.last_login_at = now
-    row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
+    row, token, csrf = await issue_session(
+        db, user, ip=ip, user_agent=user_agent, oneid_access_token=oneid_access_token
+    )
     await audit.log(
         db,
         action="user.login",
@@ -157,6 +173,7 @@ async def login_via_oneid(
         phone=profile.phone,
         ip=ip,
         user_agent=user_agent,
+        oneid_access_token=login.access_token,
     )
 
 

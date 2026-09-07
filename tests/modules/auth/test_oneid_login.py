@@ -151,3 +151,72 @@ async def test_provider_error_maps_to_502(db):
         )
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "ERR-INT-002"
+
+
+class _TokenIssuingOneId:
+    """A stand-in for the live adapter: the mock never has an access token,
+    because it never talks to a provider that could issue one."""
+
+    def __init__(self, token: str = "tok-live-1") -> None:
+        self.token = token
+
+    def authorize_url(self, *, state: str, redirect_uri: str, scope: str) -> str:
+        return f"{redirect_uri}?code=x&state={state}"
+
+    async def exchange_code(self, code: str):
+        from app.modules.integrations.adapters.oneid import OneIdLogin, OneIdProfile
+
+        return OneIdLogin(
+            profile=OneIdProfile(pinfl=code, full_name="TOKEN HOLDER"),
+            access_token=self.token,
+        )
+
+    async def logout(self, access_token: str | None) -> None:
+        return None
+
+
+async def test_the_session_keeps_the_access_token_for_one_log_out(db, monkeypatch):
+    """Stage 5.1 task 4: without it our logout closes only our own session and
+    the OneID session survives in the browser — on a shared computer the next
+    person's "sign in with OneID" lands in this citizen's cabinet."""
+    from app.modules.auth import service
+
+    monkeypatch.setattr(service, "get_oneid_adapter", lambda: _TokenIssuingOneId())
+    pinfl = unique_pinfl()
+    _user, row, _token, _csrf = await service.login_via_oneid(
+        db, code=pinfl, ip=None, user_agent=None
+    )
+    assert row.oneid_access_token == "tok-live-1"
+    # And it stayed out of the profile snapshot, which IS partly returned to
+    # the browser and read back for the director_registry basis.
+    assert "tok-live-1" not in str(_user.oneid_profile)
+
+
+async def test_a_mock_login_stores_no_token(db):
+    from app.modules.auth import service
+
+    _user, row, _t, _c = await service.login_via_oneid(
+        db, code=encode_mock_code(profile(unique_pinfl())), ip=None, user_agent=None
+    )
+    assert row.oneid_access_token is None
+
+
+async def test_the_access_token_is_in_no_response_body(db, engine, monkeypatch):
+    """`/auth/me` returns everything else about the session; a bearer token for
+    a state system must not be among it."""
+    from app.modules.auth import service
+
+    monkeypatch.setattr(service, "get_oneid_adapter", lambda: _TokenIssuingOneId())
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r1 = await client.get(f"{API}/auth/oneid/authorize")
+        state = client.cookies.get("oneid_state")
+        assert r1.status_code == 200 and state
+        r = await client.get(
+            f"{API}/auth/oneid/callback", params={"code": unique_pinfl(), "state": state}
+        )
+        assert r.status_code == 303
+        me = await client.get(f"{API}/auth/me")
+        assert me.status_code == 200
+        assert "tok-live-1" not in me.text
+        assert "oneid_access_token" not in me.text
