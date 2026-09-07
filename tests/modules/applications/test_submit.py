@@ -628,6 +628,41 @@ async def test_a_grazing_draft_with_no_herd_names_items_as_the_missing_field(
     assert refused.json()["error"]["details"]["missing"] == ["items"]
 
 
+async def test_a_missing_address_is_named_in_missing_and_resolved_by_filling_it_in(
+    db, applicant_client, applicant, draft_ready_for_submission
+) -> None:
+    """Ruling #113 (`tz/12` #20): `checks.missing_for_pricing` names `address`
+    exactly like any other incomplete field — a pre-check that reported
+    "ready" would otherwise be lying about the one thing task 5a's
+    `PATCH /auth/applicants/{id}/address` exists to fix.
+
+    The `applicant` fixture is deliberately named alongside `applicant_client`
+    and `draft_ready_for_submission`: pytest resolves all three to the SAME
+    row (fixtures are cached by name within one test), so nulling its address
+    here is nulling exactly the row `applicant_client` submits as.
+    """
+    applicant.address = None
+    await db.commit()
+    app_id = draft_ready_for_submission
+
+    refused = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["details"]["missing"] == ["address"]
+
+    filled = await applicant_client.patch(
+        f"/api/v1/auth/applicants/{applicant.id}/address",
+        json={"address": "Toshkent, Mirzo Ulug'bek tumani, 3-uy"},
+    )
+    assert filled.status_code == 200, filled.text
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 200, result.text
+
+
 async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfigured(
     applicant_client,
     draft_ready_for_submission,

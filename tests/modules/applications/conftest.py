@@ -95,13 +95,27 @@ def unique_pinfl() -> str:
     return f"1{uuid.uuid4().int % 10**13:013d}"
 
 
+# Ruling #113 (plan 07.4 task 5b): `checks.missing_for_pricing` now refuses a
+# submission whose `applicants.address` is blank. Every fixture below that
+# builds an `Applicant` a test then SUBMITS carries this, so the address gate
+# stays the property of the tests that name it (`test_submit.py`'s own
+# address-specific cases), not an incidental failure in every other one.
+TEST_APPLICANT_ADDRESS = "Toshkent shahri, Chilonzor tumani, 1-uy"
+
+
 @pytest.fixture
 async def applicant(db: AsyncSession) -> Applicant:
     """A fully registered individual applicant, owned by a real user —
     `applications.applicant_id`/`submitted_by_user_id` are both NOT NULL FKs, so a
     bare `uuid7()` would fail the FK before whatever the test means to exercise."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    row = Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+    row = Applicant(
+        kind="individual",
+        pinfl=user.pinfl,
+        name=user.full_name,
+        owner_user_id=user.id,
+        address=TEST_APPLICANT_ADDRESS,
+    )
     db.add(row)
     await db.flush()
     return row
@@ -190,7 +204,13 @@ async def other_applicant_client(db: AsyncSession):
     mistaken for the first applicant's."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
     db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+        Applicant(
+            kind="individual",
+            pinfl=user.pinfl,
+            name=user.full_name,
+            owner_user_id=user.id,
+            address=TEST_APPLICANT_ADDRESS,
+        )
     )
     await db.flush()
     async for client in _client_for_applicant(db, user):
@@ -301,7 +321,9 @@ async def legal_applicant(db: AsyncSession) -> Applicant:
     """A legal entity — `kind='legal'`, a STIR and NO `owner_user_id`: decision
     #9 gives a legal applicant no account of its own, so every application for
     it is filed by a representative."""
-    row = Applicant(kind="legal", stir=unique_stir(), name="ООО Тест")
+    row = Applicant(
+        kind="legal", stir=unique_stir(), name="ООО Тест", address=TEST_APPLICANT_ADDRESS
+    )
     db.add(row)
     await db.flush()
     return row
