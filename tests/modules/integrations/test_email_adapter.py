@@ -63,7 +63,11 @@ async def test_email_mode_real_requires_host_and_from():
 
 
 async def test_prod_forbids_the_email_mock():
-    with pytest.raises(ValueError):
+    # `match` is load-bearing: every other adapter here is configured
+    # completely, so this raise can only be the mocked-adapter guard. Without
+    # it the test passed on whichever guard happened to fire first — stage
+    # 5.1's OneID credential check did, once it existed.
+    with pytest.raises(ValueError, match="mock adapters"):
         Settings(
             app_env="prod",
             secret_key="x",
@@ -72,10 +76,16 @@ async def test_prod_forbids_the_email_mock():
             eimzo_mode="real",
             sms_mode="real",
             email_mode="mock",
+            oneid_client_id="forestry_uz",
+            oneid_client_secret="a-real-oneid-client-secret",
+            oneid_scope="forestry_uz",
+            oneid_redirect_uri="https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback",
             eskiz_email="a",
             eskiz_password="b",
             eskiz_sender="c",
             eskiz_callback_secret="d",
+            eskiz_callback_base_url="https://ruxsatnoma.example.uz",
+            public_base_url="https://ruxsatnoma.example.uz",
         )
 
 
