@@ -303,6 +303,64 @@ async def file_visible_via_announcement(
     return bool((await db.execute(stmt)).scalar_one())
 
 
+def landing_visibility_clause():
+    """What the anonymous `landing` site may read (`0037`): published, inside its
+    publish window, and explicitly flagged for the public site. Deliberately NOT
+    `announcement_visibility_clause` with some "anonymous role" — that clause asks
+    which audience the reader falls into, and an anonymous reader falls into none;
+    a row reaches the internet only because someone ticked the box for it."""
+    now = func.now()
+    return and_(
+        Announcement.public_on_landing.is_(True),
+        Announcement.status == "published",
+        Announcement.publish_from <= now,
+        or_(Announcement.publish_to.is_(None), Announcement.publish_to >= now),
+    )
+
+
+async def list_landing_announcements(
+    db: AsyncSession, *, offset: int, limit: int
+) -> tuple[list[Announcement], int]:
+    stmt = select(Announcement).where(landing_visibility_clause())
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Announcement.publish_from.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def get_landing_announcement(
+    db: AsyncSession, announcement_id: uuid.UUID
+) -> Announcement | None:
+    stmt = select(Announcement).where(
+        Announcement.id == announcement_id, landing_visibility_clause()
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def landing_file_attached(
+    db: AsyncSession, announcement_id: uuid.UUID, file_id: uuid.UUID
+) -> bool:
+    """True when `file_id` hangs off an announcement the public site may read. The
+    announcement id is part of the check on purpose: the anonymous download route
+    addresses a file THROUGH its announcement, so a file id alone is never enough."""
+    stmt = select(
+        exists(
+            select(1)
+            .select_from(AnnouncementFile)
+            .join(Announcement, Announcement.id == AnnouncementFile.announcement_id)
+            .where(
+                AnnouncementFile.announcement_id == announcement_id,
+                AnnouncementFile.file_id == file_id,
+                landing_visibility_clause(),
+            )
+        )
+    )
+    return bool((await db.execute(stmt)).scalar_one())
+
+
 async def count_active_media_files(db: AsyncSession, file_ids: list[uuid.UUID]) -> int:
     """One-SELECT existence+status check backing `file_ids` validation on
     create/patch — an archived file can't be (re)attached."""

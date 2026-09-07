@@ -182,7 +182,8 @@ class LivestockType(Base):
 class Announcement(Base):
     """Multilingual targeted announcements (tz/02: admin module owns them).
     audience: {"role_codes": [...], "region_ids": [...]} — a missing key or null
-    audience means no restriction on that axis (ruling 12)."""
+    audience means no restriction on that axis (ruling 12). `public_on_landing`
+    is the separate, narrower door: the anonymous public site (`0037`)."""
 
     __tablename__ = "announcements"
 
@@ -193,6 +194,10 @@ class Announcement(Base):
     publish_from: Mapped[datetime | None]
     publish_to: Mapped[datetime | None]
     status: Mapped[str] = mapped_column(default="draft")
+    # `0037`: the row is also readable by anonymous `landing` traffic. Only ever
+    # set on an announcement with no `audience` — a targeted notice is addressed
+    # at staff, and the service refuses the combination outright.
+    public_on_landing: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
@@ -200,6 +205,11 @@ class Announcement(Base):
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'published', 'archived')", name="status_valid"),
         Index("ix_announcements_status_window", "status", "publish_from"),
+        Index(
+            "ix_announcements_landing",
+            "publish_from",
+            postgresql_where=text("public_on_landing"),
+        ),
     )
 
 

@@ -12,8 +12,9 @@ from typing import Any
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files
+from app.core import files, storage
 from app.core.errors import err
+from app.core.models import MediaFile
 from app.core.schemas import LocalizedName, Page, PageParams
 from app.modules.admin import repo
 from app.modules.admin.models import Announcement
@@ -54,6 +55,7 @@ class AnnouncementAdminOut(BaseModel):
     title: dict[str, Any]
     body: dict[str, Any]
     audience: dict[str, Any] | None
+    public_on_landing: bool
     status: str
     publish_from: datetime | None
     publish_to: datetime | None
@@ -66,6 +68,7 @@ class AnnouncementCreateIn(BaseModel):
     title: LocalizedName
     body: LocalizedName
     audience: AudienceIn | None = None
+    public_on_landing: bool = False
     publish_from: datetime | None = None
     publish_to: datetime | None = None
     file_ids: list[uuid.UUID] | None = None
@@ -79,9 +82,24 @@ class AnnouncementPatchIn(BaseModel):
     title: LocalizedName | None = None
     body: LocalizedName | None = None
     audience: AudienceIn | None = None
+    public_on_landing: bool | None = None
     publish_from: datetime | None = None
     publish_to: datetime | None = None
     file_ids: list[uuid.UUID] | None = None
+
+
+class AnnouncementLandingOut(BaseModel):
+    """What the anonymous public site gets (`0037`). Narrower than
+    `AnnouncementOut`, which is already visibility-filtered but still an
+    authenticated shape: no `publish_to` (an internal scheduling detail — the
+    window is enforced by the query, not read by the reader) and files carry no
+    `content_type`-driven behaviour beyond what the download route decides."""
+
+    id: uuid.UUID
+    title: dict[str, Any]
+    body: dict[str, Any]
+    publish_from: datetime | None
+    files: list[FileRef]
 
 
 def _audience_dict(aud: AudienceIn | None) -> dict[str, Any] | None:
@@ -99,7 +117,26 @@ def _audience_dict(aud: AudienceIn | None) -> dict[str, Any] | None:
     return data or None
 
 
-_AUDITED_FIELDS = ("title", "body", "audience", "publish_from", "publish_to", "status")
+def _reject_targeted_public(audience: dict[str, Any] | None, public_on_landing: bool) -> None:
+    """An announcement cannot be both targeted and public (`0037`). `audience`
+    narrows a notice to a role or a region — staff, by construction — while
+    `public_on_landing` hands it to anonymous visitors, for whom no audience
+    matches. Silently ignoring the audience in that case is the defect this
+    codebase keeps producing in the other direction: the row would still LOOK
+    restricted in the admin list while the internet was reading it."""
+    if public_on_landing and audience:
+        raise err("ERR-VAL-001", details={"reason": "targeted_cannot_be_public"})
+
+
+_AUDITED_FIELDS = (
+    "title",
+    "body",
+    "audience",
+    "public_on_landing",
+    "publish_from",
+    "publish_to",
+    "status",
+)
 
 
 def _snapshot(ann: Announcement) -> dict[str, Any]:
@@ -153,6 +190,7 @@ async def _to_admin_out(db: AsyncSession, ann: Announcement) -> AnnouncementAdmi
         title=ann.title,
         body=ann.body,
         audience=ann.audience,
+        public_on_landing=ann.public_on_landing,
         status=ann.status,
         publish_from=ann.publish_from,
         publish_to=ann.publish_to,
@@ -192,6 +230,55 @@ async def get_public(
     return await _to_reader_out(db, ann)
 
 
+# --- Reader: the anonymous landing site (`0037`) -------------------------------------
+
+
+async def _to_landing_out(db: AsyncSession, ann: Announcement) -> AnnouncementLandingOut:
+    attached = await repo.list_announcement_files(db, ann.id)
+    return AnnouncementLandingOut(
+        id=ann.id,
+        title=ann.title,
+        body=ann.body,
+        publish_from=ann.publish_from,
+        files=[
+            FileRef(id=f.id, filename=f.filename, content_type=f.content_type) for f in attached
+        ],
+    )
+
+
+async def list_landing(db: AsyncSession, *, params: PageParams) -> Page[AnnouncementLandingOut]:
+    rows, total = await repo.list_landing_announcements(
+        db, offset=params.offset, limit=params.page_size
+    )
+    items = [await _to_landing_out(db, row) for row in rows]
+    return Page[AnnouncementLandingOut](
+        items=items, total=total, page=params.page, page_size=params.page_size
+    )
+
+
+async def get_landing(db: AsyncSession, *, announcement_id: uuid.UUID) -> AnnouncementLandingOut:
+    ann = await repo.get_landing_announcement(db, announcement_id)
+    if ann is None:
+        raise err("ERR-SYS-003", details={"announcement": str(announcement_id)})
+    return await _to_landing_out(db, ann)
+
+
+async def get_landing_file(
+    db: AsyncSession, *, announcement_id: uuid.UUID, file_id: uuid.UUID
+) -> tuple[MediaFile, bytes]:
+    """The anonymous attachment download. Deliberately not `files.get_readable`:
+    that one asks what an ACTOR may read, and there is no actor here. A 404 —
+    never a 403 — answers every miss, including a file that exists but hangs off
+    a different (or non-public) announcement: to the internet the two cases must
+    be indistinguishable."""
+    if not await repo.landing_file_attached(db, announcement_id, file_id):
+        raise err("ERR-SYS-003", details={"file": str(file_id)})
+    file = await db.get(MediaFile, file_id)
+    if file is None or file.status != "active":
+        raise err("ERR-SYS-003", details={"file": str(file_id)})
+    return file, await storage.get_object(file.storage_key)
+
+
 # --- Admin CRUD -----------------------------------------------------------------------
 
 
@@ -217,10 +304,13 @@ async def create(
 ) -> AnnouncementAdminOut:
     file_ids = _dedupe(data.file_ids or [])
     await _validate_file_ids(db, file_ids)
+    audience = _audience_dict(data.audience)
+    _reject_targeted_public(audience, data.public_on_landing)
     ann = Announcement(
         title=data.title.root,
         body=data.body.root,
-        audience=_audience_dict(data.audience),
+        audience=audience,
+        public_on_landing=data.public_on_landing,
         publish_from=data.publish_from,
         publish_to=data.publish_to,
         created_by=actor.id,
@@ -248,12 +338,23 @@ async def patch(
     fields = data.model_dump(exclude_unset=True)
     before = _snapshot(ann)
 
+    # Checked against the row as it WILL be, not as either half arrives: a patch
+    # may set the flag, the audience, or one of them against the other's stored
+    # value, and only the resulting pair says whether the combination is legal.
+    next_audience = _audience_dict(data.audience) if "audience" in fields else ann.audience
+    next_public = ann.public_on_landing
+    if fields.get("public_on_landing") is not None:
+        next_public = fields["public_on_landing"]
+    _reject_targeted_public(next_audience, next_public)
+
     if "title" in fields and data.title is not None:
         ann.title = data.title.root
     if "body" in fields and data.body is not None:
         ann.body = data.body.root
     if "audience" in fields:
-        ann.audience = _audience_dict(data.audience)
+        ann.audience = next_audience
+    if fields.get("public_on_landing") is not None:
+        ann.public_on_landing = next_public
     if "publish_from" in fields:
         ann.publish_from = fields["publish_from"]
     if "publish_to" in fields:
