@@ -22,7 +22,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -690,6 +690,17 @@ async def _readable_application(
     function's own refusal COMMITS an RI-12 trail before it raises (decision
     #40 ruling 2), and a forwarder who is legitimately owed this read must
     never earn a "denied" audit entry for asking.
+
+    **Ruling #110 (`tz/12` #26): a DRAFT is unsent mail — no staff caller reads
+    one they do not own, ever, zone or no zone.** Checked immediately after the
+    ownership/staff gates and BEFORE both ruling #107's carve-out and the zone
+    check: a DRAFT has no `assigned_org_id` (ruling 7) and cannot itself carry a
+    forward, so the two checks below it can never fire for one anyway — but a
+    ZONE-FREE staff caller (`Zone(None, None, None)`, e.g. `prosecutor`'s
+    `view_any`) would otherwise short-circuit `_assert_in_actor_zone` and read
+    every citizen's draft nationwide, the exact case «до подачи заявки в офисе
+    её читать некому» exists to close. No audit entry: this is an ownership
+    refusal, not a territorial one, and RI-12 stays reserved for the zone.
     """
     application = await repo.get_application(db, application_id)
     if application is None:
@@ -697,6 +708,8 @@ async def _readable_application(
     if application.applicant_id in await _own_applicant_ids(db, actor):
         return application
     if not await _holds_staff_read(db, actor):
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if application.status == INITIAL_STATUS:
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     if await _forwarded_here_by(db, application, actor=actor):
         return application
@@ -1139,6 +1152,15 @@ async def list_applications(
     live in the service layer, and a repo calling another module's service
     inverts the layering even where the boundary rule itself is satisfied
     (review I2).
+
+    **Ruling #110 excludes `INITIAL_STATUS` from the STAFF half only** —
+    otherwise this function's own "can never disagree with the card" promise
+    above would be broken by the very ruling that promise is supposed to
+    survive: `_readable_application` now 404s a staff caller on a DRAFT it
+    does not own, and a list that still named that DRAFT would be LEAKING
+    through the one door the card just closed. The owner's own scope
+    (`holder_ids`) is untouched — they see every status of their own,
+    DRAFT included, throughout.
     """
     scope: list[Any] = []
     holder_ids = await _own_applicant_ids(db, actor)
@@ -1146,11 +1168,14 @@ async def list_applications(
         scope.append(Application.applicant_id.in_(holder_ids))
     if await _holds_staff_read(db, actor):
         scope.append(
-            zone_filter(
-                zone_of(actor),
-                region_col=Organization.region_id,
-                district_col=Organization.district_id,
-                organization_col=Organization.id,
+            and_(
+                Application.status != INITIAL_STATUS,
+                zone_filter(
+                    zone_of(actor),
+                    region_col=Organization.region_id,
+                    district_col=Organization.district_id,
+                    organization_col=Organization.id,
+                ),
             )
         )
     if not scope:

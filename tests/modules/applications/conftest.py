@@ -37,7 +37,7 @@ from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
 from app.modules.applications import service as applications_service
-from app.modules.applications.permissions import APPLICATIONS_REVIEW
+from app.modules.applications.permissions import APPLICATIONS_REVIEW, APPLICATIONS_VIEW_ANY
 from app.modules.auth.models import Applicant, Representation, Role, RolePermission, User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.norms import calculator
@@ -264,6 +264,19 @@ async def other_zone_hodim_client(db: AsyncSession, other_leshoz: Organization):
     nothing else, so a test that passes for one and fails for the other can
     only be about territory."""
     async for client in _client_for(db, APPLICATIONS_REVIEW, organization_id=other_leshoz.id):
+        yield client
+
+
+@pytest.fixture
+async def prosecutor_client(db: AsyncSession):
+    """Zone-free, `applications.view_any` alone — the migration-0015 shape of
+    `prosecutor`. Ruling #110's own reasoning names this actor specifically:
+    without the DRAFT block sitting AHEAD of the zone check in
+    `_readable_application`, a republic-wide `view_any` holder would
+    short-circuit `_assert_in_actor_zone` entirely and read every citizen's
+    still-being-filled-in draft nationwide — the zone rule alone cannot stop
+    an actor who has no zone to be outside of."""
+    async for client in _client_for(db, APPLICATIONS_VIEW_ANY):
         yield client
 
 
