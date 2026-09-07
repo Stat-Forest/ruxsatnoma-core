@@ -124,6 +124,8 @@ def _register_providers() -> None:
     silently double and then triple, and the failure would read as test pollution
     rather than as a registration bug — passing whenever a file was run alone.
     """
+    from app.modules.admin import open_work as admin_open_work
+    from app.modules.applications import service as applications_service
     from app.modules.gis import service as gis_service
     from app.modules.norms import service as norms_service
     from app.modules.permits import service as permits_service
@@ -132,3 +134,16 @@ def _register_providers() -> None:
         gis_service.OCCUPANCY_PROVIDERS.append(permits_service.occupancy_provider)
     if permits_service.load_provider not in norms_service.LOAD_PROVIDERS:
         norms_service.LOAD_PROVIDERS.append(permits_service.load_provider)
+
+    # `admin` (level 1) may not read `applications` (3), and tz/04 С23 makes
+    # deletion/archival conditional on what it knows (findings F4/F5, plan
+    # 07.6). Registered here for the reason every provider above it is: put
+    # in `main.py`, the standalone worker process would answer "holds
+    # nothing" on every check, which is the exact defect this seam exists to
+    # close. `inspections` registers its own OPEN_WORK_PROVIDERS entry
+    # separately (plan 07.6 track B) — not from this file's stage-7.6 commit,
+    # which only ever ran with `applications` on this branch.
+    if applications_service.open_work_provider not in admin_open_work.OPEN_WORK_PROVIDERS:
+        admin_open_work.OPEN_WORK_PROVIDERS.append(applications_service.open_work_provider)
+    if applications_service.open_work_provider_for_org not in admin_open_work.ORG_WORK_PROVIDERS:
+        admin_open_work.ORG_WORK_PROVIDERS.append(applications_service.open_work_provider_for_org)

@@ -177,6 +177,20 @@ async def count_role_holders(db: AsyncSession, role_id: uuid.UUID) -> int:
     return result.scalar_one()
 
 
+async def count_active_users_in_org(db: AsyncSession, organization_id: uuid.UUID) -> int:
+    """Users with `status='active'` whose `organization_id` is this one —
+    `admin.service.archive_organization`'s own read (finding F5, plan 07.6
+    task 3): `admin` may call `auth` (both level 1, design/01), the same way
+    every other check in `users_service.py` already does through this file
+    rather than a raw `select(User)` of its own."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(User)
+        .where(User.organization_id == organization_id, User.status == "active")
+    )
+    return result.scalar_one()
+
+
 async def roles_with_stats(db: AsyncSession) -> list[tuple[Role, int, list[str]]]:
     """Every role with its holder count (non-deleted users) and permission codes, in
     one query (LEFT JOIN + array_agg) — avoids an N+1 across the admin roles list
