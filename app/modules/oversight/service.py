@@ -2,19 +2,21 @@
 rule 1). Two jobs live here: (1) `record_event`, the bus subscriber that turns
 the five events `applications`/`payments` already publish into the
 accumulating `oversight_events` stream, and (2) the RI harvester/detector
-(`harvest`, `sweep_overlapping_permits`) — see `models.py`'s module docstring
-for why most codes are a HARVEST of an existing tag, not a fresh detector.
+(`harvest`, `sweep_overlapping_permits`, `sweep_long_active_without_
+inspection`) — see `models.py`'s module docstring for why most codes are a
+HARVEST of an existing tag, not a fresh detector.
 
 The read surface (`list_risk_indicators`/`list_events`) is С22's prosecutor
 window: zone-scoped (`app/core/abac.py::zone_filter`, fails closed) and
 audited on every call (`tz/03`: "каждый просмотр/поиск/экспорт — в аудит")."""
 
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.abac import zone_of
 from app.core.events import Event
 from app.core.schemas import PageParams
@@ -34,6 +36,18 @@ from app.modules.oversight.models import (
 # arbitrary, the same role a hard-coded UUID constant plays elsewhere in this
 # codebase (e.g. `permits`' own fixed template ids).
 _RI03_NAMESPACE = uuid.UUID("0198f000-0000-7000-8000-0000000000ff")
+
+# RI-14's own namespace, same role and same reasoning as RI-03's above — a
+# permit either does or does not qualify at sweep time, so keying on the
+# permit's own id (rather than a source audit_log row, which does not exist
+# for a direct detector) is what makes a re-run idempotent.
+_RI14_NAMESPACE = uuid.UUID("0198f000-0000-7000-8000-0000000000fe")
+
+# Ruling #104: RI-14 "long active with no inspection" — the setting
+# `sweep_long_active_without_inspection` reads each run (60s cache,
+# `settings_store`'s own TTL), never a module constant, so the threshold can
+# be tuned without a deploy.
+RI14_THRESHOLD_SETTING = "oversight_ri14_no_inspection_days"
 
 OVERSIGHT_VIEW_ACTION = "oversight.view"
 
@@ -180,12 +194,63 @@ async def sweep_overlapping_permits(db: AsyncSession) -> int:
     return written
 
 
+async def sweep_long_active_without_inspection(db: AsyncSession) -> int:
+    """RI-14 (ruling #104): an `active` permit running `oversight_ri14_no_
+    inspection_days` (default 30 — the strictest of three options Oybek was
+    offered) with no `inspection_acts` row at all. No existing tag raises this
+    either, the same reasoning `sweep_overlapping_permits` gives for RI-03: a
+    direct detector, not a harvest.
+
+    The threshold is read fresh every sweep (`settings_store.get_int`, 60s
+    cache) rather than frozen into a constant — ruling #104's own text warns
+    that 30 fires often and an indicator that always fires stops being read,
+    so this has to be tunable without a deploy once real inspection volume
+    can judge it.
+
+    Idempotent the same way RI-03 is: `idempotency_key` is a deterministic
+    `uuid5` of the permit's own id (there is no source `audit_log` row for a
+    direct detector to key off), so a permit already carrying an RI-14 row
+    is skipped on every later sweep — it does not re-fire, and it is not
+    cleared if an inspection arrives afterwards; the row is history, not a
+    live flag."""
+    threshold_days = await settings_store.get_int(db, RI14_THRESHOLD_SETTING)
+    cutoff = datetime.now(UTC) - timedelta(days=threshold_days)
+    permits = await repo.long_active_permits_without_inspection(db, cutoff=cutoff)
+    written = 0
+    for permit in permits:
+        key = uuid.uuid5(_RI14_NAMESPACE, str(permit.id))
+        details = {
+            "permit_id": str(permit.id),
+            "issued_at": permit.issued_at.isoformat() if permit.issued_at else None,
+            "threshold_days": threshold_days,
+        }
+        description = (
+            f"Permit {permit.id} has been active since "
+            f"{permit.issued_at.isoformat() if permit.issued_at else '?'} "
+            f"with no inspection act on record ({threshold_days}+ days)"
+        )
+        ok = await repo.insert_risk_indicator_if_new(
+            db,
+            code="RI-14",
+            level=RI_LEVEL_BY_CODE["RI-14"],
+            object_type="permit",
+            object_id=permit.id,
+            description=description,
+            details=details,
+            idempotency_key=key,
+        )
+        if ok:
+            written += 1
+    return written
+
+
 async def sweep(db: AsyncSession) -> dict[str, int]:
     """The one job `app/workers/jobs.py` calls (5-minute interval, plan ruling
-    c) — harvest, then the one direct detector."""
+    c) — harvest, then the two direct detectors."""
     return {
         "harvested": await harvest(db),
         "overlaps_raised": await sweep_overlapping_permits(db),
+        "long_active_raised": await sweep_long_active_without_inspection(db),
     }
 
 
