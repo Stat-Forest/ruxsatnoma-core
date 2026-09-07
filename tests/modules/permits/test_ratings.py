@@ -1,14 +1,25 @@
 """One rating per permit, 1-5, by its owner, after issuance (rulings #140-#142).
 
 Task 3 laid the table and the read permission; Task 4 (below) adds the write —
-`POST /permits/{id}/rating` — and folds the answer into the permit card.
+`POST /permits/{id}/rating` — and folds the answer into the permit card. Task 5
+(further below) adds the read side the Agency and each leshoz use: the zone-
+scoped aggregates and the anonymous comment feed.
 """
 
+import uuid
+
+import httpx
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.models import MediaFile
+from app.modules.admin.models import Organization
+from app.modules.gis.models import GisLayer
 from app.modules.permits.models import Permit, PermitRating
+from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+from tests.modules.permits.conftest import Signer, make_permit_on_contour
 
 
 async def test_score_outside_one_to_five_is_refused_by_the_database(
@@ -110,3 +121,127 @@ async def test_score_zero_and_six_are_refused_before_the_database_sees_them(
             f"/api/v1/permits/{active_permit.id}/rating", json={"score": bad}
         )
         assert response.status_code == 422
+
+
+# --- Task 5: the Agency's aggregates, without the author ----------------------
+
+
+@pytest.fixture
+def ratings_client(head_client: Signer) -> httpx.AsyncClient:
+    """`executor_head` of `leshoz` — migration 0039 grants `ratings.view` to
+    the ROLE (`test_the_prosecutor_holds_the_new_read_permission` above proves
+    the same grant for `prosecutor`), so `head_client`'s own client is exactly
+    a `ratings.view` holder zoned to `leshoz`."""
+    return head_client.client
+
+
+@pytest.fixture
+def other_org_ratings_client(other_org_head_client: Signer) -> httpx.AsyncClient:
+    """`executor_head` of a DIFFERENT leshoz: same role, same grant, a
+    different zone (lesson: zone scoping is not a permission check)."""
+    return other_org_head_client.client
+
+
+@pytest.fixture
+def staff_client(hodim_client: httpx.AsyncClient) -> httpx.AsyncClient:
+    """`executor_staff` — holds `permits.issue` only. Migration 0039 grants
+    `ratings.view` to `central_admin`, `leadership`, `executor_head` and
+    `prosecutor`; this role is none of the four, so it is the route's own
+    closed-without-the-permission case."""
+    return hodim_client
+
+
+@pytest.fixture
+async def seeded_ratings(
+    db: AsyncSession,
+    leshoz: Organization,
+    contours_layer: GisLayer,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+    haymaking_activity_id: uuid.UUID,
+) -> list[PermitRating]:
+    """Three ratings on THIS test's own `leshoz` — a fresh organization every
+    run (`leshoz`'s own fixture builds one, never reuses another test's), so
+    the zone-scoped assertions below cannot be satisfied by a row a different
+    test left on this shared, persistent database (lesson: "the test DB is
+    shared, persistent and never empty"). Scores 3, 4, 5 average to exactly
+    4.00; two activity types so `by_activity_type` has more than one group to
+    prove it groups at all.
+
+    Inserted directly through the ORM, never through `POST /permits/{id}/
+    rating`: that route enforces "the holder, once" (ruling #140), which is
+    not what this fixture exists to prove. Only flushed, not committed —
+    `ratings_client`'s own `_commit_pending_before_requests` hook (built into
+    `head_client`) commits everything pending on `db` right before the test's
+    first request fires, whatever order pytest builds the fixtures in.
+    """
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    ratings = []
+    for activity_type_id, score in (
+        (grazing_activity_id, 3),
+        (haymaking_activity_id, 4),
+        (grazing_activity_id, 5),
+    ):
+        permit = await make_permit_on_contour(
+            db,
+            contour=contour,
+            version_id=version.id,
+            org=leshoz,
+            activity_type_id=activity_type_id,
+            status="active",
+        )
+        rating = PermitRating(permit_id=permit.id, score=score, comment=f"score {score}")
+        db.add(rating)
+        ratings.append(rating)
+    await db.flush()
+    return ratings
+
+
+async def test_summary_averages_by_organization_and_activity(
+    ratings_client, seeded_ratings
+) -> None:
+    body = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings/summary",
+            params={"period_from": "2026-01-01", "period_to": "2026-12-31"},
+        )
+    ).json()
+    assert body["count"] == 3
+    assert body["avg_score"] == "4.00"
+    assert {row["organization_id"] for row in body["by_organization"]}
+    assert {row["activity_type_id"] for row in body["by_activity_type"]}
+
+
+async def test_comments_never_name_the_author(ratings_client, seeded_ratings) -> None:
+    """Ruling #141. Asserted on the serialized body, not on the schema: a field
+    added to a nested model later would pass a field-name check and still leak."""
+    raw = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings",
+            params={"period_from": "2026-01-01", "period_to": "2026-12-31"},
+        )
+    ).text
+    for forbidden in ("applicant", "user_id", "full_name", "pinfl", "permit_number", "permit_id"):
+        assert forbidden not in raw, f"ruling #141: {forbidden} reached the comments feed"
+
+
+async def test_a_leshoz_sees_only_its_own(other_org_ratings_client, seeded_ratings) -> None:
+    body = (
+        await other_org_ratings_client.get(
+            "/api/v1/admin/ratings/summary",
+            params={"period_from": "2026-01-01", "period_to": "2026-12-31"},
+        )
+    ).json()
+    assert body["count"] == 0
+
+
+async def test_the_route_is_closed_without_the_permission(staff_client) -> None:
+    assert (
+        await staff_client.get(
+            "/api/v1/admin/ratings/summary",
+            params={"period_from": "2026-01-01", "period_to": "2026-12-31"},
+        )
+    ).status_code == 403

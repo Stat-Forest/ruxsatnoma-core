@@ -2781,3 +2781,92 @@ async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str
         {"organization_id": org_id, "active_count": count, "active_area_ha": area}
         for org_id, count, area in rows
     ]
+
+
+# --- Task 5: the Agency's aggregates, without the author (ruling #142) --------
+
+
+def _validate_rating_period(period_from: date, period_to: date) -> None:
+    """Fail-closed before any query runs, the same guard `dashboard.service.
+    _validate_period` gives its own two callers (lesson: a reversed period
+    silently inverts a range predicate and hides the rows it should find)."""
+    if period_to < period_from:
+        raise err("ERR-VAL-001", details={"reason": "period_reversed"})
+
+
+async def ratings_summary(
+    db: AsyncSession,
+    *,
+    actor: User,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> dict[str, Any]:
+    """`GET /admin/ratings/summary` (`ratings.view`): the overall average and
+    count, plus the same pair broken down by organization and by activity
+    type — all three zone-scoped to the actor's own zone
+    (`repo._ratings_conditions`, all three axes), narrowable further by the
+    two optional filters."""
+    _validate_rating_period(period_from, period_to)
+    actor_zone = zone_of(actor)
+    avg_score, count = await repo.ratings_overall(
+        db,
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    by_organization = await repo.ratings_by_organization(
+        db,
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    by_activity_type = await repo.ratings_by_activity_type(
+        db,
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    return {
+        "avg_score": avg_score,
+        "count": count,
+        "by_organization": [
+            {"organization_id": row[0], "name": row[1], "avg_score": row[2], "count": row[3]}
+            for row in by_organization
+        ],
+        "by_activity_type": [
+            {"activity_type_id": row[0], "name": row[1], "avg_score": row[2], "count": row[3]}
+            for row in by_activity_type
+        ],
+    }
+
+
+async def list_rating_comments(
+    db: AsyncSession,
+    *,
+    actor: User,
+    params: PageParams,
+    period_from: date,
+    period_to: date,
+) -> tuple[list[dict[str, Any]], int]:
+    """`GET /admin/ratings` (`ratings.view`): one page of the anonymous
+    comment feed — date, service, leshoz, score, text, and nothing that names
+    who rated (ruling #141; `repo.rating_comments`'s own docstring lists the
+    closed column set)."""
+    _validate_rating_period(period_from, period_to)
+    rows, total = await repo.rating_comments(
+        db,
+        actor_zone=zone_of(actor),
+        period_from=period_from,
+        period_to=period_to,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+    return [dict(row._mapping) for row in rows], total

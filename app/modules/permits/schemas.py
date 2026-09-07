@@ -402,3 +402,55 @@ class PublicCheckCard(BaseModel):
     activity_type: str
     signatures_valid: bool
     holder: str
+
+
+# --- Task 5: the Agency's aggregates, without the author (ruling #142) --------
+#
+# `avg_score` fields carry NO custom `field_serializer`, deliberately unlike
+# `PermitOut`'s `_trim_decimal`: `repo.py` rounds to two decimal places IN SQL
+# (`ROUND(AVG(score), 2)`), so the `Decimal` that comes back already has scale
+# 2 and pydantic's own default serialization prints it as `"4.00"`, not `"4"`
+# — trimming trailing zeros here would throw away the very rounding the SQL
+# did.
+
+
+class RatingsBreakdownRow(BaseModel):
+    """One group of `GET /admin/ratings/summary`'s two breakdowns — exactly
+    one of `organization_id`/`activity_type_id` is set, depending on which
+    list this row sits in."""
+
+    organization_id: uuid.UUID | None = None
+    activity_type_id: uuid.UUID | None = None
+    name: dict[str, Any]
+    avg_score: Decimal
+    count: int
+
+
+class RatingsSummaryOut(BaseModel):
+    """`GET /admin/ratings/summary` — the overall average and count over the
+    caller's zone and the given period, plus the same pair broken down by
+    organization and by activity type. `avg_score`/`count` are both null-safe:
+    zero ratings in scope reads as `avg_score: null, count: 0`, never a 404 or
+    a division-by-zero — a summary has no row to refuse."""
+
+    avg_score: Decimal | None
+    count: int
+    by_organization: list[RatingsBreakdownRow]
+    by_activity_type: list[RatingsBreakdownRow]
+
+
+class RatingCommentRow(BaseModel):
+    """`GET /admin/ratings` — one row of the anonymous comment feed.
+
+    Ruling #141: date, service, leshoz, score, text. No applicant, no permit
+    number — anything that identifies WHO rated is absent by construction, not
+    filtered out at render time. `test_comments_never_name_the_author` asserts
+    this on the SERIALIZED body rather than on this class, on purpose: a field
+    added here later would pass a field-name check and still leak.
+    """
+
+    created_at: datetime
+    score: int
+    comment: str | None
+    organization_name: dict[str, Any]
+    activity_type_name: dict[str, Any]
