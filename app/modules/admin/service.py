@@ -16,8 +16,9 @@ from app.core.errors import err
 from app.core.models import SystemSetting
 from app.core.time import business_today
 from app.modules.admin import repo
-from app.modules.admin.models import Classifier, ClassifierItem, Organization, Region
+from app.modules.admin.models import ActivityType, Classifier, ClassifierItem, Organization, Region
 from app.modules.admin.schemas import (
+    ActivityTypePatch,
     ClassifierIn,
     ClassifierItemIn,
     ClassifierItemPatch,
@@ -355,6 +356,60 @@ async def update_classifier_item(
         new_value=_item_snapshot(item),
     )
     return item
+
+
+_ACTIVITY_TYPE_AUDITED_FIELDS = (
+    "code",
+    "name",
+    "description",
+    "quantity_unit",
+    "sort_order",
+    "status",
+    "processing_days",
+)
+
+
+def _activity_type_snapshot(activity_type: ActivityType) -> dict[str, Any]:
+    return {field: getattr(activity_type, field) for field in _ACTIVITY_TYPE_AUDITED_FIELDS}
+
+
+async def _activity_type_or_404(db: AsyncSession, activity_type_id: uuid.UUID) -> ActivityType:
+    activity_type = await repo.get_activity_type(db, activity_type_id)
+    if activity_type is None:
+        raise err("ERR-SYS-003", details={"activity_type": str(activity_type_id)})
+    return activity_type
+
+
+async def update_activity_type(
+    db: AsyncSession, *, activity_type_id: uuid.UUID, patch: ActivityTypePatch, actor: User
+) -> ActivityType:
+    """Ruling #139: the hard catalog's one edit — presentation and the on/off switch,
+    never `code`/`quantity_unit`. Mirrors `update_classifier_item`: an explicit null for
+    `name` is a no-op (the column is NOT NULL, same reasoning as there), while `description`
+    is genuinely nullable (ruling #138) and an explicit null clears it back to NULL."""
+    activity_type = await _activity_type_or_404(db, activity_type_id)
+    before = _activity_type_snapshot(activity_type)
+    fields = patch.model_dump(exclude_unset=True)
+    if "name" in fields and patch.name is not None:
+        activity_type.name = patch.name.root
+    if "description" in fields:
+        activity_type.description = (
+            patch.description.root if patch.description is not None else None
+        )
+    for field in ("processing_days", "sort_order", "status"):
+        if field in fields:
+            setattr(activity_type, field, fields[field])
+    await db.flush()
+    await audit.log(
+        db,
+        action="activity_type.update",
+        user_id=actor.id,
+        object_type="activity_type",
+        object_id=activity_type.id,
+        old_value=before,
+        new_value=_activity_type_snapshot(activity_type),
+    )
+    return activity_type
 
 
 async def archive_classifier_item(

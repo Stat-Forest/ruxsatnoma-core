@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import date
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -71,6 +71,18 @@ class ActivityTypeOut(BaseModel):
     status: str
     description: dict[str, Any] | None
     processing_days: int
+
+
+class ActivityTypePatch(BaseModel):
+    """Ruling #139: presentation and the on/off switch. Never `code` (tariffs and
+    the calculator resolve by it) and never `quantity_unit` (a CHECK-constrained
+    enum the price arithmetic depends on)."""
+
+    name: LocalizedName | None = None
+    description: LocalizedName | None = None
+    processing_days: int | None = Field(default=None, gt=0)
+    sort_order: int | None = None
+    status: Literal["active", "archived"] | None = None
 
 
 class LivestockTypeOut(BaseModel):

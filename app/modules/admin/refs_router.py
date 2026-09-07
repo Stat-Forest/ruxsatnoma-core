@@ -13,15 +13,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
 from app.modules.admin import repo, service
+from app.modules.admin.permissions import CLASSIFIERS_MANAGE
 from app.modules.admin.schemas import (
     ActivityTypeOut,
+    ActivityTypePatch,
     ClassifierItemOut,
     DistrictOut,
     LivestockTypeOut,
     OrganizationOut,
     RegionOut,
 )
-from app.modules.auth.deps import get_current_user
+from app.modules.auth.deps import get_current_user, require_permission
+from app.modules.auth.models import User
 
 router = APIRouter(prefix="/refs", tags=["refs"], dependencies=[Depends(get_current_user)])
 
@@ -67,6 +70,22 @@ async def organizations(
 @router.get("/activity-types", response_model=list[ActivityTypeOut])
 async def activity_types(db: Annotated[AsyncSession, Depends(get_db)]):
     return await repo.list_activity_types(db)
+
+
+@router.patch("/activity-types/{activity_type_id}", response_model=ActivityTypeOut)
+async def update_activity_type(
+    activity_type_id: uuid.UUID,
+    body: ActivityTypePatch,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(CLASSIFIERS_MANAGE))],
+) -> ActivityTypeOut:
+    """Ruling #139: the only write the hard catalog offers. `admin.classifiers.manage`,
+    the same grant the other reference edits carry — this router's own module-level
+    `get_current_user` dependency is a read gate and is not enough for a write."""
+    row = await service.update_activity_type(
+        db, activity_type_id=activity_type_id, patch=body, actor=actor
+    )
+    return ActivityTypeOut.model_validate(row, from_attributes=True)
 
 
 @router.get("/livestock-types", response_model=list[LivestockTypeOut])
