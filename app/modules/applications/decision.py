@@ -98,15 +98,11 @@ REJECTION_CLASSIFIER_CODE = "rejection_reasons"
 # requires, so uz_latn is now the one every row has (uz_cyrl is optional).
 FALLBACK_LANGUAGE = "uz_latn"
 
-# What a forward writes into the bounce row's `reason_text` (controller minor 4).
-# A STABLE TOKEN, never a sentence: `reason_text` surfaces on the
-# citizen-visible timeline, and this project keeps user-facing wording in
-# versioned `notification_templates` rows an admin owns, never in code — an
-# English sentence in an Uzbek/Russian government UI is a defect the front end
-# cannot fix. WHICH ceilings were exceeded, and by how much, live in the audit
-# entry's `new_value`, which is where that detail belongs. 3.9b's return and
-# request-info reasons inherit the same convention.
-FORWARD_REASON = "role_limit_exceeded"
+# `FORWARD_REASON` (what a forward writes into the bounce row's `reason_text`)
+# now lives in `service.py`, read back here as `flow.FORWARD_REASON` — ruling
+# #107's `_readable_application` needs the identical string and this module
+# cannot be imported from there (`decision.py` imports `service.py`, not the
+# reverse). See its docstring there for the reasoning that used to sit here.
 
 
 def _over_limit(
@@ -322,9 +318,9 @@ async def _forward(
     # still owed: the bounce has to be visible on the timeline WITH its reason,
     # and `application_assignments.reason` is CHECK-constrained to
     # auto/absence/manual and carries no free text, so `reason_text` here is the
-    # only place the reason can live — as `FORWARD_REASON`, a stable token, for
-    # the reason that constant states. A reader must not mistake this row for a
-    # transition; the equal statuses are the tell.
+    # only place the reason can live — as `flow.FORWARD_REASON`, a stable
+    # token, for the reason that constant states. A reader must not mistake
+    # this row for a transition; the equal statuses are the tell.
     await repo.add_status_history(
         db,
         ApplicationStatusHistory(
@@ -332,7 +328,7 @@ async def _forward(
             from_status=application.status,
             to_status=application.status,
             changed_by=actor.id,
-            reason_text=FORWARD_REASON,
+            reason_text=flow.FORWARD_REASON,
         ),
     )
     await db.refresh(application)
@@ -355,7 +351,7 @@ async def _forward(
             "amount": flow._json_safe(amount),
             "requested_area_ha": flow._json_safe(area),
         },
-        basis=FORWARD_REASON,
+        basis=flow.FORWARD_REASON,
     )
     return parent.id
 

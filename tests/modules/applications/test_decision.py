@@ -331,16 +331,26 @@ async def test_the_forward_is_visible_on_the_timeline_as_a_bounce_with_its_reaso
 
 
 async def test_a_zone_scoped_head_forwards_too(
-    db: AsyncSession, zoned_limited_executor_head_client, application_in_review
+    db: AsyncSession,
+    zoned_limited_executor_head_client,
+    executor_head_client,
+    application_in_review,
 ) -> None:
     """The PRODUCTION shape — `executor_head` with `organization_id` set to its
     own leshoz, which is what migration 0015 assumes. Its zone-free sibling is a
-    testing convenience (it can still read the timeline afterwards); this proves
-    the forward is not an artefact of that convenience.
+    testing convenience (it can still read the timeline regardless of any zone
+    rule); this proves the forward is not an artefact of that convenience.
 
-    Asserted through `db`, not `GET /timeline`: the forward has moved the
-    application into the parent's zone, so this head is now correctly told 404
-    on its own escalation — the product question the review is sending to 3.9b.
+    **Ruling #107** (`tz/12` #27, answered after this test first shipped
+    asserting the OPPOSITE — the review's own "product question the review is
+    sending to 3.9b"): the forward moves `assigned_org_id` into the parent's
+    zone, but this head FORWARDED this exact application, so `GET /timeline`
+    now succeeds where it used to 404 — the citizen's office can still say how
+    the case they ran ended. The DECISION stays with whoever it was escalated
+    to: a second `POST /approve` from the same forwarder is still refused, and
+    `executor_head_client` — an unrelated head sitting in the SAME leshoz who
+    never touched this application — gets nothing either, because the read
+    rule is keyed on WHO forwarded, never on the zone alone.
     """
     from app.modules.applications import repo
 
@@ -356,10 +366,18 @@ async def test_a_zone_scoped_head_forwards_too(
     assert str(application.assigned_org_id) == parent_id
     assert application.assigned_user_id is None
 
-    gone = await zoned_limited_executor_head_client.get(
+    still_readable = await zoned_limited_executor_head_client.get(
         f"/api/v1/applications/{application_in_review}/timeline"
     )
-    assert gone.status_code == 404, "out of its zone once escalated — 3.9b's product question"
+    assert still_readable.status_code == 200, "ruling #107: the forwarder keeps read access"
+
+    still_refused = await _decide(
+        zoned_limited_executor_head_client, application_in_review, "approve"
+    )
+    assert still_refused.status_code == 404, "read access is not decision access"
+
+    stranger = await executor_head_client.get(f"/api/v1/applications/{application_in_review}")
+    assert stranger.status_code == 404, "same leshoz, but never forwarded this one — still refused"
 
 
 async def test_a_ceiling_equal_to_the_amount_does_not_forward(

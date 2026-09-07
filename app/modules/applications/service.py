@@ -100,6 +100,16 @@ APPLICATION_UPDATE = "application.update"
 # территориальных полномочий», High and immediate — with no way to fire on a
 # read at all. See `_readable_application`.
 APPLICATION_READ = "application.read"
+# What `decision._forward` writes into the bounce row's `reason_text`
+# (controller minor 4) — defined HERE, not in `decision.py`, because ruling
+# #107's `_readable_application` below needs the same string and `decision.py`
+# imports THIS module (`as flow`), never the other way: `decision.py` reads it
+# back as `flow.FORWARD_REASON`, exactly like `STALE_PACKAGE_REASON`/
+# `ASSIGNMENT_MANUAL` below. A STABLE TOKEN, never a sentence — `reason_text`
+# surfaces on the citizen-visible timeline, and this project keeps user-facing
+# wording in versioned `notification_templates` rows an admin owns, never in
+# code.
+FORWARD_REASON = "role_limit_exceeded"
 # Task 4's three. A pre-check writes `application_checks` rows, so it is a
 # state-changing action and audits like one — once, here, never a row per check
 # (`checks.run_all` deliberately audits nothing of its own: task 5's `submit`
@@ -612,6 +622,39 @@ async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
     return await auth_service.own_applicant_ids(db, actor.id)
 
 
+async def _forwarded_here_by(db: AsyncSession, application: Application, *, actor: User) -> bool:
+    """Ruling #107 (`tz/12` #27): whether `actor` is the one who forwarded
+    THIS application up the ladder, at any level — the one case
+    `_readable_application` grants READ past a zone that has since moved on.
+
+    `_effective_organization` tracks `assigned_org_id`, and `decision._forward`
+    MOVES it to the parent the moment it escalates — so the head who ran an
+    over-limit case loses it from their own zone entirely the instant they
+    escalate it, and cannot see how the case they ran ended, though the
+    citizen still calls the office that took the filing. The decision itself
+    stays with whoever it was escalated TO; this grants nothing but the read.
+
+    The escalation is unambiguous evidence on its own: `decision._forward`
+    writes an `application_status_history` row with `changed_by=actor.id` and
+    `reason_text=FORWARD_REASON` for EVERY forward, at every level — so "did
+    this actor ever forward this application" is exactly that row's
+    existence, no separate flag and no second definition that could drift
+    from `assigned_org_id`'s own history.
+
+    Read-only, and that is exactly where this stops mattering: the WRITE
+    paths (`decision._load_and_authorize`) call `_assert_in_actor_zone`
+    directly and never this function, so a former forwarder who is out of
+    zone still cannot approve, reject or forward what somebody else must now
+    decide. A stranger head in the SAME original leshoz who never forwarded
+    THIS application gets nothing here either — the check is keyed on
+    `changed_by`, never on the organization.
+    """
+    history = await repo.list_status_history(db, application.id)
+    return any(
+        entry.reason_text == FORWARD_REASON and entry.changed_by == actor.id for entry in history
+    )
+
+
 async def _readable_application(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> Application:
@@ -639,6 +682,14 @@ async def _readable_application(
     no contour yet — is outside every ZONED actor's zone, and inside a
     republic-wide one's, which is what the ordering below says: the zone-free
     short-circuit comes first.
+
+    **Ruling #107 carves out one more admission, checked BEFORE the zone**
+    (`_forwarded_here_by`): the head who forwarded THIS application up the
+    ladder keeps read access to it even after `assigned_org_id` has moved past
+    their own zone. Checked ahead of `_assert_in_actor_zone` deliberately — that
+    function's own refusal COMMITS an RI-12 trail before it raises (decision
+    #40 ruling 2), and a forwarder who is legitimately owed this read must
+    never earn a "denied" audit entry for asking.
     """
     application = await repo.get_application(db, application_id)
     if application is None:
@@ -647,6 +698,8 @@ async def _readable_application(
         return application
     if not await _holds_staff_read(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if await _forwarded_here_by(db, application, actor=actor):
+        return application
     await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_READ)
     return application
 
