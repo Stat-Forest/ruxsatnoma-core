@@ -14,6 +14,11 @@ SETTINGS = Settings(
     eskiz_password="s3cret",
     eskiz_sender="4546",
     eskiz_callback_secret="cbsecret",
+    # Ruling #124: `callback_url` reads THIS field, never `public_base_url` (the
+    # QR-facing one) — the two split apart at stage 7.0.
+    eskiz_callback_base_url="https://ruxsatnoma.example",
+    # Irrelevant to every test in this file, but config.py refuses to construct
+    # a Settings with the callback non-local and this one still local.
     public_base_url="https://ruxsatnoma.example",
 )
 
@@ -144,7 +149,10 @@ async def test_real_mode_returns_the_eskiz_sender(monkeypatch):
     monkeypatch.setenv("ESKIZ_PASSWORD", "p")
     monkeypatch.setenv("ESKIZ_SENDER", "4546")
     monkeypatch.setenv("ESKIZ_CALLBACK_SECRET", "c")
-    # A localhost origin is rejected outright under sms_mode=real (finding 6).
+    # A localhost origin is rejected outright under sms_mode=real (finding 6);
+    # ruling #124 retargeted that guard onto ESKIZ_CALLBACK_BASE_URL, and its own
+    # new guard then requires PUBLIC_BASE_URL non-local too, once this one is.
+    monkeypatch.setenv("ESKIZ_CALLBACK_BASE_URL", "https://ruxsatnoma.example.uz")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ruxsatnoma.example.uz")
     get_settings.cache_clear()
     sms.get_sms_sender.cache_clear()

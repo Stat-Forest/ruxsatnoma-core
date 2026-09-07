@@ -76,8 +76,11 @@ class EskizSmsSender:
 
     @property
     def callback_url(self) -> str:
+        # Ruling #124: this is a machine endpoint Eskiz's own server calls, never
+        # the QR link a citizen's browser opens — `eskiz_callback_base_url`, never
+        # `public_base_url` (the two split at stage 7.0's own dev/prod separation).
         return (
-            f"{self._settings.public_base_url.rstrip('/')}"
+            f"{self._settings.eskiz_callback_base_url.rstrip('/')}"
             f"/api/v1/webhooks/eskiz/{self._settings.eskiz_callback_secret}"
         )
 
