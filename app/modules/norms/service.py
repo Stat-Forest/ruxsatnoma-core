@@ -1286,10 +1286,14 @@ async def _forwarded_here_by(db: AsyncSession, facts: Any, *, actor: User) -> bo
     an `audit_log` row (`action=audit.APPLICATION_FORWARD`, `user_id=actor.id`,
     `object_type="application"`, `object_id=application.id`) in the exact same
     transaction as the `application_status_history` row the `applications`
-    version reads — one write, two views of it, not two independent records
-    that could drift apart. `audit.APPLICATION_FORWARD` is the shared constant
-    (defined once, in `audit.service`, precisely so both readers use the same
-    token); see its docstring for why the definition lives there.
+    version reads. Stated precisely, because the precision is the whole point
+    of F7: those are TWO rows, not one, written side by side in one
+    transaction — so they can only drift if `_forward` stops writing one of
+    them, and each row has a test that fails the moment it does (this module's
+    "a forwarding head reads the calculation" and `applications`' own).
+    `audit.APPLICATION_FORWARD` is the shared constant (defined once, in
+    `audit.service`, precisely so both readers use the same token); see its
+    docstring for why the definition lives there.
 
     Read-only, exactly like its mirror: `_calculable_statuses_for` (the WRITE
     guard) never calls this, so a former forwarder who has fallen out of zone

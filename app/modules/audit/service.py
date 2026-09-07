@@ -123,9 +123,12 @@ async def logged_by(
     `audit_log` row (`action=APPLICATION_FORWARD, user_id=actor.id,
     object_type="application", object_id=application.id`) in the SAME
     transaction as the `application_status_history` row
-    `applications.service._forwarded_here_by` reads — so the two functions
-    are two views of one write, not two independent definitions that could
-    drift apart (the risk F7 named and declined to accept)."""
+    `applications.service._forwarded_here_by` reads. Two rows, not one, and
+    saying so matters: what F7 refused was two independent DEFINITIONS of "was
+    forwarded by", and what remains here is one definition — this action token —
+    answered from two rows a single function writes together. The residual risk
+    is `_forward` one day writing one row and not the other, and each row is
+    pinned by a test that fails the moment it stops being written."""
     return await repo.exists(
         db, action=action, object_type=object_type, object_id=object_id, user_id=user_id
     )
