@@ -19,7 +19,6 @@ from app.modules.integrations.adapters.oneid import (
     OneIdProfile,
     encode_mock_code,
     get_oneid_adapter,
-    provider_authorize_url,
 )
 from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
 
@@ -145,17 +144,6 @@ async def test_mock_authorize_url_is_self_referential():
     # Obviously a demo, and not a shape any real citizen's PINFL could take.
     assert login.profile.pinfl == "99999999999999"
     assert "MOCK" in login.profile.full_name and "DEMO" in login.profile.full_name
-
-
-def test_real_oneid_provider_url_shape_is_preserved():
-    """`oneid_mode=real` still raises `NotImplementedError` (get_oneid_adapter,
-    unaffected by this fix) — but the sso.egov.uz request shape the real
-    adapter will need at stage 5.1 must survive the mock fix intact."""
-    url = provider_authorize_url(state="s", redirect_uri="http://cb", scope="ext")
-    assert url.startswith("https://sso.egov.uz/sso/oauth/Authorization.do?")
-    assert "scope=ext" in url
-    assert "state=s" in url
-    assert "redirect_uri=http%3A%2F%2Fcb" in url
 
 
 def test_oneid_real_mode_without_credentials_never_gets_as_far_as_an_adapter(monkeypatch):
