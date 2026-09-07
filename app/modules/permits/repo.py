@@ -19,6 +19,7 @@ from app.modules.permits.models import (
     ForestTicket,
     Permit,
     PermitDuplicate,
+    PermitRating,
     PermitStatusHistory,
     PermitTemplate,
 )
@@ -251,6 +252,24 @@ async def duplicates(db: AsyncSession, permit_id: uuid.UUID) -> Sequence[PermitD
         .order_by(PermitDuplicate.issued_at.desc(), PermitDuplicate.id.desc())
     )
     return rows.scalars().all()
+
+
+# --- Task 4: the citizen's rating ---------------------------------------------
+
+
+async def rating_for_permit(db: AsyncSession, permit_id: uuid.UUID) -> PermitRating | None:
+    """The citizen's rating of this permit, if one exists. `permit_ratings.permit_id`
+    is UNIQUE (migration 0039), so this is `scalar_one_or_none` and never a list.
+
+    Two callers, two reasons: `service.rate_permit` checks this explicitly so a
+    second attempt is refused with a real error rather than left to this same
+    index raising an uncaught `IntegrityError` (409 the service's way, not a
+    500); `service.permit_card` folds the answer straight into the card so the
+    cabinet needs one request for a permit and its rating, not two.
+    """
+    return (
+        await db.execute(select(PermitRating).where(PermitRating.permit_id == permit_id))
+    ).scalar_one_or_none()
 
 
 async def occupied_area_by_contour(

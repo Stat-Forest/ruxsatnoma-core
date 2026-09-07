@@ -132,6 +132,27 @@ class PermitHistoryRow(BaseModel):
     occurred_at: datetime
 
 
+class PermitRatingIn(BaseModel):
+    """`POST /permits/{id}/rating` — the citizen's verdict on a permit they
+    actually received (ruling #140). One per permit, checked by the service,
+    never left to `permit_ratings`'s own UNIQUE index."""
+
+    score: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class PermitRatingOut(BaseModel):
+    """One rating, exactly as `permit_ratings` stores it. No `permit_id`, no
+    applicant: ruling #141 keeps the author off every response built from this
+    table, and this is the shape every such response embeds."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    score: int
+    comment: str | None
+    created_at: datetime
+
+
 class PermitCardOut(PermitOut):
     """`GET /permits/{id}` — the permit's own columns, FLAT, plus the three lists
     that are not columns of `permits` at all.
@@ -160,6 +181,7 @@ class PermitCardOut(PermitOut):
     history: list[PermitHistoryRow]
     missing_signatures: list[str]
     document_date: date
+    rating: PermitRatingOut | None = None
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> PermitCardOut:
@@ -174,7 +196,10 @@ class PermitCardOut(PermitOut):
         own format — rather than added to `PermitOut.model_fields`'s generic
         copy: `snapshot` itself stays excluded from every response (this
         schema's own module docstring), so one field is lifted out of it by
-        name, never the whole blob.
+        name, never the whole blob. `rating` (Task 4) is `card["rating"]`
+        unchanged — an ORM row or `None`, either way validated `from_attributes`
+        by `PermitRatingOut`'s own config — so the cabinet needs one request for
+        the permit and its rating together, not two.
         """
         permit = card["permit"]
         return cls.model_validate(
@@ -184,6 +209,7 @@ class PermitCardOut(PermitOut):
                 "history": card["history"],
                 "missing_signatures": card["missing_signatures"],
                 "document_date": date.fromisoformat(permit.snapshot["issued_at"]),
+                "rating": card["rating"],
             }
         )
 

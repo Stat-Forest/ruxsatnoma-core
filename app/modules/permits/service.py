@@ -57,6 +57,7 @@ from app.modules.permits.models import (
     ForestTicket,
     Permit,
     PermitDuplicate,
+    PermitRating,
     PermitStatusHistory,
     PermitTemplate,
     QrCheckLog,
@@ -2589,7 +2590,9 @@ async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) ->
     second reader of its table is a second opinion about what "signed" means.
     `missing_signatures` rides along so a signing screen needs one request rather
     than two, and it is what makes the card self-explanatory while a permit is
-    still `pending_signatures`.
+    still `pending_signatures`. `rating` (Task 4) rides along for the same
+    reason — the citizen's own cabinet needs one request for the permit and
+    the rating they left on it, not two.
     """
     permit = await _readable_permit(db, permit_id, actor=actor)
     return {
@@ -2599,6 +2602,7 @@ async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) ->
         ),
         "history": await repo.status_history(db, permit.id),
         "missing_signatures": await missing_signatures(db, permit.id),
+        "rating": await repo.rating_for_permit(db, permit.id),
     }
 
 
@@ -2710,6 +2714,59 @@ async def list_permits(
         offset=params.offset,
         limit=params.page_size,
     )
+
+
+# --- Task 4: the citizen rates their permit -----------------------------------
+
+PERMIT_RATE = "permit.rate"
+
+
+async def rate_permit(
+    db: AsyncSession, permit_id: uuid.UUID, *, score: int, comment: str | None, actor: User
+) -> PermitRating:
+    """`POST /permits/{id}/rating` — the citizen's verdict, once (ruling #140).
+
+    `_readable_permit` first, so a stranger gets the card's own 404 rather than
+    a different answer that would confirm the permit exists — the same
+    permit-existence-oracle reasoning that function's own docstring gives.
+
+    Ownership, not readability, is what this route needs from there: a
+    `permits.view_any` holder, or a required official signer of this very
+    permit, can both READ the card through `_readable_permit` and neither may
+    rate somebody else's service — `_is_holder` is the one predicate that
+    answers "whose service was this", the same one the 4th signature line and
+    `extend` gate on. 403 `ERR-ACL-001` with `details.reason = "not_the_holder"`
+    for anyone `_readable_permit` admitted by a different door.
+
+    Two more refusals, both explicit rather than left to the database: 409
+    `ERR-PERM-001` with `details.reason = "not_issued"` before the permit's 4th
+    signature has landed (`issued_at IS NULL` — a permit still
+    `pending_signatures` was never delivered, so there is no service yet to
+    rate); 409 `ERR-PERM-001` with `details.reason = "already_rated"` for a
+    second attempt. The second check is `repo.rating_for_permit`, read BEFORE
+    the insert, precisely so `permit_ratings`'s own UNIQUE index never has to
+    raise — an uncaught `IntegrityError` there would surface as a 500, not the
+    409 a repeat submission deserves.
+    """
+    permit = await _readable_permit(db, permit_id, actor=actor)
+    if not await _is_holder(db, permit, actor):
+        raise err("ERR-ACL-001", details={"reason": "not_the_holder"})
+    if permit.issued_at is None:
+        raise err("ERR-PERM-001", details={"reason": "not_issued"})
+    if await repo.rating_for_permit(db, permit.id) is not None:
+        raise err("ERR-PERM-001", details={"reason": "already_rated"})
+
+    rating = PermitRating(permit_id=permit.id, score=score, comment=comment)
+    await repo.add(db, rating)
+    await audit.log(
+        db,
+        action=PERMIT_RATE,
+        user_id=actor.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"score": score},
+    )
+    return rating
 
 
 async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str, Any]]:

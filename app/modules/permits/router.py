@@ -36,6 +36,8 @@ from app.modules.permits.permissions import PERMITS_ISSUE, PERMITS_SIGN
 from app.modules.permits.schemas import (
     PermitCardOut,
     PermitOut,
+    PermitRatingIn,
+    PermitRatingOut,
     PermitSignatureOut,
     PermitSignIn,
     PermitStatus,
@@ -216,3 +218,32 @@ async def download_permit_pdf(
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+# --- Task 4: the citizen rates their permit -----------------------------------
+#
+# `Depends(get_current_user)`, not a permission dependency: the gate is
+# ownership, checked inside `service.rate_permit` (`_is_holder`) the same way
+# `POST /permits/{id}/extend` gates the citizen's other own act on a permit —
+# a route-level permission code would refuse the holder before that check ever
+# ran, since rating one's own permit needs no grant at all.
+
+
+@router.post("/permits/{permit_id}/rating", status_code=201)
+async def rate_permit(
+    permit_id: uuid.UUID,
+    body: PermitRatingIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> PermitRatingOut:
+    """The citizen's verdict on their own issued permit, 1-5, once (ruling #140).
+
+    404 `ERR-SYS-003` for a stranger — the card's own answer, so this route is
+    not a permit-existence oracle. 403 `ERR-ACL-001` for a caller who can READ
+    the permit (a required signer, a `permits.view_any` holder) but is not its
+    holder. 409 `ERR-PERM-001` for a permit not yet issued, or already rated.
+    """
+    rating = await service.rate_permit(
+        db, permit_id, score=body.score, comment=body.comment, actor=user
+    )
+    return PermitRatingOut.model_validate(rating)
