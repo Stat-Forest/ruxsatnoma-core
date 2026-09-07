@@ -93,6 +93,14 @@ Tooling and environment.
   alone, reading like a chain bug (0011, 3.7 t1; `merge_0018_0020`, 3.9b/3.11b).
 - **How to apply:** `alembic merge heads -m "merge"`; `make heads` is the gate — grep the
   test for the previous head string, since no task brief lists that file.
+- **The mirror, 2026-09-07 — the Rule above was not followed, and this is the cost:** 3.11b
+  re-pointed `0023`'s `down_revision` from `0022` to `0025` by hand before merging. A database
+  that had ALREADY passed `0023` under the old parent never runs `0025` at all — `upgrade head`
+  walks forward from the recorded revision and never back for an ancestor spliced in underneath.
+  Symptom: `alembic_version = 0035` while `application_checks.created_by` does not exist, so
+  `POST /applications/{id}/submit` 500s. **A recorded revision does not prove a schema.** Dev
+  escaped it (built after the splice); a long-lived local DB did not. Reconciling means replaying
+  that migration's `upgrade()` by hand — `stamp` back plus `upgrade` re-runs everything after it.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
