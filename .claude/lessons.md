@@ -378,6 +378,12 @@ Tooling and environment.
   the same object, the read derives its rule from the write's own sources — the permits fix
   intersects `required_purposes()` with `signers.required_role()` and reuses the write path's
   organization equality.
+- **Across a module-level boundary, the source moves down, never copies:** `norms` (level
+  2) needed applications' "was this actor the one who forwarded it" fact for ruling #107's
+  calculation read, and could not import it from `applications` (level 3). Fix: the
+  constant and its predicate moved to the lowest module both already call downward
+  (`audit`, level 0: `APPLICATION_FORWARD`/`logged_by`), not copied as a second literal or
+  bolted onto ruling 20's unrelated table grant (F7, `docs/plans/07.4-findings.md`).
 
 ## A role's identity and its grants have ONE source — the seeding migration, never a name or a docstring standing in for it
 

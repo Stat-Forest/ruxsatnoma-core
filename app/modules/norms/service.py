@@ -1269,19 +1269,58 @@ _APPLICATION_READ_CODES = frozenset(
 )
 
 
+async def _forwarded_here_by(db: AsyncSession, facts: Any, *, actor: User) -> bool:
+    """Ruling #107's third admission, mirrored from
+    `applications.service._forwarded_here_by`: whether `actor` is the one who
+    forwarded THIS application up the ladder, at any level — the one case
+    `_may_read_application` grants past a zone that has since moved on (F7,
+    `docs/plans/07.4-findings.md`: the head could read the application card
+    again but still not the calculation bound to it).
+
+    **Not a second definition.** `norms` cannot call
+    `applications.service._forwarded_here_by` directly (level 2 may not
+    import level 3) and may not read `application_status_history` either —
+    ruling 20's grant is five columns of the `applications` table, in
+    `norms/repo.py` only, and does not extend to a second table. So this asks
+    the SAME question through `audit_log` instead: `decision._forward` writes
+    an `audit_log` row (`action=audit.APPLICATION_FORWARD`, `user_id=actor.id`,
+    `object_type="application"`, `object_id=application.id`) in the exact same
+    transaction as the `application_status_history` row the `applications`
+    version reads — one write, two views of it, not two independent records
+    that could drift apart. `audit.APPLICATION_FORWARD` is the shared constant
+    (defined once, in `audit.service`, precisely so both readers use the same
+    token); see its docstring for why the definition lives there.
+
+    Read-only, exactly like its mirror: `_calculable_statuses_for` (the WRITE
+    guard) never calls this, so a former forwarder who has fallen out of zone
+    still cannot bind a new calculation to an application somebody else must
+    now decide.
+    """
+    return await audit.logged_by(
+        db,
+        action=audit.APPLICATION_FORWARD,
+        object_type="application",
+        object_id=facts["id"],
+        user_id=actor.id,
+    )
+
+
 async def _may_read_application(db: AsyncSession, actor: User, facts: Any) -> bool:
     """Whether `actor` may see the application these `repo.application_facts`
-    describe: its own applicant, or staff with a read code AND the zone.
+    describe: its own applicant, or staff with a read code AND (the zone OR
+    ruling #107's forwarding carve-out).
 
-    The mirror of `applications.service._readable_application`'s two branches,
+    The mirror of `applications.service._readable_application`'s branches,
     restated here rather than called: `norms` is level 2 and `applications`
     level 3, so the call is forbidden in that direction and ruling 20's
-    read-only right on the table is what stands in for it.
+    read-only right on the table (plus `_forwarded_here_by`'s own read of
+    `audit_log`) is what stands in for it.
     """
     if facts["applicant_id"] in await auth_service.own_applicant_ids(db, actor.id):
         return True
     return await _holds_one_of(db, actor, _APPLICATION_READ_CODES) and (
         await _application_in_actor_zone(db, actor, facts)
+        or await _forwarded_here_by(db, facts, actor=actor)
     )
 
 
@@ -1358,16 +1397,22 @@ async def list_calculations(
     decoration (review round 1, Important 1).** Without it the branch returned
     bound rows on `created_by` alone, with no per-row predicate — so a
     calculation the actor CREATED came back in the list, full `CalculationOut`
-    and all (`input_snapshot`, `amount`, `breakdown`), after they had lost the
-    right to read it. Two paths reach that state and both are live in this
-    branch: `decision._forward` moves `assigned_org_id` away from the head who
-    escalated, whose own docstring records that they can no longer see the
-    application afterwards; and `own_applicant_ids` is effective-dated, with a
+    and all (`input_snapshot`, `amount`, `breakdown`), even where the FIRST
+    branch's own question (ownership, zone, or ruling #107's forwarding
+    carve-out) would answer no. `own_applicant_ids` is effective-dated, with a
     daily job flipping a representation to `expired`, so a representative who
-    priced an application during a valid representation keeps the row. In both
-    the card and `GET /calculations/{id}` answer 404 while the list did not.
-    Pinned by `tests/modules/applications/test_end_to_end.py::
-    test_a_head_who_forwards_an_application_cannot_read_its_calculation_anywhere`.
+    priced an application during a valid representation keeps the bound row
+    forever unless this scope excludes it — the card and `GET
+    /calculations/{id}` answer 404 for them while the unfiltered list did not.
+    **A forwarding head is the OTHER illustration, and cuts the other way
+    since F7's fix**: `_forwarded_here_by` now grants them the single read and
+    the FILTERED list back (`?application_id=`), but never the unfiltered
+    one — a bound row stays reachable ONLY through the branch that asks the
+    ownership/zone/forwarding question, whatever the answer, which is the
+    whole point of keeping the two branches disjoint rather than folding
+    forwarding into `created_by`. Pinned by
+    `tests/modules/applications/test_end_to_end.py::
+    test_a_head_who_forwards_an_application_can_read_its_calculation`.
 
     The scope is deliberately NOT "every calculation on every application I
     could read". Expressing that needs a second read of `applications` — a

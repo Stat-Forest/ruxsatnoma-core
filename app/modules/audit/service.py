@@ -16,6 +16,26 @@ from app.core.logging import CORRELATION_ID_KEY
 from app.modules.audit import repo
 from app.modules.audit.models import AuditLog
 
+# The one deliberate exception to the paragraph above ("audit... knows no
+# domain vocabularies"), and it needs its own explanation. `applications`
+# (level 3) writes this action when `decision._forward` escalates an
+# over-limit application; `norms` (level 2) needs to test for the SAME fact,
+# for ruling #107 (`decisions.md`), which gives a forwarding head read access
+# to the application they escalated — `norms.service._may_read_calculation`
+# must grant the identical exception over the CALCULATION bound to it, or the
+# head can read the case but not the price (F7, `docs/plans/07.4-findings.md`).
+# `norms` may not import ANYTHING from `applications` — module levels run the
+# other way (`docs/design/01-struktura-monolita.md`) — so the token cannot
+# stay defined only in `applications.decision` the way `.APPROVE`/`.REJECT`
+# do. `audit` is level 0, already an ordinary dependency of BOTH modules, and
+# is the lowest point either one reaches: defining it once here, rather than
+# copying the literal into `norms` as a second definition of "was this actor
+# the one who forwarded it", is exactly the fix F7 asked for and rejected
+# doing the cheap way. `applications.decision` imports this name back
+# (`decision.APPLICATION_FORWARD` keeps resolving to the same value; see its
+# own import) instead of defining it — one constant, two readers.
+APPLICATION_FORWARD = "application.forward"
+
 
 async def log(
     db: AsyncSession,
@@ -87,3 +107,25 @@ async def already_logged(
     1). `audit_log` is append-only and never shrinks, so this is not a
     theoretical cost."""
     return await repo.exists(db, action=action, object_type=object_type, object_id=object_id)
+
+
+async def logged_by(
+    db: AsyncSession, *, action: str, object_type: str, object_id: uuid.UUID, user_id: uuid.UUID
+) -> bool:
+    """Whether `user_id` is the actor behind an EXISTING `audit_log` row for
+    this `(action, object_type, object_id)` triple — `already_logged`'s own
+    triple, narrowed to one actor.
+
+    First caller: `norms.service._forwarded_here_by`, mirroring
+    `applications.service._forwarded_here_by` across the module boundary that
+    stops it calling that function directly (see `APPLICATION_FORWARD`
+    above). `applications.decision._forward` writes the matching
+    `audit_log` row (`action=APPLICATION_FORWARD, user_id=actor.id,
+    object_type="application", object_id=application.id`) in the SAME
+    transaction as the `application_status_history` row
+    `applications.service._forwarded_here_by` reads — so the two functions
+    are two views of one write, not two independent definitions that could
+    drift apart (the risk F7 named and declined to accept)."""
+    return await repo.exists(
+        db, action=action, object_type=object_type, object_id=object_id, user_id=user_id
+    )

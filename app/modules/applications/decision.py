@@ -70,7 +70,15 @@ from app.modules.signatures import service as signatures_service
 # be able to see it.
 APPLICATION_APPROVE = "application.approve"
 APPLICATION_REJECT = "application.reject"
-APPLICATION_FORWARD = "application.forward"
+# NOT defined here, unlike its two siblings above — read back from
+# `audit.APPLICATION_FORWARD` instead of a local literal. `norms.service`
+# needs the identical value for ruling #107's calculation-read carve-out
+# (F7, `docs/plans/07.4-findings.md`) and may not import it from THIS module
+# (level 2 cannot import level 3) — see `audit.service.APPLICATION_FORWARD`'s
+# own comment for the full reasoning. Bound to a local name so every existing
+# reader of `decision.APPLICATION_FORWARD`/`flow.FORWARD_REASON`-style access
+# keeps working unchanged.
+APPLICATION_FORWARD = audit.APPLICATION_FORWARD
 
 # `notification_templates.event_code` — DOTTED, seeded by migration 0009, and a
 # DIFFERENT vocabulary from the bus names imported above. Passing

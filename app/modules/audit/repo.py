@@ -14,9 +14,16 @@ async def add(db: AsyncSession, entry: AuditLog) -> None:
     await db.flush()
 
 
-async def exists(db: AsyncSession, *, action: str, object_type: str, object_id: uuid.UUID) -> bool:
+async def exists(
+    db: AsyncSession,
+    *,
+    action: str,
+    object_type: str,
+    object_id: uuid.UUID,
+    user_id: uuid.UUID | None = None,
+) -> bool:
     """Whether an `audit_log` row already exists for this `(action, object_type,
-    object_id)` triple.
+    object_id)` triple — optionally narrowed to ONE actor.
 
     `object_type` is REQUIRED, not optional convenience: `ix_audit_log_object`
     is `(object_type, object_id, occurred_at)`, and PostgreSQL cannot use a
@@ -28,10 +35,18 @@ async def exists(db: AsyncSession, *, action: str, object_type: str, object_id: 
     predicate order after the index narrows to one `(object_type, object_id)`
     pair, not the reverse. `audit_log` is append-only and grows forever, so a
     caller that drops this argument reintroduces a full table scan on every
-    call, invisibly — nothing short of `EXPLAIN` would show it."""
+    call, invisibly — nothing short of `EXPLAIN` would show it.
+
+    `user_id`, when given, is one more filter evaluated the same way as
+    `action` — AFTER the index has already narrowed to one `(object_type,
+    object_id)` pair, never the column the index is chosen on. This is what
+    `service.logged_by` needs (F7, `docs/plans/07.4-findings.md`): "did THIS
+    actor perform this action on this object", not merely "did anyone"."""
     stmt = select(AuditLog.id).where(
         AuditLog.object_type == object_type,
         AuditLog.object_id == object_id,
         AuditLog.action == action,
     )
+    if user_id is not None:
+        stmt = stmt.where(AuditLog.user_id == user_id)
     return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None

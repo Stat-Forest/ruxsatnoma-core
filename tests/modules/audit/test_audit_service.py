@@ -83,3 +83,63 @@ async def test_log_does_not_commit(engine, db):
 async def test_log_invalid_result_raises_at_call_site(db):
     with pytest.raises(IntegrityError):
         await service.log(db, action="test.invalid", result="hacked")  # type: ignore[arg-type]
+
+
+async def test_logged_by_matches_only_the_actor_named_in_the_triple(db):
+    """`logged_by` is the shared predicate F7 closes with
+    (`docs/plans/07.4-findings.md`): `norms.service._forwarded_here_by` calls
+    it to answer, without importing `applications` (forbidden, level 2 ->
+    level 3), "was THIS actor the one who forwarded THIS application" —
+    `applications.decision._forward` writes exactly the row this test builds
+    by hand. Three ways to NOT match matter as much as the one way to match:
+    a different actor, a different action, and a different object all leave a
+    row `already_logged` alone would still find."""
+    role_id = (await db.execute(select(Role.id).where(Role.code == "sys_admin"))).scalar_one()
+    forwarder = User(full_name="Forwarding Head", role_id=role_id)
+    someone_else = User(full_name="Unrelated Head", role_id=role_id)
+    db.add_all([forwarder, someone_else])
+    await db.flush()
+    application_id = uuid.uuid4()
+    other_application_id = uuid.uuid4()
+    await service.log(
+        db,
+        action="application.forward",
+        user_id=forwarder.id,
+        object_type="application",
+        object_id=application_id,
+    )
+
+    assert await service.logged_by(
+        db,
+        action="application.forward",
+        object_type="application",
+        object_id=application_id,
+        user_id=forwarder.id,
+    )
+    # A DIFFERENT actor asking about the SAME forward is not a match — the
+    # whole point of narrowing `already_logged`'s triple to one actor.
+    assert not await service.logged_by(
+        db,
+        action="application.forward",
+        object_type="application",
+        object_id=application_id,
+        user_id=someone_else.id,
+    )
+    # The right actor, but a DIFFERENT action (e.g. an ordinary approval) —
+    # forwarding is not any old touch on the application.
+    assert not await service.logged_by(
+        db,
+        action="application.approve",
+        object_type="application",
+        object_id=application_id,
+        user_id=forwarder.id,
+    )
+    # The right actor and action, but a DIFFERENT object — a forward of one
+    # application must never answer for another.
+    assert not await service.logged_by(
+        db,
+        action="application.forward",
+        object_type="application",
+        object_id=other_application_id,
+        user_id=forwarder.id,
+    )
