@@ -220,3 +220,88 @@ async def test_the_access_token_is_in_no_response_body(db, engine, monkeypatch):
         assert me.status_code == 200
         assert "tok-live-1" not in me.text
         assert "oneid_access_token" not in me.text
+
+
+class _SpyLogoutOneId(_TokenIssuingOneId):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged_out: list[str | None] = []
+
+    async def logout(self, access_token: str | None) -> None:
+        self.logged_out.append(access_token)
+
+
+async def test_logout_ends_the_oneid_session_and_clears_the_token(db, monkeypatch):
+    from app.modules.auth import service
+
+    spy = _SpyLogoutOneId()
+    monkeypatch.setattr(service, "get_oneid_adapter", lambda: spy)
+    _user, row, _t, _c = await service.login_via_oneid(
+        db, code=unique_pinfl(), ip=None, user_agent=None
+    )
+    await service.logout_session(db, row)
+    assert spy.logged_out == ["tok-live-1"]
+    assert row.revoked_at is not None
+    assert row.oneid_access_token is None  # nothing left to replay
+
+
+async def test_a_provider_failure_still_logs_the_citizen_out(db, monkeypatch):
+    """Our own revocation happens FIRST and unconditionally: a citizen who
+    pressed "sign out" must be signed out of our system whatever OneID does,
+    and the provider call may hang for the adapter's whole timeout."""
+    from app.modules.auth import service
+    from app.modules.integrations.adapters.oneid import OneIdError
+
+    class _Broken(_TokenIssuingOneId):
+        async def logout(self, access_token: str | None) -> None:
+            raise OneIdError("ERR-INT-001")
+
+    monkeypatch.setattr(service, "get_oneid_adapter", lambda: _Broken())
+    _user, row, _t, _c = await service.login_via_oneid(
+        db, code=unique_pinfl(), ip=None, user_agent=None
+    )
+    await service.logout_session(db, row)  # must not raise
+    assert row.revoked_at is not None
+    assert row.oneid_access_token is None
+
+
+async def test_logout_of_a_session_with_no_oneid_token_calls_nothing(db, monkeypatch):
+    """A password or E-IMZO session — and every session opened before this
+    stage — has no token, and must not reach the provider at all."""
+    from app.modules.auth import service
+
+    # The real mock adapter, so this is a genuine tokenless OneID session.
+    _user, row, _t, _c = await service.login_via_oneid(
+        db, code=encode_mock_code(profile(unique_pinfl())), ip=None, user_agent=None
+    )
+    assert row.oneid_access_token is None
+
+    spy = _SpyLogoutOneId()
+    monkeypatch.setattr(service, "get_oneid_adapter", lambda: spy)
+    await service.logout_session(db, row)
+    assert spy.logged_out == []
+    assert row.revoked_at is not None
+
+
+async def test_the_logout_route_goes_through_logout_session(db, engine, monkeypatch):
+    """The route, not just the service: a password session must log out
+    exactly as before, and an OneID one must reach the provider."""
+    from app.modules.auth import service
+
+    spy = _SpyLogoutOneId()
+    monkeypatch.setattr(service, "get_oneid_adapter", lambda: spy)
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r1 = await client.get(f"{API}/auth/oneid/authorize")
+        state = client.cookies.get("oneid_state")
+        assert r1.status_code == 200 and state
+        assert (
+            await client.get(
+                f"{API}/auth/oneid/callback", params={"code": unique_pinfl(), "state": state}
+            )
+        ).status_code == 303
+        out = await client.post(
+            f"{API}/auth/logout", headers={"X-CSRF-Token": client.cookies.get("csrf_token") or ""}
+        )
+        assert out.status_code in (200, 204)
+    assert spy.logged_out == ["tok-live-1"]

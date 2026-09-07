@@ -228,6 +228,31 @@ async def login_via_eimzo(
     )
 
 
+async def logout_session(db: AsyncSession, session_row: Session) -> None:
+    """Revoke OUR session first, then ask OneID to end its own.
+
+    The order is the design. The provider call is best effort and may hang for
+    the adapter's whole timeout, while a citizen who pressed "sign out" must be
+    signed out of our system whatever OneID does — so the revocation is
+    unconditional and the `one_log_out` failure is only logged (the adapter
+    itself already swallows a provider error; this catch is for the day one
+    stops).
+
+    Without the provider call our logout would close only our own session: the
+    OneID session survives in the browser, and on a shared computer the next
+    person's "sign in with OneID" would land in this citizen's cabinet with no
+    password (decision #140 ruling 4)."""
+    token = session_row.oneid_access_token
+    session_row.oneid_access_token = None
+    await revoke_session(db, session_row, reason="logout")
+    if not token:
+        return
+    try:
+        await get_oneid_adapter().logout(token)
+    except OneIdError as exc:
+        structlog.get_logger().warning("oneid.logout_failed", err_code=exc.err_code)
+
+
 async def revoke_session(db: AsyncSession, session_row: Session, *, reason: str) -> None:
     session_row.revoked_at = datetime.now(UTC)
     await audit.log(
