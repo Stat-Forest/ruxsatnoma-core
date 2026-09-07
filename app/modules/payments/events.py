@@ -67,15 +67,12 @@ INVOICE_DUE_SOON = "invoice.due_soon"
 REFUND_DECIDED = "refund.decided"
 PAYMENT_MANUAL_CONFIRMED = "payment.manual_confirmed"
 # Ruling #112, `record_reversal`'s notify to the leshoz that a live permit's
-# money just went back. Deliberately NOT in `NOTIFIED_EVENT_CODES` below: no
-# migration seeds a template for it in this stage (7.4d ships no migration at
-# all), so `notify()` falls back to `notifications.service`'s own ruling 10 —
-# a raw, untranslated `inapp` row plus a `notification.template_missing` ERROR
-# log — exactly the shape `backoffice_service.py`'s reject-path comment names
-# for `payment.manual_rejected`, the sibling code left uncalled for the same
-# reason. Seeding a real template (both channels) is the follow-up; add this
-# code to the tuple below in the SAME migration that seeds it, or
-# `test_every_event_this_module_notifies_on_has_a_template` starts failing.
+# money just went back. Its template is seeded by migration `0036`, added at
+# integration in the same commit that registered this code below — a
+# notification whose whole purpose is that a human reads it cannot be the one
+# arriving through `notifications.service`'s ruling-10 fallback (a raw,
+# untranslated row plus a `notification.template_missing` ERROR on every
+# reversal).
 PAYMENT_REVERSED = "payment.reversed"
 
 NOTIFIED_EVENT_CODES = (
@@ -84,6 +81,7 @@ NOTIFIED_EVENT_CODES = (
     INVOICE_DUE_SOON,
     REFUND_DECIDED,
     PAYMENT_MANUAL_CONFIRMED,
+    PAYMENT_REVERSED,
 )
 
 PAYMENT_CONFIRMED = "payment_confirmed"

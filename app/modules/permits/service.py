@@ -149,18 +149,11 @@ APPLICATION_PERMIT_ISSUED = "PERMIT_ISSUED"
 # the word is a constant rather than a lookup.
 #
 # **The DATE half (ruling #118, closing ruling T3-b's open question).** The exact
-# source `tz/12` #17 asked for — the PAID row's own `occurred_at` in
-# `application_status_history` — needs an additive accessor on
-# `applications.service` that does not exist on this branch, and `permits` may not
-# reach that table any other way (module boundary, `CLAUDE.md`). What IS already
-# public and already read by `issue()` below is `applications_service.get(...)`,
-# and `applications.service.set_status`'s OWN docstring establishes the fact this
-# leans on: that function "touches ONLY `applications.status`", so `updated_at`
-# right after the INVOICED -> PAID move (`payments.service`'s own confirmation,
-# the only writer of that transition) IS the moment payment was confirmed — the
-# same reasoning that docstring already spells out for a caller reading
-# `updated_at` off its return value. `issue()` refuses before PAID, so nothing
-# else has legitimately touched the row between that transition and this snapshot.
+# source `tz/12` #17 asked for is the PAID row's own `occurred_at` in
+# `application_status_history`, which `permits` may not read directly (module
+# boundary, `CLAUDE.md`) — so `applications.service.status_reached_at` exposes it,
+# added with this ruling for this one caller, and `issue()` freezes what it
+# returns into the snapshot. See `_snapshot`'s own docstring.
 PAYMENT_STATUS_PAID = "Тўланган"
 
 # The document's language. `tz/13`'s note: «на государственном языке» — the permit
@@ -533,20 +526,17 @@ async def _snapshot(
     missing requisite is named at its SOURCE rather than reaching the renderer as
     an unfilled placeholder it cannot attribute.
 
-    **`paid_at` is `applications.updated_at`, read by `issue()` off the SAME
-    `PAID` application this whole snapshot is built from — not a `payments`
-    table `permits` may not read (design/01 rule 3), and not the precise
-    `application_status_history` PAID row `tz/12` #17 named as the exact
-    source, which needs an accessor `applications.service` does not expose on
-    this branch.** `applications.service.set_status` "touches ONLY
-    `applications.status`" (its own docstring), and `issue()` refuses anything
-    but `PAID`, so nothing legitimate has touched this row between the
-    INVOICED -> PAID transition and issuance — `updated_at` at this point IS
-    that transition's timestamp. The one imprecision this accepts, stated so a
-    later reader does not mistake it for a bug: a FUTURE write that touches the
-    application between payment and issuance (none exists today) would move
-    this date forward without moving the real payment — the day one is added,
-    revisit this note before trusting `updated_at` here again.
+    **`paid_at` is the `application_status_history` PAID row's own
+    `occurred_at`** — the exact source `tz/12` #17 named, read through
+    `applications_service.status_reached_at`, an accessor added with this
+    ruling for this one caller. Not a `payments` table `permits` may not read
+    (design/01 rule 3), and no longer `applications.updated_at`: that was true
+    only while nothing else wrote the row between PAID and issuance, which is
+    a property of today's code rather than of the data, and the date printed
+    into a permit is unfixable once rendered. `issue()` falls back to
+    `updated_at` only if the history carries no PAID row at all — impossible
+    for an application `issue()` accepts, kept as a floor rather than a
+    `None` reaching the renderer.
     """
     applicant = await auth_service.get_applicant(db, applicant_id)
     if applicant is None:
@@ -766,9 +756,13 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         sb_load=calculation.used_sb,
         calculation_id=calculation.id,
         calculation_input=calculation.input_snapshot,
-        # Ruling #118 — see `_snapshot`'s own docstring for why `updated_at`
-        # off this SAME `PAID` application is the lawful source `permits` has.
-        paid_at=application.updated_at,
+        # Ruling #118 — the PAID transition's own timestamp, through the
+        # accessor `applications` exposes for it; `updated_at` is the floor,
+        # never reached for an application this function accepts.
+        paid_at=(
+            await applications_service.status_reached_at(db, application.id, status="PAID")
+            or application.updated_at
+        ),
     )
 
     # 5. The QR token is a SECRET, not an identifier (ruling 8): never derived

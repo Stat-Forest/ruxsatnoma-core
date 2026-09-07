@@ -655,6 +655,35 @@ async def _forwarded_here_by(db: AsyncSession, application: Application, *, acto
     )
 
 
+async def status_reached_at(
+    db: AsyncSession, application_id: uuid.UUID, *, status: str
+) -> datetime | None:
+    """When this application last entered `status`, or `None` if it never did.
+
+    The additive accessor `permits.service`'s requisite-19 snapshot needs and
+    could not have (ruling #118): the printed form's «Тўлов ҳолати ва санаси»
+    wants the moment payment was confirmed, `application_status_history` is
+    where that moment is recorded, and `permits` may not reach this module's
+    tables any other way (module boundary, `CLAUDE.md`). Before this existed,
+    that snapshot leaned on `applications.updated_at` — true today only
+    because nothing else writes the row between PAID and issuance, which is a
+    property of the current code rather than of the data.
+
+    **The LAST matching row, not the first.** `PAID` is reachable once per
+    invoice, but 3.9b's recalculation can send an application back through
+    INVOICED, and the date the permit prints must be the payment it was
+    actually issued against.
+
+    Read-only, no zone or permission rule: this is the in-process service
+    surface, the same posture `get()` documents for itself.
+    """
+    history = await repo.list_status_history(db, application_id)
+    for entry in reversed(history):
+        if entry.to_status == status:
+            return entry.occurred_at
+    return None
+
+
 async def _readable_application(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> Application:
