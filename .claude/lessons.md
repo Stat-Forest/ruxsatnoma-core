@@ -101,6 +101,15 @@ Tooling and environment.
   `POST /applications/{id}/submit` 500s. **A recorded revision does not prove a schema.** Dev
   escaped it (built after the splice); a long-lived local DB did not. Reconciling means replaying
   that migration's `upgrade()` by hand — `stamp` back plus `upgrade` re-runs everything after it.
+- **The second mirror, 2026-09-07 — two branches, the SAME id, and `alembic merge heads` cannot
+  help:** stage 5.1 and stage 7.6 merged five minutes apart, each carrying a `0041` off `0040`
+  (`0041_session_oneid_token`, `0041_inspection_case_templates`). `dev` then reported
+  `heads: 0041, 0041` and EVERY gate failed on EVERY branch. Both CI runs were right to pass —
+  a PR's merge commit is computed against the base as it was, and neither re-ran after the other
+  landed. Duplicate ids cannot be merged (alembic cannot tell them apart): the second one is
+  RENUMBERED and re-pointed at the first, which is the one case where editing `down_revision` by
+  hand is correct — nothing has run it anywhere yet. Numbering by convention has no lock, so the
+  only real guard is repository-side ("branch up to date before merging"), never a local hook.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
