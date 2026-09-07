@@ -14,9 +14,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.core.models import MediaFile
 from app.modules.admin.models import Organization
 from app.modules.gis.models import GisLayer
+from app.modules.permits import repo, service
 from app.modules.permits.models import Permit, PermitRating
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
 from tests.modules.permits.conftest import Signer, make_permit_on_contour
@@ -121,6 +123,65 @@ async def test_score_zero_and_six_are_refused_before_the_database_sees_them(
             f"/api/v1/permits/{active_permit.id}/rating", json={"score": bad}
         )
         assert response.status_code == 422
+
+
+async def test_a_view_any_holder_may_read_but_not_rate(
+    active_permit: Permit, hodim_client: httpx.AsyncClient
+) -> None:
+    """Fix round 1, finding A2: the named ownership case. `hodim_client` is
+    built as `executor_staff`, migration 0019's own role — which is where the
+    `permits.view_any` grant lives (`ROLE_GRANTS` in that migration), never
+    only a personal grant — and the fixture is zone-free, which
+    `_organization_in_actor_zone` treats as covering every organization,
+    including this permit's own leshoz. So `_readable_permit` admits it
+    through the `view_any` door (a different one than
+    `test_a_required_signer_may_read_but_not_rate`'s required-signer door
+    above), and `_is_holder` must still refuse it: reading a permit and
+    having received its service are different questions."""
+    response = await hodim_client.post(
+        f"/api/v1/permits/{active_permit.id}/rating", json={"score": 5}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["details"]["reason"] == "not_the_holder"
+
+
+async def test_a_double_clicked_rating_answers_409_not_500(
+    db: AsyncSession, active_permit: Permit, holder_client: Signer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix round 1, finding A1: `repo.rating_for_permit`, read before the
+    insert, is the common path to `already_rated` — this pins the OTHER one,
+    the race a double-click can win. Stood in the same way
+    `signatures/test_sign.py::test_a_racing_duplicate_signature_is_also_audited`
+    stands in for its own race: a rating already exists, committed, as the
+    loser of a real race would find one; the pre-check is monkeypatched stale
+    so the call believes none exists, and the real INSERT is what has to
+    raise. Against the unguarded code (no `begin_nested()`, no `except
+    IntegrityError`) this is an uncaught `IntegrityError` on
+    `ix_permit_ratings_permit_id` — a 500 — and the fix maps it to the SAME
+    409 `already_rated` the ordinary pre-check gives."""
+    db.add(PermitRating(permit_id=active_permit.id, score=3))
+    await db.commit()
+
+    async def _stale_no_rating(db: AsyncSession, permit_id):
+        return None  # stands in for the race: the other call already committed
+
+    monkeypatch.setattr(repo, "rating_for_permit", _stale_no_rating)
+
+    with pytest.raises(DomainError) as exc:
+        await service.rate_permit(
+            db, active_permit.id, score=4, comment=None, actor=holder_client.user
+        )
+    assert exc.value.code == "ERR-PERM-001"
+    assert exc.value.details is not None
+    assert exc.value.details["reason"] == "already_rated"
+    # No second row: the loser's own insert never lands.
+    ratings = (
+        await db.execute(
+            text("SELECT count(*) FROM permit_ratings WHERE permit_id = :p"),
+            {"p": str(active_permit.id)},
+        )
+    ).scalar_one()
+    assert ratings == 1
 
 
 # --- Task 5: the Agency's aggregates, without the author ----------------------

@@ -2744,9 +2744,21 @@ async def rate_permit(
     `pending_signatures` was never delivered, so there is no service yet to
     rate); 409 `ERR-PERM-001` with `details.reason = "already_rated"` for a
     second attempt. The second check is `repo.rating_for_permit`, read BEFORE
-    the insert, precisely so `permit_ratings`'s own UNIQUE index never has to
-    raise — an uncaught `IntegrityError` there would surface as a 500, not the
-    409 a repeat submission deserves.
+    the insert — this is what makes the ordinary case a clean check-then-act
+    rather than a database round trip on every submission — but it is not the
+    only guard: a double-click is not exotic for a citizen-facing button, and
+    two concurrent requests can both pass this SELECT before either commits.
+    The insert itself is therefore wrapped in `begin_nested()` and the loser's
+    `IntegrityError` on `ix_permit_ratings_permit_id` (`permit_ratings.permit_id`
+    is UNIQUE, migration 0039 creates it as a unique INDEX rather than a named
+    constraint, and Postgres reports a unique-index violation under the index's
+    own name — verified against a real violation, not assumed from the model)
+    is mapped to the SAME `already_rated` 409 the pre-check gives the ordinary
+    case, following `signatures.service.sign()`'s own template (lesson: a
+    failed statement aborts the whole transaction — catch the right type,
+    recover with a SAVEPOINT). Without this, the loser's flush raises
+    uncaught and the citizen reads a 500 for what was, far more likely than an
+    attack, just an impatient second tap.
     """
     permit = await _readable_permit(db, permit_id, actor=actor)
     if not await _is_holder(db, permit, actor):
@@ -2757,7 +2769,14 @@ async def rate_permit(
         raise err("ERR-PERM-001", details={"reason": "already_rated"})
 
     rating = PermitRating(permit_id=permit.id, score=score, comment=comment)
-    await repo.add(db, rating)
+    try:
+        async with db.begin_nested():
+            await repo.add(db, rating)
+    except IntegrityError as exc:
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "ix_permit_ratings_permit_id":
+            raise
+        raise err("ERR-PERM-001", details={"reason": "already_rated"}) from exc
     await audit.log(
         db,
         action=PERMIT_RATE,
