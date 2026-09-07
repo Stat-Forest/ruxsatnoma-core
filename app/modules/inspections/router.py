@@ -40,6 +40,7 @@ from app.modules.inspections.schemas import (
     ChecklistOut,
     DecisionIn,
     ExplanationIn,
+    ReassignIn,
     TaskIn,
     TaskOut,
 )
@@ -139,6 +140,19 @@ async def cancel_task(
     user: Annotated[User, Depends(require_permission(TASKS_MANAGE))],
 ) -> TaskOut:
     task = await service.cancel_task(db, task_id, actor=user)
+    return TaskOut.model_validate(task)
+
+
+@router.post("/tasks/{task_id}/reassign")
+async def reassign_task(
+    task_id: uuid.UUID,
+    payload: ReassignIn,
+    db: AsyncDb,
+    user: Annotated[User, Depends(require_permission(TASKS_MANAGE))],
+) -> TaskOut:
+    task = await service.reassign_task(
+        db, task_id, new_assignee_id=payload.new_assignee_id, actor=user
+    )
     return TaskOut.model_validate(task)
 
 
@@ -254,8 +268,15 @@ async def list_cases(
     user: CurrentUser,
     params: Annotated[PageParams, Depends()],
     status: str | None = None,
+    applicant_id: uuid.UUID | None = None,
 ) -> Page[CaseOut]:
-    items, total = await service.list_cases(db, status=status, params=params, actor=user)
+    """`applicant_id` (ruling R8, finding F3): every case against ONE
+    violator, for anyone who may already see those cases — the filter runs
+    INSIDE `_case_scope`, so a leshoz head still sees only their own zone's
+    cases against that applicant, never another oblast's."""
+    items, total = await service.list_cases(
+        db, status=status, applicant_id=applicant_id, params=params, actor=user
+    )
     return Page[CaseOut](
         items=[CaseOut.model_validate(item) for item in items],
         total=total,

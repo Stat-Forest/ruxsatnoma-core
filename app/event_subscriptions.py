@@ -132,3 +132,15 @@ def _register_providers() -> None:
         gis_service.OCCUPANCY_PROVIDERS.append(permits_service.occupancy_provider)
     if permits_service.load_provider not in norms_service.LOAD_PROVIDERS:
         norms_service.LOAD_PROVIDERS.append(permits_service.load_provider)
+
+    # `admin` (level 1) may not read `inspections` (level 5), and tz/04 С23
+    # makes user deletion conditional on what they know (ruling R4/R5,
+    # `docs/plans/07.6-handover-and-the-violator.md`; finding F4,
+    # `07.5-audit-findings.md`). Registered here, not in `app/main.py`, for
+    # the identical reason the two provider registrations above it are: a
+    # `workers_mode=off` deployment never calls `create_app()`.
+    from app.modules.admin import open_work as admin_open_work
+    from app.modules.inspections import service as inspections_service
+
+    if inspections_service.open_work_provider not in admin_open_work.OPEN_WORK_PROVIDERS:
+        admin_open_work.OPEN_WORK_PROVIDERS.append(inspections_service.open_work_provider)
