@@ -60,11 +60,23 @@ async def list_ratings(
     params: Annotated[PageParams, Depends()],
     period_from: date,
     period_to: date,
+    organization_id: uuid.UUID | None = None,
+    activity_type_id: uuid.UUID | None = None,
 ) -> Page[RatingCommentRow]:
     """The anonymous comment feed: date, service, leshoz, score, text — never
-    who left it. Zone-scoped the same way the summary above is."""
+    who left it. Zone-scoped the same way the summary above is, and narrowable
+    by the same two optional filters — a screen that narrows the summary to
+    one leshoz must narrow this feed too, or the numbers above and the
+    comments below them describe different populations with nothing saying so
+    (final review, finding 3)."""
     items, total = await service.list_rating_comments(
-        db, actor=actor, params=params, period_from=period_from, period_to=period_to
+        db,
+        actor=actor,
+        params=params,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
     )
     return Page[RatingCommentRow](
         items=[RatingCommentRow.model_validate(item) for item in items],

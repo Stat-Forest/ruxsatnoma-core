@@ -2593,8 +2593,22 @@ async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) ->
     still `pending_signatures`. `rating` (Task 4) rides along for the same
     reason — the citizen's own cabinet needs one request for the permit and
     the rating they left on it, not two.
+
+    **`rating` is holder-only, never unconditional** (ruling #141): `_readable_permit`
+    admits three doors — the holder, any required signer of THIS permit, and any
+    `permits.view_any` holder whose zone covers it — and the second and third are
+    both leshoz/Agency staff, often the very official a bad rating names. Ruling
+    #141 is explicit that no response may carry the applicant's identity or the
+    permit number alongside the rating comment, "to the leshoz and to the Agency
+    alike", and `PermitCardOut` already carries `applicant_id`/`series`/`number`
+    (`PermitOut`). Re-checking `_is_holder` here (the same predicate
+    `_readable_permit` used to admit a holder through its first door) is cheap and
+    avoids a second, possibly-drifting ownership test.
     """
     permit = await _readable_permit(db, permit_id, actor=actor)
+    rating = (
+        await repo.rating_for_permit(db, permit.id) if await _is_holder(db, permit, actor) else None
+    )
     return {
         "permit": permit,
         "signatures": await signatures_service.get_for_object(
@@ -2602,7 +2616,7 @@ async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) ->
         ),
         "history": await repo.status_history(db, permit.id),
         "missing_signatures": await missing_signatures(db, permit.id),
-        "rating": await repo.rating_for_permit(db, permit.id),
+        "rating": rating,
     }
 
 
@@ -2872,17 +2886,24 @@ async def list_rating_comments(
     *,
     actor: User,
     params: PageParams,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
     period_from: date,
     period_to: date,
 ) -> tuple[list[dict[str, Any]], int]:
     """`GET /admin/ratings` (`ratings.view`): one page of the anonymous
     comment feed — date, service, leshoz, score, text, and nothing that names
     who rated (ruling #141; `repo.rating_comments`'s own docstring lists the
-    closed column set)."""
+    closed column set). `organization_id`/`activity_type_id` narrow the feed
+    the same way they narrow `ratings_summary` above — a screen that narrows
+    the summary to one leshoz must narrow the comments under it too, or the
+    two silently describe different populations (final review, finding 3)."""
     _validate_rating_period(period_from, period_to)
     rows, total = await repo.rating_comments(
         db,
         actor_zone=zone_of(actor),
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
         period_from=period_from,
         period_to=period_to,
         offset=params.offset,

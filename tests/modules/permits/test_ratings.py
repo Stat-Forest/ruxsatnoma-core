@@ -82,6 +82,43 @@ async def test_the_card_carries_the_rating_so_the_cabinet_needs_one_request(
     assert after.json()["rating"]["score"] == 5
 
 
+async def test_the_card_hides_the_rating_from_a_required_signer_and_a_view_any_holder(
+    active_permit: Permit,
+    holder_client,
+    head_client: Signer,
+    hodim_client: httpx.AsyncClient,
+) -> None:
+    """Blocker 2, final review: `_readable_permit` admits three doors — the
+    holder, any required signer of THIS permit, and any `permits.view_any`
+    holder in zone — but ruling #141 forbids the rating reaching anyone but
+    the holder alongside `applicant_id`/`series`/`number` (`PermitCardOut`
+    extends `PermitOut`). `head_client` signed `permit_head` on
+    `active_permit` (a required signer, `test_a_required_signer_may_read_but_
+    not_rate`'s door) and `hodim_client` is `executor_staff`, the role
+    migration 0019 grants `permits.view_any` to zone-free (`test_a_view_any_
+    holder_may_read_but_not_rate`'s door) — both must read the card (they are
+    not strangers) and both must get `rating: null`, on a permit that IS
+    rated, while the holder gets the real thing.
+    """
+    rate = await holder_client.client.post(
+        f"/api/v1/permits/{active_permit.id}/rating", json={"score": 2, "comment": "Sekin ishladi"}
+    )
+    assert rate.status_code == 201, rate.text
+
+    signer_card = await head_client.client.get(f"/api/v1/permits/{active_permit.id}")
+    assert signer_card.status_code == 200, signer_card.text
+    assert signer_card.json()["rating"] is None
+
+    view_any_card = await hodim_client.get(f"/api/v1/permits/{active_permit.id}")
+    assert view_any_card.status_code == 200, view_any_card.text
+    assert view_any_card.json()["rating"] is None
+
+    holder_card = await holder_client.client.get(f"/api/v1/permits/{active_permit.id}")
+    assert holder_card.status_code == 200, holder_card.text
+    assert holder_card.json()["rating"]["score"] == 2
+    assert holder_card.json()["rating"]["comment"] == "Sekin ishladi"
+
+
 async def test_a_permit_still_awaiting_signatures_cannot_be_rated(
     issued_permit: Permit, holder_client
 ) -> None:
@@ -297,6 +334,85 @@ async def test_a_leshoz_sees_only_its_own(other_org_ratings_client, seeded_ratin
         )
     ).json()
     assert body["count"] == 0
+
+
+async def test_the_feed_narrows_by_activity_type_the_same_as_the_summary(
+    ratings_client,
+    seeded_ratings: list[PermitRating],
+    grazing_activity_id: uuid.UUID,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """Final review, finding 3: `GET /admin/ratings/summary` accepts
+    `activity_type_id` and narrows; `GET /admin/ratings` must narrow the same
+    way or the comments below the summary describe a different population.
+    `seeded_ratings` puts two grazing ratings (scores 3, 5) and one haymaking
+    rating (score 4) on the same leshoz."""
+    unfiltered = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings",
+            params={"period_from": "2026-01-01", "period_to": "2026-12-31"},
+        )
+    ).json()
+    assert unfiltered["total"] == 3
+
+    grazing = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings",
+            params={
+                "period_from": "2026-01-01",
+                "period_to": "2026-12-31",
+                "activity_type_id": str(grazing_activity_id),
+            },
+        )
+    ).json()
+    assert grazing["total"] == 2
+    assert {row["score"] for row in grazing["items"]} == {3, 5}
+
+    haymaking = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings",
+            params={
+                "period_from": "2026-01-01",
+                "period_to": "2026-12-31",
+                "activity_type_id": str(haymaking_activity_id),
+            },
+        )
+    ).json()
+    assert haymaking["total"] == 1
+    assert haymaking["items"][0]["score"] == 4
+
+
+async def test_the_feed_narrows_by_organization_the_same_as_the_summary(
+    ratings_client, seeded_ratings: list[PermitRating], leshoz: Organization
+) -> None:
+    """Same finding, the other filter: `organization_id` matching the actor's
+    own leshoz keeps every row, a different organization id (still inside the
+    zone-free `head_client`'s own single-org zone) empties the feed — proof
+    the parameter reaches the query rather than being silently accepted and
+    ignored."""
+    matching = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings",
+            params={
+                "period_from": "2026-01-01",
+                "period_to": "2026-12-31",
+                "organization_id": str(leshoz.id),
+            },
+        )
+    ).json()
+    assert matching["total"] == 3
+
+    other = (
+        await ratings_client.get(
+            "/api/v1/admin/ratings",
+            params={
+                "period_from": "2026-01-01",
+                "period_to": "2026-12-31",
+                "organization_id": str(uuid.uuid4()),
+            },
+        )
+    ).json()
+    assert other["total"] == 0
 
 
 async def test_the_route_is_closed_without_the_permission(staff_client) -> None:

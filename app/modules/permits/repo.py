@@ -705,15 +705,21 @@ async def rating_comments(
     db: AsyncSession,
     *,
     actor_zone: Zone,
+    organization_id: uuid.UUID | None = None,
+    activity_type_id: uuid.UUID | None = None,
     period_from: date,
     period_to: date,
     offset: int,
     limit: int,
 ) -> tuple[Sequence[Row[Any]], int]:
     """One page of the anonymous comment feed, newest first, with the total —
-    the same count-then-select shape `list_permits` uses. No `organization_id`/
-    `activity_type_id` filters: the route this backs takes none (`_ratings_
-    conditions` still applies the actor's zone and the period).
+    the same count-then-select shape `list_permits` uses. `organization_id`/
+    `activity_type_id` narrow the same way they narrow `/admin/ratings/
+    summary` — a screen that filters the summary to one leshoz must be able to
+    filter the comment feed under it the same way, or the two describe
+    different populations with nothing saying so (final review, finding 3).
+    Both default to `None` so a caller that wants only the zone/period scope
+    (none did before this fix) still gets it.
 
     Every column named here is `RatingCommentRow`'s whole contract —
     `created_at`, `score`, `comment`, the organization's and the activity
@@ -724,8 +730,8 @@ async def rating_comments(
     """
     conditions = _ratings_conditions(
         actor_zone=actor_zone,
-        organization_id=None,
-        activity_type_id=None,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
         period_from=period_from,
         period_to=period_to,
     )
