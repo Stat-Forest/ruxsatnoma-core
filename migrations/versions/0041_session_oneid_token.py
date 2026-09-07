@@ -17,8 +17,14 @@ the browser, and a bearer token for a state system may not travel inside it.
 Nullable with no default: every session that exists today was opened before
 this column, and a password or E-IMZO session never has one at all.
 
-Revision ID: 0038
+Revision ID: 0041
 Revises: 0037
+
+Numbered 0041 on an 0037 parent, not 0038: three parallel branches (7.6, 7.7
+and the Eskiz text fix) had already taken 0038, 0039 and 0040 off the same
+`dev` commit. Integration merges the heads (`alembic merge heads`); nothing
+here is ever renumbered afterwards, because a revision id that has run
+somewhere cannot change.
 Create Date: 2026-09-07 17:20:00.000000
 
 """
@@ -28,7 +34,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0038"
+revision: str = "0041"
 down_revision: str | None = "0037"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
