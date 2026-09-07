@@ -20,6 +20,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+import structlog
 from geoalchemy2.elements import WKTElement
 from sqlalchemy import ColumnElement, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,15 +32,17 @@ from app.core.models import MediaFile
 from app.core.numbers import next_public_number
 from app.core.schemas import PageParams
 from app.core.time import add_working_days, business_today
+from app.modules.admin import open_work
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import ClassifierItem, Organization
 from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
+from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
-from app.modules.inspections import repo
+from app.modules.inspections import events, repo
 from app.modules.inspections.models import (
     Checklist,
     InspectionAct,
@@ -50,14 +53,22 @@ from app.modules.inspections.models import (
     ViolationCaseHistory,
 )
 from app.modules.inspections.permissions import ACTS_WRITE, CASES_MANAGE, TASKS_MANAGE, VIEW_ANY
+from app.modules.notifications import service as notifications
 from app.modules.permits import service as permits_service
 from app.modules.signatures import service as signatures_service
+
+logger = structlog.get_logger(__name__)
 
 # Public numbers: `core/models.py`'s own docstring already reserves "VC" for
 # this module ("RX/INV/VC/MR/ST/ChT").
 NUMBER_PREFIX = "VC"
 
 VIOLATION_TYPES_CLASSIFIER_CODE = "violation_types"
+
+# `open_work_provider`'s own cap on how many task ids ride in a refusal's
+# `details` — the refusal is a message to a person, and a thousand ids in an
+# error body helps nobody (`admin.open_work.OpenWork.as_details`'s own note).
+OPEN_WORK_ID_CAP = 20
 
 # `signatures.service.sign`'s object type/purpose for a field act (design/02 §
 # inspections: "The signature lives in signatures (purpose=act_sign)").
@@ -70,6 +81,7 @@ CHECKLIST_CREATE = "checklist.create"
 TASK_CREATE = "inspection_task.create"
 TASK_START = "inspection_task.start"
 TASK_CANCEL = "inspection_task.cancel"
+TASK_REASSIGN = "inspection_task.reassign"
 TASK_COMPLETE = "inspection_task.complete"
 ACT_CREATE = "inspection_act.create"
 ACT_UPDATE = "inspection_act.update"
@@ -150,6 +162,29 @@ async def _holds(db: AsyncSession, actor: User, code: str) -> bool:
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     return code in await auth_repo.permission_codes(db, actor)
+
+
+# --- admin.open_work's provider for this module (ruling R4/R5) -------------
+#
+# `admin` (level 1) may not read `inspections` (level 5) — design/01 rule 3's
+# direction of dependency runs the other way — so the question "does this
+# user still hold open work" travels the way this codebase already sends
+# questions upwards: a registration in `app/event_subscriptions.py`, never an
+# import from `admin` into here. Finding F4 (`plans/07.5-audit-findings.md`):
+# an inspection task had NO recovery route at all before this stage — the
+# only way off one was `cancel`, which discards it.
+
+
+async def open_work_provider(db: AsyncSession, user_id: uuid.UUID) -> open_work.OpenWork | None:
+    """This module's answer to `admin.open_work`'s question (ruling R5): an
+    inspection task in `assigned`/`in_progress` is work somebody must still
+    act on. `done`/`cancelled` are excluded at the query itself (`repo.
+    open_task_ids_for_user`) — counting those would make a long-serving
+    inspector undeletable forever over work that is already finished."""
+    ids = await repo.open_task_ids_for_user(db, user_id, limit=OPEN_WORK_ID_CAP)
+    if not ids:
+        return None
+    return open_work.OpenWork(kind="inspection_tasks", count=len(ids), ids=list(ids))
 
 
 # --- checklists ---------------------------------------------------------------
@@ -384,6 +419,65 @@ async def cancel_task(db: AsyncSession, task_id: uuid.UUID, *, actor: User) -> I
     await db.flush()
     await audit.log(
         db, action=TASK_CANCEL, user_id=actor.id, object_type="inspection_task", object_id=task.id
+    )
+    return task
+
+
+# The reassignable statuses, deliberately NOT `TASK_TRANSITIONS`: a handover
+# does not move `status` at all (the task stays `assigned`/`in_progress`,
+# only `assigned_to` changes), so reusing `_assert_task_transition` (which
+# checks a target STATUS) would be the wrong tool for a check about which
+# statuses a task may be handed over FROM.
+TASK_REASSIGNABLE_STATUSES = ("assigned", "in_progress")
+
+
+async def reassign_task(
+    db: AsyncSession, task_id: uuid.UUID, *, new_assignee_id: uuid.UUID, actor: User
+) -> InspectionTask:
+    """`POST /inspections/tasks/{id}/reassign` (ruling R6): hand an unfinished
+    field task to another inspector, keeping its id, its due date and its
+    history. Until this stage the only way off a task was `cancel`, which
+    discards it — a departing inspector's work could not be handed over at
+    all (finding F4, second shape, `plans/07.5-audit-findings.md`).
+
+    Governed by `TASKS_MANAGE`, the SAME code that already governs create and
+    cancel — a new permission code nobody has been granted is a route nobody
+    can call. `done`/`cancelled` are refused: there is nothing left to hand
+    over, and reassigning a FINISHED task would rewrite who did the work.
+
+    The new assignee is zone-checked against the TASK's own organization, not
+    the actor's — reusing `_assert_organization_in_zone` with the CANDIDATE
+    standing in as its "actor" argument, the same helper `create_task`/
+    `cancel_task` already use for the caller's own zone. A head may only hand
+    work to someone who may RECEIVE it, which is a different question from
+    whether the head may see the task at all."""
+    task = await repo.get_task(db, task_id)
+    if task is None:
+        raise err("ERR-SYS-003")
+    if not await _holds(db, actor, TASKS_MANAGE):
+        raise err("ERR-ACL-001")
+    await _assert_organization_in_zone(db, actor, task.organization_id)
+    if task.status not in TASK_REASSIGNABLE_STATUSES:
+        raise err(
+            "ERR-INSP-001",
+            details={"reason": "not_reassignable", "status": task.status},
+        )
+    new_assignee = await auth_repo.get_user(db, new_assignee_id)
+    if new_assignee is None:
+        raise err("ERR-SYS-003", details={"assigned_to": str(new_assignee_id)})
+    await _assert_organization_in_zone(db, new_assignee, task.organization_id)
+
+    old_assignee_id = task.assigned_to
+    task.assigned_to = new_assignee_id
+    await db.flush()
+    await audit.log(
+        db,
+        action=TASK_REASSIGN,
+        user_id=actor.id,
+        object_type="inspection_task",
+        object_id=task.id,
+        old_value={"assigned_to": str(old_assignee_id)},
+        new_value={"assigned_to": str(new_assignee_id)},
     )
     return task
 
@@ -856,6 +950,63 @@ async def _case_applicant_id(db: AsyncSession, act: InspectionAct) -> uuid.UUID 
     return None
 
 
+async def _violator_recipient(db: AsyncSession, case: ViolationCase) -> uuid.UUID | None:
+    """Who hears about THIS case (ruling R2): the individual applicant's own
+    account, or — for a legal entity, which has none (decision #9) — the
+    representative whose representation is currently valid.
+
+    Unlike `applications`/`permits`, a `ViolationCase` has no submitter to
+    fall back to: it is opened BY THE SYSTEM when an inspector signs a
+    violation act, never filed by anyone. So where those two modules' own
+    `_notification_recipient` always returns a `uuid.UUID`, this one may
+    return `None` — the fail-open half of R2: an unreachable applicant (or a
+    case with no identified applicant at all, e.g. an "activity without a
+    permit" act) must not be able to block its own case by being
+    unreachable. `_notify_violator` below is what turns `None` into a logged
+    warning instead of a raised error."""
+    if case.applicant_id is None:
+        return None
+    applicant = await auth_service.get_applicant(db, case.applicant_id)
+    if applicant is None:
+        return None
+    if applicant.owner_user_id is not None:
+        return applicant.owner_user_id
+    return await auth_service.effective_representative(db, applicant.id)
+
+
+async def _notify_violator(
+    db: AsyncSession, case: ViolationCase, *, event_code: str, params: dict[str, Any]
+) -> None:
+    """The four-transition notification of ruling R1 (finding F2): case
+    opened, explanation requested, decision taken, case closed — the two the
+    spec names outright plus the two where the explanation/appeal clock
+    starts or the citizen's own record changes. `submit_explanation`,
+    `appeal_case` and `resolve_appeal` are performed BY the violator and
+    call nothing here.
+
+    Wraps `_violator_recipient`'s fail-open half (R2): `notifications.
+    service.notify` itself RAISES `ValueError` on a recipient it cannot
+    resolve, and a case must not fail to open or transition over a message
+    nobody can receive (CLAUDE.md's own rule for every notify-adjacent
+    refusal). An unresolved recipient logs a warning and returns instead."""
+    recipient_id = await _violator_recipient(db, case)
+    if recipient_id is None:
+        logger.warning(
+            "notification.recipient_unresolved",
+            case_id=str(case.id),
+            event_code=event_code,
+        )
+        return
+    await notifications.notify(
+        db,
+        event_code=event_code,
+        recipient_user_id=recipient_id,
+        params=params,
+        object_type="violation_case",
+        object_id=case.id,
+    )
+
+
 async def _open_case(
     db: AsyncSession, act: InspectionAct, *, violation_type: ClassifierItem, actor: User
 ) -> ViolationCase:
@@ -881,6 +1032,15 @@ async def _open_case(
         )
     )
     await db.flush()
+    # Ruling R1: the violator hears a case was opened against them, before
+    # the audit row — matching `permits.decisions.decide`'s own step 9/10
+    # order (state change -> notify -> audit).
+    await _notify_violator(
+        db,
+        case,
+        event_code=events.CASE_OPENED,
+        params={"case_number": number, "violation_type": violation_type.code},
+    )
     await audit.log(
         db,
         action=CASE_OPEN,
@@ -916,7 +1076,22 @@ async def case_card(db: AsyncSession, case_id: uuid.UUID, *, actor: User) -> dic
     case = await _readable_case(db, case_id, actor=actor)
     history = await repo.list_case_history(db, case_id)
     appeals = await repo.list_appeals(db, case_id)
-    return {"case": case, "history": history, "appeals": appeals}
+    # Ruling R8 (finding F3): "shows the history" — deliberately NOT
+    # "suggests stricter" (no rule in the spec says how much stricter, and a
+    # suggested penalty the system cannot justify is worse than the facts
+    # alone). No applicant at all (an "activity without a permit" act with
+    # no identified party) has nothing to count against.
+    prior_cases_count = (
+        await repo.count_prior_cases(db, applicant_id=case.applicant_id, exclude_case_id=case.id)
+        if case.applicant_id is not None
+        else 0
+    )
+    return {
+        "case": case,
+        "history": history,
+        "appeals": appeals,
+        "prior_cases_count": prior_cases_count,
+    }
 
 
 async def _case_scope(db: AsyncSession, actor: User) -> ColumnElement[bool]:
@@ -940,10 +1115,17 @@ async def _case_scope(db: AsyncSession, actor: User) -> ColumnElement[bool]:
 
 
 async def list_cases(
-    db: AsyncSession, *, status: str | None, params: PageParams, actor: User
+    db: AsyncSession,
+    *,
+    status: str | None,
+    applicant_id: uuid.UUID | None = None,
+    params: PageParams,
+    actor: User,
 ) -> tuple[Sequence[ViolationCase], int]:
     scope = await _case_scope(db, actor)
-    return await repo.list_cases(db, scope=scope, status=status, params=params)
+    return await repo.list_cases(
+        db, scope=scope, status=status, applicant_id=applicant_id, params=params
+    )
 
 
 def _assert_case_transition(case: ViolationCase, to_status: str) -> None:
@@ -985,6 +1167,14 @@ async def request_explanation(
     await _move_case(db, case, to_status="explanation_requested", actor=actor)
     case.explanation_due_at = add_working_days(business_today(), 5)
     await db.flush()
+    # Ruling R1: the 5-working-day clock starts here, and nobody hearing
+    # about it was exactly finding F2.
+    await _notify_violator(
+        db,
+        case,
+        event_code=events.CASE_EXPLANATION_REQUESTED,
+        params={"case_number": case.number, "explanation_due_at": case.explanation_due_at},
+    )
     await audit.log(
         db,
         action=CASE_REQUEST_EXPLANATION,
@@ -1083,6 +1273,16 @@ async def decide_case(
     case.decided_by = actor.id
     case.decided_at = datetime.now(UTC)
     await db.flush()
+    # Ruling R1: "Решение руководителя" is one of the two transitions tz/04
+    # names outright. This is the RECORDED decision only (F1/plan ruling 2) —
+    # notifying here is not "executing" a suspend/revoke against the permit,
+    # which stays a separate, manual act on `permits`' own routes.
+    await _notify_violator(
+        db,
+        case,
+        event_code=events.CASE_DECIDED,
+        params={"case_number": case.number, "decision": decision},
+    )
     await audit.log(
         db,
         action=CASE_DECIDE,
@@ -1163,6 +1363,11 @@ async def close_case(db: AsyncSession, case_id: uuid.UUID, *, actor: User) -> Vi
         raise err("ERR-ACL-001")
     await _assert_organization_in_zone(db, actor, case.organization_id)
     await _move_case(db, case, to_status="closed", actor=actor)
+    # Ruling R1: the case is over — the fourth and last of the four
+    # transitions that notify.
+    await _notify_violator(
+        db, case, event_code=events.CASE_CLOSED, params={"case_number": case.number}
+    )
     await audit.log(
         db, action=CASE_CLOSE, user_id=actor.id, object_type="violation_case", object_id=case.id
     )

@@ -41,7 +41,11 @@ from app.modules.auth.models import (
 )
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
-from app.modules.integrations.adapters.oneid import OneIdError, get_oneid_adapter
+from app.modules.integrations.adapters.oneid import (
+    OneIdCall,
+    OneIdError,
+    get_oneid_adapter,
+)
 
 # Timing-uniform response (user enumeration): computed once at import so the
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
@@ -50,9 +54,18 @@ _DUMMY_HASH = hash_password("dummy-timing-equalizer")
 
 
 async def issue_session(
-    db: AsyncSession, user: User, *, ip: str | None, user_agent: str | None
+    db: AsyncSession,
+    user: User,
+    *,
+    ip: str | None,
+    user_agent: str | None,
+    oneid_access_token: str | None = None,
 ) -> tuple[Session, str, str]:
-    """Create a session row; returns (row, raw token for the cookie, csrf token)."""
+    """Create a session row; returns (row, raw token for the cookie, csrf token).
+
+    `oneid_access_token` is supplied only by the OneID login and is what
+    `logout_session` hands to `one_log_out`; every other caller leaves it
+    None."""
     hours = await settings_store.get_int(db, "session_absolute_hours")
     token, csrf = new_token(), new_token()
     row = Session(
@@ -62,6 +75,7 @@ async def issue_session(
         expires_at=datetime.now(UTC) + timedelta(hours=hours),
         ip=ip,
         user_agent=user_agent,
+        oneid_access_token=oneid_access_token,
     )
     await repo.add(db, row)
     await audit.log(
@@ -86,9 +100,13 @@ async def login_or_create_by_pinfl(
     phone: str | None,
     ip: str | None,
     user_agent: str | None,
+    oneid_access_token: str | None = None,
 ) -> tuple[User, Session, str, str]:
     """Shared core of OneID/E-IMZO logins (ruling 5): any-role entry by pinfl,
-    auto-creating an applicant account on first contact."""
+    auto-creating an applicant account on first contact.
+
+    `oneid_access_token` reaches the session row so our logout can end the
+    OneID session too; the E-IMZO caller leaves it None."""
     user = await repo.get_user_by_pinfl(db, pinfl)
     now = datetime.now(UTC)
     if user is not None and user.status != "active":
@@ -127,7 +145,9 @@ async def login_or_create_by_pinfl(
     if snapshot is not None:
         user.oneid_profile = snapshot
     user.last_login_at = now
-    row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
+    row, token, csrf = await issue_session(
+        db, user, ip=ip, user_agent=user_agent, oneid_access_token=oneid_access_token
+    )
     await audit.log(
         db,
         action="user.login",
@@ -139,14 +159,50 @@ async def login_or_create_by_pinfl(
     return user, row, token, csrf
 
 
+async def _log_oneid_calls(db: AsyncSession, calls: tuple[OneIdCall, ...]) -> None:
+    """One `integration_log` row per provider round trip (tz/09: logging per
+    external message).
+
+    The rows are written HERE rather than in the adapter because this is where
+    the session lives — no adapter in this codebase opens a transaction of its
+    own. `meta` carries the provider's own refusal codes and nothing else:
+    `CLIENT_SECRET_NOT_FOUND` in the log is the difference between an
+    administrator fixing one `.env` line and an administrator waiting out an
+    outage that is not happening (decision #140 ruling 5). Everything else
+    OneID exchanges — the PINFL, the phone, the token — is personal data or a
+    credential and never reaches a log row."""
+    for call in calls:
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system="oneid",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_message": call.provider_message, "provider_error": call.provider_error}
+                if call.provider_error or call.provider_message
+                else None
+            ),
+        )
+
+
 async def login_via_oneid(
     db: AsyncSession, *, code: str, ip: str | None, user_agent: str | None
 ) -> tuple[User, Session, str, str]:
     adapter = get_oneid_adapter()
     try:
-        profile = await adapter.exchange_code(code)
+        login = await adapter.exchange_code(code)
     except OneIdError as exc:
+        # The early-commit pattern this codebase uses for denied outcomes: the
+        # raise below rolls the session back, and a failed login is precisely
+        # the case the log exists for. Nothing else is pending here — the
+        # exchange is the first thing this function does.
+        await _log_oneid_calls(db, exc.calls)
+        await db.commit()
         raise err(exc.err_code) from exc
+    await _log_oneid_calls(db, login.calls)
+    profile = login.profile
     return await login_or_create_by_pinfl(
         db,
         pinfl=profile.pinfl,
@@ -156,6 +212,7 @@ async def login_via_oneid(
         phone=profile.phone,
         ip=ip,
         user_agent=user_agent,
+        oneid_access_token=login.access_token,
     )
 
 
@@ -208,6 +265,31 @@ async def login_via_eimzo(
         ip=ip,
         user_agent=user_agent,
     )
+
+
+async def logout_session(db: AsyncSession, session_row: Session) -> None:
+    """Revoke OUR session first, then ask OneID to end its own.
+
+    The order is the design. The provider call is best effort and may hang for
+    the adapter's whole timeout, while a citizen who pressed "sign out" must be
+    signed out of our system whatever OneID does — so the revocation is
+    unconditional and the `one_log_out` failure is only logged (the adapter
+    itself already swallows a provider error; this catch is for the day one
+    stops).
+
+    Without the provider call our logout would close only our own session: the
+    OneID session survives in the browser, and on a shared computer the next
+    person's "sign in with OneID" would land in this citizen's cabinet with no
+    password (decision #140 ruling 4)."""
+    token = session_row.oneid_access_token
+    session_row.oneid_access_token = None
+    await revoke_session(db, session_row, reason="logout")
+    if not token:
+        return
+    try:
+        await get_oneid_adapter().logout(token)
+    except OneIdError as exc:
+        structlog.get_logger().warning("oneid.logout_failed", err_code=exc.err_code)
 
 
 async def revoke_session(db: AsyncSession, session_row: Session, *, reason: str) -> None:
@@ -837,6 +919,23 @@ async def effective_representation_of(
     return await repo.get_effective_representation(
         db, applicant_id=applicant_id, user_id=user_id, today=business_today()
     )
+
+
+async def effective_representative(db: AsyncSession, applicant_id: uuid.UUID) -> uuid.UUID | None:
+    """One user currently holding an EFFECTIVE representation of a LEGAL
+    applicant, or `None` if nobody does. "Effective" means the same thing as
+    everywhere else in this file: `status='active'` and not past
+    `valid_until`, judged against `business_today()`, never `date.today()`
+    (lesson). A legal entity has SEVERAL representatives (decision #9); this
+    is not "the primary one" (no rule names one), only "a currently valid
+    one", deterministic via `repo.any_effective_representative`'s own
+    ordering.
+
+    First caller: `inspections.service._violator_recipient` (ruling R2) — a
+    violation case is opened BY THE SYSTEM when an inspector signs an act,
+    so unlike `applications`/`permits` there is no `submitted_by_user_id` to
+    fall back to when the applicant itself has no account."""
+    return await repo.any_effective_representative(db, applicant_id, business_today())
 
 
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:

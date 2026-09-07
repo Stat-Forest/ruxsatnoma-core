@@ -15,7 +15,7 @@ from app.core import settings_store
 from app.core.errors import err
 from app.core.models import SystemSetting
 from app.core.time import business_today
-from app.modules.admin import repo
+from app.modules.admin import open_work, repo
 from app.modules.admin.models import ActivityType, Classifier, ClassifierItem, Organization, Region
 from app.modules.admin.schemas import (
     ActivityTypePatch,
@@ -27,6 +27,7 @@ from app.modules.admin.schemas import (
     SettingOut,
 )
 from app.modules.audit import service as audit
+from app.modules.auth import repo as auth_repo
 from app.modules.auth.models import User
 
 
@@ -231,7 +232,17 @@ async def update_organization(
 
 async def archive_organization(db: AsyncSession, *, org_id: uuid.UUID, actor: User) -> Organization:
     """Archival replaces deletion (design/02 principle 7). A node with active children
-    keeps them reachable, so the subtree is archived leaves-first by the admin."""
+    keeps them reachable, so the subtree is archived leaves-first by the admin.
+
+    Two more refusals beside that one (ruling R7, finding F5 of
+    `docs/plans/07.5-audit-findings.md`): a leshoz still carrying active staff,
+    or non-terminal work routed through it, does not quietly stop showing as
+    active while that work continues underneath — the same "no handover, no
+    change of state" rule tz/04 С23 states for deleting a USER, extended here
+    to the organization archival adjacent to it. Checked in this order —
+    children, then staff, then work — so the FIRST reason returned is always
+    the cheapest one for the admin to resolve.
+    """
     org = await organization_or_404(db, org_id)
     if org.status == "archived":
         return org
@@ -244,6 +255,22 @@ async def archive_organization(db: AsyncSession, *, org_id: uuid.UUID, actor: Us
     ).scalar_one()
     if active_children:
         raise err("ERR-VAL-001", details={"reason": "active children", "count": active_children})
+    active_staff = await auth_repo.count_active_users_in_org(db, org.id)
+    if active_staff:
+        raise err("ERR-VAL-001", details={"reason": "active users", "count": active_staff})
+    # `admin` (level 1) may not import `applications` (3) to ask this itself —
+    # `open_work.org_work_for` is fail-closed the same way `open_work_for` is
+    # for a user: a provider that raises leaves the archive refused, never
+    # silently allowed.
+    held = await open_work.org_work_for(db, org.id)
+    if held:
+        raise err(
+            "ERR-VAL-001",
+            details={
+                "reason": "open applications",
+                "open_work": [item.as_details() for item in held],
+            },
+        )
     before = _snapshot(org)
     org.status = "archived"
     await db.flush()

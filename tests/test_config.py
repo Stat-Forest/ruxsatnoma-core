@@ -40,6 +40,12 @@ def test_prod_accepts_custom_secret_key():
         sms_mode="real",
         email_mode="real",
         payme_mode="real",
+        # Stage 5.1: a real OneID needs its credentials, a real scope and a
+        # redirect URI registered in the TI (localhost is forbidden there).
+        oneid_client_id="forestry_uz",
+        oneid_client_secret="a-real-oneid-client-secret",
+        oneid_scope="forestry_uz",
+        oneid_redirect_uri="https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback",
         eskiz_email="bot@example.uz",
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
@@ -94,6 +100,12 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv("S3_SECRET_KEY", "real-s3-secret-for-prod-guard-test")
     for name in ("ONEID_MODE", "EIMZO_MODE", "SMS_MODE", "EMAIL_MODE", "PAYME_MODE"):
         monkeypatch.setenv(name, "real")
+    monkeypatch.setenv("ONEID_CLIENT_ID", "forestry_uz")
+    monkeypatch.setenv("ONEID_CLIENT_SECRET", "real-oneid-secret-for-prod-guard-test")
+    monkeypatch.setenv("ONEID_SCOPE", "forestry_uz")
+    monkeypatch.setenv(
+        "ONEID_REDIRECT_URI", "https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback"
+    )
     monkeypatch.setenv("ESKIZ_EMAIL", "bot@example.uz")
     monkeypatch.setenv("ESKIZ_PASSWORD", "real-eskiz-password-for-prod-guard-test")
     monkeypatch.setenv("ESKIZ_SENDER", "4546")
@@ -260,3 +272,62 @@ def test_env_example_is_a_working_env_file(tmp_path, monkeypatch):
     assert settings.eskiz_base_url.startswith("https://")
     assert settings.public_base_url.startswith("http")
     assert settings.eskiz_callback_base_url.startswith("http")
+
+
+# --- OneID go-live (stage 5.1) -------------------------------------------------
+# `oneid_mode=real` is checked unconditionally, like sms_mode: a half-configured
+# live provider fails at LOGIN TIME, for every citizen at once, and OneID is the
+# only entry a citizen has (decision #94).
+
+REAL_ONEID = {
+    "oneid_mode": "real",
+    "oneid_client_id": "forestry_uz",
+    "oneid_client_secret": "a-real-client-secret",
+    "oneid_scope": "forestry_uz",
+    "oneid_redirect_uri": "https://dev-api.ruxsatnoma-urmon.uz/api/v1/auth/oneid/callback",
+}
+
+
+def test_oneid_mode_real_requires_client_credentials():
+    with pytest.raises(ValidationError, match="oneid_client_id"):
+        Settings(**{**REAL_ONEID, "oneid_client_id": ""}, _env_file=None)  # pyright: ignore[reportCallIssue]
+
+
+def test_oneid_mode_real_requires_the_client_secret():
+    with pytest.raises(ValidationError, match="oneid_client_id"):
+        Settings(**{**REAL_ONEID, "oneid_client_secret": ""}, _env_file=None)  # pyright: ignore[reportCallIssue]
+
+
+def test_oneid_mode_real_refuses_the_placeholder_scope():
+    # At OneID the scope IS the client_id (plan 05.1 R1). The default
+    # "mock-scope" would be sent to the provider verbatim and refused there.
+    with pytest.raises(ValidationError, match="oneid_scope"):
+        Settings(**{**REAL_ONEID, "oneid_scope": "mock-scope"}, _env_file=None)  # pyright: ignore[reportCallIssue]
+
+
+def test_oneid_mode_real_refuses_a_local_redirect_uri():
+    # The TI lists every allowed redirect URI and forbids localhost
+    # (design/04 §1.4): a local one is refused BY THE PROVIDER, with nothing on
+    # our side to explain it.
+    with pytest.raises(ValidationError, match="oneid_redirect_uri"):
+        Settings(
+            **{
+                **REAL_ONEID,
+                "oneid_redirect_uri": "http://localhost:8000/api/v1/auth/oneid/callback",
+            },
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+
+def test_oneid_mode_real_accepts_a_complete_configuration():
+    settings = Settings(**REAL_ONEID, _env_file=None)  # pyright: ignore[reportCallIssue]
+    assert settings.oneid_base_url == "https://sso.egov.uz/sso/oauth/Authorization.do"
+    assert settings.oneid_client_id == "forestry_uz"
+
+
+def test_mock_oneid_needs_none_of_it():
+    # The mock is the default in every environment that exists today, and the
+    # TI forbids localhost as a redirect target — so local development can
+    # never be made to satisfy the real-mode guard (design/04 §1.5).
+    settings = Settings(oneid_mode="mock", _env_file=None)  # pyright: ignore[reportCallIssue]
+    assert settings.oneid_scope == "mock-scope"

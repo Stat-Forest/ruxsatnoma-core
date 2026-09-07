@@ -177,6 +177,20 @@ async def count_role_holders(db: AsyncSession, role_id: uuid.UUID) -> int:
     return result.scalar_one()
 
 
+async def count_active_users_in_org(db: AsyncSession, organization_id: uuid.UUID) -> int:
+    """Users with `status='active'` whose `organization_id` is this one —
+    `admin.service.archive_organization`'s own read (finding F5, plan 07.6
+    task 3): `admin` may call `auth` (both level 1, design/01), the same way
+    every other check in `users_service.py` already does through this file
+    rather than a raw `select(User)` of its own."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(User)
+        .where(User.organization_id == organization_id, User.status == "active")
+    )
+    return result.scalar_one()
+
+
 async def roles_with_stats(db: AsyncSession) -> list[tuple[Role, int, list[str]]]:
     """Every role with its holder count (non-deleted users) and permission codes, in
     one query (LEFT JOIN + array_agg) — avoids an N+1 across the admin roles list
@@ -443,3 +457,28 @@ async def get_effective_representation(
             )
         )
     ).scalar_one_or_none()
+
+
+async def any_effective_representative(
+    db: AsyncSession, applicant_id: uuid.UUID, today: date
+) -> uuid.UUID | None:
+    """One user currently holding an EFFECTIVE representation of `applicant_id`
+    (`status='active'`, not past `valid_until`), or `None` — the reverse
+    direction of `effective_representations` above (that one walks FROM a
+    user; this walks FROM an applicant). A legal entity has SEVERAL
+    representatives (decision #9); this picks the earliest-created one,
+    deterministic rather than "the primary one" — no rule in this codebase
+    names a primary representative. First caller: `inspections.service.
+    _violator_recipient` (ruling R2, `07.6-handover-and-the-violator.md`),
+    which has no submitter of its own to fall back to the way
+    `applications`/`permits` do — a violation case is opened BY THE SYSTEM."""
+    return await db.scalar(
+        select(Representation.user_id)
+        .where(
+            Representation.applicant_id == applicant_id,
+            Representation.status == "active",
+            (Representation.valid_until.is_(None)) | (Representation.valid_until >= today),
+        )
+        .order_by(Representation.created_at)
+        .limit(1)
+    )

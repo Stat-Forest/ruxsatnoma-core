@@ -48,6 +48,25 @@ async def get_task(db: AsyncSession, task_id: uuid.UUID) -> InspectionTask | Non
     return await db.get(InspectionTask, task_id)
 
 
+async def open_task_ids_for_user(
+    db: AsyncSession, user_id: uuid.UUID, *, limit: int
+) -> Sequence[uuid.UUID]:
+    """Every `assigned`/`in_progress` task's id this user still holds, capped
+    at `limit` — `service.open_work_provider`'s only query (ruling R5: a
+    `done`/`cancelled` task needs nobody to act, so it is excluded here
+    rather than filtered by the caller)."""
+    result = await db.execute(
+        select(InspectionTask.id)
+        .where(
+            InspectionTask.assigned_to == user_id,
+            InspectionTask.status.in_(("assigned", "in_progress")),
+        )
+        .order_by(InspectionTask.due_at, InspectionTask.id)
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
 async def list_tasks(
     db: AsyncSession,
     *,
@@ -170,6 +189,7 @@ async def list_cases(
     *,
     scope: ColumnElement[bool],
     status: str | None,
+    applicant_id: uuid.UUID | None = None,
     params: PageParams,
 ) -> tuple[Sequence[ViolationCase], int]:
     # Outer join for the same reason as `list_tasks` above.
@@ -180,6 +200,11 @@ async def list_cases(
     )
     if status is not None:
         stmt = stmt.where(ViolationCase.status == status)
+    if applicant_id is not None:
+        # Ruling R8: intersected with `scope`, never a replacement for it —
+        # a leshoz head filtering by a repeat violator still sees only their
+        # own zone's cases against that applicant.
+        stmt = stmt.where(ViolationCase.applicant_id == applicant_id)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     stmt = (
         stmt.order_by(ViolationCase.created_at.desc(), ViolationCase.id)
@@ -188,6 +213,29 @@ async def list_cases(
     )
     rows = (await db.execute(stmt)).scalars().all()
     return rows, total
+
+
+async def count_prior_cases(
+    db: AsyncSession, *, applicant_id: uuid.UUID, exclude_case_id: uuid.UUID
+) -> int:
+    """Ruling R8 (finding F3, `tz/04`'s "shows the history"): every OTHER case
+    against the SAME applicant that reached a real outcome — `decided` or
+    `closed` — never `opened`/`explanation_requested`/`explained`/`appealed`,
+    which are still in progress and are not yet "history". No zone filter:
+    `case_card`'s own caller has already passed `_readable_case`, so whoever
+    can read THIS case is entitled to know how many priors its own violator
+    has, the same way `prior_cases_count` is a fact about the PERSON, not
+    about which leshoz happened to open which case."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(ViolationCase)
+        .where(
+            ViolationCase.applicant_id == applicant_id,
+            ViolationCase.id != exclude_case_id,
+            ViolationCase.status.in_(("decided", "closed")),
+        )
+    )
+    return result.scalar_one()
 
 
 async def list_case_history(db: AsyncSession, case_id: uuid.UUID) -> Sequence[ViolationCaseHistory]:

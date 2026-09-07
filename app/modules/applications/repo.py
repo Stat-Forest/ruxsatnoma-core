@@ -17,7 +17,7 @@ ours to FETCH either, so `service.list_applications` obtains it from
 this file imports no other module's service (review I2)."""
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date, datetime
 from typing import Any
 
@@ -618,5 +618,54 @@ async def list_info_requests(db: AsyncSession, application_id: uuid.UUID) -> Seq
         select(InfoRequest)
         .where(InfoRequest.application_id == application_id)
         .order_by(InfoRequest.requested_at, InfoRequest.id)
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+# --- Stage 7.6: the open-work seam (finding F4/F5) ---------------------------
+#
+# Deciding WHICH statuses are terminal is `service.py`'s job
+# (`TERMINAL_APPLICATION_STATUSES`, derived from `APPLICATION_TRANSITIONS`) —
+# this file only reads and writes rows (module docstring above), so both
+# functions take the set to exclude as a plain argument, the same division of
+# labour `list_applications_sla_due_soon` already draws with `SLA_ACTIVE_STATUSES`.
+
+
+async def assigned_open_application_ids(
+    db: AsyncSession, user_id: uuid.UUID, *, exclude_statuses: Collection[str], limit: int
+) -> Sequence[uuid.UUID]:
+    """Every application currently assigned to `user_id`
+    (`Application.assigned_user_id`) whose status is not in
+    `exclude_statuses`, capped at `limit` ids and ordered by id so a capped
+    page is the same set on every call rather than whichever the planner
+    returns first — `admin.open_work`'s per-user provider (F4)."""
+    stmt = (
+        select(Application.id)
+        .where(
+            Application.assigned_user_id == user_id,
+            Application.status.notin_(exclude_statuses),
+        )
+        .order_by(Application.id)
+        .limit(limit)
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+async def assigned_open_application_ids_for_org(
+    db: AsyncSession, organization_id: uuid.UUID, *, exclude_statuses: Collection[str], limit: int
+) -> Sequence[uuid.UUID]:
+    """The same query, keyed by `Application.assigned_org_id` instead —
+    `admin.open_work`'s per-organization provider (F5). Deliberately the
+    column an application is EXPLICITLY routed to, not the contour's owner
+    (`service._effective_organization`'s other half): archiving a leshoz
+    should not depend on geometry this query has no business reading."""
+    stmt = (
+        select(Application.id)
+        .where(
+            Application.assigned_org_id == organization_id,
+            Application.status.notin_(exclude_statuses),
+        )
+        .order_by(Application.id)
+        .limit(limit)
     )
     return (await db.execute(stmt)).scalars().all()
