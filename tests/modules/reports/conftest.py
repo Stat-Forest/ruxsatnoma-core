@@ -19,7 +19,7 @@ that could produce one.
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import httpx
@@ -32,8 +32,9 @@ from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.auth.models import User
 from app.modules.gis.models import GisLayer
+from app.modules.inspections import service as inspections_service
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
-from app.modules.payments.models import Invoice
+from app.modules.payments.models import Allocation, Invoice
 from app.modules.permits.models import Permit
 from app.modules.reports import forms_seed, service
 from app.modules.reports.models import ReportForm
@@ -52,6 +53,8 @@ from tests.modules.gis.conftest import approval_doc as approval_doc
 from tests.modules.gis.conftest import contours_layer as contours_layer
 from tests.modules.gis.conftest import leshoz as leshoz
 from tests.modules.gis.conftest import other_leshoz as other_leshoz
+from tests.modules.inspections.conftest import default_checklist_id as default_checklist_id
+from tests.modules.inspections.conftest import vt_01 as vt_01
 from tests.modules.permits.conftest import make_permit_on_contour, unique_pinfl
 
 
@@ -115,11 +118,18 @@ async def make_report_permit(
     period_from: date,
     period_to: date,
     paid_amount: Decimal | None = None,
+    refunded_amount: Decimal | None = None,
 ) -> Permit:
     """One permit + applicant + application, through
     `tests.modules.permits.conftest.make_permit_on_contour` — the FK chain
     `repo.report_rows`' join reads. `paid_amount` additionally inserts a
-    `paid` invoice, so a report's `paid_amount` column has something to show."""
+    `paid` invoice, so a report's `paid_amount` column has something to show.
+
+    `refunded_amount` (decision #106) additionally inserts a `refund`
+    allocation against that invoice — the same direct-insert shape
+    `paid_amount`'s own `Invoice` already uses (reports has no writer of its
+    own that could produce either row); requires `paid_amount` too, since a
+    refund needs an invoice to refund."""
     contour = await make_contour(db, layer, org)
     version = await make_version(
         db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
@@ -134,17 +144,78 @@ async def make_report_permit(
         period_from=period_from,
         period_to=period_to,
     )
+    invoice: Invoice | None = None
     if paid_amount is not None:
+        invoice = Invoice(
+            number=f"INV-{uuid.uuid4().hex[:10]}",
+            application_id=permit.application_id,
+            amount=paid_amount,
+            status="paid",
+        )
+        db.add(invoice)
+        await db.flush()
+    if refunded_amount is not None:
+        assert invoice is not None, "refunded_amount needs paid_amount (an invoice to refund)"
         db.add(
-            Invoice(
-                number=f"INV-{uuid.uuid4().hex[:10]}",
-                application_id=permit.application_id,
-                amount=paid_amount,
-                status="paid",
+            Allocation(
+                invoice_id=invoice.id,
+                entry_type="refund",
+                target="recipient",
+                amount=-refunded_amount,
+                note="test refund",
             )
         )
         await db.flush()
     return permit
+
+
+async def make_signed_act(
+    db: AsyncSession,
+    *,
+    permit: Permit,
+    org: Organization,
+    checklist_id: uuid.UUID,
+    occurred_at: datetime,
+    result: str,
+    violation_type_item_id: uuid.UUID | None = None,
+) -> None:
+    """A SIGNED field act against `permit`, through the real create-then-sign
+    transition (lesson: "Build a fixture's precondition through the real
+    transition, never by assigning the status") — reports has no writer of
+    its own for `inspection_acts`, so this goes through
+    `inspections.service` directly, the same module the reader join itself
+    calls (`repo.report_rows`)."""
+    inspector = await make_user(
+        db, role_code="inspector", organization_id=org.id, pinfl=unique_pinfl()
+    )
+    assert inspector.pinfl is not None
+    act = await inspections_service.create_act(
+        db,
+        task_id=None,
+        permit_id=permit.id,
+        application_id=None,
+        occurred_at=occurred_at,
+        gps=None,
+        gps_accuracy_m=None,
+        checklist_id=checklist_id,
+        answers={"activity_matches": True, "within_contour": True},
+        facts={},
+        notes=None,
+        result=result,
+        created_offline_at=None,
+        actor=inspector,
+    )
+    document = inspections_service._act_package_bytes(act)  # noqa: SLF001 - test-only reuse
+    pkcs7 = encode_mock_signature(
+        document=document, serial=f"SN-{inspector.pinfl}", issuer="ISS-1", pinfl=inspector.pinfl
+    )
+    await inspections_service.sign_act(
+        db,
+        act.id,
+        pkcs7=pkcs7,
+        violation_type_item_id=violation_type_item_id,
+        actor=inspector,
+    )
 
 
 # --- clients (HTTP, for test_router.py) -------------------------------------

@@ -1,12 +1,17 @@
 """All SQL/ORM queries for `reports` — including the cross-module reader join
 (design/01 rule 5: reports gets read-only access to any table). `permits`,
-`invoices` and `applicants` are imported here, for SELECT only, and nowhere
-else in this module — the boundary rule is enforced by convention (this file
-is the one place it happens), the same shape `norms/repo.py::application_facts`
-uses for ITS one read-only cross-module window."""
+`invoices`, `allocations` and `applicants` are imported here, for SELECT
+only, and nowhere else in this module — the boundary rule is enforced by
+convention (this file is the one place it happens), the same shape
+`norms/repo.py::application_facts` uses for ITS one read-only cross-module
+window. `inspection_result` is the one exception: it comes from
+`inspections.service.acts_for_permits`, a real cross-module SERVICE call
+rather than a table read, because "which acts count" (signed only) is
+`inspections`' own business rule — see `report_rows`'s docstring."""
 
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import Select, func, select
@@ -14,7 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
 from app.modules.auth.models import Applicant
-from app.modules.payments.models import Invoice
+from app.modules.inspections import service as inspections_service
+from app.modules.payments.models import Allocation, Invoice
 from app.modules.permits.models import Permit
 from app.modules.reports.models import Report, ReportForm
 
@@ -183,11 +189,24 @@ async def report_rows(
     writes here and no import of `permits.service`/`payments.service`: a
     reporting join is exactly the "queries across the whole database" case
     the rule carves out, not a business action any owning module frames as
-    one call.
+    one call. `allocations` is read the same way `invoices`/`permits`/
+    `applicants` already are.
 
-    `inspection_result` is always `None` — `inspections` (track 4.1) does not
-    exist on this branch (plan "scope cuts"); the field name is reserved so a
-    later wiring is an UPDATE of this function, not a schema change.
+    `inspection_result` (#105) is every SIGNED act's `result` against the
+    permit, comma-separated, oldest first — via
+    `inspections.service.acts_for_permits`, a real service call rather than
+    the table-read exception above (see the module docstring). `""` when the
+    permit has no signed act, never `None` printed as text.
+
+    `refunded_amount` (#106) is the sum of every non-`payment` `allocations`
+    entry against the permit's invoice (`refund`, from a manual refund, and
+    `correction`, from an automatic Payme reversal — `payments.service.
+    record_reversal`'s own docstring: "does not move the invoice off `paid`")
+    — stored negative in the ledger, so this negates it back to a plain
+    positive figure. `"0.00"` when nothing was ever refunded, never blank:
+    `paid_amount` keeps meaning "what the invoice showed as paid", and this
+    column is what later left again, so a printed report never has to be
+    re-rendered to net the two — see the module docstring's "never a write".
     """
     conditions: list[Any] = [
         Permit.organization_id == organization_id,
@@ -206,9 +225,20 @@ async def report_rows(
         .group_by(Invoice.application_id)
         .subquery()
     )
+    # Every entry OTHER than the original payment: a manual refund
+    # (`entry_type="refund"`) and an automatic Payme reversal
+    # (`entry_type="correction"`) both count, and both are stored negative —
+    # summed here, negated once below, never re-derived per row.
+    refund_totals = (
+        select(Allocation.invoice_id, func.sum(Allocation.amount).label("refunded_sum"))
+        .where(Allocation.entry_type != "payment")
+        .group_by(Allocation.invoice_id)
+        .subquery()
+    )
 
     result = await db.execute(
         select(
+            Permit.id,
             Permit.series,
             Permit.number,
             Permit.area_ha,
@@ -227,6 +257,7 @@ async def report_rows(
             Invoice.amount.label("paid_amount"),
             Invoice.status.label("invoice_status"),
             Invoice.paid_at,
+            refund_totals.c.refunded_sum,
         )
         .join(Applicant, Applicant.id == Permit.applicant_id)
         .outerjoin(latest_invoice, latest_invoice.c.application_id == Permit.application_id)
@@ -235,13 +266,21 @@ async def report_rows(
             (Invoice.application_id == latest_invoice.c.application_id)
             & (Invoice.issued_at == latest_invoice.c.issued_at),
         )
+        .outerjoin(refund_totals, refund_totals.c.invoice_id == Invoice.id)
         .where(*conditions)
         .order_by(Permit.series, Permit.number)
     )
+    permit_rows = result.all()
+    acts_by_permit = await inspections_service.acts_for_permits(db, [r.id for r in permit_rows])
+
     rows: list[dict[str, Any]] = []
-    for r in result.all():
+    for r in permit_rows:
         paid_amount = r.paid_amount if r.invoice_status == "paid" else None
+        refunded_amount = Decimal("0.00") if r.refunded_sum is None else -r.refunded_sum
         snapshot = r.snapshot or {}
+        inspection_result = ", ".join(
+            act.result for act in acts_by_permit.get(r.id, []) if act.result
+        )
         rows.append(
             {
                 "permit_series_number": f"{r.series} № {r.number:06d}",
@@ -271,8 +310,9 @@ async def report_rows(
                 "period_to": r.period_to.isoformat(),
                 "total_amount": str(r.amount),
                 "paid_amount": str(paid_amount) if paid_amount is not None else None,
+                "refunded_amount": str(refunded_amount),
                 "distribution": None,
-                "inspection_result": None,
+                "inspection_result": inspection_result,
             }
         )
     return rows

@@ -620,6 +620,31 @@ async def list_acts(
     return await repo.list_acts(db, scope=scope, result=result, params=params)
 
 
+async def acts_for_permits(
+    db: AsyncSession, permit_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, list[InspectionAct]]:
+    """Every SIGNED act for each of `permit_ids`, each permit's own list
+    chronological (`occurred_at` ascending) — the cross-module read
+    `reports.repo.report_rows` calls for its `inspection_result` column
+    (decision #105). Reports is a level-5 reader with its own read-only-table
+    right (design/01 rule 5), but "which acts count" is THIS module's rule —
+    a DRAFT act is not yet the inspector's final word, the same
+    `status == "signed"` filter `dashboard/repo.py` already applies when
+    counting acts — so the read goes through the service rather than reports
+    re-deriving that rule against `inspection_acts` itself.
+
+    No actor/zone scoping: the caller has already scoped `permit_ids` to the
+    report's own organization, and this is a reader calling a sibling
+    module's public surface, not a request a person makes."""
+    acts = await repo.acts_for_permits(db, permit_ids=permit_ids)
+    by_permit: dict[uuid.UUID, list[InspectionAct]] = {}
+    for act in acts:
+        if act.permit_id is None:
+            continue
+        by_permit.setdefault(act.permit_id, []).append(act)
+    return by_permit
+
+
 async def update_act(
     db: AsyncSession,
     act_id: uuid.UUID,

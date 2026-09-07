@@ -122,6 +122,24 @@ async def list_acts(
     return rows, total
 
 
+async def acts_for_permits(
+    db: AsyncSession, *, permit_ids: Sequence[uuid.UUID]
+) -> Sequence[InspectionAct]:
+    """Every SIGNED act against any of `permit_ids` — `service.
+    acts_for_permits` (reports' #105 read) is the only caller, one query for
+    a whole report's worth of permits rather than one per row. Ordered by
+    permit then `occurred_at` so grouping by `permit_id` in Python keeps each
+    permit's own list chronological without a second sort."""
+    if not permit_ids:
+        return []
+    result = await db.execute(
+        select(InspectionAct)
+        .where(InspectionAct.permit_id.in_(permit_ids), InspectionAct.status == "signed")
+        .order_by(InspectionAct.permit_id, InspectionAct.occurred_at, InspectionAct.id)
+    )
+    return result.scalars().all()
+
+
 async def list_act_files(db: AsyncSession, act_id: uuid.UUID) -> Sequence[InspectionActFile]:
     result = await db.execute(select(InspectionActFile).where(InspectionActFile.act_id == act_id))
     return result.scalars().all()

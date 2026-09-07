@@ -10,11 +10,13 @@ forms by POSTing this payload, exactly as a central admin would through the
 UI.
 
 `source` says how `service.generate_report` fills a column's value:
-`"auto"` — computed from `permits`/`invoices`/`applicants` (this module's
-reader join, `repo.report_rows`); `"manual"` — a hodim types it (a
-registry field the join does not carry today, or a signature slot that is
-not a data field at all). Every code is a snake_case name a hodim/central
-admin would recognise from the printed form, not the bare column number.
+`"auto"` — computed from `permits`/`invoices`/`applicants`/`allocations`
+(this module's reader join, `repo.report_rows`) or from `inspections` via
+its own service (`inspection_result`, decision #105); `"manual"` — a hodim
+types it (a registry field the join does not carry today, or a signature
+slot that is not a data field at all). Every code is a snake_case name a
+hodim/central admin would recognise from the printed form, not the bare
+column number.
 """
 
 from typing import Any
@@ -146,6 +148,20 @@ _SHARED_TAIL: list[dict[str, Any]] = [
             "uz_cyrl": "Тўланган сумма ва санаси",
             "uz_latn": "Toʻlangan summa va sanasi",
             "ru": "Оплаченная сумма и дата оплаты",
+        },
+        "source": "auto",
+        "type": "money",
+    },
+    # Decision #106: paid and refunded print as two separate figures, never
+    # netted — a printed report for a past month must never change
+    # retroactively. Not one of tz/13's original numbered columns; added by
+    # this ruling, same shape as every other "auto" money column.
+    {
+        "code": "refunded_amount",
+        "label": {
+            "uz_cyrl": "Қайтарилган сумма",
+            "uz_latn": "Qaytarilgan summa",
+            "ru": "Возвращённая сумма",
         },
         "source": "auto",
         "type": "money",
@@ -350,5 +366,5 @@ HAYMAKING_COLUMNS: list[dict[str, Any]] = [
     *_SHARED_TAIL,
 ]
 
-assert len(GRAZING_COLUMNS) == 28, "tz/13: 2-ilova has 28 columns"
-assert len(HAYMAKING_COLUMNS) == 22, "tz/13: 3-ilova has 22 columns"
+assert len(GRAZING_COLUMNS) == 29, "tz/13's 28 columns + refunded_amount (decision #106)"
+assert len(HAYMAKING_COLUMNS) == 23, "tz/13's 22 columns + refunded_amount (decision #106)"
