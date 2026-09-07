@@ -56,18 +56,56 @@ class OneIdProfile:
         return cls(**{**data, "legal_info": legal})
 
 
-class OneIdError(Exception):
-    """Provider unreachable or returned an error; err_code is ERR-INT-001/002."""
+@dataclass(frozen=True)
+class OneIdCall:
+    """One provider round trip, for `integration_log` (stage 5.1 task 6).
 
-    def __init__(self, err_code: str) -> None:
+    Carries no personal data and no token — only which grant it was, how it
+    went, and the provider's own error code when it refused."""
+
+    endpoint: str  # the grant_type: one_authorization_code|one_access_token_identify|one_log_out
+    http_status: int | None
+    duration_ms: int
+    # OneID refuses with HTTP 400 and {"message": ..., "error": ...} — e.g.
+    # "ClientSecretException" / "CLIENT_SECRET_NOT_FOUND" (verified against the
+    # live endpoint 2026-09-07, plan 05.1 R7). These two strings are what tells
+    # an administrator our secret is wrong rather than the provider being down.
+    provider_message: str | None = None
+    provider_error: str | None = None
+
+
+@dataclass(frozen=True)
+class OneIdLogin:
+    """What one completed exchange yields.
+
+    The access token sits HERE rather than on `OneIdProfile` deliberately: the
+    profile is serialized whole into `users.oneid_profile`
+    (`auth.service.login_or_create_by_pinfl`), a column read back for the
+    director_registry basis and partly returned to the browser. A bearer token
+    for a state system has no business inside it."""
+
+    profile: OneIdProfile
+    access_token: str | None = None
+    calls: tuple[OneIdCall, ...] = ()
+
+
+class OneIdError(Exception):
+    """Provider unreachable or returned an error; err_code is ERR-INT-001/002.
+
+    `calls` carries whatever round trips were made before the failure, so a
+    refusal is as loggable as a success — the log entry is what tells the
+    difference between a wrong secret and an outage."""
+
+    def __init__(self, err_code: str, calls: tuple[OneIdCall, ...] = ()) -> None:
         super().__init__(err_code)
         self.err_code = err_code
+        self.calls = calls
 
 
 class OneIdAdapter(Protocol):
     def authorize_url(self, *, state: str, redirect_uri: str, scope: str) -> str: ...
 
-    async def exchange_code(self, code: str) -> OneIdProfile: ...
+    async def exchange_code(self, code: str) -> OneIdLogin: ...
 
     async def logout(self, access_token: str | None) -> None: ...
 
@@ -129,9 +167,9 @@ class MockOneId:
         query = urlencode({"code": code, "state": state})
         return f"{redirect_uri}?{query}"
 
-    async def exchange_code(self, code: str) -> OneIdProfile:
+    async def exchange_code(self, code: str) -> OneIdLogin:
         try:
-            return OneIdProfile.from_snapshot(decode_payload(code))
+            return OneIdLogin(profile=OneIdProfile.from_snapshot(decode_payload(code)))
         except (ValueError, TypeError) as exc:
             raise OneIdError("ERR-INT-002") from exc
 

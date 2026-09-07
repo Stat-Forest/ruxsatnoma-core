@@ -15,6 +15,7 @@ from app.modules.integrations.adapters.oneid import (
     MockOneId,
     OneIdError,
     OneIdLegalInfo,
+    OneIdLogin,
     OneIdProfile,
     encode_mock_code,
     get_oneid_adapter,
@@ -34,9 +35,23 @@ async def test_oneid_mock_roundtrip():
     adapter = get_oneid_adapter()
     url = adapter.authorize_url(state="abc", redirect_uri="http://x/cb", scope="test-scope")
     assert "state=abc" in url
-    profile = await adapter.exchange_code(encode_mock_code(PROFILE))
-    assert profile == PROFILE
-    assert profile.legal_info[0].le_tin == "123456789"
+    login = await adapter.exchange_code(encode_mock_code(PROFILE))
+    assert login.profile == PROFILE
+    assert login.profile.legal_info[0].le_tin == "123456789"
+    # The mock has no provider session to end, so there is no token to keep.
+    assert login.access_token is None
+    assert login.calls == ()
+
+
+async def test_the_access_token_never_reaches_the_profile_snapshot():
+    """`login_or_create_by_pinfl` serializes `OneIdLogin.profile` whole into
+    `users.oneid_profile`, and that column is read back for the
+    director_registry basis and partly returned to the browser. A bearer token
+    for a state system may not travel inside it — which is why the token is a
+    field of the LOGIN, not of the profile (stage 5.1 task 2)."""
+    login = OneIdLogin(profile=PROFILE, access_token="tok-secret-1")
+    assert "tok-secret-1" not in str(login.profile.to_snapshot())
+    assert "access_token" not in login.profile.to_snapshot()
 
 
 async def test_oneid_snapshot_roundtrip():
@@ -109,7 +124,7 @@ async def test_oneid_profile_new_fields_roundtrip():
     )
     adapter = get_oneid_adapter()
     restored = await adapter.exchange_code(encode_mock_code(profile))
-    assert restored == profile
+    assert restored.profile == profile
 
 
 async def test_mock_authorize_url_is_self_referential():
@@ -125,11 +140,11 @@ async def test_mock_authorize_url_is_self_referential():
     assert "state=s" in url
     parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
     assert parsed["state"] == ["s"]
-    profile = await adapter.exchange_code(parsed["code"][0])
-    assert profile == MOCK_DEMO_PROFILE
+    login = await adapter.exchange_code(parsed["code"][0])
+    assert login.profile == MOCK_DEMO_PROFILE
     # Obviously a demo, and not a shape any real citizen's PINFL could take.
-    assert profile.pinfl == "99999999999999"
-    assert "MOCK" in profile.full_name and "DEMO" in profile.full_name
+    assert login.profile.pinfl == "99999999999999"
+    assert "MOCK" in login.profile.full_name and "DEMO" in login.profile.full_name
 
 
 def test_real_oneid_provider_url_shape_is_preserved():
@@ -143,15 +158,20 @@ def test_real_oneid_provider_url_shape_is_preserved():
     assert "redirect_uri=http%3A%2F%2Fcb" in url
 
 
-def test_oneid_real_mode_still_unimplemented(monkeypatch):
-    """`get_oneid_adapter()`'s real-mode branch — untouched by this fix, and
-    verified so: the mock-mode self-referential URL must never leak into it."""
+def test_oneid_real_mode_without_credentials_never_gets_as_far_as_an_adapter(monkeypatch):
+    """Until stage 5.1 this raised `NotImplementedError` from the factory. It
+    now fails EARLIER and harder: `oneid_mode=real` without credentials is
+    refused by `Settings` itself, so a half-configured provider cannot reach a
+    running process at all (task 1). The factory's real branch is exercised by
+    test_oneid_adapter.py, which supplies a complete configuration."""
+    from pydantic import ValidationError
+
     from app.config import get_settings
 
     monkeypatch.setenv("ONEID_MODE", "real")
     get_settings.cache_clear()
     try:
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValidationError, match="oneid_client_id"):
             get_oneid_adapter()
     finally:
         get_settings.cache_clear()

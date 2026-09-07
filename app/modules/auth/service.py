@@ -144,9 +144,10 @@ async def login_via_oneid(
 ) -> tuple[User, Session, str, str]:
     adapter = get_oneid_adapter()
     try:
-        profile = await adapter.exchange_code(code)
+        login = await adapter.exchange_code(code)
     except OneIdError as exc:
         raise err(exc.err_code) from exc
+    profile = login.profile
     return await login_or_create_by_pinfl(
         db,
         pinfl=profile.pinfl,
