@@ -396,6 +396,10 @@ async def update_activity_type(
         activity_type.description = (
             patch.description.root if patch.description is not None else None
         )
+    # `processing_days`/`sort_order`/`status` back NOT-NULL columns; unlike `name`
+    # above, this isn't a no-op-on-null guard — `ActivityTypePatch._reject_explicit_null`
+    # already refuses an explicit `null` for any of these three at the schema
+    # boundary (422), so `fields[field]` here is never `None`.
     for field in ("processing_days", "sort_order", "status"):
         if field in fields:
             setattr(activity_type, field, fields[field])

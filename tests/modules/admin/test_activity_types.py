@@ -114,22 +114,41 @@ async def test_patch_edits_presentation_and_writes_an_audit_row(
     ).scalar_one()
     original_processing_days = row.processing_days
     original_description = row.description
+    new_description = {"uz_latn": "Yangi tavsif", "ru": "Новое описание"}
     try:
         response = await staff_client.patch(
             f"/api/v1/refs/activity-types/{row.id}",
-            json={
-                "processing_days": 20,
-                "description": {"uz_latn": "Yangi tavsif", "ru": "Новое описание"},
-            },
+            json={"processing_days": 20, "description": new_description},
         )
         assert response.status_code == 200, response.text
         assert response.json()["processing_days"] == 20
+        # Scoped to THIS row and ordered to the latest row: `audit_log` is
+        # append-only on a shared, persistent DB, so a bare filter on `action`
+        # is true before the test even runs (this very test wrote such rows on
+        # every prior execution) and would never catch a dropped `audit.log(...)`
+        # call. Asserting the recorded before/after values is what makes this
+        # assertion able to fail on a regression rather than just on absence.
         trail = (
-            (await db.execute(select(AuditLog).where(AuditLog.action == "activity_type.update")))
+            (
+                await db.execute(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.object_id == row.id,
+                        AuditLog.action == "activity_type.update",
+                    )
+                    .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
+                    .limit(1)
+                )
+            )
             .scalars()
-            .all()
+            .first()
         )
-        assert trail, "an edit of the catalog left no audit trail"
+        assert trail is not None, "an edit of the catalog left no audit trail"
+        assert trail.old_value is not None
+        assert trail.old_value["processing_days"] == original_processing_days
+        assert trail.new_value is not None
+        assert trail.new_value["processing_days"] == 20
+        assert trail.new_value["description"] == new_description
     finally:
         restored = await staff_client.patch(
             f"/api/v1/refs/activity-types/{row.id}",
@@ -192,6 +211,47 @@ async def test_a_description_without_uz_latn_is_refused(
         f"/api/v1/refs/activity-types/{row.id}", json={"description": {"ru": "Только по-русски"}}
     )
     assert response.status_code == 422, "decision #90: uz_latn is required"
+
+
+@pytest.mark.parametrize("field", ["processing_days", "sort_order", "status"])
+async def test_explicit_null_for_a_not_null_field_is_refused(
+    db: AsyncSession, staff_client: httpx.AsyncClient, field: str
+) -> None:
+    """`processing_days`/`sort_order`/`status` back NOT-NULL columns, so
+    `{field: null}` is a schema-legal body that must never reach `setattr` and
+    fail the NOT NULL constraint as an IntegrityError (ERR-SYS-001, 500) — the
+    schema itself refuses it (422) before the service ever sees it."""
+    row = (
+        await db.execute(select(ActivityType).where(ActivityType.code == "grazing"))
+    ).scalar_one()
+    response = await staff_client.patch(f"/api/v1/refs/activity-types/{row.id}", json={field: None})
+    assert response.status_code == 422, response.text
+
+
+async def test_an_explicit_null_description_clears_it(
+    db: AsyncSession, staff_client: httpx.AsyncClient
+) -> None:
+    """`description` (unlike `processing_days`/`sort_order`/`status`) IS nullable
+    in the database (ruling #138) — an explicit `null` must keep clearing it back
+    to NULL, not get swept up by the guard the sibling test above pins."""
+    row = (
+        await db.execute(select(ActivityType).where(ActivityType.code == "grazing"))
+    ).scalar_one()
+    original_description = row.description
+    try:
+        response = await staff_client.patch(
+            f"/api/v1/refs/activity-types/{row.id}", json={"description": None}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["description"] is None
+        await db.refresh(row)
+        assert row.description is None
+    finally:
+        restored = await staff_client.patch(
+            f"/api/v1/refs/activity-types/{row.id}",
+            json={"description": original_description},
+        )
+        assert restored.status_code == 200, restored.text
 
 
 def test_nothing_outside_admin_and_norms_reads_processing_days() -> None:

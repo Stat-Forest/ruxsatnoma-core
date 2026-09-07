@@ -1,6 +1,9 @@
 """GET /refs/*: form dictionaries for every authenticated user (ruling 10).
 
 No permission code and no zone filtering — these are catalogs, not business objects.
+The one exception is `PATCH /activity-types/{id}` (ruling #139): the hard catalog's
+one edit is gated behind `admin.classifiers.manage`, because unlike every read here
+it changes what the catalog says.
 """
 
 import uuid
