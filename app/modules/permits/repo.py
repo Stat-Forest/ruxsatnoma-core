@@ -576,8 +576,10 @@ def _ratings_conditions(
     permits_kpi`'s own reasoning: `organization_id` alone passes a
     region-or-district-scoped actor for every organization in the country),
     the period, and the two optional narrowing filters the route accepts.
-    `organization_id`/`activity_type_id` default to `None` so `rating_comments`
-    below — whose route takes no such filters — can share this helper too."""
+    `organization_id`/`activity_type_id` default to `None` so a caller passing
+    neither gets the unnarrowed set; both routes — the summary and the comment
+    feed — pass them through, which is what keeps a narrowed summary and the
+    comments below it describing the same population."""
     conditions: list[Any] = [
         zone_filter(
             actor_zone,
