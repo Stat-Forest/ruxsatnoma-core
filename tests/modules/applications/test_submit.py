@@ -187,6 +187,72 @@ async def test_a_price_that_moved_after_signing_is_labeled_package_changed(
     assert error["details"]["reason"] == "package_changed"
 
 
+async def test_a_tariff_published_between_package_and_submit_is_also_package_changed(
+    engine, applicant_client, draft_ready_for_submission, grazing_activity_id
+) -> None:
+    """`tz/12` #24's own trigger, not just a herd edit: a tariff PUBLISHED in
+    the gap between `GET /package` and `POST /submit` recomputes the amount
+    exactly the way the herd edit above does, through the identical
+    `_price()` call — this proves the SAME `content_changed_reason` label
+    fires for the trigger the ruling was actually written about, not only for
+    the one that happens to be cheapest to set up in a test.
+
+    A raw UPDATE on the seeded `(grazing, small_adult)` published row, not a
+    real `norms.service.publish_versioned` maker-checker cycle: that row is
+    shared, singleton seed data other tests assert an exact coefficient
+    against (`test_grazing_returns_all_four_groups`), so this runs on its OWN
+    session (`published_coef_sb`'s own pattern) and restores the original
+    value in a `finally` — never on the test's own `db`, whose rollback would
+    not undo a COMMIT another connection has to see. Committed, because the
+    app's `POST /submit` reads through a separate connection than this test's
+    own session and would not see an uncommitted change.
+    """
+    from decimal import Decimal
+
+    from sqlalchemy import text
+
+    from app.db import make_session_factory
+
+    app_id = draft_ready_for_submission
+    pinfl = (await applicant_client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+    doc = (await applicant_client.get(f"/api/v1/applications/{app_id}/package")).content
+
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        update = text(
+            "UPDATE tariffs SET coefficient = :coefficient "
+            "WHERE activity_type_id = :activity_type_id "
+            "AND livestock_group = 'small_adult' AND status = 'published'"
+        )
+        await own_db.execute(
+            update, {"coefficient": Decimal("0.5"), "activity_type_id": grazing_activity_id}
+        )
+        await own_db.commit()
+        try:
+            result = await applicant_client.post(
+                f"/api/v1/applications/{app_id}/submit",
+                json={
+                    "pkcs7": encode_mock_signature(
+                        document=doc,
+                        serial=f"SER-{uuid.uuid4().hex[:12]}",
+                        issuer="ISS-TEST",
+                        pinfl=pinfl,
+                    )
+                },
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
+        finally:
+            await own_db.execute(
+                update, {"coefficient": Decimal("0.10"), "activity_type_id": grazing_activity_id}
+            )
+            await own_db.commit()
+
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "package_changed"
+
+
 async def test_a_blocking_check_refuses_here_though_the_precheck_only_reported_it(
     applicant_client, draft_ready_for_submission, sheep_type_id
 ) -> None:
