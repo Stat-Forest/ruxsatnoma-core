@@ -18,13 +18,14 @@ Nullable with no default: every session that exists today was opened before
 this column, and a password or E-IMZO session never has one at all.
 
 Revision ID: 0041
-Revises: 0037
+Revises: 0040
 
-Numbered 0041 on an 0037 parent, not 0038: three parallel branches (7.6, 7.7
-and the Eskiz text fix) had already taken 0038, 0039 and 0040 off the same
-`dev` commit. Integration merges the heads (`alembic merge heads`); nothing
-here is ever renumbered afterwards, because a revision id that has run
-somewhere cannot change.
+Numbered 0041, not 0038: three parallel branches (7.6, 7.7 and the Eskiz text
+fix) had already taken 0038, 0039 and 0040 off the same `dev` commit. It was
+written on an 0037 parent and re-pointed at 0040 when that branch merged into
+`dev` — legitimate only because this revision had run nowhere but one local
+test database at the time. A revision that has run anywhere real cannot be
+re-pointed; that case takes `alembic merge heads` instead.
 Create Date: 2026-09-07 17:20:00.000000
 
 """
@@ -35,7 +36,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0041"
-down_revision: str | None = "0037"
+down_revision: str | None = "0040"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
