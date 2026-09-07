@@ -187,6 +187,72 @@ async def test_a_price_that_moved_after_signing_is_labeled_package_changed(
     assert error["details"]["reason"] == "package_changed"
 
 
+async def test_a_tariff_published_between_package_and_submit_is_also_package_changed(
+    engine, applicant_client, draft_ready_for_submission, grazing_activity_id
+) -> None:
+    """`tz/12` #24's own trigger, not just a herd edit: a tariff PUBLISHED in
+    the gap between `GET /package` and `POST /submit` recomputes the amount
+    exactly the way the herd edit above does, through the identical
+    `_price()` call — this proves the SAME `content_changed_reason` label
+    fires for the trigger the ruling was actually written about, not only for
+    the one that happens to be cheapest to set up in a test.
+
+    A raw UPDATE on the seeded `(grazing, small_adult)` published row, not a
+    real `norms.service.publish_versioned` maker-checker cycle: that row is
+    shared, singleton seed data other tests assert an exact coefficient
+    against (`test_grazing_returns_all_four_groups`), so this runs on its OWN
+    session (`published_coef_sb`'s own pattern) and restores the original
+    value in a `finally` — never on the test's own `db`, whose rollback would
+    not undo a COMMIT another connection has to see. Committed, because the
+    app's `POST /submit` reads through a separate connection than this test's
+    own session and would not see an uncommitted change.
+    """
+    from decimal import Decimal
+
+    from sqlalchemy import text
+
+    from app.db import make_session_factory
+
+    app_id = draft_ready_for_submission
+    pinfl = (await applicant_client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+    doc = (await applicant_client.get(f"/api/v1/applications/{app_id}/package")).content
+
+    factory = make_session_factory(engine)
+    async with factory() as own_db:
+        update = text(
+            "UPDATE tariffs SET coefficient = :coefficient "
+            "WHERE activity_type_id = :activity_type_id "
+            "AND livestock_group = 'small_adult' AND status = 'published'"
+        )
+        await own_db.execute(
+            update, {"coefficient": Decimal("0.5"), "activity_type_id": grazing_activity_id}
+        )
+        await own_db.commit()
+        try:
+            result = await applicant_client.post(
+                f"/api/v1/applications/{app_id}/submit",
+                json={
+                    "pkcs7": encode_mock_signature(
+                        document=doc,
+                        serial=f"SER-{uuid.uuid4().hex[:12]}",
+                        issuer="ISS-TEST",
+                        pinfl=pinfl,
+                    )
+                },
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
+        finally:
+            await own_db.execute(
+                update, {"coefficient": Decimal("0.10"), "activity_type_id": grazing_activity_id}
+            )
+            await own_db.commit()
+
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "package_changed"
+
+
 async def test_a_blocking_check_refuses_here_though_the_precheck_only_reported_it(
     applicant_client, draft_ready_for_submission, sheep_type_id
 ) -> None:
@@ -626,6 +692,41 @@ async def test_a_grazing_draft_with_no_herd_names_items_as_the_missing_field(
     )
     assert refused.status_code == 400, refused.text
     assert refused.json()["error"]["details"]["missing"] == ["items"]
+
+
+async def test_a_missing_address_is_named_in_missing_and_resolved_by_filling_it_in(
+    db, applicant_client, applicant, draft_ready_for_submission
+) -> None:
+    """Ruling #113 (`tz/12` #20): `checks.missing_for_pricing` names `address`
+    exactly like any other incomplete field — a pre-check that reported
+    "ready" would otherwise be lying about the one thing task 5a's
+    `PATCH /auth/applicants/{id}/address` exists to fix.
+
+    The `applicant` fixture is deliberately named alongside `applicant_client`
+    and `draft_ready_for_submission`: pytest resolves all three to the SAME
+    row (fixtures are cached by name within one test), so nulling its address
+    here is nulling exactly the row `applicant_client` submits as.
+    """
+    applicant.address = None
+    await db.commit()
+    app_id = draft_ready_for_submission
+
+    refused = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["details"]["missing"] == ["address"]
+
+    filled = await applicant_client.patch(
+        f"/api/v1/auth/applicants/{applicant.id}/address",
+        json={"address": "Toshkent, Mirzo Ulug'bek tumani, 3-uy"},
+    )
+    assert filled.status_code == 200, filled.text
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 200, result.text
 
 
 async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfigured(

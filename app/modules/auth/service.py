@@ -879,6 +879,46 @@ async def own_applicant_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uuid.U
     return ids
 
 
+async def update_applicant_address(
+    db: AsyncSession, applicant_id: uuid.UUID, *, address: str, actor: User
+) -> Applicant:
+    """`PATCH /auth/applicants/{applicant_id}/address` (ruling #113): the
+    dequeuing route — whatever gate `applications.checks.missing_for_pricing`
+    puts on a missing address at SUBMISSION, this is where a citizen fills
+    it in, at any time, DRAFT or not (registration itself stays free of it —
+    the gate is at submission, not here).
+
+    404 `ERR-SYS-003` for an `applicant_id` this caller has no claim on, and
+    the SAME 404 for one that plain does not exist — `own_applicant_ids`
+    answers both at once, because an id it does not name is either a
+    stranger's or nobody's, and a 403 here would make this route an
+    applicant-existence oracle for anybody holding a session (the identical
+    reasoning `applications.service._readable_application` already states in
+    full).
+
+    "No claim" means exactly what `own_applicant_ids` means everywhere else
+    in this module: the caller's own individual row, or a legal entity they
+    hold an EFFECTIVE representation of — `status='active'` and not past
+    `valid_until`, judged against `business_today()` inside that function,
+    never `date.today()` (lesson). One definition, reused rather than
+    re-derived: a representative who may act for a legal applicant here is
+    exactly the same set that may file for it.
+    """
+    if applicant_id not in await own_applicant_ids(db, actor.id):
+        raise err("ERR-SYS-003", details={"applicant": str(applicant_id)})
+    applicant = await db.get(Applicant, applicant_id)
+    assert applicant is not None  # own_applicant_ids only ever names rows that exist
+    applicant.address = address
+    await audit.log(
+        db,
+        action="applicant.update_address",
+        user_id=actor.id,
+        object_type="applicant",
+        object_id=applicant.id,
+    )
+    return applicant
+
+
 async def update_contact(
     db: AsyncSession,
     user: User,

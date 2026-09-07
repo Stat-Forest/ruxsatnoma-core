@@ -47,6 +47,7 @@ from app.core.errors import DomainError, err
 from app.modules.admin import repo as admin_repo
 from app.modules.applications import repo
 from app.modules.applications.models import Application, ApplicationCheck
+from app.modules.auth import service as auth_service
 from app.modules.gis import service as gis_service
 from app.modules.norms import service as norms_service
 from app.modules.norms.schemas import CalculationIn, LivestockItemIn
@@ -154,6 +155,23 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+async def _applicant_address_missing(db: AsyncSession, applicant_id: uuid.UUID) -> bool:
+    """Ruling #113: `applicants.address` blank counts as missing, exactly like
+    a NULL application column above it — a citizen may register and look
+    around with no address on file (OneID does not always supply one), but a
+    submission needs one for requisite 11 of form 1-ilova.
+
+    Read through `auth.service`, never `auth.repo` directly (CLAUDE.md module
+    boundary — reference/owning-module data crosses only through the other
+    module's service). `applicant_id` is NOT NULL on `applications`, so
+    `get_applicant` returning `None` here would mean the FK itself is broken;
+    treated as missing rather than asserted, because this function's contract
+    is "what is not fillable yet", not "prove the database is healthy".
+    """
+    applicant = await auth_service.get_applicant(db, applicant_id)
+    return applicant is None or not (applicant.address or "").strip()
+
+
 async def missing_for_pricing(db: AsyncSession, application: Application) -> list[str]:
     """Which of the fields `norms` needs are still empty — `[]` when the draft
     can be priced and checked.
@@ -202,8 +220,21 @@ async def missing_for_pricing(db: AsyncSession, application: Application) -> lis
     — like every other non-grazing one, and is then priced at zero.
     `test_precheck.py::test_a_tariff_exempt_activity_still_has_to_declare_its_
     quantity` pins both halves.
+
+    **`address` (ruling #113, `tz/12` #20) joins this list too, though it
+    prices nothing.** It is a requisite of the PRINTED document, exactly the
+    reasoning `quantity` above already carries — and the name on this
+    function no longer describes only what `norms` needs, it describes what
+    "ready to submit" means, which is what both of this function's callers
+    have always actually used it for. Checked UNCONDITIONALLY, before either
+    early return below: an application whose activity is not chosen yet is
+    still missing an address, and reporting only one of the two would make a
+    second `PATCH`-then-precheck round trip necessary to learn about the
+    other.
     """
     missing = [name for name in REQUIRED_FOR_PRICING if getattr(application, name) is None]
+    if await _applicant_address_missing(db, application.applicant_id):
+        missing.append("address")
     if application.activity_type_id is None:
         return missing
     activity = await admin_repo.get_activity_type(db, application.activity_type_id)

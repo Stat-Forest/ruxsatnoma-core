@@ -22,7 +22,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,6 +100,16 @@ APPLICATION_UPDATE = "application.update"
 # территориальных полномочий», High and immediate — with no way to fire on a
 # read at all. See `_readable_application`.
 APPLICATION_READ = "application.read"
+# What `decision._forward` writes into the bounce row's `reason_text`
+# (controller minor 4) — defined HERE, not in `decision.py`, because ruling
+# #107's `_readable_application` below needs the same string and `decision.py`
+# imports THIS module (`as flow`), never the other way: `decision.py` reads it
+# back as `flow.FORWARD_REASON`, exactly like `STALE_PACKAGE_REASON`/
+# `ASSIGNMENT_MANUAL` below. A STABLE TOKEN, never a sentence — `reason_text`
+# surfaces on the citizen-visible timeline, and this project keeps user-facing
+# wording in versioned `notification_templates` rows an admin owns, never in
+# code.
+FORWARD_REASON = "role_limit_exceeded"
 # Task 4's three. A pre-check writes `application_checks` rows, so it is a
 # state-changing action and audits like one — once, here, never a row per check
 # (`checks.run_all` deliberately audits nothing of its own: task 5's `submit`
@@ -612,6 +622,39 @@ async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
     return await auth_service.own_applicant_ids(db, actor.id)
 
 
+async def _forwarded_here_by(db: AsyncSession, application: Application, *, actor: User) -> bool:
+    """Ruling #107 (`tz/12` #27): whether `actor` is the one who forwarded
+    THIS application up the ladder, at any level — the one case
+    `_readable_application` grants READ past a zone that has since moved on.
+
+    `_effective_organization` tracks `assigned_org_id`, and `decision._forward`
+    MOVES it to the parent the moment it escalates — so the head who ran an
+    over-limit case loses it from their own zone entirely the instant they
+    escalate it, and cannot see how the case they ran ended, though the
+    citizen still calls the office that took the filing. The decision itself
+    stays with whoever it was escalated TO; this grants nothing but the read.
+
+    The escalation is unambiguous evidence on its own: `decision._forward`
+    writes an `application_status_history` row with `changed_by=actor.id` and
+    `reason_text=FORWARD_REASON` for EVERY forward, at every level — so "did
+    this actor ever forward this application" is exactly that row's
+    existence, no separate flag and no second definition that could drift
+    from `assigned_org_id`'s own history.
+
+    Read-only, and that is exactly where this stops mattering: the WRITE
+    paths (`decision._load_and_authorize`) call `_assert_in_actor_zone`
+    directly and never this function, so a former forwarder who is out of
+    zone still cannot approve, reject or forward what somebody else must now
+    decide. A stranger head in the SAME original leshoz who never forwarded
+    THIS application gets nothing here either — the check is keyed on
+    `changed_by`, never on the organization.
+    """
+    history = await repo.list_status_history(db, application.id)
+    return any(
+        entry.reason_text == FORWARD_REASON and entry.changed_by == actor.id for entry in history
+    )
+
+
 async def _readable_application(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> Application:
@@ -639,6 +682,25 @@ async def _readable_application(
     no contour yet — is outside every ZONED actor's zone, and inside a
     republic-wide one's, which is what the ordering below says: the zone-free
     short-circuit comes first.
+
+    **Ruling #107 carves out one more admission, checked BEFORE the zone**
+    (`_forwarded_here_by`): the head who forwarded THIS application up the
+    ladder keeps read access to it even after `assigned_org_id` has moved past
+    their own zone. Checked ahead of `_assert_in_actor_zone` deliberately — that
+    function's own refusal COMMITS an RI-12 trail before it raises (decision
+    #40 ruling 2), and a forwarder who is legitimately owed this read must
+    never earn a "denied" audit entry for asking.
+
+    **Ruling #110 (`tz/12` #26): a DRAFT is unsent mail — no staff caller reads
+    one they do not own, ever, zone or no zone.** Checked immediately after the
+    ownership/staff gates and BEFORE both ruling #107's carve-out and the zone
+    check: a DRAFT has no `assigned_org_id` (ruling 7) and cannot itself carry a
+    forward, so the two checks below it can never fire for one anyway — but a
+    ZONE-FREE staff caller (`Zone(None, None, None)`, e.g. `prosecutor`'s
+    `view_any`) would otherwise short-circuit `_assert_in_actor_zone` and read
+    every citizen's draft nationwide, the exact case «до подачи заявки в офисе
+    её читать некому» exists to close. No audit entry: this is an ownership
+    refusal, not a territorial one, and RI-12 stays reserved for the zone.
     """
     application = await repo.get_application(db, application_id)
     if application is None:
@@ -647,6 +709,10 @@ async def _readable_application(
         return application
     if not await _holds_staff_read(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if application.status == INITIAL_STATUS:
+        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    if await _forwarded_here_by(db, application, actor=actor):
+        return application
     await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_READ)
     return application
 
@@ -1086,6 +1152,15 @@ async def list_applications(
     live in the service layer, and a repo calling another module's service
     inverts the layering even where the boundary rule itself is satisfied
     (review I2).
+
+    **Ruling #110 excludes `INITIAL_STATUS` from the STAFF half only** —
+    otherwise this function's own "can never disagree with the card" promise
+    above would be broken by the very ruling that promise is supposed to
+    survive: `_readable_application` now 404s a staff caller on a DRAFT it
+    does not own, and a list that still named that DRAFT would be LEAKING
+    through the one door the card just closed. The owner's own scope
+    (`holder_ids`) is untouched — they see every status of their own,
+    DRAFT included, throughout.
     """
     scope: list[Any] = []
     holder_ids = await _own_applicant_ids(db, actor)
@@ -1093,11 +1168,14 @@ async def list_applications(
         scope.append(Application.applicant_id.in_(holder_ids))
     if await _holds_staff_read(db, actor):
         scope.append(
-            zone_filter(
-                zone_of(actor),
-                region_col=Organization.region_id,
-                district_col=Organization.district_id,
-                organization_col=Organization.id,
+            and_(
+                Application.status != INITIAL_STATUS,
+                zone_filter(
+                    zone_of(actor),
+                    region_col=Organization.region_id,
+                    district_col=Organization.district_id,
+                    organization_col=Organization.id,
+                ),
             )
         )
     if not scope:

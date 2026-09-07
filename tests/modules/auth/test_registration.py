@@ -75,6 +75,10 @@ async def test_full_registration_flow(db, engine):
         assert body["applicant"]["kind"] == "individual"
         assert body["applicant"]["pinfl"] == pinfl
         assert body["applicant"]["verified_at"] is not None  # oneid snapshot present
+        # Ruling #113: the address gate sits at SUBMISSION
+        # (`applications.checks.missing_for_pricing`), not here — a citizen may
+        # complete registration and sign in with no address on file at all.
+        assert body["applicant"]["address"] is None
         me = await client.get(f"{API}/auth/me")
         assert me.json()["registration_complete"] is True
     from app.db import make_session_factory

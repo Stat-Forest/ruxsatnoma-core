@@ -19,6 +19,7 @@ from app.modules.auth.models import Applicant, Representation, Role, Session, Us
 from app.modules.auth.permissions import PERMISSIONS
 from app.modules.auth.schemas import (
     AddRepresentationIn,
+    ApplicantAddressIn,
     ApplicantOut,
     AttachLegalIn,
     AttachLegalOut,
@@ -372,6 +373,28 @@ async def add_representation(
         ip=request.client.host if request.client else None,
     )
     return _representation_out(representation, applicant)
+
+
+@router.patch("/applicants/{applicant_id}/address", response_model=ApplicantOut)
+async def update_applicant_address(
+    applicant_id: uuid.UUID,
+    body: ApplicantAddressIn,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ApplicantOut:
+    """Ruling #113's dequeuing route: an account that reached registration
+    before the field existed, or whose OneID profile carried none, fills it
+    in here — at any time, not only right before a submission that would
+    otherwise refuse it.
+
+    404 `ERR-SYS-003` for an `applicant_id` this caller has no claim on
+    (`service.update_applicant_address`'s own docstring), the same answer an
+    id that never existed gets.
+    """
+    applicant = await service.update_applicant_address(
+        db, applicant_id, address=body.address, actor=user
+    )
+    return ApplicantOut.model_validate(applicant, from_attributes=True)
 
 
 @router.patch("/me", response_model=MeOut)

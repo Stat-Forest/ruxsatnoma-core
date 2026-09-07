@@ -3,10 +3,10 @@
 import re
 import uuid
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from email_validator import validate_email
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, StringConstraints, model_validator
 
 
 class UserOut(BaseModel):
@@ -57,6 +57,20 @@ class ApplicantOut(BaseModel):
     district_id: uuid.UUID | None
     address: str | None
     verified_at: datetime | None
+
+
+class ApplicantAddressIn(BaseModel):
+    """`PATCH /auth/applicants/{applicant_id}/address` (ruling #113): the one
+    field the route exists for. `StringConstraints(strip_whitespace=True,
+    ...)`, not a plain `Field(min_length=1)` — a whitespace-only address has a
+    nonzero length and would otherwise pass as if it named a real place
+    (`permits/schemas.py::DuplicateIn.reason` is the same idiom for the same
+    reason). `max_length` is this codebase's own free-text convention
+    (`permits/schemas.py::DuplicateIn.reason`,
+    `norms/schemas.py::TariffIn.basis`), not a limit named anywhere in
+    `tz/13`'s form 1-ilova."""
+
+    address: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 
 class RepresentationOut(BaseModel):

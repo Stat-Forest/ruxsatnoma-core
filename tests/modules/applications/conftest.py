@@ -37,7 +37,7 @@ from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
 from app.modules.applications import service as applications_service
-from app.modules.applications.permissions import APPLICATIONS_REVIEW
+from app.modules.applications.permissions import APPLICATIONS_REVIEW, APPLICATIONS_VIEW_ANY
 from app.modules.auth.models import Applicant, Representation, Role, RolePermission, User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.norms import calculator
@@ -95,13 +95,27 @@ def unique_pinfl() -> str:
     return f"1{uuid.uuid4().int % 10**13:013d}"
 
 
+# Ruling #113 (plan 07.4 task 5b): `checks.missing_for_pricing` now refuses a
+# submission whose `applicants.address` is blank. Every fixture below that
+# builds an `Applicant` a test then SUBMITS carries this, so the address gate
+# stays the property of the tests that name it (`test_submit.py`'s own
+# address-specific cases), not an incidental failure in every other one.
+TEST_APPLICANT_ADDRESS = "Toshkent shahri, Chilonzor tumani, 1-uy"
+
+
 @pytest.fixture
 async def applicant(db: AsyncSession) -> Applicant:
     """A fully registered individual applicant, owned by a real user —
     `applications.applicant_id`/`submitted_by_user_id` are both NOT NULL FKs, so a
     bare `uuid7()` would fail the FK before whatever the test means to exercise."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    row = Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+    row = Applicant(
+        kind="individual",
+        pinfl=user.pinfl,
+        name=user.full_name,
+        owner_user_id=user.id,
+        address=TEST_APPLICANT_ADDRESS,
+    )
     db.add(row)
     await db.flush()
     return row
@@ -190,7 +204,13 @@ async def other_applicant_client(db: AsyncSession):
     mistaken for the first applicant's."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
     db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+        Applicant(
+            kind="individual",
+            pinfl=user.pinfl,
+            name=user.full_name,
+            owner_user_id=user.id,
+            address=TEST_APPLICANT_ADDRESS,
+        )
     )
     await db.flush()
     async for client in _client_for_applicant(db, user):
@@ -248,6 +268,19 @@ async def other_zone_hodim_client(db: AsyncSession, other_leshoz: Organization):
 
 
 @pytest.fixture
+async def prosecutor_client(db: AsyncSession):
+    """Zone-free, `applications.view_any` alone — the migration-0015 shape of
+    `prosecutor`. Ruling #110's own reasoning names this actor specifically:
+    without the DRAFT block sitting AHEAD of the zone check in
+    `_readable_application`, a republic-wide `view_any` holder would
+    short-circuit `_assert_in_actor_zone` entirely and read every citizen's
+    still-being-filled-in draft nationwide — the zone rule alone cannot stop
+    an actor who has no zone to be outside of."""
+    async for client in _client_for(db, APPLICATIONS_VIEW_ANY):
+        yield client
+
+
+@pytest.fixture
 async def second_hodim_client(db: AsyncSession, leshoz: Organization):
     """A SECOND reviewer in the SAME leshoz as `hodim_client` — task 7's
     (3.9b) confirming person, whom maker-checker requires to be someone other
@@ -301,7 +334,9 @@ async def legal_applicant(db: AsyncSession) -> Applicant:
     """A legal entity — `kind='legal'`, a STIR and NO `owner_user_id`: decision
     #9 gives a legal applicant no account of its own, so every application for
     it is filed by a representative."""
-    row = Applicant(kind="legal", stir=unique_stir(), name="ООО Тест")
+    row = Applicant(
+        kind="legal", stir=unique_stir(), name="ООО Тест", address=TEST_APPLICANT_ADDRESS
+    )
     db.add(row)
     await db.flush()
     return row
