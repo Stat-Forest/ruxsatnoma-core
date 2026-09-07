@@ -150,6 +150,14 @@ async def get_kpi(
         period_from=period_from,
         period_to=period_to,
     )
+    avg_score, satisfaction_count = await repo.satisfaction_kpi(
+        db,
+        actor_zone=actor_zone,
+        filter_zone=filter_zone,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
 
     return {
         "period": {"period_from": period_from, "period_to": period_to},
@@ -178,6 +186,7 @@ async def get_kpi(
             "inspections_count": inspections_count,
             "violations_count": violations_count,
         },
+        "satisfaction": {"avg_score": avg_score, "count": satisfaction_count},
         "omitted": list(OMITTED_TILES),
     }
 

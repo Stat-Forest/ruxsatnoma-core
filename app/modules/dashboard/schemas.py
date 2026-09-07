@@ -57,6 +57,14 @@ class InspectionsKpiOut(BaseModel):
     violations_count: int
 
 
+class SatisfactionKpiOut(BaseModel):
+    """Ruling #143. `avg_score` is `None`, never `0`, for a period with no
+    ratings — a portal may not state a number it cannot produce."""
+
+    avg_score: Decimal | None
+    count: int
+
+
 class KpiOut(BaseModel):
     period: PeriodOut
     permits: PermitsKpiOut
@@ -68,6 +76,7 @@ class KpiOut(BaseModel):
     rejections: list[RejectionRowOut]
     risk_indicators: RiskIndicatorsKpiOut
     inspections: InspectionsKpiOut
+    satisfaction: SatisfactionKpiOut
     # Tiles `tz/04` С21 names that this module cannot yet build for lack of a
     # real source (track brief's own rule: no plausible constant, leave it
     # out and say so instead). Empty today — `inspections`/`violations` were
