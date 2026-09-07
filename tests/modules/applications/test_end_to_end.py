@@ -237,30 +237,28 @@ async def _bind_a_recalculation(client, application_id: str, card: dict) -> str:
     return result.json()["id"]
 
 
-async def test_a_head_who_forwards_an_application_still_cannot_read_its_calculation(
-    zoned_limited_executor_head_client, application_in_review
+async def test_a_head_who_forwards_an_application_can_read_its_calculation(
+    zoned_limited_executor_head_client, other_zone_hodim_client, application_in_review
 ) -> None:
     """**Review round 1, Important 1, on the real path that produces it —
-    updated for ruling #107 (`tz/12` #27, 2026-09-07).**
+    closed for ruling #107 by F7 (`docs/plans/07.4-findings.md`,
+    2026-09-07).**
 
     `decision._forward` moves `assigned_org_id` to the parent organization.
-    Ruling #107 then carved a read-access exception into
+    Ruling #107 carved a read-access exception into
     `applications.service._readable_application` for exactly the head who did
-    the forwarding — `GET /applications/{id}` no longer 404s for them. But
-    `norms.service._may_read_calculation` answers the SAME zone question
-    through its OWN separate window onto `applications`
-    (`repo.application_facts`, ruling 20) and was not given the same
-    carve-out — plan 07.4 task 3 is scoped to `applications/service.py`, and
-    `norms` is a different module `applications` may not reach into. So a head
-    who recalculated BEFORE escalating now keeps the APPLICATION's own card
-    but still loses the CALCULATION they created on it — two modules
-    answering one zone question, only one of them updated. Worth revisiting
-    if that asymmetry turns out to matter in practice.
+    the forwarding — `GET /applications/{id}` no longer 404s for them. Track B
+    (7.4 task 3) left `norms.service._may_read_calculation` unfixed on
+    purpose: it answers the SAME zone question through its OWN separate
+    window onto `applications` (`repo.application_facts`, ruling 20), and the
+    honest fix needed a constant BOTH modules could read without `norms`
+    importing `applications` (forbidden, level 2 -> level 3) — done now via
+    `audit.APPLICATION_FORWARD` and `norms.service._forwarded_here_by`; see
+    that function's own docstring. A head who recalculated BEFORE escalating
+    now keeps BOTH the application's card and the price it forwarded a
+    decision about.
 
-    Not a hand-set state: every step here is a production route, and the same
-    corner is reachable a second way — `own_applicant_ids` is effective-dated
-    and a daily job expires representations, so a representative loses the
-    calculation the same way.
+    Not a hand-set state: every step here is a production route.
     """
     card = (
         await zoned_limited_executor_head_client.get(
@@ -272,9 +270,10 @@ async def test_a_head_who_forwards_an_application_still_cannot_read_its_calculat
     )
 
     # Before the escalation the head may read it, through the branch that asks.
-    assert (
-        await zoned_limited_executor_head_client.get(f"/api/v1/calculations/{calc_id}")
-    ).status_code == 200
+    before = await zoned_limited_executor_head_client.get(f"/api/v1/calculations/{calc_id}")
+    assert before.status_code == 200, before.text
+    amount_before_forward = before.json()["amount"]
+    assert amount_before_forward is not None
     assert (
         await zoned_limited_executor_head_client.get(
             "/api/v1/calculations", params={"application_id": application_in_review}
@@ -293,20 +292,41 @@ async def test_a_head_who_forwards_an_application_still_cannot_read_its_calculat
         f"/api/v1/applications/{application_in_review}"
     )
     assert still_there.status_code == 200, "ruling #107: the forwarder keeps read access"
-    # `norms`'s own zone gate is a SEPARATE mechanism, untouched by that ruling.
-    assert (
-        await zoned_limited_executor_head_client.get(f"/api/v1/calculations/{calc_id}")
-    ).status_code == 404
-    assert (
-        await zoned_limited_executor_head_client.get(
-            "/api/v1/calculations", params={"application_id": application_in_review}
-        )
-    ).json()["total"] == 0
+
+    # F7's fix: the CALCULATION stays readable too, with the real amount —
+    # not merely a non-403, which would pass just as well if the route
+    # silently returned an empty or wrong body.
+    after = await zoned_limited_executor_head_client.get(f"/api/v1/calculations/{calc_id}")
+    assert after.status_code == 200, after.text
+    after_body = after.json()
+    assert after_body["id"] == calc_id
+    assert after_body["amount"] == amount_before_forward
+    assert after_body["amount"] is not None
+    listed = await zoned_limited_executor_head_client.get(
+        "/api/v1/calculations", params={"application_id": application_in_review}
+    )
+    assert listed.json()["total"] >= 1
+    assert calc_id in [item["id"] for item in listed.json()["items"]]
+
+    # The unfiltered list is a DIFFERENT branch (review round 1, Important 1)
+    # and never carries a bound row, forwarding or no forwarding.
     unfiltered = await zoned_limited_executor_head_client.get("/api/v1/calculations")
     assert unfiltered.status_code == 200, unfiltered.text
     assert calc_id not in [item["id"] for item in unfiltered.json()["items"]], (
-        "the row the single read refuses must not come back through the listing"
+        "a BOUND row is reachable only through ?application_id=, never the unfiltered list"
     )
+
+    # A staff member who holds the SAME permission code, is out of the zone
+    # the application ended up in, and never forwarded it, is still refused —
+    # `_forwarded_here_by` is keyed on `changed_by`, never on the organization,
+    # so a stranger head does not inherit the forwarder's carve-out.
+    stranger = await other_zone_hodim_client.get(f"/api/v1/calculations/{calc_id}")
+    assert stranger.status_code == 404, stranger.text
+    assert stranger.json()["error"]["code"] == "ERR-SYS-003"
+    stranger_listed = await other_zone_hodim_client.get(
+        "/api/v1/calculations", params={"application_id": application_in_review}
+    )
+    assert stranger_listed.json()["total"] == 0
 
 
 async def test_set_status_refuses_an_illegal_jump(
