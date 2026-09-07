@@ -321,3 +321,25 @@ class QrCheckLog(Base):
         CheckConstraint(f"channel IN {QR_CHECK_CHANNELS}", name="channel_valid"),
         Index("ix_qr_check_log_occurred_at_brin", "occurred_at", postgresql_using="brin"),
     )
+
+
+class PermitRating(Base):
+    """The citizen's verdict on one issued permit (ruling #140).
+
+    `organization_id` and `activity_type_id` are NOT copied here: both are columns
+    of `permits`, neither can change after issuance, and a snapshot would be a
+    second opinion about the same fact. Every aggregate joins.
+
+    Ruling #141: no response built from this table carries the applicant. The row
+    keeps `permit_id` so a complaint stays traceable in the database itself.
+    """
+
+    __tablename__ = "permit_ratings"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    permit_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("permits.id"), unique=True, index=True)
+    score: Mapped[int]
+    comment: Mapped[str | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (CheckConstraint("score BETWEEN 1 AND 5", name="score_valid"),)
