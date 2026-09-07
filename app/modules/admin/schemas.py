@@ -69,6 +69,8 @@ class ActivityTypeOut(BaseModel):
     name: dict[str, Any]
     quantity_unit: str
     status: str
+    description: dict[str, Any] | None
+    processing_days: int
 
 
 class LivestockTypeOut(BaseModel):

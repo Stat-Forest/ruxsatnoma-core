@@ -426,20 +426,29 @@ class PublicEstimateOut(BaseModel):
 
 class PublicActivityTypeOut(BaseModel):
     """A narrowed `admin.schemas.ActivityTypeOut` for `GET
-    /public/refs/activity-types`: only what a dropdown needs — `id`, `code`
-    (the front-end's own hook for "this is grazing", so it can decide whether
-    to render herd inputs) and `name`. Never `quantity_unit`/`status`, which
-    the general, authenticated `/refs/*` router already answers and this
-    anonymous surface has no reason to repeat. `name` carries whatever
-    languages the row has — `uz_latn` since migration `0032`'s backfill
-    (decision #90, closing `tz/12` #31's backend half) — returned as-is,
-    never invented."""
+    /public/refs/activity-types`: only what the public catalog needs — `id`,
+    `code` (the front-end's own hook for "this is grazing", so it can decide
+    whether to render herd inputs), `name`, `description` and
+    `processing_days`. Never `quantity_unit`/`status`, which the general,
+    authenticated `/refs/*` router already answers and this anonymous
+    surface has no reason to repeat. `name` carries whatever languages the
+    row has — `uz_latn` since migration `0032`'s backfill (decision #90,
+    closing `tz/12` #31's backend half) — returned as-is, never invented.
+
+    `description`/`processing_days` ARE public (ruling #138), unlike
+    `quantity_unit`/`status` above: they are the shop-window copy — what the
+    landing site shows a citizen deciding which service to apply for — and
+    the landing is their only consumer. `description` may be NULL (a row
+    with no seeded copy yet, migration `0038`'s own docstring); `processing_days`
+    is DISPLAY ONLY, never the enforced deadline (`applications.service.SLA_DAYS`)."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     code: str
     name: dict[str, Any]
+    description: dict[str, Any] | None
+    processing_days: int
 
 
 class PublicLivestockTypeOut(BaseModel):

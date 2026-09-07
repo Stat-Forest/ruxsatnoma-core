@@ -150,6 +150,13 @@ class ActivityType(Base):
     quantity_unit: Mapped[str]
     sort_order: Mapped[int] = mapped_column(default=0)
     status: Mapped[str] = mapped_column(default="active")
+    # Ruling #138: what the public site SHOWS about this service. `description` is
+    # LocalizedName-shaped (uz_latn required, decision #90); NULL is legal so a row
+    # added later is not blocked on copy being written.
+    description: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # Ruling #138a: DISPLAY ONLY. The enforced deadline is
+    # `applications.service.SLA_DAYS` and nothing here may be read in its place.
+    processing_days: Mapped[int] = mapped_column(default=15, server_default="15")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -159,6 +166,7 @@ class ActivityType(Base):
             name="quantity_unit_valid",
         ),
         CheckConstraint("status IN ('active', 'archived')", name="status_valid"),
+        CheckConstraint("processing_days > 0", name="processing_days_positive"),
     )
 
 
