@@ -23,6 +23,7 @@ import pytest
 
 from app.core.errors import DomainError
 from app.modules.admin import open_work, service, users_service
+from app.modules.applications import service as applications_service
 from app.modules.auth.models import User
 from tests.modules.admin.conftest import make_bare_application
 from tests.modules.auth.test_sessions import make_user
@@ -145,3 +146,37 @@ async def test_archiving_a_leshoz_with_an_open_application_is_refused(db, sys_ad
 async def test_an_empty_leshoz_still_archives(db, sys_admin: User, leshoz):
     result = await service.archive_organization(db, org_id=leshoz.id, actor=sys_admin)
     assert result.status == "archived"
+
+
+def test_no_status_where_somebody_still_has_to_act_counts_as_terminal():
+    """`TERMINAL_APPLICATION_STATUSES` is DERIVED — "anything that may reach
+    ARCHIVED" — which is correct today only because every edge into ARCHIVED
+    starts from a finished application.
+
+    That invariant is not enforced anywhere, and breaking it is a one-line
+    change somebody will make for an unrelated reason: let an applicant archive
+    their own DRAFT, say, and `DRAFT` silently joins this set. The guard would
+    then stop counting drafts, a reviewer holding one would become deletable
+    again, and nothing would fail — the exact shape of defect this project keeps
+    finding, where the system quietly stops looking rather than loudly breaking.
+
+    So the eight statuses somebody must still act on are pinned by name. If a
+    future edge drags one in here, this test says so.
+    """
+    still_being_worked_on = {
+        "DRAFT",
+        "SUBMITTED",
+        "IN_REVIEW",
+        "PENDING_INFO",
+        "RETURNED",
+        "APPROVED",
+        "INVOICED",
+        "PAID",
+        "PERMIT_ISSUED",
+    }
+
+    overlap = still_being_worked_on & applications_service.TERMINAL_APPLICATION_STATUSES
+    assert not overlap, (
+        f"{sorted(overlap)} became 'terminal' by derivation, so an application in that state "
+        "would no longer block the deletion of whoever it is assigned to"
+    )
