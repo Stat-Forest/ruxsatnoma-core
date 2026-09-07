@@ -839,6 +839,23 @@ async def effective_representation_of(
     )
 
 
+async def effective_representative(db: AsyncSession, applicant_id: uuid.UUID) -> uuid.UUID | None:
+    """One user currently holding an EFFECTIVE representation of a LEGAL
+    applicant, or `None` if nobody does. "Effective" means the same thing as
+    everywhere else in this file: `status='active'` and not past
+    `valid_until`, judged against `business_today()`, never `date.today()`
+    (lesson). A legal entity has SEVERAL representatives (decision #9); this
+    is not "the primary one" (no rule names one), only "a currently valid
+    one", deterministic via `repo.any_effective_representative`'s own
+    ordering.
+
+    First caller: `inspections.service._violator_recipient` (ruling R2) — a
+    violation case is opened BY THE SYSTEM when an inspector signs an act,
+    so unlike `applications`/`permits` there is no `submitted_by_user_id` to
+    fall back to when the applicant itself has no account."""
+    return await repo.any_effective_representative(db, applicant_id, business_today())
+
+
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
     """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
     `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not
