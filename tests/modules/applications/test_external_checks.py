@@ -49,6 +49,12 @@ def _prod_settings():
         s3_secret_key="a-real-s3-secret-value",
         oneid_mode="real",
         eimzo_mode="real",
+        # Stage 5.1: a real OneID refuses to construct without its
+        # credentials, a real scope and a non-local redirect URI.
+        oneid_client_id="forestry_uz",
+        oneid_client_secret="a-real-oneid-client-secret",
+        oneid_scope="forestry_uz",
+        oneid_redirect_uri="https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback",
         sms_mode="real",
         email_mode="real",
         payme_mode="real",

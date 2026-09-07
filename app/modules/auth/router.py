@@ -126,7 +126,7 @@ async def logout(
     db: Annotated[AsyncSession, Depends(get_db)],
     response: Response,
 ) -> None:
-    await service.revoke_session(db, session_row, reason="logout")
+    await service.logout_session(db, session_row)
     response.delete_cookie("session")
     response.delete_cookie("csrf_token")
 

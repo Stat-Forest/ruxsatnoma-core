@@ -119,6 +119,13 @@ class Session(Base):
     ip: Mapped[str | None] = mapped_column(IPAddressString)
     user_agent: Mapped[str | None]
     revoked_at: Mapped[datetime | None]
+    # OneID's `one_log_out` (design/04 §1.2 step 4) needs the access token, and
+    # our own logout is the only moment we can call it. It lives on the SESSION
+    # rather than on the user: it belongs to one browser session and dies with
+    # it — `logout_session` clears it as it revokes the row. Never serialized
+    # into any response (`auth/schemas.py` has no field for it), and never into
+    # `users.oneid_profile`, which IS partly returned to the browser.
+    oneid_access_token: Mapped[str | None]
 
     __table_args__ = (Index("ix_sessions_user", "user_id"),)
 
