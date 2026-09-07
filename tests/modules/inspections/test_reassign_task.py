@@ -186,3 +186,59 @@ async def test_only_tasks_manage_may_reassign(
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+# --- The integration pass's own test (plan 07.6 task 8) ---------------------
+#
+# Neither track could write this one: the refusal lives in `admin`
+# (`delete_user`'s open-work guard, track A) and the handover lives here
+# (track B), and each branch had only its own half. Four of stage 7.4's ten
+# findings were visible ONLY once the tracks were on one branch, which is why
+# the integration pass is not optional — and why this test lives on the
+# integration branch rather than in either track's file.
+
+
+async def test_the_handover_is_what_unblocks_the_delete(
+    db, executor_head_client, assigned_task: InspectionTask, inspector: User, second_inspector: User
+):
+    """F4's two halves meeting, walked as ONE path rather than as two.
+
+    `tz/04` С23 asks for exactly this sentence — "удаление — только после
+    передачи незавершённых дел другому исполнителю" — and until stage 7.6 the
+    system had neither half: the delete never refused, and there was no way to
+    hand a field task over even if it had.
+
+    Asserting the WHOLE path matters more than either half. A guard that
+    refuses forever is as broken as one that never refuses, and a test that
+    only proved the refusal would pass just as happily on that.
+    """
+    from app.core.errors import DomainError
+    from app.modules.admin import users_service
+    from tests.modules.admin.conftest import unique_pinfl as admin_unique_pinfl
+    from tests.modules.auth.test_sessions import make_user
+
+    sys_admin = await make_user(db, role_code="sys_admin", pinfl=admin_unique_pinfl())
+
+    with pytest.raises(DomainError) as refused:
+        await users_service.delete_user(db, user_id=inspector.id, actor=sys_admin)
+    assert refused.value.code == "ERR-VAL-001"
+    assert refused.value.details is not None
+    held = {item["kind"]: item for item in refused.value.details["open_work"]}
+    assert str(assigned_task.id) in held["inspection_tasks"]["ids"], (
+        "the refusal must name the task standing in the way — an admin told only "
+        "'no' cannot act on it"
+    )
+
+    handed_over = await executor_head_client.post(
+        f"{API}/tasks/{assigned_task.id}/reassign",
+        json={"new_assignee_id": str(second_inspector.id)},
+    )
+    assert handed_over.status_code == 200, handed_over.text
+
+    deleted = await users_service.delete_user(db, user_id=inspector.id, actor=sys_admin)
+    assert deleted.status == "deleted"
+
+    await db.refresh(assigned_task)
+    assert assigned_task.assigned_to == second_inspector.id, (
+        "and the work itself survived the departure, on its original row"
+    )
