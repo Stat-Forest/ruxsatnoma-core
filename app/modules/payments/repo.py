@@ -209,25 +209,32 @@ async def list_allocations(
 #   - `archived` does NOT.
 _RI_10_PERMIT_STATUSES = ("pending_signatures", "active", "suspended")
 
-_PERMIT_EXISTS_SQL = text(
-    "SELECT EXISTS (SELECT 1 FROM permits WHERE application_id = :application_id"
-    " AND status IN :statuses)"
+_PERMIT_ORGANIZATION_SQL = text(
+    "SELECT organization_id FROM permits WHERE application_id = :application_id"
+    " AND status IN :statuses LIMIT 1"
 ).bindparams(bindparam("statuses", expanding=True))
 
 
-async def permit_exists_for_application(db: AsyncSession, application_id: uuid.UUID) -> bool:
-    """Does a permit that would make a reversed payment an RI-10 exist for
-    `application_id` — read-only, see the comment above for why this module
-    may ask and which statuses count.
+async def permit_organization_for_application(
+    db: AsyncSession, application_id: uuid.UUID
+) -> uuid.UUID | None:
+    """The `organization_id` of the permit that would make a reversed payment an
+    RI-10, if one exists for `application_id` — read-only, see the comment above
+    for why this module may ask and which statuses count. `None` when no such
+    permit exists, which doubles as the RI-10 EXISTS check itself (ruling #112:
+    this organization is also who `record_reversal` notifies, since the leshoz
+    that must decide whether to suspend the permit IS the permit's own
+    `organization_id` — no second read).
 
-    `EXISTS`, not a count: `permits.application_id` is `unique=True`, so the
-    answer can only ever be 0 or 1 and a number would suggest otherwise."""
-    return (
+    `LIMIT 1`, not a list: `permits.application_id` is `unique=True`, so at most
+    one row can ever match."""
+    row = (
         await db.execute(
-            _PERMIT_EXISTS_SQL,
+            _PERMIT_ORGANIZATION_SQL,
             {"application_id": application_id, "statuses": list(_RI_10_PERMIT_STATUSES)},
         )
-    ).scalar_one()
+    ).first()
+    return row[0] if row is not None else None
 
 
 async def add_payment_intent(db: AsyncSession, intent: PaymentIntent) -> None:

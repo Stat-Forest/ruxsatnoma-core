@@ -13,15 +13,18 @@ shared, persistent and never empty — including the spot you picked).
 """
 
 import hashlib
+import io
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from pypdf import PdfReader
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
+from app.core.time import TASHKENT
 from app.event_subscriptions import PAYMENT_CONFIRMED
 from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
@@ -220,6 +223,70 @@ async def test_the_snapshot_carries_the_calculation_that_was_priced(
 
     assert permit.snapshot["calculation_id"] == str(calculation.id)
     assert permit.amount == calculation.amount
+
+
+def _pdf_text(content: bytes) -> str:
+    """Extract a PDF's text with every run of whitespace removed — reading text
+    back out of a WeasyPrint-rendered PDF is testing this machine's fonts, not
+    the code, unless whitespace is squeezed first (lesson): `extract_text()`
+    rebuilds words from glyph positions and inserts a space wherever a run
+    happens to be kerned, and which runs are kerned depends on the fonts the
+    CI container has installed. Mirrors `tests/modules/search/test_export.py`'s
+    own helper, kept per-file the way this suite keeps its helpers."""
+    reader = PdfReader(io.BytesIO(content))
+    text_content = "\n".join(page.extract_text() or "" for page in reader.pages)
+    return "".join(text_content.split())
+
+
+async def test_the_snapshot_carries_the_payment_date_and_it_is_visible_in_the_pdf(
+    db: AsyncSession, hodim_client, paid_application: Application
+):
+    """Ruling #118: requisite 19 prints BOTH halves of «Статус оплаты и дата».
+    `service._snapshot`'s own docstring explains where the date comes from
+    (`applications.updated_at`, read off the SAME `PAID` row `issue()` already
+    holds) and why that stays inside this module's boundary."""
+    application = await applications_service.get(db, paid_application.id)
+    assert application is not None
+    expected = application.updated_at.astimezone(TASHKENT).date().isoformat()
+
+    result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    assert result.status_code == 201, result.text
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+    assert permit.snapshot["payment_date"] == expected
+    # The status half stays exactly what it always was (ruling T3-b's half that
+    # this ruling does NOT touch).
+    assert permit.snapshot["payment_status"] == service.PAYMENT_STATUS_PAID
+
+    pdf = await service.pdf_bytes(db, permit.id)
+    assert "".join(expected.split()) in _pdf_text(pdf)
+
+
+async def test_an_already_issued_permits_snapshot_is_not_touched_by_this_change(
+    db: AsyncSession, hodim_client, paid_application: Application
+):
+    """The snapshot is immutable and the document renders exactly once (module
+    docstring) — ruling #118 changes what is frozen at issuance for NEW
+    permits, and must not reach back into one already issued even if the
+    application row it was built from is touched again afterwards. Nothing in
+    this codebase does that touching today; the point is that the snapshot
+    would stay correct even if something someday did."""
+    result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
+    assert result.status_code == 201, result.text
+    permit = await service.for_application(db, paid_application.id)
+    assert permit is not None
+    frozen_payment_date = permit.snapshot["payment_date"]
+
+    await db.execute(
+        text("UPDATE applications SET updated_at = now() WHERE id = :id").bindparams(
+            id=paid_application.id
+        )
+    )
+    await db.commit()
+
+    reread = await service.for_application(db, paid_application.id)
+    assert reread is not None
+    assert reread.snapshot["payment_date"] == frozen_payment_date
 
 
 async def test_issuance_without_a_calculation_is_refused_before_a_number_is_taken(

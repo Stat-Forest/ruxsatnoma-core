@@ -447,28 +447,29 @@ Tooling and environment.
 
 ## A precondition shared by several steps belongs in ONE function every step calls
 
-- **Rule:** When several endpoints each perform one step of a shared transition, a
-  precondition belonging to the WHOLE transition — "is this even a valid target for this
-  workflow" — lives in one function all of them call, never only in the step a well-behaved
-  caller reaches first. And a transition whose loop moves zero child rows is refused, not
-  advanced.
+- **Rule:** A precondition belonging to a WHOLE transition lives in one function every step
+  calls, never only in the step a well-behaved caller reaches first — and a transition whose
+  loop moves zero child rows is refused, not advanced.
 - **Why:** `submit_import_review` alone got the "refuse a non-contour batch" guard;
-  `approve_import`/`publish_import` still gated on `row.status`. Since `CONTOURS_APPROVE` is a
-  DIFFERENT permission from `CONTOURS_MANAGE`, a rahbar-only actor could call `/approve`
-  directly on a freshly-parsed batch — never able to call submit-review at all — and both
-  loops found zero rows and still advanced the status (3.6a t8; reproduced with the fix
-  stashed, 200 instead of 409).
+  `approve_import`/`publish_import` still gated on `row.status`, and `CONTOURS_APPROVE` is a
+  DIFFERENT permission — so a rahbar-only actor called `/approve` on a freshly-parsed batch,
+  both loops moved zero rows, and the status advanced anyway (3.6a t8; 200 instead of 409).
 - **How to apply:** Factor the shared preamble — row lookup, zone check, validity check,
   status check — into one function. A loop finding nothing is not evidence that nothing
   needed to happen.
+- **The mirror, 7.4 F3 — widening that one function is a decision about every caller.**
+  Ruling #113 added `address` to `checks.missing_for_pricing`, correct by that function's own
+  contract; `service.precheck` reads the SAME list to decide whether there is a price to
+  report, so an address-less citizen reached the wizard's last step with no amount and would
+  have signed an ERI signature over a package whose cost was never shown. Green in every
+  track's own suite; found only on the integration branch. List the callers before you add.
 - **The same discipline on inputs:** before reporting a versioned-row creator done, walk
   every caller-settable field that is an FK or half of a period pair and confirm EACH has a
   service guard ahead of `flush()`. Task 4 guarded `contour_id`/`approval_doc_id` while
   `activity_type_id`, `geobotanic_doc_id` and `effective_to < effective_from` reached
-  `flush()` as `ERR-SYS-001`/500 — and the same gap sat in the SHARED `create_versioned`
-  (`POST /tariffs` with a garbage id was a 500 too). `add_classifier_item`'s
-  `valid_to < valid_from` is the period template, `_assert_doc_active` the FK one — reuse the
-  same helper per meaning, never a near-identical second copy.
+  `flush()` as `ERR-SYS-001`/500 — the same gap sat in the SHARED `create_versioned`.
+  `add_classifier_item`'s `valid_to < valid_from` is the period template, `_assert_doc_active`
+  the FK one — reuse the same helper per meaning, never a near-identical second copy.
 
 ## A gate that reads only ONE of the two things it guards is bundling two concerns
 

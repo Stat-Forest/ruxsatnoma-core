@@ -66,6 +66,14 @@ PAYMENT_CONFIRMED_NOTIFICATION_CODE = "payment.confirmed"
 INVOICE_DUE_SOON = "invoice.due_soon"
 REFUND_DECIDED = "refund.decided"
 PAYMENT_MANUAL_CONFIRMED = "payment.manual_confirmed"
+# Ruling #112, `record_reversal`'s notify to the leshoz that a live permit's
+# money just went back. Its template is seeded by migration `0036`, added at
+# integration in the same commit that registered this code below — a
+# notification whose whole purpose is that a human reads it cannot be the one
+# arriving through `notifications.service`'s ruling-10 fallback (a raw,
+# untranslated row plus a `notification.template_missing` ERROR on every
+# reversal).
+PAYMENT_REVERSED = "payment.reversed"
 
 NOTIFIED_EVENT_CODES = (
     INVOICE_ISSUED,
@@ -73,6 +81,7 @@ NOTIFIED_EVENT_CODES = (
     INVOICE_DUE_SOON,
     REFUND_DECIDED,
     PAYMENT_MANUAL_CONFIRMED,
+    PAYMENT_REVERSED,
 )
 
 PAYMENT_CONFIRMED = "payment_confirmed"

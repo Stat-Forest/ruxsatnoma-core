@@ -56,6 +56,7 @@ def _prod_settings():
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
         eskiz_callback_secret="a-real-callback-secret",
+        eskiz_callback_base_url="https://ruxsatnoma.example.uz",
         public_base_url="https://ruxsatnoma.example.uz",
         smtp_host="smtp.example.uz",
         smtp_from="noreply@example.uz",

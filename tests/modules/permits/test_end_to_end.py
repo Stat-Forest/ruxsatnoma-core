@@ -31,7 +31,7 @@ that landed after the plan was written:
 import asyncio
 import hashlib
 import uuid
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 import httpx
@@ -40,17 +40,29 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.errors import DomainError
+from app.core.models import MediaFile
 from app.db import make_session_factory
-from app.modules.admin.models import ClassifierItem
+from app.modules.admin.models import ClassifierItem, Organization
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
+from app.modules.auth.models import Applicant
+from app.modules.gis.models import GisLayer
+from app.modules.norms.calculator import RULE_CODE_VERSION
+from app.modules.norms.models import Calculation
 from app.modules.notifications.models import NotificationTemplate
 from app.modules.notifications.service import DEFAULT_CHANNELS
 from app.modules.permits import events, jobs, service, signers
 from app.modules.permits.models import PERMIT_STATUSES, Permit, PermitStatusHistory
 from app.modules.signatures import service as signatures_service
-from tests.modules.permits.conftest import Signer, sign_permit
+from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+from tests.modules.permits.conftest import (
+    GRAZING_HERD,
+    Signer,
+    calculation_input_snapshot,
+    make_permit_on_contour,
+    sign_permit,
+)
 
 API = "/api/v1"
 
@@ -139,6 +151,182 @@ async def test_a_paid_application_becomes_a_publicly_verifiable_permit(
     application = await applications_service.get(db, paid_application.id)
     assert application is not None
     assert (await _reread(db, application)).status == "PERMIT_ISSUED"
+
+
+# --- ruling #102: an extension closes the parent permit it replaces ----------
+#
+# The PARENT is built directly through the ORM, `active` from the start
+# (`make_permit_on_contour`) — its own activation is already proven by
+# `active_permit`/the scenario above, and driving it through four more real
+# signatures here would only double that cost for a fact this file already
+# established. What is NEW, and must go through the real routes, is the
+# EXTENSION: `_activate` is reachable only from `add_signature`, and the whole
+# point of these two tests is what THAT function does to a DIFFERENT permit.
+
+
+async def _build_pending_extension(
+    db: AsyncSession,
+    *,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+    hodim_client: httpx.AsyncClient,
+    holder: Signer,
+) -> tuple[Permit, uuid.UUID, bytes]:
+    """A parent permit already `active`, plus its `kind='extension'` child
+    issued into `pending_signatures` — the shared setup both tests below need,
+    differing only in whether the extension is then signed. Returns the
+    parent permit, the extension's own permit id, and the exact bytes every
+    signature below must be taken over (`service.pdf_bytes`, never a
+    re-render — ruling 3)."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    parent_permit = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version.id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+        area_ha=Decimal("12.5000"),
+        period_from=date(2027, 1, 1),
+        period_to=date(2027, 6, 30),
+    )
+
+    applicant = (
+        await db.execute(select(Applicant).where(Applicant.owner_user_id == holder.user.id))
+    ).scalar_one()
+    extension = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=holder.user.id,
+        on_behalf="self",
+        activity_type_id=grazing_activity_id,
+        contour_id=contour.id,
+        contour_version_id=version.id,
+        # Deliberately DIFFERENT from the parent's 12.5000: a bug that just
+        # sums both permits' areas is caught precisely by the occupancy
+        # assertion below, rather than by luck matching the parent's figure.
+        requested_area_ha=Decimal("8.0000"),
+        period_from=date(2027, 7, 1),
+        period_to=date(2027, 12, 31),
+        status="PAID",
+        channel="portal",
+        assigned_org_id=leshoz.id,
+        kind=applications_service.KIND_EXTENSION,
+        parent_application_id=parent_permit.application_id,
+    )
+    db.add(extension)
+    await db.flush()
+    db.add(
+        Calculation(
+            application_id=extension.id,
+            contour_id=contour.id,
+            activity_type_id=grazing_activity_id,
+            rule_code_version=RULE_CODE_VERSION,
+            input_snapshot=calculation_input_snapshot(GRAZING_HERD),
+            used_sb=Decimal("40.0000"),
+            amount=Decimal("2060000.00"),
+            breakdown={"total": "2060000.00"},
+        )
+    )
+    await db.flush()
+
+    issued = await hodim_client.post(f"{API}/applications/{extension.id}/permit")
+    assert issued.status_code == 201, issued.text
+    extension_permit_id = uuid.UUID(issued.json()["id"])
+    pdf = await service.pdf_bytes(db, extension_permit_id)
+    return parent_permit, extension_permit_id, pdf
+
+
+async def test_an_extensions_activation_closes_the_parent_permit_it_replaces(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+    hodim_client: httpx.AsyncClient,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    other_applicant_client: Signer,
+) -> None:
+    """The whole of ruling #102: once the extension's own last signature makes
+    IT active, the permit it replaces drops out of `active`, and the
+    contour's occupancy (`service.occupancy_provider`, no period — the exact
+    seam the ruling's own numeric example is about) reports the extension's
+    own area alone rather than both permits summed."""
+    parent_permit, extension_permit_id, pdf = await _build_pending_extension(
+        db,
+        contours_layer=contours_layer,
+        leshoz=leshoz,
+        approval_doc=approval_doc,
+        grazing_activity_id=grazing_activity_id,
+        hodim_client=hodim_client,
+        holder=other_applicant_client,
+    )
+
+    for signer, purpose in (
+        (head_client, "permit_head"),
+        (chief_forester_client, "permit_chief_forester"),
+        (accountant_client, "permit_accountant"),
+        (other_applicant_client, signers.RECIPIENT_PURPOSE),
+    ):
+        result = await sign_permit(signer, extension_permit_id, purpose, pdf)
+        assert result.status_code == 200, result.text
+
+    await db.refresh(parent_permit)
+    assert parent_permit.status == "expired"
+
+    occupancy = await service.occupancy_provider(db, [parent_permit.contour_id])
+    assert occupancy[parent_permit.contour_id] == Decimal("8.0000")
+
+
+async def test_an_unsigned_extension_leaves_the_parent_untouched_and_active(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+    hodim_client: httpx.AsyncClient,
+    other_applicant_client: Signer,
+) -> None:
+    """The #99 interaction that decided the TIMING in #102: an extension that
+    is merely ISSUED, still short of its own four signatures, must not touch
+    the parent at all — closing it here would leave the holder with the old
+    permit already gone and the new one not yet in force."""
+    parent_permit, extension_permit_id, _pdf = await _build_pending_extension(
+        db,
+        contours_layer=contours_layer,
+        leshoz=leshoz,
+        approval_doc=approval_doc,
+        grazing_activity_id=grazing_activity_id,
+        hodim_client=hodim_client,
+        holder=other_applicant_client,
+    )
+
+    extension_permit = await service.get(db, extension_permit_id)
+    assert extension_permit is not None
+    assert extension_permit.status == "pending_signatures"
+
+    await db.refresh(parent_permit)
+    assert parent_permit.status == "active"
+
+
+async def test_activating_a_permit_that_is_not_an_extension_has_no_parent_side_effect(
+    db: AsyncSession, active_permit: Permit, paid_application: Application
+) -> None:
+    """#102's own guard clause: `_activate` reads `application.kind` before
+    doing anything about a parent, and a `kind='new'` application — the
+    default, and every fixture before this stage — must leave it a no-op.
+    `active_permit` already runs the real `_activate` for the ordinary case;
+    this pins that the new code path does not disturb it."""
+    await db.refresh(paid_application)
+    assert paid_application.kind == "new"
+    assert paid_application.parent_application_id is None
+    assert active_permit.status == "active"
 
 
 # --- the transition table ----------------------------------------------------

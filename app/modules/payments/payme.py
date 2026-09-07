@@ -347,10 +347,11 @@ async def _cancel_transaction(
     (`design/04` §3.5 reason `5` is literally "funds returned"), and since
     3.10b it does more than move the transaction row: it calls
     `service.record_reversal`, which writes the negating `correction`
-    entries, opens a `reconciliations` row and raises RI-01 (plus RI-10 when
-    a permit already exists). 3.10a reversed nothing at all, and this
-    docstring said so — see `service.py`'s public-surface banner for what
-    shipped and for the one thing still open.
+    entries, opens a `reconciliations` row and raises RI-01 (plus RI-10, and
+    a direct notify to the permit's `executor_head`, when a permit already
+    exists — ruling #112). 3.10a reversed nothing at all, and this docstring
+    said so — see `service.py`'s public-surface banner for what shipped and
+    for the one thing still open.
 
     **It is still logged at ERROR**, not written off as ordinary traffic
     (whole-branch review), and the reason is now narrower but real: a

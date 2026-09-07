@@ -163,6 +163,35 @@ def _permit_from_row(row: Any, prefix: str) -> Permit:
     return permit
 
 
+# --- RI-14: an active permit running this long with no inspection act -------
+
+
+async def long_active_permits_without_inspection(
+    db: AsyncSession, *, cutoff: datetime
+) -> list[Permit]:
+    """Every `active` permit whose `issued_at` (`permits/models.py`: set on
+    the transition TO active, ruling 18 — despite the name, never issuance) is
+    at or before `cutoff` and has no `inspection_acts` row naming it AT ALL,
+    regardless of that act's own `status` — a `draft` act still means an
+    inspector genuinely went and looked, whether or not its signature is
+    filed yet. `NOT EXISTS`, not a LEFT JOIN plus a NULL check: this never
+    materialises the (permit, maybe-act) product and stays one index lookup
+    per candidate permit on `inspection_acts(permit_id)`.
+
+    `cutoff` is computed by the caller (`service.sweep_long_active_without_
+    inspection`, `now - threshold_days`), not here — the same split
+    `payments.jobs.expiry_sweep` uses for its own `now`, so this function has
+    no clock of its own to fake in a test."""
+    acted = select(InspectionAct.permit_id).where(InspectionAct.permit_id == Permit.id)
+    stmt = select(Permit).where(
+        Permit.status == "active",
+        Permit.issued_at.is_not(None),
+        Permit.issued_at <= cutoff,
+        ~acted.exists(),
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
 # --- Zone resolution for a risk_indicators/oversight_events row --------------
 
 # Only these object types have a knowable per-leshoz owner today (ruling f in

@@ -50,7 +50,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
+from app.modules.auth.models import User
 from app.modules.gis.models import GisLayer
+from app.modules.notifications.models import Notification
 from app.modules.payments import payme
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import (
@@ -59,6 +61,7 @@ from app.modules.payments.models import (
     ProviderTransaction,
     Reconciliation,
 )
+from tests.modules.auth.test_sessions import make_user
 from tests.modules.gis.conftest import contours_layer as contours_layer
 from tests.modules.gis.conftest import leshoz as leshoz
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
@@ -114,6 +117,14 @@ async def _risk_rows(db: AsyncSession, indicator: str, object_id: uuid.UUID) -> 
     stmt = select(AuditLog).where(
         AuditLog.object_id == object_id,
         AuditLog.extra["risk_indicator"].astext == indicator,
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def _reversal_notifications(db: AsyncSession, invoice: Invoice) -> list[Notification]:
+    stmt = select(Notification).where(
+        Notification.object_id == invoice.id,
+        Notification.event_code == "payment.reversed",
     )
     return list((await db.execute(stmt)).scalars().all())
 
@@ -211,6 +222,14 @@ async def revoked_permit(
     )
 
 
+@pytest.fixture
+async def leshoz_head(db: AsyncSession, leshoz) -> User:
+    """`executor_head` of `leshoz` — `permits.manage`'s own holder, and ruling
+    #112's notification recipient once a reversal's RI-10 fires under an
+    active permit of this organization."""
+    return await make_user(db, role_code="executor_head", organization_id=leshoz.id)
+
+
 async def test_a_post_perform_cancel_brings_the_ledger_back_to_zero(
     db: AsyncSession, pending_invoice: Invoice
 ):
@@ -306,6 +325,28 @@ async def test_ri_10_fires_only_when_a_permit_already_exists(
     assert rows[0].object_type == "application"
 
 
+async def test_ri_10_also_notifies_the_leshoz_head(
+    db: AsyncSession,
+    pending_invoice: Invoice,
+    active_permit: uuid.UUID,
+    leshoz_head: User,
+):
+    """Ruling #112: raising RI-10 is not enough on its own — the whole point
+    is that a HUMAN at the leshoz decides whether to suspend, and nobody
+    decides on a row nobody was told about. `leshoz_head` holds
+    `permits.manage` on the SAME organization `_insert_permit` gave the
+    permit, so `record_reversal` must find and notify exactly them."""
+    tx_id, now = await _perform(db, pending_invoice, "notify")
+
+    await _cancel(db, tx_id, now)
+
+    rows = await _reversal_notifications(db, pending_invoice)
+    assert len(rows) == 1
+    assert rows[0].recipient_user_id == leshoz_head.id
+    assert rows[0].object_type == "invoice"
+    assert rows[0].params["invoice_number"] == pending_invoice.number
+
+
 async def test_no_ri_10_for_a_revoked_permit(
     db: AsyncSession, pending_invoice: Invoice, revoked_permit: uuid.UUID
 ):
@@ -369,6 +410,18 @@ async def test_no_ri_10_when_no_permit_exists(db: AsyncSession, pending_invoice:
     assert await _risk_rows(db, RI_PERMIT_WITHOUT_PAYMENT, pending_invoice.application_id) == []
 
 
+async def test_no_notification_when_no_permit_exists(db: AsyncSession, pending_invoice: Invoice):
+    """The notify half mirrors the indicator half exactly: with no permit at
+    all there is no `executor_head` decision to make yet, so `record_reversal`
+    must raise RI-01 alone and tell nobody."""
+    tx_id, now = await _perform(db, pending_invoice, "no-notify")
+
+    await _cancel(db, tx_id, now)
+
+    assert await _risk_rows(db, RI_UNCONFIRMED_PAID, pending_invoice.id) != []
+    assert await _reversal_notifications(db, pending_invoice) == []
+
+
 async def test_the_invoice_stays_paid_and_the_application_stays_paid(
     db: AsyncSession, pending_invoice: Invoice
 ):
@@ -409,8 +462,9 @@ async def test_cancelling_a_never_performed_transaction_records_nothing(
 ):
     """3.10a's behaviour for state `1` -> `-1`, unchanged: no money ever
     arrived, so there is nothing to reverse — no ledger row, no register row,
-    neither risk indicator. The permit fixture is present on purpose: even
-    then, a transaction that never performed writes none of it."""
+    neither risk indicator, and (ruling #112) no notification either. The
+    permit fixture is present on purpose: even then, a transaction that never
+    performed writes none of it."""
     tx_id, now = await _create(db, pending_invoice, "state-one")
 
     result = await _cancel(db, tx_id, now, reason=1)
@@ -420,3 +474,4 @@ async def test_cancelling_a_never_performed_transaction_records_nothing(
     assert await _reconciliations(db, pending_invoice) == []
     assert await _risk_rows(db, RI_UNCONFIRMED_PAID, pending_invoice.id) == []
     assert await _risk_rows(db, RI_PERMIT_WITHOUT_PAYMENT, pending_invoice.application_id) == []
+    assert await _reversal_notifications(db, pending_invoice) == []

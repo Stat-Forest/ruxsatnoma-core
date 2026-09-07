@@ -63,6 +63,7 @@ def test_samesite_follows_the_cross_origin_setup():
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
         eskiz_callback_secret="a-real-callback-secret",
+        eskiz_callback_base_url="https://ruxsatnoma.example.uz",
         public_base_url="https://ruxsatnoma.example.uz",
         admin_base_url=ADMIN_ORIGIN,
         smtp_host="smtp.example.uz",

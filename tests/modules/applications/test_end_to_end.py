@@ -237,24 +237,30 @@ async def _bind_a_recalculation(client, application_id: str, card: dict) -> str:
     return result.json()["id"]
 
 
-async def test_a_head_who_forwards_an_application_cannot_read_its_calculation_anywhere(
+async def test_a_head_who_forwards_an_application_still_cannot_read_its_calculation(
     zoned_limited_executor_head_client, application_in_review
 ) -> None:
-    """**Review round 1, Important 1, on the real path that produces it.**
+    """**Review round 1, Important 1, on the real path that produces it —
+    updated for ruling #107 (`tz/12` #27, 2026-09-07).**
 
-    `decision._forward` moves `assigned_org_id` to the parent organization and
-    its own docstring records the consequence: "the forwarding head, if zoned
-    to the leshoz, no longer sees the application they escalated". A head who
-    recalculated BEFORE escalating is therefore the exact actor who has a
-    calculation they created, on an application they can no longer read — and
-    a `created_by`-only listing handed them the whole `CalculationOut` for it,
-    `input_snapshot`, `amount` and `breakdown` included, while
-    `GET /calculations/{id}` beside it answered 404.
+    `decision._forward` moves `assigned_org_id` to the parent organization.
+    Ruling #107 then carved a read-access exception into
+    `applications.service._readable_application` for exactly the head who did
+    the forwarding — `GET /applications/{id}` no longer 404s for them. But
+    `norms.service._may_read_calculation` answers the SAME zone question
+    through its OWN separate window onto `applications`
+    (`repo.application_facts`, ruling 20) and was not given the same
+    carve-out — plan 07.4 task 3 is scoped to `applications/service.py`, and
+    `norms` is a different module `applications` may not reach into. So a head
+    who recalculated BEFORE escalating now keeps the APPLICATION's own card
+    but still loses the CALCULATION they created on it — two modules
+    answering one zone question, only one of them updated. Worth revisiting
+    if that asymmetry turns out to matter in practice.
 
     Not a hand-set state: every step here is a production route, and the same
     corner is reachable a second way — `own_applicant_ids` is effective-dated
-    and a daily job expires representations, so a representative loses the card
-    the same way.
+    and a daily job expires representations, so a representative loses the
+    calculation the same way.
     """
     card = (
         await zoned_limited_executor_head_client.get(
@@ -282,11 +288,12 @@ async def test_a_head_who_forwards_an_application_cannot_read_its_calculation_an
     assert forwarded.status_code == 200, forwarded.text
     assert forwarded.json()["forwarded_to_organization"] is not None
 
-    # The application is out of this head's zone now — all three reads agree.
-    gone = await zoned_limited_executor_head_client.get(
+    # Ruling #107: the application's own card stays readable to its forwarder.
+    still_there = await zoned_limited_executor_head_client.get(
         f"/api/v1/applications/{application_in_review}"
     )
-    assert gone.status_code == 404, "the card is out of zone once escalated"
+    assert still_there.status_code == 200, "ruling #107: the forwarder keeps read access"
+    # `norms`'s own zone gate is a SEPARATE mechanism, untouched by that ruling.
     assert (
         await zoned_limited_executor_head_client.get(f"/api/v1/calculations/{calc_id}")
     ).status_code == 404
