@@ -29,13 +29,15 @@ Public surface for the event bus (`subscribers.py`, registered in
   function performs no check of its own beyond resolving the recipient
   account.
 - `record_reversal(db, *, invoice, transaction, reason) -> None` (3.10b task
-  8, ruling 15) — the mirror of `confirm_payment` for money that came BACK:
-  Payme cancelled an already-performed transaction. It RECORDS the reversal
-  (negating `correction` entries, an open `reconciliations` row, RI-01 and,
-  when a permit exists, RI-10) and deliberately moves neither the invoice nor
-  the application. Called from `payme.py`'s state-`2` branch ONLY. See the
-  KNOWN GAP paragraph in the public-surface comment below for the whole shape
-  of what shipped and what stays open.
+  8, ruling 15; ruling #112 added the notify) — the mirror of `confirm_payment`
+  for money that came BACK: Payme cancelled an already-performed transaction.
+  It RECORDS the reversal (negating `correction` entries, an open
+  `reconciliations` row, RI-01 and, when a permit exists, RI-10 plus a
+  notification to that permit's `executor_head`) and deliberately moves
+  neither the invoice nor the application, and deliberately does not suspend
+  the permit either — that stays a person's call. Called from `payme.py`'s
+  state-`2` branch ONLY. See the KNOWN GAP paragraph in the public-surface
+  comment below for the whole shape of what shipped and what stays open.
 
 `get_invoice_for_actor`/`list_invoices_for_actor`/`create_pay_intent` are
 this module's OWN router-facing functions (they take an HTTP `actor: User`,
@@ -104,6 +106,16 @@ REVERSAL_RECORD = "payment.reversal_record"
 # issuance; here it is a permit that already exists over money that came back.
 RISK_INDICATOR_UNCONFIRMED_PAID = "RI-01"
 RISK_INDICATOR_PERMIT_WITHOUT_PAYMENT = "RI-10"
+
+# Ruling #112: who at the leshoz `record_reversal` notifies when RI-10 fires —
+# the person who could actually act on it, `permits.manage`'s own holder
+# (`permits/permissions.py`: suspend/resume/revoke, granted to `executor_head`
+# alone). A LITERAL, not an import of `app.modules.permits.permissions`: that
+# module is level 4, the same level as this one (`design/01` rule 3), and the
+# comment on `repo.permit_organization_for_application` already keeps this
+# module's one read of `permits` to raw SQL for exactly that reason — a
+# permission CODE is no different a cross-level dependency than a model class.
+_PERMIT_DECISION_PERMISSION = "permits.manage"
 
 # design/03 §"Public numbers": every invoice number starts with this prefix.
 INVOICE_NUMBER_PREFIX = "INV"
@@ -184,7 +196,11 @@ ALLOCATION_ENTRY_CORRECTION = ALLOCATION_ENTRY_TYPES[2]
 #   провайдера/банка» — the provider withdrew a confirmation the invoice still
 #   bears); and RI-10 too («Разрешение активировано без оплаты») when a permit
 #   in a LIVE status — `pending_signatures`, `active` or `suspended`, never a
-#   `revoked` or `expired` one — already exists for that application.
+#   `revoked` or `expired` one — already exists for that application. Ruling
+#   #112 (7.4d) added the last piece the RI-10 branch was missing: a direct
+#   `notify()` to that permit's own `executor_head`, so the decision RI-10
+#   flags actually reaches a person instead of waiting for the prosecutor's
+#   next sweep or an operator who happens to open the register.
 #
 #   **What is STILL OPEN, and is not a defect in the code below.** The invoice
 #   stays `paid` and the application stays `PAID`, so this function still
@@ -925,8 +941,14 @@ async def record_reversal(
        the invoice is still `paid`), plus a second one carrying **RI-10**
        («Разрешение активировано без оплаты», critical) when a permit already
        exists for this application in a LIVE status (`repo.
-       permit_exists_for_application` — a `revoked` or `expired` permit does
-       not raise it).
+       permit_organization_for_application` — a `revoked` or `expired` permit
+       does not raise it). Ruling #112: when RI-10 fires, `notify()` also
+       tells the permit's own `executor_head` (`permits.manage`'s holder) —
+       raising the indicator only, with nobody told, would leave a human
+       decision waiting on somebody happening to read the register.
+       Automatic suspension stays OUT of scope on purpose: a provider-side
+       glitch would then switch off an honest holder's permit with nobody in
+       the loop, which is the ruling's own reasoning, verbatim.
 
     **What it does NOT do, and why.** It does not move the invoice off `paid`
     and it does not move the application off `PAID`.
@@ -1045,13 +1067,16 @@ async def record_reversal(
     )
 
     # A LIVE permit for this application means money has gone back from
-    # something already issued — `tz/10`'s RI-10 verbatim. A read-only EXISTS,
+    # something already issued — `tz/10`'s RI-10 verbatim. A read-only SELECT,
     # never a call into `permits` (both modules are level 4): see
-    # `repo.permit_exists_for_application`'s own comment for the boundary
-    # argument, for which statuses count (a `revoked` or `expired` permit does
-    # NOT — an RI-10 on either is a false positive on a CRITICAL indicator),
-    # and for what drops if the trade is ever re-decided.
-    if await repo.permit_exists_for_application(db, invoice.application_id):
+    # `repo.permit_organization_for_application`'s own comment for the
+    # boundary argument, for which statuses count (a `revoked` or `expired`
+    # permit does NOT — an RI-10 on either is a false positive on a CRITICAL
+    # indicator), and for what drops if the trade is ever re-decided.
+    permit_organization_id = await repo.permit_organization_for_application(
+        db, invoice.application_id
+    )
+    if permit_organization_id is not None:
         await audit.log(
             db,
             action=REVERSAL_RECORD,
@@ -1067,3 +1092,35 @@ async def record_reversal(
             basis="a permit exists for an application whose payment was reversed",
             extra={"risk_indicator": RISK_INDICATOR_PERMIT_WITHOUT_PAYMENT},
         )
+
+        # Ruling #112: raising RI-10 tells the prosecutor eventually (via
+        # `oversight.sweep`'s harvest, on its own schedule); it tells nobody
+        # at the leshoz AT ALL. `permits.manage`'s holder — `executor_head`,
+        # who alone may suspend/resume/revoke — is who has to decide, so they
+        # are who is notified, directly, in this same transaction.
+        recipients = await auth_service.user_ids_with_permission(
+            db, _PERMIT_DECISION_PERMISSION, organization_id=permit_organization_id
+        )
+        if not recipients:
+            # Fails closed on the SIDE EFFECT, not on the record: an
+            # organization with nobody holding `permits.manage` is a data
+            # problem this function cannot fix, and the RI-10 row above
+            # still stands for the prosecutor to find.
+            logger.warning(
+                "payments.reversal_notify_no_recipient",
+                invoice_id=str(invoice.id),
+                organization_id=str(permit_organization_id),
+            )
+        for recipient_id in recipients:
+            await notifications_service.notify(
+                db,
+                event_code=events.PAYMENT_REVERSED,
+                recipient_user_id=recipient_id,
+                params={
+                    "invoice_number": invoice.number,
+                    "reversed_amount": reversed_amount,
+                    "reason": reason,
+                },
+                object_type="invoice",
+                object_id=invoice.id,
+            )

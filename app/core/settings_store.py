@@ -263,6 +263,18 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             10000,
             "Maximum rows in one search/oversight export (С22, ruling #20)",
         ),
+        # Ruling #104: RI-14 «long active with no inspection» — the strictest
+        # of three options Oybek was offered, and his own text names the
+        # consequence: at 30 days it fires often, and an indicator that always
+        # fires stops being read. A setting, not a constant, is what lets that
+        # be tuned without a deploy once there is real inspection volume to
+        # judge it by.
+        SettingSpec(
+            "oversight_ri14_no_inspection_days",
+            int,
+            30,
+            "Days an active permit may run with no inspection act before RI-14 fires",
+        ),
     )
 }
 

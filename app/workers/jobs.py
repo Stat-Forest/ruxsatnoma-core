@@ -1,6 +1,15 @@
 """Periodic jobs (decision #36). Each takes a session factory, opens its own
 session, audits with user_id=None, and commits. Failures raise to the caller
-(the scheduler wrapper logs and swallows)."""
+(the scheduler wrapper logs and swallows).
+
+**F24 (`plans/07.3-findings.md`):** every job below logs its own completion
+UNCONDITIONALLY, counts and all, zeros included — a healthy idle run and a
+scheduler that silently died months ago must never produce the same log
+artefact (nothing). `process_gis_imports`/`process_bank_statements` are the
+deliberate exception: they poll a queue every 10-30 seconds rather than sweep
+once a night, so they still log only when there was something to drain — an
+unconditional line there would be the opposite failure, noise burying signal.
+"""
 
 import uuid
 from collections.abc import Awaitable, Callable
@@ -238,8 +247,13 @@ async def expire_invoices(factory: async_sessionmaker[AsyncSession]) -> dict[str
     async with factory() as db:
         counts = await payments_jobs.expiry_sweep(db)
         await db.commit()
-    if counts["expired"] or counts["reminded"]:
-        logger.info("job.expire_invoices", **counts)
+    # F24: log unconditionally, zeros included. A quiet night and a scheduler
+    # that died months ago used to leave the IDENTICAL trail — nothing — and
+    # an operator without the source had no way to tell them apart. The same
+    # fix applies at every `if counts[...]:` in this file (`refund_sla_sweep`,
+    # `sla_sweep`, `oversight_sweep`) and to `_drain_batches`' own `elif
+    # total:` below, which silences the same way for a zero night.
+    logger.info("job.expire_invoices", **counts)
     return counts
 
 
@@ -255,8 +269,7 @@ async def refund_sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[st
     async with factory() as db:
         counts = await payments_jobs.refund_sla_sweep(db)
         await db.commit()
-    if counts["flagged"]:
-        logger.info("job.refund_sla_sweep", **counts)
+    logger.info("job.refund_sla_sweep", **counts)  # F24: unconditional, see expire_invoices above
     return counts
 
 
@@ -274,8 +287,8 @@ async def sla_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str, int]
     async with factory() as db:
         counts = await applications_jobs.sla_sweep(db)
         await db.commit()
-    if counts["reminded"] or counts["flagged"]:
-        logger.info("job.applications_sla_sweep", **counts)
+    # F24: unconditional, see expire_invoices above.
+    logger.info("job.applications_sla_sweep", **counts)
     return counts
 
 
@@ -290,8 +303,12 @@ async def oversight_sweep(factory: async_sessionmaker[AsyncSession]) -> dict[str
     async with factory() as db:
         counts = await oversight_jobs.sweep(db, correlation_id=correlation_id)
         await db.commit()
-    if counts["harvested"] or counts["overlaps_raised"]:
-        logger.info("job.oversight_sweep", **counts)
+    # F24: unconditional, see expire_invoices above. Runs every 5 minutes
+    # rather than nightly, so this is the noisiest of the four — deliberately:
+    # this is also the job whose own silence is hardest to tell from "nothing
+    # happened" without it (RI-14, ruling #104, joins `harvested`/
+    # `overlaps_raised` in `counts` below and needs the same unconditional line).
+    logger.info("job.oversight_sweep", **counts)
     return counts
 
 
@@ -330,7 +347,13 @@ async def _drain_batches(
             break
     if failed:
         logger.error(f"job.{name}.rows_failed", failed=failed, processed=total)
-    elif total:
+    else:
+        # F24: unconditional (was `elif total:`, silent on a zero night) — the
+        # four nightly permits jobs sharing this helper (`expire_permits`,
+        # `close_finished_permits`, `expire_forest_tickets`,
+        # `watch_stalled_permits`) get the same fix as the `if counts[...]:`
+        # jobs above, for the identical reason: a healthy quiet night and a
+        # scheduler that stopped running must not produce the same silence.
         logger.info(f"job.{name}", processed=total)
     return total
 

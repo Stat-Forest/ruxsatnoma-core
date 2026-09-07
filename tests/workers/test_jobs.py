@@ -6,10 +6,18 @@ from typing import cast
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from app.db import make_session_factory
 from app.modules.auth.models import Applicant
-from app.workers.jobs import expire_representations, purge_stale_rows
+from app.workers.jobs import (
+    expire_invoices,
+    expire_representations,
+    oversight_sweep,
+    purge_stale_rows,
+    refund_sla_sweep,
+    sla_sweep,
+)
 from tests.modules.auth.test_sessions import make_user
 
 
@@ -186,3 +194,109 @@ async def test_an_empty_permit_sweep_opens_one_transaction_and_stops():
 
     assert await _drain_batches(_stub_factory(commits), sweep, name="stub_sweep") == 0
     assert (calls, len(commits)) == (1, 1)
+
+
+async def test_an_empty_permit_sweep_still_logs_its_zero():
+    """F24: `_drain_batches`' own `elif total:` used to mean a quiet night and
+    a scheduler that never started produced the identical trail — nothing.
+    Fixed to `else:`, so `processed=0` is logged unconditionally at
+    completion, the same as the `if counts[...]:` jobs below."""
+    from app.modules.permits import jobs as permits_jobs
+    from app.workers.jobs import _drain_batches
+
+    commits: list[int] = []
+
+    async def sweep(db, after_id):
+        return permits_jobs.SweepBatch(scanned=0, processed=0, failed=0, last_id=None)
+
+    with capture_logs() as logs:
+        total = await _drain_batches(_stub_factory(commits), sweep, name="stub_sweep")
+
+    assert total == 0
+    entries = [entry for entry in logs if entry.get("event") == "job.stub_sweep"]
+    assert len(entries) == 1
+    assert entries[0]["processed"] == 0
+    assert entries[0]["log_level"] == "info"
+
+
+# --- F24: every nightly sweep logs its result, zeros included ----------------
+#
+# Each wrapper's own inner sweep is stubbed to return an all-zero count,
+# rather than relied on to BE zero: this file's own database is the shared,
+# persistent one (`../CLAUDE.md`), and another test's leftover due-soon
+# invoice or SLA-eligible application would make a real "quiet night" run
+# unreliable to assert on. What is under test here is the WRAPPER's own
+# `if counts[...]:` (now unconditional) — never the sweep query itself,
+# which each module's own test suite already covers.
+
+
+async def test_expire_invoices_logs_a_quiet_night(engine, monkeypatch):
+    from app.workers import jobs as workers_jobs
+
+    async def fake_sweep(db):
+        return {"expired": 0, "reminded": 0}
+
+    monkeypatch.setattr(workers_jobs.payments_jobs, "expiry_sweep", fake_sweep)
+
+    with capture_logs() as logs:
+        counts = await expire_invoices(make_session_factory(engine))
+
+    assert counts == {"expired": 0, "reminded": 0}
+    entries = [entry for entry in logs if entry.get("event") == "job.expire_invoices"]
+    assert len(entries) == 1
+    assert entries[0]["expired"] == 0
+    assert entries[0]["reminded"] == 0
+
+
+async def test_refund_sla_sweep_logs_a_quiet_night(engine, monkeypatch):
+    from app.workers import jobs as workers_jobs
+
+    async def fake_sweep(db):
+        return {"flagged": 0}
+
+    monkeypatch.setattr(workers_jobs.payments_jobs, "refund_sla_sweep", fake_sweep)
+
+    with capture_logs() as logs:
+        counts = await refund_sla_sweep(make_session_factory(engine))
+
+    assert counts == {"flagged": 0}
+    entries = [entry for entry in logs if entry.get("event") == "job.refund_sla_sweep"]
+    assert len(entries) == 1
+    assert entries[0]["flagged"] == 0
+
+
+async def test_applications_sla_sweep_logs_a_quiet_night(engine, monkeypatch):
+    from app.workers import jobs as workers_jobs
+
+    async def fake_sweep(db):
+        return {"reminded": 0, "flagged": 0}
+
+    monkeypatch.setattr(workers_jobs.applications_jobs, "sla_sweep", fake_sweep)
+
+    with capture_logs() as logs:
+        counts = await sla_sweep(make_session_factory(engine))
+
+    assert counts == {"reminded": 0, "flagged": 0}
+    entries = [entry for entry in logs if entry.get("event") == "job.applications_sla_sweep"]
+    assert len(entries) == 1
+    assert entries[0]["reminded"] == 0
+    assert entries[0]["flagged"] == 0
+
+
+async def test_oversight_sweep_logs_a_quiet_run(engine, monkeypatch):
+    from app.workers import jobs as workers_jobs
+
+    async def fake_sweep(db, *, correlation_id):
+        return {"harvested": 0, "overlaps_raised": 0, "long_active_raised": 0}
+
+    monkeypatch.setattr(workers_jobs.oversight_jobs, "sweep", fake_sweep)
+
+    with capture_logs() as logs:
+        counts = await oversight_sweep(make_session_factory(engine))
+
+    assert counts == {"harvested": 0, "overlaps_raised": 0, "long_active_raised": 0}
+    entries = [entry for entry in logs if entry.get("event") == "job.oversight_sweep"]
+    assert len(entries) == 1
+    assert entries[0]["harvested"] == 0
+    assert entries[0]["overlaps_raised"] == 0
+    assert entries[0]["long_active_raised"] == 0
