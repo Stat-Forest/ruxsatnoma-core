@@ -39,8 +39,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "0038"
-down_revision: str | Sequence[str] | None = "0037"
+revision: str = "0041"
+down_revision: str | Sequence[str] | None = "0040"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
