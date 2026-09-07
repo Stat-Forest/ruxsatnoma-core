@@ -41,7 +41,11 @@ from app.modules.auth.models import (
 )
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
-from app.modules.integrations.adapters.oneid import OneIdError, get_oneid_adapter
+from app.modules.integrations.adapters.oneid import (
+    OneIdCall,
+    OneIdError,
+    get_oneid_adapter,
+)
 
 # Timing-uniform response (user enumeration): computed once at import so the
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
@@ -155,6 +159,34 @@ async def login_or_create_by_pinfl(
     return user, row, token, csrf
 
 
+async def _log_oneid_calls(db: AsyncSession, calls: tuple[OneIdCall, ...]) -> None:
+    """One `integration_log` row per provider round trip (tz/09: logging per
+    external message).
+
+    The rows are written HERE rather than in the adapter because this is where
+    the session lives — no adapter in this codebase opens a transaction of its
+    own. `meta` carries the provider's own refusal codes and nothing else:
+    `CLIENT_SECRET_NOT_FOUND` in the log is the difference between an
+    administrator fixing one `.env` line and an administrator waiting out an
+    outage that is not happening (decision #140 ruling 5). Everything else
+    OneID exchanges — the PINFL, the phone, the token — is personal data or a
+    credential and never reaches a log row."""
+    for call in calls:
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system="oneid",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_message": call.provider_message, "provider_error": call.provider_error}
+                if call.provider_error or call.provider_message
+                else None
+            ),
+        )
+
+
 async def login_via_oneid(
     db: AsyncSession, *, code: str, ip: str | None, user_agent: str | None
 ) -> tuple[User, Session, str, str]:
@@ -162,7 +194,14 @@ async def login_via_oneid(
     try:
         login = await adapter.exchange_code(code)
     except OneIdError as exc:
+        # The early-commit pattern this codebase uses for denied outcomes: the
+        # raise below rolls the session back, and a failed login is precisely
+        # the case the log exists for. Nothing else is pending here — the
+        # exchange is the first thing this function does.
+        await _log_oneid_calls(db, exc.calls)
+        await db.commit()
         raise err(exc.err_code) from exc
+    await _log_oneid_calls(db, login.calls)
     profile = login.profile
     return await login_or_create_by_pinfl(
         db,
