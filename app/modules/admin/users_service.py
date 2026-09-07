@@ -24,6 +24,7 @@ from app.core.security import (
     totp_provisioning_uri,
     validate_password_policy,
 )
+from app.modules.admin import open_work
 from app.modules.admin.users_schemas import (
     PermissionCodesIn,
     PermissionCodesOut,
@@ -434,6 +435,15 @@ async def unblock_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> 
 async def delete_user(db: AsyncSession, *, user_id: uuid.UUID, actor: User) -> UserAdminOut:
     _guard_not_self(user_id, actor)
     user = await _user_or_404(db, user_id)
+    # tz/04 С23: deletion only after the handover ("удаление — только после
+    # передачи незавершённых дел другому исполнителю"). `archive_role` above
+    # refuses the same way for a role that still has holders; this is that
+    # check for the one branch the spec names by name (finding F4, fleet
+    # 07.5). Fail-closed by construction: `open_work_for` propagates a
+    # provider's exception rather than treating it as "holds nothing".
+    held = await open_work.open_work_for(db, user.id)
+    if held:
+        raise err("ERR-VAL-001", details={"open_work": [item.as_details() for item in held]})
     before_status = user.status
     user.status = "deleted"
     await auth_repo.revoke_user_sessions(db, user.id)

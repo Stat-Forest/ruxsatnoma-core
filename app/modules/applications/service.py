@@ -34,6 +34,7 @@ from app.core.numbers import next_public_number
 from app.core.schemas import PageParams
 from app.core.time import business_today
 from app.db import uuid7
+from app.modules.admin import open_work as admin_open_work
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import ClassifierItem, Organization
 from app.modules.applications import checks, repo, sla
@@ -200,6 +201,28 @@ APPLICATION_TRANSITIONS: dict[str, frozenset[str]] = {
 # One-source-of-truth check: the keys and every target above must be members
 # of APPLICATION_STATUSES (models.py) — see
 # test_public_surface.py::test_transition_table_has_all_fourteen_statuses_and_only_real_targets.
+
+# `admin.open_work`'s notion of "terminal" for this module (ruling R5, plan
+# 07.6 task 2): a status nobody needs to act on any further. DERIVED from
+# `APPLICATION_TRANSITIONS` — the same single-source idiom `archive.service`
+# already uses for its own `_ELIGIBLE_APPLICATION_STATUSES` (an application
+# may reach ARCHIVED only once every ACTIVE thing about it is done) — rather
+# than a second, hand-typed list that could drift from the table above.
+# ARCHIVED itself is added: it has no outgoing edge at all and is not a
+# TARGET of anything either, so the derivation alone would miss it.
+#
+# Deliberately NOT narrowed to "review is over" (stopping at APPROVED): the
+# guard exists to keep a departing reviewer from being untraceable, not to
+# model who is doing what today, and a narrower set would need its own
+# justification nothing here asks for. What it MUST do — and is proven by
+# `test_a_terminal_application_does_not_block` — is let a long-serving
+# reviewer with a thousand CLOSED applications still be deletable.
+TERMINAL_APPLICATION_STATUSES: frozenset[str] = frozenset(
+    {
+        "ARCHIVED",
+        *(status for status, targets in APPLICATION_TRANSITIONS.items() if "ARCHIVED" in targets),
+    }
+)
 
 
 def _assert_transition(application: Application, to_status: str) -> None:
@@ -3313,3 +3336,59 @@ async def confirm_check(
         new_value={"confirmed_by": str(actor.id)},
     )
     return check
+
+
+# --- Stage 7.6: the open-work seam (finding F4/F5, plan 07.6 tasks 2 and 3) --
+#
+# `admin` is level 1 and may not import this module (level 3), so the two
+# questions it needs answered — "what does this USER still hold" (F4,
+# `delete_user`) and "what does this ORGANIZATION still have hanging off it"
+# (F5, `archive_organization`) — travel the other way, as a registration into
+# `admin.open_work`'s two registries. `app/event_subscriptions.py` is the ONE
+# place that performs the registration (never here, and never `main.py` —
+# the standalone worker imports this module too and must see the same
+# answer). Both providers share this cap so a refusal's `details.open_work`
+# never lists more ids than an admin can act on in one sitting.
+OPEN_WORK_ID_CAP = 20
+
+
+async def open_work_provider(
+    db: AsyncSession, user_id: uuid.UUID
+) -> admin_open_work.OpenWork | None:
+    """`admin.open_work.OPEN_WORK_PROVIDERS`'s entry for this module.
+
+    Non-terminal only (`TERMINAL_APPLICATION_STATUSES`, ruling R5): an
+    application in a terminal status needs nobody to act, and a guard that
+    counted those would make a long-serving reviewer undeletable forever —
+    exactly the failure mode `test_a_terminal_application_does_not_block`
+    pins.
+    """
+    ids = await repo.assigned_open_application_ids(
+        db,
+        user_id,
+        exclude_statuses=TERMINAL_APPLICATION_STATUSES,
+        limit=OPEN_WORK_ID_CAP,
+    )
+    if not ids:
+        return None
+    return admin_open_work.OpenWork(kind="applications", count=len(ids), ids=list(ids))
+
+
+async def open_work_provider_for_org(
+    db: AsyncSession, organization_id: uuid.UUID
+) -> admin_open_work.OpenWork | None:
+    """`admin.open_work.ORG_WORK_PROVIDERS`'s entry for this module (F5): every
+    non-terminal application currently routed to `organization_id` through its
+    OWN `assigned_org_id` — deliberately not the contour's owner
+    (`_effective_organization`'s other half), which would make archiving a
+    leshoz depend on geometry this check has no business reading.
+    """
+    ids = await repo.assigned_open_application_ids_for_org(
+        db,
+        organization_id,
+        exclude_statuses=TERMINAL_APPLICATION_STATUSES,
+        limit=OPEN_WORK_ID_CAP,
+    )
+    if not ids:
+        return None
+    return admin_open_work.OpenWork(kind="applications", count=len(ids), ids=list(ids))

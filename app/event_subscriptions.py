@@ -124,7 +124,10 @@ def _register_providers() -> None:
     silently double and then triple, and the failure would read as test pollution
     rather than as a registration bug — passing whenever a file was run alone.
     """
+    from app.modules.admin import open_work as admin_open_work
+    from app.modules.applications import service as applications_service
     from app.modules.gis import service as gis_service
+    from app.modules.inspections import service as inspections_service
     from app.modules.norms import service as norms_service
     from app.modules.permits import service as permits_service
 
@@ -132,3 +135,22 @@ def _register_providers() -> None:
         gis_service.OCCUPANCY_PROVIDERS.append(permits_service.occupancy_provider)
     if permits_service.load_provider not in norms_service.LOAD_PROVIDERS:
         norms_service.LOAD_PROVIDERS.append(permits_service.load_provider)
+
+    # `admin` (level 1) may not read `applications` (3) or `inspections` (5), and
+    # tz/04 С23 makes deletion — and, adjacent to it, archival — conditional on
+    # exactly what those two know (findings F4/F5 of `07.5-audit-findings.md`,
+    # rulings R4/R5 of plan 07.6). Registered here rather than in `app/main.py`
+    # for the identical reason the two provider registrations above it are: a
+    # `workers_mode=off` deployment never calls `create_app()`, and the seam
+    # would then answer "holds nothing" to every check in the worker — a
+    # fail-OPEN answer from a guard whose whole purpose is to fail closed.
+    #
+    # Both tracks of stage 7.6 wrote this block on their own branch, each
+    # registering only its own module (neither could import the other's, which
+    # did not exist there); the two halves are joined here, at integration.
+    if applications_service.open_work_provider not in admin_open_work.OPEN_WORK_PROVIDERS:
+        admin_open_work.OPEN_WORK_PROVIDERS.append(applications_service.open_work_provider)
+    if inspections_service.open_work_provider not in admin_open_work.OPEN_WORK_PROVIDERS:
+        admin_open_work.OPEN_WORK_PROVIDERS.append(inspections_service.open_work_provider)
+    if applications_service.open_work_provider_for_org not in admin_open_work.ORG_WORK_PROVIDERS:
+        admin_open_work.ORG_WORK_PROVIDERS.append(applications_service.open_work_provider_for_org)

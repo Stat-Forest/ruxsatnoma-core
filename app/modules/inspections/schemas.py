@@ -90,6 +90,14 @@ class TaskOut(BaseModel):
     created_at: datetime
 
 
+class ReassignIn(BaseModel):
+    """`POST /inspections/tasks/{id}/reassign` (ruling R6): the handover — the
+    task keeps its id, its due date and its history, only `assigned_to`
+    changes."""
+
+    new_assignee_id: uuid.UUID
+
+
 class ActCreateIn(BaseModel):
     """`POST /inspections/acts`: all three of `task_id`/`permit_id`/
     `application_id` left unset plus a `gps` fix is an "activity without a
@@ -266,10 +274,14 @@ class AppealOut(BaseModel):
 
 class CaseCardOut(CaseOut):
     """`GET /inspections/cases/{id}`: the case's own columns, FLAT, plus its
-    append-only timeline and any appeals filed against its decision."""
+    append-only timeline, any appeals filed against its decision, and how
+    many of the SAME applicant's other cases already reached a decision
+    (ruling R8, `tz/04`'s "shows the history" half of the repeat-violation
+    line — the "suggests stricter" half is deliberately NOT built)."""
 
     history: list[CaseHistoryEntry]
     appeals: list[AppealOut]
+    prior_cases_count: int
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> CaseCardOut:
@@ -279,6 +291,7 @@ class CaseCardOut(CaseOut):
                 **{name: getattr(case, name) for name in CaseOut.model_fields},
                 "history": card["history"],
                 "appeals": card["appeals"],
+                "prior_cases_count": card["prior_cases_count"],
             }
         )
 
