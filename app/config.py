@@ -74,7 +74,18 @@ class Settings(BaseSettings):
     # reached by a browser returning from an identity provider, and answering
     # it with a JSON body renders `{"user": ...}` as text on the screen.
     admin_base_url: str = "http://localhost:5173"
+    # At OneID the scope IS the client_id — the provider has no scope vocabulary
+    # (plan 05.1 R1, read off the old system's working exchange and confirmed
+    # against the live endpoint on 2026-09-07). Ours is `forestry_uz`; the
+    # default here is a placeholder the real-mode guard below refuses.
     oneid_scope: str = "mock-scope"
+    # One endpoint serves every step of the OneID exchange — authorization,
+    # token, identify and logout differ only by `grant_type` (design/04 §1.1).
+    # There is no OIDC path beside it: `/sso/.well-known/openid-configuration`
+    # answers 404, checked 2026-09-07.
+    oneid_base_url: str = "https://sso.egov.uz/sso/oauth/Authorization.do"
+    oneid_client_id: str = ""
+    oneid_client_secret: str = ""
     # Payme JSON-RPC server (stage 3.10a, design/04 §3). "mock" points at
     # Payme's own SANDBOX cashbox key, not a fake — see
     # integrations/adapters/payme.py's own docstring.
@@ -124,6 +135,28 @@ class Settings(BaseSettings):
                 "sms_mode=real requires eskiz_email, eskiz_password, eskiz_sender "
                 "and eskiz_callback_secret"
             )
+        if self.oneid_mode == "real":
+            # Checked unconditionally, like sms_mode: a half-configured OneID
+            # fails at LOGIN TIME rather than at startup, and it fails for
+            # every citizen at once — OneID is the only entry a citizen has
+            # (decision #94), so the whole public side of the system is down
+            # while the process itself looks healthy.
+            if not self.oneid_client_id or not self.oneid_client_secret:
+                raise ValueError("oneid_mode=real requires oneid_client_id and oneid_client_secret")
+            if not self.oneid_scope or self.oneid_scope == "mock-scope":
+                raise ValueError(
+                    "oneid_mode=real requires a real oneid_scope — at OneID it equals "
+                    "the client_id (plan 05.1 R1), and the placeholder default would be "
+                    "sent to the provider verbatim"
+                )
+            if _is_local_origin(self.oneid_redirect_uri):
+                # The TI lists every allowed redirect URI and forbids localhost
+                # (design/04 §1.4). The provider refuses the authorization step
+                # itself, so nothing of ours ever runs to explain why.
+                raise ValueError(
+                    "oneid_mode=real requires a non-local oneid_redirect_uri registered "
+                    f"in the OneID technical instruction (got {self.oneid_redirect_uri!r})"
+                )
         if self.sms_mode == "real" and _is_local_origin(self.eskiz_callback_base_url):
             # The only Eskiz setting whose DEFAULT looks like a working value. Get it
             # wrong and SMS still goes out while every delivery report is posted into
