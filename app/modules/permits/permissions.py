@@ -30,6 +30,7 @@ PERMITS_ISSUE = "permits.issue"
 PERMITS_SIGN = "permits.sign"
 PERMITS_VIEW_ANY = "permits.view_any"
 PERMITS_MANAGE = "permits.manage"
+RATINGS_VIEW = "ratings.view"
 
 register(
     {
@@ -37,5 +38,6 @@ register(
         PERMITS_SIGN: "Sign a permit (executor_head, chief_forester, accountant, recipient)",
         PERMITS_VIEW_ANY: "See permits beyond one's own (staff, prosecutor)",
         PERMITS_MANAGE: "Suspend, revoke or duplicate an issued permit (executor_head)",
+        RATINGS_VIEW: "Read service-satisfaction ratings (zone-scoped, ruling #142)",
     }
 )

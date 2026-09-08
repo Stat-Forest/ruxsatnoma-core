@@ -93,23 +93,23 @@ Tooling and environment.
   alone, reading like a chain bug (0011, 3.7 t1; `merge_0018_0020`, 3.9b/3.11b).
 - **How to apply:** `alembic merge heads -m "merge"`; `make heads` is the gate — grep the
   test for the previous head string, since no task brief lists that file.
-- **The mirror, 2026-09-07 — the Rule above was not followed, and this is the cost:** 3.11b
-  re-pointed `0023`'s `down_revision` from `0022` to `0025` by hand before merging. A database
-  that had ALREADY passed `0023` under the old parent never runs `0025` at all — `upgrade head`
-  walks forward from the recorded revision and never back for an ancestor spliced in underneath.
-  Symptom: `alembic_version = 0035` while `application_checks.created_by` does not exist, so
-  `POST /applications/{id}/submit` 500s. **A recorded revision does not prove a schema.** Dev
-  escaped it (built after the splice); a long-lived local DB did not. Reconciling means replaying
-  that migration's `upgrade()` by hand — `stamp` back plus `upgrade` re-runs everything after it.
-- **The second mirror, 2026-09-07 — two branches, the SAME id, and `alembic merge heads` cannot
-  help:** stage 5.1 and stage 7.6 merged five minutes apart, each carrying a `0041` off `0040`
-  (`0041_session_oneid_token`, `0041_inspection_case_templates`). `dev` then reported
-  `heads: 0041, 0041` and EVERY gate failed on EVERY branch. Both CI runs were right to pass —
-  a PR's merge commit is computed against the base as it was, and neither re-ran after the other
-  landed. Duplicate ids cannot be merged (alembic cannot tell them apart): the second one is
-  RENUMBERED and re-pointed at the first, which is the one case where editing `down_revision` by
-  hand is correct — nothing has run it anywhere yet. Numbering by convention has no lock, so the
-  only real guard is repository-side ("branch up to date before merging"), never a local hook.
+- **Three confirmed mirrors, all from re-pointing `down_revision` by hand instead of merging:**
+  3.11b (2026-09-07) re-pointed `0023`'s parent from `0022` to `0025`; a database already past
+  `0023` never runs `0025` (`upgrade head` walks forward only, never back for a spliced-in
+  ancestor) — symptom `alembic_version = 0035` with `application_checks.created_by` missing,
+  500 on submit. 7.7 (2026-09-08) did the same reconciling `0038`/`0039` against `dev`'s
+  `0040`-`0042`: re-pointed `0039`→`0042` and `0040`→`0038`. A database stamped `0042` would
+  then run only `0039`, never `0038` — `admin/repo.py::list_activity_types` would 500 the
+  catalog, wizard and price calculator. Both fixed with a merge revision instead
+  (`merge_0039_0042`, verified from both heads on a scratch DB first). **A recorded revision
+  does not prove a schema** — only a `base`-up roundtrip sees a splice; an already-migrated DB doesn't.
+- **The one exception, 2026-09-07 — same id, not a splice:** stage 5.1 and stage 7.6 each
+  minted `0041` off `0040` five minutes apart; both CI runs passed (each against the base as
+  it was), so `dev` got `heads: 0041, 0041`, which `alembic merge heads` cannot merge (identical
+  ids). The second one is RENUMBERED and re-pointed at the first — the one case where editing
+  `down_revision` by hand is correct, since nothing has run it anywhere yet. Numbering by
+  convention has no lock, so the only real guard is repository-side ("branch up to date before
+  merging"), never a local hook.
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 

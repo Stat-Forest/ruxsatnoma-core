@@ -2,9 +2,9 @@
 
 import uuid
 from datetime import date
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from app.core.schemas import LocalizedName
 
@@ -69,6 +69,36 @@ class ActivityTypeOut(BaseModel):
     name: dict[str, Any]
     quantity_unit: str
     status: str
+    description: dict[str, Any] | None
+    processing_days: int
+
+
+class ActivityTypePatch(BaseModel):
+    """Ruling #139: presentation and the on/off switch. Never `code` (tariffs and
+    the calculator resolve by it) and never `quantity_unit` (a CHECK-constrained
+    enum the price arithmetic depends on)."""
+
+    name: LocalizedName | None = None
+    description: LocalizedName | None = None
+    processing_days: int | None = Field(default=None, gt=0)
+    sort_order: int | None = None
+    status: Literal["active", "archived"] | None = None
+
+    # `processing_days`/`sort_order`/`status` back NOT-NULL columns — unlike
+    # `description`, which is genuinely nullable, an explicit `null` for any of
+    # these three has no legal meaning. Reject it here (422), same philosophy as
+    # the `Stir` pattern above: a bad value 422s at the schema boundary rather
+    # than reaching `setattr` and failing the NOT NULL constraint (IntegrityError
+    # -> ERR-SYS-001, 500). A field validator only runs when the key is actually
+    # present in the payload — an *omitted* field still takes the `None` default
+    # and is skipped by `exclude_unset=True` untouched, so this only catches a
+    # payload that names the field with a JSON `null`.
+    @field_validator("processing_days", "sort_order", "status", mode="after")
+    @classmethod
+    def _reject_explicit_null(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
 
 
 class LivestockTypeOut(BaseModel):

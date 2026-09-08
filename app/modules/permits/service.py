@@ -57,6 +57,7 @@ from app.modules.permits.models import (
     ForestTicket,
     Permit,
     PermitDuplicate,
+    PermitRating,
     PermitStatusHistory,
     PermitTemplate,
     QrCheckLog,
@@ -2589,9 +2590,25 @@ async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) ->
     second reader of its table is a second opinion about what "signed" means.
     `missing_signatures` rides along so a signing screen needs one request rather
     than two, and it is what makes the card self-explanatory while a permit is
-    still `pending_signatures`.
+    still `pending_signatures`. `rating` (Task 4) rides along for the same
+    reason — the citizen's own cabinet needs one request for the permit and
+    the rating they left on it, not two.
+
+    **`rating` is holder-only, never unconditional** (ruling #141): `_readable_permit`
+    admits three doors — the holder, any required signer of THIS permit, and any
+    `permits.view_any` holder whose zone covers it — and the second and third are
+    both leshoz/Agency staff, often the very official a bad rating names. Ruling
+    #141 is explicit that no response may carry the applicant's identity or the
+    permit number alongside the rating comment, "to the leshoz and to the Agency
+    alike", and `PermitCardOut` already carries `applicant_id`/`series`/`number`
+    (`PermitOut`). Re-checking `_is_holder` here (the same predicate
+    `_readable_permit` used to admit a holder through its first door) is cheap and
+    avoids a second, possibly-drifting ownership test.
     """
     permit = await _readable_permit(db, permit_id, actor=actor)
+    rating = (
+        await repo.rating_for_permit(db, permit.id) if await _is_holder(db, permit, actor) else None
+    )
     return {
         "permit": permit,
         "signatures": await signatures_service.get_for_object(
@@ -2599,6 +2616,7 @@ async def permit_card(db: AsyncSession, permit_id: uuid.UUID, *, actor: User) ->
         ),
         "history": await repo.status_history(db, permit.id),
         "missing_signatures": await missing_signatures(db, permit.id),
+        "rating": rating,
     }
 
 
@@ -2712,6 +2730,78 @@ async def list_permits(
     )
 
 
+# --- Task 4: the citizen rates their permit -----------------------------------
+
+PERMIT_RATE = "permit.rate"
+
+
+async def rate_permit(
+    db: AsyncSession, permit_id: uuid.UUID, *, score: int, comment: str | None, actor: User
+) -> PermitRating:
+    """`POST /permits/{id}/rating` — the citizen's verdict, once (ruling #140).
+
+    `_readable_permit` first, so a stranger gets the card's own 404 rather than
+    a different answer that would confirm the permit exists — the same
+    permit-existence-oracle reasoning that function's own docstring gives.
+
+    Ownership, not readability, is what this route needs from there: a
+    `permits.view_any` holder, or a required official signer of this very
+    permit, can both READ the card through `_readable_permit` and neither may
+    rate somebody else's service — `_is_holder` is the one predicate that
+    answers "whose service was this", the same one the 4th signature line and
+    `extend` gate on. 403 `ERR-ACL-001` with `details.reason = "not_the_holder"`
+    for anyone `_readable_permit` admitted by a different door.
+
+    Two more refusals, both explicit rather than left to the database: 409
+    `ERR-PERM-001` with `details.reason = "not_issued"` before the permit's 4th
+    signature has landed (`issued_at IS NULL` — a permit still
+    `pending_signatures` was never delivered, so there is no service yet to
+    rate); 409 `ERR-PERM-001` with `details.reason = "already_rated"` for a
+    second attempt. The second check is `repo.rating_for_permit`, read BEFORE
+    the insert — this is what makes the ordinary case a clean check-then-act
+    rather than a database round trip on every submission — but it is not the
+    only guard: a double-click is not exotic for a citizen-facing button, and
+    two concurrent requests can both pass this SELECT before either commits.
+    The insert itself is therefore wrapped in `begin_nested()` and the loser's
+    `IntegrityError` on `ix_permit_ratings_permit_id` (`permit_ratings.permit_id`
+    is UNIQUE, migration 0039 creates it as a unique INDEX rather than a named
+    constraint, and Postgres reports a unique-index violation under the index's
+    own name — verified against a real violation, not assumed from the model)
+    is mapped to the SAME `already_rated` 409 the pre-check gives the ordinary
+    case, following `signatures.service.sign()`'s own template (lesson: a
+    failed statement aborts the whole transaction — catch the right type,
+    recover with a SAVEPOINT). Without this, the loser's flush raises
+    uncaught and the citizen reads a 500 for what was, far more likely than an
+    attack, just an impatient second tap.
+    """
+    permit = await _readable_permit(db, permit_id, actor=actor)
+    if not await _is_holder(db, permit, actor):
+        raise err("ERR-ACL-001", details={"reason": "not_the_holder"})
+    if permit.issued_at is None:
+        raise err("ERR-PERM-001", details={"reason": "not_issued"})
+    if await repo.rating_for_permit(db, permit.id) is not None:
+        raise err("ERR-PERM-001", details={"reason": "already_rated"})
+
+    rating = PermitRating(permit_id=permit.id, score=score, comment=comment)
+    try:
+        async with db.begin_nested():
+            await repo.add(db, rating)
+    except IntegrityError as exc:
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "ix_permit_ratings_permit_id":
+            raise
+        raise err("ERR-PERM-001", details={"reason": "already_rated"}) from exc
+    await audit.log(
+        db,
+        action=PERMIT_RATE,
+        user_id=actor.id,
+        object_type=OBJECT_TYPE,
+        object_id=permit.id,
+        new_value={"score": score},
+    )
+    return rating
+
+
 async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str, Any]]:
     """Anonymous open-data read (4.6 `public`, design/01 rule 2: cross-module
     calls go through this service, never `permits.repo` directly). Returns
@@ -2724,3 +2814,99 @@ async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str
         {"organization_id": org_id, "active_count": count, "active_area_ha": area}
         for org_id, count, area in rows
     ]
+
+
+# --- Task 5: the Agency's aggregates, without the author (ruling #142) --------
+
+
+def _validate_rating_period(period_from: date, period_to: date) -> None:
+    """Fail-closed before any query runs, the same guard `dashboard.service.
+    _validate_period` gives its own two callers (lesson: a reversed period
+    silently inverts a range predicate and hides the rows it should find)."""
+    if period_to < period_from:
+        raise err("ERR-VAL-001", details={"reason": "period_reversed"})
+
+
+async def ratings_summary(
+    db: AsyncSession,
+    *,
+    actor: User,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> dict[str, Any]:
+    """`GET /admin/ratings/summary` (`ratings.view`): the overall average and
+    count, plus the same pair broken down by organization and by activity
+    type — all three zone-scoped to the actor's own zone
+    (`repo._ratings_conditions`, all three axes), narrowable further by the
+    two optional filters."""
+    _validate_rating_period(period_from, period_to)
+    actor_zone = zone_of(actor)
+    avg_score, count = await repo.ratings_overall(
+        db,
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    by_organization = await repo.ratings_by_organization(
+        db,
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    by_activity_type = await repo.ratings_by_activity_type(
+        db,
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    return {
+        "avg_score": avg_score,
+        "count": count,
+        "by_organization": [
+            {"organization_id": row[0], "name": row[1], "avg_score": row[2], "count": row[3]}
+            for row in by_organization
+        ],
+        "by_activity_type": [
+            {"activity_type_id": row[0], "name": row[1], "avg_score": row[2], "count": row[3]}
+            for row in by_activity_type
+        ],
+    }
+
+
+async def list_rating_comments(
+    db: AsyncSession,
+    *,
+    actor: User,
+    params: PageParams,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> tuple[list[dict[str, Any]], int]:
+    """`GET /admin/ratings` (`ratings.view`): one page of the anonymous
+    comment feed — date, service, leshoz, score, text, and nothing that names
+    who rated (ruling #141; `repo.rating_comments`'s own docstring lists the
+    closed column set). `organization_id`/`activity_type_id` narrow the feed
+    the same way they narrow `ratings_summary` above — a screen that narrows
+    the summary to one leshoz must narrow the comments under it too, or the
+    two silently describe different populations (final review, finding 3)."""
+    _validate_rating_period(period_from, period_to)
+    rows, total = await repo.rating_comments(
+        db,
+        actor_zone=zone_of(actor),
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+    return [dict(row._mapping) for row in rows], total

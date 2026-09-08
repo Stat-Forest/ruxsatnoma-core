@@ -6,19 +6,21 @@ ruling 9's race-freedom, and its failure mode is silence."""
 
 import uuid
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import ColumnElement, func, select, text
+from sqlalchemy import ColumnElement, Row, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.abac import Zone, zone_filter
 from app.db import Base
-from app.modules.admin.models import Organization
+from app.modules.admin.models import ActivityType, Organization
 from app.modules.permits.models import (
     ForestTicket,
     Permit,
     PermitDuplicate,
+    PermitRating,
     PermitStatusHistory,
     PermitTemplate,
 )
@@ -251,6 +253,24 @@ async def duplicates(db: AsyncSession, permit_id: uuid.UUID) -> Sequence[PermitD
         .order_by(PermitDuplicate.issued_at.desc(), PermitDuplicate.id.desc())
     )
     return rows.scalars().all()
+
+
+# --- Task 4: the citizen's rating ---------------------------------------------
+
+
+async def rating_for_permit(db: AsyncSession, permit_id: uuid.UUID) -> PermitRating | None:
+    """The citizen's rating of this permit, if one exists. `permit_ratings.permit_id`
+    is UNIQUE (migration 0039), so this is `scalar_one_or_none` and never a list.
+
+    Two callers, two reasons: `service.rate_permit` checks this explicitly so a
+    second attempt is refused with a real error rather than left to this same
+    index raising an uncaught `IntegrityError` (409 the service's way, not a
+    500); `service.permit_card` folds the answer straight into the card so the
+    cabinet needs one request for a permit and its rating, not two.
+    """
+    return (
+        await db.execute(select(PermitRating).where(PermitRating.permit_id == permit_id))
+    ).scalar_one_or_none()
 
 
 async def occupied_area_by_contour(
@@ -528,3 +548,217 @@ async def active_stats_by_organization(db: AsyncSession) -> list[tuple[uuid.UUID
         .group_by(Permit.organization_id)
     )
     return [(row[0], row[1], row[2]) for row in rows.all()]
+
+
+# --- Task 5: the Agency's aggregates, without the author (ruling #142) --------
+
+
+def _day_bounds(period_from: date, period_to: date) -> tuple[datetime, datetime]:
+    """A calendar-day `[from, to]` window as an inclusive timestamptz range —
+    `permit_ratings.created_at` is `timestamptz`, so the boundary must be a
+    moment, not a bare date (the same reasoning, and the same shape,
+    `dashboard.repo._day_bounds` gives its own callers — duplicated rather
+    than imported, since `dashboard` is a level-5 READER of `permits` and may
+    not be imported the other way)."""
+    return datetime.combine(period_from, time.min), datetime.combine(period_to, time.max)
+
+
+def _ratings_conditions(
+    *,
+    actor_zone: Zone,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> list[Any]:
+    """The clauses every query below shares: the actor's own zone, on ALL
+    THREE axes (region, district AND organization — `dashboard.repo.
+    permits_kpi`'s own reasoning: `organization_id` alone passes a
+    region-or-district-scoped actor for every organization in the country),
+    the period, and the two optional narrowing filters the route accepts.
+    `organization_id`/`activity_type_id` default to `None` so a caller passing
+    neither gets the unnarrowed set; both routes — the summary and the comment
+    feed — pass them through, which is what keeps a narrowed summary and the
+    comments below it describing the same population."""
+    conditions: list[Any] = [
+        zone_filter(
+            actor_zone,
+            region_col=Organization.region_id,
+            district_col=Organization.district_id,
+            organization_col=Organization.id,
+        ),
+        PermitRating.created_at.between(*_day_bounds(period_from, period_to)),
+    ]
+    if organization_id is not None:
+        conditions.append(Permit.organization_id == organization_id)
+    if activity_type_id is not None:
+        conditions.append(Permit.activity_type_id == activity_type_id)
+    return conditions
+
+
+async def ratings_overall(
+    db: AsyncSession,
+    *,
+    actor_zone: Zone,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> tuple[Decimal | None, int]:
+    """`(avg_score, count)` over every rating the actor's zone and the given
+    filters admit. `ROUND(AVG(score), 2)` runs IN SQL, never in Python
+    (`schemas.RatingsSummaryOut`'s own docstring: the resulting `Decimal`
+    already has scale 2, which is what makes `"4.00"` come out the wire
+    rather than `"4"`). `AVG` over zero rows is SQL `NULL`, and `ROUND(NULL,
+    2)` stays `NULL` — asyncpg hands that back as `None`, so a zone with no
+    ratings in the period reads as `(None, 0)`, never a division by zero.
+    """
+    conditions = _ratings_conditions(
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    stmt = (
+        select(func.round(func.avg(PermitRating.score), 2), func.count())
+        .select_from(PermitRating)
+        .join(Permit, Permit.id == PermitRating.permit_id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .where(*conditions)
+    )
+    avg_score, count = (await db.execute(stmt)).one()
+    return avg_score, count
+
+
+async def ratings_by_organization(
+    db: AsyncSession,
+    *,
+    actor_zone: Zone,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> Sequence[Row[Any]]:
+    """`(organization_id, name, avg_score, count)`, one row per organization
+    with at least one rating in scope — the summary card's left-hand
+    breakdown."""
+    conditions = _ratings_conditions(
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    stmt = (
+        select(
+            Permit.organization_id,
+            Organization.name,
+            func.round(func.avg(PermitRating.score), 2),
+            func.count(),
+        )
+        .select_from(PermitRating)
+        .join(Permit, Permit.id == PermitRating.permit_id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .where(*conditions)
+        .group_by(Permit.organization_id, Organization.name)
+    )
+    return (await db.execute(stmt)).all()
+
+
+async def ratings_by_activity_type(
+    db: AsyncSession,
+    *,
+    actor_zone: Zone,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> Sequence[Row[Any]]:
+    """`(activity_type_id, name, avg_score, count)`, one row per activity type
+    with at least one rating in scope. Still joins `organizations`, even
+    though the grouping is by activity type: the zone clause needs its
+    region/district columns."""
+    conditions = _ratings_conditions(
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    stmt = (
+        select(
+            Permit.activity_type_id,
+            ActivityType.name,
+            func.round(func.avg(PermitRating.score), 2),
+            func.count(),
+        )
+        .select_from(PermitRating)
+        .join(Permit, Permit.id == PermitRating.permit_id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .join(ActivityType, ActivityType.id == Permit.activity_type_id)
+        .where(*conditions)
+        .group_by(Permit.activity_type_id, ActivityType.name)
+    )
+    return (await db.execute(stmt)).all()
+
+
+async def rating_comments(
+    db: AsyncSession,
+    *,
+    actor_zone: Zone,
+    organization_id: uuid.UUID | None = None,
+    activity_type_id: uuid.UUID | None = None,
+    period_from: date,
+    period_to: date,
+    offset: int,
+    limit: int,
+) -> tuple[Sequence[Row[Any]], int]:
+    """One page of the anonymous comment feed, newest first, with the total —
+    the same count-then-select shape `list_permits` uses. `organization_id`/
+    `activity_type_id` narrow the same way they narrow `/admin/ratings/
+    summary` — a screen that filters the summary to one leshoz must be able to
+    filter the comment feed under it the same way, or the two describe
+    different populations with nothing saying so (final review, finding 3).
+    Both default to `None` so a caller that wants only the zone/period scope
+    (none did before this fix) still gets it.
+
+    Every column named here is `RatingCommentRow`'s whole contract —
+    `created_at`, `score`, `comment`, the organization's and the activity
+    type's own `name`, each aliased to the schema's own field name so the
+    service can build the row straight off `Row._mapping` — and nothing else:
+    never `PermitRating.permit_id`, never anything from `permits.applicant_id`
+    (ruling #141).
+    """
+    conditions = _ratings_conditions(
+        actor_zone=actor_zone,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    joined = (
+        select(PermitRating.id)
+        .join(Permit, Permit.id == PermitRating.permit_id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .where(*conditions)
+    )
+    total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
+    rows = await db.execute(
+        select(
+            PermitRating.created_at,
+            PermitRating.score,
+            PermitRating.comment,
+            Organization.name.label("organization_name"),
+            ActivityType.name.label("activity_type_name"),
+        )
+        .select_from(PermitRating)
+        .join(Permit, Permit.id == PermitRating.permit_id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .join(ActivityType, ActivityType.id == Permit.activity_type_id)
+        .where(*conditions)
+        .order_by(PermitRating.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return rows.all(), total

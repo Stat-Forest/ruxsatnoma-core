@@ -28,9 +28,20 @@ so archiving the row and inserting a v2 would put a version bump in an admin's
 history that says nothing happened. Archived rows are left alone on purpose:
 they record what was actually sent.
 
-`0038` and `0039` are taken by the parallel 7.6 and 7.7 branches, which is why this
-is `0040` on a `0037` parent — the chain is not monotonic and the two heads are
-reconciled with `alembic merge heads` at integration, never by renumbering (lesson).
+`0038` and `0039` were taken by the parallel 7.6 and 7.7 branches, which is why this
+was authored as `0040` on its original `0037` parent, growing its own
+`0040 -> 0041 -> 0042` chain alongside 7.7's `0038 -> 0039`, two heads off `0037`.
+
+Integration note, corrected 2026-09-08: an earlier ruling reconciled the two
+heads by re-pointing `0039`'s `down_revision` at `0042` and this migration's own
+`down_revision` from `0037` to `0038`, to fold both branches into one line
+without a merge revision. That was wrong — Alembic stores only the current head
+and never walks back for an ancestor spliced in underneath an already-applied
+revision, so a `dev` database already at `0042` (via the ORIGINAL `0037 -> 0040`
+edge) would apply `0039` alone on its next `upgrade head` and never gain `0038`'s
+two catalog columns; see `0039`'s own note. `down_revision` is restored here to
+its original `0037`; the two heads are reconciled properly by a merge revision,
+`merge_0039_0042_...`, whose `down_revision = ("0039", "0042")`.
 
 `tests/modules/notifications/test_sms_gsm_charset.py` is what keeps the next
 seeded SMS template inside the set.

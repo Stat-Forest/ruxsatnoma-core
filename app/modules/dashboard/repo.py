@@ -19,7 +19,7 @@ from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour, ContourVersion
 from app.modules.inspections.models import InspectionAct, ViolationCase
 from app.modules.payments.models import Allocation, Invoice
-from app.modules.permits.models import Permit
+from app.modules.permits.models import Permit, PermitRating
 
 
 def _combined(
@@ -133,6 +133,59 @@ async def sb_load_total(
     # pyright cannot see that through a raw `func.coalesce()` expression.
     assert value is not None
     return value
+
+
+# --- Satisfaction (ratings, Task 6, ruling #143) -------------------------
+
+
+async def satisfaction_kpi(
+    db: AsyncSession,
+    *,
+    actor_zone: Zone,
+    filter_zone: Zone,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> tuple[Decimal | None, int]:
+    """`(avg_score, count)` over `permit_ratings` in scope.
+
+    The period applies to `PermitRating.created_at` — when the citizen
+    rated — never `Permit.issued_at`: a rating left this month counts this
+    month, regardless of when the underlying permit was issued.
+
+    Same `_combined(...)` three-axis zone clause as `permits_kpi` — region,
+    district AND organization — for the same reason: narrowing to
+    `organization_id` alone would pass a region-or-district-scoped actor
+    for every organization in the country.
+
+    `ROUND(AVG(score), 2)` runs in SQL, never in Python, matching the
+    sibling `permits.repo.ratings_overall`: `AVG` over zero rows is SQL
+    `NULL`, and `ROUND(NULL, 2)` stays `NULL`, so an empty period reads as
+    `(None, 0)` rather than a division by zero or an invented `0` — a
+    portal may not state a number it cannot produce.
+    """
+    zone_clause = _combined(
+        actor_zone,
+        filter_zone,
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Organization.id,
+    )
+    conditions: list[Any] = [
+        zone_clause,
+        PermitRating.created_at.between(*_day_bounds(period_from, period_to)),
+    ]
+    if activity_type_id is not None:
+        conditions.append(Permit.activity_type_id == activity_type_id)
+    stmt = (
+        select(func.round(func.avg(PermitRating.score), 2), func.count())
+        .select_from(PermitRating)
+        .join(Permit, Permit.id == PermitRating.permit_id)
+        .join(Organization, Organization.id == Permit.organization_id)
+        .where(*conditions)
+    )
+    avg_score, count = (await db.execute(stmt)).one()
+    return avg_score, count
 
 
 # --- Applications ---------------------------------------------------------
