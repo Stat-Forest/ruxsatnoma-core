@@ -37,7 +37,7 @@ async def _notes(db, user_id) -> list[Notification]:
 
 
 async def test_inapp_only_when_the_phone_is_not_verified(db):
-    user = await make_user(db, phone="998901234567")
+    user = await make_user(db, role_code="applicant", phone="998901234567")
     await service.notify(
         db, event_code=EVENT, recipient_user_id=user.id, params={"permit_number": "P-1"}
     )
@@ -48,10 +48,31 @@ async def test_inapp_only_when_the_phone_is_not_verified(db):
     assert "P-1" in rows[0].rendered_text
 
 
+async def test_staff_never_get_an_sms_even_with_a_verified_phone(db):
+    """Decision #150. A staff member reads this in the cabinet they already have
+    open, so the paid channel is closed to them BY ROLE — not by whether they
+    happen to have left their number unverified, which is what used to decide it
+    and would silently re-open the channel the day one of them verified a number.
+    """
+    from datetime import UTC, datetime
+
+    user = await make_user(
+        db, role_code="executor_head", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
+    await service.notify(
+        db, event_code=EVENT, recipient_user_id=user.id, params={"permit_number": "P-STAFF"}
+    )
+    rows = await _notes(db, user.id)
+    assert [r.channel for r in rows] == ["inapp"]
+    assert "P-STAFF" in rows[0].rendered_text
+
+
 async def test_verified_phone_also_gets_an_sms_row_queued_on_the_outbox(db):
     from datetime import UTC, datetime
 
-    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    user = await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
     await service.notify(
         db, event_code=EVENT, recipient_user_id=user.id, params={"permit_number": "P-2"}
     )
@@ -73,7 +94,9 @@ async def test_kill_switch_suppresses_sms_but_never_the_inapp_row(db):
     db.add(SystemSetting(key="notifications_sms_enabled", value=False))
     await db.flush()
     settings_store.invalidate("notifications_sms_enabled")
-    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    user = await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
     await service.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
     assert [r.channel for r in await _notes(db, user.id)] == ["inapp"]
     settings_store.invalidate("notifications_sms_enabled")
@@ -140,7 +163,9 @@ async def test_duplicate_channels_collapse_to_a_single_send(db):
     SMS to a real phone number, with no error to signal it happened."""
     from datetime import UTC, datetime
 
-    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    user = await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
     await service.notify(db, event_code=EVENT, recipient_user_id=user.id, channels=("sms", "sms"))
     rows = await _notes(db, user.id)
     assert sorted(r.channel for r in rows) == ["inapp", "sms"]

@@ -223,7 +223,12 @@ class AddRepresentationIn(BaseModel):
 class ContactUpdateIn(BaseModel):
     phone: str | None = Field(default=None, pattern=r"^\+998[0-9]{9}$")
     email: EmailStr | None = None
-    otp_token: str
+    # Optional since decision #150: a staff member changes their own phone number
+    # with no SMS code, because no SMS is ever sent to them and a confirmation they
+    # cannot receive is a number they cannot change. Whether the token is REQUIRED
+    # is a question about the caller's role, so `service.update_contact` decides it
+    # — this schema cannot see the user.
+    otp_token: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self) -> ContactUpdateIn:

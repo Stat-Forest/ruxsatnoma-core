@@ -24,6 +24,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base, IPAddressString, uuid7
 
+# The one role that belongs to a member of the public rather than to staff.
+# Compared against `repo.role_code()` in half a dozen places, and since decision
+# #150 it also decides whether a notification may leave over SMS at all — a
+# literal in that many files is one typo away from opening a paid channel to
+# every employee, so it lives here, next to the table it names.
+APPLICANT_ROLE_CODE = "applicant"
+
 
 class Role(Base):
     """System role catalog; 11 seeded rows (migration 0003). Approval limits — decision #29.

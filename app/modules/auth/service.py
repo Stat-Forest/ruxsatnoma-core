@@ -31,6 +31,7 @@ from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo
 from app.modules.auth.models import (
+    APPLICANT_ROLE_CODE,
     Applicant,
     OtpCode,
     Representation,
@@ -596,7 +597,7 @@ async def complete_registration(
     address: str | None,
     ip: str | None,
 ) -> Applicant:
-    if await repo.role_code(db, user) != "applicant":
+    if await repo.role_code(db, user) != APPLICANT_ROLE_CODE:
         raise err("ERR-ACL-001", details={"reason": "not an applicant account"})
     if await repo.get_own_applicant(db, user.id) is not None:
         raise err("ERR-AUTH-012")
@@ -698,7 +699,7 @@ async def attach_legal(
     name: str | None,
     ip: str | None,
 ) -> tuple[Applicant, Representation]:
-    if await repo.role_code(db, user) != "applicant":
+    if await repo.role_code(db, user) != APPLICANT_ROLE_CODE:
         raise err("ERR-ACL-001", details={"reason": "not an applicant account"})
     assert user.pinfl is not None
     legal_name = name
@@ -820,7 +821,7 @@ async def add_representation(
     candidate = await repo.get_user_by_pinfl(db, user_pinfl)
     if candidate is None or await repo.get_own_applicant(db, candidate.id) is None:
         raise err("ERR-SYS-003", details={"reason": "candidate must sign in and register first"})
-    if await repo.role_code(db, candidate) != "applicant":
+    if await repo.role_code(db, candidate) != APPLICANT_ROLE_CODE:
         raise err("ERR-ACL-001", details={"reason": "candidate is not an applicant account"})
     assert applicant.stir is not None and user.pinfl is not None
     if basis == "org_eri":
@@ -1024,19 +1025,39 @@ async def update_contact(
     *,
     phone: str | None,
     email: str | None,
-    otp_token: str,
+    otp_token: str | None,
     ip: str | None,
 ) -> None:
+    """Change one's own phone or e-mail.
+
+    **A staff member changes their phone with no code at all** (decision #150):
+    nothing is ever sent to them over SMS, so a confirmation they cannot receive
+    would only be a number they cannot change. `phone_verified_at` is CLEARED
+    rather than stamped in that case — the number is what the employee typed, and
+    recording it as verified would be a claim nobody checked. An applicant still
+    verifies: their phone is the channel the permit actually travels on.
+
+    E-mail is unchanged for everyone. Its code arrives by e-mail, costs nothing to
+    send, and is the only proof the address exists.
+    """
     now = datetime.now(UTC)
     own = await repo.get_own_applicant(db, user.id)
+    is_applicant = await repo.role_code(db, user) == APPLICANT_ROLE_CODE
     if phone is not None:
-        await consume_otp_token(db, token=otp_token, purpose="phone_verify", target=phone)
+        if is_applicant:
+            if otp_token is None:
+                raise err("ERR-VAL-001", details={"field": "otp_token"})
+            await consume_otp_token(db, token=otp_token, purpose="phone_verify", target=phone)
+            user.phone_verified_at = now
+        else:
+            user.phone_verified_at = None
         user.phone = phone
-        user.phone_verified_at = now
         if own is not None:
             own.phone = phone
     else:
         assert email is not None  # schema guarantees exactly one
+        if otp_token is None:
+            raise err("ERR-VAL-001", details={"field": "otp_token"})
         await consume_otp_token(db, token=otp_token, purpose="email_verify", target=email)
         user.email = email
         user.email_verified_at = now
@@ -1046,7 +1067,13 @@ async def update_contact(
         db,
         action="user.update_contact",
         user_id=user.id,
-        extra={"field": "phone" if phone is not None else "email"},
+        # `verified` says whether a code was actually checked: since #150 a staff
+        # phone change is recorded as an unverified one, and the journal is the
+        # only place that distinction survives.
+        extra={
+            "field": "phone" if phone is not None else "email",
+            "verified": user.phone_verified_at is not None if phone is not None else True,
+        },
         ip=ip,
     )
 
@@ -1065,6 +1092,11 @@ class NotificationContact:
     phone_verified: bool
     email: str | None
     email_verified: bool
+    # Decision #150: SMS is for people who are NOT in the system. A staff member
+    # reads the same notification in the cabinet they already have open, so the
+    # `sms` channel is closed to every role but `applicant` — and this flag is what
+    # `notifications` decides that on, since roles live in this module.
+    is_applicant: bool
 
 
 async def get_notification_contact(
@@ -1082,6 +1114,7 @@ async def get_notification_contact(
         phone_verified=user.phone_verified_at is not None,
         email=user.email,
         email_verified=user.email_verified_at is not None,
+        is_applicant=await repo.role_code(db, user) == APPLICANT_ROLE_CODE,
     )
 
 

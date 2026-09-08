@@ -197,14 +197,22 @@ class ChannelDisabled(Exception):
 
 
 def _recipient_reachable(*, channel: str, contact: auth_service.NotificationContact) -> bool:
-    """Can this recipient be reached on this channel AT ALL? A False here is
-    PERMANENT: no number of retries conjures a verified phone, so the delivery path
-    fails the notification and returns (the outbox-sender lesson in
+    """May this recipient be reached on this channel AT ALL? A False here is
+    PERMANENT — no number of retries conjures a verified phone or changes a role, so
+    the delivery path fails the notification and returns (the outbox-sender lesson in
     `.claude/lessons.md`). Deliberately separate from the kill switch below, which
     is temporary and has nothing to do with the recipient."""
     if contact.status != "active":
         return False
     if channel == "sms":
+        # Decision #150: SMS is for people who are NOT in the system. A staff
+        # member reads this same notification in the cabinet they already have
+        # open, and every part sent to them is paid for twice over — so the
+        # channel is closed to them by ROLE, not by whether they happen to have
+        # left their number unverified. This is the only place that decides it:
+        # `notify()` callers name a recipient, never a channel.
+        if not contact.is_applicant:
+            return False
         return bool(contact.phone and contact.phone_verified)
     return bool(contact.email and contact.email_verified)
 
