@@ -137,16 +137,31 @@ async def logout(
     dependencies=[Depends(rate_limit("login", "ratelimit_login_per_minute"))],
 )
 async def login(
-    body: LoginIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+    body: LoginIn,
+    request: Request,
+    response: Response,
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> LoginOut:
-    token = await service.login_password(
+    """Password step — and, while `mfa_enabled` is off, the whole login.
+
+    With the switch off there is no second step to send the client to: the
+    session is opened here and its cookies ride this response, exactly as
+    /auth/mfa/verify would have set them.
+    """
+    step = await service.login_password(
         db,
         login=body.login,
         password=body.password,
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("User-Agent"),
     )
-    return LoginOut(mfa_required=True, mfa_token=token)
+    if step.session is None:
+        return LoginOut(mfa_required=True, mfa_token=step.mfa_token)
+    user, _row, token, csrf = step.session
+    _set_session_cookies(response, token, csrf)
+    role = await repo.get_role(db, user.role_id)
+    assert role is not None  # FK guarantees it
+    return LoginOut(mfa_required=False, me=await _me_out(db, user, role, csrf))
 
 
 @router.post("/mfa/verify", response_model=MeOut)
