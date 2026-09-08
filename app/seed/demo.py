@@ -68,6 +68,7 @@ from app.core.security import (
 )
 from app.db import make_engine, make_session_factory
 from app.modules.admin import repo as admin_repo
+from app.modules.admin.models import LegalDocument
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -667,6 +668,100 @@ async def _ensure_burchmulla_contours(db: AsyncSession, *, actor: User) -> str:
     return msg
 
 
+# --- Legal documents (`0043`) -------------------------------------------------
+
+# The four acts the public site's /documents page listed as hard-coded strings
+# before this register existed. Seeded as DRAFTS on purpose: `legal_documents_
+# service.publish` refuses a row with neither a file nor a link, and this seed
+# has neither — the PDFs are the Agency's to supply, and inventing a lex.uz id
+# to satisfy the rule would put a wrong link on a government portal. An editor
+# attaches the file (or the real link) and presses Publish; the page shows its
+# empty state until then, which is honest rather than broken.
+DEMO_LEGAL_DOCUMENTS = (
+    {
+        "doc_number": "ZRU-475",
+        "adopted_on": date(2018, 4, 16),
+        "sort_order": 0,
+        "title": {
+            "uz_latn": "O'zbekiston Respublikasining O'rmon kodeksi",
+            "ru": "Лесной кодекс Республики Узбекистан",
+        },
+        "summary": {
+            "uz_latn": "O'rmonlarni muhofaza qilish, qo'riqlash, tiklash va o'rmon "
+            "resurslaridan oqilona foydalanish sohasidagi munosabatlarni tartibga soladi.",
+            "ru": "Регулирует отношения в сфере охраны, защиты, воспроизводства лесов "
+            "и рационального использования лесных ресурсов.",
+        },
+    },
+    {
+        "doc_number": "VMQ-342",
+        "adopted_on": date(2021, 5, 12),
+        "sort_order": 10,
+        "title": {
+            "uz_latn": "O'rmon fondi yerlarida chorva mollarini boqish tartibi to'g'risidagi nizom",
+            "ru": "Положение о порядке выпаса скота на землях лесного фонда",
+        },
+        "summary": {
+            "uz_latn": "Yaylov sig'imi me'yorlarini va chorva boqishga ruxsatnoma berish "
+            "tartibini belgilaydi.",
+            "ru": "Устанавливает нормы пастбищной ёмкости и порядок выдачи разрешений "
+            "на выпас скота.",
+        },
+    },
+    {
+        "doc_number": "PF-108",
+        "adopted_on": date(2026, 1, 1),
+        "sort_order": 20,
+        "title": {
+            "uz_latn": "2026-yil uchun bazaviy hisoblash miqdori (BHM) va to'lov stavkalari",
+            "ru": "Базовая расчётная величина (БРВ) и ставки платежей на 2026 год",
+        },
+        "summary": {
+            "uz_latn": "Ruxsatnoma rasmiylashtirishda to'lanadigan to'lov koeffitsiyentlari.",
+            "ru": "Свод коэффициентов платежей, уплачиваемых при оформлении разрешений.",
+        },
+    },
+    {
+        "doc_number": "ST-04",
+        "adopted_on": date(2025, 2, 10),
+        "sort_order": 30,
+        "title": {
+            "uz_latn": "Geobotanik tadqiqotlar va yaylov sig'imi me'yorlari bo'yicha qo'llanma",
+            "ru": "Руководство по геоботаническим исследованиям и нормам пастбищной ёмкости",
+        },
+        "summary": {
+            "uz_latn": "1 gektar yaylov maydoniga to'g'ri keladigan shartli bosh soni (MaxSB).",
+            "ru": "Условная единица поголовья скота (MaxSB), приходящаяся на 1 гектар "
+            "пастбищной площади.",
+        },
+    },
+)
+
+
+async def _ensure_legal_documents(db: AsyncSession, *, actor: User) -> str:
+    """Idempotent on `doc_number` — re-running the seed neither duplicates a row
+    nor overwrites an editor's own edits to one."""
+    created = 0
+    for spec in DEMO_LEGAL_DOCUMENTS:
+        existing = (
+            await db.execute(
+                select(LegalDocument).where(LegalDocument.doc_number == spec["doc_number"])
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
+        db.add(LegalDocument(**spec, created_by=actor.id))
+        created += 1
+    await db.flush()
+    if created == 0:
+        return "Legal documents: all four already present"
+    return (
+        f"Legal documents: {created} draft(s) created — attach the PDF (or the lex.uz "
+        "link) in the admin panel and press Publish; the public /documents page shows "
+        "nothing until a row is published"
+    )
+
+
 async def _main() -> None:
     # Every account's own password, not one shared string — and a duplicate is
     # refused outright, so a future edit cannot quietly collapse them back into
@@ -789,6 +884,16 @@ async def _main() -> None:
                 norm_message = "SKIPPED: organization 'burchmulla' not found"
         report.append("")
         report.append(norm_message)
+
+        # --- Legal documents register (drafts; see the constant's own note) ---
+        async with factory() as db:
+            central_admin_user = (
+                await db.execute(select(User).where(User.login == "demo_central_admin"))
+            ).scalar_one()
+            documents_message = await _ensure_legal_documents(db, actor=central_admin_user)
+            await db.commit()
+        report.append("")
+        report.append(documents_message)
     finally:
         await engine.dispose()
 
