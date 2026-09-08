@@ -7,9 +7,11 @@ never a direct client action."""
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+
+from app.core.schemas import LocalizedName
 
 
 class InvoiceOut(BaseModel):
@@ -44,3 +46,87 @@ class PayIntentIn(BaseModel):
 
 class PayIntentOut(BaseModel):
     payment_url: str
+
+
+# --- Stage 7.9 (recipients directory, task 3) --------------------------------
+#
+# `kind` is spelled out by hand as `Literal["percent", "fixed"]`, never
+# `Literal[*RECIPIENT_KINDS]` (lesson: "An enum-ish column has ONE source of
+# truth: the tuple" — `Literal[*TUPLE]` runs, but pyright's
+# `reportInvalidTypeForm` rejects a `Literal` whose members are not statically
+# visible). `tests/modules/payments/test_recipients_api.py`'s own consistency
+# test closes the gap: `set(get_args(RecipientKind)) == set(RECIPIENT_KINDS)`.
+RecipientKind = Literal["percent", "fixed"]
+
+
+class PaymentRecipientIn(BaseModel):
+    """`POST /payments/recipients` (decisions #154, #157). Exactly ONE of
+    `percent`/`fixed_amount` may be set, matching `kind` — the DB CHECK
+    `rule_matches_kind` (migration `0045`) enforces the same rule, but a
+    client sending the wrong one should see a 422 here, never an
+    `IntegrityError` turned 500 (lesson: "A `response_model` mismatch is
+    invisible to ruff and pyright" sits beside this one — the schema is what
+    turns a database constraint into a client-facing error).
+
+    `active` is deliberately absent: every new row starts active (the
+    model's own default), and a row is deactivated afterwards through
+    `PATCH`, never created inactive — decision #157 makes deactivation, not
+    creation, the point where a row stops counting."""
+
+    name: LocalizedName
+    payme_account_id: str | None = None
+    kind: RecipientKind
+    percent: Decimal | None = Field(default=None, gt=0, le=100, decimal_places=2)
+    fixed_amount: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
+    sort_order: int = 0
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _one_rule_only(self) -> Self:
+        if self.kind == "percent" and (self.percent is None or self.fixed_amount is not None):
+            raise ValueError("a percent recipient carries percent and no fixed_amount")
+        if self.kind == "fixed" and (self.fixed_amount is None or self.percent is not None):
+            raise ValueError("a fixed recipient carries fixed_amount and no percent")
+        return self
+
+
+class PaymentRecipientPatch(BaseModel):
+    """`PATCH /payments/recipients/{id}` — every field optional, only the
+    keys actually sent are touched (`exclude_unset=True`, the convention
+    `LegalDocumentPatchIn` established). `kind` is absent: it never changes
+    after creation, so `percent`/`fixed_amount` here always mean "the row's
+    OWN kind's own amount" — `recipients_service.update` refuses whichever
+    one does not match the row's `kind`, the same reasoning `_one_rule_only`
+    above enforces at creation."""
+
+    name: LocalizedName | None = None
+    payme_account_id: str | None = None
+    percent: Decimal | None = Field(default=None, gt=0, le=100, decimal_places=2)
+    fixed_amount: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
+    sort_order: int | None = None
+    note: str | None = None
+    active: bool | None = None
+
+
+class PaymentRecipientOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: dict[str, Any]
+    payme_account_id: str | None
+    kind: str
+    percent: Decimal | None
+    fixed_amount: Decimal | None
+    active: bool
+    sort_order: int
+    note: str | None
+    created_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    # Same fixed-scale-NUMERIC lesson as `InvoiceOut.amount` above: a
+    # `Numeric` column is a string on the wire, never a JSON float — and
+    # `None` must serialize to `null`, not the string `"None"`.
+    @field_serializer("percent", "fixed_amount")
+    def _money(self, value: Decimal | None) -> str | None:
+        return None if value is None else str(value)

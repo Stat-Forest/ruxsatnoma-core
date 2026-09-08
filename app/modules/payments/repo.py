@@ -20,6 +20,7 @@ from app.modules.payments.models import (
     Invoice,
     ManualPaymentConfirmation,
     PaymentIntent,
+    PaymentRecipient,
     ProviderTransaction,
     Reconciliation,
     Refund,
@@ -674,4 +675,51 @@ async def list_refunds_past_due(db: AsyncSession, *, on_date: date) -> Sequence[
     sweep run a no-op for a row an earlier run already flagged AND decided
     in between."""
     stmt = select(Refund).where(Refund.status.in_(REFUND_OPEN_STATUSES), Refund.due_at < on_date)
+    return (await db.execute(stmt)).scalars().all()
+
+
+# --- Stage 7.9 task 3: the recipients directory --------------------------------
+
+
+async def add_payment_recipient(db: AsyncSession, recipient: PaymentRecipient) -> None:
+    db.add(recipient)
+    await db.flush()
+
+
+async def get_payment_recipient(
+    db: AsyncSession, recipient_id: uuid.UUID
+) -> PaymentRecipient | None:
+    return await db.get(PaymentRecipient, recipient_id)
+
+
+async def list_payment_recipients(
+    db: AsyncSession, *, limit: int, offset: int
+) -> tuple[list[PaymentRecipient], int]:
+    """The whole directory, active AND inactive (there is no DELETE, ruling
+    #157 — an inactive row stays a first-class citizen of this list forever),
+    ordered `(sort_order, id)` — the same tie-break `active_rules` below
+    uses, so an admin's list and the engine's own reading order agree."""
+    stmt = select(PaymentRecipient)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(PaymentRecipient.sort_order, PaymentRecipient.id)
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def list_active_recipients(db: AsyncSession) -> Sequence[PaymentRecipient]:
+    """The ACTIVE rows only, `(sort_order, id)` ordered — `recipients_
+    service.active_rules`'s one query, and the percent-total validator's own
+    read of "everything that currently counts". Unpaged: this directory is a
+    handful of rows by nature (one line per party who takes a cut off the
+    top), never a register that grows with transaction volume."""
+    stmt = (
+        select(PaymentRecipient)
+        .where(PaymentRecipient.active.is_(True))
+        .order_by(PaymentRecipient.sort_order, PaymentRecipient.id)
+    )
     return (await db.execute(stmt)).scalars().all()

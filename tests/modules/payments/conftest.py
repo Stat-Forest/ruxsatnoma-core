@@ -31,7 +31,18 @@ module-level clock helper the route reads `now` through — never `app.core.time
 which that route has no reason to use at all). `_app_on_test_db` additionally
 sets `PAYME_CASHBOX_KEY` so the module's own hardcoded test key
 (`test-cashbox-key`, matching `test_payme_rpc.py`'s own `_auth()` default)
-authenticates against something real."""
+authenticates against something real.
+
+Task 3 (recipients directory) reuses `client` verbatim for
+`test_recipients_api.py` too — it was already the plain anonymous shape that
+test file needs, since every one of its requests supplies its own actor via
+`headers=` instead of a cookie the client itself carries (several of its
+tests compare what TWO different actors may do against the SAME route, which
+a single signed-in client like `payments_view_client` below cannot express).
+It adds `sys_admin`/`accountant` (headers for those two actors) and
+`budget_50`/`budget_50_inactive` (the ONE `payment_recipients` row migration
+`0045` seeds, read rather than duplicated — Override 3 of that task's own
+brief)."""
 
 import uuid
 from collections.abc import AsyncIterator
@@ -41,10 +52,12 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.events import Event, publish
+from app.db import make_session_factory
 from app.main import create_app
 from app.modules.applications.events import APPLICATION_APPROVED, APPLICATION_CANCELLED
 from app.modules.applications.models import Application
@@ -52,7 +65,7 @@ from app.modules.auth.models import Applicant, User
 from app.modules.norms.models import Calculation
 from app.modules.payments import payme_router
 from app.modules.payments import service as payments_service
-from app.modules.payments.models import Invoice
+from app.modules.payments.models import Invoice, PaymentRecipient
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client
 from tests.modules.applications.conftest import applicant as applicant
@@ -66,6 +79,13 @@ PAYME_TEST_CASHBOX_KEY = "test-cashbox-key"
 # modes (ruling — nothing about it is mock-sensitive), so the test config
 # needs one set for `test_intents.py`'s determinism to come from anywhere.
 PAYME_TEST_MERCHANT_ID = "test-merchant-id"
+
+# Mirrors migrations/versions/0045_payment_split.py::BUDGET_RECIPIENT_ID. That
+# module's name starts with a digit and cannot be imported (`import
+# 0045_payment_split` is a SyntaxError), so the literal is duplicated here —
+# the same idiom tests/modules/permits/conftest.py uses for
+# APIARY_LAYOUT_FILE_ID, a seeded row's id it cannot import either.
+BUDGET_RECIPIENT_ID = uuid.UUID("0192f2a0-0000-7000-8000-000000000001")
 
 
 async def _new_approved_application(db: AsyncSession, applicant: Applicant) -> Application:
@@ -309,3 +329,88 @@ async def payments_view_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncCli
 # tests/modules/norms/conftest.py's own note): a fully registered applicant,
 # unrelated to `approved_application`'s own applicant — the 'a stranger gets
 # 404' case.
+
+
+# --- Task 3: the recipients directory's own actors ---------------------------
+
+
+def _session_headers(token: str, csrf: str) -> dict[str, str]:
+    """A signed-in actor as a plain header dict — `session`/`csrf_token` are
+    normally COOKIES (`auth_client` above sets them that way), but
+    `get_current_session` only ever reads `request.cookies.get("session")`
+    and `request.headers.get("X-CSRF-Token")`, and Starlette parses an
+    incoming `Cookie` header into `request.cookies` exactly the same as a
+    real cookie jar would. `test_recipients_api.py`'s tests pass this dict as
+    `headers=` on each call rather than attaching it to `client` itself, so
+    one test can compare two different actors against the same route."""
+    return {"Cookie": f"session={token}", "X-CSRF-Token": csrf}
+
+
+@pytest.fixture
+async def sys_admin(db: AsyncSession) -> dict[str, str]:
+    """Headers for a signed-in superuser. Per that task's Override 2,
+    `PAYMENTS_RECIPIENTS_MANAGE` is granted to no role — `require_permission`
+    lets `sys_admin` through before it ever checks a code (decision #41
+    ruling 2), so this is, in practice, the only actor that can write the
+    directory today."""
+    user = await make_user(db, role_code="sys_admin")
+    _, token, csrf = await make_session(db, user)
+    return _session_headers(token, csrf)
+
+
+@pytest.fixture
+async def accountant(db: AsyncSession) -> dict[str, str]:
+    """Headers for THE production `accountant` role (migration 0017's own
+    grant of `payments.view`), not a role bolted with a personal permission
+    row — same reasoning as `payments_view_client` above, restated here
+    because this fixture returns headers instead of a whole client."""
+    user = await make_user(db, role_code="accountant")
+    _, token, csrf = await make_session(db, user)
+    return _session_headers(token, csrf)
+
+
+@pytest.fixture
+async def budget_50(db: AsyncSession) -> PaymentRecipient:
+    """The budget row migration `0045` seeds (id `BUDGET_RECIPIENT_ID`,
+    50% active) — READ, never inserted a second time (that task's own
+    Override 3: `payment_recipients` is not empty in a fresh test database).
+    The migration module's name starts with a digit and cannot be imported
+    (`import 0045_payment_split` is not valid Python), so the id is
+    duplicated here as a literal — the same idiom
+    `tests/modules/permits/conftest.py::APIARY_LAYOUT_FILE_ID` already uses
+    for an identical reason."""
+    row = await db.get(PaymentRecipient, BUDGET_RECIPIENT_ID)
+    assert row is not None, "migration 0045 did not seed the budget recipient"
+    return row
+
+
+@pytest.fixture
+async def budget_50_inactive(
+    engine, budget_50: PaymentRecipient
+) -> AsyncIterator[PaymentRecipient]:
+    """`budget_50`, deactivated for the duration of ONE test, then restored.
+
+    `budget_50` is not a fixture-created row — it is THE ONE seeded budget
+    recipient, shared and persistent across every test in this worker's run
+    (lesson: "The test DB is shared, persistent, and never empty — including
+    the spot you picked"). A bare `active=False` write through `db` would
+    leave it deactivated for every test that runs afterwards on this worker,
+    including ones that assume an active 50% budget row. Mirrors
+    `tests/modules/gis/conftest.py::_restore_gis_layers` and
+    `tests/modules/permits/conftest.py::override_required_signatures`: the
+    mutation and its restore both go through the `engine`'s OWN session,
+    never `db` — `db`'s teardown `rollback()` cannot undo a write the app's
+    separate connection already committed, and committing the restore on
+    `db` would also commit whatever the test body itself left pending on it."""
+    factory = make_session_factory(engine)
+    async with factory() as session:
+        await session.execute(
+            update(PaymentRecipient).where(PaymentRecipient.id == budget_50.id).values(active=False)
+        )
+        await session.commit()
+    yield budget_50
+    async with factory() as session:
+        await session.execute(
+            update(PaymentRecipient).where(PaymentRecipient.id == budget_50.id).values(active=True)
+        )
+        await session.commit()
