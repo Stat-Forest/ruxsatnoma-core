@@ -251,6 +251,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             60,
             "Per-IP limit for the anonymous landing announcements reads (`0037`)",
         ),
+        SettingSpec(
+            "ratelimit_public_legal_documents_per_minute",
+            int,
+            60,
+            "Per-IP limit for the anonymous legal-documents reads (`0043`)",
+        ),
         # 4.8 `help`: the one anonymous route this module has.
         SettingSpec(
             "ratelimit_public_help_faq_per_minute",
