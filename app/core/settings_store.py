@@ -42,6 +42,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec("login_lockout_minutes", int, 15, "How long a locked account stays locked"),
         SettingSpec("mfa_token_ttl_minutes", int, 5, "Lifetime of the interim MFA token"),
         SettingSpec("mfa_max_attempts", int, 5, "Wrong TOTP codes before the MFA token burns"),
+        SettingSpec(
+            "mfa_enabled",
+            bool,
+            True,
+            "Require the TOTP step at staff login; OFF is a break-glass measure",
+        ),
         SettingSpec("otp_ttl_minutes", int, 5, "Lifetime of a phone/email OTP code"),
         SettingSpec("otp_max_attempts", int, 5, "Wrong OTP entries before the code burns"),
         SettingSpec("otp_hourly_limit", int, 5, "OTP requests per target per hour"),

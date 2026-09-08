@@ -124,8 +124,17 @@ class LoginIn(BaseModel):
 
 
 class LoginOut(BaseModel):
+    """Answer to the password step, in one of two shapes.
+
+    MFA on: `mfa_required` true, `mfa_token` set, `me` null — the client must
+    still call /auth/mfa/verify. MFA off (`mfa_enabled`): `mfa_required` false,
+    `mfa_token` null, `me` set — the session cookies are already on THIS
+    response and there is no second step to take.
+    """
+
     mfa_required: bool
-    mfa_token: str
+    mfa_token: str | None = None
+    me: MeOut | None = None
 
 
 class MfaIn(BaseModel):

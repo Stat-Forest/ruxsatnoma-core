@@ -305,13 +305,64 @@ async def revoke_session(db: AsyncSession, session_row: Session, *, reason: str)
     )
 
 
+@dataclass(frozen=True)
+class PasswordStep:
+    """What the password step produced — exactly one of the two is set.
+
+    `mfa_token` while the second factor is required: the caller must still pass
+    it to `verify_mfa`. `session` when `mfa_enabled` is off: the session already
+    exists and the caller only has to set its cookies. The two are not
+    interchangeable, and a caller that reads the wrong one gets None rather than
+    a half-open login.
+    """
+
+    mfa_token: str | None = None
+    session: tuple[User, Session, str, str] | None = None
+
+
+async def _complete_login(
+    db: AsyncSession,
+    user: User,
+    *,
+    ip: str | None,
+    user_agent: str | None,
+    basis: str | None = None,
+) -> tuple[User, Session, str, str]:
+    """The tail every password login shares: clear the lockout counters, stamp
+    the login, open the session, audit it.
+
+    Extracted so the with-MFA and without-MFA paths cannot drift — a login that
+    forgot to reset `failed_login_count` would leave the account one bad
+    password away from a lockout it had already cleared."""
+    user.failed_login_count = 0
+    user.locked_until = None
+    user.last_login_at = datetime.now(UTC)
+    row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
+    await audit.log(
+        db,
+        action="user.login",
+        user_id=user.id,
+        object_type="session",
+        object_id=row.id,
+        basis=basis,
+        ip=ip,
+        user_agent=user_agent,
+    )
+    return user, row, token, csrf
+
+
 async def login_password(
     db: AsyncSession, *, login: str, password: str, ip: str | None, user_agent: str | None
-) -> str:
-    """Password step. Returns a 5-min single-use mfa_token (ruling 6).
+) -> PasswordStep:
+    """Password step. Returns a 5-min single-use mfa_token (ruling 6) — or, while
+    `mfa_enabled` is off, the finished session itself.
 
     Denied outcomes follow ruling 2: counters + audit(result=denied) are
     committed explicitly BEFORE raising, so the trail survives the rollback.
+
+    The switch removes the SECOND factor only: every guard below — unknown user,
+    inactive, locked, wrong password, and the constant-time dummy verification
+    that hides which of those it was — runs exactly as it does with MFA on.
     """
     user = await repo.get_user_by_login(db, login)
     now = datetime.now(UTC)
@@ -348,6 +399,16 @@ async def login_password(
         )
         await db.commit()
         raise err("ERR-AUTH-003" if locked else "ERR-AUTH-001")
+    if not await settings_store.get_bool(db, "mfa_enabled"):
+        # WARNING, not info: while the switch is off this line is the only thing
+        # in the process log that says the deployment runs on one factor. The
+        # audit row carries the same fact for the trail that outlives the log.
+        structlog.get_logger().warning("mfa_disabled_login", user_id=str(user.id), login=user.login)
+        return PasswordStep(
+            session=await _complete_login(
+                db, user, ip=ip, user_agent=user_agent, basis="mfa disabled"
+            )
+        )
     token = new_token()
     ttl = await settings_store.get_int(db, "mfa_token_ttl_minutes")
     await repo.add(
@@ -359,7 +420,7 @@ async def login_password(
             expires_at=now + timedelta(minutes=ttl),
         ),
     )
-    return token
+    return PasswordStep(mfa_token=token)
 
 
 async def verify_mfa(
@@ -373,6 +434,10 @@ async def verify_mfa(
     exhausted) AND the attempt counts against the account's own
     failed_login_count/locked_until — otherwise MFA brute force would have no
     cap at all (the mfa_token itself never expires faster than 5 minutes).
+
+    Nothing here is relaxed while `mfa_enabled` is off — that switch is read one
+    step earlier, and with it off no mfa_token is ever minted, so this route
+    simply has nothing valid to consume.
     """
     otp = await repo.get_valid_otp(db, hash_token(mfa_token), purpose="mfa")
     if otp is None or otp.user_id is None:
@@ -425,20 +490,7 @@ async def verify_mfa(
         await db.commit()
         raise err("ERR-AUTH-003" if locked else "ERR-AUTH-001")
     otp.used_at = now
-    user.failed_login_count = 0
-    user.locked_until = None
-    user.last_login_at = now
-    row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
-    await audit.log(
-        db,
-        action="user.login",
-        user_id=user.id,
-        object_type="session",
-        object_id=row.id,
-        ip=ip,
-        user_agent=user_agent,
-    )
-    return user, row, token, csrf
+    return await _complete_login(db, user, ip=ip, user_agent=user_agent)
 
 
 async def change_password(
