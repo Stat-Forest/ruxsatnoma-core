@@ -7,7 +7,7 @@ for staying unpublished."""
 from datetime import date
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
@@ -36,12 +36,26 @@ async def version_id(db: AsyncSession, contour: Contour):
     ).scalar_one()
 
 
-async def _risk_indicator_count(db: AsyncSession) -> int:
-    return (
+async def _ri03_on(db: AsyncSession, contour_id) -> list[RiskIndicator]:
+    """The RI-03 rows about permits on THIS test's contour.
+
+    Everything here filters on the fixture's own contour because
+    `sweep_overlapping_permits` is a whole-table scan: the number it returns
+    counts every overlapping pair in the DATABASE, not this test's. Under
+    `pytest -n 4` (what CI runs) the other suites have committed permits of
+    their own by the time this file runs, so asserting on that global number
+    made the test pass or fail on which worker got there first — three of
+    these three failed that way on PR #75 while passing locally and on the
+    run before it."""
+    rows = (
         await db.execute(
-            select(func.count()).select_from(RiskIndicator).where(RiskIndicator.code == "RI-03")
+            select(RiskIndicator).where(
+                RiskIndicator.code == "RI-03",
+                RiskIndicator.details["contour_id"].astext == str(contour_id),
+            )
         )
-    ).scalar_one()
+    ).scalars()
+    return list(rows)
 
 
 async def test_raises_ri03_for_two_active_overlapping_permits(
@@ -68,22 +82,22 @@ async def test_raises_ri03_for_two_active_overlapping_permits(
         period_to=date(2027, 8, 1),
     )
 
-    written = await service.sweep_overlapping_permits(db)
+    await service.sweep_overlapping_permits(db)
 
-    assert written == 1
-    row = (
-        await db.execute(select(RiskIndicator).where(RiskIndicator.code == "RI-03"))
-    ).scalar_one()
+    mine = await _ri03_on(db, contour.id)
+    assert len(mine) == 1
+    row = mine[0]
     assert row.level == "high"
     assert row.object_type == "permit"
-    assert {row.details["permit_a"], row.details["permit_b"]} == {
+    details = row.details or {}
+    assert {details["permit_a"], details["permit_b"]} == {
         str(permit_a.id),
         str(permit_b.id),
     }
 
     # Idempotent: a second run over the same pair raises nothing new.
-    assert await service.sweep_overlapping_permits(db) == 0
-    assert await _risk_indicator_count(db) == 1
+    await service.sweep_overlapping_permits(db)
+    assert len(await _ri03_on(db, contour.id)) == 1
 
 
 async def test_ignores_non_overlapping_periods(
@@ -110,7 +124,9 @@ async def test_ignores_non_overlapping_periods(
         period_to=date(2027, 4, 1),
     )
 
-    assert await service.sweep_overlapping_permits(db) == 0
+    await service.sweep_overlapping_permits(db)
+
+    assert await _ri03_on(db, contour.id) == []
 
 
 async def test_ignores_a_revoked_permit(db, contour, version_id, leshoz, grazing_activity_id):
@@ -138,4 +154,6 @@ async def test_ignores_a_revoked_permit(db, contour, version_id, leshoz, grazing
         period_to=date(2027, 8, 1),
     )
 
-    assert await service.sweep_overlapping_permits(db) == 0
+    await service.sweep_overlapping_permits(db)
+
+    assert await _ri03_on(db, contour.id) == []
