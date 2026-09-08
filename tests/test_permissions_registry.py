@@ -46,6 +46,11 @@ UNGRANTED_BY_DESIGN = frozenset(
     {
         "admin.announcements.manage",
         "admin.classifiers.manage",
+        # `0043`: the legal-documents register, the same class as the
+        # announcements grant above it — editorial content whose owner in the
+        # Agency's org chart nobody has named yet. Reachable through the
+        # `sys_admin` bypass until an administrator grants it to a role.
+        "admin.legal_documents.manage",
         "admin.organizations.manage",
         "admin.settings.manage",
         "auth.sessions.revoke_any",
