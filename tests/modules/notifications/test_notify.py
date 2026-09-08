@@ -123,6 +123,31 @@ async def test_renders_in_the_recipients_language(db):
     assert "Разрешение P-3" in rows[0].rendered_text
 
 
+async def test_the_sms_is_latin_uzbek_even_for_a_russian_speaking_recipient(db):
+    """Decision #151: only the Latin texts are submitted for Eskiz moderation, and
+    an unmoderated text does not arrive — with nothing reporting it as undelivered.
+    So the SMS language is a property of the CHANNEL, not of the reader. The cabinet
+    copy of the same event stays in their own language: it costs nothing.
+    """
+    from datetime import UTC, datetime
+
+    user = await make_user(
+        db,
+        role_code="applicant",
+        language="ru",
+        phone="998901234567",
+        phone_verified_at=datetime.now(UTC),
+    )
+    await service.notify(
+        db, event_code=EVENT, recipient_user_id=user.id, params={"permit_number": "P-RU"}
+    )
+    rows = {r.channel: r for r in await _notes(db, user.id)}
+    assert rows["inapp"].language == "ru"
+    assert "Разрешение P-RU" in rows["inapp"].rendered_text
+    assert rows["sms"].language == "uz_latn"
+    assert "Ruxsatnoma P-RU" in rows["sms"].rendered_text
+
+
 async def test_blocked_recipient_keeps_the_history_row_but_no_transport(db):
     from datetime import UTC, datetime
 
