@@ -44,7 +44,9 @@ def _clear_sms_log():
 
 
 async def _verified_user(db):
-    return await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    return await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
 
 
 async def test_delivery_marks_the_notification_sent_and_records_the_provider_id(db):

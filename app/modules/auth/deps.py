@@ -18,7 +18,7 @@ from app.core.security import hash_token
 from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo, service
-from app.modules.auth.models import Session, User
+from app.modules.auth.models import APPLICANT_ROLE_CODE, Session, User
 from app.modules.auth.permissions import PERMISSIONS
 
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
@@ -104,7 +104,7 @@ async def get_current_user(
         raise err("ERR-AUTH-002")
     if user.must_change_password and (request.method, request.url.path) not in _MUST_CHANGE_ALLOWED:
         raise err("ERR-AUTH-007")
-    if await repo.role_code(db, user) == "applicant":
+    if await repo.role_code(db, user) == APPLICANT_ROLE_CODE:
         path = request.url.path
         exempt = (request.method, path) in _REGISTRATION_EXEMPT or path.startswith("/api/v1/refs/")
         if not exempt:

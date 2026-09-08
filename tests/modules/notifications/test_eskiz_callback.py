@@ -19,7 +19,9 @@ EVENT = "permit.issued"
 
 
 async def _sms_notification(db) -> Notification:
-    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    user = await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
     rows = await service.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
     sms = next(r for r in rows if r.channel == "sms")
     sms.status = "sent"

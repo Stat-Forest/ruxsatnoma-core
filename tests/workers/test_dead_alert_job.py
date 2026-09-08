@@ -29,7 +29,9 @@ async def test_reports_dead_rows_once_and_fails_their_notifications(db, engine):
     # first caller anywhere in the codebase, so nothing else proves that filter
     # actually holds — a blocked admin must come away with no alert.
     blocked_admin = await make_user(db, role_code="central_admin", status="blocked")
-    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    user = await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
     rows = await notifications.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
     sms = next(r for r in rows if r.channel == "sms")
     message = await db.get(OutboxMessage, sms.outbox_message_id)
@@ -94,7 +96,9 @@ async def test_no_administrators_to_alert_is_itself_an_error(db, engine, monkeyp
     factory = make_session_factory(engine)
     await jobs.alert_dead_outbox(factory)  # drain anything left by other tests
 
-    user = await make_user(db, phone="998901234567", phone_verified_at=datetime.now(UTC))
+    user = await make_user(
+        db, role_code="applicant", phone="998901234567", phone_verified_at=datetime.now(UTC)
+    )
     rows = await notifications.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
     sms = next(r for r in rows if r.channel == "sms")
     message = await db.get(OutboxMessage, sms.outbox_message_id)
