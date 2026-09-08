@@ -48,13 +48,15 @@ from app.modules.payments import refunds, repo, statement_service
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import (
     ALLOCATION_ENTRY_TYPES,
-    ALLOCATION_TARGETS,
     INVOICE_STATUSES,
     MANUAL_CONFIRMATION_STATUSES,
     PAYMENT_PROVIDERS,
     RECONCILIATION_RESULTS,
     RECONCILIATION_STATUSES,
     REFUND_STATUSES,
+    TARGET_BUDGET,
+    TARGET_OTHER,
+    TARGET_RECIPIENT,
     Allocation,
     Invoice,
     ManualPaymentConfirmation,
@@ -653,7 +655,12 @@ REFUND_SUBMIT_DECISION_ACTION = "refund.submit_decision"
 REFUND_APPROVE_ACTION = "refund.approve"
 
 _STATUS_REQUESTED, _STATUS_IN_REVIEW, _STATUS_RETURNED, _STATUS_REJECTED = REFUND_STATUSES
-_TARGET_RECIPIENT, _TARGET_BUDGET, _TARGET_OTHER = ALLOCATION_TARGETS
+# Named constants imported from models (plan 07.9 ruling P3), not a positional
+# unpack of ALLOCATION_TARGETS: that tuple gained a fourth member ('receiver')
+# in migration 0045, and a positional unpack would have silently rebound
+# _TARGET_OTHER to 'receiver' — no error, tests still green, refund
+# allocations written against the wrong target.
+_TARGET_RECIPIENT, _TARGET_BUDGET, _TARGET_OTHER = TARGET_RECIPIENT, TARGET_BUDGET, TARGET_OTHER
 # Unpacked rather than retyped (module docstring's own vocabulary rule,
 # already followed above for `RECONCILIATION_STATUSES`/`MANUAL_CONFIRMATION_
 # STATUSES`): `ALLOCATION_ENTRY_TYPES[1]` is `"refund"`, the third value
