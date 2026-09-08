@@ -29,6 +29,10 @@ from app.modules.admin.announcements_public_router import (
 from app.modules.admin.announcements_router import admin_router as announcements_admin_router
 from app.modules.admin.announcements_router import router as announcements_router
 from app.modules.admin.integrations_router import router as integrations_admin_router
+from app.modules.admin.legal_documents_public_router import (
+    router as legal_documents_public_router,
+)
+from app.modules.admin.legal_documents_router import router as legal_documents_admin_router
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
@@ -289,6 +293,8 @@ def create_app() -> FastAPI:
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(announcements_router, prefix="/api/v1")
     app.include_router(announcements_admin_router, prefix="/api/v1")
+    app.include_router(legal_documents_admin_router, prefix="/api/v1")
+    app.include_router(legal_documents_public_router, prefix="/api/v1")
     # The anonymous half of the same module (`0037`): what the public `landing`
     # site reads. Mounted beside its authenticated sibling, not with the other
     # `/public/*` routers, because the rows and the service are this module's.

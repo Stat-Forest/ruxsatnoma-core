@@ -231,3 +231,51 @@ class AnnouncementFile(Base):
     )
     file_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("media_files.id"), primary_key=True)
     position: Mapped[int] = mapped_column(default=0)
+
+
+class LegalDocument(Base):
+    """The public register of legal acts behind `landing`'s /documents page
+    (`0043`), which until now was four rows hard-coded in the front-end under a
+    Download button wired to nothing.
+
+    Deliberately not an `Announcement` carrying a flag: a news item has an
+    audience and a publication window, an act has a number and a date of
+    adoption, and one table would leave both rows carrying the other's dead
+    columns (plan 07.8 ruling R1).
+
+    `file_id` is ONE file, not the M2M `announcement_files` set — an act on this
+    page is one PDF. `source_url` (lex.uz) is what a row offers until that PDF
+    exists, and `legal_documents_service.publish` refuses a row that has
+    neither: a published row whose button opens nothing is precisely the broken
+    page this register replaces.
+    """
+
+    __tablename__ = "legal_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    title: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    doc_number: Mapped[str]
+    adopted_on: Mapped[date]
+    source_url: Mapped[str | None]
+    file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
+    status: Mapped[str] = mapped_column(default="draft", server_default=text("'draft'"))
+    # The Forest Code has to head the page forever, and by date of adoption it is
+    # the oldest row in the register: the list orders by this first (ruling R4).
+    sort_order: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'published', 'archived')", name="status_valid"),
+        # The anonymous list is the only query internet traffic runs, and the
+        # published rows are a small subset of the table: partial, in the order
+        # that query reads them.
+        Index(
+            "ix_legal_documents_public",
+            "sort_order",
+            "adopted_on",
+            postgresql_where=text("status = 'published'"),
+        ),
+    )

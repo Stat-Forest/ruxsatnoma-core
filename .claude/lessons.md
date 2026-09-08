@@ -754,25 +754,24 @@ Tooling and environment.
 
 - **Rule:** A test may only touch rows it created. No unscoped `UPDATE`/`DELETE`, no assuming
   an empty database, and no assuming an empty *neighbourhood*.
-- **Why:** The DB is shared across worktrees and runs, committing client fixtures leave rows
-  behind forever, and the round-trip test wipes it wholesale (collection order pinned in
-  `tests/conftest.py`). Four consequences paid for already, each with its remedy:
-  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 4 stray contours before 3.6a
-    t4 and 11 after, and a hard-coded `permits.number=1` dies once issuance commits one →
-    randomise (`random_box_wkt()`), or take the next value from the counter, unless a sibling
-    deliberately needs proximity (`neighbouring_published_contour`).
+- **Why:** The DB is shared across worktrees and runs, committing fixtures leave rows behind
+  forever, and the round-trip test wipes it wholesale (collection order pinned in
+  `tests/conftest.py`). Four consequences paid for, each with its remedy:
+  - **A fixed literal accumulates:** `box_wkt(69.9, 41.5)` held 11 stray contours, a
+    hard-coded `permits.number=1` dies once issuance commits one → randomise
+    (`random_box_wkt()`) unless a sibling needs proximity (`neighbouring_published_contour`).
   - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the oldest
-    `pending` import in the DB, not yours (`test_two_workers…` sees `[1, 1]` not `[0, 1]`) →
-    a package-scoped autouse drain running the JOB, bounded by `DRAIN_LIMIT`, never a DELETE.
-  - **Paging:** page 1 is full of previous runs, so
-    `test_an_applicant_sees_published_contours_only` went red the moment the endpoint was
-    paged → assert `total` plus a scoped filter (a fresh `organization_id`), not membership.
+    `pending` import in the DB, not yours → a package-scoped autouse drain running the JOB,
+    bounded by `DRAIN_LIMIT`, never a DELETE.
+  - **A global number is never your number:** page 1 is full of previous runs, and a
+    whole-table sweep returns a whole-table count — `sweep_overlapping_permits` scans every
+    permit pair in the DB, so `assert written == 1` measured other suites' committed permits
+    and went red on the CI run after a green one (`7 == 1`; PR #75) → assert on rows
+    carrying your fixture's own ids (`details["contour_id"]`, a fresh `organization_id`).
   - **A refused action leaves its row:** `test_a_maker_cannot_archive_a_published_tariff`
-    succeeds BY being refused, so its `science` tariff stays published forever — breaking
-    `test_science_has_no_tariff` and its own next run → a yield-fixture teardown with a
-    scoped DELETE. And a row the test then REFERENCES cannot be deleted at all
-    (`permits.template_id`'s FK, and an append-only `permit_status_history` blocks deleting
-    the referrer too) → get-or-create with fixed ids, never create-and-clean-up.
+    succeeds BY being refused, so its `science` tariff stays published forever → a
+    yield-fixture teardown with a scoped DELETE; and a row the test REFERENCES cannot be
+    deleted at all (FKs, append-only history) → get-or-create with fixed ids.
 - **How to apply:** Scope every assertion by the ids your fixture created. Run any new
   negative test twice in a row, and as part of the FULL suite — this class is invisible in
   isolation. Do not reorder the conftest collection hook.
