@@ -10,6 +10,7 @@ ORGANIZATIONS_MANAGE = "admin.organizations.manage"
 CLASSIFIERS_MANAGE = "admin.classifiers.manage"
 SETTINGS_MANAGE = "admin.settings.manage"
 ANNOUNCEMENTS_MANAGE = "admin.announcements.manage"
+LEGAL_DOCUMENTS_MANAGE = "admin.legal_documents.manage"
 INTEGRATIONS_VIEW = "admin.integrations.view"
 INTEGRATIONS_MANAGE = "admin.integrations.manage"
 
@@ -19,6 +20,10 @@ register(
         CLASSIFIERS_MANAGE: "Manage classifiers and their versioned items (С23)",
         SETTINGS_MANAGE: "Change runtime system settings (С23)",
         ANNOUNCEMENTS_MANAGE: "Create, publish and archive announcements (С23)",
+        # Its own door rather than a reuse of the announcements one (plan 07.8
+        # R6): the press officer publishing a news item is not performing the
+        # same act as changing which decree the portal calls current.
+        LEGAL_DOCUMENTS_MANAGE: "Create, publish and archive legal documents (С23)",
         INTEGRATIONS_VIEW: "View the outbox, dead letters and integration log",
         INTEGRATIONS_MANAGE: "Requeue outbox messages, discard dead letters",
     }

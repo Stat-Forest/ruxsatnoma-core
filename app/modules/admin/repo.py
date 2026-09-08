@@ -17,6 +17,7 @@ from app.modules.admin.models import (
     Classifier,
     ClassifierItem,
     District,
+    LegalDocument,
     LivestockType,
     Organization,
     Region,
@@ -397,3 +398,57 @@ async def list_announcement_files(db: AsyncSession, announcement_id: uuid.UUID) 
         .order_by(AnnouncementFile.position)
     )
     return list((await db.execute(stmt)).scalars())
+
+
+# --- Legal documents (`0043`) ---------------------------------------------------------
+
+
+def legal_document_public_clause():
+    """What the anonymous landing site may read: published, and nothing else.
+    No window and no audience — unlike an announcement, a law is not addressed
+    at a role or a region, so there is nothing here to filter the caller by."""
+    return LegalDocument.status == "published"
+
+
+def _legal_document_order():
+    """`sort_order` leads so the Forest Code can head the page forever despite
+    being the oldest row by date of adoption (plan 07.8 R4); `id` closes the
+    list so paging can neither repeat nor drop a row when the first two tie."""
+    return (
+        LegalDocument.sort_order.asc(),
+        LegalDocument.adopted_on.desc(),
+        LegalDocument.id.asc(),
+    )
+
+
+async def get_legal_document(db: AsyncSession, doc_id: uuid.UUID) -> LegalDocument | None:
+    return await db.get(LegalDocument, doc_id)
+
+
+async def list_public_legal_documents(
+    db: AsyncSession, *, offset: int, limit: int
+) -> tuple[list[LegalDocument], int]:
+    stmt = select(LegalDocument).where(legal_document_public_clause())
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(stmt.order_by(*_legal_document_order()).offset(offset).limit(limit))
+    ).scalars()
+    return list(rows), total
+
+
+async def get_public_legal_document(db: AsyncSession, doc_id: uuid.UUID) -> LegalDocument | None:
+    stmt = select(LegalDocument).where(LegalDocument.id == doc_id, legal_document_public_clause())
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def list_admin_legal_documents(
+    db: AsyncSession, *, status: str | None, offset: int, limit: int
+) -> tuple[list[LegalDocument], int]:
+    stmt = select(LegalDocument)
+    if status is not None:
+        stmt = stmt.where(LegalDocument.status == status)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(stmt.order_by(*_legal_document_order()).offset(offset).limit(limit))
+    ).scalars()
+    return list(rows), total
