@@ -841,20 +841,20 @@ Tooling and environment.
   reusing its committed fixtures, asserting it agrees with what the HTTP path proved. Never
   ship a contract function whose only verification is that it type-checks.
 
-## Seeded reference data with future effective dates is a scheduled test failure
+## A test left reading the real clock is a scheduled failure — the date OR the hour
 
-- **Rule:** A test asserting an exact money/norm figure computed from `business_today()` must
-  FREEZE the date — patching it in the CALLING module's namespace
-  (`app.modules.norms.service.business_today`), never in `app.core.time` — pinned inside the
-  window of the row it means to exercise.
-- **Why:** `0012` seeds `bhm` as two dated rows (412 000 until 2026-08-31, 440 000 from
-  2026-09-01). 3.7 t7's tests hard-coded amounts derived from 412 000 while `_compute`
-  resolved `on_date=business_today()`, so the suite was green the day it was written and would
-  have gone red on 1 September with nobody touching the repository.
-- **How to apply:** Adding a seed row whose period starts in the future, grep the suite for
-  the currently-in-force figure and for `business_today`. Never "fix" such a test by
-  recomputing the expectation from whatever row is in force — that passes against a WRONG
-  tariff, the opposite of what the test is for.
+- **Rule:** Freeze whatever the code under test asks the clock for, patching it in the CALLING
+  module's namespace (`app.modules.norms.service.business_today`), never in `app.core.time`.
+- **Why:** `0012` seeds `bhm` as two dated rows (412 000 until 2026-08-31, 440 000 after). 3.7
+  t7 hard-coded amounts from 412 000 while `_compute` resolved `on_date=business_today()`:
+  green the day it was written, red on 1 September with nobody touching the repository.
+- **The hour of day, same class (#152):** the SMS quiet window made five delivery tests pass at
+  09:52 and fail at 01:53 — nightly in CI, where nobody watches the clock. A feature gated on
+  the wall clock needs the predicate patched OFF suite-wide (`tests/conftest.py::
+  _no_sms_quiet_window`), with a marker opting its own test back in.
+- **How to apply:** Adding a seed row effective in the future, or any `now()`/hour comparison,
+  grep the suite for the in-force figure and for the clock call. Never "fix" such a test by
+  recomputing from whatever is in force — that passes against a WRONG tariff.
 
 ## An uncommitted test setup on the same session gets committed for real by an expected refusal
 

@@ -51,6 +51,11 @@ venv = ".venv"
 include = ["app", "tests", "migrations"]
 
 [tool.pytest.ini_options]
+markers = [
+    # Opts a test out of `tests/conftest.py::_no_sms_quiet_window`, which keeps the
+    # nightly SMS quiet window (decision #152) off for the rest of the suite.
+    "sms_quiet_window: this test drives the SMS quiet window itself",
+]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"

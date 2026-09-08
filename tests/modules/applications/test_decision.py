@@ -725,3 +725,56 @@ async def test_a_genuinely_bad_decision_signature_is_not_labeled_package_changed
     error = result.json()["error"]
     assert error["code"] == "ERR-SIGN-001"
     assert error["details"]["reason"] == "signature_invalid"
+
+
+async def test_the_approval_takes_the_cabinet_and_the_invoice_takes_the_sms(
+    db: AsyncSession, executor_head_client, application_in_review
+) -> None:
+    """Decision #152: two SMS seconds apart, and the second one says both things.
+
+    Approving publishes `application_approved` inside this same transaction and
+    `payments`' subscriber issues the invoice and notifies again a few lines
+    later, so the phone used to receive «Ariza ... ma'qullandi» and «... to'lov
+    e'lon qilindi» within seconds of each other. The approval now goes to the
+    cabinet only; the invoice text (migration `0044`) carries both pieces of news
+    over SMS. Both notifications still exist in the cabinet — nothing is hidden,
+    only the paid channel is spared the duplicate.
+    """
+    from datetime import UTC, datetime
+
+    from app.modules.applications.models import Application
+    from app.modules.auth.models import Applicant, User
+    from app.modules.notifications.models import Notification
+
+    # The recipient has to be SMS-reachable or this test proves nothing: an
+    # unverified phone produces no `sms` row whatever the channel argument says.
+    application = await db.get(Application, uuid.UUID(application_in_review))
+    assert application is not None
+    applicant = await db.get(Applicant, application.applicant_id)
+    assert applicant is not None and applicant.owner_user_id is not None
+    owner = await db.get(User, applicant.owner_user_id)
+    assert owner is not None
+    owner.phone, owner.phone_verified_at = "998901239999", datetime.now(UTC)
+    await db.commit()
+
+    result = await _decide(executor_head_client, application_in_review, "approve")
+    assert result.status_code == 200, result.text
+
+    rows = (
+        (
+            await db.execute(
+                select(Notification).where(
+                    Notification.object_id == uuid.UUID(application_in_review)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_event: dict[str, set[str]] = {}
+    for row in rows:
+        by_event.setdefault(row.event_code, set()).add(row.channel)
+    assert by_event["application.approved"] == {"inapp"}, (
+        "the approval must not take the SMS channel — the invoice notification"
+        " that follows it in this same transaction says everything it did"
+    )

@@ -6,7 +6,7 @@ classifier validity windows (admin.service.archive_classifier_item,
 admin.repo.list_classifier_items) and, later, seasons/rotations/permit validity.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TASHKENT = ZoneInfo("Asia/Tashkent")
@@ -15,6 +15,36 @@ TASHKENT = ZoneInfo("Asia/Tashkent")
 def business_today() -> date:
     """Today's calendar date in Asia/Tashkent, independent of the server's own zone."""
     return datetime.now(TASHKENT).date()
+
+
+def in_quiet_hours(start_hour: int, end_hour: int, *, now: datetime | None = None) -> bool:
+    """Is it currently inside the nightly SMS quiet window (decision #152)?
+
+    The window is expressed in Asia/Tashkent whole hours and WRAPS midnight —
+    `start_hour=21`, `end_hour=8` means 21:00-07:59, which is the only shape this
+    is ever used in. A non-wrapping pair (8, 21) is still handled correctly, so an
+    operator who inverts the two settings gets a daytime pause rather than a window
+    that silently never closes; `start == end` means no quiet hours at all, which
+    is how the feature is turned off without a third setting.
+    """
+    hour = (now or datetime.now(TASHKENT)).astimezone(TASHKENT).hour
+    if start_hour == end_hour:
+        return False
+    if start_hour < end_hour:
+        return start_hour <= hour < end_hour
+    return hour >= start_hour or hour < end_hour
+
+
+def next_quiet_window_end(end_hour: int, *, now: datetime | None = None) -> datetime:
+    """The next Tashkent `end_hour:00`, as UTC — when a message held by the window
+    becomes due. Used for logging and for `next_attempt_at`, never for a decision:
+    the decision is `in_quiet_hours` at delivery time, so a message enqueued before
+    the window and retried inside it is held too."""
+    local = (now or datetime.now(TASHKENT)).astimezone(TASHKENT)
+    target = local.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return target.astimezone(UTC)
 
 
 def add_working_days(start: date, days: int) -> date:

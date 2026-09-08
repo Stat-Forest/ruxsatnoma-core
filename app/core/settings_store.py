@@ -87,6 +87,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "ratelimit_challenge_per_minute", int, 10, "Per-IP limit for POST /auth/eimzo/challenge"
         ),
         SettingSpec("notifications_sms_enabled", bool, True, "Ops kill switch for the SMS channel"),
+        # Decision #152: the nightly SMS quiet window, Asia/Tashkent whole hours.
+        # `sms` only — `sms_otp` is a code somebody is waiting for on the login
+        # screen, and holding it until morning is not politeness but an outage.
+        # Setting the two equal turns the window off.
+        SettingSpec("sms_quiet_hours_start", int, 21, "Hour SMS delivery pauses (Asia/Tashkent)"),
+        SettingSpec("sms_quiet_hours_end", int, 8, "Hour SMS delivery resumes (Asia/Tashkent)"),
         SettingSpec(
             "outbox_breaker_failures",
             int,

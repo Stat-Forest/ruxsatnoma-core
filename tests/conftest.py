@@ -155,6 +155,33 @@ def _reset_ratelimit():
 
 
 @pytest.fixture(autouse=True)
+def _no_sms_quiet_window(request: pytest.FixtureRequest):
+    """The nightly SMS quiet window (decision #152) is OFF for the suite.
+
+    Without this, every test that asserts an SMS was delivered fails between
+    21:00 and 08:00 Asia/Tashkent — including in CI, whose runners are the one
+    place nobody watches the clock. Caught on the integration branch: the same
+    file passed at 09:52 and failed at 01:53.
+
+    Patched at the one place that reads it rather than through
+    `system_settings`, so a test that clears that table cannot bring the window
+    back by accident. `tests/modules/notifications/test_channels.py` covers the
+    window itself and opts out with `@pytest.mark.sms_quiet_window`.
+    """
+    if "sms_quiet_window" in request.keywords:
+        yield
+        return
+    from app.modules.integrations import service as integrations_service
+
+    original = integrations_service.in_quiet_hours
+    integrations_service.in_quiet_hours = lambda *args, **kwargs: False
+    try:
+        yield
+    finally:
+        integrations_service.in_quiet_hours = original
+
+
+@pytest.fixture(autouse=True)
 def _reset_breaker():
     from app.modules.integrations import breaker
 

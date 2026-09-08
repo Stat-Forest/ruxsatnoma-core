@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store
 from app.core.errors import err
+from app.core.time import in_quiet_hours
 from app.db import uuid7
 from app.modules.audit import service as audit
 from app.modules.integrations import breaker, repo
@@ -55,12 +56,39 @@ async def enqueue(
     return await db.get(OutboxMessage, new_id)
 
 
+# The one destination the quiet window covers (decision #152). `sms_otp` is
+# deliberately absent: a verification code is something a person is waiting for on
+# the screen in front of them, so holding it until morning would not be politeness
+# but an outage. `email` is not covered either — a night-time e-mail wakes nobody.
+QUIET_HOURS_DESTINATION = "sms"
+
+
+async def _paused_destinations(db: AsyncSession) -> list[str]:
+    """Destinations that must not be CLAIMED right now: a destination whose breaker
+    is open, plus `sms` inside the nightly quiet window.
+
+    Holding the row back at CLAIM time rather than failing it at delivery time is
+    what keeps the retry budget intact — a message held for eight hours must arrive
+    at 08:00 with all of its attempts left, not one attempt short of `dead` (the
+    same reasoning `pick_due` already applies to an open breaker). It also covers a
+    retry that lands inside the window although the first attempt did not.
+    """
+    paused = list(breaker.open_destinations())
+    if QUIET_HOURS_DESTINATION in paused:
+        return paused
+    start = await settings_store.get_int(db, "sms_quiet_hours_start")
+    end = await settings_store.get_int(db, "sms_quiet_hours_end")
+    if in_quiet_hours(start, end):
+        paused.append(QUIET_HOURS_DESTINATION)
+    return paused
+
+
 async def deliver_one(db: AsyncSession) -> bool:
     """Claim and deliver one due message; commits the outcome. False = queue idle.
 
     The claim is the open transaction itself: a crash rolls back to 'pending'
     and the row is retried — no reaper, no stuck 'delivering' rows (ruling 5)."""
-    row = await repo.pick_due(db, exclude_destinations=breaker.open_destinations())
+    row = await repo.pick_due(db, exclude_destinations=await _paused_destinations(db))
     if row is None:
         # Belt-and-braces: closes the open read transaction that made clock_timestamp necessary.
         await db.rollback()

@@ -215,3 +215,67 @@ async def test_the_kill_switch_pauses_the_queue_instead_of_destroying_it(db):
     # and no personal data (this column is admin-visible AND logged).
     assert "disabled" in (message.last_error or "")
     assert "998901234567" not in (message.last_error or "")
+
+
+@pytest.mark.sms_quiet_window
+async def test_the_quiet_window_holds_an_sms_but_never_the_otp_code(db):
+    """Decision #152: a notification SMS enqueued at night waits for morning.
+
+    The window is applied where the row is CLAIMED, not where it is delivered, so
+    a held message keeps its whole retry budget — it must arrive at 08:00 with all
+    of its attempts, not one short of `dead`. `sms_otp` is deliberately outside the
+    window: a code somebody is waiting for on the login screen is not politeness to
+    hold until morning, it is an outage.
+
+    The window is set around the CURRENT hour rather than patching the clock —
+    `in_quiet_hours` reads Asia/Tashkent itself, and a test that froze time would
+    be testing the freeze.
+    """
+    from datetime import datetime
+
+    from app.core.time import TASHKENT
+
+    hour = datetime.now(TASHKENT).hour
+    user = await _verified_user(db)
+    rows = await service.notify(db, event_code=EVENT, recipient_user_id=user.id, params={})
+    sms = next(r for r in rows if r.channel == "sms")
+    otp = await integrations_service.enqueue(
+        db,
+        destination="sms_otp",
+        payload={"target_type": "phone", "target": "+998901234567", "code": "123456"},
+    )
+    # Ids read BEFORE the commit: `deliver_one` commits, which expires both
+    # instances, and touching an attribute afterwards is a lazy refresh outside
+    # the greenlet.
+    assert otp is not None  # enqueue returns the row it just wrote
+    otp_id, sms_message_id = otp.id, sms.outbox_message_id
+    await db.commit()
+
+    db.add(SystemSetting(key="sms_quiet_hours_start", value=hour))
+    db.add(SystemSetting(key="sms_quiet_hours_end", value=(hour + 1) % 24))
+    await db.flush()
+    settings_store.invalidate("sms_quiet_hours_start")
+    settings_store.invalidate("sms_quiet_hours_end")
+    try:
+        while await integrations_service.deliver_one(db):
+            pass
+        await db.refresh(sms)
+        otp_row = await db.get(OutboxMessage, otp_id)
+        sms_row = await db.get(OutboxMessage, sms_message_id)
+        assert otp_row is not None and otp_row.status == "delivered"
+        # ...and the notification SMS was never even claimed: still pending, and
+        # with its attempt counter untouched.
+        assert sms_row is not None
+        assert sms_row.status == "pending"
+        assert sms_row.attempts == 0
+        assert sms.status == "queued"
+    finally:
+        await db.execute(
+            text(
+                "DELETE FROM system_settings"
+                " WHERE key IN ('sms_quiet_hours_start', 'sms_quiet_hours_end')"
+            )
+        )
+        await db.commit()
+        settings_store.invalidate("sms_quiet_hours_start")
+        settings_store.invalidate("sms_quiet_hours_end")

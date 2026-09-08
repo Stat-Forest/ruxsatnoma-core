@@ -27,6 +27,12 @@ logger = structlog.get_logger(__name__)
 # uz_latn, not uz_cyrl: decision #90 makes uz_latn the one language every
 # `LocalizedName` (`TemplateIn.body`/`.subject` included) is guaranteed to carry.
 FALLBACK_LANGUAGE = "uz_latn"
+# The one language every SMS is written in (decision #151). Deliberately the same
+# string as the fallback above and deliberately a separate constant: they answer
+# different questions — "what do we use when this template has nothing in the
+# reader's language" and "what language is an SMS" — and one of them could change
+# without the other.
+SMS_LANGUAGE = "uz_latn"
 # Deliberately narrower than str.format: only {snake_case}. An admin-authored
 # template must not be able to reach attributes ({x.__class__}) or indexes,
 # and a missing key must not raise inside a business transaction (ruling 9).
@@ -272,20 +278,31 @@ async def notify(
             db, channel=channel, contact=contact
         ):
             continue
+        # Decision #151: an SMS is ALWAYS Latin Uzbek, whatever language the
+        # recipient reads the cabinet in. Only these texts are submitted for
+        # Eskiz moderation, and an unmoderated text does not arrive — so
+        # rendering a Russian body here would send a message nothing reports as
+        # undelivered. It is also the cheap encoding (GSM 03.38, 160 characters
+        # per part against Cyrillic's 70), which is why one language is a real
+        # choice rather than a shortcut. `inapp` costs nothing and stays in the
+        # recipient's own language.
+        language = SMS_LANGUAGE if channel == "sms" else contact.language
         row = Notification(
             recipient_user_id=contact.user_id,
             channel=channel,
             event_code=event_code,
             template_id=template.id if template else None,
             params=values,
-            language=contact.language,
+            # The language actually RENDERED, not the recipient's preference —
+            # `notifications.language` is what the stored text is written in.
+            language=language,
             subject=(
-                render(template.subject, values, contact.language)
+                render(template.subject, values, language)
                 if template is not None and template.subject
                 else None
             ),
             rendered_text=(
-                render(template.body, values, contact.language)
+                render(template.body, values, language)
                 if template is not None
                 else _fallback_body(event_code, values)
             ),
