@@ -217,6 +217,7 @@ async def test_the_kill_switch_pauses_the_queue_instead_of_destroying_it(db):
     assert "998901234567" not in (message.last_error or "")
 
 
+@pytest.mark.sms_quiet_window
 async def test_the_quiet_window_holds_an_sms_but_never_the_otp_code(db):
     """Decision #152: a notification SMS enqueued at night waits for morning.
 
