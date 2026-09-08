@@ -427,16 +427,31 @@ async def _reason_item(db: AsyncSession, reason_item_id: uuid.UUID) -> Classifie
 
 
 async def _notify_decision(
-    db: AsyncSession, application: Application, *, event_code: str, params: dict[str, Any]
+    db: AsyncSession,
+    application: Application,
+    *,
+    event_code: str,
+    params: dict[str, Any],
+    channels: tuple[str, ...] | None = None,
 ) -> None:
     """One notification per decision, in THIS transaction (3.5's rule), to the
     individual applicant's own account when there is one and otherwise to
-    whoever filed — `service._notification_recipient` owns that definition."""
+    whoever filed — `service._notification_recipient` owns that definition.
+
+    `channels` is passed by ONE caller and for one reason (decision #152): an
+    approval publishes `application_approved` in this same transaction, and
+    `payments`' subscriber issues the invoice and notifies again a few lines
+    later. Both SMS reach the phone within seconds of each other, and the second
+    one — «заявка одобрена, счёт на N сум, срок» — already says everything the
+    first one did. So the approval goes to the cabinet only and the invoice
+    carries the SMS. A rejection has no second message and keeps both channels.
+    """
     await notifications_service.notify(
         db,
         event_code=event_code,
         recipient_user_id=await flow._notification_recipient(db, application),
         params=params,
+        channels=channels,
         object_type="application",
         object_id=application.id,
     )
@@ -508,6 +523,9 @@ async def approve(
         application,
         event_code=NOTIFY_APPLICATION_APPROVED,
         params={"application_number": application.number},
+        # Cabinet only — the invoice notification a few lines below carries the
+        # SMS for both. See `_notify_decision`'s docstring (decision #152).
+        channels=("inapp",),
     )
     # `application_id` and NOTHING else — the payload contract frozen in
     # `applications/events.py`. An amount here would be a second source of truth
