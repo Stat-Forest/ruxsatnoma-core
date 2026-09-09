@@ -52,8 +52,11 @@ RUN chmod +x ./docker-entrypoint.sh
 
 # keys/ is mounted read-only by the compose service (docker-compose.yml,
 # docker-compose.deploy.yml) -- nothing to COPY here, and nothing to build
-# without it: the jar starts and answers /ping with "certificate status could
-# not be verified" until the VPN key exists at that mount point (README.md).
+# without it. Measured, not assumed (README.md): with no VPN key at that
+# mount point, the jar does NOT start cleanly and does NOT answer /ping at
+# all -- it never binds port 8080, because a constructor on the startup path
+# opens keys/client.key eagerly and throws FileNotFoundException before the
+# HTTP listener is ever wired up.
 
 EXPOSE 8080 8081
 

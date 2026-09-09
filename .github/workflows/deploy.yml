@@ -67,13 +67,20 @@ jobs:
           # --exclude='.env' is load-bearing: .env lives only on the server, is not in git, and
           # --delete would otherwise remove it, taking POSTGRES_PASSWORD/S3_SECRET_KEY with it
           # — secrets baked into the db/minio volumes on first start, which would make the data
-          # unreachable.
+          # unreachable. `deploy/eimzo/keys/` and `deploy/eimzo/dist/` are the same kind of
+          # server-only, not-in-git state (deploy/eimzo/README.md) — the VPN client key, its
+          # truststores, and the vendor jar an operator installs by hand once NIC delivers one.
+          # Both are gitignored, so `git archive` never contains them either way, but --delete
+          # still means "make the destination match the archive exactly" — without these two
+          # excludes, an operator's hand-placed key or jar is extraneous at the destination and
+          # gets deleted on the very next deploy (Critical 2, final review): signing then answers
+          # 502 until someone notices.
           TMP_DIR=$(ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mktemp -d")
           git archive --format=tar.gz HEAD \
             | ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
                 "tar -xzf - -C '$TMP_DIR'"
           ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "mkdir -p '$DEPLOY_PATH' && rsync -a --delete --exclude='.env' '$TMP_DIR/' '$DEPLOY_PATH/' && rm -rf '$TMP_DIR'"
+            "mkdir -p '$DEPLOY_PATH' && rsync -a --delete --exclude='.env' --exclude='deploy/eimzo/keys/' --exclude='deploy/eimzo/dist/' '$TMP_DIR/' '$DEPLOY_PATH/' && rm -rf '$TMP_DIR'"
 
       - name: Build, migrate and roll
         env:
@@ -87,6 +94,22 @@ jobs:
           set -euo pipefail
           cd "$DEPLOY_PATH"
           COMPOSE="docker compose -f docker-compose.deploy.yml"
+
+          # Critical 1 (final review): `eimzo` sits behind the `eimzo` compose
+          # profile (docker-compose.deploy.yml's own comment) precisely because
+          # its build needs `deploy/eimzo/dist/e-imzo-server.jar` -- gitignored,
+          # never shipped by `git archive`, and placed here only by an operator
+          # once NIC delivers the vendor's distribution (deploy/eimzo/README.md).
+          # `$COMPOSE build` below therefore builds it ONLY once that file
+          # actually exists on the server; until then it builds `api` alone and
+          # never fails on the missing jar. `COMPOSE_PROFILES` (not `--profile`)
+          # is exported once here so EVERY `$COMPOSE` call below picks it up —
+          # in particular the final bare `up -d`, which is what would actually
+          # start the eimzo container once its image exists.
+          if [ -f deploy/eimzo/dist/e-imzo-server.jar ]; then
+            echo "e-imzo-server distribution found -- building and starting it too"
+            export COMPOSE_PROFILES=eimzo
+          fi
 
           echo "Building (the old container keeps serving)…"
           $COMPOSE build

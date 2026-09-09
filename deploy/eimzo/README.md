@@ -42,6 +42,32 @@ copied from the vendor's own distribution (task 8, fix round 1 finding 4) with o
 `${EIMZO_VPN_HOST}`-style placeholders substituted in at container start
 (`docker-entrypoint.sh`).
 
+## `keys/` and `dist/` are operator-owned and survive deploys (Critical 1 & 2, final review)
+
+Both directories are gitignored (`.gitignore`, this directory), so `git archive` --
+what `.github/workflows/deploy.yml` ships to the server -- never contains either one.
+Two consequences an operator needs to know:
+
+- **This service sits behind the `eimzo` Docker Compose profile**
+  (`docker-compose.yml`/`docker-compose.deploy.yml`), so a bare `docker compose
+  build`/`up -d` -- what `make up` and every deploy run by default -- never even
+  attempts to build it, and cannot fail on a missing `dist/`. The deploy workflow
+  activates the profile itself (`COMPOSE_PROFILES=eimzo`) the moment it finds
+  `deploy/eimzo/dist/e-imzo-server.jar` already on the server, so placing the
+  distribution there is the ONLY step needed -- no workflow change, no manual
+  `--profile` flag on the next deploy. Locally, `docker compose build eimzo` /
+  `docker compose up -d eimzo` (below) still reach it by name regardless of the
+  profile, exactly as before.
+- **`.github/workflows/deploy.yml`'s `rsync -a --delete` explicitly excludes
+  `deploy/eimzo/keys/` and `deploy/eimzo/dist/`** (alongside the pre-existing
+  `.env` exclude), so an operator's hand-placed VPN key, its truststores, and the
+  assembled jar+`lib/` survive every later deploy untouched. Before this exclude,
+  the NEXT deploy after an operator set these up would have deleted them straight
+  back out -- `--delete` makes the destination match the shipped archive exactly,
+  and an archive built from git can never contain a gitignored directory -- so
+  signing would answer 502 (the container back to `unhealthy`, see below) until
+  someone noticed and had to re-place both by hand, forever, on every deploy.
+
 ## What actually happens with no VPN key -- measured, not inferred
 
 **This is the part an administrator will be stopped by if they skip it.** With
@@ -136,6 +162,11 @@ docker compose exec api curl -s http://eimzo:8080/info
 ```
 
 ## Local verification
+
+Naming the service explicitly (`... eimzo`, both commands below) reaches it
+regardless of the `eimzo` compose profile (previous section) -- profile or no,
+Compose always includes a service given by name on the command line. A bare
+`docker compose build`/`up -d` would skip it instead.
 
 ```bash
 # 1. Assemble the distribution (once; never committed):

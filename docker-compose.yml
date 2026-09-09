@@ -34,8 +34,21 @@ services:
   # network entirely; here there is no `edge` network to join in the first place, so
   # `127.0.0.1`-only publishing (the same binding `db`/`minio` above use) is what keeps
   # it local-machine-only for `curl localhost:8080/ping` while developing.
+  #
+  # `profiles: ["eimzo"]` (Critical 1, final review): its `build` does
+  # `COPY dist/e-imzo-server.jar`, but `deploy/eimzo/dist/` is gitignored and
+  # exists in no clone until an operator assembles it from NIC's own
+  # distribution (README.md) -- unreachable today (task 12 is blocked on NIC
+  # delivering one). Without a profile, a bare `docker compose build`/`up -d`
+  # (what `make up` runs) tried to build THIS service too and died on the
+  # missing `dist/`, taking `db`/`minio` down with it on every fresh clone.
+  # A profile excludes a service from the default `build`/`up`
+  # set while an explicit `docker compose build eimzo` / `up -d eimzo` (this
+  # file's own "Local verification" section) still reaches it by name,
+  # profile or no -- verified empirically, not assumed (`.superpowers/sdd/05.2-eimzo-real/final-fix-report.md`).
   eimzo:
     image: ruxsatnoma-eimzo:2.1.1
+    profiles: ["eimzo"]
     build:
       context: ./deploy/eimzo
     restart: unless-stopped
