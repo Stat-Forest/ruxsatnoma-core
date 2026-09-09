@@ -18,6 +18,7 @@ from app.modules.payments.models import (
     BankStatement,
     BankStatementLine,
     Invoice,
+    InvoiceRecipient,
     ManualPaymentConfirmation,
     PaymentIntent,
     PaymentRecipient,
@@ -713,13 +714,47 @@ async def list_payment_recipients(
 
 async def list_active_recipients(db: AsyncSession) -> Sequence[PaymentRecipient]:
     """The ACTIVE rows only, `(sort_order, id)` ordered — `recipients_
-    service.active_rules`'s one query, and the percent-total validator's own
-    read of "everything that currently counts". Unpaged: this directory is a
-    handful of rows by nature (one line per party who takes a cut off the
-    top), never a register that grows with transaction volume."""
+    service.active_rules`'s one query, `payments.service.issue_invoice`'s
+    own read (task 4: it reads this directly rather than through
+    `active_rules`, so the split's `rules` AND the name/`payme_account_id`
+    each snapshot row copies come from the SAME single read), and the
+    percent-total validator's own read of "everything that currently
+    counts". Unpaged: this directory is a handful of rows by nature (one
+    line per party who takes a cut off the top), never a register that
+    grows with transaction volume."""
     stmt = (
         select(PaymentRecipient)
         .where(PaymentRecipient.active.is_(True))
         .order_by(PaymentRecipient.sort_order, PaymentRecipient.id)
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+# --- Stage 7.9 task 4: the split frozen onto one invoice ------------------
+
+
+async def add_invoice_recipients(db: AsyncSession, rows: Sequence[InvoiceRecipient]) -> None:
+    """The whole split snapshot `payments.service._snapshot_rows` builds for
+    ONE invoice, written together at issuance (decision #158) — `position`
+    order, the leshoz's `kind='remainder'` row always last. Plain,
+    unattached instances until this call, mirroring `add_allocations`
+    above."""
+    db.add_all(rows)
+    await db.flush()
+
+
+async def list_invoice_recipients(
+    db: AsyncSession, invoice_id: uuid.UUID
+) -> Sequence[InvoiceRecipient]:
+    """One invoice's frozen split, `position` order — `payments.service.
+    invoice_recipients` (Task 4), the ONE way a caller outside this module
+    learns how an invoice divides. Never read `payment_recipients` (the LIVE
+    directory) for this question instead: that would answer "what applies
+    today", not "what this invoice divides into", and defeat the freeze the
+    whole table exists for (decision #158)."""
+    stmt = (
+        select(InvoiceRecipient)
+        .where(InvoiceRecipient.invoice_id == invoice_id)
+        .order_by(InvoiceRecipient.position)
     )
     return (await db.execute(stmt)).scalars().all()

@@ -77,12 +77,17 @@ Tooling and environment.
   `permit_status_history.reason_item_id` FKs to: a bare `DELETE` on the classifier hits that
   FK, and nulling it first with a bare `UPDATE` hits the table's OWN append-only trigger —
   invisible against an EMPTY database, real once one real decision has been signed.
+  - **A fourth shape, `0045` (7.9 task 4):** seeds `payment_recipients`' budget row;
+    `invoice_recipients.recipient_id` FKs to it but stayed unreferenced until
+    `issue_invoice` wrote a real COMMITTED row, then the seed row's `DELETE` hit that FK.
+    Fixed by dropping the explicit `DELETE`: `invoice_recipients` is itself dropped later
+    in the SAME `downgrade()`, before `payment_recipients`' own final `DROP TABLE`.
 - **How to apply:** Widening a constraint → data-cleanup statement in the downgrade. Seeding
   a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the template
   delete. Seeding a row an APPEND-ONLY table's column will FK to → wrap the nulling `UPDATE`:
   `DISABLE`/`ENABLE TRIGGER USER` (never `ALL`, superuser-only) around `UPDATE ... SET col = NULL`,
-  then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red
-  in a task that changed no migration, look for the event it started emitting.
+  then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). If the referencing
+  TABLE is also dropped later in the SAME downgrade, drop it before the parent delete instead.
 
 ## A new Alembic head needs both a merge migration and the round-trip test's literal moved
 

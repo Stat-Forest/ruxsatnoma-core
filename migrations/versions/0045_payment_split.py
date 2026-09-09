@@ -245,12 +245,21 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Reverse 7-1, in that order.
-    op.execute(
-        sa.text("DELETE FROM payment_recipients WHERE id = CAST(:id AS uuid)").bindparams(
-            id=str(BUDGET_RECIPIENT_ID)
-        )
-    )
+    # Reverse 7-1 — EXCEPT step 7 (the seed row), which is deliberately not
+    # reversed with an explicit DELETE here (stage 7.9 task 4 fix). A
+    # standalone `DELETE FROM payment_recipients WHERE id = ...` run FIRST
+    # would violate `fk_invoice_recipients_recipient_id_payment_recipients`
+    # the moment an `invoice_recipients` row references the seeded budget
+    # recipient — unreachable before task 4, when nothing ever wrote a
+    # COMMITTED `invoice_recipients` row, and very much reachable once
+    # `payments.service.issue_invoice` does. Dropping `invoice_recipients`
+    # (step 2's own reversal, below) removes that FK along with the rows
+    # that carried it; `refund_components` and `allocations.recipient_id`
+    # (steps 3 and 4) are reversed the same way, for the same reason. By the
+    # time step 1's own `DROP TABLE payment_recipients` runs at the very
+    # end, every FK that could point at it is already gone, and dropping a
+    # table removes its rows unconditionally — the explicit DELETE was
+    # always redundant with that drop, never load-bearing on its own.
 
     op.execute("DROP TRIGGER IF EXISTS refund_components_complete_trg ON refunds")
     op.execute("DROP FUNCTION IF EXISTS refund_components_complete()")
