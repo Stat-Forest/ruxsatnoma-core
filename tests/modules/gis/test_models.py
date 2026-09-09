@@ -2,6 +2,8 @@
 published version per contour, the approval-document CHECK that ruling 3 keeps
 intact, and the contour-number uniqueness that ruling 11's suffixing depends on."""
 
+from decimal import Decimal
+
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -99,3 +101,43 @@ async def test_parent_needs_subcontour_check_fires(db, contours_layer, leshoz):
     with pytest.raises(IntegrityError) as excinfo:
         await db.flush()
     assert "parent_needs_subcontour" in str(excinfo.value)
+
+
+async def test_a_version_needs_either_geometry_or_a_declared_area(db, contours_layer, leshoz):
+    """Decision #178's own CHECK: a version with NEITHER is refused at the DB
+    level, the same backstop `parent_needs_subcontour` above provides for its
+    own pairing — `gis.service.create_version` pre-validates this in Python
+    (`_assert_geometry_or_declared_area`) and never reaches the constraint in
+    normal use."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = ContourVersion(
+        contour_id=contour.id,
+        version_no=1,
+        geom=None,
+        area_ha=Decimal("1.0000"),
+        declared_area_ha=None,
+        source="cadastre",
+    )
+    db.add(version)
+    with pytest.raises(IntegrityError) as excinfo:
+        await db.flush()
+    assert "geom_or_declared_area" in str(excinfo.value)
+
+
+async def test_a_version_with_only_a_declared_area_is_valid(db, contours_layer, leshoz):
+    """The other side of the same CHECK: `declared_area_ha` alone is enough —
+    a leshoz with no delivered GIS layer files a version by requisites."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = ContourVersion(
+        contour_id=contour.id,
+        version_no=1,
+        geom=None,
+        area_ha=Decimal("2.5000"),
+        declared_area_ha=Decimal("2.5000"),
+        source="cadastre",
+    )
+    db.add(version)
+    await db.flush()
+    await db.refresh(version)
+    assert version.geom is None
+    assert version.area_ha == Decimal("2.5000")

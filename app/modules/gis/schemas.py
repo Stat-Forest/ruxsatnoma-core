@@ -96,14 +96,28 @@ def _trim_decimal(value: Decimal | None) -> str | None:
 class VersionIn(BaseModel):
     """`POST /gis/contours/{id}/versions`. `declared_area_ha` is the source
     file's own figure, kept for reference only — `area_ha` is always computed by
-    PostGIS (ruling 2)."""
+    PostGIS (ruling 2).
 
-    geom: dict[str, Any]
+    `geom` is optional (decision #178): a leshoz with no delivered GIS layer
+    files a version by requisites alone, and `declared_area_ha` then becomes
+    the area of record instead (`gis.service.create_version`'s own pre-check,
+    the DB CHECK `geom_or_declared_area` behind it) — so at least one of the
+    two must be present, checked here for a same-request 422 with a clear
+    reason rather than the service's generic one.
+    """
+
+    geom: dict[str, Any] | None = None
     source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
     declared_area_ha: Decimal | None = None
     accuracy_m: Decimal | None = None
     survey_date: date | None = None
     effective_from: date | None = None
+
+    @model_validator(mode="after")
+    def _check_geometry_or_declared_area(self) -> Self:
+        if self.geom is None and self.declared_area_ha is None:
+            raise ValueError("geom or declared_area_ha is required")
+        return self
 
 
 class VersionOut(BaseModel):
@@ -137,9 +151,12 @@ class VersionDetailOut(VersionOut):
     """`GET /gis/contours/{id}/versions/{version_id}` — task defect 4a's other
     half: `VersionOut` alone carries no geometry, so a version id handed over
     out of band still could not actually be looked at. Adds exactly one field
-    over the list row."""
+    over the list row.
 
-    geometry: dict[str, Any]
+    `geometry` is `None` for a version filed by requisites alone (decision
+    #178) — there is nothing PostGIS could have rendered for it."""
+
+    geometry: dict[str, Any] | None
 
 
 class VersionPatch(BaseModel):
@@ -387,7 +404,14 @@ class ContourCardOut(BaseModel):
     computed sum, not a value round-tripped through a NUMERIC column, and
     keeping its full 4-dp precision (`"0.0000"`, not `"0"`) is what makes it
     read as a real figure rather than a rounded-away one. `s_available_ha`/
-    `over_allocated` — see `ContourListItem`'s own docstring, the same shape."""
+    `over_allocated` — see `ContourListItem`'s own docstring, the same shape.
+
+    `geometry` is `None` (decision #178) for a version filed by requisites
+    alone, and also whenever the owning organization's `gis_enabled` switch
+    is off — `gis.service.contour_card`'s own docstring explains why the
+    switch wins even over a row that happens to carry real geometry. Every
+    other field is unaffected: this is the one place `gis_enabled` reaches,
+    not a second, degraded card."""
 
     id: uuid.UUID
     number: str
@@ -395,7 +419,7 @@ class ContourCardOut(BaseModel):
     kind: str
     version_id: uuid.UUID
     area_ha: Decimal
-    geometry: dict[str, Any]
+    geometry: dict[str, Any] | None
     occupied_ha: Decimal
     s_available_ha: Decimal
     over_allocated: bool
