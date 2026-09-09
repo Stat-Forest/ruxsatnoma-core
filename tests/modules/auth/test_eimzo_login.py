@@ -3,8 +3,17 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from app.core.errors import DomainError
+from app.core.security import hash_token
 from app.main import create_app
-from app.modules.integrations.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
+from app.modules.auth import repo, service
+from app.modules.integrations.adapters.eimzo import (
+    EimzoError,
+    EimzoIdentity,
+    encode_mock_signed_challenge,
+)
 from tests.conftest import make_client
 
 API = "/api/v1"
@@ -111,3 +120,47 @@ async def test_legal_cert_still_logs_in_the_person(db):
         )
     assert r.status_code == 200
     assert r.json()["role"]["code"] == "applicant"
+
+
+class _StubAdapter:
+    """Answers `issue_challenge` with a fixed value regardless of the
+    configured `eimzo_mode` — these tests force the branch through
+    `issue_eimzo_challenge`'s own `mode` parameter instead."""
+
+    def __init__(self, challenge: str) -> None:
+        self._challenge = challenge
+
+    async def issue_challenge(self, ip: str | None = None) -> str:
+        return self._challenge
+
+
+class _OutageAdapter:
+    async def issue_challenge(self, ip: str | None = None) -> str:
+        raise EimzoError("ERR-INT-001")
+
+
+async def test_real_mode_takes_the_challenge_from_the_provider(db, monkeypatch) -> None:
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _StubAdapter("PROVIDER-CHALLENGE"))
+    challenge = await service.issue_eimzo_challenge(db, mode="real")
+    assert challenge == "PROVIDER-CHALLENGE"
+    # Nothing of ours was stored: their server owns the TTL and the matching.
+    assert await repo.get_valid_otp(db, hash_token(challenge), purpose="eimzo_challenge") is None
+
+
+async def test_mock_mode_still_mints_and_stores_our_own(db) -> None:
+    challenge = await service.issue_eimzo_challenge(db, mode="mock")
+    assert await repo.get_valid_otp(db, hash_token(challenge), purpose="eimzo_challenge")
+
+
+async def test_a_provider_outage_while_issuing_a_challenge_is_an_integration_error(
+    db, monkeypatch
+) -> None:
+    """Task 3's review found this exact class of defect on the signing
+    routes (an `EimzoError` escaping as a bare 500): a provider outage while
+    ISSUING a challenge must surface as `ERR-INT-001`, not a 500 and not an
+    empty challenge silently handed to the browser."""
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _OutageAdapter())
+    with pytest.raises(DomainError) as exc:
+        await service.issue_eimzo_challenge(db, mode="real")
+    assert exc.value.code == "ERR-INT-001"
+    assert exc.value.http_status == 503

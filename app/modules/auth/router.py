@@ -239,8 +239,11 @@ async def oneid_callback(
     response_model=EimzoChallengeOut,
     dependencies=[Depends(rate_limit("eimzo_challenge", "ratelimit_challenge_per_minute"))],
 )
-async def eimzo_challenge(db: Annotated[AsyncSession, Depends(get_db)]) -> EimzoChallengeOut:
-    return EimzoChallengeOut(challenge=await service.issue_eimzo_challenge(db))
+async def eimzo_challenge(
+    request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+) -> EimzoChallengeOut:
+    ip = request.client.host if request.client else None
+    return EimzoChallengeOut(challenge=await service.issue_eimzo_challenge(db, ip=ip))
 
 
 @router.post("/eimzo/login", response_model=MeOut)

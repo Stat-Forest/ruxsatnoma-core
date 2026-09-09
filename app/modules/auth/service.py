@@ -13,6 +13,7 @@ from cryptography.fernet import InvalidToken
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core import settings_store
 from app.core.crypto import decrypt_str
 from app.core.errors import err
@@ -220,7 +221,34 @@ async def login_via_oneid(
 EIMZO_CHALLENGE_TTL_MINUTES = 5
 
 
-async def issue_eimzo_challenge(db: AsyncSession) -> str:
+async def issue_eimzo_challenge(
+    db: AsyncSession, *, ip: str | None = None, mode: str | None = None
+) -> str:
+    """Plan 05.2 ruling R1 (option «а»): in `real` mode the login challenge
+    belongs to e-imzo-server, not to us. `POST /frontend/challenge` mints it
+    there with its own 120-second TTL and matches it again itself inside
+    `/backend/auth` — our own `otp_codes` copy would be a second TTL and a
+    second way to fail, protecting nothing (their server refuses a signature
+    whose challenge it does not recognise regardless of what we stored). So in
+    `real` mode this proxies the provider's own challenge straight through and
+    writes nothing of ours; `login_via_eimzo` mirrors this by skipping the
+    `otp_codes` lookup for the same mode (see its own comment).
+
+    In `mock` mode nothing changes: we still mint and store our own token
+    exactly as before this ruling.
+
+    `mode` defaults to `get_settings().eimzo_mode` — the route never passes
+    it, and it exists as a parameter only so a test can force either branch
+    without needing `get_eimzo_adapter()` to actually be mode-aware (a stub
+    adapter answers the same regardless of the configured mode)."""
+    if mode is None:
+        mode = get_settings().eimzo_mode
+    if mode == "real":
+        adapter = get_eimzo_adapter()
+        try:
+            return await adapter.issue_challenge(ip=ip)
+        except EimzoError as exc:
+            raise err(exc.err_code) from exc
     challenge = new_token()
     await repo.add(
         db,
@@ -241,10 +269,21 @@ async def login_via_eimzo(
         identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
         raise err(exc.err_code) from exc
-    row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
-    if row is None:
-        raise err("ERR-AUTH-004")  # unknown, expired or replayed challenge
-    row.used_at = datetime.now(UTC)
+    # Ruling R1: in `real` mode e-imzo-server has ALREADY matched the challenge
+    # itself, inside `/backend/auth`, before ever answering `status: 1` — and
+    # `issue_eimzo_challenge` never wrote an `otp_codes` row for it in this
+    # mode (see that function's own comment). `identity.challenge` is also
+    # deliberately `""` here (`RealEimzo.verify_signed_challenge`'s own
+    # docstring), so looking it up would always miss and fail closed on every
+    # real login. Do NOT "fix" this back into an unconditional lookup — that
+    # is exactly the regression this comment exists to prevent.
+    if get_settings().eimzo_mode == "mock":
+        row = await repo.get_valid_otp(
+            db, hash_token(identity.challenge), purpose="eimzo_challenge"
+        )
+        if row is None:
+            raise err("ERR-AUTH-004")  # unknown, expired or replayed challenge
+        row.used_at = datetime.now(UTC)
     if identity.cert_expires_at is not None and identity.cert_expires_at <= datetime.now(UTC):
         await audit.log(
             db,

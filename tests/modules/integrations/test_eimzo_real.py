@@ -180,14 +180,29 @@ async def test_issue_challenge_returns_the_challenge_field() -> None:
     adapter = RealEimzo(
         SETTINGS, transport=_json_transport({"challenge": "abc123", "ttl": 120, "status": 1})
     )
-    challenge = await adapter.issue_challenge()
+    challenge = await adapter.issue_challenge(ip="91.0.0.7")
     assert challenge == "abc123"
+
+
+async def test_issue_challenge_sends_the_signers_own_address() -> None:
+    """Task 3's own review flagged this gap on `issue_challenge` specifically
+    (no `ip` parameter at all): the same `X-Real-IP` threading every other
+    provider-reaching method already carries a test for."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["real_ip"] = request.headers["X-Real-IP"]
+        return httpx.Response(200, json={"challenge": "abc123", "status": 1})
+
+    adapter = _adapter(handler)
+    await adapter.issue_challenge(ip="91.0.0.7")
+    assert captured["real_ip"] == "91.0.0.7"
 
 
 async def test_issue_challenge_refuses_a_bad_response() -> None:
     adapter = RealEimzo(SETTINGS, transport=_json_transport({"status": -1}))
     with pytest.raises(EimzoError) as excinfo:
-        await adapter.issue_challenge()
+        await adapter.issue_challenge(ip=None)
     assert excinfo.value.err_code == "ERR-INT-002"
 
 
@@ -197,7 +212,7 @@ async def test_issue_challenge_refusal_carries_the_provider_status_and_reason() 
     route catching `EimzoError` could only answer a bare 502."""
     adapter = RealEimzo(SETTINGS, transport=_json_transport({"status": -1}))
     with pytest.raises(EimzoError) as excinfo:
-        await adapter.issue_challenge()
+        await adapter.issue_challenge(ip=None)
     assert excinfo.value.provider_status == -1
     assert excinfo.value.reason == "certificate_status_unknown"
 

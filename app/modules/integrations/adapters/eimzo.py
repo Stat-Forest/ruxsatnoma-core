@@ -166,7 +166,7 @@ class EimzoAdapter(Protocol):
         self, signed_challenge: str, ip: str | None
     ) -> EimzoIdentity: ...
 
-    async def issue_challenge(self) -> str: ...
+    async def issue_challenge(self, ip: str | None) -> str: ...
 
     async def verify_attached(self, pkcs7: str, ip: str | None) -> EimzoVerification: ...
 
@@ -287,12 +287,15 @@ class MockEimzo:
         except (ValueError, TypeError) as exc:
             raise EimzoError() from exc
 
-    async def issue_challenge(self) -> str:
+    async def issue_challenge(self, ip: str | None) -> str:
         """Ruling 11: in the real protocol the challenge belongs to e-imzo-server
         (`/frontend/challenge`), not to us. The mock only needs an opaque token in
-        the same shape; `auth` still issues its own login challenges into its own
-        token table through `auth.service.issue_eimzo_challenge`, unrelated to
-        this call — that redirection, if it happens, is a later task's decision."""
+        the same shape; `ip` is accepted for parity with `RealEimzo` and ignored
+        — the mock has no provider round trip to attach it to. `auth.service.
+        issue_eimzo_challenge` calls THIS method only in `real` mode: in `mock`
+        mode (still the default) it keeps minting and storing its own token in
+        `otp_codes` exactly as before ruling 11, so this method is never reached
+        from a mock-mode login at all."""
         return new_token()
 
     async def verify_attached(self, pkcs7: str, ip: str | None) -> EimzoVerification:
@@ -456,15 +459,17 @@ class RealEimzo:
     async def _get(self, path: str) -> dict[str, Any]:
         return await self._send("GET", path, content=None, ip=None)
 
-    async def issue_challenge(self) -> str:
+    async def issue_challenge(self, ip: str | None) -> str:
         """`POST /frontend/challenge` (design/04 §2.2 step 2): the challenge
         belongs to e-imzo-server here, with its own 120-second TTL — unlike
         the mock's opaque token, this one must be handed to the browser's
         `create_pkcs7` call and back to `/backend/auth` before it expires.
-        Wiring this into `auth.service.issue_eimzo_challenge` (ruling 11, the
-        mock's own docstring) is a later task; this method only speaks the
-        wire correctly."""
-        payload = await self._post("/frontend/challenge", "", ip=None)
+        `auth.service.issue_eimzo_challenge` calls this in `real` mode
+        (ruling 11) and threads through the CITIZEN's own address so it
+        reaches `X-Real-IP` here, same as every other provider-reaching
+        call — there is no session yet at this point, so `ip` comes straight
+        from the request, not from an authenticated actor."""
+        payload = await self._post("/frontend/challenge", "", ip=ip)
         challenge = payload.get("challenge")
         status = _body_status(payload)
         if status != 1 or not isinstance(challenge, str):

@@ -151,7 +151,7 @@ async def test_certificate_status_expired_serial_prefix():
 @pytest.mark.asyncio
 async def test_issue_challenge_returns_distinct_opaque_tokens():
     adapter = get_eimzo_adapter()
-    first = await adapter.issue_challenge()
-    second = await adapter.issue_challenge()
+    first = await adapter.issue_challenge(ip=None)
+    second = await adapter.issue_challenge(ip=None)
     assert isinstance(first, str) and len(first) > 16
     assert first != second
