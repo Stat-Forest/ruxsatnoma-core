@@ -32,9 +32,12 @@ from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
+from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import (
     EIMZO_STATUS_REASONS,
+    EimzoCall,
     EimzoCertificateInfo,
+    EimzoError,
     get_eimzo_adapter,
 )
 from app.modules.signatures import repo
@@ -403,12 +406,74 @@ async def _ownership_reason(
     return "certificate_pinfl_mismatch"
 
 
-async def _reconcile_status(db: AsyncSession, cert: Certificate, live_status: str) -> None:
+async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> None:
+    """One `integration_log` row per provider round trip (tz/09 "logging per
+    external message"), mirroring `auth.service._log_oneid_calls` (stage 5.1
+    task 6) — the same shape, a different provider.
+
+    Written HERE, not inside the adapter, for the same reason `_log_oneid_calls`
+    gives: this is where the session lives, and no adapter in this codebase
+    opens a transaction of its own. `calls` is whatever `RealEimzo.calls`
+    accumulated for the ONE adapter instance a caller used — every round trip
+    it made, success or refusal (`EimzoCall`'s own docstring) — so a caller
+    that reaches this after catching `EimzoError` logs the very call that
+    failed, not only the ones that succeeded. `MockEimzo` has no `.calls`
+    attribute at all (no round trip was ever made), so a caller passes
+    `getattr(adapter, "calls", ())` and this loop simply does nothing for it.
+
+    `meta` carries only `EimzoCall.provider_status`/`provider_message` — the
+    provider's own numeric status and its own message, nothing else: never the
+    pkcs7, never the PINFL, never a certificate subject, never a document
+    byte. Task 3's fix round added `provider_status`/`reason` to `EimzoError`
+    itself so a route could explain a refusal in more than a bare 502/503;
+    this is the first place either value's own DATA — carried here through the
+    sibling `EimzoCall` recorded at the same moment inside `RealEimzo._send`
+    — actually reaches somewhere an administrator can read it."""
+    for call in calls:
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system="eimzo",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_status": call.provider_status, "provider_message": call.provider_message}
+                if call.provider_status is not None or call.provider_message is not None
+                else None
+            ),
+        )
+
+
+async def _reconcile_status(
+    db: AsyncSession, cert: Certificate, live_status: str, *, revocation_checkable: bool
+) -> None:
     """The adapter's CRL/OCSP-equivalent answer is the truth about a
     certificate's PKI state; the `status` we stored at bind time (or last
     reconciled) can go stale the moment the CA revokes a certificate someone
     already holds. Reconciled on every sign attempt, not on a schedule — the
-    moment that matters is the one about to decide a verdict."""
+    moment that matters is the one about to decide a verdict.
+
+    **Task 6's own review finding, decided here: a certificate already marked
+    `"revoked"` is never moved off it by an adapter that cannot check
+    revocation authoritatively.** `revocation_checkable=False` is exactly
+    `RealEimzo` (`EimzoAdapter.revocation_checkable`'s own docstring):
+    `certificate_status` there answers from `valid_to` alone and can only
+    ever return `"active"`/`"expired"` — it never returns `"revoked"` and
+    never CONFIRMS a certificate is not revoked either, because e-imzo-server
+    has no endpoint that answers that question for a bare serial number.
+    Accepting such an answer unconditionally would silently flip a genuinely
+    revoked certificate back to `"active"` on the very next `sign()`/
+    `reverify()` while its `revoked_at` stayed set — a row contradicting
+    itself, and the exact UPGRADE this module's whole discipline forbids
+    (`reverify()`'s own docstring: confirm or downgrade, never upgrade). An
+    adapter that CAN check revocation authoritatively (`revocation_checkable
+    =True` — `MockEimzo`, whose serial-prefix convention answers the
+    question directly) is trusted for every transition, `"revoked"`
+    included: its answer already accounts for revocation and is not merely a
+    date comparison, so there is nothing to guard against."""
+    if cert.status == "revoked" and not revocation_checkable:
+        return
     if live_status == cert.status:
         return
     cert.status = live_status
@@ -472,6 +537,7 @@ async def sign(
     pkcs7: str,
     user: User,
     content_changed_reason: str | None = None,
+    ip: str | None = None,
 ) -> Signature:
     """Attach a signature to `(object_type, object_id, purpose)`.
 
@@ -573,7 +639,31 @@ async def sign(
 
     doc_hash = hashlib.sha256(document).hexdigest()
     adapter = get_eimzo_adapter()
-    result = await adapter.verify_detached(document=document, pkcs7=pkcs7)
+    try:
+        result = await adapter.verify_detached(document=document, pkcs7=pkcs7, ip=ip)
+    except EimzoError as exc:
+        # Fix round 1, finding 1: a transport failure or a non-200 from the
+        # provider (`ERR-INT-001`/`ERR-INT-002`) is not a VERDICT about this
+        # signature -- nothing was ever evaluated, so it must not become an
+        # "invalid" row (`verification_status`) the way a genuine refusal
+        # does below. It is also not the SIGNER's fault, so unlike every
+        # other refusal in this function it earns no `audit_log` entry --
+        # this mirrors `auth.service.login_via_eimzo`'s own handling of the
+        # identical exception one call up. Task 5: the integration log is not
+        # the audit trail and is written regardless -- an administrator must
+        # be able to tell "our configuration is wrong" from "the provider is
+        # down", and that is exactly the round trip a refusal like this one
+        # carries. Nothing else of ours has been written at this point in
+        # `sign()`, so the commit below only persists this one log row.
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
+        # Minor 9 (final review): carry the provider's own status/reason onto
+        # the response instead of a bare 502/503 -- `integrations.service.
+        # eimzo_error_details` already builds exactly this payload for the
+        # timestamp route (stage 3.8 ruling 9: every status code keeps its
+        # own reason); reused here rather than a second copy.
+        raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     info = result.subject_certificate
 
     if info is None:
@@ -585,7 +675,8 @@ async def sign(
         # only way this adapter reaches here) always wins ahead of it. The
         # attempt is still audited and committed before raising, same as
         # every other refusal below — there is just no signature row to keep
-        # alongside it.
+        # alongside it. The integration log row above rides along on this
+        # same commit.
         verdict = build_verdict(result, cert_status="active", now=datetime.now(UTC))
         await audit.log(
             db,
@@ -601,8 +692,12 @@ async def sign(
         raise err("ERR-SIGN-001", details={"reason": verdict.reason})
 
     cert = await bind_certificate(db, info=info, user=user)
-    live_status = await adapter.certificate_status(serial=info.serial_number, issuer=info.issuer)
-    await _reconcile_status(db, cert, live_status)
+    live_status = await adapter.certificate_status(
+        serial=info.serial_number, issuer=info.issuer, valid_to=info.valid_to
+    )
+    await _reconcile_status(
+        db, cert, live_status, revocation_checkable=adapter.revocation_checkable
+    )
 
     verdict = build_verdict(result, cert_status=cert.status, now=datetime.now(UTC))
     unowned_reason = await _ownership_reason(db, info=info, user=user)
@@ -790,7 +885,9 @@ async def list_my_certificates(
     )
 
 
-async def register_certificate(db: AsyncSession, *, pkcs7: str, user: User) -> Certificate:
+async def register_certificate(
+    db: AsyncSession, *, pkcs7: str, user: User, ip: str | None = None
+) -> Certificate:
     """`POST /certificates` (ruling 4's second sentence): register a
     certificate ahead of any actual signing, from a self-contained signed
     challenge (`verify_attached` — there is no external document to hand
@@ -806,7 +903,20 @@ async def register_certificate(db: AsyncSession, *, pkcs7: str, user: User) -> C
     own docstring names this route explicitly as the reason its permissive
     branch cannot be the only check)."""
     adapter = get_eimzo_adapter()
-    result = await adapter.verify_attached(pkcs7)
+    try:
+        result = await adapter.verify_attached(pkcs7, ip=ip)
+    except EimzoError as exc:
+        # Fix round 1, finding 1 -- same reasoning as `sign()`'s own
+        # try/except a few hundred lines up: a provider outage is not a
+        # verdict about this presentation and not the caller's fault, so it
+        # earns no `audit_log` entry and no `certificates` row, only the
+        # mapped integration error. Task 5: the integration log is written
+        # regardless -- an administrator must be able to tell "our
+        # configuration is wrong" from "the provider is down".
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
+        raise err(exc.err_code) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     info = result.subject_certificate
     if info is None or result.status_code != 1:
         reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")
@@ -957,13 +1067,37 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     lands on, so a downgrade caused by certificate standing is flagged the
     same way a `sign()`-time one is — no separate marking logic needed.
 
-    The record itself says plainly what it re-checked
-    (`"rechecked": "certificate_status"`) rather than copying the ORIGINAL
-    verification blob wholesale, which would leave its `status_code` (a
-    crypto-check result) sitting next to a reverify verdict, reading as
+    The record itself says plainly what it re-checked rather than copying the
+    ORIGINAL verification blob wholesale, which would leave its `status_code`
+    (a crypto-check result) sitting next to a reverify verdict, reading as
     though a cryptographic check had just been re-run. The original's own
     status/reason travel along for provenance under `original_*` keys,
     never bare ones a reader could mistake for this check's own.
+
+    **Task 6 (plan 05.2 R3, option «а», Oybek 2026-09-09): `rechecked` NAMES
+    the check this call actually made, and it comes from the adapter, not
+    from a mode flag.** `e-imzo-server` has no endpoint that answers "is this
+    certificate revoked" for a bare serial number — revocation is checked
+    only INSIDE signature verification, over the VPN, so in production a
+    revocation is discovered at the NEXT signature and never before a
+    reverify. Reporting `"certificate_status"` unconditionally, as this used
+    to, implied a revocation check that real mode never performs.
+    `EimzoAdapter.revocation_checkable` (Task 3) is exactly this fact,
+    readable without asking which adapter class is behind it — `signatures`
+    is a level-2 module and must not know that — so `rechecked` reads
+    `"certificate_status"` when it is `True` (`MockEimzo`, whose serial-prefix
+    convention answers a revocation question directly) and
+    `"certificate_validity_only"` when it is `False` (`RealEimzo`, whose
+    `certificate_status` answers from `valid_to` alone); `revocation_checked`
+    carries the same boolean explicitly, so a reader does not have to parse
+    the string to know whether revocation was actually examined. This is also
+    why the decision below reads `cert.status` — the value `_reconcile_status`
+    just wrote, AFTER its own guard against un-revoking a certificate on a
+    date-only answer — rather than the adapter's raw `live_status`: reading
+    the raw value here would let a real-mode reverify report a revoked
+    certificate's signature "valid" again the moment `_reconcile_status`
+    refused to update the certificate row, silently reopening the exact gap
+    that guard exists to close.
 
     Fix round 1 (Important) — the ordinal suffix: `purpose` is written as
     `f"{original.purpose}:reverify:{n}"`, `n` the next ordinal among
@@ -1000,26 +1134,34 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
         raise err("ERR-SYS-003")
     cert = await get_certificate(db, original.certificate_id)
     adapter = get_eimzo_adapter()
-    live_status = await adapter.certificate_status(serial=cert.serial_number, issuer=cert.issuer)
-    await _reconcile_status(db, cert, live_status)
+    live_status = await adapter.certificate_status(
+        serial=cert.serial_number, issuer=cert.issuer, valid_to=cert.valid_to
+    )
+    await _reconcile_status(
+        db, cert, live_status, revocation_checkable=adapter.revocation_checkable
+    )
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
 
     now = datetime.now(UTC)
     if original.verification_status == "invalid":
         new_status = "invalid"
         reason = original.verification.get("reason")
-    elif live_status == "revoked":
+    elif cert.status == "revoked":
         new_status, reason = "invalid", "certificate_revoked"
-    elif live_status == "expired":
+    elif cert.status == "expired":
         new_status, reason = "invalid", "certificate_expired"
     else:
         new_status, reason = "valid", None
 
     record: dict[str, Any] = {
-        "rechecked": "certificate_status",
+        "rechecked": (
+            "certificate_status" if adapter.revocation_checkable else "certificate_validity_only"
+        ),
+        "revocation_checked": adapter.revocation_checkable,
         "original_signature_id": str(original.id),
         "original_verification_status": original.verification_status,
         "original_reason": original.verification.get("reason"),
-        "certificate_status": live_status,
+        "certificate_status": cert.status,
         "certificate_serial_number": cert.serial_number,
         "certificate_issuer": cert.issuer,
         "reverified_at": now.isoformat(),

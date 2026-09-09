@@ -65,6 +65,11 @@ UNGRANTED_BY_DESIGN = frozenset(
         "public.appeals.manage",
         "help.faq.manage",
         "help.tickets.manage",
+        # Stage 5.2 task 7: `GET /eimzo/health` proxies the E-IMZO provider's
+        # own `/ping`/`/info` for an administrator, with no shell access to
+        # the server -- deliberately `sys_admin` only, never a role grant
+        # (`integrations.permissions`'s own docstring).
+        "integrations.eimzo.health",
         # Stage 7.9 task 3 (decision #163): the split's recipients directory
         # decides where a country's money goes, so this one is a DELIBERATE,
         # permanent member of this set until the Agency names who besides

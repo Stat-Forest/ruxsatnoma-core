@@ -1,22 +1,28 @@
 import base64
+import copy
+import json
 import secrets
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.core.errors import DomainError
 from app.core.time import business_today
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Applicant, Representation, User
-from app.modules.integrations.adapters.eimzo import encode_mock_signature
+from app.modules.integrations.adapters.eimzo import RealEimzo, encode_mock_signature
+from app.modules.integrations.models import IntegrationLog
 from app.modules.signatures import repo, service
 from tests.modules.auth.test_sessions import make_user
+from tests.modules.integrations.eimzo_samples import VENDOR_DETACHED_SAMPLE
 
 DOC = b"the-permit-bytes"
 OBJ = uuid.uuid4()
@@ -695,3 +701,200 @@ async def test_an_unrelated_integrity_violation_is_not_mislabeled_already_signed
     # level — clear it before this file's autouse cleanup fixture reuses the
     # same session in its own teardown.
     await db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: one `integration_log` row per provider round trip, written even
+# when `sign()` refuses the attempt — an administrator must be able to tell
+# "our configuration is wrong" from "the provider is down". `RealEimzo`
+# against `httpx.MockTransport` (never the real `e-imzo-server`, the same
+# rule `test_eimzo_real.py` follows), so the round trip is genuine but no
+# network is touched.
+# ---------------------------------------------------------------------------
+
+REAL_SETTINGS = Settings(
+    eimzo_mode="real",
+    eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+    _env_file=None,  # pyright: ignore[reportCallIssue]
+)
+
+
+async def _eimzo_log_tail(db: AsyncSession, count: int):
+    """The last `count` eimzo rows. The test database is shared and nothing
+    rolls a committed row back (backend/CLAUDE.md), so rows from earlier
+    tests are always present; ids are uuid7 and therefore time-ordered
+    (mirrors `test_oneid_login.py`'s own `_oneid_log_tail`)."""
+    await db.flush()
+    rows = (
+        (
+            await db.execute(
+                select(IntegrationLog)
+                .where(IntegrationLog.system == "eimzo")
+                .order_by(IntegrationLog.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows[-count:]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_signature_is_still_logged(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider answers a normal 200 with `{"status": -10}` — a genuine
+    VERDICT (no certificate parsed), not a transport error — so `sign()`
+    takes its "info is None" refusal path. The round trip itself must still
+    be logged."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": -10, "message": "bad signature"})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    obj_id = uuid.uuid4()
+
+    with pytest.raises(DomainError):
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"doc",
+            pkcs7="broken",
+            user=a_user,
+        )
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.endpoint == "/backend/pkcs7/verify/detached"
+    assert "pkcs7" not in json.dumps(row.meta or {})
+    assert "doc" not in json.dumps(row.meta or {})
+
+
+@pytest.mark.asyncio
+async def test_a_refused_signature_pins_the_providers_own_status_and_message(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 5's review, deferred to this batch: the sibling test above only
+    asserts ABSENCE (`"pkcs7" not in ...`) — a regression that always wrote
+    `meta=None` would pass it, and every other new test in this class, right
+    alongside it. `meta["provider_status"]`/`["provider_message"]` are
+    exactly what tell an administrator "our configuration is wrong" from
+    "the provider is down" (task 7's `EimzoError.provider_status`/`.reason`
+    read the very same two fields off the exception this refusal raises), so
+    this pins the POSITIVE content instead."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": -10, "message": "bad signature"})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    obj_id = uuid.uuid4()
+
+    with pytest.raises(DomainError):
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"doc",
+            pkcs7="broken",
+            user=a_user,
+        )
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.meta == {"provider_status": -10, "provider_message": "bad signature"}
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_also_logged(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other refusal shape: the provider is unreachable at all
+    (`ERR-INT-001`, never a verdict) — `EimzoCall`'s own docstring says this
+    is logged WHATEVER HAPPENS, transport failure included."""
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(boom)),
+    )
+    obj_id = uuid.uuid4()
+
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"doc",
+            pkcs7="unused",
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-INT-001"
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.endpoint == "/backend/pkcs7/verify/detached"
+    assert row.http_status is None
+    assert row.meta is None
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_certificate_from_the_provider_is_a_verdict_not_a_500(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 4 (final review): the provider answers `status: 1` (success)
+    with a signer certificate missing `validFrom` — before the fix,
+    `eimzo_wire._certificate_from_pkcs7_entry`'s bare `cert_data["validFrom"]`
+    let a `KeyError` escape `sign()`'s own `except EimzoError`, answering a
+    signing route with an unhandled 500: no signature row, no audit entry, no
+    integration-log row. The fixed wire parser treats this the way the mock
+    adapter treats an undecodable envelope — a verdict (`certificate_missing`
+    via `build_verdict`'s own fail-closed check), never an exception, so
+    `sign()` reaches its normal "info is None" refusal path: evidenced and
+    committed, `ERR-SIGN-001`, not a bare 500."""
+    sample = copy.deepcopy(VENDOR_DETACHED_SAMPLE)
+    del sample["pkcs7Info"]["signers"][0]["certificate"][0]["validFrom"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=sample)
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    obj_id = uuid.uuid4()
+
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"doc",
+            pkcs7="broken",
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details == {"reason": "certificate_missing"}
+
+    # Evidenced, not silently swallowed: an audit_log row exists (there is no
+    # certificate to bind, so no `signatures` row either — `sign()`'s own
+    # documented shape for this branch).
+    audit_count = (
+        await db.execute(
+            select(func.count()).select_from(AuditLog).where(AuditLog.object_id == obj_id)
+        )
+    ).scalar_one()
+    assert audit_count == 1

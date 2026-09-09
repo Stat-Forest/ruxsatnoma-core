@@ -1215,7 +1215,13 @@ async def _submitter_of(db: AsyncSession, permit: Permit) -> uuid.UUID:
 
 
 async def add_signature(
-    db: AsyncSession, permit_id: uuid.UUID, *, purpose: str, pkcs7: str, user: User
+    db: AsyncSession,
+    permit_id: uuid.UUID,
+    *,
+    purpose: str,
+    pkcs7: str,
+    user: User,
+    ip: str | None = None,
 ) -> Permit:
     """Attach one of the four ERI signatures, and activate the permit if it was
     the last one missing.
@@ -1308,6 +1314,7 @@ async def add_signature(
         document=document,
         pkcs7=pkcs7,
         user=user,
+        ip=ip,
     )
 
     # 5. C11: ACTIVE if and only if every required signature is valid — asked of
@@ -1937,7 +1944,12 @@ async def set_status(
 
 
 async def suspend(
-    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+    db: AsyncSession,
+    permit_id: uuid.UUID,
+    *,
+    data: DecisionIn,
+    actor: User,
+    ip: str | None = None,
 ) -> Permit:
     """С13: suspend an ACTIVE permit on a named ground. See the section
     docstring above for why this exists beside `lifecycle_router.py`'s route
@@ -1952,11 +1964,17 @@ async def suspend(
         data=data,
         actor=actor,
         event_code=events.PERMIT_SUSPENDED,
+        ip=ip,
     )
 
 
 async def resume(
-    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+    db: AsyncSession,
+    permit_id: uuid.UUID,
+    *,
+    data: DecisionIn,
+    actor: User,
+    ip: str | None = None,
 ) -> Permit:
     """С13: resume a SUSPENDED permit, back to `active`. See `suspend` above."""
     from app.modules.permits import decisions
@@ -1969,6 +1987,7 @@ async def resume(
         data=data,
         actor=actor,
         event_code=events.PERMIT_RESUMED,
+        ip=ip,
     )
 
 
@@ -2027,7 +2046,12 @@ async def revoke_tickets_of(db: AsyncSession, permit: Permit, *, actor: User) ->
 
 
 async def revoke(
-    db: AsyncSession, permit_id: uuid.UUID, *, data: DecisionIn, actor: User
+    db: AsyncSession,
+    permit_id: uuid.UUID,
+    *,
+    data: DecisionIn,
+    actor: User,
+    ip: str | None = None,
 ) -> Permit:
     """С13: cancel a permit for cause. Reachable from `active` AND from
     `suspended` (`PERMIT_TRANSITIONS`); terminal but for 4.7's `archived`.
@@ -2059,6 +2083,7 @@ async def revoke(
         data=data,
         actor=actor,
         event_code=events.PERMIT_REVOKED,
+        ip=ip,
     )
     await revoke_tickets_of(db, permit, actor=actor)
     return permit

@@ -880,6 +880,7 @@ async def sign_act(
     pkcs7: str,
     violation_type_item_id: uuid.UUID | None,
     actor: User,
+    ip: str | None = None,
 ) -> InspectionAct:
     """`POST /inspections/acts/{id}/sign` — ruling 1 of the plan: the act is
     final only once ERI-signed (tz/04 С15: "чеклист → статус → подпись ЭРИ").
@@ -911,6 +912,7 @@ async def sign_act(
         document=document,
         pkcs7=pkcs7,
         user=actor,
+        ip=ip,
     )
     act.status = "signed"
     await db.flush()

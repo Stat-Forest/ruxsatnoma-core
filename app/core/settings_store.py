@@ -86,6 +86,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ratelimit_challenge_per_minute", int, 10, "Per-IP limit for POST /auth/eimzo/challenge"
         ),
+        # Ruling T78-1: this route used to share `eimzo_challenge`'s own bucket
+        # (the brief's "rate-limited the way /auth/eimzo/challenge is" meant the
+        # MECHANISM, not the bucket). One anonymous login-challenge burst behind
+        # an office NAT would otherwise throttle unrelated, in-progress document
+        # SIGNING for everyone at that address. 20/min, double the challenge
+        # route's own limit: a permit can carry up to four signatures, each
+        # timestamped separately, plus the occasional retry.
+        SettingSpec(
+            "ratelimit_eimzo_timestamp_per_minute",
+            int,
+            20,
+            "Per-IP limit for POST /api/v1/eimzo/timestamp",
+        ),
         SettingSpec("notifications_sms_enabled", bool, True, "Ops kill switch for the SMS channel"),
         # Decision #152: the nightly SMS quiet window, Asia/Tashkent whole hours.
         # `sms` only — `sms_otp` is a code somebody is waiting for on the login

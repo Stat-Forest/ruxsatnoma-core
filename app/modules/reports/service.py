@@ -460,7 +460,14 @@ async def submit_report(db: AsyncSession, report_id: uuid.UUID, actor: User) -> 
     return report
 
 
-async def sign_report(db: AsyncSession, report_id: uuid.UUID, *, pkcs7: str, actor: User) -> Report:
+async def sign_report(
+    db: AsyncSession,
+    report_id: uuid.UUID,
+    *,
+    pkcs7: str,
+    actor: User,
+    ip: str | None = None,
+) -> Report:
     """`submitted` -> `head_approved`, the rahbar's ERI signature
     (purpose=`report_approve`, design/02). Nothing of ours is pending when
     `sign()` is called — its transaction contract commits the caller's WHOLE
@@ -481,6 +488,7 @@ async def sign_report(db: AsyncSession, report_id: uuid.UUID, *, pkcs7: str, act
         document=_report_bytes(report),
         pkcs7=pkcs7,
         user=actor,
+        ip=ip,
     )
 
     report.status = "head_approved"

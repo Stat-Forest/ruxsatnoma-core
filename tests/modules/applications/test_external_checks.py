@@ -55,6 +55,9 @@ def _prod_settings():
         oneid_client_secret="a-real-oneid-client-secret",
         oneid_scope="forestry_uz",
         oneid_redirect_uri="https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback",
+        # Stage 5.2: a real E-IMZO needs the site host its API-KEY is bound to
+        # (decision #165); eimzo_base_url keeps its private-network default.
+        eimzo_site_host="admin.ruxsatnoma-urmon.uz",
         sms_mode="real",
         email_mode="real",
         payme_mode="real",

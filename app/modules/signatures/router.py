@@ -14,7 +14,7 @@ module's own router, never mounted under another module's prefix."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -51,13 +51,19 @@ async def list_certificates(
 @router.post("/certificates", status_code=201)
 async def create_certificate(
     payload: CertificateBindIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
 ) -> CertificateOut:
     """Bind a certificate ahead of any actual signing, from a signed
     challenge — ownership proven by PINFL/STIR the same way `sign()` proves
     it on every call (ruling 4)."""
-    cert = await service.register_certificate(db, pkcs7=payload.pkcs7, user=user)
+    cert = await service.register_certificate(
+        db,
+        pkcs7=payload.pkcs7,
+        user=user,
+        ip=request.client.host if request.client else None,
+    )
     return CertificateOut.model_validate(cert)
 
 

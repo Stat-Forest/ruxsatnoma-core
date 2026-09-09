@@ -1833,7 +1833,7 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
 
 
 async def submit(
-    db: AsyncSession, application_id: uuid.UUID, *, pkcs7: str, actor: User
+    db: AsyncSession, application_id: uuid.UUID, *, pkcs7: str, actor: User, ip: str | None = None
 ) -> Application:
     """`POST /applications/{id}/submit` — the fourteen steps of the block
     comment above, in one transaction.
@@ -1908,6 +1908,7 @@ async def submit(
         pkcs7=pkcs7,
         user=actor,
         content_changed_reason=STALE_PACKAGE_REASON,
+        ip=ip,
     )
 
     # Step 9, ruling 8: EXACTLY ONE calculation per application, written here

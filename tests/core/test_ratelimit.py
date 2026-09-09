@@ -12,6 +12,8 @@ from app.core.errors import DomainError
 from app.core.models import SystemSetting
 from app.main import create_app
 from tests.conftest import make_client
+from tests.modules.admin.test_organizations_admin import auth_client
+from tests.modules.auth.test_sessions import make_session, make_user
 
 API = "/api/v1"
 
@@ -112,6 +114,62 @@ async def test_eimzo_challenge_route_is_rate_limited(db, _low_challenge_limit):
         r = await client.post(f"{API}/auth/eimzo/challenge")
     assert r.status_code == 429
     assert r.json()["error"]["code"] == "ERR-SYS-006"
+
+
+# --- Ruling T78-1: POST /eimzo/timestamp owns its own bucket ------------------
+
+
+@pytest.fixture
+async def _low_eimzo_timestamp_limit(db):
+    """Push POST /eimzo/timestamp's per-IP limit down to 2 so a 3rd call trips
+    ERR-SYS-006."""
+    key = "ratelimit_eimzo_timestamp_per_minute"
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == key))
+    db.add(SystemSetting(key=key, value=2))
+    await db.commit()
+    settings_store.invalidate(key)
+    yield
+    await db.execute(delete(SystemSetting).where(SystemSetting.key == key))
+    await db.commit()
+    settings_store.invalidate(key)
+
+
+async def test_eimzo_timestamp_route_is_rate_limited(db, _low_eimzo_timestamp_limit):
+    user = await make_user(db)
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        for _ in range(2):
+            r = await client.post(f"{API}/eimzo/timestamp", json={"pkcs7": "cGtjczc="})
+            assert r.status_code != 429
+        r = await client.post(f"{API}/eimzo/timestamp", json={"pkcs7": "cGtjczc="})
+    assert r.status_code == 429
+    assert r.json()["error"]["code"] == "ERR-SYS-006"
+
+
+async def test_eimzo_challenge_and_timestamp_do_not_share_a_bucket(db, _low_challenge_limit):
+    """The regression ruling T78-1 fixes: the two routes used to share the
+    `"eimzo_challenge"` bucket, so exhausting the login-challenge budget from one
+    IP (a plausible office-NAT burst) would also 429 an unrelated, in-progress
+    document signing through `/eimzo/timestamp`. They must be independent."""
+    user = await make_user(db)
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        for _ in range(2):
+            r = await client.post(f"{API}/auth/eimzo/challenge")
+            assert r.status_code != 429
+        exhausted = await client.post(f"{API}/auth/eimzo/challenge")
+        assert exhausted.status_code == 429
+
+        auth_client(client, token, csrf)
+        r = await client.post(f"{API}/eimzo/timestamp", json={"pkcs7": "cGtjczc="})
+    assert r.status_code == 200, r.text
 
 
 # --- 3.11a ruling T5-e: the trim may not reach across scopes ------------------

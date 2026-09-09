@@ -17,6 +17,7 @@ from app.core.time import in_quiet_hours
 from app.db import uuid7
 from app.modules.audit import service as audit
 from app.modules.integrations import breaker, repo
+from app.modules.integrations.adapters.eimzo import EimzoCall, EimzoError, get_eimzo_adapter
 from app.modules.integrations.models import InboundDeadLetter, IntegrationLog, OutboxMessage
 from app.modules.integrations.senders import SENDERS, register_sender
 
@@ -188,6 +189,94 @@ async def log_integration(
             meta=meta,
         )
     )
+
+
+async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> None:
+    """One `integration_log` row per provider round trip -- mirrors
+    `auth.service._log_eimzo_calls`/`signatures.service._log_eimzo_calls`
+    (stage 5.2 task 5) for THIS module's own two call sites (Task 7).
+    Duplicated rather than shared for the same reason those two mirror each
+    other rather than importing one another: each caller owns the session
+    the row is written on, and there is no adapter in this codebase that
+    opens a transaction of its own. `meta` carries only the provider's own
+    numeric status and message (`EimzoCall.provider_status`/
+    `.provider_message`) -- never the PKCS#7, never a certificate subject."""
+    for call in calls:
+        await log_integration(
+            db,
+            direction="out",
+            system="eimzo",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_status": call.provider_status, "provider_message": call.provider_message}
+                if call.provider_status is not None or call.provider_message is not None
+                else None
+            ),
+        )
+
+
+def eimzo_error_details(exc: EimzoError) -> dict[str, Any] | None:
+    """Task 7's whole reason to read `EimzoError.provider_status`/`.reason`
+    (fix round 1, finding 4, write-only until this route): a refusal must
+    reach the caller with the provider's OWN machine-readable reason instead
+    of a bare 502/503, so the front end can say "your certificate expired"
+    instead of "signature error" (stage 3.8 ruling 9 -- every status code
+    keeps its own reason). `None` when the exception carries neither (a
+    transport failure never reached the provider at all).
+
+    Public (not `_`-prefixed), unlike this module's own `_log_eimzo_calls` —
+    that one is deliberately duplicated per caller (each owns the session a
+    log row is written on); this one is pure, so `sign()`/`login_via_eimzo`/
+    `_verify_org_challenge` import and reuse THIS one instead of each writing
+    their own (Minor 9, final review)."""
+    if exc.provider_status is None and exc.reason is None:
+        return None
+    return {"provider_status": exc.provider_status, "reason": exc.reason}
+
+
+async def attach_eimzo_timestamp(db: AsyncSession, *, pkcs7: str, ip: str | None) -> str:
+    """`POST /api/v1/eimzo/timestamp`'s business logic (Task 7, plan ruling
+    R5). A trusted timestamp is mandatory on every signature: without one,
+    the only evidence of WHEN a document was signed is the signer's own
+    computer clock -- and a permit is a legal document with a validity
+    period. Any authenticated caller may reach this; it attaches no meaning
+    to the document, only a time.
+
+    Logs the round trip whatever happens (task 5's shape): a refusal is
+    logged and committed BEFORE it is re-raised -- nothing else is pending on
+    this session at this point, so the commit persists only this one row."""
+    adapter = get_eimzo_adapter()
+    try:
+        stamped = await adapter.attach_timestamp(pkcs7, ip=ip)
+    except EimzoError as exc:
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
+        raise err(exc.err_code, details=eimzo_error_details(exc)) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+    return stamped
+
+
+async def eimzo_health(db: AsyncSession) -> dict[str, Any]:
+    """`GET /api/v1/eimzo/health`'s business logic (Task 7; Task 8's own
+    container is what this reads from in `real` mode) -- proxies
+    `RealEimzo.health()`'s `/ping` + `/info` so an administrator can see
+    whether the VPN is up and when the key expires, without shell access to
+    the server. A provider outage raises `EimzoError` like any other call;
+    the router lets it surface as its registered `ERR-INT-001`/`ERR-INT-002`
+    rather than papering over it as "healthy" -- an administrator checking
+    this route needs to see the SAME failure a citizen's signature would
+    hit, not a friendlier lie."""
+    adapter = get_eimzo_adapter()
+    try:
+        health = await adapter.health()
+    except EimzoError as exc:
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
+        raise err(exc.err_code, details=eimzo_error_details(exc)) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+    return health
 
 
 async def requeue_message(

@@ -3,8 +3,23 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import Settings
+from app.core.errors import DomainError
+from app.core.security import hash_token
 from app.main import create_app
-from app.modules.integrations.adapters.eimzo import EimzoIdentity, encode_mock_signed_challenge
+from app.modules.auth import repo, service
+from app.modules.integrations.adapters.eimzo import (
+    EimzoError,
+    EimzoIdentity,
+    RealEimzo,
+    encode_mock_signed_challenge,
+)
+from app.modules.integrations.models import IntegrationLog
 from tests.conftest import make_client
 
 API = "/api/v1"
@@ -111,3 +126,197 @@ async def test_legal_cert_still_logs_in_the_person(db):
         )
     assert r.status_code == 200
     assert r.json()["role"]["code"] == "applicant"
+
+
+class _StubAdapter:
+    """Answers `issue_challenge` with a fixed value regardless of the
+    configured `eimzo_mode` — these tests force the branch through
+    `issue_eimzo_challenge`'s own `mode` parameter instead."""
+
+    def __init__(self, challenge: str) -> None:
+        self._challenge = challenge
+
+    async def issue_challenge(self, ip: str | None = None) -> str:
+        return self._challenge
+
+
+class _OutageAdapter:
+    async def issue_challenge(self, ip: str | None = None) -> str:
+        raise EimzoError("ERR-INT-001")
+
+
+async def test_real_mode_takes_the_challenge_from_the_provider(db, monkeypatch) -> None:
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _StubAdapter("PROVIDER-CHALLENGE"))
+    challenge = await service.issue_eimzo_challenge(db, mode="real")
+    assert challenge == "PROVIDER-CHALLENGE"
+    # Nothing of ours was stored: their server owns the TTL and the matching.
+    assert await repo.get_valid_otp(db, hash_token(challenge), purpose="eimzo_challenge") is None
+
+
+async def test_mock_mode_still_mints_and_stores_our_own(db) -> None:
+    challenge = await service.issue_eimzo_challenge(db, mode="mock")
+    assert await repo.get_valid_otp(db, hash_token(challenge), purpose="eimzo_challenge")
+
+
+async def test_a_provider_outage_while_issuing_a_challenge_is_an_integration_error(
+    db, monkeypatch
+) -> None:
+    """Task 3's review found this exact class of defect on the signing
+    routes (an `EimzoError` escaping as a bare 500): a provider outage while
+    ISSUING a challenge must surface as `ERR-INT-001`, not a 500 and not an
+    empty challenge silently handed to the browser."""
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _OutageAdapter())
+    with pytest.raises(DomainError) as exc:
+        await service.issue_eimzo_challenge(db, mode="real")
+    assert exc.value.code == "ERR-INT-001"
+    assert exc.value.http_status == 503
+
+
+# ---------------------------------------------------------------------------
+# Task 5: one `integration_log` row per provider round trip. `RealEimzo`
+# against `httpx.MockTransport` (never the real `e-imzo-server`, the same
+# rule `test_eimzo_real.py` follows) so a genuine round trip is made and
+# logged, both on success and on a refusal.
+# ---------------------------------------------------------------------------
+
+REAL_SETTINGS = Settings(
+    eimzo_mode="real",
+    eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+    _env_file=None,  # pyright: ignore[reportCallIssue]
+)
+
+
+async def _eimzo_log_tail(db: AsyncSession, count: int):
+    """The last `count` eimzo rows. The test database is shared and nothing
+    rolls a committed row back (backend/CLAUDE.md), so rows from earlier
+    tests are always present; ids are uuid7 and therefore time-ordered
+    (mirrors `test_oneid_login.py`'s own `_oneid_log_tail`)."""
+    await db.flush()
+    rows = (
+        (
+            await db.execute(
+                select(IntegrationLog)
+                .where(IntegrationLog.system == "eimzo")
+                .order_by(IntegrationLog.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows[-count:]
+
+
+async def test_a_refused_login_is_still_logged(db, monkeypatch) -> None:
+    """`/backend/auth` answers a normal 200 with a non-1 status -- a refused
+    login (`ERR-AUTH-004`), not a transport error -- and the round trip must
+    still be logged."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": -10})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(
+            db, signed_challenge="whatever", ip="91.0.0.7", user_agent="ua"
+        )
+    assert exc.value.code == "ERR-AUTH-004"
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.endpoint == "/backend/auth"
+    assert "whatever" not in str(row.meta)
+
+
+async def test_a_non_200_login_refusal_carries_the_providers_reason(db, monkeypatch) -> None:
+    """Minor 9 (final review): `login_via_eimzo` used to `raise
+    err(exc.err_code)` with no `details`, discarding `EimzoError.
+    provider_status`/`.reason` -- present here since `/backend/auth`
+    answered a non-200 with a JSON body `_send` already parses and attaches
+    to the exception (mirrors `test_eimzo_real.py::
+    test_a_non_200_response_with_a_status_field_carries_it_on_the_exception`)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"status": -11, "message": "bad cert"})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)
+    assert exc.value.code == "ERR-INT-002"
+    assert exc.value.details == {"provider_status": -11, "reason": "certificate_invalid"}
+
+
+async def test_a_provider_outage_during_login_is_also_logged(db, monkeypatch) -> None:
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(boom)),
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)
+    assert exc.value.code == "ERR-INT-001"
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.endpoint == "/backend/auth"
+    assert row.http_status is None
+
+
+async def test_a_legal_entity_only_certificate_refuses_login_cleanly(db, monkeypatch) -> None:
+    """Finding 6 (final review): `eimzo_wire.read_subject` falls back to the
+    org STIR (9 digits) and then to `""` when a certificate carries no
+    PERSONAL PINFL at all -- the right answer for an ownership check
+    (`signatures._ownership_reason`, which only needs SOME identifier), but
+    wrong for login, which hands the value straight to
+    `login_or_create_by_pinfl` -> a `User` insert against
+    `CheckConstraint("pinfl ~ '^[0-9]{14}$'")`. Before the fix, a
+    legal-entity-only certificate the provider accepts with `status: 1`
+    reached that insert with a 9-digit STIR and blew up as an
+    `IntegrityError` (a bare 500), not a clean refusal."""
+    sample = {
+        "subjectCertificateInfo": {
+            "serialNumber": "org-cert-2",
+            "X500Name": "CN=BURCHMULLA LESHOZ",
+            "subjectName": {
+                "1.2.860.3.16.1.1": "301234567",  # org STIR only -- no personal PINFL
+                "CN": "BURCHMULLA LESHOZ",
+            },
+            # Deliberately far in the future: this test targets the PINFL-format
+            # refusal, not the (unrelated) `cert_expires_at` check a couple of
+            # lines above it in `login_via_eimzo` -- a near-dated cert would let
+            # THAT check fire first and pass this test for the wrong reason.
+            "validFrom": "2026-05-25 15:47:22",
+            "validTo": "2099-06-24 15:47:22",
+        },
+        "status": 1,
+        "message": "",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=sample)
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    # `login_via_eimzo` reads `get_settings().eimzo_mode` directly (ruling R1)
+    # to decide whether to consult the LOCAL `otp_codes` challenge -- forced
+    # to "real" here too, or the default test env's mock mode would take that
+    # branch instead and refuse on `identity.challenge == ""` missing an
+    # `otp_codes` row, never reaching the PINFL check this test targets
+    # (mirrors `test_org_eri_real_mode.py`'s identical need for
+    # `_verify_org_challenge`).
+    monkeypatch.setattr(service, "get_settings", lambda: REAL_SETTINGS)
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)
+    assert exc.value.code == "ERR-AUTH-004"
+    assert exc.value.http_status == 401

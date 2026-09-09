@@ -243,7 +243,9 @@ async def test_a_certificateless_refusal_with_a_qualifying_reason_is_flagged_as_
     will; that remains unexercised until stage 5.2 lands a real one."""
 
     class _FakeAdapter:
-        async def verify_detached(self, *, document: bytes, pkcs7: str) -> EimzoVerification:
+        async def verify_detached(
+            self, *, document: bytes, pkcs7: str, ip: str | None = None
+        ) -> EimzoVerification:
             return EimzoVerification(
                 status_code=-12,
                 subject_certificate=None,

@@ -36,6 +36,46 @@ services:
       timeout: 5s
       retries: 10
 
+  # e-imzo-server v2.1.1 (plan 05.2, task 8; deploy/eimzo/README.md). NOT on the
+  # `edge` network: nothing outside the stack may reach it (R2) -- no port is
+  # published here either, unlike `db`/`minio` in docker-compose.yml, since even
+  # localhost-on-the-server access is more than R2 asks for. Check it from inside
+  # the stack instead: `docker compose exec api curl http://eimzo:8080/ping`.
+  #
+  # `profiles: ["eimzo"]` (Critical 1, final review) -- same reasoning as
+  # `docker-compose.yml`'s own copy of this comment: `deploy/eimzo/dist/` is
+  # gitignored and, today, exists on no server either (task 12 blocked on
+  # NIC). `.github/workflows/deploy.yml` activates this profile itself, via
+  # `COMPOSE_PROFILES=eimzo`, ONLY once it finds `deploy/eimzo/dist/
+  # e-imzo-server.jar` already placed on the server by an operator -- so a
+  # bare `$COMPOSE build`/`up -d` (this file's own default, unprofiled
+  # commands above) never fails on the missing jar, and the day the jar
+  # exists, the very next deploy builds and starts this service with no
+  # further change needed here. `api`'s `depends_on.eimzo` below carries
+  # `required: false` for the same reason: a non-profiled service `depends_
+  # on` an excluded profiled one is otherwise an INVALID compose project
+  # (`docker compose config` refuses to even load), not merely a skipped
+  # service -- verified empirically (`.superpowers/sdd/05.2-eimzo-real/final-fix-report.md`).
+  eimzo:
+    image: ruxsatnoma-eimzo:2.1.1
+    profiles: ["eimzo"]
+    build:
+      context: ./deploy/eimzo
+    restart: unless-stopped
+    networks: [default]
+    environment:
+      EIMZO_VPN_HOST: ${EIMZO_VPN_HOST:-}
+      EIMZO_VPN_PORT: ${EIMZO_VPN_PORT:-}
+      EIMZO_VPN_KEY_PASSWORD: ${EIMZO_VPN_KEY_PASSWORD:-}
+    volumes:
+      - ./deploy/eimzo/keys:/opt/e-imzo-server/keys:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
   api:
     build:
       context: .
@@ -75,8 +115,35 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # `service_started`, NOT `service_healthy` (fix round 1, finding 6) --
+      # measured directly, with no VPN key present (the state until NIC
+      # delivers, see deploy/eimzo/README.md): e-imzo-server never binds port
+      # 8080 at all (`HandlerRegistry.register` throws a Guice
+      # `ProvisionException` on the missing `keys/client.key` before the HTTP
+      # listener starts), so its healthcheck can never pass and the container
+      # sits `unhealthy` forever. `service_healthy` here would therefore block
+      # `api` from starting AT ALL for as long as the key is missing or the
+      # provider is down -- turning a provider outage into a total outage for
+      # every citizen-facing feature, including ones that never touch E-IMZO.
+      # `service_started` only waits for the eimzo container to exist and be
+      # running (so its DNS name resolves) and lets `api` come up regardless;
+      # the two proxy routes that actually call it
+      # (`app/modules/integrations/router.py`, task 7) already turn a provider
+      # outage into `ERR-INT-001`/`ERR-INT-002` (503/502) rather than a crash,
+      # so a down E-IMZO server costs only signing and login-via-E-IMZO, never
+      # the whole system. `required: false` (Critical 1, final review): with
+      # the `eimzo` service now behind a profile (its own comment above),
+      # this dependency must not be REQUIRED, or `docker compose config`
+      # refuses to load this file at all whenever that profile is not
+      # active -- turning "the jar is missing" into "nothing in this file
+      # works", worse than the eimzo-only outage this comment already
+      # accepts. With the profile active, `required: false` changes nothing:
+      # `condition: service_started` still applies exactly as before.
+      eimzo:
+        condition: service_started
+        required: false
     networks:
-      # `default` is this stack's private network: db and minio are reachable only here.
+      # `default` is this stack's private network: db, minio and eimzo are reachable only here.
       default:
       edge:
         aliases: [api]

@@ -1,6 +1,7 @@
 """Auth service: sessions, login+MFA, passwords. The only door for other modules."""
 
 import asyncio
+import re
 import secrets
 import uuid
 from collections.abc import Sequence
@@ -13,6 +14,7 @@ from cryptography.fernet import InvalidToken
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core import settings_store
 from app.core.crypto import decrypt_str
 from app.core.errors import err
@@ -41,7 +43,12 @@ from app.modules.auth.models import (
     UserConsent,
 )
 from app.modules.integrations import service as integrations_service
-from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
+from app.modules.integrations.adapters.eimzo import (
+    EimzoCall,
+    EimzoError,
+    EimzoIdentity,
+    get_eimzo_adapter,
+)
 from app.modules.integrations.adapters.oneid import (
     OneIdCall,
     OneIdError,
@@ -52,6 +59,12 @@ from app.modules.integrations.adapters.oneid import (
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
 # as a real verification instead of returning early and leaking timing.
 _DUMMY_HASH = hash_password("dummy-timing-equalizer")
+
+# Mirrors `users.pinfl`'s own `CheckConstraint` (`models.py`,
+# `ck_users_pinfl_format`) — checked in Python BEFORE the insert in
+# `login_via_eimzo` (finding 6, final review), not left to the database to
+# reject as an uncaught `IntegrityError`/500.
+_PINFL_RE = re.compile(r"^[0-9]{14}$")
 
 
 async def issue_session(
@@ -188,6 +201,37 @@ async def _log_oneid_calls(db: AsyncSession, calls: tuple[OneIdCall, ...]) -> No
         )
 
 
+async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> None:
+    """One `integration_log` row per provider round trip, mirroring
+    `_log_oneid_calls` above (stage 5.1 task 6) — the same shape, a different
+    provider.
+
+    `calls` is whatever `RealEimzo.calls` accumulated on the ONE adapter
+    instance a caller used, whatever happened — success, a refused challenge
+    or signature, or a transport failure (`EimzoCall`'s own docstring). A
+    caller reaches this AFTER catching `EimzoError` too, passing
+    `getattr(adapter, "calls", ())`: `MockEimzo` has no `.calls` attribute at
+    all (no round trip was ever made), and this loop then simply does
+    nothing. `meta` carries only `EimzoCall.provider_status`/
+    `provider_message` — the provider's own numeric status and its own
+    message, nothing else: never a signed challenge, never a PINFL, never a
+    certificate subject."""
+    for call in calls:
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system="eimzo",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_status": call.provider_status, "provider_message": call.provider_message}
+                if call.provider_status is not None or call.provider_message is not None
+                else None
+            ),
+        )
+
+
 async def login_via_oneid(
     db: AsyncSession, *, code: str, ip: str | None, user_agent: str | None
 ) -> tuple[User, Session, str, str]:
@@ -220,7 +264,43 @@ async def login_via_oneid(
 EIMZO_CHALLENGE_TTL_MINUTES = 5
 
 
-async def issue_eimzo_challenge(db: AsyncSession) -> str:
+async def issue_eimzo_challenge(
+    db: AsyncSession, *, ip: str | None = None, mode: str | None = None
+) -> str:
+    """Plan 05.2 ruling R1 (option «а»): in `real` mode the login challenge
+    belongs to e-imzo-server, not to us. `POST /frontend/challenge` mints it
+    there with its own 120-second TTL and matches it again itself inside
+    `/backend/auth` — our own `otp_codes` copy would be a second TTL and a
+    second way to fail, protecting nothing (their server refuses a signature
+    whose challenge it does not recognise regardless of what we stored). So in
+    `real` mode this proxies the provider's own challenge straight through and
+    writes nothing of ours; `login_via_eimzo` mirrors this by skipping the
+    `otp_codes` lookup for the same mode (see its own comment).
+
+    In `mock` mode nothing changes: we still mint and store our own token
+    exactly as before this ruling.
+
+    `mode` defaults to `get_settings().eimzo_mode` — the route never passes
+    it, and it exists as a parameter only so a test can force either branch
+    without needing `get_eimzo_adapter()` to actually be mode-aware (a stub
+    adapter answers the same regardless of the configured mode)."""
+    if mode is None:
+        mode = get_settings().eimzo_mode
+    if mode == "real":
+        adapter = get_eimzo_adapter()
+        try:
+            challenge = await adapter.issue_challenge(ip=ip)
+        except EimzoError as exc:
+            # Task 5: the log is written on a refusal too -- an
+            # administrator must be able to tell "our configuration is
+            # wrong" from "the provider is down", and nothing else of ours
+            # is pending here (this is the first thing the real-mode branch
+            # does), so the commit only persists this one log row.
+            await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+            await db.commit()
+            raise err(exc.err_code) from exc
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        return challenge
     challenge = new_token()
     await repo.add(
         db,
@@ -238,19 +318,60 @@ async def login_via_eimzo(
 ) -> tuple[User, Session, str, str]:
     adapter = get_eimzo_adapter()
     try:
-        identity = await adapter.verify_signed_challenge(signed_challenge)
+        identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
-        raise err(exc.err_code) from exc
-    row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
-    if row is None:
-        raise err("ERR-AUTH-004")  # unknown, expired or replayed challenge
-    row.used_at = datetime.now(UTC)
+        # Task 5: log the refused round trip before it is rolled back --
+        # nothing else of ours has been written yet (this is the first thing
+        # `login_via_eimzo` does), so the commit only persists this one row.
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
+        # Minor 9 (final review): carry the provider's own status/reason
+        # instead of a bare 502/503 -- `integrations.service.
+        # eimzo_error_details` already builds exactly this payload for the
+        # timestamp route; reused here rather than a second copy.
+        raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+    # Ruling R1: in `real` mode e-imzo-server has ALREADY matched the challenge
+    # itself, inside `/backend/auth`, before ever answering `status: 1` — and
+    # `issue_eimzo_challenge` never wrote an `otp_codes` row for it in this
+    # mode (see that function's own comment). `identity.challenge` is also
+    # deliberately `""` here (`RealEimzo.verify_signed_challenge`'s own
+    # docstring), so looking it up would always miss and fail closed on every
+    # real login. Do NOT "fix" this back into an unconditional lookup — that
+    # is exactly the regression this comment exists to prevent.
+    if get_settings().eimzo_mode == "mock":
+        row = await repo.get_valid_otp(
+            db, hash_token(identity.challenge), purpose="eimzo_challenge"
+        )
+        if row is None:
+            raise err("ERR-AUTH-004")  # unknown, expired or replayed challenge
+        row.used_at = datetime.now(UTC)
     if identity.cert_expires_at is not None and identity.cert_expires_at <= datetime.now(UTC):
         await audit.log(
             db,
             action="user.login",
             result="denied",
             basis="eimzo: certificate expired",
+            ip=ip,
+            user_agent=user_agent,
+        )
+        await db.commit()
+        raise err("ERR-AUTH-004")
+    if not _PINFL_RE.fullmatch(identity.pinfl):
+        # Finding 6 (final review): `eimzo_wire.read_subject`'s STIR/""
+        # fallback is right for an OWNERSHIP check (`signatures.
+        # _ownership_reason`, which only needs SOME identifier to compare
+        # against) and wrong for LOGIN -- a legal-entity-only certificate
+        # the provider accepts with `status: 1` hands `identity.pinfl` a
+        # 9-digit STIR, or `""`, neither of which `login_or_create_by_pinfl`
+        # can insert into `users.pinfl` (`CheckConstraint`, 14 digits only).
+        # Refuse here, cleanly, before that insert -- not an uncaught
+        # `IntegrityError` turning into a bare 500.
+        await audit.log(
+            db,
+            action="user.login",
+            result="denied",
+            basis="eimzo: no personal pinfl",
             ip=ip,
             user_agent=user_agent,
         )
@@ -702,18 +823,58 @@ async def complete_registration(
 
 
 async def _verify_org_challenge(
-    db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str
+    db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str, ip: str | None
 ) -> EimzoIdentity:
-    """org_eri basis: a fresh org-cert signature naming this stir and this signer."""
+    """org_eri basis: a fresh org-cert signature naming this stir and this signer.
+
+    Gap closed here, found in Task 4's own review: this function used to look
+    up `identity.challenge` in `otp_codes` UNCONDITIONALLY, the same mistake
+    `login_via_eimzo` had before ruling R1. In `real` mode e-imzo-server has
+    ALREADY matched its own challenge, inside `/backend/auth`, before ever
+    answering `status: 1` -- and `identity.challenge` is deliberately `""` in
+    that mode (`RealEimzo.verify_signed_challenge`'s own docstring), so an
+    unconditional lookup here always misses and refuses every legal-entity
+    attach the moment `EIMZO_MODE=real` is set, forever. Do NOT "fix" this
+    back into an unconditional lookup -- that is exactly the regression this
+    comment exists to prevent."""
     adapter = get_eimzo_adapter()
     try:
-        identity = await adapter.verify_signed_challenge(signed_challenge)
+        identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
+        # Fix round 1, finding 3: an integration error (`ERR-INT-001`/
+        # `ERR-INT-002`, a provider outage or a bad response) is not a
+        # verdict about the CERTIFICATE at all -- collapsing it into
+        # `ERR-ACL-001` used to tell a citizen their org certificate was
+        # invalid when the real story was that E-IMZO could not be reached.
+        # Only the genuine login-contract refusal (`ERR-AUTH-004`, the
+        # unchanged status the mock and `RealEimzo.verify_signed_challenge`
+        # both raise for a non-1 status) becomes the ACL error here; every
+        # other code keeps its own.
+        #
+        # Task 5: the refused round trip is logged before it is rolled back
+        # -- nothing else of ours is pending here (`attach_legal`/
+        # `add_representation` only read before calling this), so the commit
+        # only persists this one log row.
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
+        if exc.err_code != "ERR-AUTH-004":
+            # Minor 9 (final review): carry the provider's own status/reason
+            # for the two codes that have one (`ERR-INT-001`/`ERR-INT-002`)
+            # instead of a bare 502/503 -- reuses `integrations.service.
+            # eimzo_error_details` rather than a second copy.
+            raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
-    row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
-    if row is None:
-        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})
-    row.used_at = datetime.now(UTC)
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+    # Gap fix (this function's own docstring): in `real` mode the provider
+    # already owns and matched the challenge, and `identity.challenge` is
+    # always `""` -- looking it up here would always miss.
+    if get_settings().eimzo_mode == "mock":
+        row = await repo.get_valid_otp(
+            db, hash_token(identity.challenge), purpose="eimzo_challenge"
+        )
+        if row is None:
+            raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})
+        row.used_at = datetime.now(UTC)
     if identity.tin != stir or identity.pinfl != signer_pinfl:
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "certificate mismatch"})
     return identity
@@ -759,7 +920,7 @@ async def attach_legal(
     if basis == "org_eri":
         assert signed_challenge is not None  # schema guarantees
         identity = await _verify_org_challenge(
-            db, signed_challenge=signed_challenge, stir=stir, signer_pinfl=user.pinfl
+            db, signed_challenge=signed_challenge, stir=stir, signer_pinfl=user.pinfl, ip=ip
         )
         legal_name = identity.legal_name or legal_name or f"STIR {stir}"
         requisites = {"cert_serial": identity.cert_serial}
@@ -879,7 +1040,11 @@ async def add_representation(
     if basis == "org_eri":
         assert signed_challenge is not None
         await _verify_org_challenge(
-            db, signed_challenge=signed_challenge, stir=applicant.stir, signer_pinfl=user.pinfl
+            db,
+            signed_challenge=signed_challenge,
+            stir=applicant.stir,
+            signer_pinfl=user.pinfl,
+            ip=ip,
         )
     elif basis == "director_registry":
         listed, _ = _director_listed(candidate, applicant.stir)

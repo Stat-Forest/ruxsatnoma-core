@@ -1,0 +1,7 @@
+# Never committed (README.md explains why): the VPN client key, its truststore
+# and the TSP truststore are all issued by NIC per-domain; the jar and its
+# lib/ dependencies (assembled under dist/) are NIC's own proprietary
+# artifacts. None of the four belongs in this repository.
+keys/
+dist/
+*.jar
