@@ -11,6 +11,7 @@ import pytest
 
 from app.core.errors import DomainError
 from app.modules.norms.calculator import (
+    GRAZING,
     CalcRequest,
     LivestockItem,
     NormFact,
@@ -20,6 +21,7 @@ from app.modules.norms.calculator import (
     from_input_snapshot,
     max_sb,
     remaining_sb,
+    resolve_capacity,
 )
 
 PARAMS = {
@@ -675,6 +677,62 @@ def test_the_calculated_remaining_sb_is_the_rounded_one() -> None:
     assert result.remaining_sb == Decimal("23")
     limit_line = next(line for line in result.breakdown if line["kind"] == "limit")
     assert limit_line["remaining_sb"] == "23"
+
+
+# --- Ruling #176 (stage 9): `resolve_capacity`, the one place a caller picks
+# between grazing's `max_sb` and every other activity's own `capacity`.
+
+
+def test_resolve_capacity_reads_max_sb_for_grazing() -> None:
+    norm = NormFact(id=None, yield_c_per_ha=Decimal("12"), max_sb=250, season=None, rotation=None)
+    assert resolve_capacity(GRAZING, norm) == Decimal("250")
+
+
+def test_resolve_capacity_ignores_a_capacity_value_for_grazing() -> None:
+    """Grazing reads `max_sb` alone — a `capacity` value sitting on the same
+    row (which `service.create_norm`/`update_norm` refuse to write, but a
+    row inserted before that guard existed could still carry) is not read,
+    so there is never a second source of truth in force at once."""
+    norm = NormFact(
+        id=None,
+        yield_c_per_ha=Decimal("12"),
+        max_sb=250,
+        season=None,
+        rotation=None,
+        capacity=Decimal("999"),
+    )
+    assert resolve_capacity(GRAZING, norm) == Decimal("250")
+
+
+def test_resolve_capacity_is_none_when_max_sb_is_unset() -> None:
+    """A published grazing norm with no frozen `max_sb` — ruling #176's
+    EXCLUSIVE trigger, not "unlimited"."""
+    norm = NormFact(id=None, yield_c_per_ha=None, max_sb=None, season=None, rotation=None)
+    assert resolve_capacity(GRAZING, norm) is None
+
+
+def test_resolve_capacity_reads_capacity_for_every_other_activity() -> None:
+    norm = NormFact(
+        id=None,
+        yield_c_per_ha=None,
+        max_sb=None,
+        season=None,
+        rotation=None,
+        capacity=Decimal("10.5"),
+    )
+    assert resolve_capacity("haymaking", norm) == Decimal("10.5")
+
+
+def test_resolve_capacity_is_none_when_capacity_is_unset() -> None:
+    norm = NormFact(id=None, yield_c_per_ha=None, max_sb=None, season=None, rotation=None)
+    assert resolve_capacity("haymaking", norm) is None
+
+
+def test_resolve_capacity_is_none_with_no_norm_at_all() -> None:
+    """No norm and no capacity are the SAME fact to this function — both mean
+    "nothing to compare against", for grazing and every other activity."""
+    assert resolve_capacity(GRAZING, None) is None
+    assert resolve_capacity("haymaking", None) is None
 
 
 def test_a_stored_calculation_recomputes_to_the_same_numbers() -> None:

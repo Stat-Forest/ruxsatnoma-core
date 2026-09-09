@@ -10,13 +10,47 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError
+from app.core.models import MediaFile
+from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.norms import checks
+from app.modules.norms import params as norm_params
+from app.modules.norms import service as norms_service
 from app.modules.norms.calculator import CalcRequest, NormFact, ParamSnapshot
+from app.modules.norms.models import Norm
 from tests.modules.gis.conftest import make_feature, version_wkt
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _make_capacity_norm(
+    db: AsyncSession,
+    *,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    capacity: Decimal,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> Norm:
+    """A published norm carrying only a `capacity`, for a non-grazing
+    activity — the direct-insert shape `conftest.py::published_grazing_norm`
+    already uses for the grazing case, generalised so the seam-wiring tests
+    below don't need their own `Norm` fixture."""
+    norm = Norm(
+        contour_id=contour_id,
+        activity_type_id=activity_type_id,
+        capacity=capacity,
+        effective_from=date(2020, 1, 1),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+    return norm
+
 
 SUMMER = {"windows": [{"from": "04-01", "to": "10-31"}]}
 WINTER = {"windows": [{"from": "11-01", "to": "03-31"}]}
@@ -32,8 +66,8 @@ def _request(period_from: date, period_to: date, **over) -> CalcRequest:
         period_from=period_from,
         period_to=period_to,
         area_ha=Decimal("92"),
-        items=(),
-        quantity=None,
+        items=over.pop("items", ()),
+        quantity=over.pop("quantity", None),
         benefit_code=None,
         **over,
     )
@@ -59,7 +93,11 @@ def _snapshot(**over) -> ParamSnapshot:
         tariffs=(),
         norm=norm,
         load_sb=over.pop("load_sb", Decimal("0")),
-        load_source="none",
+        load_source=over.pop("load_source", "none"),
+        capacity_load=over.pop("capacity_load", Decimal("0")),
+        capacity_load_source=over.pop("capacity_load_source", "none"),
+        occupied_until=over.pop("occupied_until", None),
+        occupied_until_source=over.pop("occupied_until_source", "none"),
     )
 
 
@@ -209,8 +247,11 @@ async def test_a_restriction_warns_but_does_not_block(
 async def test_the_limit_check_reports_all_three_numbers(
     db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
 ) -> None:
-    """MaxSB 250, nothing committed, UsedSB 300 → fail, and the details show why
-    so an applicant can reduce the herd instead of guessing."""
+    """Capacity 250, nothing committed, requested 300 → fail, and the details
+    show why so an applicant can reduce the herd instead of guessing.
+    Ruling #176 generalised the keys — `requested`/`capacity`/`remaining`,
+    never grazing's old `used_sb`/`max_sb`/`remaining_sb` — so a front-end
+    renders one shape for every activity."""
     request = _request(date(2026, 5, 1), date(2026, 9, 30))
     results = await checks.run_checks(
         db,
@@ -223,10 +264,10 @@ async def test_the_limit_check_reports_all_three_numbers(
     limit = next(c for c in results if c["check"] == "limit")
     assert limit["result"] == "fail"
     assert limit["details"] == {
-        "used_sb": "300",
-        "max_sb": 250,
-        "committed_sb": "0",
-        "remaining_sb": "250",
+        "requested": "300",
+        "capacity": "250",
+        "committed": "0",
+        "remaining": "250",
         "load_source": "none",
     }
 
@@ -250,7 +291,7 @@ async def test_the_limit_check_compares_against_the_floored_remainder(
         used_sb=Decimal("249.2"),
     )
     limit = next(c for c in results if c["check"] == "limit")
-    assert limit["details"]["remaining_sb"] == "249"
+    assert limit["details"]["remaining"] == "249"
     assert limit["result"] == "fail"
 
 
@@ -261,7 +302,9 @@ async def test_a_missing_norm_blocks_grazing_but_is_skipped_elsewhere(
     haymaking_activity_id: uuid.UUID,
 ) -> None:
     """Ruling 13: VMQ 689 imposes a feed-stock limit on grazing, and on nothing
-    else. A haymaking request with no norm is normal, not an error."""
+    else. A haymaking request with no norm is normal, not an error — for the
+    `norm` check specifically; the `limit` check's own answer for a
+    capacity-less contour is covered separately (exclusivity, ruling #176)."""
     grazing = await checks.run_checks(
         db,
         request=_request(date(2026, 5, 1), date(2026, 9, 30)),
@@ -501,3 +544,405 @@ async def test_the_territory_checks_are_skipped_with_no_published_geometry(
     # `skipped` is not `fail`, so it does not block on its own — but it can no
     # longer be mistaken for a verified `pass` either.
     assert checks.is_blocked(results) is False
+
+
+# --- Ruling #176 (stage 9): capacity generalises beyond grazing, and a ------
+# capacity-less contour is EXCLUSIVE rather than unlimited. The tests above
+# this line pin the pre-existing grazing behaviour (still passing, renamed
+# details); everything below is new.
+
+
+async def test_a_haymaking_request_over_the_remainder_is_refused(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """Capacity 10 ha, 3 already committed, 8 requested → fail: the same
+    `requested ≤ capacity − committed` rule grazing already had, now working
+    for an activity that was never checked at all before this stage."""
+    request = _request(
+        date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking", quantity=Decimal("8")
+    )
+    snapshot = _snapshot(
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=None,
+            max_sb=None,
+            season=None,
+            rotation=None,
+            capacity=Decimal("10"),
+        ),
+        capacity_load=Decimal("3"),
+        capacity_load_source="permits",
+    )
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        snapshot=snapshot,
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit["result"] == "fail"
+    assert limit["details"] == {
+        "requested": "8",
+        "capacity": "10",
+        "committed": "3",
+        "remaining": "7",
+        "load_source": "permits",
+    }
+    assert checks.is_blocked(results) is True
+
+
+async def test_a_haymaking_request_within_the_remainder_passes(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """Same capacity and committed load as above, but 5 requested instead of
+    8 — within the 7 ha remaining, so it passes."""
+    request = _request(
+        date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking", quantity=Decimal("5")
+    )
+    snapshot = _snapshot(
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=None,
+            max_sb=None,
+            season=None,
+            rotation=None,
+            capacity=Decimal("10"),
+        ),
+        capacity_load=Decimal("3"),
+        capacity_load_source="permits",
+    )
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        snapshot=snapshot,
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit["result"] == "pass"
+    assert limit["details"]["remaining"] == "7"
+    assert checks.is_blocked(results) is False
+
+
+async def test_a_declared_quantity_needs_no_pricing_to_be_checked(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """Unlike grazing's `used_sb` (a priced fact), a non-grazing `quantity` is
+    on the request itself — the reviewer-facing path (`used_sb=None`, the
+    caller never prices the request) still gets a REAL comparison here,
+    where grazing's own unpriced screen reports `skipped`/`not_computed`."""
+    request = _request(
+        date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking", quantity=Decimal("8")
+    )
+    snapshot = _snapshot(
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=None,
+            max_sb=None,
+            season=None,
+            rotation=None,
+            capacity=Decimal("10"),
+        ),
+    )
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        snapshot=snapshot,
+        used_sb=None,  # the reviewer-facing "no money" path
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit["result"] == "pass"
+    assert limit["details"]["requested"] == "8"
+
+
+async def test_a_missing_quantity_is_skipped_not_a_manufactured_zero(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """A capacity exists, but nothing was declared to compare against it —
+    `skipped`/`not_computed`, the same honest answer grazing's own unpriced
+    path gives, never a request read as zero."""
+    request = _request(date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking")
+    snapshot = _snapshot(
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=None,
+            max_sb=None,
+            season=None,
+            rotation=None,
+            capacity=Decimal("10"),
+        ),
+    )
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        snapshot=snapshot,
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit == {"check": "limit", "result": "skipped", "details": {"reason": "not_computed"}}
+
+
+async def test_no_capacity_with_no_registered_provider_is_skipped_not_assumed_free(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """No norm at all → no capacity → EXCLUSIVE branch, but
+    `EXCLUSIVITY_PROVIDERS` is empty (T6 wires it in the next wave) — the
+    honest answer is `skipped`, never a manufactured "free"."""
+    request = _request(date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking")
+    snapshot = _snapshot(norm=None)
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        snapshot=snapshot,
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit == {
+        "check": "limit",
+        "result": "skipped",
+        "details": {"reason": "no_occupancy_provider"},
+    }
+    assert checks.is_blocked(results) is False
+
+
+async def test_a_capacity_less_contour_admits_one_active_permit_and_refuses_the_second(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """Ruling #176, Oybek's option а, exercised through the REAL seam
+    (`norm_params.load_snapshot` → `service.EXCLUSIVITY_PROVIDERS` →
+    `checks.run_checks`), not a synthetic snapshot: with nothing overlapping,
+    the request passes; with an ACTIVE permit already covering the period,
+    the very same request is refused and told the day it frees up. T4 owns
+    the seam and this proof of its behaviour; T6 registers the real query
+    against `permits` in the next wave — this is what that registration must
+    satisfy."""
+    request = _request(
+        date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking", quantity=Decimal("2")
+    )
+
+    async def free(
+        db_: AsyncSession,
+        contour_id: uuid.UUID,
+        activity_type_id: uuid.UUID,
+        period_from: date,
+        period_to: date,
+    ) -> date | None:
+        return None
+
+    norms_service.EXCLUSIVITY_PROVIDERS.append(free)
+    try:
+        snapshot = await norm_params.load_snapshot(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+        )
+        results = await checks.run_checks(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+            snapshot=snapshot,
+        )
+        limit = next(c for c in results if c["check"] == "limit")
+        assert limit == {
+            "check": "limit",
+            "result": "pass",
+            "details": {"reason": "exclusive_available"},
+        }
+    finally:
+        norms_service.EXCLUSIVITY_PROVIDERS.remove(free)
+
+    async def occupied(
+        db_: AsyncSession,
+        contour_id: uuid.UUID,
+        activity_type_id: uuid.UUID,
+        period_from: date,
+        period_to: date,
+    ) -> date | None:
+        return date(2026, 9, 30)
+
+    norms_service.EXCLUSIVITY_PROVIDERS.append(occupied)
+    try:
+        snapshot = await norm_params.load_snapshot(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+        )
+        results = await checks.run_checks(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+            snapshot=snapshot,
+        )
+        limit = next(c for c in results if c["check"] == "limit")
+        assert limit == {
+            "check": "limit",
+            "result": "fail",
+            "details": {"reason": "exclusive_occupied", "occupied_until": "2026-09-30"},
+        }
+        assert checks.is_blocked(results) is True
+    finally:
+        norms_service.EXCLUSIVITY_PROVIDERS.remove(occupied)
+
+
+async def test_a_null_max_sb_for_grazing_is_now_exclusive_not_skipped(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """Ruling #176 deliberately changes grazing too: a norm with a null
+    `max_sb` used to report `skipped`/`no_limit` here — silently unlimited.
+    It now lands in the same exclusive branch as every other capacity-less
+    activity, through the real seam."""
+    request = _request(date(2026, 5, 1), date(2026, 9, 30), activity_code="grazing")
+    snapshot_no_provider = await norm_params.load_snapshot(
+        db, request=request, contour_id=published_contour.id, activity_type_id=grazing_activity_id
+    )
+    # No norm at all on `published_contour` for grazing (no fixture inserted
+    # one), so `resolve_capacity` already reads `max_sb=None` off nothing —
+    # the null-max_sb case and the no-norm-at-all case share this one branch
+    # by construction (`calculator.resolve_capacity`'s own contract).
+    results = await checks.run_checks(
+        db,
+        request=request,
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=snapshot_no_provider,
+        used_sb=Decimal("10"),
+    )
+    limit = next(c for c in results if c["check"] == "limit")
+    assert limit["result"] == "skipped"
+    assert limit["details"] == {"reason": "no_occupancy_provider"}
+
+    async def occupied(
+        db_: AsyncSession,
+        contour_id: uuid.UUID,
+        activity_type_id: uuid.UUID,
+        period_from: date,
+        period_to: date,
+    ) -> date | None:
+        return date(2026, 12, 31)
+
+    norms_service.EXCLUSIVITY_PROVIDERS.append(occupied)
+    try:
+        snapshot = await norm_params.load_snapshot(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+        )
+        results = await checks.run_checks(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+            snapshot=snapshot,
+            used_sb=Decimal("10"),
+        )
+        limit = next(c for c in results if c["check"] == "limit")
+        assert limit["result"] == "fail"
+        assert limit["details"]["reason"] == "exclusive_occupied"
+        assert limit["details"]["occupied_until"] == "2026-12-31"
+    finally:
+        norms_service.EXCLUSIVITY_PROVIDERS.remove(occupied)
+
+
+async def test_the_capacity_load_seam_reports_none_when_empty(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """`CAPACITY_LOAD_PROVIDERS` is empty until T6 registers a provider (the
+    same placeholder `LOAD_PROVIDERS` carried until 3.11) — the committed
+    quantity is reported as zero, but honestly labelled `"none"`, never
+    mistaken for a real measurement."""
+    committed, source = await norms_service.committed_capacity_load(
+        db, published_contour.id, haymaking_activity_id, date(2026, 5, 1), date(2026, 9, 30)
+    )
+    assert (committed, source) == (Decimal("0"), "none")
+
+
+async def test_the_capacity_load_seam_sums_every_registered_provider(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> None:
+    """Two providers, summed, over the REAL seam this time (not a synthetic
+    snapshot): `norm_params.load_snapshot` calls `committed_capacity_load`
+    for a haymaking norm with a `capacity` set, exactly as `LOAD_PROVIDERS`
+    is summed for grazing's `load_sb`."""
+    await _make_capacity_norm(
+        db,
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        capacity=Decimal("10"),
+        gis_user=gis_user,
+        approval_doc=approval_doc,
+    )
+
+    async def first(
+        db_: AsyncSession,
+        contour_id: uuid.UUID,
+        activity_type_id: uuid.UUID,
+        period_from: date,
+        period_to: date,
+    ) -> Decimal:
+        return Decimal("3")
+
+    async def second(
+        db_: AsyncSession,
+        contour_id: uuid.UUID,
+        activity_type_id: uuid.UUID,
+        period_from: date,
+        period_to: date,
+    ) -> Decimal:
+        return Decimal("2")
+
+    norms_service.CAPACITY_LOAD_PROVIDERS.extend([first, second])
+    try:
+        request = _request(
+            date(2026, 5, 1), date(2026, 9, 30), activity_code="haymaking", quantity=Decimal("6")
+        )
+        snapshot = await norm_params.load_snapshot(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+        )
+        assert snapshot.capacity_load == Decimal("5")
+        assert snapshot.capacity_load_source == "permits"
+        results = await checks.run_checks(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+            snapshot=snapshot,
+        )
+        limit = next(c for c in results if c["check"] == "limit")
+        # 6 requested > 10 − 5 = 5 remaining → refused.
+        assert limit["result"] == "fail"
+        # `capacity` round-trips out of Postgres at the column's own scale —
+        # `numeric(14,4)` — not the caller's unpadded "10" (the same
+        # fixed-scale-NUMERIC lesson `TariffOut.coefficient`/`NormOut.
+        # yield_c_per_ha` already observe); `remaining` inherits that scale
+        # from the subtraction. `requested`/`committed` are Python-only
+        # figures here (the request body, the stub providers' sum) and stay
+        # at the precision they were written with.
+        assert limit["details"] == {
+            "requested": "6",
+            "capacity": "10.0000",
+            "committed": "5",
+            "remaining": "5.0000",
+            "load_source": "permits",
+        }
+    finally:
+        norms_service.CAPACITY_LOAD_PROVIDERS.remove(first)
+        norms_service.CAPACITY_LOAD_PROVIDERS.remove(second)
