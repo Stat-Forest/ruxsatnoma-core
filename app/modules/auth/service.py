@@ -794,7 +794,18 @@ async def complete_registration(
 async def _verify_org_challenge(
     db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str, ip: str | None
 ) -> EimzoIdentity:
-    """org_eri basis: a fresh org-cert signature naming this stir and this signer."""
+    """org_eri basis: a fresh org-cert signature naming this stir and this signer.
+
+    Gap closed here, found in Task 4's own review: this function used to look
+    up `identity.challenge` in `otp_codes` UNCONDITIONALLY, the same mistake
+    `login_via_eimzo` had before ruling R1. In `real` mode e-imzo-server has
+    ALREADY matched its own challenge, inside `/backend/auth`, before ever
+    answering `status: 1` -- and `identity.challenge` is deliberately `""` in
+    that mode (`RealEimzo.verify_signed_challenge`'s own docstring), so an
+    unconditional lookup here always misses and refuses every legal-entity
+    attach the moment `EIMZO_MODE=real` is set, forever. Do NOT "fix" this
+    back into an unconditional lookup -- that is exactly the regression this
+    comment exists to prevent."""
     adapter = get_eimzo_adapter()
     try:
         identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
@@ -819,10 +830,16 @@ async def _verify_org_challenge(
             raise err(exc.err_code) from exc
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
-    row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
-    if row is None:
-        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})
-    row.used_at = datetime.now(UTC)
+    # Gap fix (this function's own docstring): in `real` mode the provider
+    # already owns and matched the challenge, and `identity.challenge` is
+    # always `""` -- looking it up here would always miss.
+    if get_settings().eimzo_mode == "mock":
+        row = await repo.get_valid_otp(
+            db, hash_token(identity.challenge), purpose="eimzo_challenge"
+        )
+        if row is None:
+            raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})
+        row.used_at = datetime.now(UTC)
     if identity.tin != stir or identity.pinfl != signer_pinfl:
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "certificate mismatch"})
     return identity
