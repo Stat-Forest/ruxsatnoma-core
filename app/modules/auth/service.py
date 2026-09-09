@@ -42,7 +42,12 @@ from app.modules.auth.models import (
     UserConsent,
 )
 from app.modules.integrations import service as integrations_service
-from app.modules.integrations.adapters.eimzo import EimzoError, EimzoIdentity, get_eimzo_adapter
+from app.modules.integrations.adapters.eimzo import (
+    EimzoCall,
+    EimzoError,
+    EimzoIdentity,
+    get_eimzo_adapter,
+)
 from app.modules.integrations.adapters.oneid import (
     OneIdCall,
     OneIdError,
@@ -189,6 +194,37 @@ async def _log_oneid_calls(db: AsyncSession, calls: tuple[OneIdCall, ...]) -> No
         )
 
 
+async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> None:
+    """One `integration_log` row per provider round trip, mirroring
+    `_log_oneid_calls` above (stage 5.1 task 6) — the same shape, a different
+    provider.
+
+    `calls` is whatever `RealEimzo.calls` accumulated on the ONE adapter
+    instance a caller used, whatever happened — success, a refused challenge
+    or signature, or a transport failure (`EimzoCall`'s own docstring). A
+    caller reaches this AFTER catching `EimzoError` too, passing
+    `getattr(adapter, "calls", ())`: `MockEimzo` has no `.calls` attribute at
+    all (no round trip was ever made), and this loop then simply does
+    nothing. `meta` carries only `EimzoCall.provider_status`/
+    `provider_message` — the provider's own numeric status and its own
+    message, nothing else: never a signed challenge, never a PINFL, never a
+    certificate subject."""
+    for call in calls:
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system="eimzo",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_status": call.provider_status, "provider_message": call.provider_message}
+                if call.provider_status is not None or call.provider_message is not None
+                else None
+            ),
+        )
+
+
 async def login_via_oneid(
     db: AsyncSession, *, code: str, ip: str | None, user_agent: str | None
 ) -> tuple[User, Session, str, str]:
@@ -246,9 +282,18 @@ async def issue_eimzo_challenge(
     if mode == "real":
         adapter = get_eimzo_adapter()
         try:
-            return await adapter.issue_challenge(ip=ip)
+            challenge = await adapter.issue_challenge(ip=ip)
         except EimzoError as exc:
+            # Task 5: the log is written on a refusal too -- an
+            # administrator must be able to tell "our configuration is
+            # wrong" from "the provider is down", and nothing else of ours
+            # is pending here (this is the first thing the real-mode branch
+            # does), so the commit only persists this one log row.
+            await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+            await db.commit()
             raise err(exc.err_code) from exc
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        return challenge
     challenge = new_token()
     await repo.add(
         db,
@@ -268,7 +313,13 @@ async def login_via_eimzo(
     try:
         identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
+        # Task 5: log the refused round trip before it is rolled back --
+        # nothing else of ours has been written yet (this is the first thing
+        # `login_via_eimzo` does), so the commit only persists this one row.
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
         raise err(exc.err_code) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     # Ruling R1: in `real` mode e-imzo-server has ALREADY matched the challenge
     # itself, inside `/backend/auth`, before ever answering `status: 1` — and
     # `issue_eimzo_challenge` never wrote an `otp_codes` row for it in this
@@ -757,9 +808,17 @@ async def _verify_org_challenge(
         # unchanged status the mock and `RealEimzo.verify_signed_challenge`
         # both raise for a non-1 status) becomes the ACL error here; every
         # other code keeps its own.
+        #
+        # Task 5: the refused round trip is logged before it is rolled back
+        # -- nothing else of ours is pending here (`attach_legal`/
+        # `add_representation` only read before calling this), so the commit
+        # only persists this one log row.
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
         if exc.err_code != "ERR-AUTH-004":
             raise err(exc.err_code) from exc
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
     if row is None:
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})

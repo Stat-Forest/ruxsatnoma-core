@@ -32,8 +32,10 @@ from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
+from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import (
     EIMZO_STATUS_REASONS,
+    EimzoCall,
     EimzoCertificateInfo,
     EimzoError,
     get_eimzo_adapter,
@@ -404,6 +406,45 @@ async def _ownership_reason(
     return "certificate_pinfl_mismatch"
 
 
+async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> None:
+    """One `integration_log` row per provider round trip (tz/09 "logging per
+    external message"), mirroring `auth.service._log_oneid_calls` (stage 5.1
+    task 6) — the same shape, a different provider.
+
+    Written HERE, not inside the adapter, for the same reason `_log_oneid_calls`
+    gives: this is where the session lives, and no adapter in this codebase
+    opens a transaction of its own. `calls` is whatever `RealEimzo.calls`
+    accumulated for the ONE adapter instance a caller used — every round trip
+    it made, success or refusal (`EimzoCall`'s own docstring) — so a caller
+    that reaches this after catching `EimzoError` logs the very call that
+    failed, not only the ones that succeeded. `MockEimzo` has no `.calls`
+    attribute at all (no round trip was ever made), so a caller passes
+    `getattr(adapter, "calls", ())` and this loop simply does nothing for it.
+
+    `meta` carries only `EimzoCall.provider_status`/`provider_message` — the
+    provider's own numeric status and its own message, nothing else: never the
+    pkcs7, never the PINFL, never a certificate subject, never a document
+    byte. Task 3's fix round added `provider_status`/`reason` to `EimzoError`
+    itself so a route could explain a refusal in more than a bare 502/503;
+    this is the first place either value's own DATA — carried here through the
+    sibling `EimzoCall` recorded at the same moment inside `RealEimzo._send`
+    — actually reaches somewhere an administrator can read it."""
+    for call in calls:
+        await integrations_service.log_integration(
+            db,
+            direction="out",
+            system="eimzo",
+            endpoint=call.endpoint,
+            http_status=call.http_status,
+            duration_ms=call.duration_ms,
+            meta=(
+                {"provider_status": call.provider_status, "provider_message": call.provider_message}
+                if call.provider_status is not None or call.provider_message is not None
+                else None
+            ),
+        )
+
+
 async def _reconcile_status(db: AsyncSession, cert: Certificate, live_status: str) -> None:
     """The adapter's CRL/OCSP-equivalent answer is the truth about a
     certificate's PKI state; the `status` we stored at bind time (or last
@@ -583,14 +624,18 @@ async def sign(
         # signature -- nothing was ever evaluated, so it must not become an
         # "invalid" row (`verification_status`) the way a genuine refusal
         # does below. It is also not the SIGNER's fault, so unlike every
-        # other refusal in this function it earns no `audit_log` entry and
-        # no early commit -- this mirrors `auth.service.login_via_eimzo`'s
-        # own handling of the identical exception one call up (no
-        # audit/state write for a bare provider outage) rather than
-        # inventing a new audit shape for an event that says nothing about
-        # the signer. Nothing of ours has been written yet at this point in
-        # `sign()`, so there is nothing to roll back either.
+        # other refusal in this function it earns no `audit_log` entry --
+        # this mirrors `auth.service.login_via_eimzo`'s own handling of the
+        # identical exception one call up. Task 5: the integration log is not
+        # the audit trail and is written regardless -- an administrator must
+        # be able to tell "our configuration is wrong" from "the provider is
+        # down", and that is exactly the round trip a refusal like this one
+        # carries. Nothing else of ours has been written at this point in
+        # `sign()`, so the commit below only persists this one log row.
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
         raise err(exc.err_code) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     info = result.subject_certificate
 
     if info is None:
@@ -602,7 +647,8 @@ async def sign(
         # only way this adapter reaches here) always wins ahead of it. The
         # attempt is still audited and committed before raising, same as
         # every other refusal below — there is just no signature row to keep
-        # alongside it.
+        # alongside it. The integration log row above rides along on this
+        # same commit.
         verdict = build_verdict(result, cert_status="active", now=datetime.now(UTC))
         await audit.log(
             db,
@@ -834,8 +880,13 @@ async def register_certificate(
         # try/except a few hundred lines up: a provider outage is not a
         # verdict about this presentation and not the caller's fault, so it
         # earns no `audit_log` entry and no `certificates` row, only the
-        # mapped integration error.
+        # mapped integration error. Task 5: the integration log is written
+        # regardless -- an administrator must be able to tell "our
+        # configuration is wrong" from "the provider is down".
+        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
+        await db.commit()
         raise err(exc.err_code) from exc
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     info = result.subject_certificate
     if info is None or result.status_code != 1:
         reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")
@@ -1033,6 +1084,7 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
         serial=cert.serial_number, issuer=cert.issuer, valid_to=cert.valid_to
     )
     await _reconcile_status(db, cert, live_status)
+    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
 
     now = datetime.now(UTC)
     if original.verification_status == "invalid":

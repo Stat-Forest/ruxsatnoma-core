@@ -3,8 +3,12 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.core.errors import DomainError
 from app.core.security import hash_token
 from app.main import create_app
@@ -12,8 +16,10 @@ from app.modules.auth import repo, service
 from app.modules.integrations.adapters.eimzo import (
     EimzoError,
     EimzoIdentity,
+    RealEimzo,
     encode_mock_signed_challenge,
 )
+from app.modules.integrations.models import IntegrationLog
 from tests.conftest import make_client
 
 API = "/api/v1"
@@ -164,3 +170,79 @@ async def test_a_provider_outage_while_issuing_a_challenge_is_an_integration_err
         await service.issue_eimzo_challenge(db, mode="real")
     assert exc.value.code == "ERR-INT-001"
     assert exc.value.http_status == 503
+
+
+# ---------------------------------------------------------------------------
+# Task 5: one `integration_log` row per provider round trip. `RealEimzo`
+# against `httpx.MockTransport` (never the real `e-imzo-server`, the same
+# rule `test_eimzo_real.py` follows) so a genuine round trip is made and
+# logged, both on success and on a refusal.
+# ---------------------------------------------------------------------------
+
+REAL_SETTINGS = Settings(
+    eimzo_mode="real",
+    eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+    _env_file=None,  # pyright: ignore[reportCallIssue]
+)
+
+
+async def _eimzo_log_tail(db: AsyncSession, count: int):
+    """The last `count` eimzo rows. The test database is shared and nothing
+    rolls a committed row back (backend/CLAUDE.md), so rows from earlier
+    tests are always present; ids are uuid7 and therefore time-ordered
+    (mirrors `test_oneid_login.py`'s own `_oneid_log_tail`)."""
+    await db.flush()
+    rows = (
+        (
+            await db.execute(
+                select(IntegrationLog)
+                .where(IntegrationLog.system == "eimzo")
+                .order_by(IntegrationLog.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows[-count:]
+
+
+async def test_a_refused_login_is_still_logged(db, monkeypatch) -> None:
+    """`/backend/auth` answers a normal 200 with a non-1 status -- a refused
+    login (`ERR-AUTH-004`), not a transport error -- and the round trip must
+    still be logged."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": -10})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(
+            db, signed_challenge="whatever", ip="91.0.0.7", user_agent="ua"
+        )
+    assert exc.value.code == "ERR-AUTH-004"
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.endpoint == "/backend/auth"
+    assert "whatever" not in str(row.meta)
+
+
+async def test_a_provider_outage_during_login_is_also_logged(db, monkeypatch) -> None:
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(boom)),
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)
+    assert exc.value.code == "ERR-INT-001"
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.endpoint == "/backend/auth"
+    assert row.http_status is None
