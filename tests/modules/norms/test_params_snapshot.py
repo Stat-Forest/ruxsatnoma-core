@@ -16,6 +16,7 @@ from app.db import make_session_factory
 from app.modules.auth.models import User
 from app.modules.gis.models import Contour
 from app.modules.norms import params
+from app.modules.norms import service as norms_service
 from app.modules.norms.calculator import CalcRequest
 from app.modules.norms.models import Norm
 
@@ -219,3 +220,155 @@ async def test_published_coef_sb_does_not_leak_a_sibling_fixtures_flushed_row(
             "a flush-only sibling fixture's row became visible on an unrelated "
             "session — published_coef_sb's commit leaked it"
         )
+
+
+# --- Ruling #176 (stage 9): the two NEW seams, and which one a request needs.
+
+
+async def test_a_capacity_norm_loads_the_capacity_load_seam_not_the_exclusivity_one(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> None:
+    """A haymaking norm WITH a `capacity` resolves through
+    `CAPACITY_LOAD_PROVIDERS` — `occupied_until_source` must stay `"none"`
+    (never asked, because there was no need to)."""
+    norm = Norm(
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        capacity=Decimal("10"),
+        effective_from=date(2020, 1, 1),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+
+    async def provider(db_, contour_id, activity_type_id, period_from, period_to):
+        return Decimal("4")
+
+    norms_service.CAPACITY_LOAD_PROVIDERS.append(provider)
+    try:
+        snapshot = await params.load_snapshot(
+            db,
+            request=_request(on_date=date(2026, 8, 30), activity_code="haymaking"),
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+        )
+        assert snapshot.norm is not None
+        assert snapshot.norm.capacity == Decimal("10")
+        assert snapshot.capacity_load == Decimal("4")
+        assert snapshot.capacity_load_source == "permits"
+        assert snapshot.occupied_until is None
+        assert snapshot.occupied_until_source == "none"
+    finally:
+        norms_service.CAPACITY_LOAD_PROVIDERS.remove(provider)
+
+
+async def test_a_capacity_less_norm_loads_the_exclusivity_seam_not_the_load_one(
+    db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
+) -> None:
+    """No norm at all (so no capacity) resolves through
+    `EXCLUSIVITY_PROVIDERS` instead — `capacity_load_source` must stay
+    `"none"` (never asked: a sum could never answer "which day is it free")."""
+
+    async def provider(db_, contour_id, activity_type_id, period_from, period_to):
+        return date(2026, 12, 31)
+
+    norms_service.EXCLUSIVITY_PROVIDERS.append(provider)
+    try:
+        snapshot = await params.load_snapshot(
+            db,
+            request=_request(on_date=date(2026, 8, 30), activity_code="haymaking"),
+            contour_id=published_contour.id,
+            activity_type_id=haymaking_activity_id,
+        )
+        assert snapshot.norm is None
+        assert snapshot.occupied_until == date(2026, 12, 31)
+        assert snapshot.occupied_until_source == "permits"
+        assert snapshot.capacity_load == Decimal("0")
+        assert snapshot.capacity_load_source == "none"
+    finally:
+        norms_service.EXCLUSIVITY_PROVIDERS.remove(provider)
+
+
+async def test_grazing_never_touches_either_new_seam(
+    db: AsyncSession,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> None:
+    """Grazing resolves its capacity through `max_sb`/`LOAD_PROVIDERS`
+    alone — registering a capacity-load provider must have no effect on a
+    grazing snapshot even when a grazing norm with a frozen `max_sb` is in
+    force, proving `load_snapshot`'s branch is keyed on the ACTIVITY, not
+    merely on "a capacity resolved"."""
+    norm = Norm(
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        yield_c_per_ha=Decimal("12.0"),
+        max_sb=27,
+        effective_from=date(2020, 1, 1),
+        status="published",
+        approval_doc_id=approval_doc.id,
+        created_by=gis_user.id,
+        approved_by=gis_user.id,
+    )
+    db.add(norm)
+    await db.flush()
+
+    async def unexpected(db_, contour_id, activity_type_id, period_from, period_to):
+        raise AssertionError("grazing must never call the capacity-load seam")
+
+    norms_service.CAPACITY_LOAD_PROVIDERS.append(unexpected)
+    try:
+        snapshot = await params.load_snapshot(
+            db,
+            request=_request(on_date=date(2026, 8, 30), activity_code="grazing"),
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+        )
+        assert snapshot.norm is not None
+        assert snapshot.norm.max_sb == 27
+        assert snapshot.capacity_load == Decimal("0")
+        assert snapshot.capacity_load_source == "none"
+        assert snapshot.occupied_until_source == "none"
+    finally:
+        norms_service.CAPACITY_LOAD_PROVIDERS.remove(unexpected)
+
+
+async def test_the_snapshot_carries_the_activity_s_own_unit(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """Integration finding, stage 9 wave 1: a capacity refusal states
+    `requested`/`capacity`/`remaining` and is unreadable without the unit those
+    three are counted in. It comes from `activity_types.quantity_unit` — NOT
+    from the tariff rows in the same snapshot, since an activity may lawfully
+    have no tariff at all and still measure something.
+    """
+    haymaking = await params.load_snapshot(
+        db,
+        request=_request(on_date=date(2026, 8, 30), activity_code="haymaking"),
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+    )
+    assert haymaking.quantity_unit == "ha"
+
+    grazing = await params.load_snapshot(
+        db,
+        request=_request(on_date=date(2026, 8, 30), activity_code="grazing"),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+    )
+    # Grazing's own unit in the catalogue is `head`; the capacity check answers
+    # `"sb"` for it regardless, because what it counts is CONDITIONAL heads.
+    # Both facts are true at once and neither is the other's substitute.
+    assert grazing.quantity_unit == "head"

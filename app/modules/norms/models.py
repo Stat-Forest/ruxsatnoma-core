@@ -140,6 +140,16 @@ class Norm(Base):
     season: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     rotation: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     max_sb: Mapped[int | None]
+    # Ruling #176: capacity generalises `max_sb` to every non-grazing activity,
+    # expressed in that activity's own `activity_types.quantity_unit` (ha for
+    # haymaking, hive for an apiary, m3 for deadwood, person_day for
+    # recreation). Grazing does NOT use this column — its capacity IS `max_sb`
+    # above, and a second field would be a second source of truth for the same
+    # fact (`service.create_norm`/`update_norm` refuse a grazing norm that sets
+    # it). NULL is not "no limit": `checks._limit_check` treats an absent
+    # capacity (no norm at all, or this column left NULL) as EXCLUSIVE for the
+    # requested period, never as unlimited.
+    capacity: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
     geobotanic_doc_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
     approval_doc_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
     effective_from: Mapped[date]
@@ -157,6 +167,7 @@ class Norm(Base):
             "effective_to IS NULL OR effective_to >= effective_from", name="period_valid"
         ),
         CheckConstraint("yield_c_per_ha IS NULL OR yield_c_per_ha >= 0", name="yield_valid"),
+        CheckConstraint("capacity IS NULL OR capacity >= 0", name="capacity_valid"),
         CheckConstraint(
             "status <> 'published' OR approval_doc_id IS NOT NULL", name="published_needs_doc"
         ),

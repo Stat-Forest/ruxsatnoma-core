@@ -170,6 +170,59 @@ async def test_the_create_response_shows_the_stored_precision_not_the_caller_s(
     assert response.json()["yield_c_per_ha"] == "7.5000"
 
 
+async def test_a_capacity_norm_round_trips_at_the_stored_precision(
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """Ruling #176: `capacity` is `numeric(14,4)`, same fixed-scale lesson —
+    posting `"10.5"` for haymaking comes back `"10.5000"`."""
+    response = await _draft(
+        gis_specialist_client,
+        published_contour.id,
+        haymaking_activity_id,
+        capacity="10.5",
+        yield_c_per_ha=None,
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["capacity"] == "10.5000"
+
+
+async def test_capacity_is_refused_for_a_grazing_norm(
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """Ruling #176: grazing's capacity IS `max_sb` — a `capacity` value here
+    too would be a second source of truth for the same fact."""
+    response = await _draft(
+        gis_specialist_client,
+        published_contour.id,
+        grazing_activity_id,
+        capacity="10",
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == "capacity_not_allowed_for_grazing"
+
+
+async def test_patching_capacity_onto_a_grazing_norm_is_refused(
+    gis_specialist_client: AsyncClient,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """Same ruling #176 guard, one HTTP verb over: a PATCH must not be able
+    to write onto a grazing norm what `POST` already refuses."""
+    created = await _draft(gis_specialist_client, published_contour.id, grazing_activity_id)
+    assert created.status_code == 201, created.text
+    norm_id = created.json()["id"]
+
+    response = await gis_specialist_client.patch(
+        f"/api/v1/norms/{norm_id}", json={"capacity": "10"}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == "capacity_not_allowed_for_grazing"
+
+
 async def test_reading_a_norm_needs_no_special_permission(
     applicant_client: AsyncClient, published_contour: Contour
 ) -> None:

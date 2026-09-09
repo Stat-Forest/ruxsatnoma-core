@@ -448,6 +448,82 @@ async def committed_load_sb(
     return total, "permits"
 
 
+# --- Ruling #176 (stage 9, docs/decisions.md): capacity generalises beyond ---
+# grazing's `max_sb`/`LOAD_PROVIDERS` pair to every other activity, in its own
+# `quantity_unit` — a SEPARATE seam because the unit differs per activity and
+# grazing's own `sb_load` column carries none of it. Same registration idiom,
+# same "never manufacture a measurement" property: T6 (wave 2 of this stage)
+# registers the permits-side query; left empty here, exactly like
+# `LOAD_PROVIDERS` was until 3.11 registered `permits.service.load_provider`.
+CapacityLoadProvider = Callable[
+    [AsyncSession, uuid.UUID, uuid.UUID, date, date], Awaitable[Decimal]
+]
+CAPACITY_LOAD_PROVIDERS: list[CapacityLoadProvider] = []
+
+
+async def committed_capacity_load(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+) -> tuple[Decimal, str]:
+    """The non-grazing sibling of `committed_load_sb`: quantity already
+    committed on this contour, in the ACTIVITY'S OWN unit, for an overlapping
+    period — `activity_type_id` is part of the question (unlike grazing's
+    seam) because one contour may carry permits for more than one activity,
+    each in a unit the others' quantities must never be summed into. Empty
+    until a provider registers, and the source string says so — the same
+    `LOAD_PROVIDERS` property, preserved exactly: a caller can never read the
+    placeholder zero as a measurement."""
+    if not CAPACITY_LOAD_PROVIDERS:
+        return Decimal("0"), "none"
+    total = Decimal("0")
+    for provider in CAPACITY_LOAD_PROVIDERS:
+        total += await provider(db, contour_id, activity_type_id, period_from, period_to)
+    return total, "permits"
+
+
+# Ruling #176, Oybek's option а: a contour with NO capacity at all — no norm,
+# or the relevant column left unset — is EXCLUSIVE for the requested period,
+# never unlimited. Answering "is it free" needs more than a boolean: a refusal
+# must name the day the contour frees up, so this seam reports the LATEST day
+# still covered by an overlapping ACTIVE permit (for this contour × activity),
+# or `None` when nothing overlaps. Same registration idiom as the two seams
+# above; T6 registers the query against `permits` in the next wave. Left
+# empty, this seam can prove nothing occupied — `checks._limit_check` reports
+# `skipped`/`no_occupancy_provider` rather than a manufactured "free", the
+# same discipline `LOAD_PROVIDERS`'s own placeholder observes for a load.
+ExclusivityProvider = Callable[
+    [AsyncSession, uuid.UUID, uuid.UUID, date, date], Awaitable[date | None]
+]
+EXCLUSIVITY_PROVIDERS: list[ExclusivityProvider] = []
+
+
+async def occupied_until(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+) -> tuple[date | None, str]:
+    """The latest day an overlapping ACTIVE permit (for this contour ×
+    activity) still covers, across every registered provider — `None` when
+    nothing overlaps. The source distinguishes "asked, and the answer is
+    free" (`"permits"` with `None`) from "never asked at all" (`"none"`,
+    because `EXCLUSIVITY_PROVIDERS` is still empty) — `checks._limit_check`
+    is refused the second reading on purpose, the same way an empty
+    `LOAD_PROVIDERS` is never read as a real zero load."""
+    if not EXCLUSIVITY_PROVIDERS:
+        return None, "none"
+    latest: date | None = None
+    for provider in EXCLUSIVITY_PROVIDERS:
+        until = await provider(db, contour_id, activity_type_id, period_from, period_to)
+        if until is not None and (latest is None or until > latest):
+            latest = until
+    return latest, "permits"
+
+
 async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm:
     """A fresh draft (VMQ 689: the leshoz GIS specialist drafts from a
     geobotanical survey). No period check yet — like `create_versioned`, that
@@ -455,8 +531,14 @@ async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm
     required only to submit for review (`submit_norm_review`)."""
     await _assert_norm_zone(db, actor, payload.contour_id)
     known = await admin_repo.list_activity_types(db)
-    if not any(activity.id == payload.activity_type_id for activity in known):
+    activity = next((a for a in known if a.id == payload.activity_type_id), None)
+    if activity is None:
         raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    # Ruling #176: grazing's capacity IS `max_sb` — a `capacity` value here
+    # too would be a second source of truth for the same fact, so it is
+    # refused rather than silently ignored.
+    if payload.capacity is not None and activity.code == calculator.GRAZING:
+        raise err("ERR-VAL-001", details={"reason": "capacity_not_allowed_for_grazing"})
     if payload.geobotanic_doc_id is not None:
         # An EXISTENCE check (lesson), the same one `approve_norm` already
         # applies to `approval_doc_id` — reusing `_assert_doc_active` rather
@@ -502,6 +584,13 @@ async def update_norm(
     if norm.status not in ("draft", "review"):
         raise err("ERR-NORM-005", details={"reason": "not_draft"})
     fields = patch.model_dump(exclude_unset=True, by_alias=True)
+    if fields.get("capacity") is not None:
+        # Same ruling #176 guard `create_norm` applies — a PATCH is one HTTP
+        # verb over from that create-time check, and `activity_type_id` is
+        # identity here (excluded from `NormPatch`), so it is read off the
+        # existing row rather than the request body.
+        if await _resolve_activity_code(db, norm.activity_type_id) == calculator.GRAZING:
+            raise err("ERR-VAL-001", details={"reason": "capacity_not_allowed_for_grazing"})
     if fields.get("geobotanic_doc_id") is not None:
         await _assert_doc_active(db, fields["geobotanic_doc_id"], reason="geobotanic_doc_required")
     effective_from = fields.get("effective_from", norm.effective_from)

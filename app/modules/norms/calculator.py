@@ -81,25 +81,57 @@ class TariffFact:
 @dataclass(frozen=True)
 class NormFact:
     """The published norm in force, if any — `max_sb` is already frozen (Task
-    4's `publish_norm`), never recomputed here."""
+    4's `publish_norm`), never recomputed here.
+
+    `capacity` (ruling #176, stage 9) is the generalised limit for every
+    activity BUT grazing, in that activity's own `quantity_unit` — a trailing,
+    defaulted field so every existing construction of this dataclass (tests
+    included) that never mentions it keeps meaning exactly what it meant
+    before. Grazing keeps reading `max_sb` alone; `resolve_capacity` below is
+    the one place that picks between the two."""
 
     id: uuid.UUID | None
     yield_c_per_ha: Decimal | None
     max_sb: int | None
     season: dict[str, Any] | None
     rotation: dict[str, Any] | None
+    capacity: Decimal | None = None
 
 
 @dataclass(frozen=True)
 class ParamSnapshot:
     """Everything `calculate` needs, already resolved from the database by
-    `params.load_snapshot` — the calculator itself never queries anything."""
+    `params.load_snapshot` — the calculator itself never queries anything.
+
+    The four trailing fields are ruling #176's admissibility facts, NOT
+    pricing inputs: `calculate` below never reads them (only
+    `checks._limit_check` does), which is why they carry no counterpart in
+    `CalcResult`/`input_snapshot` and `from_input_snapshot`'s reconstruction
+    never has to set them — their defaults are exactly what a calculation
+    computed years ago, before this stage, would have meant. `capacity_load`/
+    `capacity_load_source` mirror `load_sb`/`load_source` for every activity
+    but grazing (`service.CAPACITY_LOAD_PROVIDERS`); `occupied_until`/
+    `occupied_until_source` answer the EXCLUSIVE case — no capacity at all —
+    with the day an overlapping active permit still covers, or `None`, never
+    a bare boolean (`service.EXCLUSIVITY_PROVIDERS`)."""
 
     values: Mapping[str, Any]
     tariffs: tuple[TariffFact, ...]
     norm: NormFact | None
     load_sb: Decimal
     load_source: str
+    capacity_load: Decimal = Decimal("0")
+    capacity_load_source: str = "none"
+    occupied_until: date | None = None
+    occupied_until_source: str = "none"
+    # The activity's own `activity_types.quantity_unit`, carried so a capacity
+    # refusal can say WHAT it counted (integration finding, stage 9 wave 1 —
+    # «40 of 100» with no unit is unreadable). Deliberately NOT taken from the
+    # tariff rows beside it: an activity may lawfully have no tariff at all
+    # (science, ruling in `tz/06`), and it still has a unit. `None` when the
+    # snapshot was built without one — every pre-stage-9 construction, tests
+    # included — and the refusal then states no unit rather than inventing one.
+    quantity_unit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +360,25 @@ def remaining_sb(max_sb_value: int, load_sb: Decimal, params: Mapping[str, Any])
     return Decimal(_round_heads(Decimal(max_sb_value) - load_sb, _rule(params, "rounding_heads")))
 
 
+def resolve_capacity(activity_code: str, norm: NormFact | None) -> Decimal | None:
+    """Ruling #176: the ONE place that picks between grazing's `max_sb` and
+    every other activity's own `capacity` — `checks._limit_check` calls this
+    rather than re-deriving the branch itself, and `params.load_snapshot`
+    calls it too, to decide whether it needs the capacity-load seam or the
+    exclusivity one.
+
+    `None` here is a FACT the caller acts on, not an error: no norm at all,
+    or the relevant column left unset, both mean "nothing to compare
+    against" — ruling #176's EXCLUSIVE case, never "unlimited". Wrapped as a
+    `Decimal` even for grazing's integer `max_sb` so every caller subtracts
+    a committed load the same way regardless of activity."""
+    if norm is None:
+        return None
+    if activity_code == GRAZING:
+        return None if norm.max_sb is None else Decimal(norm.max_sb)
+    return norm.capacity
+
+
 def from_input_snapshot(input_snapshot: Mapping[str, Any]) -> tuple[CalcRequest, ParamSnapshot]:
     """Rebuilds the exact `(request, snapshot)` pair a stored calculation was
     computed from, using nothing but its own `input_snapshot` column.
@@ -387,6 +438,10 @@ def from_input_snapshot(input_snapshot: Mapping[str, Any]) -> tuple[CalcRequest,
             max_sb=raw_norm["max_sb"],
             season=raw_norm["season"],
             rotation=raw_norm["rotation"],
+            # `.get`, not `[...]`: a calculation stored before ruling #176
+            # (stage 9) has no "capacity" key at all in its frozen JSONB, and
+            # `calculations` is append-only — that row must still reconstruct.
+            capacity=(None if raw_norm.get("capacity") is None else Decimal(raw_norm["capacity"])),
         )
     )
     snapshot = ParamSnapshot(

@@ -185,6 +185,11 @@ class NormIn(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    # Ruling #176 (stage 9): the general capacity limit, in the activity's own
+    # `quantity_unit` — grazing keeps `max_sb` alone and refuses this field
+    # (`service.create_norm`), so a second source of truth for the same fact
+    # can never be written.
+    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -197,6 +202,7 @@ class NormPatch(BaseModel):
     the same way `TariffPatch` excludes its own key fields."""
 
     yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -215,6 +221,7 @@ class NormOut(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     yield_c_per_ha: Decimal | None
+    capacity: Decimal | None
     season: dict[str, Any] | None
     rotation: dict[str, Any] | None
     max_sb: int | None
@@ -230,11 +237,12 @@ class NormOut(BaseModel):
 
     # Same fixed-scale-NUMERIC lesson as `TariffOut.coefficient` (plain `str`,
     # not the trim-then-rstrip dance `gis.schemas._trim_decimal` uses for a
-    # measured area): a yield figure is a caller-supplied rate like a
-    # coefficient, not a measured quantity, so the response shows the STORED
-    # precision rather than echoing the caller's own input shape.
-    @field_serializer("yield_c_per_ha")
-    def _yield_c_per_ha(self, value: Decimal | None) -> str | None:
+    # measured area): a yield figure — and `capacity`, ruling #176 — is a
+    # caller-supplied rate/limit like a coefficient, not a measured quantity,
+    # so the response shows the STORED precision rather than echoing the
+    # caller's own input shape.
+    @field_serializer("yield_c_per_ha", "capacity")
+    def _stored_precision_decimal(self, value: Decimal | None) -> str | None:
         return str(value) if value is not None else None
 
 
