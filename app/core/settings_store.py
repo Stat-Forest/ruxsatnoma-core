@@ -312,6 +312,48 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             30,
             "Days an active permit may run with no inspection act before RI-14 fires",
         ),
+        # ── public site (#174): the Agency edits these itself on the H7 screen ──
+        SettingSpec("site_contact_phone", str, "+998 71 207 88 77", "Public site: hotline number"),
+        SettingSpec(
+            "site_contact_email", str, "urmoninfo@gmail.com", "Public site: contact e-mail"
+        ),
+        SettingSpec("site_contact_address_uz", str, "", "Public site: address, Latin Uzbek"),
+        SettingSpec("site_contact_address_ru", str, "", "Public site: address, Russian"),
+        SettingSpec(
+            "site_contact_hours_uz",
+            str,
+            "Dushanba – juma, 9:00 – 18:00",
+            "Public site: working hours, Latin Uzbek",
+        ),
+        SettingSpec(
+            "site_contact_hours_ru",
+            str,
+            "Понедельник – пятница, 9:00 – 18:00",
+            "Public site: working hours, Russian",
+        ),
+        SettingSpec("site_social_telegram", str, "", "Public site: Telegram channel URL"),
+        SettingSpec("site_social_youtube", str, "", "Public site: YouTube channel URL"),
+        # Ruling R3: provisional windows, editable the day the Agency answers.
+        SettingSpec(
+            "site_season_windows",
+            dict,
+            {
+                "grazing": [4, 5, 6, 7, 8, 9, 10, 11],
+                "haymaking": [6, 7, 8],
+                "apiary": [4, 5, 6, 7, 8],
+                "recreation": [5, 6, 7, 8, 9, 10],
+                "deadwood": [1, 2, 3, 10, 11, 12],
+                "science": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            },
+            "Public site: provisional season windows per activity, months 1-12",
+        ),
+        # Ruling R2: personal geodata — stays OFF until the Agency confirms in writing.
+        SettingSpec(
+            "public_permit_contour_enabled",
+            bool,
+            False,
+            "Publish the permit contour on the anonymous check page (#174)",
+        ),
     )
 }
 
@@ -352,6 +394,10 @@ def coerce(spec: SettingSpec, raw: Any) -> Any:
     if spec.type is bool:
         if not isinstance(raw, bool):
             raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected boolean"})
+        return raw
+    if spec.type is dict:
+        if not isinstance(raw, dict):
+            raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected object"})
         return raw
     if not isinstance(raw, str) or not raw.strip():
         raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
