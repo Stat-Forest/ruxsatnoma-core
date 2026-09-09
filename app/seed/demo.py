@@ -4,7 +4,8 @@ running it twice changes nothing on the second run and never raises.
 Fills whatever the demo scenario needs that reference-data migrations do not
 already provide:
 
-  * one staff user per role the demo scenario touches, with a known password,
+  * one staff user per role `0003_auth` seeds — all ten of them, not only the
+    ones the seven-step scenario touches — each with a known password,
     a TOTP secret already enrolled (never `must_change_password`, so every
     route past `GET /auth/me` is reachable right after login+MFA), AND a
     deterministic `pinfl` that CONVERGES on every run — `signatures.service`
@@ -85,7 +86,7 @@ from app.seed import seed_organizations
 
 # One FIXED password per account, never a shared one (Oybek, 2026-09-04). The demo
 # runs on the dev server, which is reachable from the internet, so a single string
-# opening all eight accounts — `sys_admin` among them — is not acceptable there;
+# opening all eleven accounts — `sys_admin` among them — is not acceptable there;
 # and these are deliberately NOT derivable from the login by any visible rule, so
 # learning one does not hand over the rest. They are stable across reseeds on
 # purpose: an operator writes them down once. Dev only — production accounts come
@@ -254,6 +255,52 @@ DEMO_STAFF: list[DemoUser] = [
         "burchmulla",
         pinfl="30260904000007",
         password="Archali#Bosh4523",
+    ),
+    # The three roles the seven-step scenario never touches, seeded anyway
+    # (Oybek, 2026-09-09) so that EVERY role `0003_auth` creates has a demo
+    # login. `leadership` is the one that actually cost something: it owns a
+    # bespoke home screen of its own in the adminka (`LeadershipDashboardPage`
+    # — the KPI feed plus the territory drill-down), and with no account
+    # holding that role, the most demonstrable screen in the product could not
+    # be opened on the dev stand at all. `gis_specialist` and `inspector`
+    # follow the same reasoning: their screens exist and shipped (3.6a,
+    # 4.1/4.2), they were simply unreachable without an administrator minting
+    # a user first.
+    #
+    # `leadership` gets NO organization: «Агентлик раҳбарияти» is the agency
+    # level and `app/core/abac.py`'s empty zone is republic-wide, which is
+    # exactly the scope `tz/03` gives it (К,Э on every row) and what
+    # `dashboard.service`'s territory slice is meant to be seen through.
+    DemoUser(
+        "demo_leadership",
+        "Demo Agency Leadership",
+        "leadership",
+        pinfl="30260904000008",
+        password="Nurota#Rahbar5168",
+    ),
+    # Zoned to Burchmulla, unlike `leadership` above: `gis.service._assert_in_zone`
+    # treats an actor with an empty zone as republic-wide, so an unzoned demo
+    # GIS specialist could create and edit contours for every leshoz in the
+    # country. The one leshoz whose geodata this seed imports is the honest
+    # scope for them.
+    DemoUser(
+        "demo_gis_specialist",
+        "Demo GIS Specialist (Burchmulla DOX)",
+        "gis_specialist",
+        "burchmulla",
+        pinfl="30260904000009",
+        password="Zomin#Xarita3729",
+    ),
+    # Also zoned: `inspections.service._assert_organization_in_zone` checks the
+    # assignee's zone against the TASK's organization, so an inspector the
+    # Burchmulla head can actually assign must carry Burchmulla in their own.
+    DemoUser(
+        "demo_inspector",
+        "Demo Inspector (Burchmulla DOX)",
+        "inspector",
+        "burchmulla",
+        pinfl="30260904000010",
+        password="Chorvoq#Nazorat6094",
     ),
 ]
 DEMO_APPLICANT = DemoUser(
@@ -765,7 +812,7 @@ async def _ensure_legal_documents(db: AsyncSession, *, actor: User) -> str:
 async def _main() -> None:
     # Every account's own password, not one shared string — and a duplicate is
     # refused outright, so a future edit cannot quietly collapse them back into
-    # one credential that opens all eight.
+    # one credential that opens all eleven.
     for _spec in (*DEMO_STAFF, DEMO_APPLICANT):
         if not _spec.password:
             raise ValueError(f"demo seed: {_spec.login} has no password")

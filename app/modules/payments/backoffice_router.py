@@ -18,10 +18,12 @@ column for. Do not build a second worklist on top of this one.
 **What this register answers, and what it never can.** It answers "did the
 money arrive against an invoice" — a `matched`/`discrepancy`/`unknown` row per
 bank line, or one period row per provider settlement. It can never answer
-"did each half of the 50/50 split reach its own account", because the state
-budget's account number is stored nowhere in this system (`tz/12` #15) and a
-leshoz's own `requisites` may legitimately carry no `"account"` key — so at
-least half of every `allocations` row has `account = NULL`. `matcher.py`'s
+"did a configured receiver's own wallet, or the leshoz's own remainder,
+actually reach its account": a `payment_recipients` row is a Payme WALLET
+(`payme_account_id`), never a bank account, so every receiver row's
+`allocations.account` is structurally `NULL`, and a leshoz's own
+`requisites` may legitimately carry no `"account"` key either (`tz/12`
+#15) — so most of every `allocations` row has `account = NULL`. `matcher.py`'s
 module docstring states the same limitation for the matching side; this is
 the same fact, read from the accountant's own register rather than from the
 code that filled it in.
@@ -249,12 +251,13 @@ async def list_reconciliations(
     totals named in `comment` — `statement_service._period_reconciliation`).
 
     This register answers ONE question: did the money arrive against an
-    invoice. It never answers whether each half of the 50/50 split reached
-    its own account — the budget's account number is in no table at all
-    (`tz/12` #15), so at least half of every `allocations` row has
-    `account = NULL`; `matcher.py`'s module docstring gives the same
-    limitation for the matching side, and this is the same fact seen from
-    the register a human actually reads.
+    invoice. It never answers whether a configured receiver's own wallet,
+    or the leshoz's own remainder, actually reached its account — a
+    `payment_recipients` row is a Payme WALLET, never a bank account, so
+    every receiver row's `allocations.account` is structurally `NULL`, and
+    the leshoz's own account may be missing too (`tz/12` #15); `matcher.py`'s
+    module docstring gives the same limitation for the matching side, and
+    this is the same fact seen from the register a human actually reads.
     """
     rows, total = await backoffice_service.list_reconciliations(
         db, status=status, limit=limit, offset=offset, actor=actor
@@ -457,13 +460,16 @@ async def list_allocations(
     incomplete range would miss (the lesson on a reversed date period).
 
     **This route answers "did the money arrive against an invoice" — never
-    "did each half of the 50/50 split reach its own account"** (ruling 10,
-    the same limitation `GET /payments/reconciliations`'s own docstring
-    states): `account` is `null`, present on EVERY row, whenever that row
-    is the state budget's own half or names a leshoz with no account on
-    file (`tz/12` #15 — the state budget's account number is stored nowhere
-    in this system). A client renders that `null` as "settled outside the
-    system", never as a blank account number.
+    "did a configured receiver's own wallet, or the leshoz's own
+    remainder, actually reach its account"** (ruling 10, the same
+    limitation `GET /payments/reconciliations`'s own docstring states):
+    `account` is `null`, present on EVERY row, whenever that row names a
+    configured receiver (STRUCTURALLY — a `payment_recipients` row is a
+    Payme wallet, never a bank account, the seeded state-budget row
+    included) or names a leshoz with no account on file (`tz/12` #15). A
+    client renders that `null` as "settled outside the system", never as a
+    blank account number. `recipient_id`/`recipient_name` (task 8) name
+    WHICH configured receiver a `target="receiver"` row belongs to.
     """
     rows, total = await backoffice_service.list_allocations(
         db,
@@ -474,7 +480,7 @@ async def list_allocations(
         offset=offset,
     )
     return Page[AllocationOut](
-        items=[AllocationOut.model_validate(row) for row in rows],
+        items=await backoffice_service.allocations_out(db, rows),
         total=total,
         page=offset // limit + 1,
         page_size=limit,

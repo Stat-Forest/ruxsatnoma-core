@@ -14,12 +14,25 @@ inside `service.py`, exactly like `notifications.service.mark_read`.
 existed, so an accountant's screen could show one application's invoices but
 never browse the whole book. That path is staff-only and zone-scoped
 (decision #70) — `service.list_invoices_for_actor`'s own docstring carries
-the reasoning; this router stays a thin pass-through for both."""
+the reasoning; this router stays a thin pass-through for both.
+
+Stage 7.9 task 8: `GET /invoices/{id}` additionally attaches `recipients`
+(`_invoice_out` below) for a STAFF reader ONLY — gated on `service.
+holds_payments_read` (`payments.view` OR `payments.confirm`, whole-branch
+review Important 2), the SAME predicate `_may_act_on_invoices_of`'s staff
+branch already uses to decide who may act on the invoice at all. Using a
+narrower predicate here would silently drop `recipients` for an actor the
+route otherwise treats as staff — the same authorization split as
+everything else in this file, just answering a different question (WHAT is
+shown, not WHETHER the invoice is). `GET /invoices` (the list route) never
+attaches it, the same scope `RefundOut.available_sources` draws for
+itself."""
 
 import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -28,12 +41,39 @@ from app.core.schemas import PAGING_MAX, Page
 from app.modules.auth.deps import get_current_user, idempotency_context
 from app.modules.auth.models import User
 from app.modules.payments import service
-from app.modules.payments.models import INVOICE_STATUSES
-from app.modules.payments.schemas import InvoiceOut, PayIntentIn, PayIntentOut
+from app.modules.payments.models import INVOICE_STATUSES, Invoice
+from app.modules.payments.schemas import InvoiceOut, InvoiceRecipientOut, PayIntentIn, PayIntentOut
 
 router = APIRouter(tags=["payments"])
 
 _INVOICE_STATUS_PATTERN = "^(" + "|".join(INVOICE_STATUSES) + ")$"
+
+
+async def _invoice_out(db: AsyncSession, invoice: Invoice, *, actor: User) -> Any:
+    """Builds `GET /invoices/{id}`'s response, attaching `recipients` ONLY
+    for a STAFF reader (Override 4, stage 7.9 task 8 — who receives the
+    money is internal allocation, never part of what a citizen is paying
+    for). Everyone else gets `recipients` OMITTED from the JSON body
+    entirely — `exclude={"recipients"}`, never a blanket `exclude_none`
+    (`InvoiceOut.recipients`'s own docstring says why only this one field
+    is allowed to disappear).
+
+    Gated on `service.holds_payments_read`, NOT `holds_payments_view`
+    (whole-branch review Important 2, fixed after `executor_head` — the
+    checker half of the maker-checker PAID, and the head of the leshoz
+    that receives the invoice's own remainder — reached this route (via
+    `_may_act_on_invoices_of`'s `holds_payments_read`-gated staff branch)
+    and got a body with `recipients` silently absent, not a 403 and not a
+    null). One access rule, one source: whoever the route already treats
+    as staff must see the same thing every other staff reader does."""
+    out = InvoiceOut.model_validate(invoice)
+    if not await service.holds_payments_read(db, actor):
+        return JSONResponse(out.model_dump(mode="json", exclude={"recipients"}))
+    out.recipients = [
+        InvoiceRecipientOut.model_validate(row)
+        for row in await service.invoice_recipients(db, invoice.id)
+    ]
+    return out
 
 
 @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
@@ -42,7 +82,8 @@ async def get_invoice(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(get_current_user)],
 ) -> Any:
-    return await service.get_invoice_for_actor(db, invoice_id, actor=actor)
+    invoice = await service.get_invoice_for_actor(db, invoice_id, actor=actor)
+    return await _invoice_out(db, invoice, actor=actor)
 
 
 @router.get("/invoices", response_model=Page[InvoiceOut])
@@ -82,7 +123,23 @@ async def create_pay_intent(
     actor: Annotated[User, Depends(get_current_user)],
     ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
 ) -> Any:
-    """`Idempotency-Key` is MANDATORY (3.4's mechanism, ruling: ours, on our
+    """Refuses with, in the order the guards run: **`ERR-SYS-003`** (404) when
+    the invoice does not exist, its application does not, **or the caller may
+    not act on it** — the three are deliberately indistinguishable, so a
+    stranger cannot probe which invoice ids exist; **`ERR-PAY-004`** (409) when
+    the invoice is not `pending`; **`ERR-PAY-002`** when it is past `due_at`;
+    and **`ERR-PAY-007`** (409) when the split cannot be routed at the provider
+    — some receiver frozen onto this invoice has no `payme_account_id`, so
+    under decision #160 the payment is refused rather than taken onto the
+    Agency's cashbox for somebody to move by hand. `details.missing` names the
+    offending receivers by `position` only; the names are in the server log,
+    not in a body a citizen reads.
+
+    These codes are listed here because a route's docstring is the only thing
+    that carries them into the served OpenAPI — `ERR-PAY-007` was invisible to
+    anyone reading the schema until this sentence existed.
+
+    `Idempotency-Key` is MANDATORY (3.4's mechanism, ruling: ours, on our
     own route — never on `/webhooks/payme`, which has Payme's own). `ctx`
     is declared after `actor` (mirrors `gis/imports_router.py::create_import`)
     so the SAME `get_current_user` call both depend on is resolved once;

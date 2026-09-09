@@ -27,13 +27,14 @@ async def test_every_granted_permission_code_is_registered(db) -> None:
     assert not missing, f"granted in role_permissions but never registered: {sorted(missing)}"
 
 
-# The six codes that are registered, required by a route, and granted to NO role:
-# reachable only through the `sys_admin` superuser bypass (decision #41 ruling 2).
+# The seven codes that are registered, required by a route, and granted to NO
+# role: reachable only through the `sys_admin` superuser bypass (decision #41
+# ruling 2).
 #
-# All six predate stages 3.9-3.11 and are believed intentional — configuration of
-# the system itself: who exists, what the classifiers say, what the announcements
-# say, what the settings are, and whose session may be killed. No non-superuser
-# role in `0003_auth` is given that by tz/03's matrix.
+# The first six predate stages 3.9-3.11 and are believed intentional —
+# configuration of the system itself: who exists, what the classifiers say,
+# what the announcements say, what the settings are, and whose session may be
+# killed. No non-superuser role in `0003_auth` is given that by tz/03's matrix.
 #
 # Written down as an ALLOWLIST rather than left implicit, so that the set is a
 # deliberate statement instead of an accident: a code that is registered and
@@ -69,6 +70,13 @@ UNGRANTED_BY_DESIGN = frozenset(
         # the server -- deliberately `sys_admin` only, never a role grant
         # (`integrations.permissions`'s own docstring).
         "integrations.eimzo.health",
+        # Stage 7.9 task 3 (decision #163): the split's recipients directory
+        # decides where a country's money goes, so this one is a DELIBERATE,
+        # permanent member of this set until the Agency names who besides
+        # `sys_admin` may edit it — unlike the others above, granting it is
+        # expected to stay a one-row `role_permissions` INSERT, never a code
+        # change, whenever that day comes.
+        "payments.recipients.manage",
     }
 )
 

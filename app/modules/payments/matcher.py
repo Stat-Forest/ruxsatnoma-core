@@ -3,15 +3,18 @@
 `Decimal`-only, and it never sees a session — the same shape as `ledger.py`
 and `statement_parser.py`, this module's siblings.
 
-**The account is never a matching key.** The state budget's account number is
-not stored anywhere in this system (`tz/12` #15) and a leshoz's
-`organizations.requisites` JSONB may legitimately have no `"account"` key, so
-at least half of every row in the `allocations` ledger carries
-`account = NULL`. Reconciliation can therefore prove that money arrived
-against an invoice; it cannot prove that either half of the 50/50 split
-reached its own account. Matching runs on the invoice number found in the
-line's free-text `purpose` and the amount, nothing else — hence `classify`
-takes no account parameter at all, an absence that is itself the rule.
+**The account is never a matching key.** A configured receiver
+(`payment_recipients`, decision #154) identifies a Payme WALLET, never a
+bank account, so `allocations.account` is structurally `NULL` for every one
+of those rows, the seeded state-budget recipient included; a leshoz's own
+`organizations.requisites` JSONB may ALSO legitimately have no `"account"`
+key, so its own remainder row can be `NULL` too. Reconciliation can
+therefore prove that money arrived against an invoice; it cannot prove
+that a configured receiver's wallet, or the leshoz's own remainder,
+actually reached its account. Matching runs on the invoice number found in
+the line's free-text `purpose` and the amount, nothing else — hence
+`classify` takes no account parameter at all, an absence that is itself
+the rule.
 
 Also: Payme money lands in our own cashbox wallet and reaches a leshoz later
 as ONE aggregated settlement payout, so a Payme-paid invoice generally has no

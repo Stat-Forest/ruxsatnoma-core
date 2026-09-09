@@ -31,7 +31,27 @@ Every enum-ish column has exactly one source of truth — the module-level tuple
 below, each turned into a `CheckConstraint` — mirroring
 `app/modules/applications/models.py`. No schemas, service or router in this
 branch (3.10b task 2+); nothing here is imported by anything except this module's
-own tests and `permissions.py` until then."""
+own tests and `permissions.py` until then.
+
+Stage 7.9 (migration `0045`, task 1, plan ruling P1) replaces the hard-coded
+50/50 split with a configurable directory: `PaymentRecipient` (who takes a
+cut), `InvoiceRecipient` (the split frozen onto one invoice at issuance) and
+`RefundComponent` (a refund's breakdown by source, `refunds`' own trigger
+`refund_components_complete`). `0045` itself was purely additive —
+`Allocation` gained `recipient_id` and `'receiver'` joined
+`ALLOCATION_TARGETS` beside the still-legal `'budget'`, and `Refund` kept
+its three legacy amount columns and their own CHECK untouched.
+
+**Migration `0046` (task 7, decisions #161-#162) finishes the rewrite.**
+Every historical `target='budget'` allocation and every `refunds` row's
+three legacy columns were backfilled onto the new shapes and then dropped:
+`Refund` no longer has `budget_amount`/`recipient_amount`/`other_amount` or
+`returned_needs_complete_breakdown`, `'budget'` is gone from
+`ALLOCATION_TARGETS` (there is no `TARGET_BUDGET` constant any more), and
+`refund_components_complete` now requires at least one component for a
+`returned` refund — see that migration's own docstring for the five-step
+order and why decision #161 made rewriting history cheap NOW (no
+production data, dev is only demo data) rather than later."""
 
 import uuid
 from datetime import date, datetime
@@ -52,7 +72,28 @@ INVOICE_STATUSES = ("pending", "paid", "expired", "cancelled")
 PAYMENT_PROVIDERS = ("payme", "manual")
 PAYMENT_INTENT_STATUSES = ("created", "pending", "succeeded", "failed", "expired")
 ALLOCATION_ENTRY_TYPES = ("payment", "refund", "correction")
-ALLOCATION_TARGETS = ("recipient", "budget", "other")
+# 'budget' is GONE (decision #161, migration 0046): every row that carried it
+# was rewritten onto the seeded budget directory row (`target='receiver'`,
+# `recipient_id=BUDGET_RECIPIENT_ID`) and the value removed from this tuple —
+# there is no `TARGET_BUDGET` constant any more, and grepping for one is the
+# guard against a caller that still thinks there is. `'other'` SURVIVES:
+# those rows (none written by any code path any more) name no party this
+# directory can represent, and inventing one would be fabricating a
+# recipient this migration had no authority to invent.
+ALLOCATION_TARGETS = ("recipient", "other", "receiver")
+TARGET_RECIPIENT = "recipient"
+TARGET_OTHER = "other"
+TARGET_RECEIVER = "receiver"
+
+# Mirrors migrations/versions/0045_payment_split.py::BUDGET_RECIPIENT_ID (and
+# 0046's own copy) — a migration may not import app code, so each keeps its
+# own literal, the same idiom `tests/modules/payments/conftest.py` already
+# uses for the identical id. This is the one copy APPLICATION code may
+# import: `dashboard.repo.payments_kpi` names the seeded budget row's OWN
+# share by this id (decision #154, Override 1 of stage 7.9 task 8) rather
+# than by a `target` string — `'budget'` is gone from `ALLOCATION_TARGETS`
+# for good, but the seeded row itself, and its stable id, are not.
+BUDGET_RECIPIENT_ID = uuid.UUID("0192f2a0-0000-7000-8000-000000000001")
 
 MANUAL_CONFIRMATION_STATUSES = ("pending_check", "confirmed", "rejected")
 BANK_STATEMENT_SOURCES = ("api", "file")  # only "file" has a writer yet (ruling 20)
@@ -72,6 +113,11 @@ LINE_MATCH_STATUSES = (
 RECONCILIATION_RESULTS = ("matched", "discrepancy", "unknown")
 RECONCILIATION_STATUSES = ("open", "resolved")
 REFUND_STATUSES = ("requested", "in_review", "returned", "rejected")
+
+# Stage 7.9 (migration 0045): the configurable split's own directory and
+# snapshot vocabularies — see PaymentRecipient/InvoiceRecipient below.
+RECIPIENT_KINDS = ("percent", "fixed")
+SNAPSHOT_KINDS = ("percent", "fixed", "remainder")
 
 
 def _in_check(column: str, values: tuple[str, ...]) -> str:
@@ -208,24 +254,37 @@ class ProviderTransaction(Base):
 
 
 class Allocation(Base):
-    """The ledger of the 50/50 split and of refunds (design/02 § allocations).
-    The 50/50 proportion itself is enforced in code (Task 3's
-    `payments.ledger`, never here); `amount` may be negative (a refund entry)
-    so it carries no positivity CHECK.
+    """The ledger of the payment split and of refunds (design/02 §
+    allocations). The split itself is computed in code (`payments.ledger`,
+    never here) — stage 7.9 (decision #154, 2026-09-09) replaced the
+    original fixed 50/50 proportion with a configurable receivers
+    directory; see this module's own docstring banner for the full
+    history. `amount` may be negative (a refund entry) so it carries no
+    positivity CHECK.
 
     `account` is nullable (Task 3 ruling, amending this same unmerged
-    migration — see `migrations/versions/0017_payments.py`): the state
-    budget's account number is not in the system at all (`tz/08` — the
-    budget half is settled by accounting outside the system), and a
-    leshoz's `requisites` JSONB may legitimately have no `"account"` key
-    (`app/seed/data/organizations.example.json`'s `leshoz-beruniy`). A
+    migration — see `migrations/versions/0017_payments.py`): a leshoz's own
+    `requisites` JSONB may legitimately have no `"account"` key
+    (`app/seed/data/organizations.example.json`'s `leshoz-beruniy`), and —
+    since stage 7.9 — a configured receiver's row is null STRUCTURALLY,
+    never for lack of data: `payment_recipients` identifies a Payme WALLET
+    (`payme_account_id`), never a bank account, so this column carries
+    nothing for any of them, the seeded state-budget row included. A
     placeholder string in a financial ledger's account column would be
     worse than NULL.
 
     `refund_id` (3.10b task 1, ruling P2) is a nullable FK to `refunds`,
     added by migration `0022` in the same transaction that creates that
     table — design/02 always gave this column an FK target, 3.10a simply
-    could not express it against a table that did not exist yet."""
+    could not express it against a table that did not exist yet.
+
+    `recipient_id` (migration `0045`, stage 7.9) is a nullable FK to
+    `payment_recipients` — set when `target='receiver'`, NULL for the
+    leshoz's own remainder (`target='recipient'`) and for a legacy
+    `target='other'` row (no writer produces one any more, but a historical
+    row may still carry it — see migration `0046`'s own docstring, which
+    rewrote every `target='budget'` row onto `'receiver'` and removed
+    `'budget'` from the CHECK entirely)."""
 
     __tablename__ = "allocations"
 
@@ -235,6 +294,9 @@ class Allocation(Base):
         ForeignKey("provider_transactions.id"), index=True
     )
     refund_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("refunds.id"), index=True)
+    recipient_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("payment_recipients.id"), index=True
+    )
     entry_type: Mapped[str]
     target: Mapped[str]
     account: Mapped[str | None]
@@ -245,6 +307,125 @@ class Allocation(Base):
     __table_args__ = (
         CheckConstraint(f"entry_type IN {ALLOCATION_ENTRY_TYPES}", name="entry_type_valid"),
         CheckConstraint(f"target IN {ALLOCATION_TARGETS}", name="target_valid"),
+    )
+
+
+class PaymentRecipient(Base):
+    """One party that takes something off the top of every payment, before the
+    leshoz receives the remainder (decisions #154, #157).
+
+    Exactly ONE of `percent`/`fixed_amount` is set, enforced by
+    `rule_matches_kind` below rather than by the service: a row carrying both
+    has no defined meaning, and nobody reading it later would know which was
+    applied first.
+
+    The leshoz is NOT a row here. It is resolved from the application's contour
+    and receives what nobody took — which is why the parts always sum back to
+    the payment (ruling R2).
+
+    A recipient is DEACTIVATED, never deleted: a deleted row breaks every report
+    over a period in which it was paid.
+    """
+
+    __tablename__ = "payment_recipients"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    name: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    payme_account_id: Mapped[str | None]
+    kind: Mapped[str]
+    percent: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    fixed_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
+    sort_order: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    note: Mapped[str | None]
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(_in_check("kind", RECIPIENT_KINDS), name="kind_valid"),
+        CheckConstraint(
+            "(kind = 'percent' AND percent IS NOT NULL AND fixed_amount IS NULL "
+            "AND percent > 0 AND percent <= 100) OR "
+            "(kind = 'fixed' AND fixed_amount IS NOT NULL AND percent IS NULL "
+            "AND fixed_amount > 0)",
+            name="rule_matches_kind",
+        ),
+    )
+
+
+class InvoiceRecipient(Base):
+    """The split FROZEN onto one invoice at issuance (decision #158).
+
+    Same reason `invoices.calculation_id` exists: an invoice is issued when the
+    application is approved and may be paid days later, and an administrator
+    editing the directory in between must not change what an already-issued
+    invoice divides into.
+
+    The LAST row of an invoice's snapshot is the leshoz: `kind='remainder'`,
+    `recipient_id IS NULL`, `name` and `payme_account_id` both frozen from
+    the organization (task 4's `_leshoz_snapshot_fields`, which reads both
+    off the same lookup so the two can never drift apart from each other).
+
+    `amount` is this row's share OF THE INVOICE. It is display and `receivers`
+    data — NOT what the ledger writes. `confirm_payment` re-runs the frozen
+    RULES against `transaction.amount`, the money that actually arrived, which
+    a manual under-payment may make smaller (see Task 5).
+    """
+
+    __tablename__ = "invoice_recipients"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("invoices.id"), index=True)
+    recipient_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("payment_recipients.id"))
+    name: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    payme_account_id: Mapped[str | None]
+    kind: Mapped[str]
+    percent: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    fixed_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    position: Mapped[int]
+
+    __table_args__ = (
+        CheckConstraint(_in_check("kind", SNAPSHOT_KINDS), name="kind_valid"),
+        UniqueConstraint("invoice_id", "position", name="uq_invoice_recipients_position"),
+    )
+
+
+class RefundComponent(Base):
+    """One line of a refund's breakdown by source (`tz/08`), replacing the three
+    `refunds.{budget,recipient,other}_amount` columns a fixed 50/50 once made
+    sufficient — migration `0046` (decision #161) dropped all three, having
+    first backfilled every historical row's total into rows here.
+    `recipient_id` names a configured `payment_recipients` row (a
+    `target='receiver'` allocation, task 7's `approve_refund`); `NULL` means
+    the leshoz's own remainder (`target='recipient'`) — there is no
+    component for the old `'other'` bucket, which the `0046` backfill folded
+    into the leshoz's remainder (see that migration's own docstring).
+
+    **`uq_refund_components_source` does NOT stop two `recipient_id IS NULL`
+    rows** — Postgres treats `NULL <> NULL` under a plain UNIQUE constraint,
+    so a duplicate leshoz-remainder component (or any other duplicate
+    source, NULL included) is refused by the SERVICE
+    (`backoffice_service.submit_refund_decision`), not by this index.
+
+    The "components sum to `final_amount`" invariant moved from a row CHECK
+    to a trigger on `refunds` (ruling R4) — it now spans rows, which a CHECK
+    cannot express. `0045`'s own version of that trigger tolerated a
+    `returned` refund with zero components (needed only during the
+    transition its own docstring describes); `0046` tightened it to require
+    at least one (decision #162) — see that migration's own docstring."""
+
+    __tablename__ = "refund_components"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    refund_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("refunds.id"), index=True)
+    recipient_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("payment_recipients.id"))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        UniqueConstraint("refund_id", "recipient_id", name="uq_refund_components_source"),
     )
 
 
@@ -410,21 +591,26 @@ class Reconciliation(Base):
 
 
 class Refund(Base):
-    """A manual refund and its breakdown by source (design/02 § refunds,
-    decision #12, 3.10b). `basis_item_id` points at the seeded
-    `refund_reasons` classifier (migration `0022`, ruling 16) — revocation /
-    unused period / overpayment / confirmed benefit (VMQ 278 §§9-11), never
-    a CHECK-constrained enum column, so a new ground is reference data, not a
+    """A manual refund (design/02 § refunds, decision #12, 3.10b).
+    `basis_item_id` points at the seeded `refund_reasons` classifier
+    (migration `0022`, ruling 16) — revocation / unused period /
+    overpayment / confirmed benefit (VMQ 278 §§9-11), never a
+    CHECK-constrained enum column, so a new ground is reference data, not a
     migration. `suggested_amount` is the formula's hint
     (`tz/08`: `Paid × unused_eligible_period / paid_period`) and is nullable
     for ruling 17's degenerate cases (no calculable period); the accountant's
     actual `final_amount` may deviate from it, with a comment.
 
-    `returned_needs_complete_breakdown` is the CHECK design/02 names: a
-    `returned` refund without `final_amount` and a `budget`/`recipient`/
-    `other` breakdown that sums to it is impossible at the database level —
-    the same "returned_amount without a breakdown by source is impossible"
-    invariant `design/02`'s own invariants table lists. `due_at` is a plain
+    **The breakdown by source is `RefundComponent` rows, not columns here.**
+    Until migration `0046` (decision #161) this table carried
+    `budget_amount`/`recipient_amount`/`other_amount` and a row CHECK
+    (`returned_needs_complete_breakdown`) enforcing their sum; a fixed 50/50
+    made three buckets sufficient, and a configurable directory of any size
+    does not fit in a fixed column count. The identical "a returned
+    refund's breakdown sums to `final_amount`" invariant now lives in the
+    `refund_components_complete` TRIGGER on this table (decision #162) —
+    a CHECK cannot span rows, which the new shape requires — tightened by
+    `0046` to also require at least one component. `due_at` is a plain
     calendar `date` (3.10b task 1 decision), not a `timestamptz`: the 20
     working-day control deadline (RI-07) is a day, not a moment."""
 
@@ -437,9 +623,6 @@ class Refund(Base):
     suggested_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     suggestion_reason: Mapped[str | None]
     final_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    budget_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    recipient_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    other_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     status: Mapped[str] = mapped_column(default="requested")
     requested_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
     requested_at: Mapped[datetime]
@@ -448,12 +631,4 @@ class Refund(Base):
     decided_at: Mapped[datetime | None]
     comment: Mapped[str | None]
 
-    __table_args__ = (
-        CheckConstraint(_in_check("status", REFUND_STATUSES), name="status_valid"),
-        CheckConstraint(
-            "status <> 'returned' OR (final_amount IS NOT NULL AND "
-            "coalesce(budget_amount, 0) + coalesce(recipient_amount, 0) "
-            "+ coalesce(other_amount, 0) = final_amount)",
-            name="returned_needs_complete_breakdown",
-        ),
-    )
+    __table_args__ = (CheckConstraint(_in_check("status", REFUND_STATUSES), name="status_valid"),)

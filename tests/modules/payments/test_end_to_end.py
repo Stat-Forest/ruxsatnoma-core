@@ -54,6 +54,7 @@ from tests.modules.applications.conftest import published_contour as published_c
 from tests.modules.gis.conftest import approval_doc as approval_doc
 from tests.modules.gis.conftest import contours_layer as contours_layer
 from tests.modules.gis.conftest import leshoz as leshoz
+from tests.modules.payments.conftest import PAYME_TEST_LESHOZ_ACCOUNT_ID
 
 # --- fixtures ----------------------------------------------------------------
 #
@@ -115,8 +116,24 @@ async def application_with_org_account(
     under `leshoz` (`tests/modules/gis/conftest.py`'s own `make_contour` sets
     `organization_id=org.id`) — giving `leshoz` a real bank account directly
     on its own `requisites` JSONB, then pointing an application's
-    `contour_id` at that same contour, exercises the full chain for real."""
-    leshoz.requisites = {"account": "20208000123456789012"}
+    `contour_id` at that same contour, exercises the full chain for real.
+
+    Stage 7.9 task 6 (decision #160): the SAME `requisites` dict also
+    carries `payme_account_id` now — an unrelated field on the same JSONB,
+    needed only so the leshoz's own remainder row stays ROUTABLE at Payme
+    (`payme.py`'s new `CheckPerformTransaction`/`CreateTransaction`
+    refusal); the seeded `budget_50`'s OWN half is made routable
+    module-wide by `conftest.py`'s `_budget_recipient_is_routable`. Neither
+    this fixture's own point (the bank-account chain,
+    `test_perform_transaction_resolves_the_recipient_account_through_the_
+    contour`'s `by_target["recipient"].account` assertion) nor
+    `by_target["receiver"].account is None` (that same test, on the
+    configured `budget_50` row, which names a Payme wallet — a DIFFERENT
+    field — never a bank account) reads `payme_account_id` at all."""
+    leshoz.requisites = {
+        "account": "20208000123456789012",
+        "payme_account_id": PAYME_TEST_LESHOZ_ACCOUNT_ID,
+    }
     application = Application(
         applicant_id=applicant.id,
         submitted_by_user_id=applicant.owner_user_id,
@@ -261,7 +278,12 @@ async def test_perform_transaction_resolves_the_recipient_account_through_the_co
     ).all()
     by_target = {e.target: e for e in entries}
     assert by_target["recipient"].account == "20208000123456789012"
-    assert by_target["budget"].account is None
+    # Stage 7.9 task 5: the seeded `budget_50` directory row (migration
+    # `0045`, always active in a fresh test DB) is now a configured
+    # RECEIVER, not the old engine's fixed "budget" half — its own account
+    # stays `None` regardless (Override 5: a directory row names a Payme
+    # wallet, never a bank account).
+    assert by_target["receiver"].account is None
 
 
 async def test_a_failure_inside_perform_transaction_rolls_back_the_whole_write(

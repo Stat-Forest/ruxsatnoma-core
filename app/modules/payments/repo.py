@@ -18,11 +18,14 @@ from app.modules.payments.models import (
     BankStatement,
     BankStatementLine,
     Invoice,
+    InvoiceRecipient,
     ManualPaymentConfirmation,
     PaymentIntent,
+    PaymentRecipient,
     ProviderTransaction,
     Reconciliation,
     Refund,
+    RefundComponent,
 )
 
 # What "in force" means for an invoice (mirrors `uq_invoices_one_in_force`,
@@ -112,9 +115,9 @@ async def add_provider_transaction(db: AsyncSession, transaction: ProviderTransa
 
 
 async def add_allocations(db: AsyncSession, allocations: Sequence[Allocation]) -> None:
-    """The two `ledger.entries_for` rows a confirmed `PerformTransaction`
-    writes (`payments.service.confirm_payment`) — plain, unattached instances
-    until this call."""
+    """The `ledger.entries_for_shares` rows a confirmed `PerformTransaction`
+    writes, one per receiver (`payments.service.confirm_payment`) — plain,
+    unattached instances until this call."""
     db.add_all(allocations)
     await db.flush()
 
@@ -624,6 +627,35 @@ async def add_refund(db: AsyncSession, refund: Refund) -> None:
     await db.flush()
 
 
+async def add_refund_components(db: AsyncSession, rows: Sequence[RefundComponent]) -> None:
+    """The whole breakdown `backoffice_service.submit_refund_decision`
+    builds for ONE refund, written together (mirrors `add_invoice_recipients`'
+    own shape) — plain, unattached instances until this call."""
+    db.add_all(rows)
+    await db.flush()
+
+
+async def list_refund_components(
+    db: AsyncSession, refund_id: uuid.UUID
+) -> Sequence[RefundComponent]:
+    """One refund's breakdown by source — `backoffice_service.approve_refund`'s
+    own read of what `submit_refund_decision` already stored, and
+    `refunds_router.py`'s read for `available_sources`/`components` on the
+    wire. No ordering is guaranteed by the ROWS themselves (unlike
+    `InvoiceRecipient.position`); a caller that needs a stable order sorts
+    by whatever it reads off each row (e.g. `recipient_id IS NULL last`,
+    mirroring the snapshot's own remainder-last convention)."""
+    stmt = select(RefundComponent).where(RefundComponent.refund_id == refund_id)
+    return (await db.execute(stmt)).scalars().all()
+
+
+async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
+    """The plain, non-locking read — `GET /refunds/{id}` (stage 7.9 task 7).
+    `get_refund_for_update` below is for the two decision routes, which
+    must serialize; a read-only view of the register takes no lock."""
+    return await db.get(Refund, refund_id)
+
+
 async def get_refund_for_update(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
     """The locking read for `submit_refund_decision`/`approve_refund` —
     mirrors `get_manual_confirmation_for_update`'s own reasoning: two
@@ -674,4 +706,83 @@ async def list_refunds_past_due(db: AsyncSession, *, on_date: date) -> Sequence[
     sweep run a no-op for a row an earlier run already flagged AND decided
     in between."""
     stmt = select(Refund).where(Refund.status.in_(REFUND_OPEN_STATUSES), Refund.due_at < on_date)
+    return (await db.execute(stmt)).scalars().all()
+
+
+# --- Stage 7.9 task 3: the recipients directory --------------------------------
+
+
+async def add_payment_recipient(db: AsyncSession, recipient: PaymentRecipient) -> None:
+    db.add(recipient)
+    await db.flush()
+
+
+async def get_payment_recipient(
+    db: AsyncSession, recipient_id: uuid.UUID
+) -> PaymentRecipient | None:
+    return await db.get(PaymentRecipient, recipient_id)
+
+
+async def list_payment_recipients(
+    db: AsyncSession, *, limit: int, offset: int
+) -> tuple[list[PaymentRecipient], int]:
+    """The whole directory, active AND inactive (there is no DELETE, ruling
+    #157 — an inactive row stays a first-class citizen of this list forever),
+    ordered `(sort_order, id)` — the same tie-break `list_active_recipients`
+    below uses, so an admin's list and the engine's own reading order agree."""
+    stmt = select(PaymentRecipient)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(PaymentRecipient.sort_order, PaymentRecipient.id)
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def list_active_recipients(db: AsyncSession) -> Sequence[PaymentRecipient]:
+    """The ACTIVE rows only, `(sort_order, id)` ordered — read DIRECTLY by
+    `payments.service.issue_invoice` (task 4, so the split's `rules` AND
+    the name/`payme_account_id` each snapshot row copies come from the SAME
+    single read) and by the percent-total validator's own read of
+    "everything that currently counts". Unpaged: this directory is a
+    handful of rows by nature (one line per party who takes a cut off the
+    top), never a register that grows with transaction volume."""
+    stmt = (
+        select(PaymentRecipient)
+        .where(PaymentRecipient.active.is_(True))
+        .order_by(PaymentRecipient.sort_order, PaymentRecipient.id)
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+# --- Stage 7.9 task 4: the split frozen onto one invoice ------------------
+
+
+async def add_invoice_recipients(db: AsyncSession, rows: Sequence[InvoiceRecipient]) -> None:
+    """The whole split snapshot `payments.service._snapshot_rows` builds for
+    ONE invoice, written together at issuance (decision #158) — `position`
+    order, the leshoz's `kind='remainder'` row always last. Plain,
+    unattached instances until this call, mirroring `add_allocations`
+    above."""
+    db.add_all(rows)
+    await db.flush()
+
+
+async def list_invoice_recipients(
+    db: AsyncSession, invoice_id: uuid.UUID
+) -> Sequence[InvoiceRecipient]:
+    """One invoice's frozen split, `position` order — `payments.service.
+    invoice_recipients` (Task 4), the ONE way a caller outside this module
+    learns how an invoice divides. Never read `payment_recipients` (the LIVE
+    directory) for this question instead: that would answer "what applies
+    today", not "what this invoice divides into", and defeat the freeze the
+    whole table exists for (decision #158)."""
+    stmt = (
+        select(InvoiceRecipient)
+        .where(InvoiceRecipient.invoice_id == invoice_id)
+        .order_by(InvoiceRecipient.position)
+    )
     return (await db.execute(stmt)).scalars().all()

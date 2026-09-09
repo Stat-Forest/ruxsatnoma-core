@@ -13,11 +13,16 @@ Task 9 adds the refund schemas below. They are the one exception to "read by
 exactly one audience": `RefundOut` is also what an applicant's own
 `POST /refunds` (mounted at the ROOT `/refunds` prefix by `refunds_router.py`,
 design/03 — never under `/payments`) answers with, since ruling 7 lets an
-applicant file for their own application. `RefundOut.budget_account` is
-`None` on every response before `approve` decides `returned`, and stays
-`None` afterwards too when the resolution is `rejected` — see
-`backoffice_service.approve_refund`'s own docstring for why the field is
-present rather than omitted (`tz/12` #15, ruling 5).
+applicant file for their own application.
+
+Stage 7.9 task 7 (decision #154) replaced the fixed `budget_amount`/
+`recipient_amount`/`other_amount` breakdown with `RefundComponentOut` rows
+(`RefundOut.components`) — a configurable directory of any size does not
+fit two named accounts. Each component's `account` is `None` for a
+configured receiver always, and for the leshoz's own remainder until the
+refund reaches `returned` — see `RefundComponentOut`'s own docstring for
+why the field stays present rather than omitted (`tz/12` #15, ruling 5,
+generalised from a single `budget_account` field to any source).
 """
 
 import uuid
@@ -114,13 +119,25 @@ class AllocationOut(BaseModel):
     `service.record_reversal`) and `refund` (a returned refund's negative
     entries, `backoffice_service.approve_refund`) rows alike.
 
-    **`account` is `null` whenever the row is the state budget's own half of
-    the 50/50 split, or names a leshoz with no account on file** (`tz/12`
-    #15, ruling 10 — the budget's account number is stored nowhere in this
-    system): declared here with no default and no `field_serializer` of its
-    own, so a `None` value serializes as JSON `null` — present on every
-    response, never omitted, never `""`. An accountant's UI must render that
-    as "settled outside the system", not as a blank account number."""
+    **`account` is `null` for two different reasons that look identical on
+    the wire.** A row naming a configured receiver (`target="receiver"`) is
+    null STRUCTURALLY: `payment_recipients` identifies a Payme WALLET
+    (`payme_account_id`), never a bank account, so this column carries
+    nothing for any of them, the seeded state-budget row included. A row
+    naming the leshoz's own remainder (`target="recipient"`) is null only
+    when that organization's own `requisites` carries no `"account"` key
+    (`tz/12` #15) — declared here with no default and no `field_serializer`
+    of its own, so a `None` value serializes as JSON `null` — present on
+    every response, never omitted, never `""`. An accountant's UI must
+    render that as "settled outside the system", not as a blank account
+    number.
+
+    `recipient_id`/`recipient_name` (stage 7.9 task 8) name the configured
+    receiver a `target="receiver"` row belongs to — `None` for the leshoz's
+    own remainder (`recipient_id` mirrors the column directly; `target`
+    already says what a `None` id means here, so this schema does not
+    invent a leshoz label the way `RefundComponentOut` does for its own,
+    symmetric breakdown form)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -128,6 +145,8 @@ class AllocationOut(BaseModel):
     invoice_id: uuid.UUID
     transaction_id: uuid.UUID | None
     refund_id: uuid.UUID | None
+    recipient_id: uuid.UUID | None
+    recipient_name: dict[str, Any] | None = None
     entry_type: str
     target: str
     account: str | None
@@ -289,30 +308,50 @@ class RefundRequestIn(BaseModel):
     comment: str | None = None
 
 
+class RefundComponentIn(BaseModel):
+    """One line of the accountant's breakdown by source
+    (`RefundSubmitDecisionIn.components`) — `recipient_id` names a
+    configured `payment_recipients` row (a `target='receiver'` allocation
+    once approved), or `None` for the leshoz's own remainder
+    (`target='recipient'`). Replaces the three fixed `budget_amount`/
+    `recipient_amount`/`other_amount` fields (stage 7.9 task 7, decision
+    #154) — the split is now a configurable directory of any size, not
+    three named buckets.
+
+    `amount` defaults to no default at all: unlike the old three-column
+    shape, where an untouched bucket read `0.00` for free, a component the
+    accountant means to enter must be an explicit list entry — omitting a
+    source from the list IS "nothing from here", the same reading
+    `refunds.breakdown_is_complete` already gives an empty sequence.
+    `ge=0` (never `gt=0`) keeps a negative component out of a financial
+    ledger at the edge, before it becomes a negative-of-a-negative
+    allocation; a `0.00` component is accepted but writes no
+    `RefundComponent` row (that table's own `amount_positive` CHECK forbids
+    it) — the same "nothing from this source" reading.
+
+    **Override 1 — the SERVICE, not this schema, refuses a duplicate
+    source.** `uq_refund_components_source` cannot stop two components both
+    naming `recipient_id=None` (Postgres treats `NULL <> NULL` under a
+    plain UNIQUE constraint), so `backoffice_service.submit_refund_decision`
+    checks the whole list for a repeated `recipient_id` — `None` included —
+    before writing anything, and answers `ERR-VAL-001` naming the reason."""
+
+    recipient_id: uuid.UUID | None
+    amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+
+
 class RefundSubmitDecisionIn(BaseModel):
     """`POST /refunds/{id}/submit-decision` — the accountant's (`payments.
-    manage`) own half (ruling 4): the three-way breakdown and the amount it
+    manage`) own half (ruling 4): the breakdown by source and the amount it
     is meant to sum to. Checked against `refunds.breakdown_is_complete` in
     code BEFORE the insert, so a mismatch answers `ERR-VAL-001` rather than
-    an IntegrityError 500 from `returned_needs_complete_breakdown` — even
-    though that CHECK only fires once `approve` moves the row to `returned`,
+    a 500 out of the `refund_components_complete` trigger — even though
+    that trigger only fires once `approve` moves the row to `returned`,
     catching the arithmetic here is what keeps a wrong number from ever
-    reaching the rahbar's screen at all.
-
-    Each component defaults to `0.00`, not `None`: an accountant who leaves
-    a source untouched means "nothing from here", the same reading
-    `refunds.breakdown_is_complete`'s own `coalesce`-style treatment of
-    `None` already gives it — a bare `Field(ge=0, ...)` on each keeps a
-    negative component (which `returned_needs_complete_breakdown` does not
-    itself forbid) out of a financial ledger at the edge, before it becomes
-    a negative-of-a-negative allocation."""
+    reaching the rahbar's screen at all."""
 
     final_amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
-    budget_amount: Decimal = Field(default=Decimal("0.00"), ge=0, max_digits=18, decimal_places=2)
-    recipient_amount: Decimal = Field(
-        default=Decimal("0.00"), ge=0, max_digits=18, decimal_places=2
-    )
-    other_amount: Decimal = Field(default=Decimal("0.00"), ge=0, max_digits=18, decimal_places=2)
+    components: list[RefundComponentIn] = Field(default_factory=list)
     comment: str | None = None
 
 
@@ -329,20 +368,50 @@ class RefundApproveIn(BaseModel):
     comment: str | None = None
 
 
-class RefundAllocationOut(BaseModel):
-    """One ledger row `approve_refund` just wrote — what makes ruling 5's
-    NULL visible on the wire rather than only in the database (see
-    `RefundOut.budget_account`'s own docstring)."""
+class RefundComponentOut(BaseModel):
+    """One line of `RefundOut.components` — a `refund_components` row
+    enriched with its source's own name, replacing the old
+    `RefundAllocationOut`/`recipient_account`/`budget_account` trio (stage
+    7.9 task 7): a configurable directory of any size does not fit two
+    named accounts.
+
+    Always reflects whatever `submit_refund_decision` has stored — visible
+    on every response from `in_review` onward, including a `rejected` one
+    (the accountant's submitted breakdown is a fact about what was
+    entered, independent of whether the rahbar accepted it) and empty
+    while the refund is still `requested` (nothing submitted yet).
+    `account` is `None` for every configured receiver (never a bank
+    account of its own, `payments.ledger`'s own docstring) and for the
+    leshoz's own remainder UNTIL the refund reaches `returned` — the same
+    `None`-until-decided posture the old `budget_account` field documented
+    (`tz/12` #15), now generalised to any source rather than two fixed
+    ones."""
 
     model_config = ConfigDict(from_attributes=True)
 
-    target: str
+    recipient_id: uuid.UUID | None
+    name: dict[str, Any]
     account: str | None
     amount: Decimal
 
     @field_serializer("amount")
     def _amount(self, value: Decimal) -> str:
         return str(value)
+
+
+class AvailableSourceOut(BaseModel):
+    """One row of `RefundOut.available_sources` — the invoice's OWN frozen
+    split (`payments.service.invoice_recipients`), so the accountant's form
+    offers exactly the parties THIS payment was split between, never a
+    fixed budget/recipient/other trio. The last row is always
+    `kind="remainder"`, `recipient_id=None` — the leshoz's own share,
+    mirroring `InvoiceRecipient`'s own "remainder always last" convention."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    recipient_id: uuid.UUID | None
+    name: dict[str, Any]
+    kind: str
 
 
 class RefundOut(BaseModel):
@@ -352,17 +421,13 @@ class RefundOut(BaseModel):
     hint is never an error, so `POST /refunds` always answers 201 with one
     of the two set.
 
-    `budget_account`/`recipient_account` are NOT columns on `refunds` — they
-    are filled in only by `POST /refunds/{id}/approve`'s own response, from
-    the allocations that call just wrote, and stay `None` on every other
-    response (nothing has been decided yet to have an account at all).
-    **`budget_account` is `None` by design, not by omission** (`tz/12` #15
-    — the state budget's account number is stored nowhere in this system):
-    the field is declared here, with an explicit default, specifically so an
-    accountant reading this response sees a `null` the API chose to report
-    rather than a key that silently is not there. `allocations` carries the
-    same two rows in full (target, account, amount) for a client that wants
-    more than the two named accounts."""
+    `components`/`available_sources` are NOT columns on `refunds` (stage
+    7.9 task 7) — see `RefundComponentOut`/`AvailableSourceOut`'s own
+    docstrings. `available_sources` is populated only by
+    `GET /refunds/{id}` (the one route that already holds the invoice to
+    read it from); every other route leaves it `[]`, not because the data
+    would be wrong there but because no other handler reads the invoice's
+    snapshot today — a real absence, not a hidden default."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -373,9 +438,6 @@ class RefundOut(BaseModel):
     suggested_amount: Decimal | None
     suggestion_reason: str | None
     final_amount: Decimal | None
-    budget_amount: Decimal | None
-    recipient_amount: Decimal | None
-    other_amount: Decimal | None
     status: str
     requested_by: uuid.UUID | None
     requested_at: datetime
@@ -383,12 +445,9 @@ class RefundOut(BaseModel):
     decided_by: uuid.UUID | None
     decided_at: datetime | None
     comment: str | None
-    recipient_account: str | None = None
-    budget_account: str | None = None
-    allocations: list[RefundAllocationOut] = Field(default_factory=list)
+    components: list[RefundComponentOut] = Field(default_factory=list)
+    available_sources: list[AvailableSourceOut] = Field(default_factory=list)
 
-    @field_serializer(
-        "suggested_amount", "final_amount", "budget_amount", "recipient_amount", "other_amount"
-    )
+    @field_serializer("suggested_amount", "final_amount")
     def _money(self, value: Decimal | None) -> str | None:
         return None if value is None else str(value)

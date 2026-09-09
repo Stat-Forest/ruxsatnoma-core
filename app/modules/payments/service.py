@@ -20,14 +20,18 @@ Public surface for the event bus (`subscribers.py`, registered in
   Idempotent and silent when there is no in-force invoice, and it refuses
   (loudly logged, `None` returned) to cancel one that is already `paid` —
   see its own docstring.
-- `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J) —
-  the whole business action behind a successful Payme `PerformTransaction`:
-  invoice -> paid, the 50/50 ledger written, application -> PAID, the
-  applicant notified, `payment_confirmed` published on the bus. Called from
-  `payme.py` ONLY, already inside the caller's own transaction and already
-  past every Payme-protocol check (idempotency, amount, payability) — this
-  function performs no check of its own beyond resolving the recipient
-  account.
+- `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J;
+  stage 7.9 task 5) — the whole business action behind a confirmed payment:
+  invoice -> paid, one ledger row PER RECEIVER written (the frozen split
+  re-applied against what actually arrived), application -> PAID, the
+  applicant notified, `payment_confirmed` published on the bus. TWO
+  callers — `payme._perform_transaction`, already past every
+  Payme-protocol check (idempotency, amount, payability), and
+  `backoffice_service._confirm_and_pay`, the manual maker-checker door —
+  and this function performs exactly ONE check of its own: it refuses
+  (`ERR-VAL-001`, before any write) when the frozen split does not fit
+  `transaction.amount`, reachable only through the manual door. See its
+  own docstring for both callers and the refusal in full.
 - `record_reversal(db, *, invoice, transaction, reason) -> None` (3.10b task
   8, ruling 15; ruling #112 added the notify) — the mirror of `confirm_payment`
   for money that came BACK: Payme cancelled an already-performed transaction.
@@ -45,8 +49,10 @@ unlike the functions above) — not part of the cross-module public surface.
 """
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any, NamedTuple
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,9 +78,12 @@ from app.modules.payments.models import (
     ALLOCATION_ENTRY_TYPES,
     RECONCILIATION_RESULTS,
     RECONCILIATION_STATUSES,
+    SNAPSHOT_KINDS,
     Allocation,
     Invoice,
+    InvoiceRecipient,
     PaymentIntent,
+    PaymentRecipient,
     ProviderTransaction,
     Reconciliation,
 )
@@ -131,13 +140,27 @@ RECONCILIATION_RESULT_DISCREPANCY = RECONCILIATION_RESULTS[1]
 RECONCILIATION_STATUS_OPEN = RECONCILIATION_STATUSES[0]
 ALLOCATION_ENTRY_PAYMENT = ALLOCATION_ENTRY_TYPES[0]
 ALLOCATION_ENTRY_CORRECTION = ALLOCATION_ENTRY_TYPES[2]
+SNAPSHOT_KIND_REMAINDER = SNAPSHOT_KINDS[2]
+
+# Task 4 (decision #158): `invoice_recipients.name` is NOT NULL even for the
+# leshoz's own `kind='remainder'` row — unlike a configured receiver, it has
+# no `payment_recipients` row of its own to copy a name from. The leshoz's
+# row freezes its ORGANIZATION's own name instead (`_leshoz_snapshot_
+# fields`, below `_organization_for`), exactly as a configured receiver's
+# row freezes ITS name from `payment_recipients` — this constant is only
+# the FALLBACK label for when no organization resolves at all (no contour,
+# no assigned organization, no such organization: `_organization_for`'s own
+# `None`), which must stay non-fatal — a leshoz without one must never
+# block an invoice from being issued (review finding "Important 3").
+LESHOZ_SNAPSHOT_NAME: dict[str, Any] = {"uz_latn": "Leshoz"}
 
 
 # --- Task 7: the public surface for 3.11 permits ---------------------------
 #
-# Three entry points, and nothing else a level-4+ caller may use to learn
-# about an invoice or its ledger. The contract below is FROZEN once this
-# task lands — 3.11 builds against it starting now, in a parallel worktree.
+# Four entry points (stage 7.9 task 4 added the last, `invoice_recipients`),
+# and nothing else a level-4+ caller may use to learn about an invoice or its
+# ledger. The contract below is FROZEN once this task lands — 3.11 builds
+# against it starting now, in a parallel worktree.
 #
 # - `invoice_for_application(db, application_id) -> Invoice | None` — the
 #   in-force (`pending`/`paid`) invoice, or `None` when the application was
@@ -218,18 +241,27 @@ ALLOCATION_ENTRY_CORRECTION = ALLOCATION_ENTRY_TYPES[2]
 #   `"correction"` from `record_reversal` and `"refund"` from 3.10b's refund
 #   register — a caller must not assume every row it gets back is a payment,
 #   and must not assume they are all positive.
+# - `invoice_recipients(db, invoice_id) -> list[InvoiceRecipient]` (stage 7.9
+#   task 4, decision #158) — the split FROZEN onto this invoice at issuance,
+#   `position` order, the leshoz's `kind='remainder'` row always last. The
+#   ONE way Tasks 5, 6 and 8 of that plan learn how an invoice divides;
+#   reading `payment_recipients` (the LIVE directory) for that question
+#   would defeat the freeze the whole `invoice_recipients` table exists for
+#   — an admin editing the directory after issuance must not change what an
+#   already-issued invoice divides into.
 #
-# No permission or zone rule on any of the three — the caller is another
+# No permission or zone rule on any of the four — the caller is another
 # SERVICE inside this process, not an HTTP actor, mirroring
 # `applications.service.get`/`norms.service.effective_norm`.
 #
 # A level-4+ caller must NEVER:
-#   - read `invoices` or `allocations` as tables of its own — no
-#     `payments.repo` import, no `select(Invoice)`/`select(Allocation)`
-#     against this module's tables from outside it. Every fact reachable
-#     that way is already one of the three functions above (module
-#     boundary, CLAUDE.md — the same reasoning `norms.service`'s own
-#     public-surface comment states for `tariffs`/`rule_parameters`).
+#   - read `invoices`, `allocations` or `invoice_recipients` as tables of
+#     its own — no `payments.repo` import, no `select(Invoice)`/
+#     `select(Allocation)`/`select(InvoiceRecipient)` against this module's
+#     tables from outside it. Every fact reachable that way is already one
+#     of the four functions above (module boundary, CLAUDE.md — the same
+#     reasoning `norms.service`'s own public-surface comment states for
+#     `tariffs`/`rule_parameters`).
 #   - set an invoice's `status` directly. `issue_invoice`,
 #     `cancel_invoice_for_application` and `confirm_payment` (below) are
 #     the only writers, each already wired to the one event that should
@@ -267,6 +299,41 @@ async def allocations_for(db: AsyncSession, invoice_id: uuid.UUID) -> list[Alloc
     return list(await repo.list_allocations_by_invoice(db, invoice_id))
 
 
+async def invoice_recipients(db: AsyncSession, invoice_id: uuid.UUID) -> list[InvoiceRecipient]:
+    """The split FROZEN onto `invoice_id` at issuance (`issue_invoice`
+    below, decision #158), `position` order, the leshoz's own
+    `kind='remainder'` row always last. See the banner above — no permission
+    or zone rule, the caller is another service — and never read
+    `payment_recipients` (the LIVE directory) in this reader's place: that
+    would answer "what applies today", not "what this invoice divides
+    into", and defeat the whole reason this table exists."""
+    return list(await repo.list_invoice_recipients(db, invoice_id))
+
+
+def missing_payme_receivers(snapshot: Sequence[InvoiceRecipient]) -> list[InvoiceRecipient]:
+    """Rows of a frozen `invoice_recipients` snapshot (`invoice_recipients`
+    above) that carry no `payme_account_id` AND would actually receive money
+    (`row.amount > 0`) — the shared "this split cannot be routed at Payme"
+    precondition, decision #160. Scoped to `amount > 0` on purpose:
+    `ledger.split_payment` can floor a percent rule, or the leshoz's own
+    remainder, to exactly `0.00`, and a receiver Payme would never be asked
+    to route anything to can never be the reason the WHOLE payment is
+    refused — the same reading Task 6's own `receivers` builder gives a
+    `0.00` row (omitted, never routed, but never blocking either).
+
+    TWO callers, the two refusal points Override 1 of the task-6 brief
+    names: `create_pay_intent` below (`ERR-PAY-007`, the citizen's own
+    button) and `payme.py`'s `_receivers_for` (`-31008`, BOTH
+    `CheckPerformTransaction` and `CreateTransaction`) — pure and
+    synchronous so neither has to re-derive "missing" its own way and
+    silently drift from the other (the same reasoning `resolve_recipient_
+    account`'s own docstring gives for staying a single, frozen, two-caller
+    helper). An EMPTY snapshot (an invoice issued before stage 7.9, Override
+    3) has no rows to iterate and returns `[]` — never a reason to refuse a
+    payment nothing here can even describe."""
+    return [row for row in snapshot if row.amount > 0 and not row.payme_account_id]
+
+
 async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     """The whole business action behind `APPLICATION_APPROVED`: freeze the
     application's current calculation into an invoice, move the application to
@@ -289,6 +356,20 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     Never recomputes the amount — reads it once from
     `applications.service.current_calculation`, the frozen price 3.7's own
     preview/save split exists to protect.
+
+    Stage 7.9 task 4 (decision #158): also freezes the split onto the new
+    invoice — `payment_recipients`' ACTIVE rows, applied through
+    `ledger.split_payment` and written as `invoice_recipients`, so an
+    administrator editing the directory afterwards cannot change what THIS
+    invoice divides into (`invoice_recipients` mirrors `calculation_id`
+    above for the same reason). This write sits on the branch that CREATES a
+    new invoice — after the early idempotency return above, never on it — so
+    a retry inside the same approval transaction (the same retry the
+    docstring above already accounts for) can never write the snapshot
+    twice and trip `uq_invoice_recipients_position`. A configuration whose
+    fixed amounts alone exceed the invoice refuses the WHOLE issuance
+    (`ledger.SplitDoesNotFit` -> `ERR-VAL-001`) rather than issuing an
+    invoice nobody could divide.
     """
     existing = await invoice_for_application(db, application_id)
     if existing is not None:
@@ -346,6 +427,43 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
 
     application = await applications_service.set_status(db, application_id, to_status="INVOICED")
 
+    # The split, frozen onto THIS invoice (decision #158). `repo.
+    # list_active_recipients` — the ACTIVE directory rows, `(sort_order,
+    # id)` order — is read DIRECTLY and exactly ONCE here, never through
+    # `recipients_service` (whose own readers return either
+    # `PaymentRecipientOut` schemas or, formerly, `RecipientRule` tuples
+    # with no name to copy — neither can supply what this snapshot needs):
+    # `rules` (the engine's input) and the name/`payme_account_id` each
+    # receiver row copies (below, `_snapshot_rows`) both come out of this
+    # one read, never two separate queries a concurrent directory edit
+    # could answer differently (lesson: "a precondition shared by several
+    # steps belongs in ONE function every step calls").
+    recipients = await repo.list_active_recipients(db)
+    rules = [
+        ledger.RecipientRule(row.id, row.kind, row.percent, row.fixed_amount) for row in recipients
+    ]
+    try:
+        shares = ledger.split_payment(invoice.amount, rules)
+    except ledger.SplitDoesNotFit as exc:
+        # `ERR-VAL-001` (422), the same code and the same reasoning as the
+        # `calculation is None` branch above: this function has no HTTP
+        # route of its own, it runs as a bus subscriber INSIDE the
+        # publisher's transaction, so the approval rolls back WITH it
+        # either way (synchronous, in-transaction bus, by design) — an
+        # invoice nobody can divide must never exist, and the reviewer
+        # needs to be told WHY here rather than discovering it as a 500
+        # out of `confirm_payment` days later, when the money has already
+        # arrived and there is nowhere left for the excess to come from.
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "split_does_not_fit", "detail": str(exc)},
+        ) from exc
+
+    leshoz = await _leshoz_snapshot_fields(
+        db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
+    )
+    await repo.add_invoice_recipients(db, _snapshot_rows(invoice, recipients, shares, leshoz))
+
     await notifications_service.notify(
         db,
         event_code=events.INVOICE_ISSUED,
@@ -363,6 +481,82 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
         object_id=invoice.id,
     )
     return invoice
+
+
+class _LeshozSnapshotFields(NamedTuple):
+    """What `issue_invoice` freezes onto the leshoz's own `kind='remainder'`
+    row: its `name` (a `LocalizedName`-shaped dict, `app/modules/admin/
+    models.py::Organization.name`) and its Payme account id — both resolved
+    by `_leshoz_snapshot_fields`, below `_organization_for`."""
+
+    name: dict[str, Any]
+    payme_account_id: str | None
+
+
+def _snapshot_rows(
+    invoice: Invoice,
+    recipients: Sequence[PaymentRecipient],
+    shares: Sequence[ledger.Share],
+    leshoz: _LeshozSnapshotFields,
+) -> list[InvoiceRecipient]:
+    """`issue_invoice`'s own pure, in-memory builder — no I/O, no session,
+    nothing here can fail once its inputs are already consistent.
+
+    `recipients` is exactly the ACTIVE directory `rules` (the engine's
+    input `issue_invoice` built `shares` from) was itself built from, in the
+    SAME `(sort_order, id)` order — so `recipients[i]` and `shares[i]` name
+    the SAME recipient in the SAME position, which `zip(..., strict=True)`
+    below asserts rather than trusts by convention. `shares` carries exactly
+    one MORE entry than `recipients`: `ledger.split_payment` always appends
+    the leshoz's own `Share` last, `recipient_id=None` (Override 2 of this
+    task's brief) — the loop below stops one short of `shares` and the
+    leshoz's own row is appended separately, `kind='remainder'`.
+
+    Each receiver row copies its OWN `name`/`payme_account_id` from its
+    `payment_recipients` row — never re-derives them — because that row may
+    already have moved on by the time anyone reads this snapshot back
+    (decision #158, the whole point of freezing it). The leshoz's row has no
+    `payment_recipients` row of its own to copy from: its `name` and
+    `payme_account_id` come from `leshoz` (`_leshoz_snapshot_fields`,
+    resolved by the caller and handed in already-resolved, since that
+    resolution needs a session and this function may not take one) — its
+    OWN organization's name when one resolves, `LESHOZ_SNAPSHOT_NAME`
+    otherwise (review finding "Important 3")."""
+    leshoz_share = shares[-1]
+    rows: list[InvoiceRecipient] = []
+    for position, (recipient, share) in enumerate(zip(recipients, shares[:-1], strict=True)):
+        assert recipient.id == share.recipient_id, (
+            f"recipients[{position}]={recipient.id} does not match "
+            f"shares[{position}].recipient_id={share.recipient_id} — issue_invoice "
+            "must build `rules` from `recipients` in the same order"
+        )
+        rows.append(
+            InvoiceRecipient(
+                invoice_id=invoice.id,
+                recipient_id=recipient.id,
+                name=recipient.name,
+                payme_account_id=recipient.payme_account_id,
+                kind=recipient.kind,
+                percent=recipient.percent,
+                fixed_amount=recipient.fixed_amount,
+                amount=share.amount,
+                position=position,
+            )
+        )
+    rows.append(
+        InvoiceRecipient(
+            invoice_id=invoice.id,
+            recipient_id=None,
+            name=leshoz.name,
+            payme_account_id=leshoz.payme_account_id,
+            kind=SNAPSHOT_KIND_REMAINDER,
+            percent=None,
+            fixed_amount=None,
+            amount=leshoz_share.amount,
+            position=len(rows),
+        )
+    )
+    return rows
 
 
 async def cancel_invoice_for_application(
@@ -425,7 +619,7 @@ async def cancel_invoice_for_application(
     return invoice
 
 
-async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
+async def holds_payments_read(db: AsyncSession, actor: User) -> bool:
     """Holds a permission that entitles its holder to READ invoices —
     `payments.view`, or `payments.confirm`, or the superuser gate.
 
@@ -441,21 +635,46 @@ async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
     **Reads only.** `create_pay_intent` shares `_may_act_on_invoices_of` and
     deliberately does NOT accept this wider set: raising a payment link is
     `payments.view`'s, and the caller marks which question it is asking with
-    `read_only`."""
+    `read_only`.
+
+    Named WITHOUT a leading underscore since the whole-branch review's
+    Important 2: `router.py::_invoice_out` gained a SECOND caller across
+    files, to decide whether `GET /invoices/{id}` attaches `recipients` at
+    all — it must be the SAME predicate `_may_act_on_invoices_of`'s staff
+    branch already uses to decide who may act on the invoice in the first
+    place (`staff = holds_payments_read if read_only else
+    holds_payments_view`, right below), or a `payments.confirm`-only holder
+    (`executor_head`, the checker half of the maker-checker PAID, and the
+    head of the leshoz that receives the invoice's own remainder) reaches
+    the route and gets a body with `recipients` silently absent — not a
+    403, not a null: gone. One access rule, one source; `holds_payments_view`
+    alone was a SECOND, narrower copy of it living in the wrong file."""
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     codes = await auth_repo.permission_codes(db, actor)
     return PAYMENTS_VIEW in codes or PAYMENTS_CONFIRM in codes
 
 
-async def _holds_payments_view(db: AsyncSession, actor: User) -> bool:
+async def holds_payments_view(db: AsyncSession, actor: User) -> bool:
     """Holds `payments.view`, or is the superuser that passes every permission
     gate (decision #41 ruling 2) — the same two-branch shape
     `norms.service._holds_tariffs_publish`/`gis.service._may_manage_layers`
     use for a rule INSIDE a handler, as opposed to a `require_permission`
     dependency on the route itself (needed here because even a caller
     holding NEITHER `payments.view` NOR any grant at all must still reach
-    these routes, to read their OWN invoice)."""
+    these routes, to read their OWN invoice).
+
+    Named WITHOUT a leading underscore since stage 7.9 task 8, when
+    `router.py` gained a caller across files — the same "no underscore
+    once a caller crosses a file" convention `resolve_recipient_account`'s
+    own docstring states. That caller (`_invoice_out`, deciding whether
+    `GET /invoices/{id}` attaches `recipients` at all) has since moved to
+    `holds_payments_read` instead (whole-branch review Important 2 —
+    gating on THIS narrower predicate silently dropped `recipients` for a
+    `payments.confirm`-only reader the route otherwise treats as staff);
+    the underscore stays off regardless, because `_may_act_on_invoices_of`
+    right below still calls this across the SAME two-branch shape for the
+    write path."""
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     return PAYMENTS_VIEW in await auth_repo.permission_codes(db, actor)
@@ -542,7 +761,7 @@ async def _may_act_on_invoices_of(
     pay-intent route (`create_pay_intent`) — one rule, three callers, so the
     representation gap Task 2 deliberately carried to this task is closed
     for reads too, not just for paying."""
-    staff = _holds_payments_read if read_only else _holds_payments_view
+    staff = holds_payments_read if read_only else holds_payments_view
     if await staff(db, actor):
         # A permission says WHETHER, a zone says WHERE — and zone scoping is
         # not a permission check (lesson). Staff pass both or neither.
@@ -621,7 +840,7 @@ async def list_invoices_for_actor(
             db, application_id, status=status, limit=limit, offset=offset
         )
 
-    if not await _holds_payments_read(db, actor):
+    if not await holds_payments_read(db, actor):
         raise err("ERR-ACL-001")
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
@@ -719,6 +938,35 @@ async def create_pay_intent(
     (`PaymentIntent`'s own docstring). The column carries no DB unique
     constraint by design; `app/core/idempotency.py`'s own table is what
     de-duplicates the HTTP request itself.
+
+    Stage 7.9 task 6 (decision #160): checked LAST, after every other
+    precondition above, is whether the invoice's own FROZEN split
+    (`invoice_recipients`, decision #158) can be routed at Payme at all —
+    every row that would actually receive money (`amount > 0`) must carry a
+    `payme_account_id`, or this refuses with `ERR-PAY-007` and
+    `details.missing` naming the receivers that lack one **by POSITION
+    ONLY, never by name** (whole-branch review Important 4, fixed from
+    `{"position", "name"}`): this route answers the APPLICANT's own "pay"
+    button, and `GET /invoices/{id}` already hides `recipients` from that
+    same actor (Override 4) — echoing a receiver's name back into a 409 the
+    instant they press pay would hand them exactly what the read route
+    refuses to. `logger.error` right below names them IN FULL for staff,
+    who are who must actually fix a missing `payme_account_id` — decision
+    #160's own goal (a legible refusal rather than a raw provider error)
+    is served by `position` alone: it tells the reader WHICH configured
+    row is broken without disclosing WHO it is to the one actor who must
+    never be told. This is the refusal a human actually SEES (Override 1
+    of the task's own brief) — Payme's own `CheckPerformTransaction`/
+    `CreateTransaction` (`payme.py`) answer the SAME condition as `-31008`
+    instead, for a citizen who reaches the payment page some other way.
+    All-or-nothing by construction (`missing_payme_receivers` reads the
+    WHOLE snapshot): a partial `receivers` array would route some
+    receivers at Payme and leave the rest on the Agency's own cashbox
+    awaiting a manual transfer — the worst of both mechanisms and the
+    hardest thing in this system to reconcile. An invoice issued BEFORE
+    this stage carries an EMPTY snapshot (Override 3) and stays payable
+    unchanged — refusing those would strand every invoice already pending
+    on the stand.
     """
     invoice = await repo.get_invoice(db, invoice_id)
     if invoice is None:
@@ -732,6 +980,22 @@ async def create_pay_intent(
         raise err("ERR-PAY-004", details={"invoice": str(invoice_id), "status": invoice.status})
     if datetime.now(UTC) > invoice.due_at:
         raise err("ERR-PAY-002", details={"invoice": str(invoice_id)})
+
+    snapshot = await invoice_recipients(db, invoice.id)
+    missing = missing_payme_receivers(snapshot)
+    if missing:
+        logger.error(
+            "payments.pay_intent_refused_unroutable_split",
+            invoice_id=str(invoice_id),
+            missing=[{"position": row.position, "name": row.name} for row in missing],
+        )
+        raise err(
+            "ERR-PAY-007",
+            details={
+                "invoice": str(invoice_id),
+                "missing": [{"position": row.position} for row in missing],
+            },
+        )
 
     payment_url = payme_adapter.build_checkout_url(
         invoice_number=invoice.number, amount=invoice.amount
@@ -755,17 +1019,44 @@ async def create_pay_intent(
     return intent, payment_url
 
 
+async def _organization_for(
+    db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
+) -> OrganizationRow | None:
+    """The leshoz's own organization row — `contour_id` ->
+    `gis.service.contour_organization` -> `admin.repo.get_organization`,
+    falling back to `assigned_org_id` when there is no contour. `None`
+    whenever any step comes up empty: no contour AND no assigned
+    organization, a contour with no known owner, or an owner id that no
+    longer resolves.
+
+    Extracted (stage 7.9 task 4) so `resolve_recipient_account` and
+    `_leshoz_snapshot_fields` below — both of which walk this SAME
+    four-step chain to read the SAME organization's `requisites` and/or
+    `name` — cannot drift apart. Two functions independently walking
+    the same steps is exactly the shape that produced finding F7 of stage
+    7.4: a module's own hard-coded claim about another module rots silently
+    once nothing forces the two claims to agree."""
+    org_id: uuid.UUID | None
+    if contour_id is not None:
+        org_id = await gis_service.contour_organization(db, contour_id)
+    else:
+        org_id = assigned_org_id
+    if org_id is None:
+        return None
+    return await admin_repo.get_organization(db, org_id)
+
+
 async def resolve_recipient_account(
     db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
 ) -> str | None:
-    """Ruling H: the leshoz's own bank account for the 50/50 recipient half —
-    `contour_id` -> `gis.service.contour_organization` ->
-    `admin.repo.get_organization` -> `organization.requisites.get("account")`,
-    falling back to `assigned_org_id` when there is no contour. `None`
-    (never a placeholder string) whenever any step comes up empty: a leshoz
-    without bank details, or without even an assigned organization, must
-    never block money that has already arrived — `allocations.account` is
-    nullable for exactly this (Task 3 ruling).
+    """Ruling H: the leshoz's own bank account for its own remainder share
+    (`target=TARGET_RECIPIENT` — a configured receiver resolves a Payme
+    WALLET elsewhere, never through this function) —
+    `_organization_for(...)` -> `organization.requisites.get("account")`.
+    `None` (never a placeholder string) whenever any step comes up empty: a
+    leshoz without bank details, or without even an assigned organization,
+    must never block money that has already arrived — `allocations.account`
+    is nullable for exactly this (Task 3 ruling).
 
     Takes the two fields it actually reads, not the whole `Application`
     (review finding I3): `payments` may not import `applications.models` —
@@ -775,38 +1066,82 @@ async def resolve_recipient_account(
     `applications.service.get`, itself the sanctioned cross-module surface —
     only the TYPE import for this helper's own signature was the violation.
 
+    **Signature and `None`-on-any-missing-step behaviour are FROZEN as of
+    stage 7.9 task 4.** TWO existing callers depend on both: `confirm_payment`
+    (below, same file) and `backoffice_service.approve_refund`.
+
     Named WITHOUT a leading underscore since 3.10b task 9: it gained a
     SECOND caller in that stage, `backoffice_service.approve_refund`, which
     resolves the very same account for a refund's recipient-side entry — a
     module-internal helper with two callers across two files of the SAME
     module is exactly what the rest of this file (`invoice_for_application`,
     `allocations_for`, ...) already spells with no underscore; only a
-    helper that stays single-file-private keeps one (`_holds_payments_view`,
-    `_may_act_on_invoices_of` right below, still called from nowhere but
-    this file)."""
-    org_id: uuid.UUID | None
-    if contour_id is not None:
-        org_id = await gis_service.contour_organization(db, contour_id)
-    else:
-        org_id = assigned_org_id
-    if org_id is None:
-        return None
-    organization = await admin_repo.get_organization(db, org_id)
+    helper that stays single-file-private keeps one. `holds_payments_view`
+    lost its own underscore the same way in stage 7.9 task 8, once
+    `router.py` needed it too, to decide whether `GET /invoices/{id}`
+    attaches the split at all — `_may_act_on_invoices_of` right below is
+    still called from nowhere but this file, so it is the one that keeps
+    its underscore today."""
+    organization = await _organization_for(
+        db, contour_id=contour_id, assigned_org_id=assigned_org_id
+    )
     if organization is None:
         return None
     account = organization.requisites.get("account")
     return account if isinstance(account, str) else None
 
 
+async def _leshoz_snapshot_fields(
+    db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
+) -> _LeshozSnapshotFields:
+    """The leshoz's own name and Payme account id, frozen onto an invoice's
+    `invoice_recipients` remainder row at issuance (decision #158, review
+    finding "Important 3") — both read off the SAME `_organization_for(...)`
+    row, in ONE query, the same chain `resolve_recipient_account` reads
+    (there `organization.requisites.get("account")`, here `.get(
+    "payme_account_id")` and `.name` directly).
+
+    `None`/`LESHOZ_SNAPSHOT_NAME` whenever `_organization_for` comes up
+    empty — no contour AND no assigned organization, a contour with no
+    known owner, or an owner id that no longer resolves — exactly the same
+    posture `resolve_recipient_account` already states for the recipient
+    account: a leshoz with no organization, or one with no Payme id
+    configured, must never block an invoice from being issued, only leave
+    that invoice's leshoz row without one (and, for the name, carrying the
+    fixed fallback label instead of the organization's own)."""
+    organization = await _organization_for(
+        db, contour_id=contour_id, assigned_org_id=assigned_org_id
+    )
+    if organization is None:
+        return _LeshozSnapshotFields(name=LESHOZ_SNAPSHOT_NAME, payme_account_id=None)
+    payme_account_id = organization.requisites.get("payme_account_id")
+    return _LeshozSnapshotFields(
+        name=organization.name,
+        payme_account_id=payme_account_id if isinstance(payme_account_id, str) else None,
+    )
+
+
 async def confirm_payment(
     db: AsyncSession, *, invoice: Invoice, transaction: ProviderTransaction
 ) -> None:
     """The whole business action behind a confirmed payment — invoice ->
-    paid, the 50/50 ledger written, application -> PAID, the applicant
-    notified, `payment_confirmed` published — all inside the CALLER's
-    transaction: the caller owns the session, and this function neither
-    commits nor performs any check of its own beyond resolving the recipient
-    account. Every check is the caller's.
+    paid, one ledger row PER RECEIVER written, application -> PAID, the
+    applicant notified, `payment_confirmed` published — all inside the
+    CALLER's transaction: the caller owns the session, and this function
+    commits nothing of its own. Every PRECONDITION on the caller's side —
+    idempotency, amount, payability, the invoice's own status — is the
+    caller's, never repeated here.
+
+    **One check IS this function's own, and it is not a precondition — it
+    is the split arithmetic itself.** Task 5 added it (see the `ERR-VAL-001`
+    paragraph further down this same docstring): `ledger.split_payment`
+    raises `SplitDoesNotFit` when the frozen rules do not fit `transaction.
+    amount`, and this function turns that into `ERR-VAL-001` before
+    anything is written. That is not a business rule a caller could have
+    checked in advance (it depends on the split, which only this function
+    reads) — it is this function refusing to allocate money it cannot
+    honestly divide, the same posture `issue_invoice` takes for the
+    identical exception.
 
     TWO callers, and they are the whole list:
 
@@ -820,24 +1155,63 @@ async def confirm_payment(
       invoice locked and re-read as `pending`, and the amount bounded
       `> 0` by `backoffice_schemas.ManualConfirmationIn`.
 
-    Ruling I: the amount split is `transaction.amount` — the money that
-    actually arrived — never `invoice.amount`. Task 3's own tests prove the
-    sourcing rule this function relies on (`ledger.entries_for`).
-
-    **The two amounts are NOT equal by construction.** They are on the Payme
-    path, where `CheckPerformTransaction`/`CreateTransaction` refuse a
+    **Stage 7.9 task 5 (decision #154): the ledger is rebuilt from the
+    FROZEN split, re-applied against what actually arrived.** `invoice_
+    recipients(db, invoice.id)` reads back the `RecipientRule`s `issue_
+    invoice` froze onto this invoice (every row whose `kind != "remainder"`,
+    in `position` order — the remainder row itself is not a rule, it is
+    `split_payment`'s own OUTPUT), and `ledger.split_payment` re-runs them
+    against `transaction.amount` — never the snapshot's own `amount` column
+    (that is the share OF THE INVOICE, display data) and never `invoice.
+    amount` (a claim, possibly stale). The two amounts are EQUAL on the
+    Payme path, where `CheckPerformTransaction`/`CreateTransaction` refuse a
     mismatch with `-31001`; this docstring claimed that as a general
     invariant until 2026-09-03, and the manual door deliberately breaks it.
     An accountant may confirm an UNDERPAYMENT — money that really arrived,
     less than was owed — and 3.10b files the difference as an open
     `reconciliations` row rather than refusing it. So a caller reading this
-    must not assume `transaction.amount == invoice.amount`: the ledger below
-    settles what arrived, and an invoice can be `paid` with less than its own
-    amount allocated.
-    """
-    invoice.status = "paid"
-    invoice.paid_at = transaction.performed_at
+    must not assume `transaction.amount == invoice.amount`: re-running the
+    frozen rules against the snapshot's own amounts here would allocate
+    money that never arrived, silently, with every module's own suite
+    staying green — reusing `invoice.amount` would repeat the identical
+    mistake one level up.
 
+    An invoice issued BEFORE this stage carries no snapshot at all —
+    `invoice_recipients` returns `[]` — which `split_payment` already reads
+    as "everything to the leshoz" (Task 2), the correct reading of "nobody
+    is configured" and not an error: refusing those would strand every
+    invoice already pending when this stage ships.
+
+    `accounts = {None: leshoz_account}` only: a `payment_recipients` row
+    identifies a Payme WALLET, not a bank account, so a configured
+    receiver's `allocations.account` always stays `None` — the same
+    reasoning `resolve_recipient_account`'s own docstring carries for the
+    leshoz half this replaces (a placeholder string in a financial ledger is
+    worse than `NULL`).
+
+    **Raises `err("ERR-VAL-001", details={"reason": "split_does_not_fit"})`
+    when the frozen rules do not fit `transaction.amount`** (review round 1,
+    Important 1). `backoffice_schemas.ManualConfirmationIn.amount` is bounded
+    only `gt=0` — an accountant may confirm LESS than the invoice, the whole
+    point of the underpayment paragraph above — so a configured FIXED-amount
+    receiver larger than what arrived makes `ledger.split_payment` raise
+    `SplitDoesNotFit`. This mirrors `issue_invoice`'s own handling of the
+    identical exception. Unreachable on the Payme path: `-31001` already
+    pins `transaction.amount == invoice.amount`, and `issue_invoice` already
+    proved the frozen rules fit the FULL invoice at issuance time.
+
+    REFUSING is the right behaviour, not allocating a partial split: money
+    that physically arrived is not lost by declining to mark the invoice
+    `paid` — 3.10b's discrepancy register is exactly where an underpayment
+    nobody can allocate belongs, and it can be confirmed the moment either
+    the amount or the directory is corrected. The alternative — allocating
+    anyway — would put a NEGATIVE row in a financial ledger, which is worse
+    than an unconfirmed payment and far harder to notice. The check below
+    runs BEFORE `invoice.status`/`.paid_at` are touched, so this leaves
+    NOTHING written: no allocations, and the invoice stays exactly as it
+    was — `get_db` rolls the caller's whole transaction back on this raise
+    (decision #37), so no explicit rollback belongs here.
+    """
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         # invoice.application_id is a NOT NULL FK — unreachable in practice;
@@ -845,16 +1219,32 @@ async def confirm_payment(
         # by payme_router.py's generic handler and answered -32400.
         raise err("ERR-SYS-003", details={"invoice": str(invoice.id)})
 
-    recipient_account = await resolve_recipient_account(
+    snapshot = await invoice_recipients(db, invoice.id)
+    rules = [
+        ledger.RecipientRule(row.recipient_id, row.kind, row.percent, row.fixed_amount)
+        for row in snapshot
+        if row.kind != SNAPSHOT_KIND_REMAINDER
+    ]
+    try:
+        shares = ledger.split_payment(transaction.amount, rules)
+    except ledger.SplitDoesNotFit as exc:
+        # Reached only through the manual maker-checker door (see the
+        # docstring paragraph above) — refuse before any write, mirroring
+        # `issue_invoice`'s own handling of the identical exception.
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "split_does_not_fit", "detail": str(exc)},
+        ) from exc
+
+    invoice.status = "paid"
+    invoice.paid_at = transaction.performed_at
+
+    leshoz_account = await resolve_recipient_account(
         db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
     )
-    entries = ledger.entries_for(
-        invoice=invoice,
-        transaction=transaction,
-        recipient_account=recipient_account,
-        # Ruling H: the state budget's account number is not in the system
-        # at all in 3.10a — never a placeholder string.
-        budget_account=None,
+    accounts: dict[uuid.UUID | None, str | None] = {None: leshoz_account}
+    entries = ledger.entries_for_shares(
+        invoice=invoice, transaction=transaction, shares=shares, accounts=accounts
     )
     await repo.add_allocations(db, entries)
 
@@ -928,11 +1318,17 @@ async def record_reversal(
 
     1. one `correction` allocation per `payment` row this transaction wrote,
        with the sign flipped — the ledger is append-only (ruling 4), so the
-       reversal is new rows rather than an edit of the old ones. This
-       transaction's own entries always cancel out; the INVOICE's whole ledger
-       sums to `0.00` too, as long as only one transaction ever performed
-       against it, which is all today's paths allow (see the comment on
-       `paid_rows` below);
+       reversal is new rows rather than an edit of the old ones. `target`,
+       `recipient_id` AND `account` are copied verbatim from the row being
+       reversed — only `entry_type` and the sign of `amount` change — because
+       a correction that drops `recipient_id` still matches `target=
+       'receiver'` but no longer matches any ONE receiver: `dashboard.repo`'s
+       per-receiver sum filters on `recipient_id`, not `target`, and a
+       correction missing it would leave that receiver's reported share
+       overstated by exactly the money that went back. This transaction's own
+       entries always cancel out; the INVOICE's whole ledger sums to `0.00`
+       too, as long as only one transaction ever performed against it, which
+       is all today's paths allow (see the comment on `paid_rows` below);
     2. one `reconciliations` row, `result='discrepancy'`, `status='open'` —
        the register a human reads every morning, and the operator's handle on
        a case only a human can finish;
@@ -1007,6 +1403,7 @@ async def record_reversal(
                 transaction_id=transaction.id,
                 entry_type=ALLOCATION_ENTRY_CORRECTION,
                 target=row.target,
+                recipient_id=row.recipient_id,
                 account=row.account,
                 amount=-row.amount,
                 note=note,

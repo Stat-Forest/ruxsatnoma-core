@@ -256,7 +256,25 @@ async def test_a_post_perform_cancel_brings_the_ledger_back_to_zero(
     corrections = [row for row in after if row.entry_type == "correction"]
     assert len(after) == 4
     assert len(corrections) == 2
-    assert {row.target for row in corrections} == {"recipient", "budget"}
+    # Stage 7.9 task 5: the seeded `budget_50` directory row (migration
+    # `0045`) is now a configured RECEIVER, not the old engine's fixed
+    # "budget" half — `record_reversal` negates whatever targets
+    # `confirm_payment` actually wrote.
+    assert {row.target for row in corrections} == {"recipient", "receiver"}
+    # BLOCKER 1 (whole-branch review): `record_reversal` used to copy `target`
+    # and `account` onto the correction row but drop `recipient_id`, so a
+    # correction against the configured receiver's own row landed with
+    # `target='receiver', recipient_id=None` — matching the target filter but
+    # not `dashboard.repo`'s per-receiver sum, which keys on `recipient_id`.
+    # The receiver's correction must carry the SAME `recipient_id` its
+    # positive twin did, not `None`.
+    before_receiver = next(row for row in before if row.target == "receiver")
+    after_receiver_correction = next(row for row in corrections if row.target == "receiver")
+    assert before_receiver.recipient_id is not None
+    assert after_receiver_correction.recipient_id == before_receiver.recipient_id
+    before_recipient = next(row for row in before if row.target == "recipient")
+    after_recipient_correction = next(row for row in corrections if row.target == "recipient")
+    assert after_recipient_correction.recipient_id == before_recipient.recipient_id is None
     assert all(row.amount < 0 for row in corrections)
     assert sum((row.amount for row in after), Decimal("0.00")) == Decimal("0.00")
     # Every correction traces back to the transaction that was reversed, and
