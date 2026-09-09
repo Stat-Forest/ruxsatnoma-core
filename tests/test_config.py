@@ -381,3 +381,32 @@ def test_eimzo_real_refuses_a_public_base_url() -> None:
             _env_file=None,  # pyright: ignore[reportCallIssue]
         )
         assert settings.eimzo_base_url == base_url
+
+
+def test_eimzo_real_refuses_a_public_ipv6_base_url() -> None:
+    # `urlsplit().hostname` strips the brackets from an IPv6 literal, so what
+    # the guard actually parses is `2606:4700:4700::1111` — a string with no
+    # dot. Checking "no dot" before "is this an IP" would wrongly accept
+    # this as a bare Docker service name; it is Cloudflare's PUBLIC IPv6
+    # resolver and must be refused like any other public address.
+    with pytest.raises(ValidationError, match="must not be publicly reachable"):
+        Settings(
+            eimzo_mode="real",
+            eimzo_base_url="http://[2606:4700:4700::1111]:8080",
+            eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+
+def test_eimzo_real_accepts_ipv6_loopback_and_unique_local() -> None:
+    # The IPv6 counterparts of IPv4's loopback and RFC-1918: `::1` and a
+    # `fc00::/7` unique-local address, decided by the numeric rules exactly
+    # like their IPv4 equivalents above.
+    for base_url in ("http://[::1]:8080", "http://[fc00::1]:8080"):
+        settings = Settings(
+            eimzo_mode="real",
+            eimzo_base_url=base_url,
+            eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+        assert settings.eimzo_base_url == base_url

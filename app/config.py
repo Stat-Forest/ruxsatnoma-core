@@ -283,27 +283,48 @@ _PRIVATE_NETWORKS = (
     ipaddress.ip_network("192.168.0.0/16"),
 )
 
+# The IPv6 analogues of `_PRIVATE_NETWORKS` above: loopback and unique-local
+# (RFC 4193, the IPv6 counterpart of RFC-1918). Deliberately just these two —
+# an IPv6 literal that is neither is public and must be rejected, the same
+# fail-closed stance `_PRIVATE_NETWORKS` takes for IPv4 (no `is_private`,
+# no link-local carve-out).
+_PRIVATE_NETWORKS_V6 = (
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+)
+
 
 def _is_private_network_host(url: str) -> bool:
     """True when `url`'s host cannot be reached from the public internet: a
     bare name with no dot (a Docker Compose service name, e.g. `eimzo` — such
     a name can never resolve on the public DNS), `localhost`, a `.local`
-    mDNS name, or a numeric address in `_PRIVATE_NETWORKS`. Numeric ranges are
-    checked with `ipaddress.ip_address`/`ip_network`, not a string prefix —
-    `"172.16.0.0/12"` is not "starts with 172.", and a prefix check would
-    wrongly accept a public address like 172.200.0.1."""
+    mDNS name, or a numeric address (IPv4 or IPv6) in one of the private
+    ranges above. An IP literal is ALWAYS tried first, before the bare-name
+    check: `urlsplit().hostname` strips the brackets from an IPv6 literal
+    like `[::1]`, so what reaches this function is `::1` — a string with no
+    dot. Checking "no dot" before "is this an IP" would therefore accept
+    EVERY IPv6 address, public ones included (e.g. Cloudflare's
+    `2606:4700:4700::1111`), as a bare Docker service name. Numeric ranges
+    are checked with `ipaddress.ip_address`/`ip_network`, not a string
+    prefix — `"172.16.0.0/12"` is not "starts with 172.", and a prefix check
+    would wrongly accept a public address like 172.200.0.1."""
     host = (urlsplit(url).hostname or "").lower()
     if not host:
         return False
+    try:
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address):
+            return any(ip in network for network in _PRIVATE_NETWORKS_V6)
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    # Not an IP literal at all past this point — a genuine hostname.
     if host == "localhost" or host.endswith(".local"):
         return True
     if "." not in host:
         return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False  # a real, dotted hostname — publicly resolvable
-    return any(ip in network for network in _PRIVATE_NETWORKS)
+    return False  # a real, dotted hostname — publicly resolvable
 
 
 @lru_cache
