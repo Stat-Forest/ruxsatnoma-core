@@ -34,8 +34,8 @@ from alembic import op
 from geoalchemy2 import Geometry
 
 # revision identifiers, used by Alembic.
-revision: str = "0047"
-down_revision: str | Sequence[str] | None = "0046"
+revision: str = "0048"
+down_revision: str | Sequence[str] | None = "0047"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -356,6 +356,14 @@ async def _norm_results(
     Left `None` — a caller with no price to hand — the unpriced
     `norms.service.run_checks` runs instead, and `norm_limit` is honestly
     recorded as `skipped`.
+
+    **Since ruling #176 that last sentence holds for GRAZING ONLY.** The limit
+    check is no longer grazing-only: every other activity compares
+    `request.quantity`, which needs no pricing step, so the unpriced path now
+    returns a real capacity — or exclusivity — verdict for them rather than
+    `skipped`. That catches more than before and never fewer, so nothing
+    downstream loosens; only this paragraph's old promise of a uniform
+    `skipped` is gone.
     """
     missing = await missing_for_pricing(db, application)
     if missing:

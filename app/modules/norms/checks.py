@@ -251,6 +251,28 @@ def _resolve_requested(request: CalcRequest, used_sb: Decimal | None) -> Decimal
     return request.quantity
 
 
+def _capacity_unit(request: CalcRequest, snapshot: ParamSnapshot) -> str | None:
+    """The unit the three capacity numbers are counted in — the one thing
+    `requested`/`capacity`/`remaining` cannot be read without.
+
+    Integration finding, stage 9 wave 1: T4 generalised the check across every
+    activity and T3 rendered it, but nothing carried the unit, so a refusal
+    said «40 of 100» with no way to know whether that meant hectares, hives or
+    cubic metres. Grazing answers `"sb"` (условная голова) because its numbers
+    are conditional heads rather than the tariff's own billing unit; every
+    other activity answers its `activity_types.quantity_unit`, which reaches
+    here on the tariff rows in force. No tariff row (a lawful case — science
+    has no rate at all) means the unit is genuinely unknown, and `None` says so
+    rather than guessing one.
+    """
+    if request.activity_code == GRAZING:
+        return "sb"
+    for tariff in snapshot.tariffs:
+        if tariff.quantity_unit:
+            return tariff.quantity_unit
+    return None
+
+
 def _capacity_result(
     request: CalcRequest,
     snapshot: ParamSnapshot,
@@ -290,6 +312,7 @@ def _capacity_result(
         "committed": jsonable(committed),
         "remaining": jsonable(remaining),
         "load_source": load_source,
+        "unit": _capacity_unit(request, snapshot),
     }
     result = "fail" if requested > remaining else "pass"
     return {"check": "limit", "result": result, "details": details}
