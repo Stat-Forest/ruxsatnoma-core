@@ -23,7 +23,7 @@ from app.core.time import business_today
 from app.modules.audit.models import AuditLog
 from app.modules.payments import jobs
 from app.modules.payments.jobs import REFUND_SLA_BREACH, RISK_INDICATOR_REFUND_OVERDUE
-from app.modules.payments.models import Invoice, Refund
+from app.modules.payments.models import Invoice, Refund, RefundComponent
 from tests.modules.payments.test_refunds import rf01 as rf01
 
 
@@ -91,12 +91,22 @@ async def test_a_decided_refund_past_due_is_untouched(
     """Only `requested`/`in_review` refunds are candidates — a `returned` or
     `rejected` one is terminal, however long past its own `due_at`, and the
     sweep must not raise RI-07 on a question that is already settled."""
-    overdue_refund.status = status
     if status == "returned":
-        # `returned_needs_complete_breakdown` — satisfied trivially so the
-        # flush itself does not fail; the sweep's own candidate filter is
-        # what this test is pinning, not the CHECK.
-        overdue_refund.final_amount = Decimal("0.00")
+        # `refund_components_complete` (migration 0046) now requires at
+        # least one component summing to `final_amount` for a `returned`
+        # refund. Inserted in its OWN flush, before `status`/`final_amount`
+        # change on `overdue_refund` — the trigger fires BEFORE UPDATE on
+        # `refunds` and reads `refund_components` as it stands at that
+        # moment, so the component must already be committed to the
+        # session when `status` flips, not merely staged in the same
+        # flush. `final_amount` and `status` are then set TOGETHER, in one
+        # flush, so the trigger sees a `final_amount` that is not NULL and
+        # a total that sums to it (satisfied trivially — the sweep's own
+        # candidate filter is what this test is pinning, not the trigger).
+        db.add(RefundComponent(refund_id=overdue_refund.id, amount=Decimal("100.00")))
+        await db.flush()
+        overdue_refund.final_amount = Decimal("100.00")
+    overdue_refund.status = status
     await db.flush()
 
     await jobs.refund_sla_sweep(db)

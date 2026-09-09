@@ -4,11 +4,13 @@ module error code of its own)."""
 
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from sqlalchemy import select
 
 from app.modules.dashboard.permissions import DASHBOARD_VIEW
 from app.modules.gis.models import ContourVersion
+from app.modules.payments.models import BUDGET_RECIPIENT_ID, Allocation, Invoice
 from app.modules.permits.models import Permit
 from tests.modules.gis.conftest import _client_for, make_contour, make_version, random_box_wkt
 from tests.modules.gis.conftest import approval_doc as approval_doc  # noqa: F401
@@ -181,3 +183,56 @@ async def test_kpi_applications_by_status(db, leshoz):
         assert response.status_code == 200
         body = response.json()
         assert body["applications"]["by_status"].get(app_row.status, 0) >= 1
+
+
+async def test_kpi_budget_share_reads_the_seeded_budget_recipient(db, leshoz):
+    """Override 1 of stage 7.9 task 8 (decision #154): `budget_share_amount`
+    used to sum `allocations.target == "budget"` — a value migration
+    `0046` removed from `target_valid` entirely, so this KPI silently
+    reported ZERO on every database migrated past that point, with no test
+    ever failing (the exact defect this test closes). It now reads the
+    seeded budget recipient's OWN share by `recipient_id ==
+    BUDGET_RECIPIENT_ID`, never by a `target` string; `recipient_share_
+    amount` stays a `target` read, since the leshoz's own remainder is
+    unambiguous regardless of how many receivers are configured."""
+    application = await make_bare_application(db, org=leshoz)
+    invoice = Invoice(
+        application_id=application.id,
+        number=f"INV-KPI-{uuid.uuid4().hex[:8]}",
+        amount=Decimal("600000.00"),
+        status="paid",
+        issued_at=datetime(2027, 6, 1, tzinfo=UTC),
+        paid_at=datetime(2027, 6, 1, tzinfo=UTC),
+    )
+    db.add(invoice)
+    await db.flush()
+    db.add_all(
+        [
+            Allocation(
+                invoice_id=invoice.id,
+                entry_type="payment",
+                target="receiver",
+                recipient_id=BUDGET_RECIPIENT_ID,
+                amount=Decimal("300000.00"),
+            ),
+            Allocation(
+                invoice_id=invoice.id,
+                entry_type="payment",
+                target="recipient",
+                amount=Decimal("300000.00"),
+            ),
+        ]
+    )
+    await db.flush()
+
+    async for client in _client_for_zoned(db, leshoz.id):
+        response = await client.get(
+            f"{API}/dashboard/kpi",
+            params={"period_from": PERIOD_FROM.isoformat(), "period_to": PERIOD_TO.isoformat()},
+        )
+        assert response.status_code == 200
+        body = response.json()["payments"]
+        assert body["invoiced_amount"] == "600000.00"
+        assert body["paid_amount"] == "600000.00"
+        assert body["budget_share_amount"] == "300000.00"
+        assert body["recipient_share_amount"] == "300000.00"

@@ -46,21 +46,28 @@ from app.modules.notifications import service as notifications_service
 from app.modules.payments import events as payment_events
 from app.modules.payments import refunds, repo, statement_service
 from app.modules.payments import service as payments_service
+from app.modules.payments.backoffice_schemas import (
+    AllocationOut,
+    AvailableSourceOut,
+    RefundComponentOut,
+)
 from app.modules.payments.models import (
     ALLOCATION_ENTRY_TYPES,
-    ALLOCATION_TARGETS,
     INVOICE_STATUSES,
     MANUAL_CONFIRMATION_STATUSES,
     PAYMENT_PROVIDERS,
     RECONCILIATION_RESULTS,
     RECONCILIATION_STATUSES,
     REFUND_STATUSES,
+    TARGET_RECEIVER,
+    TARGET_RECIPIENT,
     Allocation,
     Invoice,
     ManualPaymentConfirmation,
     ProviderTransaction,
     Reconciliation,
     Refund,
+    RefundComponent,
 )
 from app.modules.payments.permissions import PAYMENTS_MANAGE
 
@@ -382,8 +389,9 @@ async def check_manual_confirmation(
        makes a double-confirm impossible at the database level as well as
        at the status level;
     6. `service.confirm_payment` — unchanged, not widened, not copied. It
-       does the whole job: invoice -> paid, the 50/50 ledger, application ->
-       PAID, the applicant told, `payment_confirmed` on the bus;
+       does the whole job: invoice -> paid, one ledger row PER RECEIVER,
+       application -> PAID, the applicant told, `payment_confirmed` on the
+       bus;
     7. stamp the confirmation `confirmed`/`rejected` with the checker and
        the moment — all three fields in ONE assignment, since
        `confirmed_needs_checker` forbids a `confirmed` row with a NULL
@@ -653,7 +661,12 @@ REFUND_SUBMIT_DECISION_ACTION = "refund.submit_decision"
 REFUND_APPROVE_ACTION = "refund.approve"
 
 _STATUS_REQUESTED, _STATUS_IN_REVIEW, _STATUS_RETURNED, _STATUS_REJECTED = REFUND_STATUSES
-_TARGET_RECIPIENT, _TARGET_BUDGET, _TARGET_OTHER = ALLOCATION_TARGETS
+# Named constants imported from models (plan 07.9 ruling P3), not a positional
+# unpack of ALLOCATION_TARGETS: migration 0046 removed 'budget' from that
+# tuple entirely (decision #161), so a positional unpack today would silently
+# rebind _TARGET_RECEIVER to 'other' — no error, tests still green, refund
+# allocations written against the wrong target.
+_TARGET_RECIPIENT, _TARGET_RECEIVER = TARGET_RECIPIENT, TARGET_RECEIVER
 # Unpacked rather than retyped (module docstring's own vocabulary rule,
 # already followed above for `RECONCILIATION_STATUSES`/`MANUAL_CONFIRMATION_
 # STATUSES`): `ALLOCATION_ENTRY_TYPES[1]` is `"refund"`, the third value
@@ -843,44 +856,117 @@ async def request_refund(
     return row
 
 
+class RefundComponentInput(NamedTuple):
+    """One line of the accountant's submitted breakdown — the service's own
+    shape, decoupled from `backoffice_schemas.RefundComponentIn` the same
+    way `ledger.RecipientRule` decouples the split engine from the wire."""
+
+    recipient_id: uuid.UUID | None
+    amount: Decimal
+
+
 async def submit_refund_decision(
     db: AsyncSession,
     refund_id: uuid.UUID,
     *,
     final_amount: Decimal,
-    budget_amount: Decimal,
-    recipient_amount: Decimal,
-    other_amount: Decimal,
+    components: Sequence[RefundComponentInput],
     comment: str | None,
     actor: Any,
 ) -> Refund:
     """`POST /refunds/{id}/submit-decision` — the accountant's own half
-    (ruling 4): STORE the figures, move `requested` -> `in_review`, touch no
-    money. `approve_refund` is what writes the ledger.
+    (ruling 4): STORE the figures — now `refund_components` rows, stage 7.9
+    task 7, decision #154, replacing the old fixed three-column breakdown —
+    move `requested` -> `in_review`, touch no money. `approve_refund` is
+    what writes the ledger.
 
     The breakdown is checked against `refunds.breakdown_is_complete` BEFORE
-    the row is written — `ERR-VAL-001`, not an IntegrityError 500 — even
-    though `returned_needs_complete_breakdown` itself only fires once
-    `approve_refund` moves the row to `returned`, not at this status: a
-    wrong number caught here never reaches the rahbar's screen at all."""
+    anything is written — `ERR-VAL-001`, not a 500 out of the
+    `refund_components_complete` trigger — even though that trigger only
+    fires once `approve_refund` moves the row to `returned`, not at this
+    status: a wrong number caught here never reaches the rahbar's screen at
+    all.
+
+    **Override 1: refuses a duplicate source FIRST, before the arithmetic.**
+    `uq_refund_components_source` cannot stop two components both naming
+    `recipient_id=None` (Postgres treats `NULL <> NULL` under a plain
+    UNIQUE constraint), so this checks the whole submitted list itself —
+    ANY repeated `recipient_id`, `None` included — and answers
+    `ERR-VAL-001` naming the reason, before either the DB or the sum check
+    ever sees it.
+
+    **Whole-branch review Important 5: every `recipient_id` must be a
+    source THIS INVOICE actually paid.** Before this, only the duplicate
+    check and the sum were verified — a stale or mistyped uuid (or one
+    that names a receiver real but never active on THIS invoice) reached
+    `flush()` and either failed the FK as an uncaught `IntegrityError` (a
+    500, the exact conversion this codebase converts to `ERR-*`
+    everywhere else) or, worse, named a recipient that IS a real row in
+    `payment_recipients` but never received a share of THIS payment — a
+    valid-looking id that is simply WRONG. That second case is silent and
+    dangerous: `approve_refund` would later write a negative allocation
+    against a party that took in nothing on this invoice, while the party
+    that actually did keeps its untouched positive row — the total balance
+    check still passes (it only checks the SUM), so the per-receiver
+    balances quietly go wrong, one negative and one whole, with nothing
+    to catch it. `available_sources_for` already computes the legal set
+    for exactly this invoice (`RefundOut.available_sources`, the same read
+    the accountant's own form is built from) — checked against here too,
+    so a submission can never name a source its own form never offered.
+
+    **The empty-snapshot case is not "nothing is legal", it is "only the
+    leshoz is".** `available_sources_for` answers `[]` for an invoice
+    issued before stage 7.9 (`invoice_recipients` is purely additive,
+    ruling P1 — no backfill, so a real pre-migration invoice has no
+    snapshot at all) — the SAME "everything to the leshoz" reading that
+    empty answer's own docstring gives, not "refuse every submission
+    against this invoice". So an empty `available_sources_for` widens the
+    legal set to `{None}` rather than narrowing it to nothing: the
+    leshoz's own remainder is still refundable, and nothing else is.
+
+    A component with `amount == 0.00` is accepted into the sum (the same
+    "nothing from this source" reading `breakdown_is_complete` gives an
+    empty list) but writes no `RefundComponent` row — that table's own
+    `amount_positive` CHECK forbids it, the same "a 0.00 component writes
+    no row" rule the old three-column shape applied at `approve_refund`
+    (moved here, since the components are now stored at THIS step)."""
     row = await repo.get_refund_for_update(db, refund_id)
     if row is None:
         raise err("ERR-SYS-003", details={"refund": str(refund_id)})
     if row.status != _STATUS_REQUESTED:
         raise err("ERR-PAY-006", details={"status": row.status})
+
+    sources = [component.recipient_id for component in components]
+    if len(sources) != len(set(sources)):
+        raise err("ERR-VAL-001", details={"reason": "duplicate_source"})
+    legal_sources = {
+        source.recipient_id for source in await available_sources_for(db, row.invoice_id)
+    } or {None}
+    for source_id in sources:
+        if source_id not in legal_sources:
+            raise err(
+                "ERR-VAL-001",
+                details={"reason": "recipient_not_in_split", "recipient_id": str(source_id)},
+            )
     if not refunds.breakdown_is_complete(
-        final_amount, budget_amount, recipient_amount, other_amount
+        final_amount, [component.amount for component in components]
     ):
         raise err("ERR-VAL-001", details={"reason": "breakdown_incomplete"})
 
     old_value = {"status": row.status}
     row.final_amount = final_amount
-    row.budget_amount = budget_amount
-    row.recipient_amount = recipient_amount
-    row.other_amount = other_amount
     row.status = _STATUS_IN_REVIEW
     if comment:
         row.comment = comment
+    new_rows = [
+        RefundComponent(
+            refund_id=row.id, recipient_id=component.recipient_id, amount=component.amount
+        )
+        for component in components
+        if component.amount
+    ]
+    if new_rows:
+        await repo.add_refund_components(db, new_rows)
     await db.flush()
     await audit.log(
         db,
@@ -892,9 +978,13 @@ async def submit_refund_decision(
         new_value={
             "status": row.status,
             "final_amount": str(final_amount),
-            "budget_amount": str(budget_amount),
-            "recipient_amount": str(recipient_amount),
-            "other_amount": str(other_amount),
+            "components": [
+                {
+                    "recipient_id": str(c.recipient_id) if c.recipient_id is not None else None,
+                    "amount": str(c.amount),
+                }
+                for c in components
+            ],
         },
     )
     return row
@@ -952,14 +1042,20 @@ async def approve_refund(
        only checks `final_amount <= balance`, never `balance == invoice.amount`;
     4. resolves the recipient's account the SAME way `service.confirm_payment`
        does (`payments_service.resolve_recipient_account`) — the leshoz's
-       own bank account, `None` when it has none on file. The budget half's
-       account is `None` unconditionally (ruling 5, `tz/12` #15 — the state
-       budget's account number is stored nowhere in this system) and so is
-       the `other` bucket's, which names no account of its own either;
-    5. writes ONE negative `entry_type="refund"` allocation per NON-ZERO
-       component, each carrying `refund_id` — a `0.00` component writes no
-       row, the same "nothing from this source" reading
-       `refunds.breakdown_is_complete` already gives it;
+       own bank account, `None` when it has none on file. A configured
+       receiver's account is `None` unconditionally (ruling 5, `tz/12` #15,
+       generalised by stage 7.9 task 7 — a `payment_recipients` row
+       identifies a Payme WALLET, not a bank account, the same reasoning
+       `payments.ledger`'s own docstring gives `confirm_payment`'s
+       identical `accounts` dict);
+    5. **writes ONE negative `entry_type="refund"` allocation per stored
+       `refund_components` row** (stage 7.9 task 7, decision #154 — this is
+       the one behaviour that changed: the source used to be the row's own
+       `budget_amount`/`recipient_amount`/`other_amount` columns, now it is
+       whatever `submit_refund_decision` already wrote to that table).
+       `target="recipient"` for the leshoz's own remainder
+       (`recipient_id IS NULL`), `target="receiver"` for a configured
+       receiver — matching `ledger.entries_for_shares`'s identical split;
     6. moves the refund to `returned`.
 
     `resolution="rejected"` writes NOTHING to `allocations` — no money ever
@@ -984,8 +1080,9 @@ async def approve_refund(
     written: list[Allocation] = []
 
     if resolution == _STATUS_RETURNED:
+        stored_components = await repo.list_refund_components(db, row.id)
         if row.final_amount is None or not refunds.breakdown_is_complete(
-            row.final_amount, row.budget_amount, row.recipient_amount, row.other_amount
+            row.final_amount, [component.amount for component in stored_components]
         ):
             raise err("ERR-VAL-001", details={"reason": "breakdown_incomplete"})
 
@@ -1009,22 +1106,18 @@ async def approve_refund(
             contour_id=application.contour_id if application else None,
             assigned_org_id=application.assigned_org_id if application else None,
         )
-        components = (
-            (_TARGET_RECIPIENT, recipient_account, row.recipient_amount),
-            (_TARGET_BUDGET, None, row.budget_amount),
-            (_TARGET_OTHER, None, row.other_amount),
-        )
-        for target, account, amount in components:
-            if not amount:
-                continue
+        for component in stored_components:
+            target = _TARGET_RECIPIENT if component.recipient_id is None else _TARGET_RECEIVER
+            account = recipient_account if component.recipient_id is None else None
             written.append(
                 Allocation(
                     invoice_id=row.invoice_id,
                     refund_id=row.id,
+                    recipient_id=component.recipient_id,
                     entry_type=ALLOCATION_ENTRY_REFUND,
                     target=target,
                     account=account,
-                    amount=-amount,
+                    amount=-component.amount,
                     note=f"refund {row.id} approved ({resolution})",
                 )
             )
@@ -1090,6 +1183,97 @@ async def list_refunds(
     )
 
 
+async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund:
+    """`GET /refunds/{id}` (stage 7.9 task 7) — the single-item read
+    `available_sources` needs a home on: `list_refunds` pages many rows
+    with no ONE invoice to read a snapshot from, and building it there
+    would mean a query per row for a field most callers of the register
+    never look at."""
+    row = await repo.get_refund(db, refund_id)
+    if row is None:
+        raise err("ERR-SYS-003", details={"refund": str(refund_id)})
+    return row
+
+
+async def refund_components_out(db: AsyncSession, refund: Refund) -> list[RefundComponentOut]:
+    """Builds `RefundOut.components` from `refund_components` — whatever
+    `submit_refund_decision` already stored, regardless of status: a
+    `rejected` refund still shows what the accountant submitted (a fact
+    about what was entered, independent of whether the rahbar accepted
+    it), and a `requested` refund shows `[]` (nothing submitted yet).
+
+    The leshoz's own account is resolved ONLY once the refund has reached
+    `returned` — the same `None`-until-decided posture the old
+    `budget_account` field documented (`tz/12` #15) — and a configured
+    receiver's account stays `None` always (never a bank account of its
+    own, `payments.ledger`'s own docstring).
+
+    The leshoz's own NAME (`recipient_id is None`) is read off the SAME
+    frozen `invoice_recipients` snapshot `available_sources_for` reads for
+    this identical invoice (whole-branch review Minor 6, fixed from an
+    unconditional `LESHOZ_SNAPSHOT_NAME`): before the fix, `available_
+    sources` on `GET /refunds/{id}` carried the leshoz's REAL frozen
+    organization name while `components` on the SAME response labelled
+    the identical party with the generic `{"uz_latn": "Leshoz"}` fallback
+    — one response naming one party two different ways. `
+    LESHOZ_SNAPSHOT_NAME` stays the fallback for the one case that
+    genuinely has no snapshot to read: an invoice issued before stage 7.9
+    (`invoice_recipients` is purely additive, ruling P1)."""
+    rows = await repo.list_refund_components(db, refund.id)
+    if not rows:
+        return []
+    leshoz_account: str | None = None
+    leshoz_name: dict[str, Any] = payments_service.LESHOZ_SNAPSHOT_NAME
+    if any(row.recipient_id is None for row in rows):
+        snapshot = await payments_service.invoice_recipients(db, refund.invoice_id)
+        frozen_remainder = next((s for s in snapshot if s.recipient_id is None), None)
+        if frozen_remainder is not None:
+            leshoz_name = frozen_remainder.name
+        if refund.status == _STATUS_RETURNED:
+            application = await applications_service.get(db, refund.application_id)
+            if application is not None:
+                leshoz_account = await payments_service.resolve_recipient_account(
+                    db,
+                    contour_id=application.contour_id,
+                    assigned_org_id=application.assigned_org_id,
+                )
+    names: dict[uuid.UUID, dict[str, Any]] = {}
+    out: list[RefundComponentOut] = []
+    for row in rows:
+        if row.recipient_id is None:
+            name = leshoz_name
+            account = leshoz_account
+        else:
+            if row.recipient_id not in names:
+                recipient = await repo.get_payment_recipient(db, row.recipient_id)
+                names[row.recipient_id] = recipient.name if recipient is not None else {}
+            name = names[row.recipient_id]
+            account = None
+        out.append(
+            RefundComponentOut(
+                recipient_id=row.recipient_id, name=name, account=account, amount=row.amount
+            )
+        )
+    return out
+
+
+async def available_sources_for(
+    db: AsyncSession, invoice_id: uuid.UUID
+) -> list[AvailableSourceOut]:
+    """`RefundOut.available_sources` — the invoice's OWN frozen split
+    (`payments.service.invoice_recipients`), so the accountant's form
+    offers exactly the parties THIS payment was split between, never three
+    fixed buckets. `[]` for an invoice issued before stage 7.9 (no snapshot
+    at all) — the same "everything to the leshoz" reading
+    `ledger.split_payment` already gives an empty `rules` list, restated
+    here as "nothing to offer beyond the default" rather than an error."""
+    snapshot = await payments_service.invoice_recipients(db, invoice_id)
+    return [
+        AvailableSourceOut(recipient_id=row.recipient_id, name=row.name, kind=row.kind)
+        for row in snapshot
+    ]
+
+
 # --- Task 10: the ledger read route ---------------------------------------
 
 
@@ -1129,3 +1313,28 @@ async def list_allocations(
     return await repo.list_allocations(
         db, invoice_id=None, since=since, until=until, limit=limit, offset=offset
     )
+
+
+async def allocations_out(db: AsyncSession, rows: Sequence[Allocation]) -> list[AllocationOut]:
+    """Builds `AllocationOut` rows for `GET /payments/allocations` (stage 7.9
+    task 8), resolving `recipient_name` per row: the configured receiver's
+    own `name`, cached per id — the same shape `refund_components_out`
+    already uses for its identical lookup — or `None` for the leshoz's own
+    remainder (`recipient_id IS NULL`). Unlike `RefundComponentOut`, which
+    labels that row with `LESHOZ_SNAPSHOT_NAME` for a breakdown FORM that
+    must show every source symmetrically, this ledger already carries
+    `target` to say what a `None` id means, so inventing a label here
+    would only repeat that column in prose."""
+    names: dict[uuid.UUID, dict[str, Any]] = {}
+    out: list[AllocationOut] = []
+    for row in rows:
+        recipient_name: dict[str, Any] | None = None
+        if row.recipient_id is not None:
+            if row.recipient_id not in names:
+                recipient = await repo.get_payment_recipient(db, row.recipient_id)
+                names[row.recipient_id] = recipient.name if recipient is not None else {}
+            recipient_name = names[row.recipient_id]
+        item = AllocationOut.model_validate(row)
+        item.recipient_name = recipient_name
+        out.append(item)
+    return out

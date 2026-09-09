@@ -232,7 +232,10 @@ async def test_perform_marks_the_invoice_paid_writes_the_ledger_and_moves_the_ap
     entries = (
         await db.scalars(select(Allocation).where(Allocation.invoice_id == pending_invoice.id))
     ).all()
-    assert {e.target for e in entries} == {"recipient", "budget"}
+    # Stage 7.9 task 5: the seeded `budget_50` directory row (migration
+    # `0045`) is now a configured RECEIVER, not the old engine's fixed
+    # "budget" half.
+    assert {e.target for e in entries} == {"recipient", "receiver"}
     assert sum(e.amount for e in entries) == pending_invoice.amount
 
     application = await applications_service.get(db, pending_invoice.application_id)

@@ -10,10 +10,13 @@ calls, never a second money path of this file's own.
 
 Two things this file deliberately pins rather than fixes:
 
-- **the budget allocation's `account` is NULL while the recipient's is not**
-  (`tz/12` #15 — the state budget's account number is in no table at all).
-  The day the Agency answers, this test is what tells the next session where
-  to change things.
+- **a configured receiver's `account` is always NULL, the leshoz's is not**
+  (Override 5, stage 7.9 task 5 — a `payment_recipients` row identifies a
+  PAYME WALLET, not a bank account, so this is permanent by design, not an
+  open question waiting on the Agency; `tz/12` #15, the state budget's OWN
+  account number, was reformulated the same day decision #159 landed and no
+  longer blocks this path at all — Payme routes by recipient id, not a
+  stored account number).
 - **the `payment_confirmed` bus hop reaches `permits`** exactly as the Payme
   path does (`tests/test_cross_module_journey.py` hop 3). A manual PAID that
   does not tell the executor a permit is due is PR #31's defect with a
@@ -28,10 +31,11 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
+from app.db import make_session_factory
 from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
@@ -40,10 +44,12 @@ from app.modules.auth.models import User
 from app.modules.notifications.models import Notification
 from app.modules.payments import backoffice_service
 from app.modules.payments import events as payment_events
+from app.modules.payments import service as payments_service
 from app.modules.payments.models import (
     Allocation,
     Invoice,
     ManualPaymentConfirmation,
+    PaymentRecipient,
     ProviderTransaction,
     Reconciliation,
 )
@@ -383,7 +389,10 @@ async def test_a_confirmation_pays_the_invoice_through_the_one_existing_path(
 
     allocations = await _allocations(db, pending_invoice.id)
     assert len(allocations) == 2
-    assert {a.target for a in allocations} == {"recipient", "budget"}
+    # Stage 7.9 task 5: the seeded `budget_50` directory row (migration
+    # `0045`) is now a configured RECEIVER, not the old engine's fixed
+    # "budget" half.
+    assert {a.target for a in allocations} == {"recipient", "receiver"}
     assert sum(a.amount for a in allocations) == transaction.amount
 
 
@@ -418,17 +427,21 @@ async def test_ri_01_is_written_to_the_audit_journal_as_a_success(
     assert rows[0].result == "success"
 
 
-async def test_the_budget_half_has_no_account_and_the_recipients_does(
+async def test_the_leshoz_has_a_bank_account_and_the_configured_receiver_never_does(
     payments_view_client,
     head_client,
     db: AsyncSession,
     pending_invoice_with_org_account: Invoice,
     bank_doc: MediaFile,
 ):
-    """`tz/12` #15, pinned deliberately: the leshoz's own account comes off
-    its `requisites`, and the state budget's account number is stored NOWHERE
-    in this system — so the budget half is written with `account = NULL`.
-    Do not "fix" the NULL; when the Agency answers, change it here first."""
+    """Review round 1, Minor 3 (renamed — the old name and docstring
+    described the pre-7.9 fixed 50/50 engine's untracked state-budget
+    account, `tz/12` #15; the body now asserts something else entirely).
+    Override 5, stage 7.9 task 5: a `payment_recipients` row identifies a
+    PAYME WALLET, not a bank account, so a configured receiver's own
+    `allocations.account` always stays `None` — by design, permanently, not
+    because nobody has answered `tz/12` #15 yet. The leshoz's account still
+    comes off its own organization `requisites`, exactly as before."""
     invoice = pending_invoice_with_org_account
     filed = await _file_via_http(payments_view_client, invoice, bank_doc)
 
@@ -437,7 +450,9 @@ async def test_the_budget_half_has_no_account_and_the_recipients_does(
 
     by_target = {a.target: a for a in await _allocations(db, invoice.id)}
     assert by_target["recipient"].account == "20208000123456789012"
-    assert by_target["budget"].account is None
+    # Stage 7.9 task 5: `budget_50` is now a configured RECEIVER, and a
+    # receiver's own account always stays `None` (Override 5).
+    assert by_target["receiver"].account is None
 
 
 async def test_the_payment_confirmed_event_reaches_permits(
@@ -696,6 +711,107 @@ async def test_an_overpayment_is_still_accepted(
         )
     ).one()
     assert row.difference == Decimal("1000.00")
+
+
+# --- the split does not fit (review round 1, Important 1) ---------------------
+#
+# `ManualConfirmationIn.amount` is bounded only `gt=0` (see the section
+# above) — an accountant may confirm LESS than the invoice, the whole point
+# of the underpayment path. But `confirm_payment` re-runs the frozen split
+# against whatever amount was confirmed, and a configured FIXED receiver
+# larger than that amount makes the split not fit (`ledger.SplitDoesNotFit`).
+# Before this fix that exception was unhandled here and reached the HTTP
+# layer as a bare 500; the controller ruling is REFUSE, mirroring
+# `issue_invoice` — see `service.confirm_payment`'s own docstring.
+
+
+@pytest.fixture
+async def receiver_fixed_50000(db: AsyncSession, engine) -> AsyncIterator[PaymentRecipient]:
+    """A configured FIXED receiver, 50 000 — chosen so that, ALONGSIDE the
+    seeded `budget_50` (50%), it still fits `approved_application`'s full
+    150 000.00 invoice at issuance (75 000 + 50 000 = 125 000, leaving the
+    leshoz 25 000), but no longer fits the 40 000
+    `test_a_split_that_does_not_fit_is_refused_through_the_http_route`
+    confirms — a manual confirmation smaller than this fixed amount, the
+    combination review round 1's Important 1 names.
+
+    Deactivated at teardown (never deleted — a row already frozen into an
+    `invoice_recipients` snapshot cannot be deleted at all,
+    `fk_invoice_recipients_recipient_id_payment_recipients`), through
+    `engine`, never `db`: the ONE test that uses this fixture drives
+    `payments_view_client`/`head_client`, real HTTP clients whose own
+    `_commit_pending_before_requests` commits this row FOR REAL before
+    their first request — `db`'s own rollback at teardown cannot undo a
+    write the app's separate connection already committed. Left ACTIVE, it
+    would push every LATER invoice built on this xdist worker (`budget_50`
+    50% + this 50 000 fixed) past what a smaller invoice can fit,
+    `ledger.SplitDoesNotFit`, in a file that has nothing to do with this
+    one (the class `tests/modules/payments/conftest.py::
+    _budget_recipient_is_routable`'s own docstring names for the identical
+    reason, stage 7.9 task 6)."""
+    row = PaymentRecipient(
+        name={"uz_latn": "Ekologiya jamg'armasi"},
+        kind="fixed",
+        fixed_amount=Decimal("50000.00"),
+        sort_order=20,
+    )
+    db.add(row)
+    await db.flush()
+    row_id = row.id
+    yield row
+    factory = make_session_factory(engine)
+    async with factory() as session:
+        await session.execute(
+            update(PaymentRecipient).where(PaymentRecipient.id == row_id).values(active=False)
+        )
+        await session.commit()
+
+
+@pytest.fixture
+async def pending_invoice_with_fixed_receiver(
+    db: AsyncSession,
+    approved_application: Application,
+    receiver_fixed_50000: PaymentRecipient,
+) -> Invoice:
+    """`approved_application`'s invoice (150 000.00), issued through the
+    real `service.issue_invoice` — application -> INVOICED, invoice left
+    `pending` — with `receiver_fixed_50000` already flushed so
+    `issue_invoice`'s own directory read freezes it onto the split. A
+    fixture parameter, not a row created inside this fixture's own body:
+    `issue_invoice` reads `payment_recipients` directly and exactly once,
+    so the receiver must exist BEFORE this call, the same ordering
+    `test_confirm_payment_split.py::paid_invoice_ctx` relies on."""
+    return await payments_service.issue_invoice(db, approved_application.id)
+
+
+async def test_a_split_that_does_not_fit_is_refused_through_the_http_route(
+    payments_view_client,
+    head_client,
+    db: AsyncSession,
+    pending_invoice_with_fixed_receiver: Invoice,
+    bank_doc: MediaFile,
+):
+    """Checked through the REAL maker-checker HTTP route — filed by the
+    accountant, confirmed by the head — not just `service.confirm_payment`
+    called directly: `app.main`'s global `DomainError` handler must turn
+    the refusal into a proper `ERR-VAL-001` response (422), never a bare
+    500, and nothing may be written on the way there."""
+    invoice = pending_invoice_with_fixed_receiver
+    filed = await _file_via_http(
+        payments_view_client, invoice, bank_doc, amount=Decimal("40000.00")
+    )
+
+    response = await head_client.post(f"{MANUAL_CONFIRMATIONS}/{filed['id']}/confirm")
+
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert body["error"]["code"] == "ERR-VAL-001"
+    assert body["error"]["details"]["reason"] == "split_does_not_fit"
+
+    assert await _allocations(db, invoice.id) == []
+    await db.refresh(invoice)
+    assert invoice.status == "pending"
+    assert invoice.paid_at is None
 
 
 # --- sys_admin is a superuser for permissions, not for maker-checker ----------

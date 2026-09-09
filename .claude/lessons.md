@@ -77,12 +77,17 @@ Tooling and environment.
   `permit_status_history.reason_item_id` FKs to: a bare `DELETE` on the classifier hits that
   FK, and nulling it first with a bare `UPDATE` hits the table's OWN append-only trigger —
   invisible against an EMPTY database, real once one real decision has been signed.
+  - **A fourth shape, `0045` (7.9 task 4):** seeds `payment_recipients`' budget row;
+    `invoice_recipients.recipient_id` FKs to it but stayed unreferenced until
+    `issue_invoice` wrote a real COMMITTED row, then the seed row's `DELETE` hit that FK.
+    Fixed by dropping the explicit `DELETE`: `invoice_recipients` is itself dropped later
+    in the SAME `downgrade()`, before `payment_recipients`' own final `DROP TABLE`.
 - **How to apply:** Widening a constraint → data-cleanup statement in the downgrade. Seeding
   a template → `DELETE FROM notifications WHERE event_code = '<code>'` above the template
   delete. Seeding a row an APPEND-ONLY table's column will FK to → wrap the nulling `UPDATE`:
   `DISABLE`/`ENABLE TRIGGER USER` (never `ALL`, superuser-only) around `UPDATE ... SET col = NULL`,
-  then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). When the round-trip goes red
-  in a task that changed no migration, look for the event it started emitting.
+  then the `DELETE` (`0023_permits_lifecycle.py`'s own `downgrade()`). If the referencing
+  TABLE is also dropped later in the SAME downgrade, drop it before the parent delete instead.
 
 ## A new Alembic head needs both a merge migration and the round-trip test's literal moved
 
@@ -486,6 +491,20 @@ Tooling and environment.
   `add_classifier_item`'s `valid_to < valid_from` is the period template, `_assert_doc_active`
   the FK one — reuse the same helper per meaning, never a near-identical second copy.
 
+## A new refusal on a hot path breaks every caller through a seeded row, not through code
+
+- **Rule:** Adding a precondition to a widely-shared entry point (a JSON-RPC dispatcher, a
+  webhook handler), check what a FRESH TEST DATABASE's seeded rows make TRUE by default —
+  not just the callers your diff touches — before trusting a file-scoped green run.
+- **Why:** Stage 7.9 t6's Payme routability check broke ~15 PRE-EXISTING tests across three
+  unrelated files (none about routability) because migration `0045`'s seeded `budget_50`
+  recipient has no Payme id BY DESIGN and is active in every fresh test DB — every real
+  invoice built through it became "unroutable". Every file-scoped run stayed green; only
+  `make test` on the WHOLE suite showed it.
+- **How to apply:** `tests/modules/payments/conftest.py::_budget_recipient_is_routable` is
+  the fix shape — a package-level autouse fixture giving the seeded row a fixed test value
+  via `engine` (never `db`, whose rollback never reaches the app's own connection).
+
 ## A gate that reads only ONE of the two things it guards is bundling two concerns
 
 - **Rule:** When an `if` guards a block computing several values, check that EVERY value in
@@ -565,6 +584,20 @@ Tooling and environment.
   they assert `omitted` is reported HONESTLY — nothing asserts the REASON still holds.
 - **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
   fails once that module ships, or tie it to a tracked ticket.
+
+## A `.get(key, default)` over a GROUP BY turns another module's retired enum value into a plausible zero
+
+- **Rule:** A dict built from a `GROUP BY` and read with `.get(key, default)`, where `key`
+  is another module's enum-ish string (`target`, `status`, `kind`), must not default
+  silently — assert the key set against the column's CURRENT check/tuple instead.
+- **Why:** Stage 7.9's migration `0046` retired `allocations.target = 'budget'`, rewriting
+  every row to `'receiver'` and dropping it from the CHECK. `dashboard/repo.py::payments_kpi`
+  — a DIFFERENT module — still read `by_target.get("budget", Decimal("0.00"))`; nothing
+  carries that key after the migration, so `budget_share_amount` reported zero with no
+  exception, no log line, and no test — found only by a human grepping the retired string.
+- **How to apply:** Aggregating another module's enum-ish column into a dict, grep every
+  `.get(<literal>,` keyed by it and pin the key set against the owning table's CHECK — the
+  shape `test_the_schema_literals_match_the_tables_own_check_constraints` already uses.
 
 ---
 

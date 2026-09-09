@@ -18,7 +18,7 @@ from app.modules.applications.sla import SLA_ACTIVE_STATUSES
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour, ContourVersion
 from app.modules.inspections.models import InspectionAct, ViolationCase
-from app.modules.payments.models import Allocation, Invoice
+from app.modules.payments.models import BUDGET_RECIPIENT_ID, TARGET_RECIPIENT, Allocation, Invoice
 from app.modules.permits.models import Permit, PermitRating
 
 
@@ -311,9 +311,24 @@ async def payments_kpi(
     period_from: date,
     period_to: date,
 ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
-    """`(invoiced_amount, paid_amount, budget_share, recipient_share)` — the
-    split reads `allocations.target` (`payments.ledger.split`'s own
-    vocabulary), never a re-derived 50/50 here."""
+    """`(invoiced_amount, paid_amount, budget_share, recipient_share)`.
+
+    **`budget_share` changed meaning on 2026-09-09 (decision #154, stage
+    7.9 task 8, Override 1).** Stage 7.9 replaced the fixed 50/50 split
+    with a configurable receivers directory and migration `0046` removed
+    `'budget'` from `allocations.target_valid` entirely — reading
+    `target == "budget"` here (this function's own shape until that task)
+    silently summed to ZERO on every fresh database, with no test failing,
+    exactly the hiding-direction defect this project keeps producing. A
+    single `budget_share` field is a question with no answer once the
+    split is an arbitrary-size directory — there is no longer "the
+    budget's half" — so this reads it the one way that still has an
+    honest meaning: the seeded budget recipient's OWN share, by
+    `recipient_id == BUDGET_RECIPIENT_ID` (decision #157's default
+    directory entry), never by a `target` string. `recipient_share` stays
+    a `target` read: the leshoz's own remainder is unambiguously
+    `target=TARGET_RECIPIENT` no matter how many receivers are configured
+    beside it."""
     org_col = _application_org_column()
     zone_clause = _combined(
         actor_zone,
@@ -341,20 +356,22 @@ async def payments_kpi(
             )
         )
     ).scalar_one()
-    allocation_totals = (
+    recipient_share = (
         await db.execute(
-            select(Allocation.target, func.coalesce(func.sum(Allocation.amount), 0))
-            .where(Allocation.invoice_id.in_(invoice_ids))
-            .group_by(Allocation.target)
+            select(func.coalesce(func.sum(Allocation.amount), 0)).where(
+                Allocation.invoice_id.in_(invoice_ids), Allocation.target == TARGET_RECIPIENT
+            )
         )
-    ).all()
-    by_target = {row[0]: row[1] for row in allocation_totals}
-    return (
-        invoiced,
-        paid,
-        by_target.get("budget", Decimal(0)),
-        by_target.get("recipient", Decimal(0)),
-    )
+    ).scalar_one()
+    budget_share = (
+        await db.execute(
+            select(func.coalesce(func.sum(Allocation.amount), 0)).where(
+                Allocation.invoice_id.in_(invoice_ids),
+                Allocation.recipient_id == BUDGET_RECIPIENT_ID,
+            )
+        )
+    ).scalar_one()
+    return (invoiced, paid, budget_share, recipient_share)
 
 
 # --- Occupancy (gis) ----------------------------------------------------------

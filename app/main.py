@@ -56,6 +56,7 @@ from app.modules.notifications.webhooks_router import router as notifications_we
 from app.modules.oversight.router import router as oversight_router
 from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
+from app.modules.payments.recipients_router import router as payments_recipients_router
 from app.modules.payments.refunds_router import router as refunds_router
 from app.modules.payments.router import router as payments_router
 from app.modules.permits.admin_router import router as permits_admin_router
@@ -317,6 +318,7 @@ def create_app() -> FastAPI:
     app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
     app.include_router(payments_backoffice_router, prefix="/api/v1")
+    app.include_router(payments_recipients_router, prefix="/api/v1")
     app.include_router(refunds_router, prefix="/api/v1")
     app.include_router(payme_router, prefix="/api/v1")
     app.include_router(permits_router, prefix="/api/v1")
