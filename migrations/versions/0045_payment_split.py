@@ -264,6 +264,20 @@ def downgrade() -> None:
     op.execute("DROP TRIGGER IF EXISTS refund_components_complete_trg ON refunds")
     op.execute("DROP FUNCTION IF EXISTS refund_components_complete()")
 
+    # Stage 7.9 task 5 fix: `'receiver'` rows must be collapsed BEFORE the
+    # CHECK is narrowed back to `_OLD_TARGET_VALID`, or the narrowing itself
+    # fails with `CheckViolationError` the moment one exists — unreachable
+    # before task 5, when nothing outside a rolled-back `db`-fixture test
+    # ever wrote a COMMITTED `target='receiver'` row; very much reachable
+    # once `payments.service.confirm_payment` does, for every real payment.
+    # `recipient_id` (each row's own receiver) is dropped two statements
+    # below regardless — the concept of a per-receiver ledger row does not
+    # survive this downgrade at all, so folding every receiver's share into
+    # the old fixed `'budget'` bucket is the correct reading of "undo the
+    # configurable split", not an approximation of a distinction downgrade
+    # still needs to preserve.
+    op.execute("UPDATE allocations SET target = 'budget' WHERE target = 'receiver'")
+
     op.drop_constraint(op.f("ck_allocations_target_valid"), "allocations", type_="check")
     op.create_check_constraint("target_valid", "allocations", _OLD_TARGET_VALID)
 

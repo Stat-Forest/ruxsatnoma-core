@@ -261,7 +261,12 @@ async def test_perform_transaction_resolves_the_recipient_account_through_the_co
     ).all()
     by_target = {e.target: e for e in entries}
     assert by_target["recipient"].account == "20208000123456789012"
-    assert by_target["budget"].account is None
+    # Stage 7.9 task 5: the seeded `budget_50` directory row (migration
+    # `0045`, always active in a fresh test DB) is now a configured
+    # RECEIVER, not the old engine's fixed "budget" half — its own account
+    # stays `None` regardless (Override 5: a directory row names a Payme
+    # wallet, never a bank account).
+    assert by_target["receiver"].account is None
 
 
 async def test_a_failure_inside_perform_transaction_rolls_back_the_whole_write(

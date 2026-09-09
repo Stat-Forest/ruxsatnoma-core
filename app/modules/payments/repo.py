@@ -114,9 +114,9 @@ async def add_provider_transaction(db: AsyncSession, transaction: ProviderTransa
 
 
 async def add_allocations(db: AsyncSession, allocations: Sequence[Allocation]) -> None:
-    """The two `ledger.entries_for` rows a confirmed `PerformTransaction`
-    writes (`payments.service.confirm_payment`) — plain, unattached instances
-    until this call."""
+    """The `ledger.entries_for_shares` rows a confirmed `PerformTransaction`
+    writes, one per receiver (`payments.service.confirm_payment`) — plain,
+    unattached instances until this call."""
     db.add_all(allocations)
     await db.flush()
 

@@ -20,10 +20,12 @@ Public surface for the event bus (`subscribers.py`, registered in
   Idempotent and silent when there is no in-force invoice, and it refuses
   (loudly logged, `None` returned) to cancel one that is already `paid` —
   see its own docstring.
-- `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J) —
-  the whole business action behind a successful Payme `PerformTransaction`:
-  invoice -> paid, the 50/50 ledger written, application -> PAID, the
-  applicant notified, `payment_confirmed` published on the bus. Called from
+- `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J;
+  stage 7.9 task 5) — the whole business action behind a successful Payme
+  `PerformTransaction`: invoice -> paid, one ledger row PER RECEIVER
+  written (the frozen split re-applied against what actually arrived),
+  application -> PAID, the applicant notified, `payment_confirmed`
+  published on the bus. Called from
   `payme.py` ONLY, already inside the caller's own transaction and already
   past every Payme-protocol check (idempotency, amount, payability) — this
   function performs no check of its own beyond resolving the recipient
@@ -1022,11 +1024,11 @@ async def confirm_payment(
     db: AsyncSession, *, invoice: Invoice, transaction: ProviderTransaction
 ) -> None:
     """The whole business action behind a confirmed payment — invoice ->
-    paid, the 50/50 ledger written, application -> PAID, the applicant
-    notified, `payment_confirmed` published — all inside the CALLER's
-    transaction: the caller owns the session, and this function neither
-    commits nor performs any check of its own beyond resolving the recipient
-    account. Every check is the caller's.
+    paid, one ledger row PER RECEIVER written, application -> PAID, the
+    applicant notified, `payment_confirmed` published — all inside the
+    CALLER's transaction: the caller owns the session, and this function
+    neither commits nor performs any check of its own beyond resolving the
+    recipient account. Every check is the caller's.
 
     TWO callers, and they are the whole list:
 
@@ -1040,20 +1042,39 @@ async def confirm_payment(
       invoice locked and re-read as `pending`, and the amount bounded
       `> 0` by `backoffice_schemas.ManualConfirmationIn`.
 
-    Ruling I: the amount split is `transaction.amount` — the money that
-    actually arrived — never `invoice.amount`. Task 3's own tests prove the
-    sourcing rule this function relies on (`ledger.entries_for`).
-
-    **The two amounts are NOT equal by construction.** They are on the Payme
-    path, where `CheckPerformTransaction`/`CreateTransaction` refuse a
+    **Stage 7.9 task 5 (decision #154): the ledger is rebuilt from the
+    FROZEN split, re-applied against what actually arrived.** `invoice_
+    recipients(db, invoice.id)` reads back the `RecipientRule`s `issue_
+    invoice` froze onto this invoice (every row whose `kind != "remainder"`,
+    in `position` order — the remainder row itself is not a rule, it is
+    `split_payment`'s own OUTPUT), and `ledger.split_payment` re-runs them
+    against `transaction.amount` — never the snapshot's own `amount` column
+    (that is the share OF THE INVOICE, display data) and never `invoice.
+    amount` (a claim, possibly stale). The two amounts are EQUAL on the
+    Payme path, where `CheckPerformTransaction`/`CreateTransaction` refuse a
     mismatch with `-31001`; this docstring claimed that as a general
     invariant until 2026-09-03, and the manual door deliberately breaks it.
     An accountant may confirm an UNDERPAYMENT — money that really arrived,
     less than was owed — and 3.10b files the difference as an open
     `reconciliations` row rather than refusing it. So a caller reading this
-    must not assume `transaction.amount == invoice.amount`: the ledger below
-    settles what arrived, and an invoice can be `paid` with less than its own
-    amount allocated.
+    must not assume `transaction.amount == invoice.amount`: re-running the
+    frozen rules against the snapshot's own amounts here would allocate
+    money that never arrived, silently, with every module's own suite
+    staying green — reusing `invoice.amount` would repeat the identical
+    mistake one level up.
+
+    An invoice issued BEFORE this stage carries no snapshot at all —
+    `invoice_recipients` returns `[]` — which `split_payment` already reads
+    as "everything to the leshoz" (Task 2), the correct reading of "nobody
+    is configured" and not an error: refusing those would strand every
+    invoice already pending when this stage ships.
+
+    `accounts = {None: leshoz_account}` only: a `payment_recipients` row
+    identifies a Payme WALLET, not a bank account, so a configured
+    receiver's `allocations.account` always stays `None` — the same
+    reasoning `resolve_recipient_account`'s own docstring carries for the
+    leshoz half this replaces (a placeholder string in a financial ledger is
+    worse than `NULL`).
     """
     invoice.status = "paid"
     invoice.paid_at = transaction.performed_at
@@ -1065,16 +1086,20 @@ async def confirm_payment(
         # by payme_router.py's generic handler and answered -32400.
         raise err("ERR-SYS-003", details={"invoice": str(invoice.id)})
 
-    recipient_account = await resolve_recipient_account(
+    snapshot = await invoice_recipients(db, invoice.id)
+    rules = [
+        ledger.RecipientRule(row.recipient_id, row.kind, row.percent, row.fixed_amount)
+        for row in snapshot
+        if row.kind != SNAPSHOT_KIND_REMAINDER
+    ]
+    shares = ledger.split_payment(transaction.amount, rules)
+
+    leshoz_account = await resolve_recipient_account(
         db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
     )
-    entries = ledger.entries_for(
-        invoice=invoice,
-        transaction=transaction,
-        recipient_account=recipient_account,
-        # Ruling H: the state budget's account number is not in the system
-        # at all in 3.10a — never a placeholder string.
-        budget_account=None,
+    accounts: dict[uuid.UUID | None, str | None] = {None: leshoz_account}
+    entries = ledger.entries_for_shares(
+        invoice=invoice, transaction=transaction, shares=shares, accounts=accounts
     )
     await repo.add_allocations(db, entries)
 

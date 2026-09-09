@@ -383,7 +383,10 @@ async def test_a_confirmation_pays_the_invoice_through_the_one_existing_path(
 
     allocations = await _allocations(db, pending_invoice.id)
     assert len(allocations) == 2
-    assert {a.target for a in allocations} == {"recipient", "budget"}
+    # Stage 7.9 task 5: the seeded `budget_50` directory row (migration
+    # `0045`) is now a configured RECEIVER, not the old engine's fixed
+    # "budget" half.
+    assert {a.target for a in allocations} == {"recipient", "receiver"}
     assert sum(a.amount for a in allocations) == transaction.amount
 
 
@@ -437,7 +440,9 @@ async def test_the_budget_half_has_no_account_and_the_recipients_does(
 
     by_target = {a.target: a for a in await _allocations(db, invoice.id)}
     assert by_target["recipient"].account == "20208000123456789012"
-    assert by_target["budget"].account is None
+    # Stage 7.9 task 5: `budget_50` is now a configured RECEIVER, and a
+    # receiver's own account always stays `None` (Override 5).
+    assert by_target["receiver"].account is None
 
 
 async def test_the_payment_confirmed_event_reaches_permits(

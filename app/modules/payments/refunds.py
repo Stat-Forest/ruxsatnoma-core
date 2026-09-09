@@ -60,8 +60,9 @@ def hint(*, paid: Decimal, period_from: date, period_to: date, on_date: date) ->
     A reversed or zero-length period is one of the degenerate cases the
     CALLER screens out — see this module's own docstring and
     `backoffice_service.request_refund` — and must never reach this
-    function; it is not re-checked here, the same way `ledger.entries_for`
-    trusts its own caller's invariant rather than re-deriving it."""
+    function; it is not re-checked here, the same way
+    `ledger.entries_for_shares` trusts its own caller's invariant rather
+    than re-deriving it."""
     total_days = (period_to - period_from).days + 1
     used_days = (on_date - period_from).days
     used_days = max(0, min(used_days, total_days))

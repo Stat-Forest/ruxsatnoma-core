@@ -1,8 +1,9 @@
 """The configurable split (decisions #154, #157) that replaces the fixed
 50/50: `split_payment` is pure arithmetic — no `db` fixture anywhere in this
 file, every rule and share below is a plain `NamedTuple`. `ledger.py`'s own
-module docstring explains why this pair exists ALONGSIDE the legacy
-`split`/`entries_for` rather than instead of it until Task 5."""
+module docstring carries the legacy 50/50 engine's history — stage 7.9
+task 5 deleted it and switched `payments.service.confirm_payment` over to
+this pair."""
 
 import uuid
 from decimal import Decimal
