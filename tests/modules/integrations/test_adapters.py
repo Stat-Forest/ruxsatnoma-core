@@ -72,14 +72,14 @@ async def test_eimzo_mock_roundtrip():
         challenge="ch-1", pinfl="12345678901234", full_name="TESTOV TEST", tin="123456789"
     )
     adapter = get_eimzo_adapter()
-    parsed = await adapter.verify_signed_challenge(encode_mock_signed_challenge(identity))
+    parsed = await adapter.verify_signed_challenge(encode_mock_signed_challenge(identity), ip=None)
     assert parsed == identity
 
 
 async def test_eimzo_garbage_rejected():
     adapter = get_eimzo_adapter()
     with pytest.raises(EimzoError) as exc:
-        await adapter.verify_signed_challenge("garbage")
+        await adapter.verify_signed_challenge("garbage", ip=None)
     assert exc.value.err_code == "ERR-AUTH-004"
 
 

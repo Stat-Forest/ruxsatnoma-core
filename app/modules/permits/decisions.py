@@ -173,6 +173,7 @@ async def decide(
     data: DecisionIn,
     actor: User,
     event_code: str,
+    ip: str | None = None,
 ) -> Permit:
     """One suspension, resumption or revocation, in the one order that is safe.
 
@@ -267,6 +268,7 @@ async def decide(
         document=document,
         pkcs7=data.pkcs7,
         user=actor,
+        ip=ip,
     )
 
     # 8.

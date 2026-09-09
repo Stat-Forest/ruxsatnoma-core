@@ -365,7 +365,12 @@ async def _forward(
 
 
 async def _sign_decision(
-    db: AsyncSession, application: Application, *, pkcs7: str, actor: User
+    db: AsyncSession,
+    application: Application,
+    *,
+    pkcs7: str,
+    actor: User,
+    ip: str | None = None,
 ) -> None:
     """The head's ERI over the decision (ruling 25: one decision object per
     application, however many times it was submitted).
@@ -403,6 +408,7 @@ async def _sign_decision(
         pkcs7=pkcs7,
         user=actor,
         content_changed_reason=flow.STALE_PACKAGE_REASON,
+        ip=ip,
     )
 
 
@@ -470,7 +476,12 @@ async def _recipient_language(db: AsyncSession, application: Application) -> str
 
 
 async def approve(
-    db: AsyncSession, application_id: uuid.UUID, *, pkcs7: str, actor: User
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    pkcs7: str,
+    actor: User,
+    ip: str | None = None,
 ) -> tuple[Application, uuid.UUID | None]:
     """`POST /applications/{id}/approve` — the head signs, or the application
     goes up the ladder. Returns `(application, forwarded_to_organization)`, the
@@ -500,7 +511,7 @@ async def approve(
             db, application, actor=actor, amount=amount, area=area, over=over
         )
 
-    await _sign_decision(db, application, pkcs7=pkcs7, actor=actor)
+    await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)
     # `decided_at` belongs to the flow verb that owns the decision, never to
     # `set_status`, which moves `status` and nothing else. Set BEFORE the
     # transition so that ONE update carries it: `updated_at` is
@@ -543,6 +554,7 @@ async def reject(
     reason_item_id: uuid.UUID,
     legal_basis: str,
     actor: User,
+    ip: str | None = None,
 ) -> Application:
     """`POST /applications/{id}/reject` — IN_REVIEW -> REJECTED, with grounds.
 
@@ -569,7 +581,7 @@ async def reject(
     )
     item = await _reason_item(db, reason_item_id)
 
-    await _sign_decision(db, application, pkcs7=pkcs7, actor=actor)
+    await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)
     # Set BEFORE the transition, so ONE update carries the whole decision — see
     # `approve`'s note on `updated_at` for why a column written after
     # `_apply_transition`'s `db.refresh` turns a successful rejection into a 500.

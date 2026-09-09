@@ -23,7 +23,7 @@ existed.
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files
@@ -69,6 +69,7 @@ async def issue_permit(
 async def sign_permit(
     permit_id: uuid.UUID,
     payload: PermitSignIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(PERMITS_SIGN))],
 ) -> PermitSignatureOut:
@@ -96,7 +97,12 @@ async def sign_permit(
     window.
     """
     permit = await service.add_signature(
-        db, permit_id, purpose=payload.purpose, pkcs7=payload.pkcs7, user=actor
+        db,
+        permit_id,
+        purpose=payload.purpose,
+        pkcs7=payload.pkcs7,
+        user=actor,
+        ip=request.client.host if request.client else None,
     )
     # `model_validate`, not the constructor: `permits.status` is a plain `str`
     # column and `PermitStatus` is a `Literal`, so pydantic checks the membership

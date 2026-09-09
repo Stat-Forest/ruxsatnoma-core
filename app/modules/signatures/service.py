@@ -472,6 +472,7 @@ async def sign(
     pkcs7: str,
     user: User,
     content_changed_reason: str | None = None,
+    ip: str | None = None,
 ) -> Signature:
     """Attach a signature to `(object_type, object_id, purpose)`.
 
@@ -573,7 +574,7 @@ async def sign(
 
     doc_hash = hashlib.sha256(document).hexdigest()
     adapter = get_eimzo_adapter()
-    result = await adapter.verify_detached(document=document, pkcs7=pkcs7)
+    result = await adapter.verify_detached(document=document, pkcs7=pkcs7, ip=ip)
     info = result.subject_certificate
 
     if info is None:
@@ -601,7 +602,9 @@ async def sign(
         raise err("ERR-SIGN-001", details={"reason": verdict.reason})
 
     cert = await bind_certificate(db, info=info, user=user)
-    live_status = await adapter.certificate_status(serial=info.serial_number, issuer=info.issuer)
+    live_status = await adapter.certificate_status(
+        serial=info.serial_number, issuer=info.issuer, valid_to=info.valid_to
+    )
     await _reconcile_status(db, cert, live_status)
 
     verdict = build_verdict(result, cert_status=cert.status, now=datetime.now(UTC))
@@ -790,7 +793,9 @@ async def list_my_certificates(
     )
 
 
-async def register_certificate(db: AsyncSession, *, pkcs7: str, user: User) -> Certificate:
+async def register_certificate(
+    db: AsyncSession, *, pkcs7: str, user: User, ip: str | None = None
+) -> Certificate:
     """`POST /certificates` (ruling 4's second sentence): register a
     certificate ahead of any actual signing, from a self-contained signed
     challenge (`verify_attached` — there is no external document to hand
@@ -806,7 +811,7 @@ async def register_certificate(db: AsyncSession, *, pkcs7: str, user: User) -> C
     own docstring names this route explicitly as the reason its permissive
     branch cannot be the only check)."""
     adapter = get_eimzo_adapter()
-    result = await adapter.verify_attached(pkcs7)
+    result = await adapter.verify_attached(pkcs7, ip=ip)
     info = result.subject_certificate
     if info is None or result.status_code != 1:
         reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")
@@ -1000,7 +1005,9 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
         raise err("ERR-SYS-003")
     cert = await get_certificate(db, original.certificate_id)
     adapter = get_eimzo_adapter()
-    live_status = await adapter.certificate_status(serial=cert.serial_number, issuer=cert.issuer)
+    live_status = await adapter.certificate_status(
+        serial=cert.serial_number, issuer=cert.issuer, valid_to=cert.valid_to
+    )
     await _reconcile_status(db, cert, live_status)
 
     now = datetime.now(UTC)

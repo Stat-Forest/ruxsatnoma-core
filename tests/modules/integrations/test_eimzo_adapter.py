@@ -1,6 +1,8 @@
 """E-IMZO adapter seam extension (plan 03.8 Task 2): document verification and
 the seven design/04 §2.5 status codes, on top of the unchanged login mock."""
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from app.modules.integrations.adapters.eimzo import (
@@ -9,6 +11,10 @@ from app.modules.integrations.adapters.eimzo import (
     get_eimzo_adapter,
 )
 
+# `certificate_status`'s `valid_to` (ruling T3-1) is unused by the mock's own
+# serial-prefix convention — any value satisfies the widened signature.
+SOME_VALID_TO = datetime.now(UTC) + timedelta(days=30)
+
 
 @pytest.mark.asyncio
 async def test_verify_detached_returns_the_certificate_of_the_signer():
@@ -16,7 +22,7 @@ async def test_verify_detached_returns_the_certificate_of_the_signer():
     pkcs7 = encode_mock_signature(
         document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
     )
-    result = await adapter.verify_detached(document=b"the-document", pkcs7=pkcs7)
+    result = await adapter.verify_detached(document=b"the-document", pkcs7=pkcs7, ip=None)
     assert result.status_code == 1
     assert result.subject_certificate is not None
     assert result.subject_certificate.serial_number == "SER-1"
@@ -28,7 +34,7 @@ async def test_a_signature_over_other_bytes_is_status_minus_10():
     pkcs7 = encode_mock_signature(
         document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
     )
-    result = await adapter.verify_detached(document=b"OTHER-BYTES", pkcs7=pkcs7)
+    result = await adapter.verify_detached(document=b"OTHER-BYTES", pkcs7=pkcs7, ip=None)
     assert result.status_code == -10
     assert EIMZO_STATUS_REASONS[-10] == "signature_invalid"
 
@@ -63,7 +69,7 @@ async def test_verify_attached_recovers_the_document_from_the_envelope():
     pkcs7 = encode_mock_signature(
         document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
     )
-    result = await adapter.verify_attached(pkcs7=pkcs7)
+    result = await adapter.verify_attached(pkcs7=pkcs7, ip=None)
     assert result.status_code == 1
     assert result.subject_certificate is not None
     assert result.subject_certificate.serial_number == "SER-1"
@@ -81,7 +87,7 @@ async def test_verify_attached_still_matches_after_document_b64_is_dropped_from_
     pkcs7 = encode_mock_signature(
         document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
     )
-    result = await adapter.verify_attached(pkcs7=pkcs7)
+    result = await adapter.verify_attached(pkcs7=pkcs7, ip=None)
     assert result.status_code == 1  # the sha256 check inside still passed
     assert "document_b64" not in result.raw
     assert "document_sha256" in result.raw  # everything else in `raw` survives
@@ -96,7 +102,7 @@ async def test_verify_detached_raw_never_carries_the_document_bytes():
     pkcs7 = encode_mock_signature(
         document=b"the-document", serial="SER-1", issuer="ISS-1", pinfl="12345678901"
     )
-    result = await adapter.verify_detached(document=b"the-document", pkcs7=pkcs7)
+    result = await adapter.verify_detached(document=b"the-document", pkcs7=pkcs7, ip=None)
     assert result.status_code == 1
     assert "document_b64" not in result.raw
 
@@ -107,8 +113,8 @@ async def test_garbage_pkcs7_is_a_verdict_not_an_exception():
     # way verify_signed_challenge does (that EimzoError is the unchanged login
     # contract, not this one).
     adapter = get_eimzo_adapter()
-    detached = await adapter.verify_detached(document=b"x", pkcs7="garbage")
-    attached = await adapter.verify_attached(pkcs7="garbage")
+    detached = await adapter.verify_detached(document=b"x", pkcs7="garbage", ip=None)
+    attached = await adapter.verify_attached(pkcs7="garbage", ip=None)
     assert detached.status_code == -10
     assert attached.status_code == -10
     assert detached.subject_certificate is None
@@ -118,19 +124,28 @@ async def test_garbage_pkcs7_is_a_verdict_not_an_exception():
 @pytest.mark.asyncio
 async def test_certificate_status_active_by_default():
     adapter = get_eimzo_adapter()
-    assert await adapter.certificate_status(serial="SER-1", issuer="ISS-1") == "active"
+    status = await adapter.certificate_status(
+        serial="SER-1", issuer="ISS-1", valid_to=SOME_VALID_TO
+    )
+    assert status == "active"
 
 
 @pytest.mark.asyncio
 async def test_certificate_status_revoked_serial_prefix():
     adapter = get_eimzo_adapter()
-    assert await adapter.certificate_status(serial="REVOKED-1", issuer="ISS-1") == "revoked"
+    status = await adapter.certificate_status(
+        serial="REVOKED-1", issuer="ISS-1", valid_to=SOME_VALID_TO
+    )
+    assert status == "revoked"
 
 
 @pytest.mark.asyncio
 async def test_certificate_status_expired_serial_prefix():
     adapter = get_eimzo_adapter()
-    assert await adapter.certificate_status(serial="EXPIRED-1", issuer="ISS-1") == "expired"
+    status = await adapter.certificate_status(
+        serial="EXPIRED-1", issuer="ISS-1", valid_to=SOME_VALID_TO
+    )
+    assert status == "expired"
 
 
 @pytest.mark.asyncio

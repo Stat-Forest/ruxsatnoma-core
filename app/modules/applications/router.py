@@ -28,7 +28,7 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -323,6 +323,7 @@ async def get_application_package(
 async def submit_application(
     application_id: uuid.UUID,
     payload: ApplicationSubmitIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
     ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
@@ -346,7 +347,13 @@ async def submit_application(
     `ERR-APP-002` with the existing number when another active application
     already covers this plot and period.
     """
-    application = await service.submit(db, application_id, pkcs7=payload.pkcs7, actor=actor)
+    application = await service.submit(
+        db,
+        application_id,
+        pkcs7=payload.pkcs7,
+        actor=actor,
+        ip=request.client.host if request.client else None,
+    )
     out = ApplicationOut.model_validate(application)
     await ctx.save(db, status_code=200, body=out.model_dump(mode="json"))
     return out
@@ -725,6 +732,7 @@ async def recalculate_application(
 async def approve_application(
     application_id: uuid.UUID,
     payload: ApplicationApproveIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_DECIDE))],
 ) -> ApplicationDecisionOut:
@@ -754,7 +762,11 @@ async def approve_application(
     package bytes.
     """
     application, forwarded_to = await service_decision.approve(
-        db, application_id, pkcs7=payload.pkcs7, actor=actor
+        db,
+        application_id,
+        pkcs7=payload.pkcs7,
+        actor=actor,
+        ip=request.client.host if request.client else None,
     )
     return ApplicationDecisionOut.build(application, forwarded_to_organization=forwarded_to)
 
@@ -763,6 +775,7 @@ async def approve_application(
 async def reject_application(
     application_id: uuid.UUID,
     payload: ApplicationRejectIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_DECIDE))],
 ) -> ApplicationDecisionOut:
@@ -786,6 +799,7 @@ async def reject_application(
             reason_item_id=payload.reason_item_id,
             legal_basis=payload.legal_basis,
             actor=actor,
+            ip=request.client.host if request.client else None,
         ),
         forwarded_to_organization=None,
     )

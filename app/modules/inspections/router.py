@@ -9,7 +9,7 @@ from "may this role act at all")."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -249,6 +249,7 @@ async def attach_act_file(
 async def sign_act(
     act_id: uuid.UUID,
     payload: ActSignIn,
+    request: Request,
     db: AsyncDb,
     user: Annotated[User, Depends(require_permission(ACTS_WRITE))],
 ) -> ActOut:
@@ -258,6 +259,7 @@ async def sign_act(
         pkcs7=payload.pkcs7,
         violation_type_item_id=payload.violation_type_item_id,
         actor=user,
+        ip=request.client.host if request.client else None,
     )
     return ActOut.model_validate(act)
 

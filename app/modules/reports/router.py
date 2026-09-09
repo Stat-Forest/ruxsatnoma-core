@@ -5,7 +5,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files
@@ -192,10 +192,17 @@ async def submit_report(
 async def sign_report(
     report_id: uuid.UUID,
     data: ReportSignIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(REPORTS_SIGN))],
 ) -> ReportOut:
-    report = await service.sign_report(db, report_id, pkcs7=data.pkcs7, actor=user)
+    report = await service.sign_report(
+        db,
+        report_id,
+        pkcs7=data.pkcs7,
+        actor=user,
+        ip=request.client.host if request.client else None,
+    )
     return ReportOut.model_validate(report)
 
 

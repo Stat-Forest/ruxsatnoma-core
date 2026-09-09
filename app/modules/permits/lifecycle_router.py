@@ -22,7 +22,7 @@ merge conflict here is expected, not a mistake; keep both sides.
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -61,6 +61,7 @@ router = APIRouter(tags=["permits"])
 async def suspend_permit(
     permit_id: uuid.UUID,
     payload: DecisionIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
 ) -> PermitOut:
@@ -73,7 +74,13 @@ async def suspend_permit(
     `ERR-ACL-002` outside the caller's leshoz, `ERR-ACL-001` when the caller
     holds `permits.manage` but not `executor_head` OF this leshoz.
     """
-    permit = await service.suspend(db, permit_id, data=payload, actor=actor)
+    permit = await service.suspend(
+        db,
+        permit_id,
+        data=payload,
+        actor=actor,
+        ip=request.client.host if request.client else None,
+    )
     return PermitOut.model_validate(permit)
 
 
@@ -81,6 +88,7 @@ async def suspend_permit(
 async def resume_permit(
     permit_id: uuid.UUID,
     payload: DecisionIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
 ) -> PermitOut:
@@ -89,7 +97,13 @@ async def resume_permit(
     document cannot add to; 409 `ERR-PERM-001` when the permit is not
     `suspended`.
     """
-    permit = await service.resume(db, permit_id, data=payload, actor=actor)
+    permit = await service.resume(
+        db,
+        permit_id,
+        data=payload,
+        actor=actor,
+        ip=request.client.host if request.client else None,
+    )
     return PermitOut.model_validate(permit)
 
 
@@ -97,6 +111,7 @@ async def resume_permit(
 async def revoke_permit(
     permit_id: uuid.UUID,
     payload: DecisionIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(PERMITS_MANAGE))],
 ) -> PermitOut:
@@ -115,7 +130,13 @@ async def revoke_permit(
     not verify, in which case the permit is untouched and the attempt is
     stored as evidence.
     """
-    permit = await service.revoke(db, permit_id, data=payload, actor=actor)
+    permit = await service.revoke(
+        db,
+        permit_id,
+        data=payload,
+        actor=actor,
+        ip=request.client.host if request.client else None,
+    )
     return PermitOut.model_validate(permit)
 
 

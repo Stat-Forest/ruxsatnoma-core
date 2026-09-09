@@ -238,7 +238,7 @@ async def login_via_eimzo(
 ) -> tuple[User, Session, str, str]:
     adapter = get_eimzo_adapter()
     try:
-        identity = await adapter.verify_signed_challenge(signed_challenge)
+        identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
         raise err(exc.err_code) from exc
     row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
@@ -702,12 +702,12 @@ async def complete_registration(
 
 
 async def _verify_org_challenge(
-    db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str
+    db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str, ip: str | None
 ) -> EimzoIdentity:
     """org_eri basis: a fresh org-cert signature naming this stir and this signer."""
     adapter = get_eimzo_adapter()
     try:
-        identity = await adapter.verify_signed_challenge(signed_challenge)
+        identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
     row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
@@ -759,7 +759,7 @@ async def attach_legal(
     if basis == "org_eri":
         assert signed_challenge is not None  # schema guarantees
         identity = await _verify_org_challenge(
-            db, signed_challenge=signed_challenge, stir=stir, signer_pinfl=user.pinfl
+            db, signed_challenge=signed_challenge, stir=stir, signer_pinfl=user.pinfl, ip=ip
         )
         legal_name = identity.legal_name or legal_name or f"STIR {stir}"
         requisites = {"cert_serial": identity.cert_serial}
@@ -879,7 +879,11 @@ async def add_representation(
     if basis == "org_eri":
         assert signed_challenge is not None
         await _verify_org_challenge(
-            db, signed_challenge=signed_challenge, stir=applicant.stir, signer_pinfl=user.pinfl
+            db,
+            signed_challenge=signed_challenge,
+            stir=applicant.stir,
+            signer_pinfl=user.pinfl,
+            ip=ip,
         )
     elif basis == "director_registry":
         listed, _ = _director_listed(candidate, applicant.stir)
