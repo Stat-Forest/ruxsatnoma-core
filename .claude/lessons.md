@@ -215,33 +215,29 @@ Tooling and environment.
   supersede write (classifier items 3.3a, notification templates 3.5) is
   `old.status = "archived"` → `await db.flush()` → `db.add(new_row)`, in that order.
 
-## An enum-ish column has ONE source of truth: the tuple
+## An enum-ish column has ONE source of truth: the tuple — for whoever WRITES it and whoever READS it
 
 - **Rule:** Define the allowed values as a module-level tuple, build the DB CHECK from it
   (`CheckConstraint(f"col IN {TUPLE}")`), spell the pydantic `Literal` members out by hand,
-  and close the gap with `assert set(get_args(TheLiteral)) == set(THE_TUPLE)`.
+  and close the gap with `assert set(get_args(TheLiteral)) == set(THE_TUPLE)`. Reading such a
+  column from ANOTHER module — a dict off a `GROUP BY`, keyed by its strings — never defaults
+  silently: pin the key set against that same CHECK.
 - **Why:** Retyping the literals is two sources of truth — a value added on one side is a
   422 that should be a 201, or an `IntegrityError` 500 that should be a 422. But
   `Literal[*TUPLE]` is not the fix: it runs and pydantic accepts it, while pyright reports
   `reportInvalidTypeForm` ("Variable not allowed in type expression") — a `Literal`'s members
   must be statically visible (3.7 fix wave, finding I8).
+- **The read side fails silently instead (7.9, `0046`):** that migration retired
+  `allocations.target = 'budget'`, rewrote every row to `'receiver'` and dropped it from the
+  CHECK; `dashboard/repo.py::payments_kpi` still read `by_target.get("budget", Decimal("0.00"))`,
+  so `budget_share_amount` reported zero with no exception, no log line and no failing test —
+  found only by a human grepping the retired string.
 - **How to apply:** `norms/models.py`'s `LIVESTOCK_GROUPS`/`QUANTITY_UNITS` +
   `norms/schemas.py`'s `LivestockGroup`/`QuantityUnit` +
   `test_models.py::test_the_schema_literals_match_the_tables_own_check_constraints` are the
-  shape. `admin.models.ORGANIZATION_KINDS` still retypes its CHECK — fix on next touch.
-
-## Two mechanisms refusing one thing: an outcome-only test cannot tell which one fired
-
-- **Rule:** When something else also refuses what your guard refuses — a DB CHECK behind a
-  service pre-check, a later guard in the same function — assert the RECORDED reason, not
-  just the status code, and revert the guard to prove that test goes red.
-- **Why:** Twice, one class. `parent_needs_subcontour`'s only test went through
-  `POST /gis/contours`, which raises `ERR-VAL-001` before a row exists, so the CHECK never
-  ran (3.6a t3). `permits.signers.is_known` was redundant — an unmapped purpose fell
-  through to the role comparison as `wrong_role`, so deleting the guard left it green.
-- **How to apply:** Adding a guard in front of an existing refusal → one test per
-  mechanism, each asserting its OWN reason (a direct-ORM `pytest.raises` for a CHECK). A
-  negative control that stays green means the guard is redundant, not that it works.
+  shape, and the same test is what pins a reader's key set. Retiring a value → grep every
+  `.get(<literal>,` keyed by that column first. `admin.models.ORGANIZATION_KINDS` still
+  retypes its CHECK — fix on next touch.
 
 ## A failed DB statement aborts the whole transaction — catch the right type, recover with a SAVEPOINT
 
@@ -585,20 +581,6 @@ Tooling and environment.
 - **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
   fails once that module ships, or tie it to a tracked ticket.
 
-## A `.get(key, default)` over a GROUP BY turns another module's retired enum value into a plausible zero
-
-- **Rule:** A dict built from a `GROUP BY` and read with `.get(key, default)`, where `key`
-  is another module's enum-ish string (`target`, `status`, `kind`), must not default
-  silently — assert the key set against the column's CURRENT check/tuple instead.
-- **Why:** Stage 7.9's migration `0046` retired `allocations.target = 'budget'`, rewriting
-  every row to `'receiver'` and dropping it from the CHECK. `dashboard/repo.py::payments_kpi`
-  — a DIFFERENT module — still read `by_target.get("budget", Decimal("0.00"))`; nothing
-  carries that key after the migration, so `budget_share_amount` reported zero with no
-  exception, no log line, and no test — found only by a human grepping the retired string.
-- **How to apply:** Aggregating another module's enum-ish column into a dict, grep every
-  `.get(<literal>,` keyed by it and pin the key set against the owning table's CHECK — the
-  shape `test_the_schema_literals_match_the_tables_own_check_constraints` already uses.
-
 ---
 
 # PostGIS
@@ -875,33 +857,49 @@ Tooling and environment.
 - **How to apply:** `make heads` covers this one. Before writing a test about infrastructure
   the fixtures themselves depend on, ask which runs first.
 
-## A "public surface" task's own end-to-end test can ship the surface untested
+## A green test proves nothing until you have seen it go red — break the code and watch
 
-- **Rule:** When a task adds functions to a module's public surface FOR a caller that does not
-  exist yet, check whether its end-to-end test actually calls them — an HTTP scenario
-  exercises the ROUTES, not the in-process functions a future module will call.
-- **Why:** Task 8's test drives `preview`/`save_calculation`/`publish_norm` over `httpx`,
-  while `service.effective_norm` and `service.run_checks` — exactly what 3.9/3.11 will call
-  in-process — were reached by nothing: hard-coding `run_checks`'s `used_sb` to a real Decimal
-  left the brief-verbatim test green.
-- **How to apply:** Add a direct in-process call to each NEW function inside the SAME test,
-  reusing its committed fixtures, asserting it agrees with what the HTTP path proved. Never
-  ship a contract function whose only verification is that it type-checks.
+- **Rule:** Before trusting a test, make the thing it guards WRONG and confirm it fails.
+  Two shapes need this most: a guard sitting in front of another refusal (assert the RECORDED
+  reason, never just the status code), and a function added to a module's public surface for a
+  caller that does not exist yet (an HTTP scenario exercises ROUTES, not in-process functions).
+- **Why:** three ways to ship an assertion that cannot fail. `parent_needs_subcontour`'s only
+  test went through `POST /gis/contours`, which raises `ERR-VAL-001` before a row exists — the
+  CHECK it was written for never ran (3.6a t3). `permits.signers.is_known` was redundant: an
+  unmapped purpose already fell through to the role comparison as `wrong_role`, so DELETING the
+  guard left the test green. And 3.7 task 8's end-to-end test drove `preview`/`save_calculation`
+  over `httpx` while `service.effective_norm`/`service.run_checks` — exactly what 3.9/3.11 would
+  call in-process — were reached by nothing: hard-coding `run_checks`'s `used_sb` to a real
+  Decimal left it green.
+- **How to apply:** One test per refusing mechanism, each asserting its OWN reason (a
+  direct-ORM `pytest.raises` for a CHECK). Add a direct in-process call to each NEW surface
+  function inside the SAME test, reusing its committed fixtures. A negative control that stays
+  green means the guard is redundant or the call is unreached — never that it works.
 
-## A test left reading the real clock is a scheduled failure — the date OR the hour
+## A test that reads the machine — its clock, its fonts, its runtime — is a scheduled failure
 
-- **Rule:** Freeze whatever the code under test asks the clock for, patching it in the CALLING
-  module's namespace (`app.modules.norms.service.business_today`), never in `app.core.time`.
-- **Why:** `0012` seeds `bhm` as two dated rows (412 000 until 2026-08-31, 440 000 after). 3.7
-  t7 hard-coded amounts from 412 000 while `_compute` resolved `on_date=business_today()`:
-  green the day it was written, red on 1 September with nobody touching the repository.
-- **The hour of day, same class (#152):** the SMS quiet window made five delivery tests pass at
-  09:52 and fail at 01:53 — nightly in CI, where nobody watches the clock. A feature gated on
-  the wall clock needs the predicate patched OFF suite-wide (`tests/conftest.py::
-  _no_sms_quiet_window`), with a marker opting its own test back in.
-- **How to apply:** Adding a seed row effective in the future, or any `now()`/hour comparison,
-  grep the suite for the in-force figure and for the clock call. Never "fix" such a test by
-  recomputing from whatever is in force — that passes against a WRONG tariff.
+- **Rule:** An assertion may depend on the code under test and on nothing else about where it
+  runs. Freeze the clock the code actually calls, patching it in the CALLING module's namespace
+  (`app.modules.norms.service.business_today`), never in `app.core.time`; and never assert a
+  substring against rendered output verbatim — squeeze the whitespace from BOTH sides
+  (`"".join(s.split())`).
+- **Why:** the same failure arrives on a date, at an hour, or on another image. `0012` seeds
+  `bhm` as two dated rows (412 000 until 2026-08-31, 440 000 after) and 3.7 t7 hard-coded
+  amounts from 412 000 while `_compute` resolved `on_date=business_today()`: green the day it
+  was written, red on 1 September with nobody touching the repository. The SMS quiet window
+  (#152) made five delivery tests pass at 09:52 and fail at 01:53 — nightly in CI, where nobody
+  watches the clock. And the С22 watermark tests passed on macOS, failed in CI with
+  `assert 'Test User' in '... T est User — 2026-09-07'`: `extract_text()` rebuilds words from
+  glyph positions and inserts a space wherever a run is kerned, which depends on the fonts in
+  the image — the negative assertion fails OPEN the same way, a leaked name slipping past on a
+  space. Mirror the same evening in the adminka: a mock using jsdom's `Blob` passed on Node 25,
+  failed on CI's Node 22.
+- **How to apply:** A feature gated on the wall clock gets its predicate patched OFF suite-wide
+  (`tests/conftest.py::_no_sms_quiet_window`), with a marker opting its own test back in;
+  `tests/modules/search/test_export.py::_pdf_text` is the render-reading helper. Adding a seed
+  row effective in the future, grep the suite for the in-force figure — never "fix" such a test
+  by recomputing from whatever is in force, which passes against a WRONG tariff. Green locally
+  and red in CI: reproduce the CI runtime first (a `node:22` container did it here).
 
 ## An uncommitted test setup on the same session gets committed for real by an expected refusal
 
@@ -933,19 +931,6 @@ Tooling and environment.
   attribute explicitly at the call site (`assert a_user.pinfl is not None`) instead of
   leaving the parameter unannotated to dodge the check.
 
-## An assertion over rendered output is testing this machine's fonts, not your code
-
-- **Rule:** Reading text back out of a PDF, squeeze the whitespace from BOTH sides
-  (`"".join(s.split())`). Never assert a substring against `extract_text()` verbatim.
-- **Why:** the С22 watermark tests passed on macOS and failed in CI with
-  `assert 'Test User' in '... T est User — 2026-09-07'`. `extract_text()` rebuilds words
-  from glyph positions and inserts a space wherever a run is kerned — and which runs are
-  kerned depends on the fonts in the image; the negative assertion fails OPEN the same
-  way, a leaked name slipping past on a space (2026-09-07). Mirror the same evening in the
-  adminka: a mock using jsdom's `Blob` passed on Node 25, failed on CI's Node 22.
-- **How to apply:** any test reading back what WeasyPrint produced —
-  `tests/modules/search/test_export.py::_pdf_text` is the helper. Green locally and red in
-  CI: reproduce the CI runtime first (a `node:22` container did it here).
 
 ---
 
