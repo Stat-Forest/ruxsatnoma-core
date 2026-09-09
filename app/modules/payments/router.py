@@ -17,11 +17,16 @@ never browse the whole book. That path is staff-only and zone-scoped
 the reasoning; this router stays a thin pass-through for both.
 
 Stage 7.9 task 8: `GET /invoices/{id}` additionally attaches `recipients`
-(`_invoice_out` below) for a `payments.view` holder ONLY — the same
-authorization split as everything else in this file, just answering a
-different question (WHAT is shown, not WHETHER the invoice is). `GET
-/invoices` (the list route) never attaches it, the same scope `RefundOut.
-available_sources` draws for itself."""
+(`_invoice_out` below) for a STAFF reader ONLY — gated on `service.
+holds_payments_read` (`payments.view` OR `payments.confirm`, whole-branch
+review Important 2), the SAME predicate `_may_act_on_invoices_of`'s staff
+branch already uses to decide who may act on the invoice at all. Using a
+narrower predicate here would silently drop `recipients` for an actor the
+route otherwise treats as staff — the same authorization split as
+everything else in this file, just answering a different question (WHAT is
+shown, not WHETHER the invoice is). `GET /invoices` (the list route) never
+attaches it, the same scope `RefundOut.available_sources` draws for
+itself."""
 
 import uuid
 from typing import Annotated, Any
@@ -46,14 +51,23 @@ _INVOICE_STATUS_PATTERN = "^(" + "|".join(INVOICE_STATUSES) + ")$"
 
 async def _invoice_out(db: AsyncSession, invoice: Invoice, *, actor: User) -> Any:
     """Builds `GET /invoices/{id}`'s response, attaching `recipients` ONLY
-    for a `payments.view` holder (Override 4, stage 7.9 task 8 — who
-    receives the money is internal allocation, never part of what a
-    citizen is paying for). Everyone else gets `recipients` OMITTED from
-    the JSON body entirely — `exclude={"recipients"}`, never a blanket
-    `exclude_none` (`InvoiceOut.recipients`'s own docstring says why only
-    this one field is allowed to disappear)."""
+    for a STAFF reader (Override 4, stage 7.9 task 8 — who receives the
+    money is internal allocation, never part of what a citizen is paying
+    for). Everyone else gets `recipients` OMITTED from the JSON body
+    entirely — `exclude={"recipients"}`, never a blanket `exclude_none`
+    (`InvoiceOut.recipients`'s own docstring says why only this one field
+    is allowed to disappear).
+
+    Gated on `service.holds_payments_read`, NOT `holds_payments_view`
+    (whole-branch review Important 2, fixed after `executor_head` — the
+    checker half of the maker-checker PAID, and the head of the leshoz
+    that receives the invoice's own remainder — reached this route (via
+    `_may_act_on_invoices_of`'s `holds_payments_read`-gated staff branch)
+    and got a body with `recipients` silently absent, not a 403 and not a
+    null). One access rule, one source: whoever the route already treats
+    as staff must see the same thing every other staff reader does."""
     out = InvoiceOut.model_validate(invoice)
-    if not await service.holds_payments_view(db, actor):
+    if not await service.holds_payments_read(db, actor):
         return JSONResponse(out.model_dump(mode="json", exclude={"recipients"}))
     out.recipients = [
         InvoiceRecipientOut.model_validate(row)

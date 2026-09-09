@@ -619,7 +619,7 @@ async def cancel_invoice_for_application(
     return invoice
 
 
-async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
+async def holds_payments_read(db: AsyncSession, actor: User) -> bool:
     """Holds a permission that entitles its holder to READ invoices —
     `payments.view`, or `payments.confirm`, or the superuser gate.
 
@@ -635,7 +635,20 @@ async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
     **Reads only.** `create_pay_intent` shares `_may_act_on_invoices_of` and
     deliberately does NOT accept this wider set: raising a payment link is
     `payments.view`'s, and the caller marks which question it is asking with
-    `read_only`."""
+    `read_only`.
+
+    Named WITHOUT a leading underscore since the whole-branch review's
+    Important 2: `router.py::_invoice_out` gained a SECOND caller across
+    files, to decide whether `GET /invoices/{id}` attaches `recipients` at
+    all — it must be the SAME predicate `_may_act_on_invoices_of`'s staff
+    branch already uses to decide who may act on the invoice in the first
+    place (`staff = holds_payments_read if read_only else
+    holds_payments_view`, right below), or a `payments.confirm`-only holder
+    (`executor_head`, the checker half of the maker-checker PAID, and the
+    head of the leshoz that receives the invoice's own remainder) reaches
+    the route and gets a body with `recipients` silently absent — not a
+    403, not a null: gone. One access rule, one source; `holds_payments_view`
+    alone was a SECOND, narrower copy of it living in the wrong file."""
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     codes = await auth_repo.permission_codes(db, actor)
@@ -651,12 +664,17 @@ async def holds_payments_view(db: AsyncSession, actor: User) -> bool:
     holding NEITHER `payments.view` NOR any grant at all must still reach
     these routes, to read their OWN invoice).
 
-    Named WITHOUT a leading underscore since stage 7.9 task 8: `router.py`
-    gained a SECOND caller across files, to decide whether `GET /invoices/
-    {id}` attaches the split at all (Override 4 — an applicant must never
-    be shown who receives the money) — the same "no underscore once a
-    second caller crosses a file" convention `resolve_recipient_account`'s
-    own docstring states, applied here for the identical reason."""
+    Named WITHOUT a leading underscore since stage 7.9 task 8, when
+    `router.py` gained a caller across files — the same "no underscore
+    once a caller crosses a file" convention `resolve_recipient_account`'s
+    own docstring states. That caller (`_invoice_out`, deciding whether
+    `GET /invoices/{id}` attaches `recipients` at all) has since moved to
+    `holds_payments_read` instead (whole-branch review Important 2 —
+    gating on THIS narrower predicate silently dropped `recipients` for a
+    `payments.confirm`-only reader the route otherwise treats as staff);
+    the underscore stays off regardless, because `_may_act_on_invoices_of`
+    right below still calls this across the SAME two-branch shape for the
+    write path."""
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     return PAYMENTS_VIEW in await auth_repo.permission_codes(db, actor)
@@ -743,7 +761,7 @@ async def _may_act_on_invoices_of(
     pay-intent route (`create_pay_intent`) — one rule, three callers, so the
     representation gap Task 2 deliberately carried to this task is closed
     for reads too, not just for paying."""
-    staff = _holds_payments_read if read_only else holds_payments_view
+    staff = holds_payments_read if read_only else holds_payments_view
     if await staff(db, actor):
         # A permission says WHETHER, a zone says WHERE — and zone scoping is
         # not a permission check (lesson). Staff pass both or neither.
@@ -822,7 +840,7 @@ async def list_invoices_for_actor(
             db, application_id, status=status, limit=limit, offset=offset
         )
 
-    if not await _holds_payments_read(db, actor):
+    if not await holds_payments_read(db, actor):
         raise err("ERR-ACL-001")
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
@@ -926,19 +944,29 @@ async def create_pay_intent(
     (`invoice_recipients`, decision #158) can be routed at Payme at all —
     every row that would actually receive money (`amount > 0`) must carry a
     `payme_account_id`, or this refuses with `ERR-PAY-007` and
-    `details.missing` naming the receivers that lack one (position and
-    name, never an invented id). This is the refusal a human actually SEES
-    (Override 1 of the task's own brief) — Payme's own
-    `CheckPerformTransaction`/`CreateTransaction` (`payme.py`) answer the
-    SAME condition as `-31008` instead, for a citizen who reaches the
-    payment page some other way. All-or-nothing by construction
-    (`missing_payme_receivers` reads the WHOLE snapshot): a partial
-    `receivers` array would route some receivers at Payme and leave the
-    rest on the Agency's own cashbox awaiting a manual transfer — the worst
-    of both mechanisms and the hardest thing in this system to reconcile.
-    An invoice issued BEFORE this stage carries an EMPTY snapshot (Override
-    3) and stays payable unchanged — refusing those would strand every
-    invoice already pending on the stand.
+    `details.missing` naming the receivers that lack one **by POSITION
+    ONLY, never by name** (whole-branch review Important 4, fixed from
+    `{"position", "name"}`): this route answers the APPLICANT's own "pay"
+    button, and `GET /invoices/{id}` already hides `recipients` from that
+    same actor (Override 4) — echoing a receiver's name back into a 409 the
+    instant they press pay would hand them exactly what the read route
+    refuses to. `logger.error` right below names them IN FULL for staff,
+    who are who must actually fix a missing `payme_account_id` — decision
+    #160's own goal (a legible refusal rather than a raw provider error)
+    is served by `position` alone: it tells the reader WHICH configured
+    row is broken without disclosing WHO it is to the one actor who must
+    never be told. This is the refusal a human actually SEES (Override 1
+    of the task's own brief) — Payme's own `CheckPerformTransaction`/
+    `CreateTransaction` (`payme.py`) answer the SAME condition as `-31008`
+    instead, for a citizen who reaches the payment page some other way.
+    All-or-nothing by construction (`missing_payme_receivers` reads the
+    WHOLE snapshot): a partial `receivers` array would route some
+    receivers at Payme and leave the rest on the Agency's own cashbox
+    awaiting a manual transfer — the worst of both mechanisms and the
+    hardest thing in this system to reconcile. An invoice issued BEFORE
+    this stage carries an EMPTY snapshot (Override 3) and stays payable
+    unchanged — refusing those would strand every invoice already pending
+    on the stand.
     """
     invoice = await repo.get_invoice(db, invoice_id)
     if invoice is None:
@@ -956,11 +984,16 @@ async def create_pay_intent(
     snapshot = await invoice_recipients(db, invoice.id)
     missing = missing_payme_receivers(snapshot)
     if missing:
+        logger.error(
+            "payments.pay_intent_refused_unroutable_split",
+            invoice_id=str(invoice_id),
+            missing=[{"position": row.position, "name": row.name} for row in missing],
+        )
         raise err(
             "ERR-PAY-007",
             details={
                 "invoice": str(invoice_id),
-                "missing": [{"position": row.position, "name": row.name} for row in missing],
+                "missing": [{"position": row.position} for row in missing],
             },
         )
 
@@ -1285,11 +1318,17 @@ async def record_reversal(
 
     1. one `correction` allocation per `payment` row this transaction wrote,
        with the sign flipped — the ledger is append-only (ruling 4), so the
-       reversal is new rows rather than an edit of the old ones. This
-       transaction's own entries always cancel out; the INVOICE's whole ledger
-       sums to `0.00` too, as long as only one transaction ever performed
-       against it, which is all today's paths allow (see the comment on
-       `paid_rows` below);
+       reversal is new rows rather than an edit of the old ones. `target`,
+       `recipient_id` AND `account` are copied verbatim from the row being
+       reversed — only `entry_type` and the sign of `amount` change — because
+       a correction that drops `recipient_id` still matches `target=
+       'receiver'` but no longer matches any ONE receiver: `dashboard.repo`'s
+       per-receiver sum filters on `recipient_id`, not `target`, and a
+       correction missing it would leave that receiver's reported share
+       overstated by exactly the money that went back. This transaction's own
+       entries always cancel out; the INVOICE's whole ledger sums to `0.00`
+       too, as long as only one transaction ever performed against it, which
+       is all today's paths allow (see the comment on `paid_rows` below);
     2. one `reconciliations` row, `result='discrepancy'`, `status='open'` —
        the register a human reads every morning, and the operator's handle on
        a case only a human can finish;
@@ -1364,6 +1403,7 @@ async def record_reversal(
                 transaction_id=transaction.id,
                 entry_type=ALLOCATION_ENTRY_CORRECTION,
                 target=row.target,
+                recipient_id=row.recipient_id,
                 account=row.account,
                 amount=-row.amount,
                 note=note,

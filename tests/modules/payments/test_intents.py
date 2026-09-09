@@ -341,8 +341,12 @@ async def test_pay_intents_refuses_a_split_that_cannot_be_routed(
     must be legible — `ERR-PAY-007` (409), inside the normal `ERR-*`
     envelope (never a raw Payme code, which belongs on the OTHER refusal
     point, `payme.py`'s own `-31008`), `details.missing` naming the
-    receiver that lacks a Payme id by POSITION and NAME — never an
-    invented id."""
+    receiver that lacks a Payme id by POSITION ONLY — never a name, and
+    never an invented id (whole-branch review Important 4, fixed from
+    `{"position", "name"}`: this route answers the APPLICANT's own "pay"
+    button, and `GET /invoices/{id}` already hides who receives the money
+    from that same actor — echoing a name back into this 409 would hand
+    them exactly what that read route refuses to)."""
     result = await applicant_client.post(
         f"/api/v1/invoices/{invoice_with_unrouted_receiver.id}/pay-intents",
         json={"provider": "payme"},
@@ -353,4 +357,4 @@ async def test_pay_intents_refuses_a_split_that_cannot_be_routed(
     assert body["error"]["code"] == "ERR-PAY-007"
     missing = body["error"]["details"]["missing"]
     assert missing, "details.missing must name at least one receiver"
-    assert all(set(row) == {"position", "name"} for row in missing)
+    assert all(set(row) == {"position"} for row in missing)
