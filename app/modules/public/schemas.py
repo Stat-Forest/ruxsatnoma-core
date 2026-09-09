@@ -133,3 +133,19 @@ class SiteSettingsOut(BaseModel):
     contacts: SiteContactsOut
     # Ruling R3: provisional until the Agency answers; the strip says so on screen.
     season_windows: dict[str, list[int]]
+
+
+class RatingSummaryOut(BaseModel):
+    """The landing's single national number for citizens' post-issuance
+    ratings (#174) — suppressed below `service.OPEN_DATA_K_ANONYMITY`: below
+    it `published` is `False` and BOTH `average` and `histogram` are `None`,
+    never a number computed from a handful of rows and presented as if it
+    meant something nationally. `count` is always the true count, published
+    or not — it is what lets the front end say "not enough ratings yet"
+    instead of just hiding the block."""
+
+    published: bool
+    average: Decimal | None
+    count: int
+    histogram: dict[int, int] | None
+    threshold: int

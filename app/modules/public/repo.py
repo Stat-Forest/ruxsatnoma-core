@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
+from app.modules.permits.models import PermitRating
 from app.modules.public.models import CitizenAppeal
 
 
@@ -34,3 +35,13 @@ async def list_appeals(
         await db.execute(stmt.order_by(CitizenAppeal.created_at.desc()).offset(offset).limit(limit))
     ).scalars()
     return list(rows), total or 0
+
+
+async def rating_histogram(db: AsyncSession) -> dict[int, int]:
+    """Count of `permit_ratings` rows per score, 1-5, across every
+    organization — the national total `service.rating_summary` decides
+    whether to publish. Missing scores are absent from the result, not zero;
+    the service fills the 1-5 range only once it already knows the total
+    clears the threshold."""
+    rows = await db.execute(select(PermitRating.score, func.count()).group_by(PermitRating.score))
+    return {int(score): int(count) for score, count in rows.all()}

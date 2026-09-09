@@ -20,11 +20,16 @@ Three surfaces, each with its own trust boundary:
    season calendar — never the whole store (`login_max_attempts`,
    `mfa_enabled` and the other operational parameters live in the same table
    and must never leak here).
+5. **Rating summary** — `rating_summary` is read-only, anonymous, and
+   publishes the national average of citizens' post-issuance ratings ONLY
+   once `repo.rating_histogram`'s total meets `OPEN_DATA_K_ANONYMITY` — the
+   same threshold `open_data_stats` already reads, not a second constant
+   (#174).
 """
 
 import uuid
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +48,7 @@ from app.modules.public import repo
 from app.modules.public.models import APPEAL_NUMBER_PREFIX, APPEAL_TRANSITIONS, CitizenAppeal
 from app.modules.public.schemas import (
     AppealContact,
+    RatingSummaryOut,
     SiteContactsOut,
     SiteSettingsOut,
     SiteSocialOut,
@@ -285,4 +291,37 @@ async def site_settings(db: AsyncSession) -> SiteSettingsOut:
     return SiteSettingsOut(
         contacts=contacts,
         season_windows=await get_setting(db, "site_season_windows"),
+    )
+
+
+async def rating_summary(db: AsyncSession) -> RatingSummaryOut:
+    """The landing's single national rating number (#174). Below
+    `OPEN_DATA_K_ANONYMITY` ratings nationwide, `published` is `False` and
+    BOTH `average` and `histogram` come back `None` — an average over a
+    handful of ratings published as a national figure is exactly the "hides
+    or overstates" defect this project keeps finding, so the front end gets
+    nulls to render as "not enough ratings yet", never a rounded-up or
+    zeroed number. Reuses `OPEN_DATA_K_ANONYMITY` rather than a second,
+    independent threshold constant — the same value `open_data_stats` reads
+    for its own per-cell suppression.
+    """
+    histogram = await repo.rating_histogram(db)
+    full = {score: histogram.get(score, 0) for score in range(1, 6)}
+    count = sum(full.values())
+    if count < OPEN_DATA_K_ANONYMITY:
+        return RatingSummaryOut(
+            published=False,
+            average=None,
+            count=count,
+            histogram=None,
+            threshold=OPEN_DATA_K_ANONYMITY,
+        )
+    total = sum(score * n for score, n in full.items())
+    average = (Decimal(total) / Decimal(count)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return RatingSummaryOut(
+        published=True,
+        average=average,
+        count=count,
+        histogram=full,
+        threshold=OPEN_DATA_K_ANONYMITY,
     )
