@@ -1,12 +1,13 @@
-"""The anonymous surface — appeals and open data. No `get_current_user`, no
-permission code anywhere in this file; a rate limit instead of both, same
-idiom `permits.public_router` and `norms.public_router` already established.
+"""The anonymous surface — appeals, open data and public site settings. No
+`get_current_user`, no permission code anywhere in this file; a rate limit
+instead of both, same idiom `permits.public_router` and `norms.public_router`
+already established.
 
 `POST /public/appeals` and `GET /public/appeals/check` are in
 `app/core/logging.py`'s `SILENT_ACCESS_LOG_PATHS` — `check`'s `contact` query
 parameter is exactly the kind of thing that precedent exists to keep out of a
-process log. The open-data routes carry no personal data and are deliberately
-left out of that list."""
+process log. The open-data and site-settings routes carry no personal data
+and are deliberately left out of that list."""
 
 from typing import Annotated, Any
 
@@ -23,6 +24,7 @@ from app.modules.public.schemas import (
     AppealSubmitOut,
     OpenDataLayerOut,
     OpenDataStatsOut,
+    SiteSettingsOut,
 )
 
 router = APIRouter(prefix="/public", tags=["public"])
@@ -83,3 +85,10 @@ async def open_data_layer_features(
 @router.get("/open-data/stats", response_model=OpenDataStatsOut, dependencies=[_OPEN_DATA_LIMIT])
 async def open_data_stats(db: Annotated[AsyncSession, Depends(get_db)]) -> Any:
     return await service.open_data_stats(db)
+
+
+@router.get("/site-settings", response_model=SiteSettingsOut, dependencies=[_OPEN_DATA_LIMIT])
+async def site_settings(db: Annotated[AsyncSession, Depends(get_db)]) -> Any:
+    """Feeds the landing footer and its season calendar — an explicit
+    whitelist, never a proxy of `system_settings` (`service.site_settings`)."""
+    return await service.site_settings(db)

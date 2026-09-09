@@ -15,6 +15,11 @@ Three surfaces, each with its own trust boundary:
 3. **Staff triage** — `list_appeals`/`get_appeal`/`advance_appeal_status`/
    `answer_appeal` require `public.appeals.manage` (checked by the router's
    `require_permission`, not repeated here).
+4. **Site settings** — `site_settings` is read-only, anonymous, and serves an
+   EXPLICIT whitelist of `system_settings` keys for the landing's footer and
+   season calendar — never the whole store (`login_max_attempts`,
+   `mfa_enabled` and the other operational parameters live in the same table
+   and must never leak here).
 """
 
 import uuid
@@ -27,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import numbers
 from app.core.errors import err
 from app.core.schemas import PageParams
+from app.core.settings_store import get_setting
 from app.core.time import business_today
 from app.modules.admin import service as admin_service
 from app.modules.audit import service as audit
@@ -35,7 +41,13 @@ from app.modules.gis import service as gis_service
 from app.modules.permits import service as permits_service
 from app.modules.public import repo
 from app.modules.public.models import APPEAL_NUMBER_PREFIX, APPEAL_TRANSITIONS, CitizenAppeal
-from app.modules.public.schemas import AppealContact
+from app.modules.public.schemas import (
+    AppealContact,
+    SiteContactsOut,
+    SiteSettingsOut,
+    SiteSocialOut,
+    SiteTextOut,
+)
 
 # R2 (`plans/04.6-4.8-public-help.md`): a smaller cell reveals a specific
 # applicant's business — see the plan for the concrete reasoning. A constant,
@@ -243,3 +255,34 @@ async def open_data_stats(db: AsyncSession) -> dict[str, Any]:
         "by_region": by_region,
         "by_organization": by_organization,
     }
+
+
+async def site_settings(db: AsyncSession) -> SiteSettingsOut:
+    """Exactly the keys the public site needs — never the whole settings
+    store. `system_settings` also holds operational parameters
+    (`login_max_attempts`, `mfa_enabled`, `session_absolute_hours`, ...); this
+    whitelist is the point of the route, so a future key added to the store
+    must never appear here by accident."""
+
+    async def value(key: str) -> str:
+        return await get_setting(db, key)
+
+    telegram = await value("site_social_telegram")
+    youtube = await value("site_social_youtube")
+    contacts = SiteContactsOut(
+        phone=await value("site_contact_phone"),
+        email=await value("site_contact_email"),
+        address=SiteTextOut(
+            uz_latn=await value("site_contact_address_uz"),
+            ru=await value("site_contact_address_ru"),
+        ),
+        hours=SiteTextOut(
+            uz_latn=await value("site_contact_hours_uz"),
+            ru=await value("site_contact_hours_ru"),
+        ),
+        social=SiteSocialOut(telegram=telegram or None, youtube=youtube or None),
+    )
+    return SiteSettingsOut(
+        contacts=contacts,
+        season_windows=await get_setting(db, "site_season_windows"),
+    )

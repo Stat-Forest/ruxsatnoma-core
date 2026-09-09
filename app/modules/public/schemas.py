@@ -102,3 +102,34 @@ class OpenDataStatsOut(BaseModel):
     total_active_area_ha: Decimal
     by_region: list[OpenDataRegionStatOut]
     by_organization: list[OpenDataOrgStatOut]
+
+
+class SiteTextOut(BaseModel):
+    """Two languages only: the landing falls back to `uz_latn` for the other
+    three UI languages (#90)."""
+
+    uz_latn: str
+    ru: str
+
+
+class SiteSocialOut(BaseModel):
+    telegram: str | None = None
+    youtube: str | None = None
+
+
+class SiteContactsOut(BaseModel):
+    phone: str
+    email: str
+    address: SiteTextOut
+    hours: SiteTextOut
+    social: SiteSocialOut
+
+
+class SiteSettingsOut(BaseModel):
+    """Feeds the landing footer and its season calendar in one anonymous
+    request (ruling R3) — an explicit whitelist of `system_settings` keys,
+    never a proxy of the store."""
+
+    contacts: SiteContactsOut
+    # Ruling R3: provisional until the Agency answers; the strip says so on screen.
+    season_windows: dict[str, list[int]]
