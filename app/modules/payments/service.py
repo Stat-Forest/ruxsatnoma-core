@@ -642,14 +642,21 @@ async def _holds_payments_read(db: AsyncSession, actor: User) -> bool:
     return PAYMENTS_VIEW in codes or PAYMENTS_CONFIRM in codes
 
 
-async def _holds_payments_view(db: AsyncSession, actor: User) -> bool:
+async def holds_payments_view(db: AsyncSession, actor: User) -> bool:
     """Holds `payments.view`, or is the superuser that passes every permission
     gate (decision #41 ruling 2) — the same two-branch shape
     `norms.service._holds_tariffs_publish`/`gis.service._may_manage_layers`
     use for a rule INSIDE a handler, as opposed to a `require_permission`
     dependency on the route itself (needed here because even a caller
     holding NEITHER `payments.view` NOR any grant at all must still reach
-    these routes, to read their OWN invoice)."""
+    these routes, to read their OWN invoice).
+
+    Named WITHOUT a leading underscore since stage 7.9 task 8: `router.py`
+    gained a SECOND caller across files, to decide whether `GET /invoices/
+    {id}` attaches the split at all (Override 4 — an applicant must never
+    be shown who receives the money) — the same "no underscore once a
+    second caller crosses a file" convention `resolve_recipient_account`'s
+    own docstring states, applied here for the identical reason."""
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     return PAYMENTS_VIEW in await auth_repo.permission_codes(db, actor)
@@ -736,7 +743,7 @@ async def _may_act_on_invoices_of(
     pay-intent route (`create_pay_intent`) — one rule, three callers, so the
     representation gap Task 2 deliberately carried to this task is closed
     for reads too, not just for paying."""
-    staff = _holds_payments_read if read_only else _holds_payments_view
+    staff = _holds_payments_read if read_only else holds_payments_view
     if await staff(db, actor):
         # A permission says WHETHER, a zone says WHERE — and zone scoping is
         # not a permission check (lesson). Staff pass both or neither.
@@ -1009,7 +1016,9 @@ async def _organization_for(
 async def resolve_recipient_account(
     db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
 ) -> str | None:
-    """Ruling H: the leshoz's own bank account for the 50/50 recipient half —
+    """Ruling H: the leshoz's own bank account for its own remainder share
+    (`target=TARGET_RECIPIENT` — a configured receiver resolves a Payme
+    WALLET elsewhere, never through this function) —
     `_organization_for(...)` -> `organization.requisites.get("account")`.
     `None` (never a placeholder string) whenever any step comes up empty: a
     leshoz without bank details, or without even an assigned organization,
@@ -1034,9 +1043,12 @@ async def resolve_recipient_account(
     module-internal helper with two callers across two files of the SAME
     module is exactly what the rest of this file (`invoice_for_application`,
     `allocations_for`, ...) already spells with no underscore; only a
-    helper that stays single-file-private keeps one (`_holds_payments_view`,
-    `_may_act_on_invoices_of` right below, still called from nowhere but
-    this file)."""
+    helper that stays single-file-private keeps one. `holds_payments_view`
+    lost its own underscore the same way in stage 7.9 task 8, once
+    `router.py` needed it too, to decide whether `GET /invoices/{id}`
+    attaches the split at all — `_may_act_on_invoices_of` right below is
+    still called from nowhere but this file, so it is the one that keeps
+    its underscore today."""
     organization = await _organization_for(
         db, contour_id=contour_id, assigned_org_id=assigned_org_id
     )
@@ -1083,8 +1095,20 @@ async def confirm_payment(
     paid, one ledger row PER RECEIVER written, application -> PAID, the
     applicant notified, `payment_confirmed` published — all inside the
     CALLER's transaction: the caller owns the session, and this function
-    neither commits nor performs any check of its own beyond resolving the
-    recipient account. Every check is the caller's.
+    commits nothing of its own. Every PRECONDITION on the caller's side —
+    idempotency, amount, payability, the invoice's own status — is the
+    caller's, never repeated here.
+
+    **One check IS this function's own, and it is not a precondition — it
+    is the split arithmetic itself.** Task 5 added it (see the `ERR-VAL-001`
+    paragraph further down this same docstring): `ledger.split_payment`
+    raises `SplitDoesNotFit` when the frozen rules do not fit `transaction.
+    amount`, and this function turns that into `ERR-VAL-001` before
+    anything is written. That is not a business rule a caller could have
+    checked in advance (it depends on the split, which only this function
+    reads) — it is this function refusing to allocate money it cannot
+    honestly divide, the same posture `issue_invoice` takes for the
+    identical exception.
 
     TWO callers, and they are the whole list:
 

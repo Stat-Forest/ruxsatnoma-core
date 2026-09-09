@@ -46,7 +46,11 @@ from app.modules.notifications import service as notifications_service
 from app.modules.payments import events as payment_events
 from app.modules.payments import refunds, repo, statement_service
 from app.modules.payments import service as payments_service
-from app.modules.payments.backoffice_schemas import AvailableSourceOut, RefundComponentOut
+from app.modules.payments.backoffice_schemas import (
+    AllocationOut,
+    AvailableSourceOut,
+    RefundComponentOut,
+)
 from app.modules.payments.models import (
     ALLOCATION_ENTRY_TYPES,
     INVOICE_STATUSES,
@@ -385,7 +389,8 @@ async def check_manual_confirmation(
        makes a double-confirm impossible at the database level as well as
        at the status level;
     6. `service.confirm_payment` — unchanged, not widened, not copied. It
-       does the whole job: invoice -> paid, the 50/50 ledger, application ->
+       does the whole job: invoice -> paid, one ledger row PER RECEIVER,
+       application ->
        PAID, the applicant told, `payment_confirmed` on the bus;
     7. stamp the confirmation `confirmed`/`rejected` with the checker and
        the moment — all three fields in ONE assignment, since
@@ -1250,3 +1255,28 @@ async def list_allocations(
     return await repo.list_allocations(
         db, invoice_id=None, since=since, until=until, limit=limit, offset=offset
     )
+
+
+async def allocations_out(db: AsyncSession, rows: Sequence[Allocation]) -> list[AllocationOut]:
+    """Builds `AllocationOut` rows for `GET /payments/allocations` (stage 7.9
+    task 8), resolving `recipient_name` per row: the configured receiver's
+    own `name`, cached per id — the same shape `refund_components_out`
+    already uses for its identical lookup — or `None` for the leshoz's own
+    remainder (`recipient_id IS NULL`). Unlike `RefundComponentOut`, which
+    labels that row with `LESHOZ_SNAPSHOT_NAME` for a breakdown FORM that
+    must show every source symmetrically, this ledger already carries
+    `target` to say what a `None` id means, so inventing a label here
+    would only repeat that column in prose."""
+    names: dict[uuid.UUID, dict[str, Any]] = {}
+    out: list[AllocationOut] = []
+    for row in rows:
+        recipient_name: dict[str, Any] | None = None
+        if row.recipient_id is not None:
+            if row.recipient_id not in names:
+                recipient = await repo.get_payment_recipient(db, row.recipient_id)
+                names[row.recipient_id] = recipient.name if recipient is not None else {}
+            recipient_name = names[row.recipient_id]
+        item = AllocationOut.model_validate(row)
+        item.recipient_name = recipient_name
+        out.append(item)
+    return out

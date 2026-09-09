@@ -14,12 +14,20 @@ inside `service.py`, exactly like `notifications.service.mark_read`.
 existed, so an accountant's screen could show one application's invoices but
 never browse the whole book. That path is staff-only and zone-scoped
 (decision #70) — `service.list_invoices_for_actor`'s own docstring carries
-the reasoning; this router stays a thin pass-through for both."""
+the reasoning; this router stays a thin pass-through for both.
+
+Stage 7.9 task 8: `GET /invoices/{id}` additionally attaches `recipients`
+(`_invoice_out` below) for a `payments.view` holder ONLY — the same
+authorization split as everything else in this file, just answering a
+different question (WHAT is shown, not WHETHER the invoice is). `GET
+/invoices` (the list route) never attaches it, the same scope `RefundOut.
+available_sources` draws for itself."""
 
 import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -28,12 +36,30 @@ from app.core.schemas import PAGING_MAX, Page
 from app.modules.auth.deps import get_current_user, idempotency_context
 from app.modules.auth.models import User
 from app.modules.payments import service
-from app.modules.payments.models import INVOICE_STATUSES
-from app.modules.payments.schemas import InvoiceOut, PayIntentIn, PayIntentOut
+from app.modules.payments.models import INVOICE_STATUSES, Invoice
+from app.modules.payments.schemas import InvoiceOut, InvoiceRecipientOut, PayIntentIn, PayIntentOut
 
 router = APIRouter(tags=["payments"])
 
 _INVOICE_STATUS_PATTERN = "^(" + "|".join(INVOICE_STATUSES) + ")$"
+
+
+async def _invoice_out(db: AsyncSession, invoice: Invoice, *, actor: User) -> Any:
+    """Builds `GET /invoices/{id}`'s response, attaching `recipients` ONLY
+    for a `payments.view` holder (Override 4, stage 7.9 task 8 — who
+    receives the money is internal allocation, never part of what a
+    citizen is paying for). Everyone else gets `recipients` OMITTED from
+    the JSON body entirely — `exclude={"recipients"}`, never a blanket
+    `exclude_none` (`InvoiceOut.recipients`'s own docstring says why only
+    this one field is allowed to disappear)."""
+    out = InvoiceOut.model_validate(invoice)
+    if not await service.holds_payments_view(db, actor):
+        return JSONResponse(out.model_dump(mode="json", exclude={"recipients"}))
+    out.recipients = [
+        InvoiceRecipientOut.model_validate(row)
+        for row in await service.invoice_recipients(db, invoice.id)
+    ]
+    return out
 
 
 @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
@@ -42,7 +68,8 @@ async def get_invoice(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(get_current_user)],
 ) -> Any:
-    return await service.get_invoice_for_actor(db, invoice_id, actor=actor)
+    invoice = await service.get_invoice_for_actor(db, invoice_id, actor=actor)
+    return await _invoice_out(db, invoice, actor=actor)
 
 
 @router.get("/invoices", response_model=Page[InvoiceOut])

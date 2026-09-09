@@ -119,13 +119,25 @@ class AllocationOut(BaseModel):
     `service.record_reversal`) and `refund` (a returned refund's negative
     entries, `backoffice_service.approve_refund`) rows alike.
 
-    **`account` is `null` whenever the row is the state budget's own half of
-    the 50/50 split, or names a leshoz with no account on file** (`tz/12`
-    #15, ruling 10 — the budget's account number is stored nowhere in this
-    system): declared here with no default and no `field_serializer` of its
-    own, so a `None` value serializes as JSON `null` — present on every
-    response, never omitted, never `""`. An accountant's UI must render that
-    as "settled outside the system", not as a blank account number."""
+    **`account` is `null` for two different reasons that look identical on
+    the wire.** A row naming a configured receiver (`target="receiver"`) is
+    null STRUCTURALLY: `payment_recipients` identifies a Payme WALLET
+    (`payme_account_id`), never a bank account, so this column carries
+    nothing for any of them, the seeded state-budget row included. A row
+    naming the leshoz's own remainder (`target="recipient"`) is null only
+    when that organization's own `requisites` carries no `"account"` key
+    (`tz/12` #15) — declared here with no default and no `field_serializer`
+    of its own, so a `None` value serializes as JSON `null` — present on
+    every response, never omitted, never `""`. An accountant's UI must
+    render that as "settled outside the system", not as a blank account
+    number.
+
+    `recipient_id`/`recipient_name` (stage 7.9 task 8) name the configured
+    receiver a `target="receiver"` row belongs to — `None` for the leshoz's
+    own remainder (`recipient_id` mirrors the column directly; `target`
+    already says what a `None` id means here, so this schema does not
+    invent a leshoz label the way `RefundComponentOut` does for its own,
+    symmetric breakdown form)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -133,6 +145,8 @@ class AllocationOut(BaseModel):
     invoice_id: uuid.UUID
     transaction_id: uuid.UUID | None
     refund_id: uuid.UUID | None
+    recipient_id: uuid.UUID | None
+    recipient_name: dict[str, Any] | None = None
     entry_type: str
     target: str
     account: str | None

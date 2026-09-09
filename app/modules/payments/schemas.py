@@ -2,7 +2,14 @@
 /invoices?application_id=`) and for starting a payment (`POST
 /invoices/{id}/pay-intents`, task 5). No write schema for the invoice
 itself: issuing and cancelling one are event-driven (`subscribers.py`),
-never a direct client action."""
+never a direct client action.
+
+Stage 7.9 task 8 adds `InvoiceOut.recipients` (`InvoiceRecipientOut` below)
+— the invoice's own frozen split, decision #154. It is gated on
+`payments.view` at the ROUTER (`router.py::get_invoice`), never here: a
+citizen paying their own invoice must see the total, never who receives
+it (Override 4 — internal allocation is not part of what they are paying
+for)."""
 
 import uuid
 from datetime import datetime
@@ -12,6 +19,37 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from app.core.schemas import LocalizedName
+
+
+class InvoiceRecipientOut(BaseModel):
+    """One row of an invoice's split, FROZEN at issuance
+    (`payments.models.InvoiceRecipient`, decision #158) — `InvoiceOut.
+    recipients`, ordered by `position`, the LAST row always the leshoz's
+    own remainder (`kind="remainder"`, `recipient_id=None`).
+
+    Carries the full frozen rule, not just the resulting `amount`: `kind`/
+    `percent`/`fixed_amount` are what a `payments.view` holder needs to see
+    WHY a share is what it is, the same fields `PaymentRecipientOut`
+    exposes for the live directory this snapshot was copied from."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    recipient_id: uuid.UUID | None
+    name: dict[str, Any]
+    payme_account_id: str | None
+    kind: str
+    percent: Decimal | None
+    fixed_amount: Decimal | None
+    amount: Decimal
+
+    # Same fixed-scale-NUMERIC lesson as `InvoiceOut.amount` below.
+    @field_serializer("amount")
+    def _amount(self, value: Decimal) -> str:
+        return str(value)
+
+    @field_serializer("percent", "fixed_amount")
+    def _money(self, value: Decimal | None) -> str | None:
+        return None if value is None else str(value)
 
 
 class InvoiceOut(BaseModel):
@@ -26,6 +64,16 @@ class InvoiceOut(BaseModel):
     issued_at: datetime
     due_at: datetime
     paid_at: datetime | None
+    # Populated by the router ONLY for a `payments.view` holder (Override 4)
+    # and OMITTED from the JSON body — never sent as `null` — for anyone
+    # else (`router.py`'s own `_invoice_out`: `exclude={"recipients"}`, not
+    # a blanket `exclude_none`, since `AllocationOut.account` elsewhere in
+    # this module documents the opposite convention for its OWN `None` — a
+    # null there must stay visible, so this field alone disappears, not
+    # every other one). Absent on `GET /invoices` (the list route) too,
+    # the same scope `RefundOut.available_sources` already draws for
+    # itself: "a real absence, not a hidden default."
+    recipients: list[InvoiceRecipientOut] | None = None
 
     # Same fixed-scale-NUMERIC lesson as `norms.schemas.TariffOut.coefficient`:
     # money is carried on the wire as a string, never a JSON float.
