@@ -34,8 +34,22 @@ async def test_a_signature_over_other_bytes_is_status_minus_10():
 
 
 def test_every_documented_status_code_has_a_reason():
-    # design/04 §2.5: the seven codes must not collapse into one message.
-    assert set(EIMZO_STATUS_REASONS) == {1, -1, -5, -10, -11, -12, -20}
+    # design/04 §2.5's seven login codes, plus the four pkcs7-verify-only
+    # codes stage 5.2 added (`eimzo_wire.py`) — none may collapse into one
+    # message.
+    assert set(EIMZO_STATUS_REASONS) == {
+        1,
+        0,
+        -1,
+        -5,
+        -10,
+        -11,
+        -12,
+        -20,
+        -21,
+        -22,
+        -23,
+    }
 
 
 # The three methods below have no test in the brief's own Step 1 (only

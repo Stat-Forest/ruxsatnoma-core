@@ -47,14 +47,26 @@ class EimzoError(Exception):
 # design/04 §2.5 — the seven E-IMZO status codes. `1` is success; every other
 # code must keep its own machine-readable reason (ruling 9) rather than
 # collapsing into one "signature error".
+#
+# Stage 5.2 adds four more, specific to `/backend/pkcs7/verify/{attached,
+# detached}` (github.com/qo0p/e-imzo-doc): `0` is this codebase's own —
+# `eimzo_wire.verification_from_pkcs7_info` defaults to it when the
+# provider's response carries no `status` field at all — and `-21`/`-22`/
+# `-23` are the provider's own timestamp-specific failures, distinct from
+# the `-10`/`-11`/`-12` signature/certificate codes above even though the
+# wording is almost the same.
 EIMZO_STATUS_REASONS: dict[int, str] = {
     1: "ok",
+    0: "provider_bad_response",
     -1: "certificate_status_unknown",
     -5: "clock_skew",
     -10: "signature_invalid",
     -11: "certificate_invalid",
     -12: "certificate_invalid_at_signing",
     -20: "challenge_expired",
+    -21: "timestamp_signature_invalid",
+    -22: "timestamp_certificate_invalid",
+    -23: "timestamp_certificate_invalid_at_signing",
 }
 
 CertificateStatus = Literal["active", "revoked", "expired"]
