@@ -44,11 +44,23 @@ having run):
    `backoffice_service.submit_refund_decision` before it can ever reach
    `returned`, so this trigger now requires `count(*) > 0` too.
 
-`downgrade()` reverses all five, INCLUDING the backfills — the mapping is
-total in both directions, which is what makes this a genuine rewrite rather
-than a one-way migration nobody could undo. Every raw bind below is
-`CAST(:name AS type)`, never `:name::type` (`TextClause`'s regex
-mis-registers a name written the second way — see `.claude/lessons.md`).
+`downgrade()` reverses all five, INCLUDING the backfills — but the mapping
+is total in only ONE direction (whole-branch review Minor 9: this used to
+claim "both", which the `downgrade()` code below already contradicted
+itself). Forward (`upgrade()`), the fold is exact: `recipient_amount` and
+`other_amount` sum into one `recipient_id IS NULL` component, and that sum
+is all `refund_components` ever needs, because nothing downstream reads
+`other_amount` on its own again. Backward, that sum cannot un-split back
+into the two numbers it came from — `other` never named a party of its own
+even in the OLD schema, so there is no second value to recover, only one
+to invent. The books still balance either way (`recipient_amount` restored
+is the correct TOTAL, and the trigger's own sum check passes), the
+provenance of that total does not (`other_amount` comes back `NULL` on
+every row, never a guess) — accepted because a component naming no party
+was already unrecoverable information, not information this migration
+loses on the way down. Every raw bind below is `CAST(:name AS type)`,
+never `:name::type` (`TextClause`'s regex mis-registers a name written the
+second way — see `.claude/lessons.md`).
 
 Revision ID: 0046
 Revises: 0045
@@ -333,6 +345,33 @@ def downgrade() -> None:
     # anomalous one — consistent with what `recipient_amount` always meant
     # under the old schema: everything that went to the leshoz's own
     # account, not "the single row that happened to be there."
+    # Minor 7 (whole-branch review), same reasoning as BLOCKER 1: the SUM()
+    # below silently ACCOMMODATES two `recipient_id IS NULL` rows on one
+    # refund (Postgres' `NULL <> NULL` means `uq_refund_components_source`
+    # cannot stop it — only `submit_refund_decision`'s own Override 1
+    # check does, and only for writes after this migration's `upgrade()`).
+    # A row pair like that reaching this downgrade is an anomaly, not a
+    # normal case the SUM should absorb quietly — logged BEFORE summing so
+    # it is diagnosable rather than indistinguishable from the single-row
+    # case that is this loop's actual design.
+    duplicate_leshoz_refunds = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                "SELECT count(*) FROM (SELECT 1 FROM refund_components "
+                "WHERE recipient_id IS NULL GROUP BY refund_id HAVING count(*) > 1) dupes"
+            )
+        )
+        .scalar_one()
+    )
+    if duplicate_leshoz_refunds:
+        logger.warning(
+            "0046 downgrade: %d refund(s) carry more than one recipient_id IS NULL "
+            "refund_components row - recipient_amount below is their SUM, not one "
+            "row's own amount",
+            duplicate_leshoz_refunds,
+        )
+
     op.execute(
         sa.text(
             "UPDATE refunds SET "

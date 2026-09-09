@@ -255,6 +255,190 @@ async def test_0046_downgrade_survives_a_returned_refund_with_real_components(en
             )
 
 
+async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine):
+    """Minor 8 (whole-branch review): `0045`'s downgrade has two bugs
+    already found BY HAND — narrowing `allocations.target_valid` before
+    collapsing `'receiver'` rows back to `'budget'`, and dropping
+    `invoice_recipients` while a real FK still pointed at the seeded
+    budget recipient — both fixed at the time (task 4/5 fixes, this
+    module's own docstring), and both untestable by
+    `test_downgrade_upgrade_roundtrip` alone: that test always runs
+    base -> head -> base -> head on an EMPTY database, so neither the
+    CHECK nor the FK it narrows/drops against ever has a row to choke on.
+
+    This test is `test_0046_downgrade_survives_a_returned_refund_with_
+    real_components`'s own mirror, one migration further down: a REAL,
+    COMMITTED `invoice_recipients` row (the split frozen at issuance,
+    naming the seeded budget recipient) and a REAL `target='receiver'`
+    allocation, then a downgrade all the way to `"0044"` — past BOTH
+    `0046` (which first collapses `'receiver'`/`recipient_id` back onto
+    the legacy `'budget'` shape) and `0045` (which drops
+    `invoice_recipients` and the `recipient_id` column outright). Proves
+    the two-migration path a real committed row actually travels, not
+    just each migration's own isolated downgrade."""
+    url = get_settings().database_url_test
+    cfg = _alembic_config(url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    user_id = uuid.uuid4()
+    applicant_id = uuid.uuid4()
+    application_id = uuid.uuid4()
+    invoice_id = uuid.uuid4()
+    pinfl = str(applicant_id.int % 10**14).zfill(14)
+
+    async with engine.begin() as conn:
+        role_id = (await conn.execute(text("SELECT id FROM roles LIMIT 1"))).scalar_one()
+        await conn.execute(
+            text(
+                "INSERT INTO users "
+                "(id, full_name, role_id, status, must_change_password, failed_login_count) "
+                "VALUES (CAST(:id AS uuid), 'Migration test user', "
+                "CAST(:role_id AS uuid), 'active', false, 0)"
+            ),
+            {"id": user_id, "role_id": role_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO applicants (id, kind, pinfl, name, owner_user_id) "
+                "VALUES (CAST(:id AS uuid), 'individual', :pinfl, "
+                "'Migration test applicant', CAST(:user_id AS uuid))"
+            ),
+            {"id": applicant_id, "pinfl": pinfl, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO applications "
+                "(id, applicant_id, submitted_by_user_id, on_behalf, channel, status, kind) "
+                "VALUES (CAST(:id AS uuid), CAST(:applicant_id AS uuid), "
+                "CAST(:user_id AS uuid), 'self', 'portal', 'APPROVED', 'new')"
+            ),
+            {"id": application_id, "applicant_id": applicant_id, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO invoices (id, number, application_id, amount, status) "
+                "VALUES (CAST(:id AS uuid), :number, CAST(:application_id AS uuid), "
+                "600000.00, 'paid')"
+            ),
+            {
+                "id": invoice_id,
+                "number": f"TEST-0045-{invoice_id.hex[:12]}",
+                "application_id": application_id,
+            },
+        )
+        # The split FROZEN at issuance (decision #158): the seeded budget
+        # recipient at position 0, the leshoz's own remainder last — the
+        # exact shape `issue_invoice`/`_snapshot_rows` writes for real.
+        await conn.execute(
+            text(
+                "INSERT INTO invoice_recipients "
+                "(id, invoice_id, recipient_id, name, kind, percent, amount, position) "
+                "VALUES (gen_random_uuid(), CAST(:invoice_id AS uuid), "
+                "CAST(:recipient_id AS uuid), "
+                "CAST(:name AS jsonb), 'percent', 50.00, 300000.00, 0)"
+            ),
+            {
+                "invoice_id": invoice_id,
+                "recipient_id": _BUDGET_RECIPIENT_ID,
+                "name": '{"uz_latn": "Davlat byudjeti"}',
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO invoice_recipients "
+                "(id, invoice_id, recipient_id, name, kind, amount, position) "
+                "VALUES (gen_random_uuid(), CAST(:invoice_id AS uuid), NULL, "
+                "CAST(:name AS jsonb), 'remainder', 300000.00, 1)"
+            ),
+            {"invoice_id": invoice_id, "name": '{"uz_latn": "Leshoz"}'},
+        )
+        # The ledger row the same payment actually wrote (`ledger.
+        # entries_for_shares`): `target='receiver'`, `recipient_id` set —
+        # the exact shape `0046`'s downgrade must fold back onto
+        # `target='budget'`, `recipient_id=NULL` BEFORE `0045`'s own
+        # downgrade drops the column entirely.
+        await conn.execute(
+            text(
+                "INSERT INTO allocations "
+                "(id, invoice_id, recipient_id, entry_type, target, amount) "
+                "VALUES (gen_random_uuid(), CAST(:invoice_id AS uuid), "
+                "CAST(:recipient_id AS uuid), 'payment', 'receiver', 300000.00)"
+            ),
+            {"invoice_id": invoice_id, "recipient_id": _BUDGET_RECIPIENT_ID},
+        )
+
+    try:
+        # THE PROOF: this must not raise. Before the task 4/5 fixes, either
+        # `0046`'s FK-narrowing-before-collapse or `0045`'s drop-before-
+        # collapse ordering would abort here against exactly this shape of
+        # committed row.
+        await asyncio.to_thread(command.downgrade, cfg, "0044")
+
+        async with engine.connect() as conn:
+            # `invoice_recipients` does not survive past `0045` — the table
+            # itself is gone, dropped along with the row this test committed.
+            exists = (
+                await conn.execute(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                        "WHERE table_name = 'invoice_recipients')"
+                    )
+                )
+            ).scalar_one()
+            assert exists is False
+
+            # `allocations.recipient_id` does not survive past `0045` either.
+            has_column = (
+                await conn.execute(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = 'allocations' AND column_name = 'recipient_id')"
+                    )
+                )
+            ).scalar_one()
+            assert has_column is False
+
+            # What comes back: the `'receiver'` row `0046`'s downgrade folded
+            # onto `'budget'` stays `'budget'` through `0045`'s own downgrade
+            # too (that migration's `UPDATE ... WHERE target = 'receiver'` is
+            # a no-op by the time it runs — nothing to do, and nothing to
+            # break).
+            row = (
+                await conn.execute(
+                    text("SELECT target FROM allocations WHERE invoice_id = CAST(:id AS uuid)"),
+                    {"id": invoice_id},
+                )
+            ).one()
+            assert row.target == "budget"
+    finally:
+        # Same reasoning as the 0046 test above: leave the schema at head
+        # regardless of outcome, and clean up every row this test
+        # committed — `allocations` (unaffected by either DROP TABLE, so
+        # still here after the upgrade back), `invoice_recipients`
+        # (recreated EMPTY by the upgrade, nothing of this test's own to
+        # delete there), then the FK chain beneath the invoice.
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM allocations WHERE invoice_id = CAST(:id AS uuid)"),
+                {"id": invoice_id},
+            )
+            await conn.execute(
+                text("DELETE FROM invoices WHERE id = CAST(:id AS uuid)"), {"id": invoice_id}
+            )
+            await conn.execute(
+                text("DELETE FROM applications WHERE id = CAST(:id AS uuid)"),
+                {"id": application_id},
+            )
+            await conn.execute(
+                text("DELETE FROM applicants WHERE id = CAST(:id AS uuid)"),
+                {"id": applicant_id},
+            )
+            await conn.execute(
+                text("DELETE FROM users WHERE id = CAST(:id AS uuid)"), {"id": user_id}
+            )
+
+
 async def test_downgrade_upgrade_roundtrip(engine):
     """upgrade head → downgrade base → upgrade head (plan 03.4 ruling 16).
 
