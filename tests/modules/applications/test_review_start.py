@@ -189,8 +189,8 @@ async def test_the_out_of_zone_refusal_is_territorial_and_leaves_an_ri_12_trail(
 ) -> None:
     """The brief's own zone test accepts 403 or 404 — and a 404 is also what a
     route that does not exist answers, so on its own it cannot say WHICH
-    mechanism refused (lesson: "Two mechanisms refusing one thing: an
-    outcome-only test cannot tell which one fired").
+    mechanism refused (lesson: "A green test proves nothing until you have seen
+    it go red" — assert the RECORDED reason).
 
     The recorded reason can. `tz/10`'s RI-12 — «попытка доступа вне
     территориальных полномочий», High, immediate — is written under the flow

@@ -655,10 +655,11 @@ async def test_reverifying_two_different_signatures_under_the_same_purpose_does_
 async def test_reverify_does_not_satisfy_a_missing_purpose(client_oversight, db: AsyncSession):
     """Confirms, in code and not just by inspection, the brief's own warning:
     a reverify record must never let `is_complete`/`missing_purposes` (Task
-    6's public surface) count a requirement as satisfied (lesson: a
-    public-surface task's own end-to-end test can ship the surface
-    untested -- exercised here IN-PROCESS, the same functions 3.11 will call
-    directly, not only over HTTP)."""
+    6's public surface) count a requirement as satisfied (lesson: "a green test
+    proves nothing until you have seen it go red" — a public-surface task's own
+    end-to-end test can ship the surface untested, so this is exercised
+    IN-PROCESS, the same functions 3.11 will call directly, not only over
+    HTTP)."""
     user = await make_user(db, pinfl=_pinfl())
     obj_id = uuid.uuid4()
     row = await service.sign(

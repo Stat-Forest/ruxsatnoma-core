@@ -3,8 +3,9 @@ branch 1 ships: `service.get`, `service.current_calculation`,
 `service.set_status`. Nothing in this branch calls them over HTTP — the
 callers are 3.10a `payments` and 3.11 `permits`, running in parallel right
 now — so an end-to-end/HTTP scenario would exercise nothing here at all
-(lesson: "a 'public surface' task's own end-to-end test can ship the surface
-untested"). Every function gets its own direct call below."""
+(lesson: "a green test proves nothing until you have seen it go red" — a
+public-surface task's own end-to-end test can ship the surface untested).
+Every function gets its own direct call below."""
 
 import asyncio
 import uuid

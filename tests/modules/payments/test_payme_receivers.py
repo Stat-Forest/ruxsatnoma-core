@@ -315,8 +315,9 @@ async def test_a_repeat_returns_the_same_receivers(client, invoice_with_complete
 async def test_the_missing_id_refusal_names_the_right_reason(
     client, invoice_with_budget_lacking_an_id
 ):
-    """Lesson: "Two mechanisms refusing one thing: an outcome-only test
-    cannot tell which one fired." `_check_invoice_for_payment`'s own
+    """Lesson: "A green test proves nothing until you have seen it go red" —
+    an outcome-only assertion cannot tell which mechanism refused.
+    `_check_invoice_for_payment`'s own
     status check ALSO answers `-31008`, for an unrelated reason (a
     non-pending invoice) — `invoice_with_budget_lacking_an_id` is
     `pending`, so a code-only assertion does not by itself prove the

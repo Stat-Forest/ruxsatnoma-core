@@ -298,7 +298,8 @@ async def test_recording_a_check_outside_the_actor_zone_is_refused(
 
     A bare 404 + `ERR-SYS-003` is not enough to prove THIS mechanism fired:
     `app/main.py`'s own catch-all turns an unregistered route into the exact
-    same envelope (lesson: "Two mechanisms refusing one thing"), so a typo in
+    same envelope (lesson: "A green test proves nothing until you have seen it
+    go red"), so a typo in
     the route path would pass this assertion too. The RI-12 audit trail
     (`test_the_out_of_zone_refusal_is_territorial_and_leaves_an_ri_12_trail`'s
     own shape) only exists if `_assert_in_actor_zone` actually ran."""
