@@ -123,7 +123,23 @@ async def create_pay_intent(
     actor: Annotated[User, Depends(get_current_user)],
     ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
 ) -> Any:
-    """`Idempotency-Key` is MANDATORY (3.4's mechanism, ruling: ours, on our
+    """Refuses with, in the order the guards run: **`ERR-SYS-003`** (404) when
+    the invoice does not exist, its application does not, **or the caller may
+    not act on it** — the three are deliberately indistinguishable, so a
+    stranger cannot probe which invoice ids exist; **`ERR-PAY-004`** (409) when
+    the invoice is not `pending`; **`ERR-PAY-002`** when it is past `due_at`;
+    and **`ERR-PAY-007`** (409) when the split cannot be routed at the provider
+    — some receiver frozen onto this invoice has no `payme_account_id`, so
+    under decision #160 the payment is refused rather than taken onto the
+    Agency's cashbox for somebody to move by hand. `details.missing` names the
+    offending receivers by `position` only; the names are in the server log,
+    not in a body a citizen reads.
+
+    These codes are listed here because a route's docstring is the only thing
+    that carries them into the served OpenAPI — `ERR-PAY-007` was invisible to
+    anyone reading the schema until this sentence existed.
+
+    `Idempotency-Key` is MANDATORY (3.4's mechanism, ruling: ours, on our
     own route — never on `/webhooks/payme`, which has Payme's own). `ctx`
     is declared after `actor` (mirrors `gis/imports_router.py::create_import`)
     so the SAME `get_current_user` call both depend on is resolved once;
