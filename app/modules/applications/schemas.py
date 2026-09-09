@@ -58,6 +58,11 @@ ApplicationKind = Literal["new", "extension"]
 # CHECK-backed-tuple shape as the four above, guarded by the same test.
 ConclusionKind = Literal["executor", "gis"]
 ConclusionRecommendation = Literal["approve", "reject"]
+# Ruling #179: `models.BENEFIT_VERIFICATION_STATUSES`, spelled out for the
+# identical pyright reason the five Literals above are — a starred variable
+# is rejected inside `Literal`, and `test_the_schema_literals_match_the_
+# tuples_the_checks_are_built_from` is the guard that keeps the two in sync.
+BenefitVerificationStatus = Literal["not_required", "pending", "verified", "rejected"]
 
 # `POST /applications/{id}/checks` (task 7, 3.9b) — deliberate SUBSETS of
 # `models.CHECK_TYPES`/`CHECK_RESULTS`/`CHECK_SOURCES`, not their mirror, so
@@ -84,6 +89,11 @@ MAX_HEAD_COUNT = 1_000_000
 # `NumericValueOutOfRange` 500.
 QUANTITY_MAX_DIGITS = 12
 QUANTITY_DECIMAL_PLACES = 4
+# `applications.benefit_certificate_no` is unbounded TEXT (ruling #179 — no
+# `tz/` document prescribes a format, the Agency's certificate registries vary
+# by category), so this is the only ceiling it has, the same reasoning
+# `MAX_HEAD_COUNT` above states for an integer column.
+BENEFIT_CERTIFICATE_NO_MAX_LENGTH = 200
 
 
 def _trim_decimal(value: Decimal | None) -> str | None:
@@ -172,6 +182,15 @@ class ApplicationPatch(BaseModel):
     ) = None
     items: list[ApplicationItemIn] | None = None
     benefit_category_item_id: uuid.UUID | None = None
+    # Ruling #179: the certificate a certificate-requiring benefit category
+    # needs. Free to leave blank while the claim is still being typed —
+    # `applications.service.submit` is where "requires the certificate number
+    # at submission" is enforced (this module's report to the integrator),
+    # the same split `requested_area_ha` draws between PATCH (unconstrained)
+    # and submission (where completeness actually matters).
+    benefit_certificate_no: (
+        Annotated[str, Field(max_length=BENEFIT_CERTIFICATE_NO_MAX_LENGTH)] | None
+    ) = None
 
 
 class ApplicationItemOut(BaseModel):
@@ -317,6 +336,14 @@ class ApplicationOut(BaseModel):
     channel: Channel
     kind: ApplicationKind
     benefit_category_item_id: uuid.UUID | None
+    # Ruling #179 — read-only on this shape (never accepted by
+    # `ApplicationPatch`, which forbids unknown fields): `benefit_certificate_
+    # no` is the one exception, editable through the patch above.
+    benefit_certificate_no: str | None
+    benefit_verification_status: BenefitVerificationStatus
+    benefit_verified_by: uuid.UUID | None
+    benefit_verified_at: datetime | None
+    benefit_rejection_reason: str | None
     rejection_reason_item_id: uuid.UUID | None
     assigned_org_id: uuid.UUID | None
     assigned_user_id: uuid.UUID | None
@@ -837,3 +864,68 @@ class ApplicationDecisionOut(ApplicationOut):
                 "forwarded_to_organization": forwarded_to_organization,
             }
         )
+
+
+# --- Ruling #179: the benefit-verification office's own surface --------------
+#
+# `benefit_verification.py`/`benefit_verification_router.py` — a sibling of
+# `service.py`/`router.py`, the same "second file of the same module, not a
+# second module" shape `decision.py` already uses, because the ONE file this
+# track may not touch is `service.py` itself.
+
+# `application_status_history.reason_text`/`applications.decision_basis` both
+# cap at 2000 (see `REASON_MAX_LENGTH`/`LEGAL_BASIS_MAX_LENGTH` above);
+# `benefit_rejection_reason` is the identical shape — unbounded TEXT column,
+# a mandatory human explanation — so it reuses the same ceiling rather than
+# inventing a third number that means the same thing.
+BENEFIT_REJECTION_REASON_MAX_LENGTH = REASON_MAX_LENGTH
+
+
+class BenefitClaimDetailOut(ApplicationOut):
+    """`GET /applications/benefit-verifications/{id}` — the verifier's own
+    single-item read. `GET /applications/benefit-verifications` (the list)
+    answers `Page[ApplicationOut]` directly and needs no schema of its own:
+    every column this office cares about is already on that shape, including
+    the five ruling #179 added.
+
+    Deliberately NOT `ApplicationCardOut`: that shape is built by `service.
+    get_card`, which gates through `service._readable_application` — a
+    function this role never satisfies (it holds no `applications.view_any`
+    and, being central, no zone match either), so reusing it would 404 the
+    very role it is meant to serve. `documents` is the one thing beyond the
+    application's own columns this office needs on the DETAIL read (`tz/06`
+    §Льготы: the certificate's supporting file, attached through the ordinary
+    document mechanism — see `repo.list_documents`) — left off the list
+    response so paging the queue costs one query, not one plus N.
+    """
+
+    documents: list[ApplicationDocumentOut]
+
+    @classmethod
+    def build(cls, application: Any, documents: list[Any]) -> BenefitClaimDetailOut:
+        """`ApplicationOut.model_fields` read rather than retyped — the same
+        shape `ApplicationCardOut.build`/`ApplicationDecisionOut.build` use,
+        for the identical reason: a column added to `ApplicationOut` must not
+        need a second edit here to reach this response too."""
+        return cls.model_validate(
+            {
+                **{name: getattr(application, name) for name in ApplicationOut.model_fields},
+                "documents": [ApplicationDocumentOut.model_validate(doc) for doc in documents],
+            }
+        )
+
+
+class BenefitClaimRejectIn(BaseModel):
+    """`POST /applications/benefit-verifications/{id}/reject` — the ONE field
+    ruling #179 requires: a reason, MANDATORY (`min_length=1`, the same gap
+    `ApplicationRejectIn.legal_basis` closes for the head's own rejection).
+
+    No `pkcs7` here, unlike `ApplicationRejectIn`/`ApplicationApproveIn`: a
+    benefit-certificate check is an administrative verification against a
+    paper registry, not a decision `tz/04` asks the state to sign — the same
+    reasoning `ApplicationReturnIn` states for itself.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=1, max_length=BENEFIT_REJECTION_REASON_MAX_LENGTH)]

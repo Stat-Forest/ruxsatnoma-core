@@ -45,6 +45,19 @@ APPLICATION_STATUSES = (
 ON_BEHALF_VALUES = ("self", "legal")
 CHANNELS = ("portal", "mygov")
 APPLICATION_KINDS = ("new", "extension")
+# Ruling #179 (decisions.md): a SEPARATE state machine from `status` above,
+# living on the same row on purpose — the benefit claim and the application
+# itself are decided by different people at different moments, and a claim
+# rejection must never be confused with `status="REJECTED"` (the head's own
+# refusal of the whole filing). `not_required` is the default for every
+# application, benefit or none: only a claim whose classifier item carries
+# `props.requires_certificate = true` ever leaves it. `pending` -> `verified`
+# or `rejected` is the only transition this module's router drives
+# (`benefit_verification.py`); nothing here writes `pending` — that belongs to
+# `applications.service.submit`, which this branch does not touch (see this
+# module's own report to the integrator: `applications/service.py` must set it
+# at step 3, beside `_assert_benefit_documents`).
+BENEFIT_VERIFICATION_STATUSES = ("not_required", "pending", "verified", "rejected")
 
 # ruling 21: what gis.checks and norms.checks actually emit. gis's own `restrictions`
 # is dropped (a strictly weaker duplicate of norm_restrictions over the same three
@@ -138,6 +151,22 @@ class Application(Base):
     benefit_category_item_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("classifier_items.id"), index=True
     )
+    # Ruling #179's five columns. `benefit_certificate_no` is applicant input
+    # (added to `ApplicationPatch`, stored exactly like every other draft
+    # field — no format is prescribed, the Agency's registries vary by
+    # category); the remaining four are never client-settable and are written
+    # only by `applications.service.submit` (the `pending`/`not_required`
+    # split, per this file's `BENEFIT_VERIFICATION_STATUSES` docstring) and by
+    # `benefit_verification.py`'s verify/reject (`verified`/`rejected`, plus
+    # who and when — `benefit_rejection_reason` is NULL for every status but
+    # `rejected`, where it is mandatory).
+    benefit_certificate_no: Mapped[str | None]
+    benefit_verification_status: Mapped[str] = mapped_column(default="not_required")
+    benefit_verified_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), index=True
+    )
+    benefit_verified_at: Mapped[datetime | None]
+    benefit_rejection_reason: Mapped[str | None]
     decision_basis: Mapped[str | None]
     submitted_at: Mapped[datetime | None]
     decided_at: Mapped[datetime | None]
@@ -149,6 +178,22 @@ class Application(Base):
         CheckConstraint(f"on_behalf IN {ON_BEHALF_VALUES}", name="on_behalf_valid"),
         CheckConstraint(f"channel IN {CHANNELS}", name="channel_valid"),
         CheckConstraint(f"kind IN {APPLICATION_KINDS}", name="kind_valid"),
+        CheckConstraint(
+            f"benefit_verification_status IN {BENEFIT_VERIFICATION_STATUSES}",
+            name="benefit_verification_status_valid",
+        ),
+        # `repo.list_certificate_claims`'s own query, materialised: every row
+        # the benefit-verification office may ever read (ruling #179), and a
+        # small fraction of the table otherwise. A manually named partial
+        # index, declared here (not just in the migration) so the
+        # autogenerate-diff guard stays empty — `ApplicationAssignment.
+        # __table_args__`'s `uq_application_assignments_active` below is the
+        # identical shape, one class over.
+        Index(
+            "ix_applications_benefit_verification_pending",
+            "benefit_verification_status",
+            postgresql_where=text("benefit_verification_status <> 'not_required'"),
+        ),
     )
 
 
