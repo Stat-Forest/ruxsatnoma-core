@@ -64,6 +64,11 @@ UNGRANTED_BY_DESIGN = frozenset(
         "public.appeals.manage",
         "help.faq.manage",
         "help.tickets.manage",
+        # Stage 5.2 task 7: `GET /eimzo/health` proxies the E-IMZO provider's
+        # own `/ping`/`/info` for an administrator, with no shell access to
+        # the server -- deliberately `sys_admin` only, never a role grant
+        # (`integrations.permissions`'s own docstring).
+        "integrations.eimzo.health",
     }
 )
 

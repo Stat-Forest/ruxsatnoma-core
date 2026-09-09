@@ -46,6 +46,7 @@ from app.modules.gis.router import router as gis_router
 from app.modules.help.admin_router import router as help_admin_router
 from app.modules.help.router import router as help_router
 from app.modules.inspections.router import router as inspections_router
+from app.modules.integrations.router import router as integrations_router
 from app.modules.norms.calc_router import router as norms_calc_router
 from app.modules.norms.public_router import router as norms_public_router
 from app.modules.norms.refs_router import router as norms_refs_router
@@ -300,6 +301,9 @@ def create_app() -> FastAPI:
     # `/public/*` routers, because the rows and the service are this module's.
     app.include_router(announcements_landing_router, prefix="/api/v1")
     app.include_router(integrations_admin_router, prefix="/api/v1")
+    # Task 7 (plan 05.2): the two proxy routes a browser genuinely needs from
+    # the E-IMZO server, which itself never leaves the stack's private network.
+    app.include_router(integrations_router, prefix="/api/v1")
     app.include_router(notification_templates_router, prefix="/api/v1")
     app.include_router(notifications_router, prefix="/api/v1")
     app.include_router(notifications_webhooks_router, prefix="/api/v1")
