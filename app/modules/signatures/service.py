@@ -445,12 +445,35 @@ async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> No
         )
 
 
-async def _reconcile_status(db: AsyncSession, cert: Certificate, live_status: str) -> None:
+async def _reconcile_status(
+    db: AsyncSession, cert: Certificate, live_status: str, *, revocation_checkable: bool
+) -> None:
     """The adapter's CRL/OCSP-equivalent answer is the truth about a
     certificate's PKI state; the `status` we stored at bind time (or last
     reconciled) can go stale the moment the CA revokes a certificate someone
     already holds. Reconciled on every sign attempt, not on a schedule — the
-    moment that matters is the one about to decide a verdict."""
+    moment that matters is the one about to decide a verdict.
+
+    **Task 6's own review finding, decided here: a certificate already marked
+    `"revoked"` is never moved off it by an adapter that cannot check
+    revocation authoritatively.** `revocation_checkable=False` is exactly
+    `RealEimzo` (`EimzoAdapter.revocation_checkable`'s own docstring):
+    `certificate_status` there answers from `valid_to` alone and can only
+    ever return `"active"`/`"expired"` — it never returns `"revoked"` and
+    never CONFIRMS a certificate is not revoked either, because e-imzo-server
+    has no endpoint that answers that question for a bare serial number.
+    Accepting such an answer unconditionally would silently flip a genuinely
+    revoked certificate back to `"active"` on the very next `sign()`/
+    `reverify()` while its `revoked_at` stayed set — a row contradicting
+    itself, and the exact UPGRADE this module's whole discipline forbids
+    (`reverify()`'s own docstring: confirm or downgrade, never upgrade). An
+    adapter that CAN check revocation authoritatively (`revocation_checkable
+    =True` — `MockEimzo`, whose serial-prefix convention answers the
+    question directly) is trusted for every transition, `"revoked"`
+    included: its answer already accounts for revocation and is not merely a
+    date comparison, so there is nothing to guard against."""
+    if cert.status == "revoked" and not revocation_checkable:
+        return
     if live_status == cert.status:
         return
     cert.status = live_status
@@ -667,7 +690,9 @@ async def sign(
     live_status = await adapter.certificate_status(
         serial=info.serial_number, issuer=info.issuer, valid_to=info.valid_to
     )
-    await _reconcile_status(db, cert, live_status)
+    await _reconcile_status(
+        db, cert, live_status, revocation_checkable=adapter.revocation_checkable
+    )
 
     verdict = build_verdict(result, cert_status=cert.status, now=datetime.now(UTC))
     unowned_reason = await _ownership_reason(db, info=info, user=user)
@@ -1037,13 +1062,37 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     lands on, so a downgrade caused by certificate standing is flagged the
     same way a `sign()`-time one is — no separate marking logic needed.
 
-    The record itself says plainly what it re-checked
-    (`"rechecked": "certificate_status"`) rather than copying the ORIGINAL
-    verification blob wholesale, which would leave its `status_code` (a
-    crypto-check result) sitting next to a reverify verdict, reading as
+    The record itself says plainly what it re-checked rather than copying the
+    ORIGINAL verification blob wholesale, which would leave its `status_code`
+    (a crypto-check result) sitting next to a reverify verdict, reading as
     though a cryptographic check had just been re-run. The original's own
     status/reason travel along for provenance under `original_*` keys,
     never bare ones a reader could mistake for this check's own.
+
+    **Task 6 (plan 05.2 R3, option «а», Oybek 2026-09-09): `rechecked` NAMES
+    the check this call actually made, and it comes from the adapter, not
+    from a mode flag.** `e-imzo-server` has no endpoint that answers "is this
+    certificate revoked" for a bare serial number — revocation is checked
+    only INSIDE signature verification, over the VPN, so in production a
+    revocation is discovered at the NEXT signature and never before a
+    reverify. Reporting `"certificate_status"` unconditionally, as this used
+    to, implied a revocation check that real mode never performs.
+    `EimzoAdapter.revocation_checkable` (Task 3) is exactly this fact,
+    readable without asking which adapter class is behind it — `signatures`
+    is a level-2 module and must not know that — so `rechecked` reads
+    `"certificate_status"` when it is `True` (`MockEimzo`, whose serial-prefix
+    convention answers a revocation question directly) and
+    `"certificate_validity_only"` when it is `False` (`RealEimzo`, whose
+    `certificate_status` answers from `valid_to` alone); `revocation_checked`
+    carries the same boolean explicitly, so a reader does not have to parse
+    the string to know whether revocation was actually examined. This is also
+    why the decision below reads `cert.status` — the value `_reconcile_status`
+    just wrote, AFTER its own guard against un-revoking a certificate on a
+    date-only answer — rather than the adapter's raw `live_status`: reading
+    the raw value here would let a real-mode reverify report a revoked
+    certificate's signature "valid" again the moment `_reconcile_status`
+    refused to update the certificate row, silently reopening the exact gap
+    that guard exists to close.
 
     Fix round 1 (Important) — the ordinal suffix: `purpose` is written as
     `f"{original.purpose}:reverify:{n}"`, `n` the next ordinal among
@@ -1083,26 +1132,31 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     live_status = await adapter.certificate_status(
         serial=cert.serial_number, issuer=cert.issuer, valid_to=cert.valid_to
     )
-    await _reconcile_status(db, cert, live_status)
+    await _reconcile_status(
+        db, cert, live_status, revocation_checkable=adapter.revocation_checkable
+    )
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
 
     now = datetime.now(UTC)
     if original.verification_status == "invalid":
         new_status = "invalid"
         reason = original.verification.get("reason")
-    elif live_status == "revoked":
+    elif cert.status == "revoked":
         new_status, reason = "invalid", "certificate_revoked"
-    elif live_status == "expired":
+    elif cert.status == "expired":
         new_status, reason = "invalid", "certificate_expired"
     else:
         new_status, reason = "valid", None
 
     record: dict[str, Any] = {
-        "rechecked": "certificate_status",
+        "rechecked": (
+            "certificate_status" if adapter.revocation_checkable else "certificate_validity_only"
+        ),
+        "revocation_checked": adapter.revocation_checkable,
         "original_signature_id": str(original.id),
         "original_verification_status": original.verification_status,
         "original_reason": original.verification.get("reason"),
-        "certificate_status": live_status,
+        "certificate_status": cert.status,
         "certificate_serial_number": cert.serial_number,
         "certificate_issuer": cert.issuer,
         "reverified_at": now.isoformat(),

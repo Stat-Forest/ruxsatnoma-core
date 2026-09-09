@@ -1,4 +1,9 @@
+import secrets
+import uuid
 from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.signatures.verify import build_verdict
 
@@ -113,3 +118,152 @@ def test_a_certificate_that_expires_after_signing_does_not_invalidate_the_signat
     verdict = build_verdict(result, cert_status="active", now=NOW + timedelta(days=400))
     assert verdict.status == "valid"
     assert verdict.reason is None
+
+
+# ---------------------------------------------------------------------------
+# Task 6: `reverify()` names the check it actually made — the async,
+# service-level counterpart of the pure `build_verdict` tests above. A
+# `RealEimzo`-shaped stub with `revocation_checkable = False` stands in for
+# the live adapter, the same way `test_provider_outage.py`'s `_OutageAdapter`
+# and `test_ri05.py`'s `_FakeAdapter` stand in for it elsewhere in this
+# module — no network, no e-imzo-server.
+# ---------------------------------------------------------------------------
+
+
+def _pinfl() -> str:
+    """A fresh, valid-shape (`^[0-9]{14}$`) pinfl per call — `users.pinfl` is
+    UNIQUE and this test database is shared and persistent (mirrors
+    `test_sign.py`'s own helper)."""
+    return f"{secrets.randbelow(10**14):014d}"
+
+
+class _DateOnlyAdapter:
+    """Stands in for `RealEimzo.certificate_status`: no revocation check is
+    possible, only the validity window against `valid_to` — Task 6's own
+    scenario (plan 05.2 R3)."""
+
+    revocation_checkable = False
+
+    async def certificate_status(self, *, serial: str, issuer: str, valid_to: datetime) -> str:
+        return "expired" if valid_to < datetime.now(UTC) else "active"
+
+
+@pytest.mark.asyncio
+async def test_reverify_in_real_mode_names_what_it_could_check(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.integrations.adapters.eimzo import encode_mock_signature
+    from app.modules.signatures import service
+    from tests.modules.auth.test_sessions import make_user
+
+    document = b"the-permit-bytes"
+    user = await make_user(db, pinfl=_pinfl())
+    assert user.pinfl is not None  # narrows User.pinfl's nullable column type
+    pkcs7 = encode_mock_signature(
+        document=document, serial=f"SER-{uuid.uuid4().hex[:10]}", issuer="ISS-1", pinfl=user.pinfl
+    )
+    signature = await service.sign(
+        db,
+        object_type="permit",
+        object_id=uuid.uuid4(),
+        purpose="permit_head",
+        document=document,
+        pkcs7=pkcs7,
+        user=user,
+    )
+    await db.commit()
+
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _DateOnlyAdapter())
+    record = (await service.reverify(db, signature_id=signature.id, user=user)).verification
+
+    assert record["rechecked"] == "certificate_validity_only"
+    assert record["revocation_checked"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 6's own review finding: `_reconcile_status` must never let a
+# date-only answer (`revocation_checkable=False`) un-revoke a certificate
+# already marked `"revoked"` — confirm-or-downgrade, never upgrade
+# (`reverify()`'s own docstring). Decided here: a certificate already
+# revoked stays revoked against such an adapter's answer, in both the
+# `certificates` row itself and in what a `reverify()` call REPORTS about a
+# signature bound to it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_status_never_lets_a_date_only_answer_un_revoke_a_certificate(
+    db: AsyncSession,
+) -> None:
+    from app.db import uuid7
+    from app.modules.signatures import service
+    from app.modules.signatures.models import Certificate
+
+    now = datetime.now(UTC)
+    cert = Certificate(
+        id=uuid7(),
+        user_id=None,
+        serial_number=f"SER-{uuid.uuid4().hex[:12]}",
+        issuer=f"ISS-{uuid.uuid4().hex[:8]}",
+        subject="CN=Test Signer",
+        pinfl_or_stir="12345678901",
+        valid_from=now - timedelta(days=30),
+        valid_to=now + timedelta(days=300),  # not yet expired by date
+        status="revoked",
+        revoked_at=now - timedelta(days=1),
+    )
+    db.add(cert)
+    await db.flush()
+
+    # A date-only adapter's "active" answer (RealEimzo's own shape: the cert
+    # has not yet reached valid_to) must not overwrite a KNOWN revocation.
+    await service._reconcile_status(db, cert, "active", revocation_checkable=False)
+
+    assert cert.status == "revoked"
+    assert cert.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_reverify_never_reports_a_revoked_certificates_signature_valid_in_real_mode(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The integration this module's whole discipline depends on: even once
+    `_reconcile_status` refuses to un-revoke the CERTIFICATE row, `reverify()`
+    itself must read that guarded value back — not the adapter's raw,
+    unreconciled answer — or the SIGNATURE record it writes would still
+    claim "valid" for a certificate everyone else can see is revoked."""
+    from app.modules.integrations.adapters.eimzo import encode_mock_signature
+    from app.modules.signatures import service
+    from tests.modules.auth.test_sessions import make_user
+
+    document = b"the-permit-bytes"
+    user = await make_user(db, pinfl=_pinfl())
+    assert user.pinfl is not None  # narrows User.pinfl's nullable column type
+    pkcs7 = encode_mock_signature(
+        document=document, serial=f"SER-{uuid.uuid4().hex[:10]}", issuer="ISS-1", pinfl=user.pinfl
+    )
+    signature = await service.sign(
+        db,
+        object_type="permit",
+        object_id=uuid.uuid4(),
+        purpose="permit_head",
+        document=document,
+        pkcs7=pkcs7,
+        user=user,
+    )
+    await db.commit()
+
+    cert = await service.get_certificate(db, signature.certificate_id)
+    cert.status = "revoked"
+    cert.revoked_at = datetime.now(UTC)
+    await db.commit()
+
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _DateOnlyAdapter())
+    new_row = await service.reverify(db, signature_id=signature.id, user=user)
+
+    assert new_row.verification_status == "invalid"
+    assert new_row.verification["reason"] == "certificate_revoked"
+    assert new_row.verification["certificate_status"] == "revoked"
+    await db.refresh(cert)
+    assert cert.status == "revoked"
+    assert cert.revoked_at is not None
