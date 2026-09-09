@@ -22,23 +22,27 @@ unpacked e-imzo-server v2.1.1 jar's `uz/eimzo/server/json/` package
 
 from typing import Any
 
-# Verbatim vendor sample for POST /backend/auth, published 2026-05-25 with
-# e-imzo-server v2.1.1. The inner `subjectCertificateInfo` object is exactly
-# as published; the outer envelope (a sibling `status`/`message`) is the
-# shape documented for this endpoint in the README and confirmed by
-# `AuthJsonResponse` (extends `JsonResponse`, which carries `status`/
-# `message`, plus its own `subjectCertificateInfo` field).
-#
-# Note this sample's own `subjectName` uses `"UID"`/`"CN"` keys rather than
-# the OID-keyed form (`"1.2.860.3.16.1.2"`) the README's older example and
-# `read_subject`'s OID constants use — both forms are real, and this sample
-# is kept exactly as the vendor published it rather than "corrected" to
-# match the OID form.
+# Sample for POST /backend/auth, e-imzo-server v2.1.1. The outer envelope (a
+# sibling `status`/`message`) and the DATE FORMAT and `publicKeyParameter`
+# fields are the vendor's own channel post, published 2026-05-25 — those are
+# kept exactly as published. `subjectName`, per controller ruling T2-1, is
+# NOT kept as posted: the channel post abbreviated it down to
+# `{"UID": "1234", "CN": "XXX"}`, which is not the shape the real endpoint
+# returns. The real shape — confirmed by both the official README's own
+# `/backend/auth` example and `SubjectCertificateInfoJson`/`AuthJsonResponse`
+# in the unpacked jar — is OID-keyed: a personal PINFL under
+# `1.2.860.3.16.1.2` alongside `CN`. `X500Name` is updated to match (it is
+# the same identity, expressed as a DN string). The PINFL below
+# (`"12345678901234"`) is an obviously-fake but well-formed 14-digit number,
+# not a real citizen's.
 VENDOR_AUTH_SAMPLE: dict[str, Any] = {
     "subjectCertificateInfo": {
         "serialNumber": "218712ed3",
-        "X500Name": "CN=XXX,UID=1234",
-        "subjectName": {"UID": "1234", "CN": "XXX"},
+        "X500Name": "CN=TESTOV TEST TESTOVICH",
+        "subjectName": {
+            "1.2.860.3.16.1.2": "12345678901234",
+            "CN": "TESTOV TEST TESTOVICH",
+        },
         "validFrom": "2026-05-25 15:47:22",
         "validTo": "2026-06-24 15:47:22",
         "publicKeyParameter": {
@@ -69,10 +73,10 @@ _SIGNER: dict[str, Any] = {
     "certificate": [
         {
             # OID-keyed, per the README's `/backend/pkcs7/verify/attached`
-            # example (`CertificateJson.subjectInfo`) — a different key than
-            # `VENDOR_AUTH_SAMPLE`'s own `subjectName`, and deliberately so:
-            # `read_subject` takes either shape, this fixture exercises the
-            # OID form.
+            # example (`CertificateJson.subjectInfo`) — the same OID-keyed
+            # style as `VENDOR_AUTH_SAMPLE`'s own `subjectName`, just under a
+            # different field name (`subjectInfo` vs `subjectName`);
+            # `read_subject` takes either.
             "subjectInfo": {
                 "1.2.860.3.16.1.2": "31234567890123",
                 "CN": "ALIYEV ALI ALIYEVICH",

@@ -49,12 +49,16 @@ class EimzoError(Exception):
 # collapsing into one "signature error".
 #
 # Stage 5.2 adds four more, specific to `/backend/pkcs7/verify/{attached,
-# detached}` (github.com/qo0p/e-imzo-doc): `0` is this codebase's own —
-# `eimzo_wire.verification_from_pkcs7_info` defaults to it when the
-# provider's response carries no `status` field at all — and `-21`/`-22`/
-# `-23` are the provider's own timestamp-specific failures, distinct from
-# the `-10`/`-11`/`-12` signature/certificate codes above even though the
-# wording is almost the same.
+# detached}` (github.com/qo0p/e-imzo-doc): `0` is the VENDOR's own reserved
+# code, not this codebase's — the README documents it for `/frontend/mobile`
+# as "bad response, should never happen"; it is not spelled out again for
+# the pkcs7-verify endpoints, but it is the same reserved value, and
+# `eimzo_wire.verification_from_pkcs7_info` falls back to it only when the
+# provider's response carries no `status` field at all (exactly the
+# "should never happen" shape). `-21`/`-22`/`-23` are the provider's own
+# timestamp-specific failures, distinct from the `-10`/`-11`/`-12`
+# signature/certificate codes above even though the wording is almost the
+# same.
 EIMZO_STATUS_REASONS: dict[int, str] = {
     1: "ok",
     0: "provider_bad_response",
@@ -87,6 +91,9 @@ class EimzoVerification:
     status_code: int
     subject_certificate: EimzoCertificateInfo | None
     signed_at: datetime | None
+    # Real mode: the trusted timestamp's own ISO time string, not a
+    # cryptographic token — the wire has no separate token field to carry
+    # (see `eimzo_wire.verification_from_pkcs7_info`).
     timestamp_token: str | None
     raw: dict[str, Any]
 

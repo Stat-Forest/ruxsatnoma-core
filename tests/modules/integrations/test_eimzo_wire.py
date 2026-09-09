@@ -101,8 +101,16 @@ def test_certificate_from_subject_info_reads_the_vendor_auth_sample() -> None:
     # `certificate_from_subject_info` has no test of its own in the brief;
     # added because Task 3 depends on it and it is cheap to pin now against
     # the vendor's own sample rather than leaving it unexercised until then.
+    #
+    # `pinfl_or_stir` is asserted here on purpose: `VENDOR_AUTH_SAMPLE`'s
+    # `subjectName` must be OID-keyed (controller ruling T2-1) for this
+    # fixture to exercise the actual extraction Task 3's ERI-login path
+    # depends on — an abbreviated `{"UID": ..., "CN": ...}` shape would
+    # parse without error and silently yield an empty identifier, which is
+    # exactly the gap that stayed invisible before this assertion existed.
     cert = certificate_from_subject_info(VENDOR_AUTH_SAMPLE["subjectCertificateInfo"])
     assert cert.serial_number == "218712ed3"
-    assert cert.issuer == "CN=XXX,UID=1234"  # X500Name, the only issuer-shaped field here
+    assert cert.issuer == "CN=TESTOV TEST TESTOVICH"  # X500Name, the only issuer-shaped field here
+    assert cert.pinfl_or_stir == "12345678901234"
     assert cert.valid_from == datetime(2026, 5, 25, 15, 47, 22, tzinfo=UTC)
     assert cert.valid_to == datetime(2026, 6, 24, 15, 47, 22, tzinfo=UTC)
