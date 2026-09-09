@@ -36,6 +36,30 @@ services:
       timeout: 5s
       retries: 10
 
+  # e-imzo-server v2.1.1 (plan 05.2, task 8; deploy/eimzo/README.md). NOT on the
+  # `edge` network: nothing outside the stack may reach it (R2) -- no port is
+  # published here either, unlike `db`/`minio` in docker-compose.yml, since even
+  # localhost-on-the-server access is more than R2 asks for. Check it from inside
+  # the stack instead: `docker compose exec api curl http://eimzo:8080/ping`.
+  eimzo:
+    image: ruxsatnoma-eimzo:2.1.1
+    build:
+      context: ./deploy/eimzo
+    restart: unless-stopped
+    networks: [default]
+    environment:
+      EIMZO_VPN_HOST: ${EIMZO_VPN_HOST:-}
+      EIMZO_VPN_PORT: ${EIMZO_VPN_PORT:-}
+      EIMZO_VPN_KEY_PASSWORD: ${EIMZO_VPN_KEY_PASSWORD:-}
+    volumes:
+      - ./deploy/eimzo/keys:/opt/e-imzo-server/keys:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
   api:
     build:
       context: .
@@ -75,8 +99,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      eimzo:
+        condition: service_healthy
     networks:
-      # `default` is this stack's private network: db and minio are reachable only here.
+      # `default` is this stack's private network: db, minio and eimzo are reachable only here.
       default:
       edge:
         aliases: [api]

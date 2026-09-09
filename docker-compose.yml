@@ -28,3 +28,28 @@ services:
       MINIO_ROOT_PASSWORD: ruxsatnoma-secret
     ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes: ["./minio-data:/data"]
+
+  # e-imzo-server v2.1.1 (plan 05.2, task 8; deploy/eimzo/README.md). Must never be
+  # reachable from the internet (R2) -- in the deploy stack this stays off the `edge`
+  # network entirely; here there is no `edge` network to join in the first place, so
+  # `127.0.0.1`-only publishing (the same binding `db`/`minio` above use) is what keeps
+  # it local-machine-only for `curl localhost:8080/ping` while developing.
+  eimzo:
+    image: ruxsatnoma-eimzo:2.1.1
+    build:
+      context: ./deploy/eimzo
+    restart: unless-stopped
+    networks: [default]
+    environment:
+      EIMZO_VPN_HOST: ${EIMZO_VPN_HOST:-}
+      EIMZO_VPN_PORT: ${EIMZO_VPN_PORT:-}
+      EIMZO_VPN_KEY_PASSWORD: ${EIMZO_VPN_KEY_PASSWORD:-}
+    volumes:
+      - ./deploy/eimzo/keys:/opt/e-imzo-server/keys:ro
+    ports: ["127.0.0.1:8080:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
