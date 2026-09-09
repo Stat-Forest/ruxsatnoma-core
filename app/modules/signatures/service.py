@@ -35,6 +35,7 @@ from app.modules.auth.models import User
 from app.modules.integrations.adapters.eimzo import (
     EIMZO_STATUS_REASONS,
     EimzoCertificateInfo,
+    EimzoError,
     get_eimzo_adapter,
 )
 from app.modules.signatures import repo
@@ -574,7 +575,22 @@ async def sign(
 
     doc_hash = hashlib.sha256(document).hexdigest()
     adapter = get_eimzo_adapter()
-    result = await adapter.verify_detached(document=document, pkcs7=pkcs7, ip=ip)
+    try:
+        result = await adapter.verify_detached(document=document, pkcs7=pkcs7, ip=ip)
+    except EimzoError as exc:
+        # Fix round 1, finding 1: a transport failure or a non-200 from the
+        # provider (`ERR-INT-001`/`ERR-INT-002`) is not a VERDICT about this
+        # signature -- nothing was ever evaluated, so it must not become an
+        # "invalid" row (`verification_status`) the way a genuine refusal
+        # does below. It is also not the SIGNER's fault, so unlike every
+        # other refusal in this function it earns no `audit_log` entry and
+        # no early commit -- this mirrors `auth.service.login_via_eimzo`'s
+        # own handling of the identical exception one call up (no
+        # audit/state write for a bare provider outage) rather than
+        # inventing a new audit shape for an event that says nothing about
+        # the signer. Nothing of ours has been written yet at this point in
+        # `sign()`, so there is nothing to roll back either.
+        raise err(exc.err_code) from exc
     info = result.subject_certificate
 
     if info is None:
@@ -811,7 +827,15 @@ async def register_certificate(
     own docstring names this route explicitly as the reason its permissive
     branch cannot be the only check)."""
     adapter = get_eimzo_adapter()
-    result = await adapter.verify_attached(pkcs7, ip=ip)
+    try:
+        result = await adapter.verify_attached(pkcs7, ip=ip)
+    except EimzoError as exc:
+        # Fix round 1, finding 1 -- same reasoning as `sign()`'s own
+        # try/except a few hundred lines up: a provider outage is not a
+        # verdict about this presentation and not the caller's fault, so it
+        # earns no `audit_log` entry and no `certificates` row, only the
+        # mapped integration error.
+        raise err(exc.err_code) from exc
     info = result.subject_certificate
     if info is None or result.status_code != 1:
         reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")

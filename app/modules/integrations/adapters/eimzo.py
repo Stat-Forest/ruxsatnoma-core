@@ -57,9 +57,29 @@ class EimzoIdentity:
 
 
 class EimzoError(Exception):
-    def __init__(self, err_code: str = "ERR-AUTH-004") -> None:
+    """Provider unreachable, refused, or answered with a non-1 status.
+
+    `err_code` picks the response a caller maps this to (`ERR-INT-001`/
+    `ERR-INT-002`/`ERR-AUTH-004`/...). `provider_status`/`reason` (fix round
+    1, finding 4) carry the PROVIDER's own numeric status — the
+    `EIMZO_STATUS_REASONS` domain, e.g. `-10`/`-20` — and its mapped
+    machine-readable reason, so a route catching this can answer with more
+    than a bare 502/503 (stage 3.8 ruling 9; Task 7 needs this to explain a
+    timestamp refusal to the browser). Deliberately carries nothing else: no
+    PKCS#7, no PINFL, no other personal data belongs on an exception a route
+    might echo straight into a response body."""
+
+    def __init__(
+        self,
+        err_code: str = "ERR-AUTH-004",
+        *,
+        provider_status: int | None = None,
+        reason: str | None = None,
+    ) -> None:
         super().__init__(err_code)
         self.err_code = err_code
+        self.provider_status = provider_status
+        self.reason = reason
 
 
 # design/04 §2.5 — the seven E-IMZO status codes. `1` is success; every other
@@ -317,6 +337,14 @@ def _ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+def _body_status(body: dict[str, Any] | None) -> int | None:
+    """The vendor's own `status` field, kept only when it is actually an
+    `int` (`EIMZO_STATUS_REASONS`'s domain) — a malformed or absent field
+    must not crash the refusal it is trying to explain (finding 4)."""
+    status = body.get("status") if body else None
+    return status if isinstance(status, int) else None
+
+
 class RealEimzo:
     """Live `e-imzo-server` v2.1.1 client (design/04 §2, plan 05.2), reached
     over the stack's private network — `Settings._forbid_default_secret_in_prod`
@@ -399,13 +427,25 @@ class RealEimzo:
                 path,
                 response.status_code,
                 _ms(started),
-                provider_status=body.get("status") if body else None,
+                provider_status=_body_status(body),
                 provider_message=str(body["message"]) if body and body.get("message") else None,
             )
         )
         if response.status_code != 200:
             logger.warning("eimzo.provider_unavailable", endpoint=path, status=response.status_code)
-            raise EimzoError("ERR-INT-002")
+            # `_body_status`/`EIMZO_STATUS_REASONS` (finding 4): a non-200 can
+            # still carry the vendor's own JSON body (the comment above is
+            # why it was already parsed) — its `status` and mapped reason
+            # survive onto the exception, not only into the `EimzoCall` log
+            # entry `self.calls` already got a few lines up.
+            provider_status = _body_status(body)
+            raise EimzoError(
+                "ERR-INT-002",
+                provider_status=provider_status,
+                reason=EIMZO_STATUS_REASONS.get(provider_status)
+                if provider_status is not None
+                else None,
+            )
         if body is None:
             raise EimzoError("ERR-INT-002")
         return body
@@ -426,9 +466,14 @@ class RealEimzo:
         wire correctly."""
         payload = await self._post("/frontend/challenge", "", ip=None)
         challenge = payload.get("challenge")
-        if payload.get("status") != 1 or not isinstance(challenge, str):
+        status = _body_status(payload)
+        if status != 1 or not isinstance(challenge, str):
             logger.warning("eimzo.challenge_refused", status=payload.get("status"))
-            raise EimzoError("ERR-INT-002")
+            raise EimzoError(
+                "ERR-INT-002",
+                provider_status=status,
+                reason=EIMZO_STATUS_REASONS.get(status) if status is not None else None,
+            )
         return challenge
 
     async def verify_signed_challenge(self, signed_challenge: str, ip: str | None) -> EimzoIdentity:
@@ -529,9 +574,14 @@ class RealEimzo:
         or did not — so it raises the same as any other bad response."""
         payload = await self._post("/frontend/timestamp/pkcs7", pkcs7, ip=ip)
         stamped = payload.get("pkcs7b64")
-        if payload.get("status") != 1 or not isinstance(stamped, str):
+        status = _body_status(payload)
+        if status != 1 or not isinstance(stamped, str):
             logger.warning("eimzo.timestamp_refused", status=payload.get("status"))
-            raise EimzoError("ERR-INT-002")
+            raise EimzoError(
+                "ERR-INT-002",
+                provider_status=status,
+                reason=EIMZO_STATUS_REASONS.get(status) if status is not None else None,
+            )
         return stamped
 
     async def certificate_status(

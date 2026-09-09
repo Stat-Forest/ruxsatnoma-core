@@ -236,7 +236,11 @@ def _isolate_subscriptions():
 
 @asynccontextmanager
 async def make_client(
-    app, *, lifespan: bool = False, raise_app_exceptions: bool = False
+    app,
+    *,
+    lifespan: bool = False,
+    raise_app_exceptions: bool = False,
+    client_address: tuple[str, int] | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """Общий тестовый HTTP-клиент поверх ASGI-приложения.
 
@@ -245,8 +249,21 @@ async def make_client(
     raise_app_exceptions=False (по умолчанию) — ASGITransport не ре-рейзит
     необработанные исключения хендлеров наружу, а отдаёт итоговый HTTP-ответ
     (нужно, чтобы проверять реальный 500-ответ, а не traceback в тесте).
+
+    `client_address` — the ASGI scope's own `(host, port)` client address,
+    passed straight to `httpx.ASGITransport` (whose own default is
+    `('127.0.0.1', 123)`, kept here when omitted). Stage 5.2 fix round 1's
+    IP-threading test (finding 2) is the first caller that needs a
+    DISTINGUISHABLE address: `request.client.host` reads directly from this
+    tuple, so it is the one way an ASGI-transport test can prove a real
+    signer address reaches an adapter rather than some coincidental or
+    hardcoded fallback.
     """
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
+    transport = httpx.ASGITransport(
+        app=app,
+        raise_app_exceptions=raise_app_exceptions,
+        client=client_address or ("127.0.0.1", 123),
+    )
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         if lifespan:
             async with app.router.lifespan_context(app):

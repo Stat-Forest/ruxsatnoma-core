@@ -97,6 +97,24 @@ async def test_a_non_200_response_raises_err_int_002() -> None:
     with pytest.raises(EimzoError) as excinfo:
         await adapter.verify_attached("y", ip=None)
     assert excinfo.value.err_code == "ERR-INT-002"
+    # No `status` field in this body at all — nothing to carry.
+    assert excinfo.value.provider_status is None
+    assert excinfo.value.reason is None
+
+
+async def test_a_non_200_response_with_a_status_field_carries_it_on_the_exception() -> None:
+    """Finding 4 (fix round 1): a non-200 HTTP response can still carry the
+    vendor's own JSON body (`_send`'s own comment on reading the body before
+    deciding) — its `status` and mapped reason must survive onto the raised
+    exception, not just into the `EimzoCall` log entry."""
+    adapter = RealEimzo(
+        SETTINGS, transport=_json_transport({"status": -11, "message": "bad cert"}, status_code=502)
+    )
+    with pytest.raises(EimzoError) as excinfo:
+        await adapter.verify_attached("y", ip=None)
+    assert excinfo.value.err_code == "ERR-INT-002"
+    assert excinfo.value.provider_status == -11
+    assert excinfo.value.reason == "certificate_invalid"
 
 
 async def test_verify_attached_parses_the_vendor_sample() -> None:
@@ -173,6 +191,17 @@ async def test_issue_challenge_refuses_a_bad_response() -> None:
     assert excinfo.value.err_code == "ERR-INT-002"
 
 
+async def test_issue_challenge_refusal_carries_the_provider_status_and_reason() -> None:
+    """Finding 4 (fix round 1): the vendor's own `status` (`-1`, the
+    `EIMZO_STATUS_REASONS` domain) used to be logged and then discarded — a
+    route catching `EimzoError` could only answer a bare 502."""
+    adapter = RealEimzo(SETTINGS, transport=_json_transport({"status": -1}))
+    with pytest.raises(EimzoError) as excinfo:
+        await adapter.issue_challenge()
+    assert excinfo.value.provider_status == -1
+    assert excinfo.value.reason == "certificate_status_unknown"
+
+
 async def test_attach_timestamp_returns_pkcs7b64() -> None:
     adapter = RealEimzo(
         SETTINGS, transport=_json_transport({"status": 1, "pkcs7b64": "widened-pkcs7"})
@@ -186,6 +215,16 @@ async def test_attach_timestamp_refuses_a_non_1_status() -> None:
     with pytest.raises(EimzoError) as excinfo:
         await adapter.attach_timestamp("pkcs7", ip=None)
     assert excinfo.value.err_code == "ERR-INT-002"
+
+
+async def test_attach_timestamp_refusal_carries_the_provider_status_and_reason() -> None:
+    """Finding 4 (fix round 1): Task 7 proxies this call to a citizen's
+    browser and needs more than a bare 502 to explain a timestamp refusal."""
+    adapter = RealEimzo(SETTINGS, transport=_json_transport({"status": -21}))
+    with pytest.raises(EimzoError) as excinfo:
+        await adapter.attach_timestamp("pkcs7", ip=None)
+    assert excinfo.value.provider_status == -21
+    assert excinfo.value.reason == "timestamp_signature_invalid"
 
 
 async def test_certificate_status_makes_no_provider_call() -> None:

@@ -709,6 +709,17 @@ async def _verify_org_challenge(
     try:
         identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
     except EimzoError as exc:
+        # Fix round 1, finding 3: an integration error (`ERR-INT-001`/
+        # `ERR-INT-002`, a provider outage or a bad response) is not a
+        # verdict about the CERTIFICATE at all -- collapsing it into
+        # `ERR-ACL-001` used to tell a citizen their org certificate was
+        # invalid when the real story was that E-IMZO could not be reached.
+        # Only the genuine login-contract refusal (`ERR-AUTH-004`, the
+        # unchanged status the mock and `RealEimzo.verify_signed_challenge`
+        # both raise for a non-1 status) becomes the ACL error here; every
+        # other code keeps its own.
+        if exc.err_code != "ERR-AUTH-004":
+            raise err(exc.err_code) from exc
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
     row = await repo.get_valid_otp(db, hash_token(identity.challenge), purpose="eimzo_challenge")
     if row is None:
