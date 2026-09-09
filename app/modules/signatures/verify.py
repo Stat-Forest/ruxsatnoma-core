@@ -47,7 +47,7 @@ class Verdict:
 
 
 def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime) -> Verdict:
-    """Four checks, in an order that is itself the ruling, not an accident of
+    """Five checks, in an order that is itself the ruling, not an accident of
     control flow:
 
     1. The adapter's own `status_code` — a cryptographically broken signature
@@ -64,14 +64,23 @@ def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime)
        verifier that answers "valid" without ever looking at a certificate is
        the exact failure this module exists to prevent, and naming the
        missing piece keeps the failure recoverable in one retry.
-    4. Only once both are in hand: the validity window, compared against
-       `signed_at` — **never against `now`** (plan ruling 5). A certificate
-       that legitimately expires a year after a permit was signed must not
-       retroactively invalidate that permit; the trusted timestamp is what
-       makes that comparison meaningful.
+    4. A trusted timestamp is mandatory (plan ruling R5, final review): with
+       none, the only evidence of WHEN a document was signed is the signer's
+       own computer clock, and a permit is a legal document with a validity
+       period. `timestamp_token is None` is `timestamp_missing`, grouped with
+       the other "evidence missing" checks above rather than the validity-
+       window comparison below, which needs this evidence to already be in
+       hand. Mock envelopes default `timestamp_token` to `"MOCK-TS"`
+       (`encode_mock_signature`), so every existing mock-mode signing test
+       already carries one and stays unaffected by this check.
+    5. Only once all of the above are in hand: the validity window, compared
+       against `signed_at` — **never against `now`** (plan ruling 5). A
+       certificate that legitimately expires a year after a permit was
+       signed must not retroactively invalidate that permit; the trusted
+       timestamp is what makes that comparison meaningful.
 
     The first check that finds a problem wins; `reason` stays `None` (and
-    `status` is `"valid"`) only if none of the four do."""
+    `status` is `"valid"`) only if none of the five do."""
     cert = result.subject_certificate
     signed_at = result.signed_at
     reason: str | None = None
@@ -83,6 +92,8 @@ def build_verdict(result: EimzoVerification, *, cert_status: str, now: datetime)
         reason = "certificate_expired"
     elif cert is None or signed_at is None:
         reason = "certificate_missing"
+    elif result.timestamp_token is None:
+        reason = "timestamp_missing"
     elif not (cert.valid_from <= signed_at <= cert.valid_to):
         reason = "certificate_invalid_at_signing"
 

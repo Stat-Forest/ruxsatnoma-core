@@ -1,6 +1,7 @@
 """Auth service: sessions, login+MFA, passwords. The only door for other modules."""
 
 import asyncio
+import re
 import secrets
 import uuid
 from collections.abc import Sequence
@@ -58,6 +59,12 @@ from app.modules.integrations.adapters.oneid import (
 # unknown/inactive/no-hash branch of login_password pays the same Argon2 cost
 # as a real verification instead of returning early and leaking timing.
 _DUMMY_HASH = hash_password("dummy-timing-equalizer")
+
+# Mirrors `users.pinfl`'s own `CheckConstraint` (`models.py`,
+# `ck_users_pinfl_format`) — checked in Python BEFORE the insert in
+# `login_via_eimzo` (finding 6, final review), not left to the database to
+# reject as an uncaught `IntegrityError`/500.
+_PINFL_RE = re.compile(r"^[0-9]{14}$")
 
 
 async def issue_session(
@@ -318,7 +325,11 @@ async def login_via_eimzo(
         # `login_via_eimzo` does), so the commit only persists this one row.
         await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
         await db.commit()
-        raise err(exc.err_code) from exc
+        # Minor 9 (final review): carry the provider's own status/reason
+        # instead of a bare 502/503 -- `integrations.service.
+        # eimzo_error_details` already builds exactly this payload for the
+        # timestamp route; reused here rather than a second copy.
+        raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     # Ruling R1: in `real` mode e-imzo-server has ALREADY matched the challenge
     # itself, inside `/backend/auth`, before ever answering `status: 1` — and
@@ -341,6 +352,26 @@ async def login_via_eimzo(
             action="user.login",
             result="denied",
             basis="eimzo: certificate expired",
+            ip=ip,
+            user_agent=user_agent,
+        )
+        await db.commit()
+        raise err("ERR-AUTH-004")
+    if not _PINFL_RE.fullmatch(identity.pinfl):
+        # Finding 6 (final review): `eimzo_wire.read_subject`'s STIR/""
+        # fallback is right for an OWNERSHIP check (`signatures.
+        # _ownership_reason`, which only needs SOME identifier to compare
+        # against) and wrong for LOGIN -- a legal-entity-only certificate
+        # the provider accepts with `status: 1` hands `identity.pinfl` a
+        # 9-digit STIR, or `""`, neither of which `login_or_create_by_pinfl`
+        # can insert into `users.pinfl` (`CheckConstraint`, 14 digits only).
+        # Refuse here, cleanly, before that insert -- not an uncaught
+        # `IntegrityError` turning into a bare 500.
+        await audit.log(
+            db,
+            action="user.login",
+            result="denied",
+            basis="eimzo: no personal pinfl",
             ip=ip,
             user_agent=user_agent,
         )
@@ -827,7 +858,11 @@ async def _verify_org_challenge(
         await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
         await db.commit()
         if exc.err_code != "ERR-AUTH-004":
-            raise err(exc.err_code) from exc
+            # Minor 9 (final review): carry the provider's own status/reason
+            # for the two codes that have one (`ERR-INT-001`/`ERR-INT-002`)
+            # instead of a bare 502/503 -- reuses `integrations.service.
+            # eimzo_error_details` rather than a second copy.
+            raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
         raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     # Gap fix (this function's own docstring): in `real` mode the provider

@@ -184,6 +184,21 @@ async def test_issue_challenge_returns_the_challenge_field() -> None:
     assert challenge == "abc123"
 
 
+async def test_health_omits_x_real_ip_when_there_is_no_signer_address() -> None:
+    """Minor 10 (final review): `_headers` used to send `X-Real-IP: ""`
+    rather than omitting the header entirely when there is no signer address
+    to report (`health()`'s two calls always pass `ip=None`)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["has_header"] = "X-Real-IP" in request.headers
+        return httpx.Response(200, json={"status": 1})
+
+    adapter = _adapter(handler)
+    await adapter.health()
+    assert captured["has_header"] is False
+
+
 async def test_issue_challenge_sends_the_signers_own_address() -> None:
     """Task 3's own review flagged this gap on `issue_challenge` specifically
     (no `ip` parameter at all): the same `X-Real-IP` threading every other

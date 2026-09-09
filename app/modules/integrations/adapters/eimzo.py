@@ -399,9 +399,15 @@ class RealEimzo:
     def _headers(self, ip: str | None) -> dict[str, str]:
         # `ip` is `None` whenever the caller has no signer address to report
         # (`issue_challenge`, `health`, or a caller that itself received
-        # `None` — `request.client` can be unset) — httpx headers must be
-        # strings, so that becomes an empty value rather than a crash.
-        return {"X-Real-IP": ip or "", "Host": self._settings.eimzo_site_host}
+        # `None` — `request.client` can be unset). Minor 10 (final review):
+        # the header is OMITTED entirely in that case, not sent as an empty
+        # string — `X-Real-IP: ""` is not a real address either, and an
+        # absent header is the honest way to say "we have none" rather than
+        # a value that looks like one.
+        headers = {"Host": self._settings.eimzo_site_host}
+        if ip:
+            headers["X-Real-IP"] = ip
+        return headers
 
     async def _send(
         self, method: str, path: str, *, content: str | None, ip: str | None

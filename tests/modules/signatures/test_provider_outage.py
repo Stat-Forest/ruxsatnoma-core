@@ -129,3 +129,41 @@ async def test_register_certificate_surfaces_a_provider_outage_as_the_integratio
         )
     ).scalar_one()
     assert audit_count == 0
+
+
+class _RefusalWithReasonAdapter:
+    """Stands in for a `RealEimzo` whose `_send` attached the provider's own
+    `provider_status`/`reason` onto the `EimzoError` it raised (`_send`'s own
+    non-200 handling does exactly this) -- unlike `_OutageAdapter` above,
+    which stands in for the transport-failure shape that carries neither."""
+
+    async def verify_detached(
+        self, *, document: bytes, pkcs7: str, ip: str | None = None
+    ) -> EimzoVerification:
+        raise EimzoError("ERR-INT-002", provider_status=-11, reason="certificate_invalid")
+
+
+@pytest.mark.asyncio
+async def test_sign_carries_the_providers_reason_onto_the_raised_error(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Minor 9 (final review): `sign()` used to `raise err(exc.err_code)`
+    with no `details`, discarding `EimzoError.provider_status`/`.reason` --
+    the exact payload `integrations.service.eimzo_error_details` already
+    builds for the timestamp route. A 502 that could have said "certificate
+    invalid" told the citizen nothing at all."""
+    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _RefusalWithReasonAdapter())
+
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=uuid.uuid4(),
+            purpose="permit_head",
+            document=DOC,
+            pkcs7="unused-the-fake-adapter-never-decodes-it",
+            user=a_user,
+        )
+
+    assert exc.value.code == "ERR-INT-002"
+    assert exc.value.details == {"provider_status": -11, "reason": "certificate_invalid"}

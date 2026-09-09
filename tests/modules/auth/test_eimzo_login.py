@@ -230,6 +230,28 @@ async def test_a_refused_login_is_still_logged(db, monkeypatch) -> None:
     assert "whatever" not in str(row.meta)
 
 
+async def test_a_non_200_login_refusal_carries_the_providers_reason(db, monkeypatch) -> None:
+    """Minor 9 (final review): `login_via_eimzo` used to `raise
+    err(exc.err_code)` with no `details`, discarding `EimzoError.
+    provider_status`/`.reason` -- present here since `/backend/auth`
+    answered a non-200 with a JSON body `_send` already parses and attaches
+    to the exception (mirrors `test_eimzo_real.py::
+    test_a_non_200_response_with_a_status_field_carries_it_on_the_exception`)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"status": -11, "message": "bad cert"})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)
+    assert exc.value.code == "ERR-INT-002"
+    assert exc.value.details == {"provider_status": -11, "reason": "certificate_invalid"}
+
+
 async def test_a_provider_outage_during_login_is_also_logged(db, monkeypatch) -> None:
     def boom(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("no route to host")
@@ -246,3 +268,55 @@ async def test_a_provider_outage_during_login_is_also_logged(db, monkeypatch) ->
     (row,) = await _eimzo_log_tail(db, 1)
     assert row.endpoint == "/backend/auth"
     assert row.http_status is None
+
+
+async def test_a_legal_entity_only_certificate_refuses_login_cleanly(db, monkeypatch) -> None:
+    """Finding 6 (final review): `eimzo_wire.read_subject` falls back to the
+    org STIR (9 digits) and then to `""` when a certificate carries no
+    PERSONAL PINFL at all -- the right answer for an ownership check
+    (`signatures._ownership_reason`, which only needs SOME identifier), but
+    wrong for login, which hands the value straight to
+    `login_or_create_by_pinfl` -> a `User` insert against
+    `CheckConstraint("pinfl ~ '^[0-9]{14}$'")`. Before the fix, a
+    legal-entity-only certificate the provider accepts with `status: 1`
+    reached that insert with a 9-digit STIR and blew up as an
+    `IntegrityError` (a bare 500), not a clean refusal."""
+    sample = {
+        "subjectCertificateInfo": {
+            "serialNumber": "org-cert-2",
+            "X500Name": "CN=BURCHMULLA LESHOZ",
+            "subjectName": {
+                "1.2.860.3.16.1.1": "301234567",  # org STIR only -- no personal PINFL
+                "CN": "BURCHMULLA LESHOZ",
+            },
+            # Deliberately far in the future: this test targets the PINFL-format
+            # refusal, not the (unrelated) `cert_expires_at` check a couple of
+            # lines above it in `login_via_eimzo` -- a near-dated cert would let
+            # THAT check fire first and pass this test for the wrong reason.
+            "validFrom": "2026-05-25 15:47:22",
+            "validTo": "2099-06-24 15:47:22",
+        },
+        "status": 1,
+        "message": "",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=sample)
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    # `login_via_eimzo` reads `get_settings().eimzo_mode` directly (ruling R1)
+    # to decide whether to consult the LOCAL `otp_codes` challenge -- forced
+    # to "real" here too, or the default test env's mock mode would take that
+    # branch instead and refuse on `identity.challenge == ""` missing an
+    # `otp_codes` row, never reaching the PINFL check this test targets
+    # (mirrors `test_org_eri_real_mode.py`'s identical need for
+    # `_verify_org_challenge`).
+    monkeypatch.setattr(service, "get_settings", lambda: REAL_SETTINGS)
+    with pytest.raises(DomainError) as exc:
+        await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)
+    assert exc.value.code == "ERR-AUTH-004"
+    assert exc.value.http_status == 401

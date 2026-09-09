@@ -25,7 +25,7 @@ def _result(status_code: int = 1, **kw):
         status_code=status_code,
         subject_certificate=kw.get("cert", cert),
         signed_at=kw.get("signed_at", NOW),
-        timestamp_token="TS",
+        timestamp_token=kw.get("timestamp_token", "TS"),
         raw={},
     )
 
@@ -96,6 +96,26 @@ def test_a_missing_certificate_fails_closed_instead_of_passing_as_valid():
     verdict = build_verdict(_result(cert=None), cert_status="active", now=NOW)
     assert verdict.status == "invalid"
     assert verdict.reason == "certificate_missing"
+
+
+def test_a_missing_timestamp_fails_closed_instead_of_passing_as_valid():
+    # Ruling R5 (final review, Important 3): a timestamp is mandatory on
+    # every signature -- without one, the only evidence of WHEN a document
+    # was signed is the signer's own computer clock, and a permit is a legal
+    # document with a validity period. An otherwise-good signature with no
+    # `timestamp_token` must not read as "valid".
+    verdict = build_verdict(_result(timestamp_token=None), cert_status="active", now=NOW)
+    assert verdict.status == "invalid"
+    assert verdict.reason == "timestamp_missing"
+
+
+def test_mock_envelopes_default_a_timestamp_so_the_existing_suite_is_unaffected():
+    # `encode_mock_signature`'s own default (`timestamp_token="MOCK-TS"`) is
+    # what keeps every pre-existing mock-mode signing test valid after the
+    # check above was added -- pinned here rather than merely assumed.
+    verdict = build_verdict(_result(), cert_status="active", now=NOW)
+    assert verdict.status == "valid"
+    assert verdict.record["timestamp_token"] == "TS"
 
 
 def test_the_validity_window_is_checked_against_signed_at_not_now():

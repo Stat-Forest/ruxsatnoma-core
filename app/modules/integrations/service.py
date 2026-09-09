@@ -217,14 +217,20 @@ async def _log_eimzo_calls(db: AsyncSession, calls: tuple[EimzoCall, ...]) -> No
         )
 
 
-def _eimzo_error_details(exc: EimzoError) -> dict[str, Any] | None:
+def eimzo_error_details(exc: EimzoError) -> dict[str, Any] | None:
     """Task 7's whole reason to read `EimzoError.provider_status`/`.reason`
     (fix round 1, finding 4, write-only until this route): a refusal must
     reach the caller with the provider's OWN machine-readable reason instead
     of a bare 502/503, so the front end can say "your certificate expired"
     instead of "signature error" (stage 3.8 ruling 9 -- every status code
     keeps its own reason). `None` when the exception carries neither (a
-    transport failure never reached the provider at all)."""
+    transport failure never reached the provider at all).
+
+    Public (not `_`-prefixed), unlike this module's own `_log_eimzo_calls` —
+    that one is deliberately duplicated per caller (each owns the session a
+    log row is written on); this one is pure, so `sign()`/`login_via_eimzo`/
+    `_verify_org_challenge` import and reuse THIS one instead of each writing
+    their own (Minor 9, final review)."""
     if exc.provider_status is None and exc.reason is None:
         return None
     return {"provider_status": exc.provider_status, "reason": exc.reason}
@@ -247,7 +253,7 @@ async def attach_eimzo_timestamp(db: AsyncSession, *, pkcs7: str, ip: str | None
     except EimzoError as exc:
         await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
         await db.commit()
-        raise err(exc.err_code, details=_eimzo_error_details(exc)) from exc
+        raise err(exc.err_code, details=eimzo_error_details(exc)) from exc
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     return stamped
 
@@ -268,7 +274,7 @@ async def eimzo_health(db: AsyncSession) -> dict[str, Any]:
     except EimzoError as exc:
         await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
         await db.commit()
-        raise err(exc.err_code, details=_eimzo_error_details(exc)) from exc
+        raise err(exc.err_code, details=eimzo_error_details(exc)) from exc
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     return health
 

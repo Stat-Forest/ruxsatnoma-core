@@ -657,7 +657,12 @@ async def sign(
         # `sign()`, so the commit below only persists this one log row.
         await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
         await db.commit()
-        raise err(exc.err_code) from exc
+        # Minor 9 (final review): carry the provider's own status/reason onto
+        # the response instead of a bare 502/503 -- `integrations.service.
+        # eimzo_error_details` already builds exactly this payload for the
+        # timestamp route (stage 3.8 ruling 9: every status code keeps its
+        # own reason); reused here rather than a second copy.
+        raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
     await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
     info = result.subject_certificate
 

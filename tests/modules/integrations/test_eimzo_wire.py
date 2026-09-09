@@ -2,16 +2,16 @@
 status codes (stage 5.2 plan, Task 2). Pure functions, no adapter, no I/O —
 the vendor's own response samples are enough to exercise all of it."""
 
+import copy
 from datetime import UTC, datetime
 
 from app.modules.integrations.adapters.eimzo import EIMZO_STATUS_REASONS
 from app.modules.integrations.adapters.eimzo_wire import (
-    certificate_from_subject_info,
     parse_provider_datetime,
     read_subject,
     verification_from_pkcs7_info,
 )
-from tests.modules.integrations.eimzo_samples import VENDOR_ATTACHED_SAMPLE, VENDOR_AUTH_SAMPLE
+from tests.modules.integrations.eimzo_samples import VENDOR_ATTACHED_SAMPLE
 
 
 def test_provider_datetime_is_parsed_and_made_aware() -> None:
@@ -97,20 +97,85 @@ def test_verification_of_an_empty_response_does_not_raise() -> None:
     assert result.raw == {}
 
 
-def test_certificate_from_subject_info_reads_the_vendor_auth_sample() -> None:
-    # `certificate_from_subject_info` has no test of its own in the brief;
-    # added because Task 3 depends on it and it is cheap to pin now against
-    # the vendor's own sample rather than leaving it unexercised until then.
-    #
-    # `pinfl_or_stir` is asserted here on purpose: `VENDOR_AUTH_SAMPLE`'s
-    # `subjectName` must be OID-keyed (controller ruling T2-1) for this
-    # fixture to exercise the actual extraction Task 3's ERI-login path
-    # depends on — an abbreviated `{"UID": ..., "CN": ...}` shape would
-    # parse without error and silently yield an empty identifier, which is
-    # exactly the gap that stayed invisible before this assertion existed.
-    cert = certificate_from_subject_info(VENDOR_AUTH_SAMPLE["subjectCertificateInfo"])
-    assert cert.serial_number == "218712ed3"
-    assert cert.issuer == "CN=TESTOV TEST TESTOVICH"  # X500Name, the only issuer-shaped field here
-    assert cert.pinfl_or_stir == "12345678901234"
-    assert cert.valid_from == datetime(2026, 5, 25, 15, 47, 22, tzinfo=UTC)
-    assert cert.valid_to == datetime(2026, 6, 24, 15, 47, 22, tzinfo=UTC)
+# ---------------------------------------------------------------------------
+# Finding 4 (final review): a malformed provider payload is a VERDICT, not an
+# exception -- `verification_from_pkcs7_info`'s own docstring already claims
+# it never raises, but a certificate entry missing `serialNumber`/`validFrom`/
+# `validTo`, or one whose date string `fromisoformat` rejects, used to escape
+# as KeyError/ValueError straight through `sign()`'s `except EimzoError` as an
+# unhandled 500 -- no signature row, no audit entry, no integration-log row.
+# ---------------------------------------------------------------------------
+
+
+def test_a_certificate_entry_missing_a_required_field_does_not_raise() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    del sample["pkcs7Info"]["signers"][0]["certificate"][0]["validFrom"]
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == 1
+    assert result.subject_certificate is None
+
+
+def test_a_certificate_entry_with_an_unparseable_date_does_not_raise() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    sample["pkcs7Info"]["signers"][0]["certificate"][0]["validFrom"] = "not-a-date"
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == 1
+    assert result.subject_certificate is None
+
+
+def test_an_unparseable_signing_time_does_not_raise() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    sample["pkcs7Info"]["signers"][0]["signingTime"] = "not-a-date"
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == 1
+    assert result.signed_at is None
+
+
+def test_an_unparseable_timestamp_time_does_not_raise() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    sample["pkcs7Info"]["signers"][0]["timeStampInfo"]["time"] = "not-a-date"
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == 1
+    assert result.timestamp_token is None
+
+
+# ---------------------------------------------------------------------------
+# Ruling FR-1 (final review): the vendor's OUTER `status` may mean only
+# "request processed", not "signature good" -- `pkcs7Info.signers[0]` itself
+# carries three independent verification booleans, all present in the
+# vendor's own sample, that `status: 1` alone does not guarantee.
+# ---------------------------------------------------------------------------
+
+
+def test_an_explicit_false_verified_boolean_refuses_despite_status_1() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    sample["pkcs7Info"]["signers"][0]["verified"] = False
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == -10
+    assert EIMZO_STATUS_REASONS[result.status_code] == "signature_invalid"
+
+
+def test_an_explicit_false_certificate_verified_boolean_refuses_despite_status_1() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    sample["pkcs7Info"]["signers"][0]["certificateVerified"] = False
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == -11
+    assert EIMZO_STATUS_REASONS[result.status_code] == "certificate_invalid"
+
+
+def test_an_explicit_false_certificate_valid_at_signing_time_boolean_refuses() -> None:
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    sample["pkcs7Info"]["signers"][0]["certificateValidAtSigningTime"] = False
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == -12
+    assert EIMZO_STATUS_REASONS[result.status_code] == "certificate_invalid_at_signing"
+
+
+def test_an_absent_verification_boolean_keeps_todays_behaviour() -> None:
+    # Only an EXPLICIT `False` refuses -- a provider that never sends one of
+    # these fields at all must not have every signature it approves flip to
+    # invalid.
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    del sample["pkcs7Info"]["signers"][0]["certificateValidAtSigningTime"]
+    result = verification_from_pkcs7_info(sample)
+    assert result.status_code == 1

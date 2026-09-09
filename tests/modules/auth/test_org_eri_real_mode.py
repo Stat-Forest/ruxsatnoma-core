@@ -104,3 +104,39 @@ async def test_a_genuinely_bad_signature_is_still_refused_in_real_mode(
     assert exc.value.code == "ERR-ACL-001"
     assert exc.value.details is not None
     assert exc.value.details["reason"] == "bad signature"
+
+
+class _RefusalWithReasonAdapter:
+    """Stands in for a `RealEimzo` whose `_send` attached the provider's own
+    `provider_status`/`reason` onto the `EimzoError` it raised — the
+    ERR-INT-002 shape, distinct from `_StubOrgAdapter(ok=False)`'s
+    ERR-AUTH-004 (a genuine bad-signature refusal, which has no provider
+    status to carry)."""
+
+    async def verify_signed_challenge(
+        self, signed_challenge: str, ip: str | None = None
+    ) -> EimzoIdentity:
+        raise EimzoError("ERR-INT-002", provider_status=-11, reason="certificate_invalid")
+
+
+@pytest.mark.asyncio
+async def test_an_integration_error_carries_the_providers_reason(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Minor 9 (final review): the `exc.err_code != "ERR-AUTH-004"` branch
+    used to `raise err(exc.err_code)` with no `details`, discarding a
+    genuine `provider_status`/`.reason` an ERR-INT-002 carries."""
+    monkeypatch.setattr(auth_service, "get_settings", lambda: REAL_SETTINGS)
+    monkeypatch.setattr(auth_service, "get_eimzo_adapter", lambda: _RefusalWithReasonAdapter())
+
+    with pytest.raises(DomainError) as exc:
+        await auth_service._verify_org_challenge(
+            db,
+            signed_challenge="whatever",
+            stir="123456789",
+            signer_pinfl="12345678901234",
+            ip=None,
+        )
+
+    assert exc.value.code == "ERR-INT-002"
+    assert exc.value.details == {"provider_status": -11, "reason": "certificate_invalid"}

@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import secrets
 import uuid
@@ -21,6 +22,7 @@ from app.modules.integrations.adapters.eimzo import RealEimzo, encode_mock_signa
 from app.modules.integrations.models import IntegrationLog
 from app.modules.signatures import repo, service
 from tests.modules.auth.test_sessions import make_user
+from tests.modules.integrations.eimzo_samples import VENDOR_DETACHED_SAMPLE
 
 DOC = b"the-permit-bytes"
 OBJ = uuid.uuid4()
@@ -845,3 +847,54 @@ async def test_a_transport_failure_is_also_logged(
     assert row.endpoint == "/backend/pkcs7/verify/detached"
     assert row.http_status is None
     assert row.meta is None
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_certificate_from_the_provider_is_a_verdict_not_a_500(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 4 (final review): the provider answers `status: 1` (success)
+    with a signer certificate missing `validFrom` — before the fix,
+    `eimzo_wire._certificate_from_pkcs7_entry`'s bare `cert_data["validFrom"]`
+    let a `KeyError` escape `sign()`'s own `except EimzoError`, answering a
+    signing route with an unhandled 500: no signature row, no audit entry, no
+    integration-log row. The fixed wire parser treats this the way the mock
+    adapter treats an undecodable envelope — a verdict (`certificate_missing`
+    via `build_verdict`'s own fail-closed check), never an exception, so
+    `sign()` reaches its normal "info is None" refusal path: evidenced and
+    committed, `ERR-SIGN-001`, not a bare 500."""
+    sample = copy.deepcopy(VENDOR_DETACHED_SAMPLE)
+    del sample["pkcs7Info"]["signers"][0]["certificate"][0]["validFrom"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=sample)
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    obj_id = uuid.uuid4()
+
+    with pytest.raises(DomainError) as exc:
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"doc",
+            pkcs7="broken",
+            user=a_user,
+        )
+    assert exc.value.code == "ERR-SIGN-001"
+    assert exc.value.details == {"reason": "certificate_missing"}
+
+    # Evidenced, not silently swallowed: an audit_log row exists (there is no
+    # certificate to bind, so no `signatures` row either — `sign()`'s own
+    # documented shape for this branch).
+    audit_count = (
+        await db.execute(
+            select(func.count()).select_from(AuditLog).where(AuditLog.object_id == obj_id)
+        )
+    ).scalar_one()
+    assert audit_count == 1

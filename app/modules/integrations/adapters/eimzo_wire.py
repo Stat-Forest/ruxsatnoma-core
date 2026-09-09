@@ -56,41 +56,56 @@ def read_subject(subject_name: dict[str, str]) -> tuple[str, str, str | None]:
     return subject, (pinfl or legal_tin or ""), legal_tin
 
 
-def certificate_from_subject_info(data: dict[str, Any]) -> EimzoCertificateInfo:
-    """Builds from `/backend/auth`'s `subjectCertificateInfo` object
-    (`serialNumber`, `subjectName`, `validFrom`, `validTo`) — the inner
-    object only, one level under the response's own `status`/`message`.
-
-    That response carries no separate issuer field at all
-    (`SubjectCertificateInfoJson` has no `issuer`), so `X500Name` — actually
-    the SUBJECT's own X.500 name (e.g. `"CN=XXX,UID=1234"`) — is used as the
-    best available stand-in for `issuer` rather than leaving it empty."""
-    subject, identifier, _legal_tin = read_subject(data.get("subjectName") or {})
-    return EimzoCertificateInfo(
-        serial_number=data["serialNumber"],
-        issuer=data.get("X500Name", ""),
-        subject=subject,
-        pinfl_or_stir=identifier,
-        valid_from=parse_provider_datetime(data["validFrom"]),
-        valid_to=parse_provider_datetime(data["validTo"]),
-    )
-
-
-def _certificate_from_pkcs7_entry(cert_data: dict[str, Any]) -> EimzoCertificateInfo:
+def _certificate_from_pkcs7_entry(cert_data: dict[str, Any]) -> EimzoCertificateInfo | None:
     """A pkcs7-verify signer's own `certificate[0]` — a different shape from
     `/backend/auth`'s `subjectCertificateInfo` (`subjectInfo` rather than
     `subjectName`, and a real `issuerName` rather than needing `X500Name` as
-    a stand-in), so this stays separate from `certificate_from_subject_info`
-    instead of making one function understand both shapes."""
-    subject, identifier, _legal_tin = read_subject(cert_data.get("subjectInfo") or {})
-    return EimzoCertificateInfo(
-        serial_number=cert_data["serialNumber"],
-        issuer=cert_data.get("issuerName", ""),
-        subject=subject,
-        pinfl_or_stir=identifier,
-        valid_from=parse_provider_datetime(cert_data["validFrom"]),
-        valid_to=parse_provider_datetime(cert_data["validTo"]),
-    )
+    a stand-in).
+
+    Returns `None` on a malformed entry — a missing `serialNumber`/
+    `validFrom`/`validTo`, or a date string `parse_provider_datetime` cannot
+    parse — rather than raising (finding 4, final review): a provider
+    payload the vendor itself calls successful (`status: 1`) but that is
+    missing a field this codebase reads must become a verdict
+    (`certificate_missing`, via `build_verdict`), never a `KeyError`/
+    `ValueError` escaping `sign()`'s `except EimzoError` as an unhandled
+    500 with no signature row, no audit entry and no integration-log row."""
+    try:
+        subject, identifier, _legal_tin = read_subject(cert_data.get("subjectInfo") or {})
+        return EimzoCertificateInfo(
+            serial_number=cert_data["serialNumber"],
+            issuer=cert_data.get("issuerName", ""),
+            subject=subject,
+            pinfl_or_stir=identifier,
+            valid_from=parse_provider_datetime(cert_data["validFrom"]),
+            valid_to=parse_provider_datetime(cert_data["validTo"]),
+        )
+    except KeyError, ValueError, TypeError:
+        return None
+
+
+def _verified_status(signer: dict[str, Any], status: int) -> int:
+    """Ruling FR-1 (final review): the vendor's OUTER `status` may mean only
+    "request processed", not "signature good" — `pkcs7Info.signers[0]` itself
+    carries three independent verification booleans (`verified`,
+    `certificateVerified`, `certificateValidAtSigningTime`, all present in
+    the vendor's own sample) that a `status` of `1` does not by itself
+    guarantee. An explicit `False` on any of them overrides a `status` of `1`
+    with the EXISTING status code (and, through it, `EIMZO_STATUS_REASONS`'s
+    existing reason) that already means the same thing — `build_verdict`
+    needs no change at all for this. An ABSENT boolean (the key missing, or
+    `None`) changes nothing: a provider that never sends one of these fields
+    must not have every signature it approves flip to invalid — only an
+    EXPLICIT `False` refuses."""
+    if status != 1:
+        return status
+    if signer.get("verified") is False:
+        return -10  # EIMZO_STATUS_REASONS[-10] == "signature_invalid"
+    if signer.get("certificateVerified") is False:
+        return -11  # EIMZO_STATUS_REASONS[-11] == "certificate_invalid"
+    if signer.get("certificateValidAtSigningTime") is False:
+        return -12  # EIMZO_STATUS_REASONS[-12] == "certificate_invalid_at_signing"
+    return status
 
 
 def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
@@ -115,7 +130,15 @@ def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
     `pkcs7Info` at all (the provider's other response shape, keyed on
     `failedSignerInfo` instead) — every lookup here is defensive, and that
     shape simply yields an "empty" verdict with only `status_code` filled
-    in, exactly like `eimzo.py::_unparseable_signature`."""
+    in, exactly like `eimzo.py::_unparseable_signature`. Nor does a
+    `status: 1` response with a malformed certificate entry or an
+    unparseable date raise (finding 4, final review): `_certificate_from_
+    pkcs7_entry` and the two date reads below each fail closed to `None`
+    rather than letting `KeyError`/`ValueError` escape — a provider payload
+    this codebase cannot fully read becomes a verdict
+    (`certificate_missing`/`timestamp_missing` in `build_verdict`), never an
+    unhandled 500 with no signature row, no audit entry and no
+    integration-log row."""
     pkcs7_info = data.get("pkcs7Info") or {}
     signers = pkcs7_info.get("signers") or []
     signer = signers[0] if signers else {}
@@ -125,13 +148,19 @@ def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
     subject_certificate = _certificate_from_pkcs7_entry(cert_data) if cert_data else None
 
     signing_time = signer.get("signingTime")
-    signed_at = parse_provider_datetime(signing_time) if signing_time else None
+    try:
+        signed_at = parse_provider_datetime(signing_time) if signing_time else None
+    except ValueError, TypeError:
+        signed_at = None
 
     timestamp_info = signer.get("timeStampInfo") or {}
     timestamp_time = timestamp_info.get("time")
-    timestamp_token = (
-        parse_provider_datetime(timestamp_time).isoformat() if timestamp_time else None
-    )
+    try:
+        timestamp_token = (
+            parse_provider_datetime(timestamp_time).isoformat() if timestamp_time else None
+        )
+    except ValueError, TypeError:
+        timestamp_token = None
 
     raw_signers = []
     for entry in signers:
@@ -145,7 +174,7 @@ def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
         raw["signers"] = raw_signers
 
     return EimzoVerification(
-        status_code=data.get("status", 0),
+        status_code=_verified_status(signer, data.get("status", 0)),
         subject_certificate=subject_certificate,
         signed_at=signed_at,
         timestamp_token=timestamp_token,
