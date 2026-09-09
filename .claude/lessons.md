@@ -950,3 +950,18 @@ Tooling and environment.
 - **How to apply:** One worktree per session (root `CLAUDE.md`). If already stuck,
   `git stash push .pre-commit-config.yaml` in your own tree beats `--no-verify`; if you do use
   it, run `make check` by hand and say so in the PR.
+
+## A vendor's own Dockerfile is the contract, not something to reconstruct from research
+
+- **Rule:** If a vendor distribution ships its own Dockerfile, build from it, not from
+  documentation guesses. For a thin jar, check `Class-Path` in `META-INF/MANIFEST.MF`
+  for a `lib/` directory before assuming the jar runs standalone.
+- **Why:** `deploy/eimzo/Dockerfile` (5.2 task 8), written believing the jar was
+  unobtainable, never copied `lib/` (`NoClassDefFoundError` on `picocli.CommandLine`,
+  before class loading finishes) and passed the config path as a bare positional
+  argument instead of the `-Dproperties.filename=` system property the jar actually
+  reads. The vendor's own zip ships the jar, `lib/` and a working Dockerfile together.
+- **How to apply:** Search for the real artifact before declaring it unobtainable. Treat
+  an inferred boot/health behavior as unverified until measured against the real jar —
+  5.2's own prior report inferred a graceful `/ping`; measured, the process never binds
+  the port at all with no VPN key, so a healthcheck-gated `depends_on` would block `api`.

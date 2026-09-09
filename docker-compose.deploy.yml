@@ -99,8 +99,25 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # `service_started`, NOT `service_healthy` (fix round 1, finding 6) --
+      # measured directly, with no VPN key present (the state until NIC
+      # delivers, see deploy/eimzo/README.md): e-imzo-server never binds port
+      # 8080 at all (`HandlerRegistry.register` throws a Guice
+      # `ProvisionException` on the missing `keys/client.key` before the HTTP
+      # listener starts), so its healthcheck can never pass and the container
+      # sits `unhealthy` forever. `service_healthy` here would therefore block
+      # `api` from starting AT ALL for as long as the key is missing or the
+      # provider is down -- turning a provider outage into a total outage for
+      # every citizen-facing feature, including ones that never touch E-IMZO.
+      # `service_started` only waits for the eimzo container to exist and be
+      # running (so its DNS name resolves) and lets `api` come up regardless;
+      # the two proxy routes that actually call it
+      # (`app/modules/integrations/router.py`, task 7) already turn a provider
+      # outage into `ERR-INT-001`/`ERR-INT-002` (503/502) rather than a crash,
+      # so a down E-IMZO server costs only signing and login-via-E-IMZO, never
+      # the whole system.
       eimzo:
-        condition: service_healthy
+        condition: service_started
     networks:
       # `default` is this stack's private network: db, minio and eimzo are reachable only here.
       default:
