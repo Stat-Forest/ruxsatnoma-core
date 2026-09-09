@@ -491,6 +491,20 @@ Tooling and environment.
   `add_classifier_item`'s `valid_to < valid_from` is the period template, `_assert_doc_active`
   the FK one — reuse the same helper per meaning, never a near-identical second copy.
 
+## A new refusal on a hot path breaks every caller through a seeded row, not through code
+
+- **Rule:** Adding a precondition to a widely-shared entry point (a JSON-RPC dispatcher, a
+  webhook handler), check what a FRESH TEST DATABASE's seeded rows make TRUE by default —
+  not just the callers your diff touches — before trusting a file-scoped green run.
+- **Why:** Stage 7.9 t6's Payme routability check broke ~15 PRE-EXISTING tests across three
+  unrelated files (none about routability) because migration `0045`'s seeded `budget_50`
+  recipient has no Payme id BY DESIGN and is active in every fresh test DB — every real
+  invoice built through it became "unroutable". Every file-scoped run stayed green; only
+  `make test` on the WHOLE suite showed it.
+- **How to apply:** `tests/modules/payments/conftest.py::_budget_recipient_is_routable` is
+  the fix shape — a package-level autouse fixture giving the seeded row a fixed test value
+  via `engine` (never `db`, whose rollback never reaches the app's own connection).
+
 ## A gate that reads only ONE of the two things it guards is bundling two concerns
 
 - **Rule:** When an `if` guards a block computing several values, check that EVERY value in

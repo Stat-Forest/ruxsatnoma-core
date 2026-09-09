@@ -310,6 +310,30 @@ async def invoice_recipients(db: AsyncSession, invoice_id: uuid.UUID) -> list[In
     return list(await repo.list_invoice_recipients(db, invoice_id))
 
 
+def missing_payme_receivers(snapshot: Sequence[InvoiceRecipient]) -> list[InvoiceRecipient]:
+    """Rows of a frozen `invoice_recipients` snapshot (`invoice_recipients`
+    above) that carry no `payme_account_id` AND would actually receive money
+    (`row.amount > 0`) — the shared "this split cannot be routed at Payme"
+    precondition, decision #160. Scoped to `amount > 0` on purpose:
+    `ledger.split_payment` can floor a percent rule, or the leshoz's own
+    remainder, to exactly `0.00`, and a receiver Payme would never be asked
+    to route anything to can never be the reason the WHOLE payment is
+    refused — the same reading Task 6's own `receivers` builder gives a
+    `0.00` row (omitted, never routed, but never blocking either).
+
+    TWO callers, the two refusal points Override 1 of the task-6 brief
+    names: `create_pay_intent` below (`ERR-PAY-007`, the citizen's own
+    button) and `payme.py`'s `_receivers_for` (`-31008`, BOTH
+    `CheckPerformTransaction` and `CreateTransaction`) — pure and
+    synchronous so neither has to re-derive "missing" its own way and
+    silently drift from the other (the same reasoning `resolve_recipient_
+    account`'s own docstring gives for staying a single, frozen, two-caller
+    helper). An EMPTY snapshot (an invoice issued before stage 7.9, Override
+    3) has no rows to iterate and returns `[]` — never a reason to refuse a
+    payment nothing here can even describe."""
+    return [row for row in snapshot if row.amount > 0 and not row.payme_account_id]
+
+
 async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     """The whole business action behind `APPLICATION_APPROVED`: freeze the
     application's current calculation into an invoice, move the application to
@@ -889,6 +913,25 @@ async def create_pay_intent(
     (`PaymentIntent`'s own docstring). The column carries no DB unique
     constraint by design; `app/core/idempotency.py`'s own table is what
     de-duplicates the HTTP request itself.
+
+    Stage 7.9 task 6 (decision #160): checked LAST, after every other
+    precondition above, is whether the invoice's own FROZEN split
+    (`invoice_recipients`, decision #158) can be routed at Payme at all —
+    every row that would actually receive money (`amount > 0`) must carry a
+    `payme_account_id`, or this refuses with `ERR-PAY-007` and
+    `details.missing` naming the receivers that lack one (position and
+    name, never an invented id). This is the refusal a human actually SEES
+    (Override 1 of the task's own brief) — Payme's own
+    `CheckPerformTransaction`/`CreateTransaction` (`payme.py`) answer the
+    SAME condition as `-31008` instead, for a citizen who reaches the
+    payment page some other way. All-or-nothing by construction
+    (`missing_payme_receivers` reads the WHOLE snapshot): a partial
+    `receivers` array would route some receivers at Payme and leave the
+    rest on the Agency's own cashbox awaiting a manual transfer — the worst
+    of both mechanisms and the hardest thing in this system to reconcile.
+    An invoice issued BEFORE this stage carries an EMPTY snapshot (Override
+    3) and stays payable unchanged — refusing those would strand every
+    invoice already pending on the stand.
     """
     invoice = await repo.get_invoice(db, invoice_id)
     if invoice is None:
@@ -902,6 +945,17 @@ async def create_pay_intent(
         raise err("ERR-PAY-004", details={"invoice": str(invoice_id), "status": invoice.status})
     if datetime.now(UTC) > invoice.due_at:
         raise err("ERR-PAY-002", details={"invoice": str(invoice_id)})
+
+    snapshot = await invoice_recipients(db, invoice.id)
+    missing = missing_payme_receivers(snapshot)
+    if missing:
+        raise err(
+            "ERR-PAY-007",
+            details={
+                "invoice": str(invoice_id),
+                "missing": [{"position": row.position, "name": row.name} for row in missing],
+            },
+        )
 
     payment_url = payme_adapter.build_checkout_url(
         invoice_number=invoice.number, amount=invoice.amount

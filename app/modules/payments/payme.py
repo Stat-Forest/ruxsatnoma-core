@@ -36,9 +36,26 @@ payable" under `-31050`):
   code, two related but distinct triggers — "this account cannot be paid"
   and "this transaction cannot proceed" — never conflated with `-31050`,
   which is reserved for "this account does not exist at all".
+
+Stage 7.9 task 6 (decision #160): `-31008` is now ALSO what
+`CheckPerformTransaction` and `CreateTransaction` answer when the invoice's
+own FROZEN split (`service.invoice_recipients`, decision #158) cannot be
+routed at Payme in full — some receiver that would actually get money
+carries no `payme_account_id` (`_receivers_for`). Fail-closed by design: a
+payment we cannot route is refused rather than taken onto the Agency's own
+cashbox for someone to move by hand, and the refusal is ALL-OR-NOTHING —
+never a shortened `receivers` array. `CreateTransaction`'s own response
+gains `receivers` (design/04 §3.7): one `{"id", "amount"}` per row of the
+snapshot with `amount > 0`, tiyin integers via `to_tiyin`. The sibling
+refusal a human actually SEES is `ERR-PAY-007` on
+`POST /invoices/{id}/pay-intents` (`payments.service.create_pay_intent`) —
+this module answers Payme, that one answers the citizen, and neither reuses
+the other's envelope (this module is never inside `ERR-*`; `pay-intents`
+is never a raw Payme code).
 """
 
 import hashlib
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -166,10 +183,63 @@ async def _check_invoice_for_payment(db: AsyncSession, params: dict[str, Any]) -
     return invoice
 
 
+async def _receivers_for(db: AsyncSession, invoice_id: uuid.UUID) -> list[dict[str, Any]] | None:
+    """`receivers` for `CreateTransaction`'s response (design/04 §3.7):
+    `{"id": <payme_account_id>, "amount": <tiyin, integer>}` per row of the
+    invoice's own FROZEN split (`service.invoice_recipients`, decision
+    #158), `position` order. RAISES `PaymeError(-31008)` when
+    `service.missing_payme_receivers` finds any row that would actually
+    receive money with no Payme account id — decision #160, fail-closed: a
+    payment whose split cannot be routed IN FULL is refused rather than
+    taken onto the Agency's cashbox for someone to move by hand.
+    ALL-OR-NOTHING by construction (never a shortened array): a partial
+    `receivers` array would route SOME receivers at Payme and leave the
+    rest on the cashbox awaiting a manual transfer — the worst of both
+    mechanisms and the hardest thing in this system to reconcile.
+
+    Called from BOTH `_check_perform_transaction` and `_create_transaction`
+    below (Override 1 of the task-6 brief): Payme calls
+    `CheckPerformTransaction` before it ever shows the payment page, so
+    refusing there too — not only in `CreateTransaction` — is what stops a
+    citizen from reaching a page that would fail anyway.
+
+    Returns `None` — never `[]` — for an EMPTY snapshot (an invoice issued
+    BEFORE stage 7.9, Override 3): it is payable unchanged, and refusing it
+    would strand every invoice already pending on the stand. The
+    distinction is load-bearing, not cosmetic: `_create_result` (below)
+    includes the `receivers` key ONLY when this is not `None`, so `None`
+    here is what keeps a legacy invoice's response from gaining an empty
+    `"receivers": []` it never had. A snapshot that EXISTS but whose every
+    row happens to be `0.00` (the invoice itself is `0.00` — vanishingly
+    rare, never a legacy invoice) is a real, if empty, `[]`, correctly
+    included."""
+    snapshot = await service.invoice_recipients(db, invoice_id)
+    if not snapshot:
+        return None
+    missing = service.missing_payme_receivers(snapshot)
+    if missing:
+        logger.error(
+            "payme_account_id missing for invoice %s rows %s - payment refused",
+            invoice_id,
+            [row.position for row in missing],
+        )
+        raise PaymeError(ERR_CANNOT_PERFORM, "Split cannot be routed")
+    return [
+        {"id": row.payme_account_id, "amount": to_tiyin(row.amount)}
+        for row in snapshot
+        if row.amount > 0
+    ]
+
+
 async def _check_perform_transaction(
     db: AsyncSession, params: dict[str, Any], now: datetime
 ) -> dict[str, Any]:
-    await _check_invoice_for_payment(db, params)
+    invoice = await _check_invoice_for_payment(db, params)
+    # Discards the result — CheckPerformTransaction only ever answers
+    # `{"allow": True}` or an error; `receivers` belongs solely to
+    # CreateTransaction's own response (design/04 §3.7). Called for its
+    # RAISE alone (Override 1: refuse here too, before the payment page).
+    await _receivers_for(db, invoice.id)
     return {"allow": True}
 
 
@@ -198,12 +268,24 @@ async def _expire_if_overdue(
     return True
 
 
-def _create_result(transaction: ProviderTransaction) -> dict[str, Any]:
-    return {
+def _create_result(
+    transaction: ProviderTransaction, receivers: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """`receivers` is included ONLY when not `None` (design/04 §3.7): a
+    `CheckTransaction`/`GetStatement`-shaped caller never asks for it, and
+    an idempotent repeat of `CreateTransaction` must answer byte-identical
+    JSON to its own first call (Override 5) — an explicit `None` sentinel
+    keeps an accidental empty list (a real, valid `receivers` answer for a
+    fully-fixed split with nothing left over) from being read the same as
+    "omit the key"."""
+    result: dict[str, Any] = {
         "create_time": _to_millis(transaction.received_at),
         "transaction": str(transaction.id),
         "state": int(transaction.state),
     }
+    if receivers is not None:
+        result["receivers"] = receivers
+    return result
 
 
 async def _create_transaction_existing(
@@ -212,7 +294,14 @@ async def _create_transaction_existing(
     if await _expire_if_overdue(db, transaction, now):
         raise PaymeError(ERR_CANNOT_PERFORM, "Transaction has expired")
     if transaction.state in (STATE_CREATED, STATE_PERFORMED):
-        return _create_result(transaction)
+        # Override 5: a repeat answers byte-identical JSON. `receivers` is
+        # RECOMPUTED here, never cached from the original call — the
+        # snapshot it reads (`service.invoice_recipients`) is frozen at
+        # issuance and never changes, so recomputing is provably stable,
+        # and caching would be one more piece of state to keep in sync with
+        # nothing.
+        receivers = await _receivers_for(db, transaction.invoice_id)
+        return _create_result(transaction, receivers)
     raise PaymeError(ERR_CANNOT_PERFORM, "Transaction was already cancelled")
 
 
@@ -236,6 +325,11 @@ async def _create_transaction(
         return await _create_transaction_existing(db, existing, now)
 
     invoice = await _check_invoice_for_payment(db, params)
+    # Computed BEFORE any row is written (decision #160, fail-closed): an
+    # invoice whose split cannot be routed must never get a
+    # `provider_transactions` row at all — raises `PaymeError(-31008)` here,
+    # leaving nothing behind for a caller to clean up.
+    receivers = await _receivers_for(db, invoice.id)
     amount = _amount_tiyin(params)
     assert amount is not None  # _check_invoice_for_payment already validated it
 
@@ -279,7 +373,7 @@ async def _create_transaction(
             "amount": str(transaction.amount),
         },
     )
-    return _create_result(transaction)
+    return _create_result(transaction, receivers)
 
 
 def _perform_result(transaction: ProviderTransaction) -> dict[str, Any]:

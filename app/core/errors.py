@@ -54,6 +54,17 @@ ERRORS: dict[str, tuple[int, str]] = {
     # `backoffice_service.resolve_reconciliation` gives for minting its own
     # `ERR-PAY-005` rather than reusing that code for a reconciliation).
     "ERR-PAY-006": (409, "Запрос на возврат не может быть изменён в текущем статусе"),
+    # Stage 7.9 task 6, decision #160: the frozen split (`invoice_recipients`)
+    # names a receiver with no `payme_account_id` — the citizen's own
+    # `POST /invoices/{id}/pay-intents` button refuses BEFORE a checkout link
+    # is even built, `details.missing` naming the receivers (position, name).
+    # Fail-closed by design: a split we cannot ROUTE at Payme is refused
+    # rather than taken onto the Agency's cashbox for someone to move by
+    # hand. The two Payme RPC methods (`CheckPerformTransaction`,
+    # `CreateTransaction`) answer the SAME condition as `-31008` instead —
+    # they are outside the `ERR-*` envelope entirely (`payme.py`'s own
+    # module docstring), never this code.
+    "ERR-PAY-007": (409, "Разделение платежа не может быть маршрутизировано"),
     "ERR-PERM-001": (409, "Недопустимый переход статуса разрешения"),
     "ERR-PERM-002": (409, "Документ уже подписан и не может быть перевыпущен"),
     "ERR-PERM-003": (409, "Конфликт состояния лесного билета"),

@@ -21,6 +21,7 @@ from typing import get_args
 
 import pytest
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.db import make_session_factory
 from app.modules.audit.models import AuditLog
@@ -49,12 +50,46 @@ _BUDGET_SEED = {
 
 @pytest.fixture(autouse=True)
 async def _reset_payment_recipients(engine):
+    """See the module docstring. Deletes each stray row ONE AT A TIME, in
+    its own SAVEPOINT, rather than one bulk `DELETE`: under `-n 4`, a
+    DIFFERENT file's own test can call `issue_invoice` and freeze one of
+    THIS file's just-created rows into an `invoice_recipients` snapshot
+    between its creation and this teardown running (cross-file
+    interleaving the shared, persistent test DB makes possible — this
+    file's own docstring names the WITHIN-file version of the same class).
+    A bulk `DELETE` would then raise `IntegrityError` on
+    `fk_invoice_recipients_recipient_id_payment_recipients` and roll back
+    the WHOLE cleanup, leaving every stray row ACTIVE — not just the one
+    actually referenced — for the rest of this WORKER's entire run, so a
+    later, unrelated test's own split silently exceeds 100%
+    (`ledger.SplitDoesNotFit`). Falling back to DEACTIVATE (never deleted
+    again, `active=False`) only the row that could not be deleted keeps
+    that failure scoped to the one row actually in use, instead of
+    cascading to every stray row this file ever created."""
     yield
     factory = make_session_factory(engine)
     async with factory() as session:
-        await session.execute(
-            delete(PaymentRecipient).where(PaymentRecipient.id != BUDGET_RECIPIENT_ID)
+        stray_ids = (
+            (
+                await session.execute(
+                    select(PaymentRecipient.id).where(PaymentRecipient.id != BUDGET_RECIPIENT_ID)
+                )
+            )
+            .scalars()
+            .all()
         )
+        for stray_id in stray_ids:
+            try:
+                async with session.begin_nested():
+                    await session.execute(
+                        delete(PaymentRecipient).where(PaymentRecipient.id == stray_id)
+                    )
+            except IntegrityError:
+                await session.execute(
+                    update(PaymentRecipient)
+                    .where(PaymentRecipient.id == stray_id)
+                    .values(active=False)
+                )
         await session.execute(
             update(PaymentRecipient)
             .where(PaymentRecipient.id == BUDGET_RECIPIENT_ID)
@@ -135,7 +170,15 @@ async def test_a_recipient_is_deactivated_not_deleted(client, sys_admin, budget_
     assert response.status_code == 200
     assert response.json()["active"] is False
     listing = await client.get("/api/v1/payments/recipients", headers=sys_admin)
-    assert [r["id"] for r in listing.json()["items"]] == [str(budget_50.id)]
+    # Membership, not exact-list equality: `_reset_payment_recipients`'s own
+    # docstring names the rare cross-file race (a DIFFERENT file's
+    # `issue_invoice` froze a stray row from an EARLIER test into an
+    # `invoice_recipients` snapshot before that row's own teardown could
+    # delete it) that leaves an extra, harmless INACTIVE row behind — this
+    # test's own name is about budget_50 surviving as inactive, not about
+    # being the only row in the whole directory.
+    by_id = {r["id"]: r for r in listing.json()["items"]}
+    assert by_id[str(budget_50.id)]["active"] is False
 
 
 async def test_uz_latn_is_required_in_the_name(client, sys_admin):

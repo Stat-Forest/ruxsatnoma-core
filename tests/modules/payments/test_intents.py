@@ -31,10 +31,13 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.events import Event, publish
 from app.core.time import business_today
 from app.main import create_app
+from app.modules.applications.events import APPLICATION_APPROVED
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant, Representation
+from app.modules.payments import service as payments_service
 from app.modules.payments.models import Invoice
 from tests.conftest import make_client
 from tests.modules.admin.test_organizations_admin import auth_client
@@ -301,3 +304,53 @@ async def test_a_representative_can_start_a_payment_for_the_applicant_they_repre
     )
     assert result.status_code == 201, result.text
     assert result.json()["payment_url"].startswith("https://checkout.paycom.uz/")
+
+
+# --- stage 7.9 task 6 (decision #160): the citizen's own refusal point ------
+
+
+@pytest.fixture
+async def invoice_with_unrouted_receiver(
+    db: AsyncSession, approved_application: Application
+) -> Invoice:
+    """Built through the REAL event path, same as `conftest.py`'s own
+    `pending_invoice` — but WITHOUT that fixture's task-6 addition of an
+    org carrying a Payme id: `approved_application` here names no contour
+    and no assigned organization, so the leshoz's own remainder row (half
+    of the seeded `budget_50`'s split — `budget_50` is itself made
+    routable module-wide, `_budget_recipient_is_routable`) resolves to NO
+    organization at all and carries no Payme id
+    (`service._leshoz_snapshot_fields`'s own fallback). The exact "not
+    fully routable" shape `test_payme_receivers.py` tests at the Payme RPC
+    layer (`-31008`), reached here instead through the citizen's own
+    `POST /pay-intents` button (`ERR-PAY-007`)."""
+    await publish(
+        db, Event(name=APPLICATION_APPROVED, payload={"application_id": approved_application.id})
+    )
+    await db.commit()
+    row = await payments_service.invoice_for_application(db, approved_application.id)
+    assert row is not None
+    await db.refresh(row)
+    return row
+
+
+async def test_pay_intents_refuses_a_split_that_cannot_be_routed(
+    applicant_client, invoice_with_unrouted_receiver
+):
+    """Override 1: the refusal a human actually SEES, so it comes FIRST and
+    must be legible — `ERR-PAY-007` (409), inside the normal `ERR-*`
+    envelope (never a raw Payme code, which belongs on the OTHER refusal
+    point, `payme.py`'s own `-31008`), `details.missing` naming the
+    receiver that lacks a Payme id by POSITION and NAME — never an
+    invented id."""
+    result = await applicant_client.post(
+        f"/api/v1/invoices/{invoice_with_unrouted_receiver.id}/pay-intents",
+        json={"provider": "payme"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert result.status_code == 409, result.text
+    body = result.json()
+    assert body["error"]["code"] == "ERR-PAY-007"
+    missing = body["error"]["details"]["missing"]
+    assert missing, "details.missing must name at least one receiver"
+    assert all(set(row) == {"position", "name"} for row in missing)

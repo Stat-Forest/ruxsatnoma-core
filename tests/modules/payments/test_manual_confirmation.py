@@ -31,10 +31,11 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
+from app.db import make_session_factory
 from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
@@ -725,14 +726,29 @@ async def test_an_overpayment_is_still_accepted(
 
 
 @pytest.fixture
-async def receiver_fixed_50000(db: AsyncSession) -> PaymentRecipient:
+async def receiver_fixed_50000(db: AsyncSession, engine) -> AsyncIterator[PaymentRecipient]:
     """A configured FIXED receiver, 50 000 — chosen so that, ALONGSIDE the
     seeded `budget_50` (50%), it still fits `approved_application`'s full
     150 000.00 invoice at issuance (75 000 + 50 000 = 125 000, leaving the
     leshoz 25 000), but no longer fits the 40 000
     `test_a_split_that_does_not_fit_is_refused_through_the_http_route`
     confirms — a manual confirmation smaller than this fixed amount, the
-    combination review round 1's Important 1 names."""
+    combination review round 1's Important 1 names.
+
+    Deactivated at teardown (never deleted — a row already frozen into an
+    `invoice_recipients` snapshot cannot be deleted at all,
+    `fk_invoice_recipients_recipient_id_payment_recipients`), through
+    `engine`, never `db`: the ONE test that uses this fixture drives
+    `payments_view_client`/`head_client`, real HTTP clients whose own
+    `_commit_pending_before_requests` commits this row FOR REAL before
+    their first request — `db`'s own rollback at teardown cannot undo a
+    write the app's separate connection already committed. Left ACTIVE, it
+    would push every LATER invoice built on this xdist worker (`budget_50`
+    50% + this 50 000 fixed) past what a smaller invoice can fit,
+    `ledger.SplitDoesNotFit`, in a file that has nothing to do with this
+    one (the class `tests/modules/payments/conftest.py::
+    _budget_recipient_is_routable`'s own docstring names for the identical
+    reason, stage 7.9 task 6)."""
     row = PaymentRecipient(
         name={"uz_latn": "Ekologiya jamg'armasi"},
         kind="fixed",
@@ -741,7 +757,14 @@ async def receiver_fixed_50000(db: AsyncSession) -> PaymentRecipient:
     )
     db.add(row)
     await db.flush()
-    return row
+    row_id = row.id
+    yield row
+    factory = make_session_factory(engine)
+    async with factory() as session:
+        await session.execute(
+            update(PaymentRecipient).where(PaymentRecipient.id == row_id).values(active=False)
+        )
+        await session.commit()
 
 
 @pytest.fixture
