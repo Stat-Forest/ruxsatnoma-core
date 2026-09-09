@@ -248,12 +248,24 @@ def downgrade() -> None:
     op.add_column("refunds", sa.Column("budget_amount", sa.Numeric(18, 2), nullable=True))
     op.add_column("refunds", sa.Column("recipient_amount", sa.Numeric(18, 2), nullable=True))
     op.add_column("refunds", sa.Column("other_amount", sa.Numeric(18, 2), nullable=True))
+    # NOT VALID: at this exact instant the three columns are all NULL for
+    # EVERY row (step 1 reversed, below, is what fills them back in) — a
+    # validating ADD CONSTRAINT checks every existing row immediately, so
+    # any `returned` refund with a nonzero `final_amount` would hit
+    # coalesce(NULL,0)*3 = 0 <> final_amount and crash the whole downgrade
+    # before a single value came back (review round 1, CRITICAL 1). NOT
+    # VALID defers that check to the explicit VALIDATE CONSTRAINT below,
+    # run only after step 1 reversed has restored real values — the same
+    # two-step this codebase already uses in
+    # migrations/versions/0003_auth.py:221 (an FK there, a CHECK here, same
+    # reason: don't validate over existing data before that data is right).
     op.create_check_constraint(
         "returned_needs_complete_breakdown",
         "refunds",
         "status <> 'returned' OR (final_amount IS NOT NULL AND "
         "coalesce(budget_amount, 0) + coalesce(recipient_amount, 0) "
         "+ coalesce(other_amount, 0) = final_amount)",
+        postgresql_not_valid=True,
     )
 
     # --- Step 2 reversed: allocations 'receiver' rows against the budget
@@ -272,46 +284,81 @@ def downgrade() -> None:
 
     # --- Step 1 reversed: copy refund_components back onto refunds' three
     # columns, then delete the rows this migration's own upgrade() created.
-    # The budget component -> budget_amount:
-    budget_components = (
+    #
+    # Both columns for the SAME refund are set in ONE UPDATE, never two
+    # sequential single-column ones (the original shape of this section,
+    # and a SECOND instance of review round 1's CRITICAL 1): the CHECK
+    # re-added above is NOT VALID only for rows that already existed when
+    # it was created — Postgres still enforces it on every write from that
+    # point on, valid or not. Two separate UPDATEs would carry a row
+    # through an intermediate state with `budget_amount` set and
+    # `recipient_amount` still NULL, which fails the sum check exactly
+    # like the constraint-creation bug did, just one statement later. A
+    # single UPDATE with two correlated subqueries computes BOTH new
+    # values before the row is written, so the CHECK only ever sees each
+    # row's final, complete shape — proven against a scratch table before
+    # this line shipped (see this task's own fix report).
+    #
+    # The old `other_amount` column stays NULL for every row — the split
+    # between the two legacy columns cannot be recovered once folded into
+    # one leshoz component, and NULL reads as "nothing from this source"
+    # exactly like `0` did before this migration ran.
+    budget_count = (
         op.get_bind()
         .execute(
             sa.text(
-                "SELECT refund_id, amount FROM refund_components "
+                "SELECT count(*) FROM refund_components "
                 "WHERE recipient_id = CAST(:recipient_id AS uuid)"
             ).bindparams(recipient_id=BUDGET_RECIPIENT_ID)
         )
-        .all()
+        .scalar_one()
     )
-    for row in budget_components:
-        op.execute(
-            sa.text(
-                "UPDATE refunds SET budget_amount = CAST(:amount AS numeric(18,2)) "
-                "WHERE id = CAST(:refund_id AS uuid)"
-            ).bindparams(amount=row.amount, refund_id=row.refund_id)
-        )
-    # The leshoz's remainder component -> recipient_amount (the old
-    # other_amount column stays NULL — the split between the two legacy
-    # columns cannot be recovered, and NULL reads as "nothing from this
-    # source" exactly like `0` did before this migration ran).
-    leshoz_components = (
+    leshoz_count = (
         op.get_bind()
-        .execute(
-            sa.text("SELECT refund_id, amount FROM refund_components WHERE recipient_id IS NULL")
-        )
-        .all()
+        .execute(sa.text("SELECT count(*) FROM refund_components WHERE recipient_id IS NULL"))
+        .scalar_one()
     )
-    for row in leshoz_components:
-        op.execute(
-            sa.text(
-                "UPDATE refunds SET recipient_amount = CAST(:amount AS numeric(18,2)) "
-                "WHERE id = CAST(:refund_id AS uuid)"
-            ).bindparams(amount=row.amount, refund_id=row.refund_id)
-        )
+    # SUM(), not a bare `amount` column read: `uq_refund_components_source`
+    # does NOT stop two `recipient_id IS NULL` rows on the SAME refund
+    # (`RefundComponent`'s own docstring — Postgres treats `NULL <> NULL`
+    # under a plain UNIQUE constraint; only the SERVICE layer refuses that
+    # duplicate, per Override 1). A bare `(SELECT amount FROM ... )`
+    # correlated subquery raises `CardinalityViolationError` the instant
+    # such a pair exists for one refund — hit for real against this
+    # worktree's own accumulated test data while proving this fix (a
+    # leftover pair from an earlier manual guard-removal check, `amount`
+    # 300000.00 each). An aggregate always collapses to exactly one row
+    # (NULL when nothing matches), so this is correct for the normal
+    # single-row case and merely SUMS instead of crashing for the
+    # anomalous one — consistent with what `recipient_amount` always meant
+    # under the old schema: everything that went to the leshoz's own
+    # account, not "the single row that happened to be there."
+    op.execute(
+        sa.text(
+            "UPDATE refunds SET "
+            "budget_amount = (SELECT sum(amount) FROM refund_components "
+            "WHERE refund_id = refunds.id AND recipient_id = CAST(:recipient_id AS uuid)), "
+            "recipient_amount = (SELECT sum(amount) FROM refund_components "
+            "WHERE refund_id = refunds.id AND recipient_id IS NULL) "
+            "WHERE id IN (SELECT refund_id FROM refund_components "
+            "WHERE recipient_id = CAST(:recipient_id AS uuid) OR recipient_id IS NULL)"
+        ).bindparams(recipient_id=BUDGET_RECIPIENT_ID)
+    )
     logger.info(
         "0046 downgrade: restored %d budget_amount and %d recipient_amount row(s)",
-        len(budget_components),
-        len(leshoz_components),
+        budget_count,
+        leshoz_count,
+    )
+
+    # Now that every row's legacy columns carry real values, validate the
+    # NOT VALID constraint created above — the deferred half of the
+    # NOT VALID -> VALIDATE two-step (review round 1, CRITICAL 1). A row
+    # whose breakdown genuinely does not add up (should not exist: the OLD
+    # CHECK enforced this invariant on every write until this migration's
+    # upgrade() dropped it) raises here, loudly, rather than silently
+    # leaving an unenforced CHECK behind.
+    op.execute(
+        "ALTER TABLE refunds VALIDATE CONSTRAINT ck_refunds_returned_needs_complete_breakdown"
     )
 
     # Delete every refund_components row this upgrade() created — i.e.

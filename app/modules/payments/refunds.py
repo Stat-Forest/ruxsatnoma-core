@@ -87,5 +87,12 @@ def breakdown_is_complete(final_amount: Decimal, components: Sequence[Decimal]) 
     caller's own list of component amounts — one per source, in whatever
     order the accountant entered them. An empty `components` reads as "no
     breakdown submitted", the same way three `None`s did before: it sums to
-    `0.00`, which is complete only when `final_amount` is also `0.00`."""
+    `0.00`, which this pure function reports complete only when
+    `final_amount` is also `0.00` — a branch no real caller can reach,
+    since `RefundSubmitDecisionIn.final_amount` requires `gt=0` and nothing
+    upstream ever calls this with an empty `components` and a positive
+    `final_amount` expecting `True`. Kept for the function's own
+    correctness (it mirrors the trigger's arithmetic exactly, and the
+    trigger has no such upstream schema to lean on), not because the API
+    can exercise it."""
     return sum(components, Decimal("0.00")) == final_amount
