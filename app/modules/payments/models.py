@@ -85,6 +85,16 @@ TARGET_RECIPIENT = "recipient"
 TARGET_OTHER = "other"
 TARGET_RECEIVER = "receiver"
 
+# Mirrors migrations/versions/0045_payment_split.py::BUDGET_RECIPIENT_ID (and
+# 0046's own copy) — a migration may not import app code, so each keeps its
+# own literal, the same idiom `tests/modules/payments/conftest.py` already
+# uses for the identical id. This is the one copy APPLICATION code may
+# import: `dashboard.repo.payments_kpi` names the seeded budget row's OWN
+# share by this id (decision #154, Override 1 of stage 7.9 task 8) rather
+# than by a `target` string — `'budget'` is gone from `ALLOCATION_TARGETS`
+# for good, but the seeded row itself, and its stable id, are not.
+BUDGET_RECIPIENT_ID = uuid.UUID("0192f2a0-0000-7000-8000-000000000001")
+
 MANUAL_CONFIRMATION_STATUSES = ("pending_check", "confirmed", "rejected")
 BANK_STATEMENT_SOURCES = ("api", "file")  # only "file" has a writer yet (ruling 20)
 BANK_STATEMENT_FORMATS = ("csv",)  # ruling 9
@@ -244,17 +254,22 @@ class ProviderTransaction(Base):
 
 
 class Allocation(Base):
-    """The ledger of the 50/50 split and of refunds (design/02 § allocations).
-    The 50/50 proportion itself is enforced in code (Task 3's
-    `payments.ledger`, never here); `amount` may be negative (a refund entry)
-    so it carries no positivity CHECK.
+    """The ledger of the payment split and of refunds (design/02 §
+    allocations). The split itself is computed in code (`payments.ledger`,
+    never here) — stage 7.9 (decision #154, 2026-09-09) replaced the
+    original fixed 50/50 proportion with a configurable receivers
+    directory; see this module's own docstring banner for the full
+    history. `amount` may be negative (a refund entry) so it carries no
+    positivity CHECK.
 
     `account` is nullable (Task 3 ruling, amending this same unmerged
-    migration — see `migrations/versions/0017_payments.py`): the state
-    budget's account number is not in the system at all (`tz/08` — the
-    budget half is settled by accounting outside the system), and a
-    leshoz's `requisites` JSONB may legitimately have no `"account"` key
-    (`app/seed/data/organizations.example.json`'s `leshoz-beruniy`). A
+    migration — see `migrations/versions/0017_payments.py`): a leshoz's own
+    `requisites` JSONB may legitimately have no `"account"` key
+    (`app/seed/data/organizations.example.json`'s `leshoz-beruniy`), and —
+    since stage 7.9 — a configured receiver's row is null STRUCTURALLY,
+    never for lack of data: `payment_recipients` identifies a Payme WALLET
+    (`payme_account_id`), never a bank account, so this column carries
+    nothing for any of them, the seeded state-budget row included. A
     placeholder string in a financial ledger's account column would be
     worse than NULL.
 
@@ -348,7 +363,9 @@ class InvoiceRecipient(Base):
     invoice divides into.
 
     The LAST row of an invoice's snapshot is the leshoz: `kind='remainder'`,
-    `recipient_id IS NULL`, `payme_account_id` frozen from the organization.
+    `recipient_id IS NULL`, `name` and `payme_account_id` both frozen from
+    the organization (task 4's `_leshoz_snapshot_fields`, which reads both
+    off the same lookup so the two can never drift apart from each other).
 
     `amount` is this row's share OF THE INVOICE. It is display and `receivers`
     data — NOT what the ledger writes. `confirm_payment` re-runs the frozen
