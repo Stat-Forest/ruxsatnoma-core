@@ -56,6 +56,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.occupancy.router import router as occupancy_router
 from app.modules.oversight.router import router as oversight_router
 from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
@@ -321,6 +322,11 @@ def create_app() -> FastAPI:
     app.include_router(gis_layers_router, prefix="/api/v1")
     app.include_router(gis_imports_router, prefix="/api/v1")
     app.include_router(gis_router, prefix="/api/v1")
+    # Stage 9 wave 2: the applicant's occupancy calendar (ruling #176/#177) —
+    # a separate module mounted on the SAME `/gis/contours/{id}/...` prefix,
+    # not a route added to `gis_router` itself (`occupancy` owns no `gis`
+    # table).
+    app.include_router(occupancy_router, prefix="/api/v1")
     app.include_router(norms_refs_router, prefix="/api/v1")
     app.include_router(norms_router, prefix="/api/v1")
     app.include_router(norms_activity_seasons_router, prefix="/api/v1")
