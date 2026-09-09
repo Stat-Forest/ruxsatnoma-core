@@ -895,6 +895,35 @@ async def submit_refund_decision(
     `ERR-VAL-001` naming the reason, before either the DB or the sum check
     ever sees it.
 
+    **Whole-branch review Important 5: every `recipient_id` must be a
+    source THIS INVOICE actually paid.** Before this, only the duplicate
+    check and the sum were verified — a stale or mistyped uuid (or one
+    that names a receiver real but never active on THIS invoice) reached
+    `flush()` and either failed the FK as an uncaught `IntegrityError` (a
+    500, the exact conversion this codebase converts to `ERR-*`
+    everywhere else) or, worse, named a recipient that IS a real row in
+    `payment_recipients` but never received a share of THIS payment — a
+    valid-looking id that is simply WRONG. That second case is silent and
+    dangerous: `approve_refund` would later write a negative allocation
+    against a party that took in nothing on this invoice, while the party
+    that actually did keeps its untouched positive row — the total balance
+    check still passes (it only checks the SUM), so the per-receiver
+    balances quietly go wrong, one negative and one whole, with nothing
+    to catch it. `available_sources_for` already computes the legal set
+    for exactly this invoice (`RefundOut.available_sources`, the same read
+    the accountant's own form is built from) — checked against here too,
+    so a submission can never name a source its own form never offered.
+
+    **The empty-snapshot case is not "nothing is legal", it is "only the
+    leshoz is".** `available_sources_for` answers `[]` for an invoice
+    issued before stage 7.9 (`invoice_recipients` is purely additive,
+    ruling P1 — no backfill, so a real pre-migration invoice has no
+    snapshot at all) — the SAME "everything to the leshoz" reading that
+    empty answer's own docstring gives, not "refuse every submission
+    against this invoice". So an empty `available_sources_for` widens the
+    legal set to `{None}` rather than narrowing it to nothing: the
+    leshoz's own remainder is still refundable, and nothing else is.
+
     A component with `amount == 0.00` is accepted into the sum (the same
     "nothing from this source" reading `breakdown_is_complete` gives an
     empty list) but writes no `RefundComponent` row — that table's own
@@ -910,6 +939,15 @@ async def submit_refund_decision(
     sources = [component.recipient_id for component in components]
     if len(sources) != len(set(sources)):
         raise err("ERR-VAL-001", details={"reason": "duplicate_source"})
+    legal_sources = {
+        source.recipient_id for source in await available_sources_for(db, row.invoice_id)
+    } or {None}
+    for source_id in sources:
+        if source_id not in legal_sources:
+            raise err(
+                "ERR-VAL-001",
+                details={"reason": "recipient_not_in_split", "recipient_id": str(source_id)},
+            )
     if not refunds.breakdown_is_complete(
         final_amount, [component.amount for component in components]
     ):
@@ -1168,22 +1206,42 @@ async def refund_components_out(db: AsyncSession, refund: Refund) -> list[Refund
     `returned` — the same `None`-until-decided posture the old
     `budget_account` field documented (`tz/12` #15) — and a configured
     receiver's account stays `None` always (never a bank account of its
-    own, `payments.ledger`'s own docstring)."""
+    own, `payments.ledger`'s own docstring).
+
+    The leshoz's own NAME (`recipient_id is None`) is read off the SAME
+    frozen `invoice_recipients` snapshot `available_sources_for` reads for
+    this identical invoice (whole-branch review Minor 6, fixed from an
+    unconditional `LESHOZ_SNAPSHOT_NAME`): before the fix, `available_
+    sources` on `GET /refunds/{id}` carried the leshoz's REAL frozen
+    organization name while `components` on the SAME response labelled
+    the identical party with the generic `{"uz_latn": "Leshoz"}` fallback
+    — one response naming one party two different ways. `
+    LESHOZ_SNAPSHOT_NAME` stays the fallback for the one case that
+    genuinely has no snapshot to read: an invoice issued before stage 7.9
+    (`invoice_recipients` is purely additive, ruling P1)."""
     rows = await repo.list_refund_components(db, refund.id)
     if not rows:
         return []
     leshoz_account: str | None = None
-    if refund.status == _STATUS_RETURNED and any(row.recipient_id is None for row in rows):
-        application = await applications_service.get(db, refund.application_id)
-        if application is not None:
-            leshoz_account = await payments_service.resolve_recipient_account(
-                db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
-            )
+    leshoz_name: dict[str, Any] = payments_service.LESHOZ_SNAPSHOT_NAME
+    if any(row.recipient_id is None for row in rows):
+        snapshot = await payments_service.invoice_recipients(db, refund.invoice_id)
+        frozen_remainder = next((s for s in snapshot if s.recipient_id is None), None)
+        if frozen_remainder is not None:
+            leshoz_name = frozen_remainder.name
+        if refund.status == _STATUS_RETURNED:
+            application = await applications_service.get(db, refund.application_id)
+            if application is not None:
+                leshoz_account = await payments_service.resolve_recipient_account(
+                    db,
+                    contour_id=application.contour_id,
+                    assigned_org_id=application.assigned_org_id,
+                )
     names: dict[uuid.UUID, dict[str, Any]] = {}
     out: list[RefundComponentOut] = []
     for row in rows:
         if row.recipient_id is None:
-            name = payments_service.LESHOZ_SNAPSHOT_NAME
+            name = leshoz_name
             account = leshoz_account
         else:
             if row.recipient_id not in names:

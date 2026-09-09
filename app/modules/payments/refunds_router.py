@@ -14,13 +14,15 @@ the maker-checker `tz/08` describes, mirroring `backoffice_router.py`'s own
 manual-confirmation split one permission over.
 
 Stage 7.9 task 7 (decision #154) adds `GET /refunds/{id}` — the single-item
-read `available_sources` needs, gated `PAYMENTS_VIEW` like the list route —
-and replaces the old `budget_amount`/`recipient_amount`/`other_amount`
-breakdown with `components`, built by `backoffice_service.
-refund_components_out` on every response that names one refund (never on
-the paged list, matching the old `allocations`/`recipient_account`/
-`budget_account` fields' own scope, which the list route never populated
-either)."""
+read `available_sources` needs — and replaces the old `budget_amount`/
+`recipient_amount`/`other_amount` breakdown with `components`, built by
+`backoffice_service.refund_components_out` on every response that names one
+refund (never on the paged list, matching the old `allocations`/
+`recipient_account`/`budget_account` fields' own scope, which the list route
+never populated either). Both reads are gated `PAYMENTS_VIEW` OR
+`PAYMENTS_CONFIRM` (whole-branch review Important 3) — the rahbar
+(`executor_head`) approves through `PAYMENTS_CONFIRM` alone and needs both
+to see what he is approving before he commits to it."""
 
 import uuid
 from typing import Annotated, Any
@@ -30,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.core.schemas import PAGING_MAX, Page
-from app.modules.auth.deps import get_current_user, require_permission
+from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service
 from app.modules.payments.backoffice_schemas import (
@@ -130,12 +132,20 @@ async def approve_refund(
 async def get_refund(
     refund_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    actor: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    actor: Annotated[User, Depends(require_any_permission(PAYMENTS_VIEW, PAYMENTS_CONFIRM))],
 ) -> Any:
     """The single-item read (stage 7.9 task 7): `available_sources` — the
     invoice's own frozen split, so the accountant's/rahbar's own form
     offers exactly the parties THIS payment was split between — and
-    `components`, whatever has already been submitted."""
+    `components`, whatever has already been submitted.
+
+    Gated on `PAYMENTS_VIEW` OR `PAYMENTS_CONFIRM` (whole-branch review
+    Important 3, fixed from `PAYMENTS_VIEW` alone): the rahbar
+    (`executor_head`, `payments.confirm`) is exactly who this docstring's
+    own "rahbar's own form" refers to, and under the narrower gate he could
+    reach `POST .../approve` (which returns `components` too) but not THIS
+    route — reading the breakdown only by committing to it. `available_
+    sources` existed for the actor it was unreachable to."""
     row = await backoffice_service.get_refund(db, refund_id)
     out = RefundOut.model_validate(row)
     out.components = await backoffice_service.refund_components_out(db, row)
@@ -146,7 +156,7 @@ async def get_refund(
 @router.get("/refunds", response_model=Page[RefundOut])
 async def list_refunds(
     db: Annotated[AsyncSession, Depends(get_db)],
-    actor: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    actor: Annotated[User, Depends(require_any_permission(PAYMENTS_VIEW, PAYMENTS_CONFIRM))],
     application_id: uuid.UUID | None = None,
     status: Annotated[str | None, Query(pattern=_STATUS_PATTERN)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -157,7 +167,13 @@ async def list_refunds(
     `available_sources` stay `[]` on every row here, the same scope the old
     `allocations`/`recipient_account`/`budget_account` fields had: a page of
     up to 200 rows is not the place for a per-row extra query, and
-    `GET /refunds/{id}` is the single-item read built for it."""
+    `GET /refunds/{id}` is the single-item read built for it.
+
+    Widened to `PAYMENTS_VIEW` OR `PAYMENTS_CONFIRM` alongside `get_refund`
+    above (whole-branch review Important 3): this docstring already called
+    it the rahbar's own register too, and there is no other route through
+    which he could ever discover a refund's id to approve it — no
+    notification carries one today (`submit_refund_decision` sends none)."""
     rows, total = await backoffice_service.list_refunds(
         db,
         application_id=application_id,
