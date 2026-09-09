@@ -140,13 +140,18 @@ async def update(
     is written (the same "refuse before the database does" reasoning
     `PaymentRecipientIn._one_rule_only` applies at creation, restated here
     because a `PATCH` body has no `kind` field of its own to validate
-    against). An explicit `null` for the row's OWN amount field is refused
-    the same way a wrong-kind field is: `PaymentRecipientPatch` types both
-    fields `Decimal | None` so pydantic accepts a bare `null`, but clearing
-    the only amount a `rule_matches_kind` row is allowed to carry has no
-    legal meaning here — the DB CHECK would refuse it anyway, and refusing
-    it here turns that into a clean 422 instead of a 500 from the
-    `resulting_percent is not None` assertion below."""
+    against). An explicit `null` is refused for every column that is
+    `Optional` on the wire only for PATCH's own "field not sent" idiom but
+    is NOT NULL underneath: `percent`/`fixed_amount` (their kind-mismatch
+    guard covers a bare `null` too, since clearing the only amount a
+    `rule_matches_kind` row is allowed to carry has no legal meaning), and
+    `sort_order`/`active`, which carry no such kind-relative meaning at all
+    — a `null` there is simply not a legal value for a NOT NULL column
+    (`models.py`'s `sort_order: Mapped[int]`, `active: Mapped[bool]`). Every
+    one of these is checked before the generic `setattr` loop below, so the
+    DB CHECK / NOT NULL constraint is never the thing that catches a bad
+    `PATCH` body — this turns what would otherwise be an uncaught
+    `IntegrityError` (500) into a clean 422."""
     row = await _recipient_or_404(db, recipient_id)
     fields = data.model_dump(exclude_unset=True)
     before = _snapshot(row)
@@ -155,6 +160,10 @@ async def update(
         raise err("ERR-VAL-001", details={"reason": "invalid_percent_for_recipient_kind"})
     if "fixed_amount" in fields and (row.kind != "fixed" or fields["fixed_amount"] is None):
         raise err("ERR-VAL-001", details={"reason": "invalid_fixed_amount_for_recipient_kind"})
+    if "sort_order" in fields and fields["sort_order"] is None:
+        raise err("ERR-VAL-001", details={"reason": "sort_order_cannot_be_null"})
+    if "active" in fields and fields["active"] is None:
+        raise err("ERR-VAL-001", details={"reason": "active_cannot_be_null"})
 
     resulting_active = fields.get("active", row.active)
     if row.kind == "percent" and resulting_active:
@@ -179,18 +188,6 @@ async def update(
         new_value=_snapshot(row),
     )
     return _to_out(row)
-
-
-async def set_active(
-    db: AsyncSession, *, recipient_id: uuid.UUID, active: bool, actor: User
-) -> PaymentRecipientOut:
-    """The semantic name for decision #157's "deactivated, never deleted" —
-    a bare `{"active": ...}` patch, routed through `update` so the
-    percent-total check on (re)activation and the single audit row per call
-    never have a second implementation to drift from."""
-    return await update(
-        db, recipient_id=recipient_id, data=PaymentRecipientPatch(active=active), actor=actor
-    )
 
 
 async def active_rules(db: AsyncSession) -> list[ledger.RecipientRule]:

@@ -186,3 +186,106 @@ async def test_every_change_leaves_an_audit_row_with_both_values(db, client, sys
     assert row is not None
     assert row.old_value["percent"] == "50.00"
     assert row.new_value["percent"] == "40.00"
+
+
+# --- Fix round 1 (task-3-findings-r1.md) --------------------------------------
+
+
+async def test_clearing_a_fixed_recipients_own_fixed_amount_is_refused(client, sys_admin):
+    """Minor 4 — the mirror image of `test_clearing_a_percent_recipients_
+    own_percent_is_refused` above: `fixed_amount` is typed `Decimal | None`
+    on `PaymentRecipientPatch` too, so a bare `null` parses, and the same
+    kind-mismatch guard in `recipients_service.update` must refuse it the
+    same way — the two branches are symmetric enough that an asymmetric
+    regression on this one would otherwise be invisible."""
+    create = await client.post(
+        "/api/v1/payments/recipients",
+        json={"name": {"uz_latn": "Z"}, "kind": "fixed", "fixed_amount": "5000.00"},
+        headers=sys_admin,
+    )
+    assert create.status_code == 201
+    recipient_id = create.json()["id"]
+
+    response = await client.patch(
+        f"/api/v1/payments/recipients/{recipient_id}",
+        json={"fixed_amount": None},
+        headers=sys_admin,
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_an_explicit_null_sort_order_is_refused(client, sys_admin, budget_50):
+    """Important 1 — `sort_order: Mapped[int]` is NOT NULL, but
+    `PaymentRecipientPatch.sort_order` is `int | None` for the "field not
+    sent" idiom, so an explicit `{"sort_order": null}` used to reach the
+    generic `setattr` loop and crash `db.flush()` with an uncaught
+    `IntegrityError` (500, `ERR-SYS-001`) instead of a clean 422."""
+    response = await client.patch(
+        f"/api/v1/payments/recipients/{budget_50.id}",
+        json={"sort_order": None},
+        headers=sys_admin,
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_an_explicit_null_active_is_refused(client, sys_admin, budget_50):
+    """Important 1, the `active` half of the same gap — `active: Mapped[bool]`
+    is NOT NULL, but `PaymentRecipientPatch.active` is `bool | None`, so
+    `{"active": null}` used to reach `db.flush()` and raise an uncaught
+    `IntegrityError` (500) rather than a 422."""
+    response = await client.patch(
+        f"/api/v1/payments/recipients/{budget_50.id}",
+        json={"active": None},
+        headers=sys_admin,
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_increasing_the_sole_active_rows_own_percent_is_not_double_counted(
+    client, sys_admin, budget_50
+):
+    """Important 2.1 — `_assert_percent_fits` must EXCLUDE the row being
+    edited from the current total before adding its own new value back in
+    (`exclude_id=row.id`). A DECREASE alone can never catch a broken
+    exclusion, since it always still fits under the ceiling; only an
+    INCREASE past the point where self-double-counting would wrongly
+    refuse it proves the exclusion actually runs. `budget_50` is the sole
+    active row at 50%: patched to 90%, the correct total is 90 (<=100); with
+    the exclusion broken it would see 50 (itself, still counted once) + 90
+    = 140 and wrongly 422."""
+    response = await client.patch(
+        f"/api/v1/payments/recipients/{budget_50.id}",
+        json={"percent": "90.00"},
+        headers=sys_admin,
+    )
+    assert response.status_code == 200
+    assert response.json()["percent"] == "90.00"
+
+
+async def test_reactivating_a_row_that_would_exceed_the_ceiling_is_refused(
+    client, sys_admin, budget_50_inactive
+):
+    """Important 2.2 — a row being ACTIVATED must be INCLUDED in the total
+    (`resulting_active` branch), not left out the way an untouched inactive
+    row is. `budget_50_inactive` starts deactivated, so the active total is
+    0% and a fresh 60% row may be created; reactivating the budget row on
+    top of it (60 + 50 = 110) must be refused with the same ceiling error a
+    straight creation over 100 gets."""
+    create = await client.post(
+        "/api/v1/payments/recipients",
+        json={"name": {"uz_latn": "Y"}, "kind": "percent", "percent": "60.00"},
+        headers=sys_admin,
+    )
+    assert create.status_code == 201
+
+    reactivate = await client.patch(
+        f"/api/v1/payments/recipients/{budget_50_inactive.id}",
+        json={"active": True},
+        headers=sys_admin,
+    )
+    assert reactivate.status_code == 422
+    assert reactivate.json()["error"]["code"] == "ERR-VAL-001"
+    assert reactivate.json()["error"]["details"]["reason"] == "percent_total_exceeds_100"
