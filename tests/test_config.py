@@ -46,6 +46,9 @@ def test_prod_accepts_custom_secret_key():
         oneid_client_secret="a-real-oneid-client-secret",
         oneid_scope="forestry_uz",
         oneid_redirect_uri="https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback",
+        # Stage 5.2: a real E-IMZO needs the site host its API-KEY is bound to
+        # (decision #165); eimzo_base_url keeps its private-network default.
+        eimzo_site_host="admin.ruxsatnoma-urmon.uz",
         eskiz_email="bot@example.uz",
         eskiz_password="a-real-eskiz-password",
         eskiz_sender="4546",
@@ -106,6 +109,9 @@ def test_prod_accepts_real_adapters(monkeypatch):
     monkeypatch.setenv(
         "ONEID_REDIRECT_URI", "https://ruxsatnoma.example.uz/api/v1/auth/oneid/callback"
     )
+    # Stage 5.2: a real E-IMZO needs the site host its API-KEY is bound to
+    # (decision #165); EIMZO_BASE_URL keeps its private-network default.
+    monkeypatch.setenv("EIMZO_SITE_HOST", "admin.ruxsatnoma-urmon.uz")
     monkeypatch.setenv("ESKIZ_EMAIL", "bot@example.uz")
     monkeypatch.setenv("ESKIZ_PASSWORD", "real-eskiz-password-for-prod-guard-test")
     monkeypatch.setenv("ESKIZ_SENDER", "4546")
@@ -331,3 +337,47 @@ def test_mock_oneid_needs_none_of_it():
     # never be made to satisfy the real-mode guard (design/04 §1.5).
     settings = Settings(oneid_mode="mock", _env_file=None)  # pyright: ignore[reportCallIssue]
     assert settings.oneid_scope == "mock-scope"
+
+
+def test_eimzo_real_requires_base_url_and_site_host() -> None:
+    with pytest.raises(ValidationError, match="eimzo_mode=real requires eimzo_base_url"):
+        Settings(
+            eimzo_mode="real",
+            eimzo_base_url="",
+            eimzo_site_host="admin.example.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+    with pytest.raises(ValidationError, match="eimzo_mode=real requires eimzo_site_host"):
+        Settings(
+            eimzo_mode="real",
+            eimzo_base_url="http://eimzo:8080",
+            eimzo_site_host="",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+
+
+def test_eimzo_real_refuses_a_public_base_url() -> None:
+    # The server must sit in the stack's private network (plan 05.2 R2). A
+    # public address means somebody exposed it, and that is worth failing
+    # over. "Private" is not "contains no dot": a bare Docker service name
+    # (`eimzo`), `localhost` and any RFC-1918/loopback numeric address are
+    # all private too, and dev/CI both run against `http://127.0.0.1:8080`.
+    with pytest.raises(ValidationError, match="must not be publicly reachable"):
+        Settings(
+            eimzo_mode="real",
+            eimzo_base_url="https://eimzo.ruxsatnoma-urmon.uz",
+            eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+    for base_url in (
+        "http://127.0.0.1:8080",
+        "http://eimzo:8080",
+        "http://10.1.2.3:8080",
+    ):
+        settings = Settings(
+            eimzo_mode="real",
+            eimzo_base_url=base_url,
+            eimzo_site_host="admin.ruxsatnoma-urmon.uz",
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+        )
+        assert settings.eimzo_base_url == base_url

@@ -1,5 +1,6 @@
 """Настройки приложения: всё из окружения/.env, никаких хардкодов по коду."""
 
+import ipaddress
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
@@ -26,6 +27,11 @@ class Settings(BaseSettings):
     cors_origins: list[str] = []
     oneid_mode: Literal["mock", "real"] = "mock"
     eimzo_mode: Literal["mock", "real"] = "mock"
+    eimzo_base_url: str = "http://eimzo:8080"
+    eimzo_timeout_seconds: float = 20.0
+    # The `Host` header e-imzo-server is given on every call: the domain the
+    # API-KEY is bound to (decision #165), NOT our API's own address.
+    eimzo_site_host: str = ""
     sms_mode: Literal["mock", "real"] = "mock"
     email_mode: Literal["mock", "real"] = "mock"
     # Ruling #124. Until stage 7.0 this was ONE setting serving two unrelated
@@ -157,6 +163,30 @@ class Settings(BaseSettings):
                     "oneid_mode=real requires a non-local oneid_redirect_uri registered "
                     f"in the OneID technical instruction (got {self.oneid_redirect_uri!r})"
                 )
+        if self.eimzo_mode == "real":
+            # Checked unconditionally, like oneid_mode: a half-configured
+            # e-imzo-server fails at SIGNING TIME rather than at startup, and
+            # every ERI signature this system takes — an application's
+            # submission, a decision, a permit's issuance — goes through it,
+            # so the failure surfaces mid-workflow while the process itself
+            # still looks healthy.
+            if not self.eimzo_base_url:
+                raise ValueError("eimzo_mode=real requires eimzo_base_url")
+            if not self.eimzo_site_host:
+                raise ValueError(
+                    "eimzo_mode=real requires eimzo_site_host — the domain the E-IMZO "
+                    "API-KEY is bound to (decision #165)"
+                )
+            if not _is_private_network_host(self.eimzo_base_url):
+                # The server must sit in the stack's private network (plan
+                # 05.2 R2) — e-imzo-server holds no auth of its own beyond
+                # network placement, so a publicly reachable address means
+                # somebody exposed it, and that is worth failing over.
+                raise ValueError(
+                    "eimzo_mode=real requires eimzo_base_url to be a private, in-stack "
+                    f"address — {self.eimzo_base_url!r} must not be publicly reachable "
+                    "(plan 05.2 R2)"
+                )
         if self.sms_mode == "real" and _is_local_origin(self.eskiz_callback_base_url):
             # The only Eskiz setting whose DEFAULT looks like a working value. Get it
             # wrong and SMS still goes out while every delivery report is posted into
@@ -238,6 +268,42 @@ _LOCAL_HOSTS = frozenset({"", "localhost", "127.0.0.1", "0.0.0.0", "::1"})  # no
 def _is_local_origin(url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
     return host in _LOCAL_HOSTS or host.endswith(".localhost")
+
+
+# The ranges a stack-internal address (e-imzo-server, plan 05.2 R2) may sit
+# in: loopback and the three RFC-1918 private blocks. Not the same list as
+# `_LOCAL_HOSTS` above — that one is about a PUBLIC-facing setting accidentally
+# left at a localhost-looking default; this one is about a setting that must
+# NOT be publicly reachable, which a Docker service's own subnet (typically a
+# 172.16.0.0/12 address) satisfies without being "local" in that sense.
+_PRIVATE_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _is_private_network_host(url: str) -> bool:
+    """True when `url`'s host cannot be reached from the public internet: a
+    bare name with no dot (a Docker Compose service name, e.g. `eimzo` — such
+    a name can never resolve on the public DNS), `localhost`, a `.local`
+    mDNS name, or a numeric address in `_PRIVATE_NETWORKS`. Numeric ranges are
+    checked with `ipaddress.ip_address`/`ip_network`, not a string prefix —
+    `"172.16.0.0/12"` is not "starts with 172.", and a prefix check would
+    wrongly accept a public address like 172.200.0.1."""
+    host = (urlsplit(url).hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    if "." not in host:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a real, dotted hostname — publicly resolvable
+    return any(ip in network for network in _PRIVATE_NETWORKS)
 
 
 @lru_cache
