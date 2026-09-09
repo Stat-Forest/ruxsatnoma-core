@@ -25,6 +25,7 @@ from app.modules.payments.models import (
     ProviderTransaction,
     Reconciliation,
     Refund,
+    RefundComponent,
 )
 
 # What "in force" means for an invoice (mirrors `uq_invoices_one_in_force`,
@@ -624,6 +625,35 @@ async def list_manual_confirmations(
 async def add_refund(db: AsyncSession, refund: Refund) -> None:
     db.add(refund)
     await db.flush()
+
+
+async def add_refund_components(db: AsyncSession, rows: Sequence[RefundComponent]) -> None:
+    """The whole breakdown `backoffice_service.submit_refund_decision`
+    builds for ONE refund, written together (mirrors `add_invoice_recipients`'
+    own shape) — plain, unattached instances until this call."""
+    db.add_all(rows)
+    await db.flush()
+
+
+async def list_refund_components(
+    db: AsyncSession, refund_id: uuid.UUID
+) -> Sequence[RefundComponent]:
+    """One refund's breakdown by source — `backoffice_service.approve_refund`'s
+    own read of what `submit_refund_decision` already stored, and
+    `refunds_router.py`'s read for `available_sources`/`components` on the
+    wire. No ordering is guaranteed by the ROWS themselves (unlike
+    `InvoiceRecipient.position`); a caller that needs a stable order sorts
+    by whatever it reads off each row (e.g. `recipient_id IS NULL last`,
+    mirroring the snapshot's own remainder-last convention)."""
+    stmt = select(RefundComponent).where(RefundComponent.refund_id == refund_id)
+    return (await db.execute(stmt)).scalars().all()
+
+
+async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:
+    """The plain, non-locking read — `GET /refunds/{id}` (stage 7.9 task 7).
+    `get_refund_for_update` below is for the two decision routes, which
+    must serialize; a read-only view of the register takes no lock."""
+    return await db.get(Refund, refund_id)
 
 
 async def get_refund_for_update(db: AsyncSession, refund_id: uuid.UUID) -> Refund | None:

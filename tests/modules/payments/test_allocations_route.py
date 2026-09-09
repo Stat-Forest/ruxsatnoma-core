@@ -53,7 +53,7 @@ async def test_the_ledger_for_one_invoice_is_oldest_first_and_untyped(
     refund = Allocation(
         invoice_id=invoice.id,
         entry_type="refund",
-        target="budget",
+        target="receiver",
         account=None,
         amount=Decimal("-50.00"),
         occurred_at=_at("2026-01-12"),
@@ -72,14 +72,14 @@ async def test_the_ledger_for_one_invoice_is_oldest_first_and_untyped(
 async def test_account_is_null_never_omitted_never_blank(
     payments_view_client, db: AsyncSession, invoice: Invoice
 ):
-    """Ruling 10, `tz/12` #15: the state budget's account number is stored
-    nowhere in this system — `account` must serialize as JSON `null`
-    (present as a key with no string value), never absent from the object
-    and never an empty string."""
+    """Ruling 10, `tz/12` #15: a configured receiver's account is never a
+    bank account (`payments.ledger`'s own docstring) — `account` must
+    serialize as JSON `null` (present as a key with no string value), never
+    absent from the object and never an empty string."""
     row = Allocation(
         invoice_id=invoice.id,
         entry_type="payment",
-        target="budget",
+        target="receiver",
         account=None,
         amount=Decimal("50.00"),
         occurred_at=_at("2026-01-13"),

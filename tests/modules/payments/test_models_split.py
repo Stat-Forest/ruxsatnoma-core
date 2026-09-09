@@ -1,22 +1,22 @@
-"""Task 1 of stage 7.9: the schema of the configurable payment split
-(migration `0045`, decisions #154-#159, plan `07.9-payme-split` rulings P1/P3).
+"""Tasks 1 and 7 of stage 7.9: the schema of the configurable payment split
+(migrations `0045`/`0046`, decisions #154-#159, #161-#162, plan
+`07.9-payme-split` rulings P1/P3).
 
 Three new tables — `payment_recipients` (the directory), `invoice_recipients`
 (the split frozen onto an invoice at issuance) and `refund_components` (a
-refund's breakdown by source) — plus `allocations.recipient_id` and the
-widened `target_valid` CHECK (`'receiver'` added, `'budget'` KEPT — ruling P1
-makes this migration purely additive, no backfill, no column drops; see the
-migration's own docstring). Mirrors `test_models.py`/`test_backoffice_models.py`'s
-own shape: no HTTP, no service — pure ORM/CHECK-level tests against a real,
-migrated schema.
+refund's breakdown by source) — plus `allocations.recipient_id`. Mirrors
+`test_models.py`/`test_backoffice_models.py`'s own shape: no HTTP, no
+service — pure ORM/CHECK-level tests against a real, migrated schema.
 
-The `refund_components_complete` trigger on `refunds` is deliberately
-tolerant during this transition (ruling P1's own consequence): with the old
-three-column CHECK (`returned_needs_complete_breakdown`) still live and no
-`refund_components` rows written by anyone yet, the trigger must PASS a
-`returned` refund that has NO components at all, and enforce the sum only
-once at least one component exists. Both branches are pinned below.
-"""
+**`0045` was purely additive** (`target_valid` widened to add `'receiver'`
+while `'budget'` stayed legal, no backfill, no column drops — that
+migration's own docstring) — a transitional shape `0046` (task 7) ended:
+`'budget'` is gone from `target_valid` for good (every row that carried it
+was rewritten onto `'receiver'` first), and the `refund_components_complete`
+trigger — which `0045` deliberately left tolerant of a `returned` refund
+with ZERO components, because the old three-column CHECK was still what
+balanced it — now requires at least one. Both the narrowed CHECK and the
+tightened trigger are pinned below."""
 
 import uuid
 from datetime import UTC, datetime
@@ -208,9 +208,7 @@ async def test_refund_component_source_is_unique_per_refund(db: AsyncSession, re
 
 
 async def test_allocation_target_accepts_receiver(db: AsyncSession, invoice: Invoice):
-    """Ruling P1: `'receiver'` is the new value the split engine will write;
-    `'budget'` (below) stays legal for the same transition reason the
-    trigger below does."""
+    """Ruling P1: `'receiver'` is the new value the split engine writes."""
     row = Allocation(
         invoice_id=invoice.id, entry_type="payment", target="receiver", amount=Decimal("500.00")
     )
@@ -219,13 +217,19 @@ async def test_allocation_target_accepts_receiver(db: AsyncSession, invoice: Inv
     assert row.target == "receiver"
 
 
-async def test_allocation_target_still_accepts_budget(db: AsyncSession, invoice: Invoice):
+async def test_allocation_target_no_longer_accepts_budget(db: AsyncSession, invoice: Invoice):
+    """Migration `0046` (decision #161) narrowed `target_valid` to
+    `('recipient', 'other', 'receiver')` — `'budget'` was only ever legal
+    during `0045`'s own additive transition, and every row that carried it
+    was rewritten onto `'receiver'` before the value was removed from the
+    CHECK. The transition is over; a NEW `'budget'` row is a defect, not a
+    tolerated legacy shape, and must refuse."""
     row = Allocation(
         invoice_id=invoice.id, entry_type="payment", target="budget", amount=Decimal("500.00")
     )
     db.add(row)
-    await db.flush()
-    assert row.target == "budget"
+    with pytest.raises(IntegrityError, match="target_valid"):
+        await db.flush()
 
 
 async def test_allocation_recipient_id_may_point_at_the_directory(
@@ -248,22 +252,22 @@ async def test_allocation_recipient_id_may_point_at_the_directory(
     assert row.recipient_id == recipient.id
 
 
-# --- refund_components_complete trigger: the transition tolerance ---------
+# --- refund_components_complete trigger: tightened by migration 0046 -----
 
 
-async def test_trigger_passes_a_returned_refund_with_no_components_at_all(
+async def test_trigger_refuses_a_returned_refund_with_no_components_at_all(
     db: AsyncSession, refund: Refund
 ):
-    """Ruling P1's own consequence: today no `refund_components` rows exist
-    for anyone, so the OLD three-column CHECK is still what enforces the
-    total (via `budget_amount`/`recipient_amount`), and the new trigger must
-    not additionally refuse a refund the legacy columns already balance."""
+    """Migration `0046` (decision #162) tightened the trigger: `0045`'s own
+    version tolerated a `returned` refund with ZERO components, because the
+    old three-column CHECK was still live and no component had ever been
+    written by anyone. That transition is over — `refunds` no longer has
+    those columns at all, so a `returned` refund with no components is
+    unbalanced by construction and must refuse."""
     refund.final_amount = Decimal("500.00")
-    refund.budget_amount = Decimal("250.00")
-    refund.recipient_amount = Decimal("250.00")
     refund.status = "returned"
-    await db.flush()
-    assert refund.status == "returned"
+    with pytest.raises(DBAPIError, match="needs at least one component"):
+        await db.flush()
 
 
 async def test_trigger_refuses_once_components_exist_but_do_not_sum_to_final_amount(
@@ -272,7 +276,6 @@ async def test_trigger_refuses_once_components_exist_but_do_not_sum_to_final_amo
     db.add(RefundComponent(refund_id=refund.id, amount=Decimal("100.00")))
     await db.flush()
     refund.final_amount = Decimal("500.00")
-    refund.budget_amount = Decimal("500.00")
     refund.status = "returned"
     with pytest.raises(DBAPIError, match="do not sum to final_amount"):
         await db.flush()
@@ -282,7 +285,6 @@ async def test_trigger_passes_once_components_sum_to_final_amount(db: AsyncSessi
     db.add(RefundComponent(refund_id=refund.id, amount=Decimal("500.00")))
     await db.flush()
     refund.final_amount = Decimal("500.00")
-    refund.budget_amount = Decimal("500.00")
     refund.status = "returned"
     await db.flush()
     assert refund.status == "returned"

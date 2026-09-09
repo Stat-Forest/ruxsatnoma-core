@@ -52,6 +52,29 @@ from tests.modules.gis.conftest import _commit_pending_before_requests
 from tests.modules.gis.conftest import approval_doc as approval_doc
 from tests.modules.gis.conftest import contours_layer as contours_layer
 from tests.modules.gis.conftest import leshoz as leshoz
+from tests.modules.payments.conftest import BUDGET_RECIPIENT_ID
+
+
+def _components(**by_target: str) -> list[dict[str, str | None]]:
+    """Builds a `submit-decision` `components` list from the OLD three-name
+    vocabulary this file's own tests were written against
+    (`budget=...`/`recipient=...`/`other=...`), so every rewritten call
+    below reads as close to its original shape as possible. `budget`
+    resolves to the seeded `BUDGET_RECIPIENT_ID` component, `recipient` to
+    the leshoz's own remainder (`recipient_id=None`); `other` has no
+    component of its own any more (migration 0046's own backfill folded it
+    into the leshoz's remainder) and is asserted to be `"0.00"` wherever the
+    original body carried a non-zero one, so no caller silently drops
+    money this rewrite owes an assertion about."""
+    other = Decimal(by_target.get("other", "0.00"))
+    assert other == Decimal("0.00"), "no component represents the old 'other' bucket any more"
+    components: list[dict[str, str | None]] = []
+    if "budget" in by_target:
+        components.append({"recipient_id": str(BUDGET_RECIPIENT_ID), "amount": by_target["budget"]})
+    if "recipient" in by_target:
+        components.append({"recipient_id": None, "amount": by_target["recipient"]})
+    return components
+
 
 API = "/api/v1"
 REFUNDS = f"{API}/refunds"
@@ -111,19 +134,20 @@ def test_a_request_before_the_period_starts_hints_the_whole_amount():
 # --- pure tests: `refunds.breakdown_is_complete` -----------------------------
 
 
-def test_breakdown_is_complete_when_the_three_components_sum_to_final():
+def test_breakdown_is_complete_when_the_components_sum_to_final():
     assert refunds.breakdown_is_complete(
-        Decimal("600000.00"), Decimal("100000.00"), Decimal("500000.00"), Decimal("0.00")
+        Decimal("600000.00"), [Decimal("100000.00"), Decimal("500000.00")]
     )
 
 
-def test_breakdown_is_complete_treats_a_missing_component_as_zero():
-    assert refunds.breakdown_is_complete(Decimal("500000.00"), None, Decimal("500000.00"), None)
+def test_breakdown_is_complete_treats_an_empty_list_as_zero():
+    assert refunds.breakdown_is_complete(Decimal("0.00"), [])
+    assert not refunds.breakdown_is_complete(Decimal("500000.00"), [])
 
 
 def test_breakdown_is_not_complete_when_the_sum_disagrees():
     assert not refunds.breakdown_is_complete(
-        Decimal("600000.00"), Decimal("100000.00"), Decimal("400000.00"), Decimal("0.00")
+        Decimal("600000.00"), [Decimal("100000.00"), Decimal("400000.00")]
     )
 
 
@@ -460,9 +484,9 @@ async def test_submit_decision_with_a_wrong_breakdown_answers_err_val_001(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "400000.00",  # sums to 500000, not 600000
-            "other_amount": "0.00",
+            "components": _components(
+                budget="100000.00", recipient="400000.00"
+            ),  # sums to 500000, not 600000
         },
     )
     assert response.status_code == 422, response.text
@@ -480,9 +504,7 @@ async def test_submit_decision_requires_payments_manage(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     assert response.status_code == 403, response.text
@@ -514,9 +536,7 @@ async def test_submit_decision_writes_no_allocations(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     assert response.status_code == 200, response.text
@@ -545,9 +565,7 @@ async def test_approve_requires_payments_confirm(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     response = await payments_view_client.post(
@@ -576,9 +594,7 @@ async def test_approve_writes_negative_allocations_and_the_ledger_sums_to_paid_m
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
 
@@ -589,17 +605,19 @@ async def test_approve_writes_negative_allocations_and_the_ledger_sums_to_paid_m
     body = response.json()
     assert body["status"] == "returned"
 
-    # --- test 9: the budget allocation's account is NULL, deliberately, and
-    # the response says so explicitly rather than omitting the field.
-    assert body["budget_account"] is None
-    assert body["recipient_account"] == "20208000123456789012"
-    budget_entry = next(a for a in body["allocations"] if a["target"] == "budget")
-    assert budget_entry["account"] is None
-    assert budget_entry["amount"] == "-100000.00"
-    recipient_entry = next(a for a in body["allocations"] if a["target"] == "recipient")
-    assert recipient_entry["account"] == "20208000123456789012"
-    assert recipient_entry["amount"] == "-500000.00"
-    assert len(body["allocations"]) == 2  # `other_amount` is "0.00" — no row for it
+    # --- test 9: the budget component's account is NULL, deliberately (a
+    # configured receiver never has a bank account of its own), and the
+    # response says so explicitly rather than omitting the field; the
+    # leshoz's own remainder component carries the resolved account.
+    budget_component = next(
+        c for c in body["components"] if c["recipient_id"] == str(BUDGET_RECIPIENT_ID)
+    )
+    assert budget_component["account"] is None
+    assert budget_component["amount"] == "100000.00"
+    leshoz_component = next(c for c in body["components"] if c["recipient_id"] is None)
+    assert leshoz_component["account"] == "20208000123456789012"
+    assert leshoz_component["amount"] == "500000.00"
+    assert len(body["components"]) == 2  # nothing represents the old 'other' bucket
 
     # --- test 8: every allocation on this invoice carries a `refund_id` for
     # the two just written, and the WHOLE ledger sums to paid - final.
@@ -649,9 +667,7 @@ async def test_approve_refuses_a_refund_on_a_never_paid_invoice(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "50000.00",
-            "budget_amount": "10000.00",
-            "recipient_amount": "40000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="10000.00", recipient="40000.00"),
         },
     )
     assert submitted.status_code == 200, submitted.text
@@ -691,9 +707,7 @@ async def test_approve_refuses_a_second_full_refund_on_the_same_invoice(
         f"{REFUNDS}/{first['id']}/submit-decision",
         json={
             "final_amount": "1000000.00",
-            "budget_amount": "500000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="500000.00", recipient="500000.00"),
         },
     )
     assert first_submit.status_code == 200, first_submit.text
@@ -707,9 +721,7 @@ async def test_approve_refuses_a_second_full_refund_on_the_same_invoice(
         f"{REFUNDS}/{second['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     assert second_submit.status_code == 200, second_submit.text
@@ -769,9 +781,7 @@ async def test_approve_refuses_a_refund_after_a_post_perform_reversal(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     assert submitted.status_code == 200, submitted.text
@@ -810,9 +820,7 @@ async def test_two_partial_refunds_within_the_remaining_balance_both_succeed(
         f"{REFUNDS}/{first['id']}/submit-decision",
         json={
             "final_amount": "400000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "300000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="300000.00"),
         },
     )
     assert first_submit.status_code == 200, first_submit.text
@@ -826,9 +834,7 @@ async def test_two_partial_refunds_within_the_remaining_balance_both_succeed(
         f"{REFUNDS}/{second['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     assert second_submit.status_code == 200, second_submit.text
@@ -866,9 +872,7 @@ async def test_approve_rejected_writes_no_allocations(
         f"{REFUNDS}/{filed['id']}/submit-decision",
         json={
             "final_amount": "600000.00",
-            "budget_amount": "100000.00",
-            "recipient_amount": "500000.00",
-            "other_amount": "0.00",
+            "components": _components(budget="100000.00", recipient="500000.00"),
         },
     )
     before = (
@@ -887,8 +891,12 @@ async def test_approve_rejected_writes_no_allocations(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["status"] == "rejected"
-    assert body["budget_account"] is None
-    assert body["allocations"] == []
+    # `components` still shows what the accountant SUBMITTED (a fact about
+    # what was entered, independent of the rahbar's decision) — but the
+    # leshoz's own account stays `None`: it is only resolved once a refund
+    # actually reaches `returned`, which rejection never does.
+    assert sorted(c["amount"] for c in body["components"]) == ["100000.00", "500000.00"]
+    assert all(c["account"] is None for c in body["components"])
 
     after = (
         (

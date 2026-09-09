@@ -37,10 +37,21 @@ Stage 7.9 (migration `0045`, task 1, plan ruling P1) replaces the hard-coded
 50/50 split with a configurable directory: `PaymentRecipient` (who takes a
 cut), `InvoiceRecipient` (the split frozen onto one invoice at issuance) and
 `RefundComponent` (a refund's breakdown by source, `refunds`' own trigger
-`refund_components_complete`). Purely additive — `Allocation` gains
-`recipient_id` and `'receiver'` joins `ALLOCATION_TARGETS` beside the
-still-legal `'budget'`; `Refund`'s three legacy amount columns and their own
-CHECK are untouched until a later migration rewrites what still uses them."""
+`refund_components_complete`). `0045` itself was purely additive —
+`Allocation` gained `recipient_id` and `'receiver'` joined
+`ALLOCATION_TARGETS` beside the still-legal `'budget'`, and `Refund` kept
+its three legacy amount columns and their own CHECK untouched.
+
+**Migration `0046` (task 7, decisions #161-#162) finishes the rewrite.**
+Every historical `target='budget'` allocation and every `refunds` row's
+three legacy columns were backfilled onto the new shapes and then dropped:
+`Refund` no longer has `budget_amount`/`recipient_amount`/`other_amount` or
+`returned_needs_complete_breakdown`, `'budget'` is gone from
+`ALLOCATION_TARGETS` (there is no `TARGET_BUDGET` constant any more), and
+`refund_components_complete` now requires at least one component for a
+`returned` refund — see that migration's own docstring for the five-step
+order and why decision #161 made rewriting history cheap NOW (no
+production data, dev is only demo data) rather than later."""
 
 import uuid
 from datetime import date, datetime
@@ -61,12 +72,16 @@ INVOICE_STATUSES = ("pending", "paid", "expired", "cancelled")
 PAYMENT_PROVIDERS = ("payme", "manual")
 PAYMENT_INTENT_STATUSES = ("created", "pending", "succeeded", "failed", "expired")
 ALLOCATION_ENTRY_TYPES = ("payment", "refund", "correction")
-ALLOCATION_TARGETS = ("recipient", "budget", "other", "receiver")
-# 'budget' is on its way out (decision #161): migration 0046 rewrites every row
-# carrying it onto the seeded budget directory row and then removes it from this
-# tuple. Until then both spellings are legal.
+# 'budget' is GONE (decision #161, migration 0046): every row that carried it
+# was rewritten onto the seeded budget directory row (`target='receiver'`,
+# `recipient_id=BUDGET_RECIPIENT_ID`) and the value removed from this tuple —
+# there is no `TARGET_BUDGET` constant any more, and grepping for one is the
+# guard against a caller that still thinks there is. `'other'` SURVIVES:
+# those rows (none written by any code path any more) name no party this
+# directory can represent, and inventing one would be fabricating a
+# recipient this migration had no authority to invent.
+ALLOCATION_TARGETS = ("recipient", "other", "receiver")
 TARGET_RECIPIENT = "recipient"
-TARGET_BUDGET = "budget"
 TARGET_OTHER = "other"
 TARGET_RECEIVER = "receiver"
 
@@ -250,10 +265,11 @@ class Allocation(Base):
 
     `recipient_id` (migration `0045`, stage 7.9) is a nullable FK to
     `payment_recipients` — set when `target='receiver'`, NULL for the
-    leshoz's own remainder and for the legacy `'recipient'`/`'budget'`/
-    `'other'` entries a `'receiver'` write never touches (ruling P1: this
-    migration adds the column and the CHECK value without rewriting a
-    single existing row)."""
+    leshoz's own remainder (`target='recipient'`) and for a legacy
+    `target='other'` row (no writer produces one any more, but a historical
+    row may still carry it — see migration `0046`'s own docstring, which
+    rewrote every `target='budget'` row onto `'receiver'` and removed
+    `'budget'` from the CHECK entirely)."""
 
     __tablename__ = "allocations"
 
@@ -361,15 +377,27 @@ class InvoiceRecipient(Base):
 
 class RefundComponent(Base):
     """One line of a refund's breakdown by source (`tz/08`), replacing the three
-    `refunds.{budget,recipient,other}_amount` columns that a fixed 50/50 made
-    sufficient. `recipient_id IS NULL` means the leshoz's remainder.
+    `refunds.{budget,recipient,other}_amount` columns a fixed 50/50 once made
+    sufficient — migration `0046` (decision #161) dropped all three, having
+    first backfilled every historical row's total into rows here.
+    `recipient_id` names a configured `payment_recipients` row (a
+    `target='receiver'` allocation, task 7's `approve_refund`); `NULL` means
+    the leshoz's own remainder (`target='recipient'`) — there is no
+    component for the old `'other'` bucket, which the `0046` backfill folded
+    into the leshoz's remainder (see that migration's own docstring).
 
-    The "components sum to `final_amount`" invariant moved from a row CHECK to a
-    trigger on `refunds` (ruling R4) — it now spans rows, which a CHECK cannot
-    express. Migration `0045` (ruling P1) leaves the legacy three columns and
-    their own CHECK on `Refund` untouched, and the trigger tolerates a refund
-    with zero components — see the trigger's own docstring in that migration.
-    """
+    **`uq_refund_components_source` does NOT stop two `recipient_id IS NULL`
+    rows** — Postgres treats `NULL <> NULL` under a plain UNIQUE constraint,
+    so a duplicate leshoz-remainder component (or any other duplicate
+    source, NULL included) is refused by the SERVICE
+    (`backoffice_service.submit_refund_decision`), not by this index.
+
+    The "components sum to `final_amount`" invariant moved from a row CHECK
+    to a trigger on `refunds` (ruling R4) — it now spans rows, which a CHECK
+    cannot express. `0045`'s own version of that trigger tolerated a
+    `returned` refund with zero components (needed only during the
+    transition its own docstring describes); `0046` tightened it to require
+    at least one (decision #162) — see that migration's own docstring."""
 
     __tablename__ = "refund_components"
 
@@ -546,21 +574,26 @@ class Reconciliation(Base):
 
 
 class Refund(Base):
-    """A manual refund and its breakdown by source (design/02 § refunds,
-    decision #12, 3.10b). `basis_item_id` points at the seeded
-    `refund_reasons` classifier (migration `0022`, ruling 16) — revocation /
-    unused period / overpayment / confirmed benefit (VMQ 278 §§9-11), never
-    a CHECK-constrained enum column, so a new ground is reference data, not a
+    """A manual refund (design/02 § refunds, decision #12, 3.10b).
+    `basis_item_id` points at the seeded `refund_reasons` classifier
+    (migration `0022`, ruling 16) — revocation / unused period /
+    overpayment / confirmed benefit (VMQ 278 §§9-11), never a
+    CHECK-constrained enum column, so a new ground is reference data, not a
     migration. `suggested_amount` is the formula's hint
     (`tz/08`: `Paid × unused_eligible_period / paid_period`) and is nullable
     for ruling 17's degenerate cases (no calculable period); the accountant's
     actual `final_amount` may deviate from it, with a comment.
 
-    `returned_needs_complete_breakdown` is the CHECK design/02 names: a
-    `returned` refund without `final_amount` and a `budget`/`recipient`/
-    `other` breakdown that sums to it is impossible at the database level —
-    the same "returned_amount without a breakdown by source is impossible"
-    invariant `design/02`'s own invariants table lists. `due_at` is a plain
+    **The breakdown by source is `RefundComponent` rows, not columns here.**
+    Until migration `0046` (decision #161) this table carried
+    `budget_amount`/`recipient_amount`/`other_amount` and a row CHECK
+    (`returned_needs_complete_breakdown`) enforcing their sum; a fixed 50/50
+    made three buckets sufficient, and a configurable directory of any size
+    does not fit in a fixed column count. The identical "a returned
+    refund's breakdown sums to `final_amount`" invariant now lives in the
+    `refund_components_complete` TRIGGER on this table (decision #162) —
+    a CHECK cannot span rows, which the new shape requires — tightened by
+    `0046` to also require at least one component. `due_at` is a plain
     calendar `date` (3.10b task 1 decision), not a `timestamptz`: the 20
     working-day control deadline (RI-07) is a day, not a moment."""
 
@@ -573,9 +606,6 @@ class Refund(Base):
     suggested_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     suggestion_reason: Mapped[str | None]
     final_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    budget_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    recipient_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    other_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     status: Mapped[str] = mapped_column(default="requested")
     requested_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
     requested_at: Mapped[datetime]
@@ -584,12 +614,4 @@ class Refund(Base):
     decided_at: Mapped[datetime | None]
     comment: Mapped[str | None]
 
-    __table_args__ = (
-        CheckConstraint(_in_check("status", REFUND_STATUSES), name="status_valid"),
-        CheckConstraint(
-            "status <> 'returned' OR (final_amount IS NOT NULL AND "
-            "coalesce(budget_amount, 0) + coalesce(recipient_amount, 0) "
-            "+ coalesce(other_amount, 0) = final_amount)",
-            name="returned_needs_complete_breakdown",
-        ),
-    )
+    __table_args__ = (CheckConstraint(_in_check("status", REFUND_STATUSES), name="status_valid"),)

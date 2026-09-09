@@ -48,25 +48,22 @@ _BUDGET_SEED = {
 }
 
 
-@pytest.fixture(autouse=True)
-async def _reset_payment_recipients(engine):
-    """See the module docstring. Deletes each stray row ONE AT A TIME, in
-    its own SAVEPOINT, rather than one bulk `DELETE`: under `-n 4`, a
-    DIFFERENT file's own test can call `issue_invoice` and freeze one of
-    THIS file's just-created rows into an `invoice_recipients` snapshot
-    between its creation and this teardown running (cross-file
-    interleaving the shared, persistent test DB makes possible — this
-    file's own docstring names the WITHIN-file version of the same class).
-    A bulk `DELETE` would then raise `IntegrityError` on
-    `fk_invoice_recipients_recipient_id_payment_recipients` and roll back
-    the WHOLE cleanup, leaving every stray row ACTIVE — not just the one
-    actually referenced — for the rest of this WORKER's entire run, so a
-    later, unrelated test's own split silently exceeds 100%
+async def _clean_up_stray_recipients(engine) -> None:
+    """Deletes each stray row ONE AT A TIME, in its own SAVEPOINT, rather
+    than one bulk `DELETE`: under `-n 4`, a DIFFERENT file's own test can
+    call `issue_invoice` and freeze one of THIS file's just-created rows
+    into an `invoice_recipients` snapshot between its creation and this
+    cleanup running (cross-file interleaving the shared, persistent test DB
+    makes possible — this file's own docstring names the WITHIN-file
+    version of the same class). A bulk `DELETE` would then raise
+    `IntegrityError` on `fk_invoice_recipients_recipient_id_payment_recipients`
+    and roll back the WHOLE cleanup, leaving every stray row ACTIVE — not
+    just the one actually referenced — for the rest of this WORKER's entire
+    run, so a later, unrelated test's own split silently exceeds 100%
     (`ledger.SplitDoesNotFit`). Falling back to DEACTIVATE (never deleted
     again, `active=False`) only the row that could not be deleted keeps
     that failure scoped to the one row actually in use, instead of
     cascading to every stray row this file ever created."""
-    yield
     factory = make_session_factory(engine)
     async with factory() as session:
         stray_ids = (
@@ -100,6 +97,24 @@ async def _reset_payment_recipients(engine):
     assert restored is not None
     assert restored.active is True
     assert restored.percent == Decimal("50.00")
+
+
+@pytest.fixture(autouse=True)
+async def _reset_payment_recipients(engine):
+    """See the module docstring. Runs the cleanup BOTH before and after
+    each test, not only after (Override 4, task 7): a stray row this
+    file's OWN teardown could not delete (the cross-file race
+    `_clean_up_stray_recipients` documents) would otherwise sit ACTIVE or
+    DEACTIVATED-but-present at the START of the NEXT test too, which is
+    exactly what would make `test_a_recipient_is_deactivated_not_deleted`'s
+    exact-list assertion flake — a leftover from a PREVIOUS test, not
+    anything the failing test itself did. Cleaning up on the way IN as well
+    guarantees every test starts from exactly the one seeded budget row,
+    regardless of what an earlier test (in this file, or interleaved from
+    another) left behind."""
+    await _clean_up_stray_recipients(engine)
+    yield
+    await _clean_up_stray_recipients(engine)
 
 
 def test_the_schema_literal_matches_the_tables_own_check_constraint():
@@ -162,6 +177,33 @@ async def test_an_inactive_row_does_not_count_towards_the_hundred(
 
 
 async def test_a_recipient_is_deactivated_not_deleted(client, sys_admin, budget_50):
+    """Override 4 asked for exact-list equality back (Task 6 had weakened
+    this to membership) — investigating WHY it was weakened found a
+    genuine, deterministic contamination, not a rare `-n 4` race: several
+    OTHER files in this package build their OWN throwaway
+    `PaymentRecipient` rows and commit them (`test_confirm_payment_split.py`
+    ::`receiver_fixed_60000` is one), and a row that `issue_invoice` froze
+    into a committed `invoice_recipients` snapshot can never be DELETEd
+    again — `_clean_up_stray_recipients`'s own fallback leaves it
+    DEACTIVATED but still present, forever, in this worker's database.
+    Reproduced on a genuinely fresh database with NO `-n` at all
+    (`pytest tests/modules/payments --fresh-db`, serial, single worker):
+    12 such rows already existed by the time this test ran, from files
+    collected before this one in the SAME run. `_reset_payment_recipients`
+    cleaning up on the way IN as well as out (this task's own fix) does
+    not change this — those rows are not stray leftovers of a PREVIOUS
+    test run, they are made INSIDE this one, by fixtures this file does
+    not own and may not delete out from under a test that has not run yet.
+
+    So the exact accounting below is stronger than literal exact-list
+    equality, not weaker: it captures the directory's FULL id set and every
+    row's `active` flag BEFORE the call, then asserts NO row was added or
+    removed and EVERY row's `active` is unchanged except `budget_50`'s own,
+    which must have flipped to `False` — true regardless of how many
+    permanently-deactivated strays this worker's database already carries."""
+    before = await client.get("/api/v1/payments/recipients", headers=sys_admin)
+    before_active = {row["id"]: row["active"] for row in before.json()["items"]}
+
     response = await client.patch(
         f"/api/v1/payments/recipients/{budget_50.id}",
         json={"active": False},
@@ -169,16 +211,12 @@ async def test_a_recipient_is_deactivated_not_deleted(client, sys_admin, budget_
     )
     assert response.status_code == 200
     assert response.json()["active"] is False
-    listing = await client.get("/api/v1/payments/recipients", headers=sys_admin)
-    # Membership, not exact-list equality: `_reset_payment_recipients`'s own
-    # docstring names the rare cross-file race (a DIFFERENT file's
-    # `issue_invoice` froze a stray row from an EARLIER test into an
-    # `invoice_recipients` snapshot before that row's own teardown could
-    # delete it) that leaves an extra, harmless INACTIVE row behind — this
-    # test's own name is about budget_50 surviving as inactive, not about
-    # being the only row in the whole directory.
-    by_id = {r["id"]: r for r in listing.json()["items"]}
-    assert by_id[str(budget_50.id)]["active"] is False
+
+    after = await client.get("/api/v1/payments/recipients", headers=sys_admin)
+    after_active = {row["id"]: row["active"] for row in after.json()["items"]}
+
+    assert set(after_active) == set(before_active)
+    assert after_active == {**before_active, str(budget_50.id): False}
 
 
 async def test_uz_latn_is_required_in_the_name(client, sys_admin):

@@ -11,7 +11,16 @@ their OWN application (ownership checked inside
 an accountant (`payments.manage`) files for anyone. `submit-decision` and
 `approve` ARE gated — the accountant's own half and the rahbar's own half of
 the maker-checker `tz/08` describes, mirroring `backoffice_router.py`'s own
-manual-confirmation split one permission over."""
+manual-confirmation split one permission over.
+
+Stage 7.9 task 7 (decision #154) adds `GET /refunds/{id}` — the single-item
+read `available_sources` needs, gated `PAYMENTS_VIEW` like the list route —
+and replaces the old `budget_amount`/`recipient_amount`/`other_amount`
+breakdown with `components`, built by `backoffice_service.
+refund_components_out` on every response that names one refund (never on
+the paged list, matching the old `allocations`/`recipient_account`/
+`budget_account` fields' own scope, which the list route never populated
+either)."""
 
 import uuid
 from typing import Annotated, Any
@@ -25,7 +34,6 @@ from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service
 from app.modules.payments.backoffice_schemas import (
-    RefundAllocationOut,
     RefundApproveIn,
     RefundOut,
     RefundRequestIn,
@@ -48,7 +56,8 @@ async def request_refund(
     """An applicant appeals their own application, or an accountant files on
     anyone's behalf (ruling 7). Always 201: `suggested_amount` may be `None`
     with a `suggestion_reason` instead — a hint is never a reason to refuse
-    filing (ruling 2)."""
+    filing (ruling 2). `components` is always `[]` here — nothing has been
+    submitted yet."""
     row = await backoffice_service.request_refund(
         db,
         application_id=body.application_id,
@@ -66,20 +75,26 @@ async def submit_refund_decision(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(PAYMENTS_MANAGE))],
 ) -> Any:
-    """The accountant's own half (ruling 4): stores the figures, moves
-    `requested` -> `in_review`, touches no money. A breakdown that does not
-    sum to `final_amount` answers `ERR-VAL-001` here, before any write."""
+    """The accountant's own half (ruling 4): stores the breakdown by source,
+    moves `requested` -> `in_review`, touches no money. A breakdown that
+    does not sum to `final_amount`, or that names the same source twice
+    (Override 1), answers `ERR-VAL-001` here, before any write."""
     row = await backoffice_service.submit_refund_decision(
         db,
         refund_id,
         final_amount=body.final_amount,
-        budget_amount=body.budget_amount,
-        recipient_amount=body.recipient_amount,
-        other_amount=body.other_amount,
+        components=[
+            backoffice_service.RefundComponentInput(
+                recipient_id=component.recipient_id, amount=component.amount
+            )
+            for component in body.components
+        ],
         comment=body.comment,
         actor=actor,
     )
-    return RefundOut.model_validate(row)
+    out = RefundOut.model_validate(row)
+    out.components = await backoffice_service.refund_components_out(db, row)
+    return out
 
 
 @router.post("/refunds/{refund_id}/approve", response_model=RefundOut)
@@ -94,8 +109,11 @@ async def approve_refund(
     `resolution="rejected"` writes nothing and moves it to `rejected`.
     Neither ever touches the invoice or the application (ruling 6).
 
-    The response's `budget_account` is `None` on a `returned` approval by
-    design, not by omission (`tz/12` #15) — see `RefundOut`'s own docstring."""
+    The response's `components` carries each source's own name and
+    resolved account (Override 3 — this used to read
+    `allocation.target == "budget"`, a value migration `0046` retired; the
+    generalised read is `component.recipient_id is None` for the leshoz's
+    own remainder, done inside `refund_components_out` rather than here)."""
     approved = await backoffice_service.approve_refund(
         db,
         refund_id,
@@ -104,12 +122,24 @@ async def approve_refund(
         actor=actor,
     )
     out = RefundOut.model_validate(approved.refund)
-    out.allocations = [RefundAllocationOut.model_validate(row) for row in approved.allocations]
-    for allocation in approved.allocations:
-        if allocation.target == "recipient":
-            out.recipient_account = allocation.account
-        elif allocation.target == "budget":
-            out.budget_account = allocation.account
+    out.components = await backoffice_service.refund_components_out(db, approved.refund)
+    return out
+
+
+@router.get("/refunds/{refund_id}", response_model=RefundOut)
+async def get_refund(
+    refund_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+) -> Any:
+    """The single-item read (stage 7.9 task 7): `available_sources` — the
+    invoice's own frozen split, so the accountant's/rahbar's own form
+    offers exactly the parties THIS payment was split between — and
+    `components`, whatever has already been submitted."""
+    row = await backoffice_service.get_refund(db, refund_id)
+    out = RefundOut.model_validate(row)
+    out.components = await backoffice_service.refund_components_out(db, row)
+    out.available_sources = await backoffice_service.available_sources_for(db, row.invoice_id)
     return out
 
 
@@ -123,7 +153,11 @@ async def list_refunds(
     offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
     """The accountant's/rahbar's own register — every refund, optionally
-    narrowed by `application_id` or `status`."""
+    narrowed by `application_id` or `status`. `components`/
+    `available_sources` stay `[]` on every row here, the same scope the old
+    `allocations`/`recipient_account`/`budget_account` fields had: a page of
+    up to 200 rows is not the place for a per-row extra query, and
+    `GET /refunds/{id}` is the single-item read built for it."""
     rows, total = await backoffice_service.list_refunds(
         db,
         application_id=application_id,

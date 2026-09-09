@@ -6,9 +6,11 @@ synchronous, `Decimal`-only, and it never sees a session — the same shape as
 A refund is a MANUAL process (decision #12): the money moves outside this
 system. What this module computes is a HINT for the accountant — never a
 figure the system pays out on its own — and `breakdown_is_complete`, the
-same arithmetic `refunds.returned_needs_complete_breakdown` enforces at the
-database level, checked here FIRST so a caller answers `ERR-VAL-001` rather
-than an IntegrityError 500 from that CHECK.
+same arithmetic the `refund_components_complete` TRIGGER enforces at the
+database level (decision #162 — it moved from a row CHECK to a trigger
+when the breakdown became `refund_components` rows, migration `0046`),
+checked here FIRST so a caller answers `ERR-VAL-001` rather than a 500 out
+of that trigger.
 
 **A hint is never an error** (ruling 17, `backoffice_service.request_refund`'s
 own docstring carries the full list of degenerate cases this module's
@@ -19,6 +21,7 @@ BEFORE this module is called at all, so `hint()`'s only precondition is
 files the refund, with `RefundHint(amount=None, reason="...")` instead of a
 raised exception."""
 
+from collections.abc import Sequence
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from typing import NamedTuple
@@ -72,18 +75,17 @@ def hint(*, paid: Decimal, period_from: date, period_to: date, on_date: date) ->
     )
 
 
-def breakdown_is_complete(
-    final_amount: Decimal,
-    budget_amount: Decimal | None,
-    recipient_amount: Decimal | None,
-    other_amount: Decimal | None,
-) -> bool:
-    """Mirrors `refunds.returned_needs_complete_breakdown` (the database
-    CHECK) exactly, so `backoffice_service` can run the SAME arithmetic in
-    code, ahead of any write: `coalesce(budget, 0) + coalesce(recipient, 0)
-    + coalesce(other, 0) == final`. `None` reads as `0.00`, the same
-    `coalesce` the CHECK itself uses — a component the accountant leaves
-    unset is "nothing from this source", not "unknown"."""
-    zero = Decimal("0.00")
-    total = (budget_amount or zero) + (recipient_amount or zero) + (other_amount or zero)
-    return total == final_amount
+def breakdown_is_complete(final_amount: Decimal, components: Sequence[Decimal]) -> bool:
+    """The same arithmetic the `refund_components_complete` trigger enforces
+    at the database level, checked here FIRST so a caller answers
+    `ERR-VAL-001` rather than a 500 out of that trigger.
+
+    Before 2026-09-09 this took three optional `Decimal`s
+    (`budget_amount`/`recipient_amount`/`other_amount`), because a fixed
+    50/50 made three buckets sufficient; a configurable directory of any
+    size does not fit a fixed parameter count, so the breakdown is now the
+    caller's own list of component amounts — one per source, in whatever
+    order the accountant entered them. An empty `components` reads as "no
+    breakdown submitted", the same way three `None`s did before: it sums to
+    `0.00`, which is complete only when `final_amount` is also `0.00`."""
+    return sum(components, Decimal("0.00")) == final_amount
