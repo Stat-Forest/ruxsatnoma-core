@@ -21,15 +21,17 @@ Public surface for the event bus (`subscribers.py`, registered in
   (loudly logged, `None` returned) to cancel one that is already `paid` —
   see its own docstring.
 - `confirm_payment(db, *, invoice, transaction) -> None` (task 4, ruling J;
-  stage 7.9 task 5) — the whole business action behind a successful Payme
-  `PerformTransaction`: invoice -> paid, one ledger row PER RECEIVER
-  written (the frozen split re-applied against what actually arrived),
-  application -> PAID, the applicant notified, `payment_confirmed`
-  published on the bus. Called from
-  `payme.py` ONLY, already inside the caller's own transaction and already
-  past every Payme-protocol check (idempotency, amount, payability) — this
-  function performs no check of its own beyond resolving the recipient
-  account.
+  stage 7.9 task 5) — the whole business action behind a confirmed payment:
+  invoice -> paid, one ledger row PER RECEIVER written (the frozen split
+  re-applied against what actually arrived), application -> PAID, the
+  applicant notified, `payment_confirmed` published on the bus. TWO
+  callers — `payme._perform_transaction`, already past every
+  Payme-protocol check (idempotency, amount, payability), and
+  `backoffice_service._confirm_and_pay`, the manual maker-checker door —
+  and this function performs exactly ONE check of its own: it refuses
+  (`ERR-VAL-001`, before any write) when the frozen split does not fit
+  `transaction.amount`, reachable only through the manual door. See its
+  own docstring for both callers and the refusal in full.
 - `record_reversal(db, *, invoice, transaction, reason) -> None` (3.10b task
   8, ruling 15; ruling #112 added the notify) — the mirror of `confirm_payment`
   for money that came BACK: Payme cancelled an already-performed transaction.
@@ -1075,10 +1077,30 @@ async def confirm_payment(
     reasoning `resolve_recipient_account`'s own docstring carries for the
     leshoz half this replaces (a placeholder string in a financial ledger is
     worse than `NULL`).
-    """
-    invoice.status = "paid"
-    invoice.paid_at = transaction.performed_at
 
+    **Raises `err("ERR-VAL-001", details={"reason": "split_does_not_fit"})`
+    when the frozen rules do not fit `transaction.amount`** (review round 1,
+    Important 1). `backoffice_schemas.ManualConfirmationIn.amount` is bounded
+    only `gt=0` — an accountant may confirm LESS than the invoice, the whole
+    point of the underpayment paragraph above — so a configured FIXED-amount
+    receiver larger than what arrived makes `ledger.split_payment` raise
+    `SplitDoesNotFit`. This mirrors `issue_invoice`'s own handling of the
+    identical exception. Unreachable on the Payme path: `-31001` already
+    pins `transaction.amount == invoice.amount`, and `issue_invoice` already
+    proved the frozen rules fit the FULL invoice at issuance time.
+
+    REFUSING is the right behaviour, not allocating a partial split: money
+    that physically arrived is not lost by declining to mark the invoice
+    `paid` — 3.10b's discrepancy register is exactly where an underpayment
+    nobody can allocate belongs, and it can be confirmed the moment either
+    the amount or the directory is corrected. The alternative — allocating
+    anyway — would put a NEGATIVE row in a financial ledger, which is worse
+    than an unconfirmed payment and far harder to notice. The check below
+    runs BEFORE `invoice.status`/`.paid_at` are touched, so this leaves
+    NOTHING written: no allocations, and the invoice stays exactly as it
+    was — `get_db` rolls the caller's whole transaction back on this raise
+    (decision #37), so no explicit rollback belongs here.
+    """
     application = await applications_service.get(db, invoice.application_id)
     if application is None:
         # invoice.application_id is a NOT NULL FK — unreachable in practice;
@@ -1092,7 +1114,19 @@ async def confirm_payment(
         for row in snapshot
         if row.kind != SNAPSHOT_KIND_REMAINDER
     ]
-    shares = ledger.split_payment(transaction.amount, rules)
+    try:
+        shares = ledger.split_payment(transaction.amount, rules)
+    except ledger.SplitDoesNotFit as exc:
+        # Reached only through the manual maker-checker door (see the
+        # docstring paragraph above) — refuse before any write, mirroring
+        # `issue_invoice`'s own handling of the identical exception.
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "split_does_not_fit", "detail": str(exc)},
+        ) from exc
+
+    invoice.status = "paid"
+    invoice.paid_at = transaction.performed_at
 
     leshoz_account = await resolve_recipient_account(
         db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id

@@ -14,8 +14,10 @@ from app.modules.payments.ledger import (
     RecipientRule,
     Share,
     SplitDoesNotFit,
+    entries_for_shares,
     split_payment,
 )
+from app.modules.payments.models import Invoice, ProviderTransaction
 
 BUDGET = uuid.uuid4()
 AGENCY = uuid.uuid4()
@@ -83,3 +85,46 @@ def test_fixed_amounts_larger_than_the_payment_refuse_rather_than_go_negative():
 def test_percent_and_fixed_together_still_fit_or_refuse():
     with pytest.raises(SplitDoesNotFit):
         split_payment(Decimal("100000.00"), [percent(BUDGET, "90"), fixed(FUND, "20000.00")])
+
+
+def _invoice(*, amount: Decimal) -> Invoice:
+    return Invoice(
+        id=uuid.uuid4(),
+        application_id=uuid.uuid4(),
+        number=f"INV-2027-{uuid.uuid4().hex[:6]}",
+        amount=amount,
+    )
+
+
+def _transaction(*, invoice_id: uuid.UUID, amount: Decimal) -> ProviderTransaction:
+    return ProviderTransaction(
+        id=uuid.uuid4(),
+        invoice_id=invoice_id,
+        provider="payme",
+        external_id=f"payme-{uuid.uuid4().hex[:8]}",
+        amount=amount,
+        state="2",
+    )
+
+
+def test_entries_for_shares_refuses_a_transaction_that_belongs_to_a_different_invoice():
+    """Review round 1, Minor 2: the deleted `entries_for` carried this exact
+    guard and a dedicated test for it (both correctly deleted together,
+    stage 7.9 task 5, Override 1) — `entries_for_shares` inherited the SAME
+    check, and nothing in `tests/` exercised it until now. Catches a stale
+    object reused across a retry, or a copy-paste mix-up in the caller:
+    without this, a mismatched pair would silently write a ledger row
+    pointing at the WRONG invoice — no exception, no log line,
+    undetectable until manual reconciliation. Both objects are already in
+    memory, so this costs neither I/O nor a session."""
+    invoice = _invoice(amount=Decimal("100.00"))
+    other_invoice_id = uuid.uuid4()
+    transaction = _transaction(invoice_id=other_invoice_id, amount=Decimal("100.00"))
+
+    with pytest.raises(ValueError, match=str(transaction.id)):
+        entries_for_shares(
+            invoice=invoice,
+            transaction=transaction,
+            shares=[Share(None, Decimal("100.00"))],
+            accounts={},
+        )

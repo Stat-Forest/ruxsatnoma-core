@@ -32,6 +32,7 @@ from typing import NamedTuple
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import Application
@@ -220,3 +221,45 @@ async def test_an_invoice_with_no_frozen_snapshot_pays_the_leshoz_everything(
     assert entries[0].recipient_id is None
     assert entries[0].target == "recipient"
     assert entries[0].amount == legacy_invoice.amount
+
+
+@pytest.fixture
+async def invoice_with_fixed_receiver(
+    db: AsyncSession,
+    application_600k: Application,
+    budget_50: PaymentRecipient,
+    receiver_fixed_60000: PaymentRecipient,
+) -> Invoice:
+    """`application_600k`'s invoice, issued but left `pending`, with the
+    frozen split covering BOTH the seeded `budget_50` (50%) and the fixed
+    `receiver_fixed_60000` (60 000) — the combination
+    `test_an_underpayment_smaller_than_a_fixed_receiver_refuses_to_confirm`
+    needs: a manual confirmation smaller than the fixed receiver's own
+    amount makes the frozen rules not fit, whatever the percent rule takes."""
+    return await service.issue_invoice(db, application_600k.id)
+
+
+async def test_an_underpayment_smaller_than_a_fixed_receiver_refuses_to_confirm(
+    db: AsyncSession, invoice_with_fixed_receiver: Invoice
+):
+    """Review round 1, Important 1: `ManualConfirmationIn.amount` is bounded
+    only `gt=0`, so an accountant may confirm LESS than the invoice — that
+    is the whole point of the manual door — but a configured FIXED receiver
+    (60 000) larger than what arrived (50 000, well under it) makes the
+    frozen split not fit. `confirm_payment` must REFUSE
+    (`ERR-VAL-001`/`split_does_not_fit`), mirroring `issue_invoice`'s own
+    handling of the identical `SplitDoesNotFit`, and — per the controller
+    ruling — leave NOTHING written: no allocation row, and the invoice
+    still `pending`, not `paid`."""
+    with pytest.raises(DomainError) as excinfo:
+        await manual_confirm(db, invoice_with_fixed_receiver, amount=Decimal("50000.00"))
+    assert excinfo.value.code == "ERR-VAL-001"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["reason"] == "split_does_not_fit"
+
+    entries = await service.allocations_for(db, invoice_with_fixed_receiver.id)
+    assert entries == []
+
+    await db.refresh(invoice_with_fixed_receiver)
+    assert invoice_with_fixed_receiver.status == "pending"
+    assert invoice_with_fixed_receiver.paid_at is None
