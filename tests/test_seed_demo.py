@@ -104,7 +104,7 @@ async def test_reseeding_an_unchanged_password_reports_no_convergence(
 def test_no_two_demo_accounts_share_a_password() -> None:
     """Every account carries its OWN fixed password (Oybek, 2026-09-04): the
     demo runs on the internet-facing dev server, where one string opening all
-    eight accounts — `sys_admin` among them — is not acceptable.
+    eleven accounts — `sys_admin` among them — is not acceptable.
 
     This asserts the property rather than the strings, so it survives a
     rotation but fails the moment an edit collapses two accounts onto one
@@ -119,7 +119,7 @@ def test_no_two_demo_accounts_share_a_password() -> None:
 
 def test_no_demo_password_is_derivable_from_its_login() -> None:
     """The passwords must not be a visible function of the login: knowing one
-    would then hand over the other seven. Cheap structural guard — the login's
+    would then hand over the other ten. Cheap structural guard — the login's
     distinctive part must not appear in its own password."""
     for spec in (*DEMO_STAFF, DEMO_APPLICANT):
         stem = spec.login.removeprefix("demo_")
