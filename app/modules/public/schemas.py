@@ -4,11 +4,13 @@ own `ValidationError` (422 `ERR-VAL-001`, handled centrally) never echoes
 field VALUES back for a plain type mismatch, only field names."""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Self
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
+
+from app.core.schemas import LocalizedName
 
 
 class AppealContact(BaseModel):
@@ -149,3 +151,25 @@ class RatingSummaryOut(BaseModel):
     count: int
     histogram: dict[int, int] | None
     threshold: int
+
+
+class ApplicationStatusOut(BaseModel):
+    """`GET /public/applications/check` — status without logging in (task 4).
+
+    Same "no oracle" posture as `AppealStatusOut`: an unknown `number` and a
+    `number` whose `phone` does not match answer identically, every field
+    `None` but `found`. What this shape may NEVER carry — the applicant's
+    name, the contour geometry, the calculated sum, attachments, the
+    reviewing official — stays behind the cabinet login; only the status,
+    its human label, the activity, the leshoz and what happens next cross
+    this boundary.
+    """
+
+    found: bool
+    number: str | None = None
+    status: str | None = None
+    status_label: LocalizedName | None = None
+    activity_type: str | None = None
+    organization: str | None = None
+    next_step: str | None = None
+    submitted_at: date | None = None

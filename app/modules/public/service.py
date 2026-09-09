@@ -25,6 +25,15 @@ Three surfaces, each with its own trust boundary:
    once `repo.rating_histogram`'s total meets `OPEN_DATA_K_ANONYMITY` — the
    same threshold `open_data_stats` already reads, not a second constant
    (#174).
+6. **Application status** — `check_application_status` (task 4) answers a
+   citizen who never logged in, on the same "no oracle" posture as
+   `check_appeal_status`: a `number` that does not exist and one that exists
+   but whose `phone` does not match get the identical `{"found": False}`.
+   `_APPLICATION_STATUS_INFO` is this module's own status vocabulary — it
+   maps `applications.models.APPLICATION_STATUSES`, not a copy of it, so a
+   status this dict has never heard of (impossible while the CHECK
+   constraint holds, but worth naming) answers `status_label`/`next_step`
+   as `None` rather than raising.
 """
 
 import uuid
@@ -190,6 +199,168 @@ async def answer_appeal(
         new_value={"status": "answered"},
     )
     return appeal
+
+
+# Task 4: every one of `applications.models.APPLICATION_STATUSES`'s fourteen
+# values gets a `label` (`LocalizedName`-shaped: `uz_latn` required, decision
+# #90) and a `next_step` sentence, both held in `uz_latn` AND `ru` in ONE dict
+# so the label and the sentence can never drift out of step with each other.
+# `check_application_status` reads only the `uz_latn` half of `next_step` —
+# the public site's base language (#90) — but the `ru` half is written anyway,
+# the same way every other citizen-facing string in this codebase is: cheap to
+# add beside the first, expensive to backfill once only one language exists.
+# `tests/modules/public/test_application_check.py` pins that every member of
+# `APPLICATION_STATUSES` has an entry here.
+_APPLICATION_STATUS_INFO: dict[str, dict[str, dict[str, str]]] = {
+    "DRAFT": {
+        "label": {"uz_latn": "Qoralama", "ru": "Черновик"},
+        "next_step": {
+            "uz_latn": "Arizani toʻldirib, yuboring.",
+            "ru": "Заполните заявку и отправьте её.",
+        },
+    },
+    "SUBMITTED": {
+        "label": {"uz_latn": "Yuborildi", "ru": "Подана"},
+        "next_step": {
+            "uz_latn": "Ariza koʻrib chiqish uchun navbatda.",
+            "ru": "Заявка в очереди на рассмотрение.",
+        },
+    },
+    "IN_REVIEW": {
+        "label": {"uz_latn": "Koʻrib chiqilmoqda", "ru": "На рассмотрении"},
+        "next_step": {
+            "uz_latn": "Mutaxassis arizangizni koʻrib chiqmoqda.",
+            "ru": "Специалист рассматривает вашу заявку.",
+        },
+    },
+    "PENDING_INFO": {
+        "label": {
+            "uz_latn": "Qoʻshimcha maʼlumot talab qilinadi",
+            "ru": "Требуется дополнительная информация",
+        },
+        "next_step": {
+            "uz_latn": "Shaxsiy kabinetga kirib, soʻralgan maʼlumotni taqdim eting.",
+            "ru": "Войдите в личный кабинет и предоставьте запрошенные сведения.",
+        },
+    },
+    "RETURNED": {
+        "label": {"uz_latn": "Qaytarildi", "ru": "Возвращена"},
+        "next_step": {
+            "uz_latn": "Arizani tuzatib, qayta yuboring.",
+            "ru": "Исправьте заявку и отправьте её повторно.",
+        },
+    },
+    "APPROVED": {
+        "label": {"uz_latn": "Maʼqullandi", "ru": "Одобрена"},
+        "next_step": {
+            "uz_latn": "Toʻlov hisobvarag‘i tayyorlanmoqda.",
+            "ru": "Готовится счёт на оплату.",
+        },
+    },
+    "INVOICED": {
+        "label": {"uz_latn": "Toʻlov kutilmoqda", "ru": "Ожидает оплаты"},
+        "next_step": {
+            "uz_latn": "Shaxsiy kabinetdagi hisobvaraq boʻyicha toʻlovni amalga oshiring.",
+            "ru": "Оплатите счёт в личном кабинете.",
+        },
+    },
+    "PAID": {
+        "label": {"uz_latn": "Toʻlandi", "ru": "Оплачена"},
+        "next_step": {
+            "uz_latn": "Ruxsatnoma rasmiylashtirilmoqda.",
+            "ru": "Разрешение оформляется.",
+        },
+    },
+    "PERMIT_ISSUED": {
+        "label": {"uz_latn": "Ruxsatnoma berildi", "ru": "Разрешение выдано"},
+        "next_step": {
+            "uz_latn": "Ruxsatnomani shaxsiy kabinetdan yuklab oling.",
+            "ru": "Скачайте разрешение в личном кабинете.",
+        },
+    },
+    "REJECTED": {
+        "label": {"uz_latn": "Rad etildi", "ru": "Отклонена"},
+        "next_step": {
+            "uz_latn": "Rad etish sababi bilan shaxsiy kabinetda tanishing.",
+            "ru": "Ознакомьтесь с причиной отказа в личном кабинете.",
+        },
+    },
+    "CANCELLED": {
+        "label": {"uz_latn": "Bekor qilindi", "ru": "Отменена"},
+        "next_step": {
+            "uz_latn": "Ariza arizachi tomonidan bekor qilingan.",
+            "ru": "Заявка отменена заявителем.",
+        },
+    },
+    "EXPIRED_UNPAID": {
+        "label": {"uz_latn": "Toʻlov muddati oʻtib ketdi", "ru": "Истёк срок оплаты"},
+        "next_step": {
+            "uz_latn": "Yangi ariza topshiring.",
+            "ru": "Подайте новую заявку.",
+        },
+    },
+    "CLOSED": {
+        "label": {"uz_latn": "Yakunlandi", "ru": "Завершена"},
+        "next_step": {
+            "uz_latn": "Jarayon yakunlandi, hech qanday amal talab qilinmaydi.",
+            "ru": "Процесс завершён, действий не требуется.",
+        },
+    },
+    "ARCHIVED": {
+        "label": {"uz_latn": "Arxivlandi", "ru": "Архивирована"},
+        "next_step": {
+            "uz_latn": "Jarayon yakunlandi, hech qanday amal talab qilinmaydi.",
+            "ru": "Процесс завершён, действий не требуется.",
+        },
+    },
+}
+
+
+def _digits(value: str | None) -> str:
+    """The same normalization `_normalize_contact` applies to a phone: strip
+    everything but digits, so `"+998 90 123-45-67"` and `"998901234567"`
+    compare equal. A free function rather than reusing `_normalize_contact`
+    (dict-shaped, `AppealContact`-specific) — this route's `phone` is a bare
+    query parameter, not that shape."""
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _phone_matches(stored: str | None, given: str) -> bool:
+    """`bool(stored_digits)` first, the same guard `_contact_matches` uses for
+    email: two blanks must never compare equal, or an application with no
+    phone on file would match an empty `phone` query parameter."""
+    stored_digits = _digits(stored)
+    return bool(stored_digits) and stored_digits == _digits(given)
+
+
+async def check_application_status(db: AsyncSession, *, number: str, phone: str) -> dict[str, Any]:
+    """Always 200-shaped (task 4), the same "no oracle" rule
+    `check_appeal_status` applies to its own miss: an unknown `number` and one
+    that exists but whose stored phone does not match answer identically,
+    `{"found": False}` — `AR-YYYY-NNNNNN` is a gapless, walkable space exactly
+    like `MR-YYYY-NNNNNN`, so a distinguishable answer would let a caller
+    learn which application numbers are real.
+
+    Only `repo.get_application_status_row`'s six columns ever reach the
+    response — no contour, no calculation, no attachment, no reviewing
+    official — and the applicant's own NAME is never selected in the first
+    place (unlike `phone`, read only to be compared, never echoed back)."""
+    row = await repo.get_application_status_row(db, number=number)
+    if row is None or not _phone_matches(row.phone, phone):
+        return {"found": False}
+    info = _APPLICATION_STATUS_INFO.get(row.status)
+    return {
+        "found": True,
+        "number": row.number,
+        "status": row.status,
+        "status_label": info["label"] if info else None,
+        "activity_type": (
+            row.activity_type_name.get("uz_latn") if row.activity_type_name else None
+        ),
+        "organization": (row.organization_name.get("uz_latn") if row.organization_name else None),
+        "next_step": info["next_step"]["uz_latn"] if info else None,
+        "submitted_at": row.submitted_at.date() if row.submitted_at else None,
+    }
 
 
 async def open_data_layers(db: AsyncSession) -> list[Any]:

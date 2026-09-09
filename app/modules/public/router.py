@@ -1,10 +1,11 @@
-"""The anonymous surface — appeals, open data, public site settings and the
-national rating summary. No `get_current_user`, no permission code anywhere
-in this file; a rate limit instead of both, same idiom `permits.public_router`
-and `norms.public_router` already established.
+"""The anonymous surface — appeals, open data, public site settings, the
+national rating summary and application status. No `get_current_user`, no
+permission code anywhere in this file; a rate limit instead of both, same
+idiom `permits.public_router` and `norms.public_router` already established.
 
-`POST /public/appeals` and `GET /public/appeals/check` are in
-`app/core/logging.py`'s `SILENT_ACCESS_LOG_PATHS` — `check`'s `contact` query
+`POST /public/appeals`, `GET /public/appeals/check` and `GET
+/public/applications/check` are in `app/core/logging.py`'s
+`SILENT_ACCESS_LOG_PATHS` — the latter two's `contact`/`phone` query
 parameter is exactly the kind of thing that precedent exists to keep out of a
 process log. The open-data, site-settings and ratings-summary routes carry no
 personal data and are deliberately left out of that list."""
@@ -22,6 +23,7 @@ from app.modules.public.schemas import (
     AppealIn,
     AppealStatusOut,
     AppealSubmitOut,
+    ApplicationStatusOut,
     OpenDataLayerOut,
     OpenDataStatsOut,
     RatingSummaryOut,
@@ -67,6 +69,25 @@ async def check_appeal_status(
     buy an attacker a way to distinguish "malformed" from "wrong" for free."""
     contact = AppealContact.model_construct(phone=phone, email=email)
     return await service.check_appeal_status(db, number=number, contact=contact)
+
+
+@router.get(
+    "/applications/check",
+    response_model=ApplicationStatusOut,
+    dependencies=[_APPEAL_STATUS_LIMIT],
+)
+async def check_application_status(
+    number: str, phone: str, db: Annotated[AsyncSession, Depends(get_db)]
+) -> Any:
+    """Task 4: status without logging in. `phone` is compared against the
+    applicant's own contact on file (`service.check_application_status`'s own
+    docstring) — not validated as a real phone shape here, for the identical
+    reason `check_appeal_status` above does not validate its own
+    `phone`/`email`: an unparsable value simply never matches anything, the
+    same `found: false` an unknown number gets. Shares `_APPEAL_STATUS_LIMIT`'s
+    bucket rather than a new settings key — both are the same shape of
+    low-volume, anonymous "check my status" call."""
+    return await service.check_application_status(db, number=number, phone=phone)
 
 
 @router.get(

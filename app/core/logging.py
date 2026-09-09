@@ -30,9 +30,17 @@ CORRELATION_ID_KEY = "correlation_id"
 # STRING (`?phone=`/`?email=`) — exactly what this filter exists to keep out
 # of a plaintext log. The open-data routes carry no personal data at all and
 # are deliberately NOT here — their access pattern is worth keeping for ops.
+#
+# Stage 8 task 4 adds a third: `GET /public/applications/check` takes the
+# identical shape of QUERY STRING (`?phone=`) for the identical reason —
+# checking an application's status without logging in needs the same shared
+# secret `check_appeal_status` already uses, and it would defeat the whole
+# purpose of this filter to keep a citizen's phone number out of one public
+# check's access-log line and not the other's.
 SILENT_ACCESS_LOG_PATHS = (
     "/api/v1/public/permits/check",
     "/api/v1/public/appeals",
+    "/api/v1/public/applications/check",
 )
 
 
