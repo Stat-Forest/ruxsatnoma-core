@@ -51,6 +51,7 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import Applicant, User
 from app.modules.gis import service as gis_service
+from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications
 from app.modules.permits import events, grounds, render, repo, signers
 from app.modules.permits.models import (
@@ -104,6 +105,27 @@ FOREST_TICKET_EXPIRE = "forest_ticket.expire"
 # `signatures.service.missing_purposes` has come back empty (C11).
 INITIAL_STATUS = "pending_signatures"
 ACTIVE_STATUS = "active"
+
+# Re-declared rather than imported from `norms.calculator.GRAZING`: `permits`
+# reaches `norms` through `norms.service` only, and a calculator constant is
+# not part of that public surface — the identical reasoning
+# `applications.checks.GRAZING_ACTIVITY_CODE` already carries for the same
+# string, at the same module boundary.
+GRAZING_ACTIVITY_CODE = "grazing"
+
+# Ruling #176 (stage 9): the two ACTIVE-only seams below
+# (`capacity_load_provider`, `exclusivity_provider`, and the pre-existing
+# `load_provider`/`occupancy_provider`) answer what `norms` needs for pricing
+# and admissibility — submission, precheck, the decision re-check. Issuance's
+# OWN gate, `_assert_contour_still_has_room`, is stricter on purpose: a
+# permit already EXISTS the moment `issue()` creates its row, in
+# `INITIAL_STATUS`, days or weeks before the fourth signature could ever make
+# it `ACTIVE_STATUS` — so a check that only counted `ACTIVE_STATUS` would let
+# `repo.lock_contour_activity`'s lock serialise two concurrent issuances
+# without either ever seeing the other's freshly written row, defeating the
+# whole point of taking it. This is the LAST gate before a legal, numbered
+# document, so it counts a competing permit from the moment it exists.
+ISSUANCE_BLOCKING_STATUSES = (INITIAL_STATUS, ACTIVE_STATUS)
 
 # Ruling #102: the status an extension's OWN activation moves its PARENT permit
 # out of `active` into — see `_close_parent_permit_if_extension`, the only writer
@@ -603,6 +625,115 @@ async def _snapshot(
     }
 
 
+async def _assert_contour_still_has_room(
+    db: AsyncSession,
+    *,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    activity_code: str,
+    quantity_unit: str,
+    period_from: date,
+    period_to: date,
+    requested_sb: Decimal | None,
+    requested_quantity: Decimal | None,
+) -> None:
+    """Ruling #176's issuance-time re-check — `issue()`'s caller must have
+    already taken `repo.lock_contour_activity`'s lock, or two concurrent
+    calls read the SAME "before" picture and both pass.
+
+    The SAME "requested <= capacity - committed" comparison (or, with no
+    capacity at all, exclusivity) `norms.checks._limit_check` makes at
+    submission and `applications.decision._assert_capacity_available` remakes
+    at approval — but against THIS module's own, STRICTER accounting,
+    `ISSUANCE_BLOCKING_STATUSES`, which counts a permit from the moment it
+    EXISTS rather than only once `add_signature` makes it `ACTIVE_STATUS`
+    (that constant's own comment has the full reasoning). `norms.service.
+    effective_norm` is the one call this needs from `norms` — on that
+    module's own public surface, never `norms.repo`/`norms.calculator`
+    directly (module boundary).
+
+    Raises `ERR-NORM-002`, the identical code `applications.checks` maps
+    `norm_limit` onto, with the same `details` shape `norms.checks.
+    _capacity_result`/`_exclusivity_result` already produce — a client
+    reading `details` cannot tell this refusal from the one at submission or
+    at decision.
+    """
+    norm = await norms_service.effective_norm(db, contour_id, activity_type_id, business_today())
+    if activity_code == GRAZING_ACTIVITY_CODE:
+        capacity = None if norm is None or norm.max_sb is None else Decimal(norm.max_sb)
+        requested = requested_sb
+        unit = "sb"
+    else:
+        capacity = None if norm is None else norm.capacity
+        requested = requested_quantity
+        unit = quantity_unit
+
+    if capacity is None:
+        occupied_until = await repo.latest_occupied_until(
+            db,
+            contour_id,
+            activity_type_id,
+            period_from,
+            period_to,
+            statuses=ISSUANCE_BLOCKING_STATUSES,
+        )
+        if occupied_until is not None:
+            raise err(
+                "ERR-NORM-002",
+                details={
+                    "reason": "exclusive_occupied",
+                    "occupied_until": occupied_until.isoformat(),
+                },
+            )
+        return
+
+    if requested is None:
+        # Checks without the money (`norms.checks._capacity_result`'s own
+        # phrase): nothing to compare, and never a manufactured demand of
+        # zero. Not reachable for a PAID application under today's pricing
+        # rules (`norms.calculator.calculate` refuses `quantity_required`
+        # before a priced, non-exempt, non-grazing calculation can exist),
+        # kept as the same fail-open-on-absence shape the norm module itself
+        # uses rather than a assumption this module bakes in twice.
+        return
+
+    if activity_code == GRAZING_ACTIVITY_CODE:
+        committed = await repo.committed_sb_load(
+            db, contour_id, period_from, period_to, statuses=ISSUANCE_BLOCKING_STATUSES
+        )
+    else:
+        committed = await repo.committed_capacity_quantity(
+            db,
+            contour_id,
+            activity_type_id,
+            period_from,
+            period_to,
+            statuses=ISSUANCE_BLOCKING_STATUSES,
+        )
+    # A plain `Decimal` subtraction, deliberately NOT `calculator.
+    # remaining_sb`'s `rounding_heads` floor for grazing: that rounding lives
+    # behind `norms.calculator`, not this module's public surface into
+    # `norms`, and flooring only ever makes `remaining` SMALLER (ruling 19 —
+    # never in the applicant's favour), so this comparison is, at most, a
+    # fraction of one conditional head MORE permissive than the DECISION-time
+    # check a moment earlier. Comparable to `s_available_ha`'s own floor at
+    # zero being a display concern, not an enforcement one: the true gate
+    # against negative capacity is `requested > remaining` below, which a
+    # missing floor cannot weaken past that fraction.
+    remaining = capacity - committed
+    if requested > remaining:
+        raise err(
+            "ERR-NORM-002",
+            details={
+                "requested": str(requested),
+                "capacity": str(capacity),
+                "committed": str(committed),
+                "remaining": str(remaining),
+                "unit": unit,
+            },
+        )
+
+
 async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Permit:
     """Form the permit for a PAID application, in one transaction.
 
@@ -647,6 +778,28 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
     # refused with ERR-PERM-001, never answered with a second document.
     if await repo.permit_by_application(db, application_id) is not None:
         raise err("ERR-PERM-001", details={"reason": "already_issued"})
+
+    # 2.5. Ruling #179's route point: issuance refuses an unverified benefit
+    # claim. T9 (stage 9, wave 2) owns the columns — `benefit_verification_
+    # status`, `benefit_rejection_reason` — on `applications.models`, a file
+    # this track may not touch; `getattr(..., None)` is therefore the guard,
+    # not a style choice: on a branch where T9's migration has not landed yet,
+    # the attribute does not exist on the ORM class at all and `getattr`
+    # degrades to `None` exactly as it would for a genuinely `not_required`
+    # row, never an `AttributeError`. `pending` blocks (the claim has not been
+    # looked at); `verified` and `not_required` pass; `rejected` blocks and
+    # names the reason a reviewer already recorded.
+    benefit_status = getattr(application, "benefit_verification_status", None)
+    if benefit_status == "pending":
+        raise err("ERR-VAL-001", details={"reason": "benefit_unverified"})
+    if benefit_status == "rejected":
+        raise err(
+            "ERR-VAL-001",
+            details={
+                "reason": "benefit_rejected",
+                "benefit_rejection_reason": getattr(application, "benefit_rejection_reason", None),
+            },
+        )
 
     # 3. Everything the document says, gathered once. A DRAFT is autosaved field
     # by field, so most of these columns are nullable (3.9a ruling 7) and each is
@@ -721,6 +874,29 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
                 "decided_at": application.decided_at.isoformat(),
             },
         )
+
+    # 3.5. Ruling #176's LAST gate, right before a legal, numbered document is
+    # produced (task 6). The contour x activity slot is locked FIRST
+    # (`repo.lock_contour_activity` — the advisory-lock idiom
+    # `repo.permit_by_id_for_update` gives a real row) so two approvals
+    # decided in the same second serialise instead of both reading the same
+    # "before" picture and both passing; see that function's own docstring
+    # for why an advisory lock and not a `gis.contours` row lock.
+    await repo.lock_contour_activity(db, contour_id, activity_type_id)
+    activity = await admin_repo.get_activity_type(db, activity_type_id)
+    if activity is None:
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    await _assert_contour_still_has_room(
+        db,
+        contour_id=contour_id,
+        activity_type_id=activity_type_id,
+        activity_code=activity.code,
+        quantity_unit=activity.quantity_unit,
+        period_from=period_from,
+        period_to=period_to,
+        requested_sb=calculation.used_sb,
+        requested_quantity=application.quantity,
+    )
 
     template = await repo.active_template(db, activity_type_id)
     if template is None:
@@ -799,6 +975,13 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         period_to=period_to,
         amount=calculation.amount,
         sb_load=calculation.used_sb,
+        # Ruling #176: `sb_load`'s non-grazing sibling. NULL for grazing itself
+        # (its committed load IS `sb_load`, never a second column) and for any
+        # activity priced at a declared quantity of zero — `application.
+        # quantity` already carries exactly the figure that was priced
+        # (`checks.calculation_payload` reads this same column into the
+        # `CalculationIn` `preview()`/`save_calculation()` priced against).
+        quantity=None if activity.code == GRAZING_ACTIVITY_CODE else application.quantity,
         status=INITIAL_STATUS,
         pdf_file_id=document.id,
         doc_hash=hashlib.sha256(pdf).hexdigest(),
@@ -1362,7 +1545,7 @@ async def add_signature(
 async def occupancy_provider(
     db: AsyncSession, contour_ids: Sequence[uuid.UUID]
 ) -> Mapping[uuid.UUID, Decimal]:
-    """How much of each contour's area is taken by permits in force.
+    """How much of each contour's area is taken by permits in force, TODAY.
 
     ONE query for the whole page, never one per contour: 3.6a reshaped this seam
     from per-contour to batch specifically so that this, its first registration,
@@ -1372,26 +1555,28 @@ async def occupancy_provider(
     one that matched nothing, and `IN ()` is a statement with no possible answer.
 
     A contour with nothing on it is absent from the mapping rather than present
-    as a zero; the seam's contract is that a key it does not get back counts as
+    as a zero; the seam's contract is that a key it was not given back counts as
     zero, and `occupancy_map` quantizes whatever it is given to `area_ha`'s own
     NUMERIC(12,4) scale.
 
-    **NO PERIOD, deliberately — and this is the one place the two seams disagree.**
-    `load_provider` below takes `period_from`/`period_to` and counts only permits
-    overlapping them; this one takes none, so two SEASONAL permits on one contour
-    whose periods do not overlap at all both count, and `gis`'s `s_available_ha`
-    reports less free area than a given day actually has. That is ruling 11 as
-    written and it is the conservative direction: the seam can under-report free
-    area, never over-book a contour. It is asymmetric because the SHAPE 3.6a fixed
-    is asymmetric — this one answers a whole page of contours at once, for a list
-    with no period in the request at all, while `norms` asks about one contour for
-    one named period. Do not "fix" the asymmetry by adding a period here: a page
-    of contours has no single period to filter on, and the answer would silently
-    become "free on some unstated day".
+    **PERIOD-AWARE since ruling #176 (stage 9), closing the asymmetry with
+    `load_provider` below that used to be deliberate here.** This seam takes no
+    `period_from`/`period_to` of its own — `gis.service.list_contours` asks
+    about a whole page at once, with no single period to filter a caller-
+    supplied window on — but "no period" is not "no date": `repo.
+    occupied_area_by_contour`'s own `as_of=business_today()` excludes a permit
+    whose OWN period has already ended, so last season's expired-in-fact grazing
+    permit — still `active` in the database until the nightly
+    `jobs.expire_permits` sweep catches up — no longer occupies the hectares it
+    no longer uses. A permit that has not yet STARTED still counts, the same
+    conservative direction ruling 11 always favoured: this seam may under-report
+    free area, never over-book a contour.
     """
     if not contour_ids:
         return {}
-    return await repo.occupied_area_by_contour(db, contour_ids, status=ACTIVE_STATUS)
+    return await repo.occupied_area_by_contour(
+        db, contour_ids, status=ACTIVE_STATUS, as_of=business_today()
+    )
 
 
 async def load_provider(
@@ -1406,14 +1591,47 @@ async def load_provider(
     (`tz/05` invariant 7), and re-deriving it here would let a later tariff
     regrouping change how much room a contour has today.
 
-    **PERIOD-AWARE, unlike `occupancy_provider` above**, which counts every active
-    permit on a contour whatever its dates. A reader meeting both seams must not
-    assume symmetry: last summer's expired-in-fact-but-still-`active` grazing
-    permit is excluded here and included there. See that function's own docstring
-    for why the difference is deliberate and which way it errs.
-    """
+    PERIOD-AWARE the same way `occupancy_provider` above now is too — the two
+    seams no longer disagree (ruling #176, stage 9)."""
     return await repo.committed_sb_load(
-        db, contour_id, period_from, period_to, status=ACTIVE_STATUS
+        db, contour_id, period_from, period_to, statuses=(ACTIVE_STATUS,)
+    )
+
+
+async def capacity_load_provider(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+) -> Decimal:
+    """`load_provider`'s non-grazing sibling — registered into `norms.
+    CAPACITY_LOAD_PROVIDERS` (ruling #176). Sums `permits.quantity`, the
+    committed amount in the activity's OWN unit, from `ACTIVE_STATUS` permits
+    over an overlapping period — the identical `ACTIVE_STATUS`-only accounting
+    `load_provider` already uses, extended with `activity_type_id` because one
+    contour may carry permits for more than one activity whose quantities must
+    never be summed together (`repo.committed_capacity_quantity`'s own
+    docstring)."""
+    return await repo.committed_capacity_quantity(
+        db, contour_id, activity_type_id, period_from, period_to, statuses=(ACTIVE_STATUS,)
+    )
+
+
+async def exclusivity_provider(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+) -> date | None:
+    """Registered into `norms.EXCLUSIVITY_PROVIDERS` (ruling #176, Oybek's
+    option а): the latest day an overlapping `ACTIVE_STATUS` permit, for this
+    contour × activity, still covers — `None` when nothing overlaps. Answers
+    the question a contour with NO capacity resolves to: not "how much room is
+    left" but "is it free at all, and if not, until when"."""
+    return await repo.latest_occupied_until(
+        db, contour_id, activity_type_id, period_from, period_to, statuses=(ACTIVE_STATUS,)
     )
 
 

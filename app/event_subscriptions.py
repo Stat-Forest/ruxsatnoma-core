@@ -135,6 +135,16 @@ def _register_providers() -> None:
         gis_service.OCCUPANCY_PROVIDERS.append(permits_service.occupancy_provider)
     if permits_service.load_provider not in norms_service.LOAD_PROVIDERS:
         norms_service.LOAD_PROVIDERS.append(permits_service.load_provider)
+    # Ruling #176 (stage 9, T6): the two seams T4 opened empty, generalising
+    # `LOAD_PROVIDERS` beyond grazing. Same idiom, same reason to live here
+    # rather than in `app/main.py` — a `workers_mode=off` deployment never
+    # calls `create_app()`, and the daily jobs that read a contour's
+    # committed capacity would otherwise answer `capacity_load_source: "none"`
+    # in that process while the API answers `"permits"`.
+    if permits_service.capacity_load_provider not in norms_service.CAPACITY_LOAD_PROVIDERS:
+        norms_service.CAPACITY_LOAD_PROVIDERS.append(permits_service.capacity_load_provider)
+    if permits_service.exclusivity_provider not in norms_service.EXCLUSIVITY_PROVIDERS:
+        norms_service.EXCLUSIVITY_PROVIDERS.append(permits_service.exclusivity_provider)
 
     # `admin` (level 1) may not read `applications` (3) or `inspections` (5), and
     # tz/04 С23 makes deletion — and, adjacent to it, archival — conditional on
