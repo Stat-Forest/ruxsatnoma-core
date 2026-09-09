@@ -627,6 +627,20 @@ Tooling and environment.
 
 # HTTP layer
 
+## The request's transaction commits before the response is sent, not after
+
+- **Rule:** Leave the request's `commit()` in `CommitBeforeResponseMiddleware`
+  (`app/core/deps.py`), which fires on `http.response.start`; `get_db` only rolls back and
+  keeps a fallback. Moving it back into `get_db`'s `else:` restores the race below.
+- **Why:** FastAPI (>= 0.106) exits a `yield` dependency AFTER the response reaches the
+  server, so a client racing its own write loses: on dev 2026-09-09 `POST /auth/login`
+  answered 200 with a session cookie and a request 6 ms later got `ERR-AUTH-002` — which the
+  adminka reads as "session gone" and bounces to /login. The window shut by ~40 ms, so every
+  retry worked and no test saw it.
+- **How to apply:** `tests/core/test_transaction_timing.py` pins the ORDER of `after_commit`
+  against `http.response.start`. A probe reading the row from a second connection CANNOT: its
+  own `await` lets the loop finish the very commit it means to catch, and reports "no race".
+
 ## `request.body()` raises inside a dependency on any FORM route
 
 - **Rule:** A dependency needing the raw body (`auth.deps.idempotency_context` is the only
