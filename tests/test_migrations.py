@@ -275,7 +275,20 @@ async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine
     the legacy `'budget'` shape) and `0045` (which drops
     `invoice_recipients` and the `recipient_id` column outright). Proves
     the two-migration path a real committed row actually travels, not
-    just each migration's own isolated downgrade."""
+    just each migration's own isolated downgrade.
+
+    The allocation names a SECOND, fabricated recipient — not the seeded
+    budget one the invoice_recipients row uses. `0046`'s downgrade folds
+    only rows matching `recipient_id = BUDGET_RECIPIENT_ID`; a row naming
+    any other recipient sails through it untouched, still
+    `target='receiver'`, and only `0045`'s OWN blanket
+    `UPDATE allocations SET target = 'budget' WHERE target = 'receiver'`
+    collapses it before its CHECK is narrowed back. Using the budget
+    recipient here instead (as an earlier version of this test did) made
+    `0046`'s downgrade collapse the row FIRST, so `0045`'s own
+    collapse-then-narrow ran against nothing — a regression that swapped
+    that migration's own order back would have found zero violating rows
+    and passed unnoticed."""
     url = get_settings().database_url_test
     cfg = _alembic_config(url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -284,6 +297,7 @@ async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine
     applicant_id = uuid.uuid4()
     application_id = uuid.uuid4()
     invoice_id = uuid.uuid4()
+    other_recipient_id = uuid.uuid4()
     pinfl = str(applicant_id.int % 10**14).zfill(14)
 
     async with engine.begin() as conn:
@@ -352,11 +366,28 @@ async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine
             ),
             {"invoice_id": invoice_id, "name": '{"uz_latn": "Leshoz"}'},
         )
+        # A SECOND payment_recipients row, fabricated for this test and
+        # deliberately NOT the seeded budget recipient — see the docstring
+        # and the comment on the allocations INSERT below for why.
+        await conn.execute(
+            text(
+                "INSERT INTO payment_recipients (id, name, kind, percent) "
+                "VALUES (CAST(:id AS uuid), CAST(:name AS jsonb), 'percent', 25.00)"
+            ),
+            {"id": other_recipient_id, "name": '{"uz_latn": "Boshqa oluvchi"}'},
+        )
         # The ledger row the same payment actually wrote (`ledger.
         # entries_for_shares`): `target='receiver'`, `recipient_id` set —
-        # the exact shape `0046`'s downgrade must fold back onto
-        # `target='budget'`, `recipient_id=NULL` BEFORE `0045`'s own
-        # downgrade drops the column entirely.
+        # but against `other_recipient_id`, NOT `_BUDGET_RECIPIENT_ID`.
+        # `0046`'s own downgrade only folds rows matching
+        # `recipient_id = BUDGET_RECIPIENT_ID` (its own targeted UPDATE);
+        # a row naming any OTHER recipient sails through `0046`'s
+        # downgrade untouched, still `target='receiver'`, and lands on
+        # `0045`'s downgrade as a live row that its blanket
+        # `UPDATE ... WHERE target = 'receiver'` must actually collapse
+        # BEFORE the CHECK is narrowed back — the case that was a no-op
+        # (and proved nothing) while this row named the budget recipient
+        # instead.
         await conn.execute(
             text(
                 "INSERT INTO allocations "
@@ -364,7 +395,7 @@ async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine
                 "VALUES (gen_random_uuid(), CAST(:invoice_id AS uuid), "
                 "CAST(:recipient_id AS uuid), 'payment', 'receiver', 300000.00)"
             ),
-            {"invoice_id": invoice_id, "recipient_id": _BUDGET_RECIPIENT_ID},
+            {"invoice_id": invoice_id, "recipient_id": other_recipient_id},
         )
 
     try:
@@ -398,11 +429,13 @@ async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine
             ).scalar_one()
             assert has_column is False
 
-            # What comes back: the `'receiver'` row `0046`'s downgrade folded
-            # onto `'budget'` stays `'budget'` through `0045`'s own downgrade
-            # too (that migration's `UPDATE ... WHERE target = 'receiver'` is
-            # a no-op by the time it runs — nothing to do, and nothing to
-            # break).
+            # What comes back: `0046`'s downgrade left this row untouched
+            # (its recipient_id does not match BUDGET_RECIPIENT_ID), so it
+            # reaches `0045`'s downgrade still `target='receiver'` — and
+            # THAT migration's own blanket
+            # `UPDATE ... WHERE target = 'receiver'` is what collapses it
+            # to `'budget'` here, before the CHECK is narrowed back. This
+            # is the assertion this test actually exists to prove.
             row = (
                 await conn.execute(
                     text("SELECT target FROM allocations WHERE invoice_id = CAST(:id AS uuid)"),
