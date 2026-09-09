@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError, err
 from app.modules.gis import service as gis_service
-from app.modules.norms import calculator
+from app.modules.norms import calculator, repo
 from app.modules.norms.calculator import (
     GRAZING,
     CalcRequest,
@@ -31,7 +31,7 @@ class CheckResult(TypedDict):
     details: dict[str, Any]
 
 
-BLOCKING = frozenset({"norm", "season", "rotation", "fire_ban", "limit"})
+BLOCKING = frozenset({"norm", "season", "min_term", "rotation", "fire_ban", "limit"})
 
 SEASON_ERROR = "ERR-NORM-003"
 
@@ -57,6 +57,7 @@ _ERROR_BY_CHECK = {
     "norm": "ERR-NORM-001",
     "limit": "ERR-NORM-002",
     "season": SEASON_ERROR,
+    "min_term": SEASON_ERROR,
     "rotation": SEASON_ERROR,
     "fire_ban": SEASON_ERROR,
 }
@@ -103,8 +104,37 @@ def _in_window(day: date, window: Any) -> bool:
     return start <= stamp <= end if start <= end else stamp >= start or stamp <= end
 
 
+def resolve_effective_windows(
+    norm_season: Mapping[str, Any] | None, dictionary_season: Mapping[str, Any] | None
+) -> tuple[list[Any], str]:
+    """Ruling #177's override order, and the ONE place it is decided — both
+    `_season_check` below and `service.effective_season` (task 4's public
+    read for the wizard) call this rather than each re-deriving the
+    precedence, so a date picker built from the public read can never
+    disagree with the check that fires if the applicant ignores it (lesson:
+    a precondition/decision shared by several callers belongs in one
+    function every one of them calls).
+
+    The contour's own norm wins when it states windows of its own; the
+    leshoz dictionary (`activity_seasons`, keyed by organization × activity)
+    is the fallback a leshoz states once instead of on every one of its
+    contours; neither present is `("none", [])` — today's exact meaning,
+    unchanged: `no_season_defined`. Reads both defensively (`isinstance`
+    before `.get`), the same fail-closed posture `_in_window` already uses —
+    a malformed `season`/`windows` value never crashes this function, it
+    simply does not count as "has windows"."""
+    if isinstance(norm_season, Mapping) and norm_season.get("windows"):
+        return list(norm_season["windows"]), "norm"
+    if isinstance(dictionary_season, Mapping) and dictionary_season.get("windows"):
+        return list(dictionary_season["windows"]), "activity_season"
+    return [], "none"
+
+
 def _season_check(
-    period_from: date, period_to: date, season: Mapping[str, Any] | None
+    period_from: date,
+    period_to: date,
+    norm_season: Mapping[str, Any] | None,
+    dictionary_season: Mapping[str, Any] | None,
 ) -> CheckResult:
     """Walks every day of the requested period, not just its two ends: two
     windows can each cover one end of a period while leaving a gap between them
@@ -115,18 +145,58 @@ def _season_check(
     is both correct and cheap — no need to reason about which window edges
     could matter.
 
-    No `windows` configured is not the same as "always in season" — it means
-    this norm never recorded one, so the check reports `skipped` rather than
-    asserting something nobody verified."""
-    if not season or not season.get("windows"):
+    No windows resolved at all (`resolve_effective_windows` — neither the
+    contour's own norm nor the leshoz dictionary states any) is not the same
+    as "always in season" — it means nobody has recorded one anywhere, so the
+    check reports `skipped` rather than asserting something nobody verified.
+    `details.source` says which of the two won when one did (ruling #177),
+    so a caller can tell a norm override from the leshoz default without a
+    second round trip."""
+    windows, source = resolve_effective_windows(norm_season, dictionary_season)
+    if not windows:
         return {"check": "season", "result": "skipped", "details": {"reason": "no_season_defined"}}
-    windows = season["windows"]
     day = period_from
     while day <= period_to:
         if not any(_in_window(day, window) for window in windows):
-            return {"check": "season", "result": "fail", "details": {"reason": "outside_season"}}
+            return {
+                "check": "season",
+                "result": "fail",
+                "details": {"reason": "outside_season", "source": source},
+            }
         day += timedelta(days=1)
-    return {"check": "season", "result": "pass", "details": {}}
+    return {"check": "season", "result": "pass", "details": {"source": source}}
+
+
+def _min_term_check(period_from: date, period_to: date, min_term_days: int | None) -> CheckResult:
+    """Ruling #177 task 3: the leshoz dictionary's own `min_term_days`,
+    blocking, `details.min_term_days` carried on every outcome (not just the
+    failure) so the UI can STATE the rule rather than merely enforce it.
+
+    No norm-level override exists for this figure — the ruling only speaks
+    of overriding the WINDOWS — so it reads `activity_seasons` alone; no
+    dictionary row, or the column left NULL, means no minimum is enforced
+    (`skipped`), never a manufactured zero. `requested_days` is inclusive
+    of both ends (`payments.refunds`'s own `total_days` convention for "how
+    many days is this period"), so a one-day request against a one-day
+    minimum passes rather than failing by construction."""
+    if min_term_days is None:
+        return {
+            "check": "min_term",
+            "result": "skipped",
+            "details": {"reason": "no_min_term_defined"},
+        }
+    requested_days = (period_to - period_from).days + 1
+    if requested_days < min_term_days:
+        return {
+            "check": "min_term",
+            "result": "fail",
+            "details": {
+                "reason": "period_too_short",
+                "min_term_days": min_term_days,
+                "requested_days": requested_days,
+            },
+        }
+    return {"check": "min_term", "result": "pass", "details": {"min_term_days": min_term_days}}
 
 
 def _rotation_check(
@@ -404,13 +474,32 @@ async def run_checks(
     if (period_to - period_from).days > MAX_PERIOD_DAYS:
         raise err("ERR-VAL-001", details={"reason": "period_too_long"})
 
+    # Ruling #177: the leshoz dictionary (`activity_seasons`) is resolved
+    # once per contour × activity, regardless of whether a norm exists at
+    # all — the whole point of the ruling is a season stated even where no
+    # geobotanical survey, and therefore no `Norm`, exists yet.
+    # `organization_id` is None only when the contour itself cannot be
+    # resolved, which `service._build_request_and_snapshot` already refuses
+    # before this function is ever reached — kept defensive here since this
+    # module is the shared entry point 3.9 also calls directly.
+    organization_id = await gis_service.contour_organization(db, contour_id)
+    dictionary_row = (
+        await repo.get_activity_season(db, organization_id, activity_type_id)
+        if organization_id is not None
+        else None
+    )
+    dictionary_season = dictionary_row.season if dictionary_row is not None else None
+    dictionary_min_term = dictionary_row.min_term_days if dictionary_row is not None else None
+
     results: list[CheckResult] = [_norm_check(request, snapshot.norm)]
 
+    norm_season = snapshot.norm.season if snapshot.norm is not None else None
+    results.append(_season_check(period_from, period_to, norm_season, dictionary_season))
+    results.append(_min_term_check(period_from, period_to, dictionary_min_term))
+
     if snapshot.norm is not None:
-        results.append(_season_check(period_from, period_to, snapshot.norm.season))
         results.append(_rotation_check(period_from, period_to, snapshot.norm.rotation))
     else:
-        results.append({"check": "season", "result": "skipped", "details": {"reason": "no_norm"}})
         results.append({"check": "rotation", "result": "skipped", "details": {"reason": "no_norm"}})
 
     fire_ban, restrictions = await _territory_checks(db, contour_id, period_from, period_to)
