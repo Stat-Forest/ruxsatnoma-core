@@ -37,6 +37,9 @@ from app.modules.admin.legal_documents_router import router as legal_documents_a
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
+from app.modules.applications.benefit_verification_router import (
+    router as benefit_verification_router,
+)
 from app.modules.applications.router import router as applications_router
 from app.modules.archive.router import router as archive_router
 from app.modules.auth.router import router as auth_router
@@ -327,6 +330,13 @@ def create_app() -> FastAPI:
     # parcel, no permission code; a rate limit instead of all three.
     app.include_router(norms_public_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
+    # Ruling #179: the central benefit-verification office, mounted BEFORE its
+    # sibling `applications_router` — Starlette matches routes in REGISTRATION
+    # order, not by specificity, so `GET /applications/{application_id}` would
+    # otherwise shadow the literal `/applications/benefit-verifications` path
+    # (a 422 `uuid_parsing` on "benefit-verifications", found by this track's
+    # own tests — a wrong-order regression here fails the exact same way).
+    app.include_router(benefit_verification_router, prefix="/api/v1")
     app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
     app.include_router(payments_backoffice_router, prefix="/api/v1")

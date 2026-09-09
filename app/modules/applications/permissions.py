@@ -36,6 +36,14 @@ APPLICATIONS_DECIDE = "applications.decide"
 APPLICATIONS_VIEW_ANY = "applications.view_any"
 APPLICATIONS_ASSIGN = "applications.assign"
 APPLICATIONS_CONCLUDE_GIS = "applications.conclude_gis"
+# Ruling #179 (migration 0049, role `benefit_verifier`): owned here, not by a
+# new module, for the identical reason `.conclude_gis` above is — what it
+# authorises is a write on an APPLICATION (verify/reject a benefit claim),
+# regardless of which role happens to hold it. `benefit_verifier` is the
+# CENTRAL office this code was built for, but the code names the ACTION, not
+# the role — `benefit_verification.py`'s router gates on this alone, never on
+# `role_code == "benefit_verifier"` directly.
+BENEFITS_VERIFY = "benefits.verify"
 
 register(
     {
@@ -46,6 +54,10 @@ register(
         APPLICATIONS_ASSIGN: "Reassign an application to another org or user",
         APPLICATIONS_CONCLUDE_GIS: (
             "Write the kind=gis conclusion on an application (gis_specialist)"
+        ),
+        BENEFITS_VERIFY: (
+            "Verify or reject a certificate-bearing benefit claim, country-wide "
+            "(benefit_verifier — the central office)"
         ),
     }
 )
