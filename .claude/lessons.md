@@ -585,6 +585,20 @@ Tooling and environment.
 - **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
   fails once that module ships, or tie it to a tracked ticket.
 
+## A `.get(key, default)` over a GROUP BY turns another module's retired enum value into a plausible zero
+
+- **Rule:** A dict built from a `GROUP BY` and read with `.get(key, default)`, where `key`
+  is another module's enum-ish string (`target`, `status`, `kind`), must not default
+  silently — assert the key set against the column's CURRENT check/tuple instead.
+- **Why:** Stage 7.9's migration `0046` retired `allocations.target = 'budget'`, rewriting
+  every row to `'receiver'` and dropping it from the CHECK. `dashboard/repo.py::payments_kpi`
+  — a DIFFERENT module — still read `by_target.get("budget", Decimal("0.00"))`; nothing
+  carries that key after the migration, so `budget_share_amount` reported zero with no
+  exception, no log line, and no test — found only by a human grepping the retired string.
+- **How to apply:** Aggregating another module's enum-ish column into a dict, grep every
+  `.get(<literal>,` keyed by it and pin the key set against the owning table's CHECK — the
+  shape `test_the_schema_literals_match_the_tables_own_check_constraints` already uses.
+
 ---
 
 # PostGIS
