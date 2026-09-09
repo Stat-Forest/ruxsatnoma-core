@@ -98,6 +98,9 @@ def _snapshot(**over) -> ParamSnapshot:
         capacity_load_source=over.pop("capacity_load_source", "none"),
         occupied_until=over.pop("occupied_until", None),
         occupied_until_source=over.pop("occupied_until_source", "none"),
+        # `params.load_snapshot` fills this from `activity_types`; a test that
+        # does not care leaves it unset, and the refusal then states no unit.
+        quantity_unit=over.pop("quantity_unit", None),
     )
 
 
@@ -269,6 +272,7 @@ async def test_the_limit_check_reports_all_three_numbers(
         "committed": "0",
         "remaining": "250",
         "load_source": "none",
+        "unit": "sb",
     }
 
 
@@ -572,6 +576,7 @@ async def test_a_haymaking_request_over_the_remainder_is_refused(
         ),
         capacity_load=Decimal("3"),
         capacity_load_source="permits",
+        quantity_unit="ha",
     )
     results = await checks.run_checks(
         db,
@@ -588,6 +593,7 @@ async def test_a_haymaking_request_over_the_remainder_is_refused(
         "committed": "3",
         "remaining": "7",
         "load_source": "permits",
+        "unit": "ha",
     }
     assert checks.is_blocked(results) is True
 
@@ -611,6 +617,7 @@ async def test_a_haymaking_request_within_the_remainder_passes(
         ),
         capacity_load=Decimal("3"),
         capacity_load_source="permits",
+        quantity_unit="ha",
     )
     results = await checks.run_checks(
         db,
@@ -942,6 +949,7 @@ async def test_the_capacity_load_seam_sums_every_registered_provider(
             "committed": "5",
             "remaining": "5.0000",
             "load_source": "permits",
+            "unit": "ha",
         }
     finally:
         norms_service.CAPACITY_LOAD_PROVIDERS.remove(first)

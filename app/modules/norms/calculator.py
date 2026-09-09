@@ -124,6 +124,14 @@ class ParamSnapshot:
     capacity_load_source: str = "none"
     occupied_until: date | None = None
     occupied_until_source: str = "none"
+    # The activity's own `activity_types.quantity_unit`, carried so a capacity
+    # refusal can say WHAT it counted (integration finding, stage 9 wave 1 —
+    # «40 of 100» with no unit is unreadable). Deliberately NOT taken from the
+    # tariff rows beside it: an activity may lawfully have no tariff at all
+    # (science, ruling in `tz/06`), and it still has a unit. `None` when the
+    # snapshot was built without one — every pre-stage-9 construction, tests
+    # included — and the refusal then states no unit rather than inventing one.
+    quantity_unit: str | None = None
 
 
 @dataclass(frozen=True)

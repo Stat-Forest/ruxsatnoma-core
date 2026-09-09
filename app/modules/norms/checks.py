@@ -260,17 +260,16 @@ def _capacity_unit(request: CalcRequest, snapshot: ParamSnapshot) -> str | None:
     said «40 of 100» with no way to know whether that meant hectares, hives or
     cubic metres. Grazing answers `"sb"` (условная голова) because its numbers
     are conditional heads rather than the tariff's own billing unit; every
-    other activity answers its `activity_types.quantity_unit`, which reaches
-    here on the tariff rows in force. No tariff row (a lawful case — science
-    has no rate at all) means the unit is genuinely unknown, and `None` says so
-    rather than guessing one.
+    other activity answers its own `activity_types.quantity_unit`, carried on
+    the snapshot. It is deliberately NOT read off the tariff rows beside it:
+    `science` has no tariff row by law (`tz/06`) and still measures something.
+    A snapshot built without a unit — every construction predating this stage,
+    tests included — answers `None`, and the refusal then states no unit
+    instead of inventing one.
     """
     if request.activity_code == GRAZING:
         return "sb"
-    for tariff in snapshot.tariffs:
-        if tariff.quantity_unit:
-            return tariff.quantity_unit
-    return None
+    return snapshot.quantity_unit
 
 
 def _capacity_result(

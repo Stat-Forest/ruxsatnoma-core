@@ -340,3 +340,35 @@ async def test_grazing_never_touches_either_new_seam(
         assert snapshot.occupied_until_source == "none"
     finally:
         norms_service.CAPACITY_LOAD_PROVIDERS.remove(unexpected)
+
+
+async def test_the_snapshot_carries_the_activity_s_own_unit(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """Integration finding, stage 9 wave 1: a capacity refusal states
+    `requested`/`capacity`/`remaining` and is unreadable without the unit those
+    three are counted in. It comes from `activity_types.quantity_unit` — NOT
+    from the tariff rows in the same snapshot, since an activity may lawfully
+    have no tariff at all and still measure something.
+    """
+    haymaking = await params.load_snapshot(
+        db,
+        request=_request(on_date=date(2026, 8, 30), activity_code="haymaking"),
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+    )
+    assert haymaking.quantity_unit == "ha"
+
+    grazing = await params.load_snapshot(
+        db,
+        request=_request(on_date=date(2026, 8, 30), activity_code="grazing"),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+    )
+    # Grazing's own unit in the catalogue is `head`; the capacity check answers
+    # `"sb"` for it regardless, because what it counts is CONDITIONAL heads.
+    # Both facts are true at once and neither is the other's substitute.
+    assert grazing.quantity_unit == "head"

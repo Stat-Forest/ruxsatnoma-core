@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.admin import repo as admin_repo
 from app.modules.norms import calculator, repo, service
 from app.modules.norms.calculator import CalcRequest, NormFact, ParamSnapshot, TariffFact
 
@@ -53,6 +54,15 @@ async def load_snapshot(
     values.update({code: row.value for code, row in coef_rows.items()})
     values.update({code: row.value for code, row in group_rows.items()})
     values.update({code: row.value for code, row in exempt_rows.items()})
+
+    # The unit belongs to the ACTIVITY, not to its tariff: `science` has no
+    # tariff row by law and still measures something. Read through `admin.repo`
+    # like every other reference-data lookup here, never a direct
+    # `activity_types` query (module boundary, 'Reference data').
+    activity_types = await admin_repo.list_activity_types(db)
+    quantity_unit = next(
+        (a.quantity_unit for a in activity_types if a.id == activity_type_id), None
+    )
 
     tariff_rows = await repo.effective_tariffs(db, activity_type_id, request.on_date)
     tariffs = tuple(
@@ -113,4 +123,5 @@ async def load_snapshot(
         capacity_load_source=capacity_load_source,
         occupied_until=occupied_until,
         occupied_until_source=occupied_until_source,
+        quantity_unit=quantity_unit,
     )
