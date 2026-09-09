@@ -73,6 +73,31 @@ def test_verification_never_carries_the_document_bytes() -> None:
     assert result.raw["signers"][0]["paramSetOID"] == "1.2.860.3.15.2.1.2.1.1"
 
 
+def test_verification_never_carries_the_signers_pinfl_or_the_ocsp_response() -> None:
+    """Finding 5 (final review): `raw` used to be `pkcs7Info` copied
+    wholesale minus only `documentBase64`, so `certificate[0].subjectInfo`'s
+    PINFL, `subjectName`'s `UID=<pinfl>`, the OCSP response and the raw
+    public key all rode along into an append-only column served whole to
+    every co-signer (`GET /api/v1/signatures`) — a citizen who signed as one
+    party could read every OTHER signer's own PINFL. Replaced with an
+    explicit allow-list of what a verdict actually rests on."""
+    result = verification_from_pkcs7_info(VENDOR_ATTACHED_SAMPLE)
+    blob = str(result.raw)
+    assert "31234567890123" not in blob  # the signer's own PINFL
+    assert "subjectInfo" not in blob
+    assert "subjectName" not in blob
+    assert "OCSPResponse" not in blob
+    assert "publicKey" not in blob
+    signer_evidence = result.raw["signers"][0]
+    # What a verdict genuinely rests on is still there.
+    assert signer_evidence["verified"] is True
+    assert signer_evidence["certificateVerified"] is True
+    assert signer_evidence["certificateValidAtSigningTime"] is True
+    assert signer_evidence["certificateSerialNumber"] == "218712ed3"
+    assert signer_evidence["certificateValidFrom"] == "2026-05-25 15:47:22"
+    assert signer_evidence["certificateValidTo"] == "2026-06-24 15:47:22"
+
+
 def test_verification_reads_the_signer_certificate_and_signing_time() -> None:
     result = verification_from_pkcs7_info(VENDOR_ATTACHED_SAMPLE)
     assert result.status_code == 1

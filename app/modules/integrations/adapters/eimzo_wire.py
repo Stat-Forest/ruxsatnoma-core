@@ -108,6 +108,40 @@ def _verified_status(signer: dict[str, Any], status: int) -> int:
     return status
 
 
+def _signer_evidence(entry: dict[str, Any]) -> dict[str, Any]:
+    """An explicit allow-list of one signer's fields worth keeping as
+    evidence (finding 5, final review) — replaces the old "copy everything
+    except one key" approach, which let `certificate[0].subjectInfo`'s
+    PINFL, `subjectName`'s `UID=<pinfl>`, the OCSP response and the raw
+    public key all ride into `signatures.verification`, an append-only
+    column served WHOLE to every co-signer of the same object
+    (`GET /api/v1/signatures`) — so a citizen who signed as the recipient
+    could read the head's, the chief forester's and the accountant's own
+    personal identification numbers.
+
+    Kept: what `build_verdict` and a human auditor actually need — the three
+    verification booleans, the signing time, the trusted timestamp's own
+    info, and the certificate's serial and validity window (already
+    duplicated at the top level of the stored record, but worth having
+    alongside the rest of the evidence). `paramSetOID`, flattened up from
+    `certificate[0].publicKey` exactly as before, stays at the signer level,
+    not nested — `signatures` evidence wants it at hand without reaching
+    back into a certificate sub-object for it."""
+    certificates = entry.get("certificate") or []
+    cert = certificates[0] if certificates else {}
+    return {
+        "verified": entry.get("verified"),
+        "certificateVerified": entry.get("certificateVerified"),
+        "certificateValidAtSigningTime": entry.get("certificateValidAtSigningTime"),
+        "signingTime": entry.get("signingTime"),
+        "timeStampInfo": entry.get("timeStampInfo"),
+        "certificateSerialNumber": cert.get("serialNumber"),
+        "certificateValidFrom": cert.get("validFrom"),
+        "certificateValidTo": cert.get("validTo"),
+        "paramSetOID": (cert.get("publicKey") or {}).get("paramSetOID"),
+    }
+
+
 def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
     """Reads `pkcs7Info.signers[0]` — one document, one signer, mirroring
     what `EimzoVerification` itself carries (a single `subject_certificate`,
@@ -118,13 +152,11 @@ def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
     timestamp's own time is what ends up in `timestamp_token`, normalized to
     an aware ISO string rather than the ambiguous string the provider sent.
 
-    `raw` is `pkcs7Info` with `documentBase64` dropped before anything is
-    stored (`eimzo.py::_verify_envelope`'s docstring: the same contract, the
-    same reason — an append-only column served whole to every co-signer must
-    never carry the signed document itself) and, per signer, a flattened
-    `paramSetOID` copied up from `certificate[0].publicKey` — the one field
-    `signatures` evidence wants at hand without reaching back into the
-    certificate chain for it.
+    `raw` is an explicit allow-list of evidence, per signer
+    (`_signer_evidence`, finding 5, final review) — never `pkcs7Info` copied
+    wholesale: personal identifiers (a signer's PINFL, `subjectName`'s
+    `UID=<pinfl>`), the OCSP response and the raw public key have no
+    business in an append-only column served whole to every co-signer.
 
     Never raises: a totally failed verification may arrive with no
     `pkcs7Info` at all (the provider's other response shape, keyed on
@@ -162,16 +194,7 @@ def verification_from_pkcs7_info(data: dict[str, Any]) -> EimzoVerification:
     except ValueError, TypeError:
         timestamp_token = None
 
-    raw_signers = []
-    for entry in signers:
-        entry_copy = dict(entry)
-        entry_certificates = entry.get("certificate") or []
-        if entry_certificates and "publicKey" in entry_certificates[0]:
-            entry_copy["paramSetOID"] = entry_certificates[0]["publicKey"].get("paramSetOID")
-        raw_signers.append(entry_copy)
-    raw = {k: v for k, v in pkcs7_info.items() if k != "documentBase64"}
-    if "signers" in pkcs7_info:
-        raw["signers"] = raw_signers
+    raw = {"signers": [_signer_evidence(entry) for entry in signers]} if signers else {}
 
     return EimzoVerification(
         status_code=_verified_status(signer, data.get("status", 0)),
