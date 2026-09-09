@@ -2,10 +2,15 @@
 needs from the E-IMZO server, which itself sits on the stack's private
 network and is never reachable from the internet directly.
 
-`POST /eimzo/timestamp` is authenticated (any signed-in user) and
-rate-limited the same way `/auth/eimzo/challenge` already is -- literally the
-same dependency call, not a second mechanism. `GET /eimzo/health` is
-`sys_admin` only, reachable through the superuser bypass alone
+`POST /eimzo/timestamp` is authenticated (any signed-in user) and rate-limited
+through the same `rate_limit` mechanism `/auth/eimzo/challenge` uses -- but its
+OWN scope and settings key (`"eimzo_timestamp"` /
+`ratelimit_eimzo_timestamp_per_minute`), never the challenge route's own
+bucket (ruling T78-1: sharing it would let an anonymous login-challenge burst
+throttle unrelated, in-progress document signing behind the same NAT). The
+bucket-isolation tests live in `tests/core/test_ratelimit.py`, beside
+`/auth/eimzo/challenge`'s own. `GET /eimzo/health` is `sys_admin` only,
+reachable through the superuser bypass alone
 (`integrations.permissions.EIMZO_HEALTH` is registered but granted to
 nobody, the same shape `applications.assign` uses).
 """

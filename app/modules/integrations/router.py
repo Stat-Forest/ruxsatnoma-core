@@ -33,9 +33,13 @@ class EimzoTimestampOut(BaseModel):
 @router.post(
     "/timestamp",
     response_model=EimzoTimestampOut,
-    # Copies `/auth/eimzo/challenge`'s own rate limit dependency verbatim
-    # (task brief) -- the SAME bucket and setting, not a second mechanism.
-    dependencies=[Depends(rate_limit("eimzo_challenge", "ratelimit_challenge_per_minute"))],
+    # Uses the SAME MECHANISM `/auth/eimzo/challenge` does (`rate_limit`), but
+    # its OWN scope and its OWN settings key (ruling T78-1). Sharing
+    # "eimzo_challenge" would key an anonymous login-challenge burst and an
+    # authenticated document-signing call to the same (scope, client IP)
+    # bucket -- behind one office NAT, a burst of login challenges would throttle
+    # unrelated, in-progress SIGNING for everyone at that address.
+    dependencies=[Depends(rate_limit("eimzo_timestamp", "ratelimit_eimzo_timestamp_per_minute"))],
 )
 async def eimzo_timestamp(
     body: EimzoTimestampIn,
