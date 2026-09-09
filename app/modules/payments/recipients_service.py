@@ -150,14 +150,19 @@ async def update(
     `Optional` on the wire only for PATCH's own "field not sent" idiom but
     is NOT NULL underneath: `percent`/`fixed_amount` (their kind-mismatch
     guard covers a bare `null` too, since clearing the only amount a
-    `rule_matches_kind` row is allowed to carry has no legal meaning), and
-    `sort_order`/`active`, which carry no such kind-relative meaning at all
-    — a `null` there is simply not a legal value for a NOT NULL column
-    (`models.py`'s `sort_order: Mapped[int]`, `active: Mapped[bool]`). Every
-    one of these is checked before the generic `setattr` loop below, so the
-    DB CHECK / NOT NULL constraint is never the thing that catches a bad
-    `PATCH` body — this turns what would otherwise be an uncaught
-    `IntegrityError` (500) into a clean 422."""
+    `rule_matches_kind` row is allowed to carry has no legal meaning),
+    `name` (a `LocalizedName` requires `uz_latn`, so a `null` here has no
+    legal reading either — Override 3 of stage 7.9 task 8: this used to
+    silently NO-OP a `{"name": null}` body instead, since `"name" in
+    fields` was true but `data.name is not None` was false, so the field
+    was skipped rather than applied or refused), and `sort_order`/`active`,
+    which carry no such kind-relative meaning at all — a `null` there is
+    simply not a legal value for a NOT NULL column (`models.py`'s
+    `sort_order: Mapped[int]`, `active: Mapped[bool]`). Every one of these
+    is checked before the generic `setattr` loop below, so the DB CHECK /
+    NOT NULL constraint is never the thing that catches a bad `PATCH`
+    body — this turns what would otherwise be an uncaught `IntegrityError`
+    (500) into a clean 422."""
     row = await _recipient_or_404(db, recipient_id)
     fields = data.model_dump(exclude_unset=True)
     before = _snapshot(row)
@@ -166,6 +171,8 @@ async def update(
         raise err("ERR-VAL-001", details={"reason": "invalid_percent_for_recipient_kind"})
     if "fixed_amount" in fields and (row.kind != "fixed" or fields["fixed_amount"] is None):
         raise err("ERR-VAL-001", details={"reason": "invalid_fixed_amount_for_recipient_kind"})
+    if "name" in fields and fields["name"] is None:
+        raise err("ERR-VAL-001", details={"reason": "name_cannot_be_null"})
     if "sort_order" in fields and fields["sort_order"] is None:
         raise err("ERR-VAL-001", details={"reason": "sort_order_cannot_be_null"})
     if "active" in fields and fields["active"] is None:
@@ -177,7 +184,8 @@ async def update(
         assert resulting_percent is not None  # rule_matches_kind: a percent row always has one
         await _assert_percent_fits(db, exclude_id=row.id, resulting_percent=resulting_percent)
 
-    if "name" in fields and data.name is not None:
+    if "name" in fields:
+        assert data.name is not None  # refused above
         row.name = data.name.root
     for field in ("payme_account_id", "percent", "fixed_amount", "sort_order", "note", "active"):
         if field in fields:

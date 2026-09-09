@@ -325,6 +325,28 @@ async def test_an_explicit_null_active_is_refused(client, sys_admin, budget_50):
     assert response.json()["error"]["code"] == "ERR-VAL-001"
 
 
+async def test_an_explicit_null_name_is_refused(db, client, sys_admin, budget_50):
+    """Override 3 of stage 7.9 task 8 — `name` is typed `LocalizedName | None`
+    on `PaymentRecipientPatch` for the "field not sent" idiom, so
+    `{"name": null}` parses too, and `"name" in fields` reads `True`. This
+    used to silently NO-OP: `data.name is not None` was `False`, so the
+    generic-looking `if "name" in fields and data.name is not None` guard
+    skipped the assignment instead of applying or refusing it — a `PATCH`
+    that reported 200 and changed NOTHING. It must now come back as a
+    clean 422, the same shape every sibling column in this route already
+    gets, and the row's own `name` must be untouched."""
+    before_name = dict(budget_50.name)
+    response = await client.patch(
+        f"/api/v1/payments/recipients/{budget_50.id}",
+        json={"name": None},
+        headers=sys_admin,
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "ERR-VAL-001"
+    await db.refresh(budget_50)
+    assert budget_50.name == before_name
+
+
 async def test_increasing_the_sole_active_rows_own_percent_is_not_double_counted(
     client, sys_admin, budget_50
 ):

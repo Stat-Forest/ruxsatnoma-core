@@ -53,9 +53,12 @@ class District(Base):
 class Organization(Base):
     """agency → territorial → leshoz → bolim → aylanma → bolak (ruling 6).
 
-    `requisites` holds bank details, including the 50/50 recipient account used by
-    payments (design/02). Kind-pair validation and cycle checks live in the service —
-    they span two rows, which a CHECK cannot see.
+    `requisites` holds bank details, including the leshoz's own account
+    `payments` resolves for its remainder share of an invoice (design/02;
+    stage 7.9 decision #154 replaced the original fixed 50/50 split with a
+    configurable receivers directory — see `payments.models.Allocation`'s
+    own docstring). Kind-pair validation and cycle checks live in the
+    service — they span two rows, which a CHECK cannot see.
     """
 
     __tablename__ = "organizations"

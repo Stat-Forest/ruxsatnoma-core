@@ -390,8 +390,8 @@ async def check_manual_confirmation(
        at the status level;
     6. `service.confirm_payment` — unchanged, not widened, not copied. It
        does the whole job: invoice -> paid, one ledger row PER RECEIVER,
-       application ->
-       PAID, the applicant told, `payment_confirmed` on the bus;
+       application -> PAID, the applicant told, `payment_confirmed` on the
+       bus;
     7. stamp the confirmation `confirmed`/`rejected` with the checker and
        the moment — all three fields in ONE assignment, since
        `confirmed_needs_checker` forbids a `confirmed` row with a NULL

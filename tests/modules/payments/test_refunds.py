@@ -205,7 +205,7 @@ async def refund_application(
 async def _pay_in_full(db: AsyncSession, invoice: Invoice) -> ProviderTransaction:
     """Pays `invoice` in full through the REAL `confirm_payment` (never a
     hand-set `status='paid'`) — the same synthetic-transaction shape
-    `backoffice_service._confirm_and_pay` feeds it, so the 50/50 ledger this
+    `backoffice_service._confirm_and_pay` feeds it, so the ledger this
     file's own tests read back is the genuine one, not a stand-in."""
     transaction = ProviderTransaction(
         invoice_id=invoice.id,
