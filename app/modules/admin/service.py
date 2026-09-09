@@ -129,6 +129,7 @@ _AUDITED_FIELDS = (
     "district_id",
     "requisites",
     "status",
+    "gis_enabled",
 )
 
 
@@ -182,6 +183,7 @@ async def create_organization(
         region_id=data.region_id,
         district_id=data.district_id,
         requisites=data.requisites,
+        gis_enabled=data.gis_enabled,
     )
     await repo.add(db, org)
     await audit.log(
@@ -214,7 +216,7 @@ async def update_organization(
         org.parent_id = new_parent
     if "name" in fields and patch.name is not None:
         org.name = patch.name.root
-    for field in ("stir", "region_id", "district_id", "requisites"):
+    for field in ("stir", "region_id", "district_id", "requisites", "gis_enabled"):
         if field in fields:
             setattr(org, field, fields[field])
     await db.flush()

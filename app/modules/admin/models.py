@@ -73,6 +73,12 @@ class Organization(Base):
     district_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("districts.id"))
     requisites: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
     status: Mapped[str] = mapped_column(default="active")
+    # Decision #178: most leshozes have no delivered GIS layer yet. False means this
+    # organization files contours by requisites (number, forestry unit, quarter, plot,
+    # declared area) and shows no map — editable only by the central admin (nothing
+    # grants `admin.organizations.manage` to any seeded role; `sys_admin` reaches this
+    # route as the superuser). Defaults true so nothing else has to opt in explicitly.
+    gis_enabled: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
