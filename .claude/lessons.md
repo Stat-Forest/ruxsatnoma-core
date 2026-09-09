@@ -566,6 +566,18 @@ Tooling and environment.
 - **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
   fails once that module ships, or tie it to a tracked ticket.
 
+## A guard that corrects a row's own column must be read back from that column, not from the raw answer it was given
+
+- **Rule:** After calling a step whose job is "write the reconciled value onto this row", every
+  later decision in the same function reads the ROW's own field again — never the raw parameter
+  handed to that step, even a few lines below the call.
+- **Why:** `signatures.service._reconcile_status` refuses to un-revoke `cert.status` from a
+  date-only adapter's answer; `reverify()` built its verdict from that SAME raw `live_status`
+  anyway, so a revoked certificate's signature would have re-reported "valid" the moment a
+  real-mode adapter confirmed only the expiry date (5.2, caught pre-merge).
+- **How to apply:** A function calling a reconcile/guard step on `row.field`, grep its own body
+  for the parameter name it passed in — every use after the call is a bug; re-read `row.field`.
+
 ---
 
 # PostGIS
