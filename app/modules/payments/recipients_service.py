@@ -1,7 +1,13 @@
 """The recipients directory's own service (stage 7.9 task 3, decisions #154,
-#157, #163) — the CRUD side of the configurable split. `active_rules` below
-is the ONE reader Task 4 freezes onto an invoice at issuance; every other
-reader (this file's own `list_all`, a future report) goes through
+#157, #163) — the CRUD side of the configurable split. `issue_invoice`
+(`payments/service.py`, Task 4) freezes the split onto an invoice at
+issuance by reading `repo.list_active_recipients` DIRECTLY, never through
+this file — it needs each recipient's `name` and `payme_account_id` to
+copy onto the snapshot, which the engine's own `RecipientRule` input
+cannot carry, and reading the directory twice inside one transaction (once
+for the engine, once for the names) would reopen a non-repeatable-read
+risk under READ COMMITTED that this file has no reason to protect against.
+Every reader in THIS file (`list_all`, a future report) goes through
 `repo.list_payment_recipients` instead, so that editing the directory can
 never change what an already-issued invoice divides into.
 
@@ -31,7 +37,7 @@ from app.core.errors import err
 from app.core.schemas import Page, PageParams
 from app.modules.audit import service as audit
 from app.modules.auth.models import User
-from app.modules.payments import ledger, repo
+from app.modules.payments import repo
 from app.modules.payments.models import PaymentRecipient
 from app.modules.payments.schemas import (
     PaymentRecipientIn,
@@ -188,13 +194,3 @@ async def update(
         new_value=_snapshot(row),
     )
     return _to_out(row)
-
-
-async def active_rules(db: AsyncSession) -> list[ledger.RecipientRule]:
-    """The ACTIVE directory rows, in `(sort_order, id)` order, as the pure
-    engine's input. This is the ONE reader Task 4 freezes onto an invoice —
-    every other caller reads the frozen snapshot instead, so that an edit
-    here can never change what an already-issued invoice divides into
-    (decision #158)."""
-    rows = await repo.list_active_recipients(db)
-    return [ledger.RecipientRule(row.id, row.kind, row.percent, row.fixed_amount) for row in rows]

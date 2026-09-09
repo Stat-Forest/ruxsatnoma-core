@@ -698,8 +698,8 @@ async def list_payment_recipients(
 ) -> tuple[list[PaymentRecipient], int]:
     """The whole directory, active AND inactive (there is no DELETE, ruling
     #157 — an inactive row stays a first-class citizen of this list forever),
-    ordered `(sort_order, id)` — the same tie-break `active_rules` below
-    uses, so an admin's list and the engine's own reading order agree."""
+    ordered `(sort_order, id)` — the same tie-break `list_active_recipients`
+    below uses, so an admin's list and the engine's own reading order agree."""
     stmt = select(PaymentRecipient)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     rows = (
@@ -713,15 +713,13 @@ async def list_payment_recipients(
 
 
 async def list_active_recipients(db: AsyncSession) -> Sequence[PaymentRecipient]:
-    """The ACTIVE rows only, `(sort_order, id)` ordered — `recipients_
-    service.active_rules`'s one query, `payments.service.issue_invoice`'s
-    own read (task 4: it reads this directly rather than through
-    `active_rules`, so the split's `rules` AND the name/`payme_account_id`
-    each snapshot row copies come from the SAME single read), and the
-    percent-total validator's own read of "everything that currently
-    counts". Unpaged: this directory is a handful of rows by nature (one
-    line per party who takes a cut off the top), never a register that
-    grows with transaction volume."""
+    """The ACTIVE rows only, `(sort_order, id)` ordered — read DIRECTLY by
+    `payments.service.issue_invoice` (task 4, so the split's `rules` AND
+    the name/`payme_account_id` each snapshot row copies come from the SAME
+    single read) and by the percent-total validator's own read of
+    "everything that currently counts". Unpaged: this directory is a
+    handful of rows by nature (one line per party who takes a cut off the
+    top), never a register that grows with transaction volume."""
     stmt = (
         select(PaymentRecipient)
         .where(PaymentRecipient.active.is_(True))

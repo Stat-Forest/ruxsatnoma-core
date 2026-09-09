@@ -48,7 +48,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -140,10 +140,14 @@ SNAPSHOT_KIND_REMAINDER = SNAPSHOT_KINDS[2]
 
 # Task 4 (decision #158): `invoice_recipients.name` is NOT NULL even for the
 # leshoz's own `kind='remainder'` row — unlike a configured receiver, it has
-# no `payment_recipients` row of its own to copy a name from. Only the
-# leshoz's `payme_account_id` is frozen from its ORGANIZATION (the model's
-# own docstring) — this is a fixed label, not an attempt to also freeze the
-# organization's own display name, which nothing in decision #158 asks for.
+# no `payment_recipients` row of its own to copy a name from. The leshoz's
+# row freezes its ORGANIZATION's own name instead (`_leshoz_snapshot_
+# fields`, below `_organization_for`), exactly as a configured receiver's
+# row freezes ITS name from `payment_recipients` — this constant is only
+# the FALLBACK label for when no organization resolves at all (no contour,
+# no assigned organization, no such organization: `_organization_for`'s own
+# `None`), which must stay non-fatal — a leshoz without one must never
+# block an invoice from being issued (review finding "Important 3").
 LESHOZ_SNAPSHOT_NAME: dict[str, Any] = {"uz_latn": "Leshoz"}
 
 
@@ -397,15 +401,15 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
 
     # The split, frozen onto THIS invoice (decision #158). `repo.
     # list_active_recipients` — the ACTIVE directory rows, `(sort_order,
-    # id)` order, the SAME query `recipients_service.active_rules` wraps —
-    # is read exactly ONCE here: `rules` (the engine's input) and the
-    # name/`payme_account_id` each receiver row copies (below,
-    # `_snapshot_rows`) both come out of this one read, never two separate
-    # queries a concurrent directory edit could answer differently (lesson:
-    # "a precondition shared by several steps belongs in ONE function every
-    # step calls" — `recipients_service.active_rules` itself returns only
-    # `RecipientRule` tuples, with no name to copy, which is why this reads
-    # the full rows directly rather than going through it a second time).
+    # id)` order — is read DIRECTLY and exactly ONCE here, never through
+    # `recipients_service` (whose own readers return either
+    # `PaymentRecipientOut` schemas or, formerly, `RecipientRule` tuples
+    # with no name to copy — neither can supply what this snapshot needs):
+    # `rules` (the engine's input) and the name/`payme_account_id` each
+    # receiver row copies (below, `_snapshot_rows`) both come out of this
+    # one read, never two separate queries a concurrent directory edit
+    # could answer differently (lesson: "a precondition shared by several
+    # steps belongs in ONE function every step calls").
     recipients = await repo.list_active_recipients(db)
     rules = [
         ledger.RecipientRule(row.id, row.kind, row.percent, row.fixed_amount) for row in recipients
@@ -427,12 +431,10 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
             details={"reason": "split_does_not_fit", "detail": str(exc)},
         ) from exc
 
-    leshoz_payme_id = await resolve_leshoz_payme_id(
+    leshoz = await _leshoz_snapshot_fields(
         db, contour_id=application.contour_id, assigned_org_id=application.assigned_org_id
     )
-    await repo.add_invoice_recipients(
-        db, _snapshot_rows(invoice, recipients, shares, leshoz_payme_id)
-    )
+    await repo.add_invoice_recipients(db, _snapshot_rows(invoice, recipients, shares, leshoz))
 
     await notifications_service.notify(
         db,
@@ -453,11 +455,21 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     return invoice
 
 
+class _LeshozSnapshotFields(NamedTuple):
+    """What `issue_invoice` freezes onto the leshoz's own `kind='remainder'`
+    row: its `name` (a `LocalizedName`-shaped dict, `app/modules/admin/
+    models.py::Organization.name`) and its Payme account id — both resolved
+    by `_leshoz_snapshot_fields`, below `_organization_for`."""
+
+    name: dict[str, Any]
+    payme_account_id: str | None
+
+
 def _snapshot_rows(
     invoice: Invoice,
     recipients: Sequence[PaymentRecipient],
     shares: Sequence[ledger.Share],
-    leshoz_payme_id: str | None,
+    leshoz: _LeshozSnapshotFields,
 ) -> list[InvoiceRecipient]:
     """`issue_invoice`'s own pure, in-memory builder — no I/O, no session,
     nothing here can fail once its inputs are already consistent.
@@ -476,11 +488,12 @@ def _snapshot_rows(
     `payment_recipients` row — never re-derives them — because that row may
     already have moved on by the time anyone reads this snapshot back
     (decision #158, the whole point of freezing it). The leshoz's row has no
-    `payment_recipients` row of its own to copy from: its `name` is the
-    fixed `LESHOZ_SNAPSHOT_NAME`, and its `payme_account_id` is
-    `leshoz_payme_id` — resolved by the caller through
-    `resolve_leshoz_payme_id` and handed in already-resolved, since that
-    resolution needs a session and this function may not take one."""
+    `payment_recipients` row of its own to copy from: its `name` and
+    `payme_account_id` come from `leshoz` (`_leshoz_snapshot_fields`,
+    resolved by the caller and handed in already-resolved, since that
+    resolution needs a session and this function may not take one) — its
+    OWN organization's name when one resolves, `LESHOZ_SNAPSHOT_NAME`
+    otherwise (review finding "Important 3")."""
     leshoz_share = shares[-1]
     rows: list[InvoiceRecipient] = []
     for position, (recipient, share) in enumerate(zip(recipients, shares[:-1], strict=True)):
@@ -506,8 +519,8 @@ def _snapshot_rows(
         InvoiceRecipient(
             invoice_id=invoice.id,
             recipient_id=None,
-            name=LESHOZ_SNAPSHOT_NAME,
-            payme_account_id=leshoz_payme_id,
+            name=leshoz.name,
+            payme_account_id=leshoz.payme_account_id,
             kind=SNAPSHOT_KIND_REMAINDER,
             percent=None,
             fixed_amount=None,
@@ -919,9 +932,9 @@ async def _organization_for(
     longer resolves.
 
     Extracted (stage 7.9 task 4) so `resolve_recipient_account` and
-    `resolve_leshoz_payme_id` below — both of which walk this SAME
-    four-step chain to read a different key of the SAME organization's
-    `requisites` — cannot drift apart. Two functions independently walking
+    `_leshoz_snapshot_fields` below — both of which walk this SAME
+    four-step chain to read the SAME organization's `requisites` and/or
+    `name` — cannot drift apart. Two functions independently walking
     the same steps is exactly the shape that produced finding F7 of stage
     7.4: a module's own hard-coded claim about another module rots silently
     once nothing forces the two claims to agree."""
@@ -975,25 +988,34 @@ async def resolve_recipient_account(
     return account if isinstance(account, str) else None
 
 
-async def resolve_leshoz_payme_id(
+async def _leshoz_snapshot_fields(
     db: AsyncSession, *, contour_id: uuid.UUID | None, assigned_org_id: uuid.UUID | None
-) -> str | None:
-    """The leshoz's own Payme account id, frozen onto an invoice's
-    `invoice_recipients` snapshot at issuance (decision #158) — the same
-    `_organization_for(...)` chain `resolve_recipient_account` reads, this
-    time `organization.requisites.get("payme_account_id")` instead of
-    `.get("account")`. `None` whenever any step comes up empty, same as its
-    sibling: a leshoz with no Payme id configured must not block issuing an
-    invoice, only leave that invoice's leshoz row without one — exactly the
-    reasoning `resolve_recipient_account` already states for the recipient
-    account, applied to the same organization's other key."""
+) -> _LeshozSnapshotFields:
+    """The leshoz's own name and Payme account id, frozen onto an invoice's
+    `invoice_recipients` remainder row at issuance (decision #158, review
+    finding "Important 3") — both read off the SAME `_organization_for(...)`
+    row, in ONE query, the same chain `resolve_recipient_account` reads
+    (there `organization.requisites.get("account")`, here `.get(
+    "payme_account_id")` and `.name` directly).
+
+    `None`/`LESHOZ_SNAPSHOT_NAME` whenever `_organization_for` comes up
+    empty — no contour AND no assigned organization, a contour with no
+    known owner, or an owner id that no longer resolves — exactly the same
+    posture `resolve_recipient_account` already states for the recipient
+    account: a leshoz with no organization, or one with no Payme id
+    configured, must never block an invoice from being issued, only leave
+    that invoice's leshoz row without one (and, for the name, carrying the
+    fixed fallback label instead of the organization's own)."""
     organization = await _organization_for(
         db, contour_id=contour_id, assigned_org_id=assigned_org_id
     )
     if organization is None:
-        return None
+        return _LeshozSnapshotFields(name=LESHOZ_SNAPSHOT_NAME, payme_account_id=None)
     payme_account_id = organization.requisites.get("payme_account_id")
-    return payme_account_id if isinstance(payme_account_id, str) else None
+    return _LeshozSnapshotFields(
+        name=organization.name,
+        payme_account_id=payme_account_id if isinstance(payme_account_id, str) else None,
+    )
 
 
 async def confirm_payment(

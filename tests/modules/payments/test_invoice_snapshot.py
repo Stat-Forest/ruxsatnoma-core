@@ -21,7 +21,15 @@ task's own brief:
 fixtures, not in the shared `conftest.py`) build
 `test_fixed_amounts_exceeding_the_invoice_refuse_to_issue_it`'s own
 precondition: an invoice small enough that ONE configured fixed amount
-already exceeds it, regardless of the seeded budget row's own 50%."""
+already exceeds it, regardless of the seeded budget row's own 50%.
+
+Review round 1 (`task-4-findings-r1.md`) added three tests: `test_a_
+repeated_issuance_does_not_write_the_snapshot_twice` (Important 2 — the
+brief's own headline risk had no NAMED test before this), and `test_the_
+leshoz_name_is_frozen_too` / `test_the_leshoz_name_falls_back_when_no_
+organization_resolves` (Important 3 — the remainder row now freezes the
+leshoz's OWN organization name, `LESHOZ_SNAPSHOT_NAME` being only the
+fallback for when no organization resolves)."""
 
 import uuid
 from decimal import Decimal
@@ -89,7 +97,7 @@ async def leshoz_with_payme_id(
 ) -> Organization:
     """Points `approved_application` at `leshoz` (`gis/conftest.py`'s shared
     organization fixture — agency-or-reuse already handled there) after
-    giving it a Payme account id — `resolve_leshoz_payme_id`'s own chain
+    giving it a Payme account id — `_leshoz_snapshot_fields`'s own chain
     (`assigned_org_id` -> `admin.repo.get_organization` ->
     `requisites["payme_account_id"]`), exercised through `assigned_org_id`
     alone since `approved_application` names no contour at all (no GIS
@@ -128,10 +136,66 @@ async def test_editing_the_directory_afterwards_changes_nothing(
     assert after == before
 
 
+async def test_a_repeated_issuance_does_not_write_the_snapshot_twice(
+    db, approved_application, budget_50
+):
+    """Important 2: the brief's own headline risk ("a retry does not write
+    the snapshot twice") had no test naming it — only the accidental side
+    effect of `test_invoice.py::test_a_repeated_event_returns_the_same_
+    invoice_and_does_not_raise`, which asserts the `Invoice` row count and
+    says nothing about `invoice_recipients`. `issue_invoice`'s own
+    idempotency check (an existing in-force invoice is returned BEFORE the
+    snapshot is ever written) is what a regression here would actually
+    break — silently, as an `IntegrityError` out of `uq_invoice_recipients_
+    position` instead of a named assertion failure."""
+    invoice = await service.issue_invoice(db, approved_application.id)
+    before = [
+        (r.recipient_id, r.kind, r.amount, r.position)
+        for r in await service.invoice_recipients(db, invoice.id)
+    ]
+
+    again = await service.issue_invoice(db, approved_application.id)
+
+    after = [
+        (r.recipient_id, r.kind, r.amount, r.position)
+        for r in await service.invoice_recipients(db, invoice.id)
+    ]
+    assert again.id == invoice.id
+    assert len(after) == len(before)
+    assert after == before
+
+
 async def test_the_leshoz_payme_id_is_frozen_too(db, approved_application, leshoz_with_payme_id):
     invoice = await service.issue_invoice(db, approved_application.id)
     rows = await service.invoice_recipients(db, invoice.id)
     assert rows[-1].payme_account_id == "12345"
+
+
+async def test_the_leshoz_name_is_frozen_too(db, approved_application, leshoz_with_payme_id):
+    """Important 3: the remainder row freezes the leshoz's OWN organization
+    name (`organizations.name`, a `LocalizedName` JSONB), the same way a
+    configured receiver's row freezes ITS name from `payment_recipients` —
+    not the fixed `LESHOZ_SNAPSHOT_NAME` label, which is only the fallback
+    for when no organization resolves at all (covered separately below)."""
+    invoice = await service.issue_invoice(db, approved_application.id)
+    rows = await service.invoice_recipients(db, invoice.id)
+    assert rows[-1].name == leshoz_with_payme_id.name
+    assert rows[-1].name != service.LESHOZ_SNAPSHOT_NAME
+
+
+async def test_the_leshoz_name_falls_back_when_no_organization_resolves(
+    db, approved_application, budget_50
+):
+    """Important 3's other half: `approved_application` names no contour
+    and no assigned organization, so `_organization_for` returns `None` —
+    the same non-fatal path `payme_account_id` already falls back on
+    (`test_issuing_an_invoice_freezes_the_directory` never sets one either)
+    — and the remainder row's `name` must fall back to the fixed
+    `LESHOZ_SNAPSHOT_NAME` label rather than raise or freeze nothing."""
+    invoice = await service.issue_invoice(db, approved_application.id)
+    rows = await service.invoice_recipients(db, invoice.id)
+    assert rows[-1].name == service.LESHOZ_SNAPSHOT_NAME
+    assert rows[-1].payme_account_id is None
 
 
 async def test_fixed_amounts_exceeding_the_invoice_refuse_to_issue_it(
