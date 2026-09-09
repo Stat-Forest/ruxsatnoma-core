@@ -273,8 +273,9 @@ async def test_an_attachment_is_addressed_through_its_own_announcement(db):
 async def test_the_service_reader_agrees_with_the_route(db):
     """The in-process half of the surface: `landing`'s pages go through HTTP, but
     `list_landing`/`get_landing` are module functions too, and a route test proves
-    only the route (lessons.md: a public surface's own end-to-end test can ship the
-    surface untested)."""
+    only the route (lessons.md: "a green test proves nothing until you have seen
+    it go red" — a public surface's own end-to-end test can ship the surface
+    untested)."""
     admin, _, _ = await signed_in_with(db, ANNOUNCEMENTS_MANAGE)
     ann = await make_announcement(
         db,
