@@ -774,6 +774,44 @@ async def test_a_refused_signature_is_still_logged(
 
 
 @pytest.mark.asyncio
+async def test_a_refused_signature_pins_the_providers_own_status_and_message(
+    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 5's review, deferred to this batch: the sibling test above only
+    asserts ABSENCE (`"pkcs7" not in ...`) — a regression that always wrote
+    `meta=None` would pass it, and every other new test in this class, right
+    alongside it. `meta["provider_status"]`/`["provider_message"]` are
+    exactly what tell an administrator "our configuration is wrong" from
+    "the provider is down" (task 7's `EimzoError.provider_status`/`.reason`
+    read the very same two fields off the exception this refusal raises), so
+    this pins the POSITIVE content instead."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": -10, "message": "bad signature"})
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
+    obj_id = uuid.uuid4()
+
+    with pytest.raises(DomainError):
+        await service.sign(
+            db,
+            object_type="permit",
+            object_id=obj_id,
+            purpose="permit_head",
+            document=b"doc",
+            pkcs7="broken",
+            user=a_user,
+        )
+
+    (row,) = await _eimzo_log_tail(db, 1)
+    assert row.meta == {"provider_status": -10, "provider_message": "bad signature"}
+
+
+@pytest.mark.asyncio
 async def test_a_transport_failure_is_also_logged(
     db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
 ) -> None:
