@@ -11,7 +11,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -172,6 +172,46 @@ class Norm(Base):
             "status <> 'published' OR approval_doc_id IS NOT NULL", name="published_needs_doc"
         ),
         Index("ix_norms_lookup", "contour_id", "activity_type_id", "status", "effective_from"),
+    )
+
+
+class ActivitySeason(Base):
+    """Ruling #177 (stage 9): the season windows and minimum term for a WHOLE
+    leshoz × activity, rather than repeated on every one of its contours — a
+    leshoz with 151 contours used to have to state its grazing season 151
+    times, and stated it nowhere at all where no geobotanical survey exists
+    and therefore no `Norm` can be published.
+
+    `season` carries the exact same JSONB shape `Norm.season` already uses
+    (`schemas.Season`'s edge validation applies here too, via
+    `schemas.ActivitySeasonIn`/`ActivitySeasonPatch` — the same malformed-
+    window guard `checks._in_window` already reads defensively). Unlike
+    `Norm`, there is no lifecycle here (draft/review/approved/…): this is a
+    plain, current-value setting the leshoz or the central office edits in
+    place, not a versioned catalog row.
+
+    `checks._season_check` prefers a contour's OWN norm windows when it has
+    any; this row is the fallback resolved when it does not
+    (`checks.resolve_effective_windows`). `min_term_days` has NO norm-level
+    override — ruling #177 only speaks of overriding the WINDOWS — so
+    `checks._min_term_check` reads this table alone."""
+
+    __tablename__ = "activity_seasons"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id"))
+    activity_type_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("activity_types.id"))
+    season: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    min_term_days: Mapped[int | None]
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "activity_type_id", name="uq_activity_seasons_org_activity"
+        ),
+        CheckConstraint("min_term_days IS NULL OR min_term_days > 0", name="min_term_days_valid"),
     )
 
 
