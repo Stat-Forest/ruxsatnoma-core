@@ -418,13 +418,25 @@ async def test_the_scheduler_runs_both_sweeps() -> None:
 async def test_an_expired_permit_frees_the_area_it_held(
     db: AsyncSession, active_permit_ending_yesterday: Permit, contour: Contour
 ) -> None:
-    """Task 6 and Task 7 meet here: the sweep is what makes ruling 11's "an
-    expired permit frees the area it held" happen on its own, rather than only
-    when somebody remembers to move the status by hand."""
+    """Task 6 and Task 7 used to meet here differently: the sweep was what made
+    ruling 11's "an expired permit frees the area it held" happen, since
+    `occupancy_provider` counted every `active` permit whatever its dates.
+
+    Stage 9's own ruling #176 closed that gap directly in the provider
+    (`repo.occupied_area_by_contour`'s `as_of=business_today()` — see its
+    docstring): a permit whose OWN period has already ended no longer
+    occupies its area EVEN BEFORE the sweep ever runs, `active` status and
+    all. This test now shows exactly that — the "before" figure the fixture's
+    name promises is already zero — while `test_a_permit_past_its_period_
+    expires` above covers what the sweep itself still does: flip the STATUS,
+    which occupancy no longer needs it to do."""
     from app.modules.permits import jobs, service
 
     before = await service.occupancy_provider(db, [contour.id])
-    assert before[contour.id] == Decimal("12.5000")
+    assert before.get(contour.id, Decimal("0")) == Decimal("0"), (
+        "occupancy_provider is period-aware since ruling #176 — a permit whose "
+        "period has already ended occupies nothing, independent of the sweep"
+    )
 
     await jobs.expire_permits(db)
 

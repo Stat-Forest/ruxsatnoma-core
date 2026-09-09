@@ -1,9 +1,11 @@
-"""Task 6: the two seams `gis` (3.6a) and `norms` (3.7) shipped empty.
+"""Task 6: the four seams `gis` (3.6a) and `norms` (3.7 / stage 9 ruling #176)
+shipped empty.
 
-Both have been answering with an explicit placeholder — `occupancy_source:
-"none"`, `load_source: "none"` — since the stages that opened them, precisely so
-that nobody could read a zero as a measurement. Registering this module's two
-providers is what flips both to `"permits"` system-wide.
+All four have answered with an explicit placeholder — `occupancy_source:
+"none"`, `load_source: "none"`, `capacity_load_source: "none"`, `occupied_
+until_source: "none"` — since the stages that opened them, precisely so that
+nobody could read a zero (or a `None`) as a measurement. Registering this
+module's four providers is what flips them all to `"permits"` system-wide.
 
 The fixtures below are module-local on purpose. `contour` has to be independent
 of any permit (the suspended case asserts an EMPTY contour), and the permits
@@ -15,13 +17,14 @@ reader ends up asserting against the wrong permit.
 """
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.models import MediaFile
+from app.core.time import business_today
 from app.modules.admin.models import Organization
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.permits.models import Permit
@@ -147,50 +150,89 @@ async def test_a_suspended_permit_occupies_nothing(
     ) == Decimal("0")
 
 
-async def test_occupancy_is_period_blind_and_double_counts_two_seasons(
+async def test_occupancy_excludes_a_permit_whose_period_has_already_ended(
     db: AsyncSession,
     contour: Contour,
     version_id: uuid.UUID,
     leshoz: Organization,
     grazing_activity_id: uuid.UUID,
 ) -> None:
-    """The asymmetry between the two seams, pinned so it is a decision and not a
-    surprise. `load_provider` takes a period; `occupancy_provider` takes none, so two
-    permits on ONE contour whose seasons do not overlap AT ALL both count and
-    `gis`'s `s_available_ha` reports less free area than any single day really has.
+    """Ruling #176 (stage 9, T6) closed the asymmetry the previous version of
+    this test pinned as deliberate: `occupancy_provider` now excludes a
+    permit whose OWN period has already ended, even while its stored status
+    still reads `active` — "last season's expired-in-fact permit" (the
+    ruling's own phrase), before the nightly `jobs.expire_permits` sweep ever
+    runs (`test_jobs.py::test_an_expired_permit_frees_the_area_it_held` pins
+    that half). A permit that has not yet STARTED still counts, the same
+    conservative direction ruling 11 always favoured — reserving a FUTURE
+    slot must still block a second applicant from being granted it.
 
-    That is ruling 11 as written and it is the conservative direction — this seam can
-    only ever under-report free area, never over-book a contour. `test_providers.py`
-    had no period test on the occupancy side at all, so the day someone "fixes" the
-    asymmetry by filtering here, they would do it against a green suite.
-
-    Spring and autumn, sharing not one day: 4 + 5 = 9 hectares held on a contour
-    where no single day holds more than 5."""
+    Dates are relative to `business_today()`, never a fixed year: the seam
+    now reads the real clock, so a hard-coded period would eventually drift
+    from "past" to "future" and silently stop testing anything (lesson: a
+    test that reads the machine's clock must compute against it, not a
+    literal)."""
     from app.modules.permits import service
 
-    for area, period in (
-        (Decimal("4.0000"), (date(2027, 3, 1), date(2027, 5, 31))),
-        (Decimal("5.0000"), (date(2027, 9, 1), date(2027, 11, 30))),
-    ):
-        await make_permit_on_contour(
-            db,
-            contour=contour,
-            version_id=version_id,
-            org=leshoz,
-            activity_type_id=grazing_activity_id,
-            status="active",
-            area_ha=area,
-            period_from=period[0],
-            period_to=period[1],
-        )
+    today = business_today()
+    ended = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+        area_ha=Decimal("4.0000"),
+        period_from=today - timedelta(days=90),
+        period_to=today - timedelta(days=30),
+    )
+    current = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+        area_ha=Decimal("5.0000"),
+        period_from=today - timedelta(days=10),
+        period_to=today + timedelta(days=60),
+    )
 
-    assert (await service.occupancy_provider(db, [contour.id]))[contour.id] == Decimal("9.0000")
+    occupied = await service.occupancy_provider(db, [contour.id])
+    assert occupied[contour.id] == current.area_ha, (
+        f"the permit ending {ended.period_to} must no longer occupy its area, "
+        "whatever `permits.status` still reads"
+    )
 
-    # The other seam, on the same two rows, for contrast: asked about spring it
-    # answers for spring alone. Same contour, same statuses, different question.
-    assert await service.load_provider(
-        db, contour.id, date(2027, 4, 1), date(2027, 4, 30)
-    ) == Decimal("40.0000")
+
+async def test_occupancy_still_counts_a_permit_ending_exactly_today(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+) -> None:
+    """The boundary of `as_of`'s own `>=`: a permit's LAST day of use is still
+    a day of use (the same inclusive-both-ends reasoning `load_provider`'s
+    overlap predicate already carries), so a permit ending today has not yet
+    freed its area."""
+    from app.modules.permits import service
+
+    today = business_today()
+    permit = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+        area_ha=Decimal("3.0000"),
+        period_from=today - timedelta(days=30),
+        period_to=today,
+    )
+
+    occupied = await service.occupancy_provider(db, [contour.id])
+    assert occupied[contour.id] == permit.area_ha
 
 
 async def test_occupancy_answers_a_whole_page_in_one_query(
@@ -335,13 +377,155 @@ async def test_norms_reports_the_load_source_as_permits(
     assert total == Decimal("40.0000")
 
 
-def test_both_providers_are_registered_exactly_once() -> None:
-    """Ruling P4. `tests/conftest.py::_isolate_subscriptions` calls
+async def test_capacity_load_provider_sums_quantity_for_the_same_activity_only(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    apiary_activity_id: uuid.UUID,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """Ruling #176 (stage 9, T6): `load_provider`'s non-grazing sibling.
+    `activity_type_id` is part of the question — unlike grazing's seam, ONE
+    contour may carry permits for more than one activity, and a haymaking
+    permit's hectares must never be summed into an apiary's hives
+    (`repo.committed_capacity_quantity`'s own docstring)."""
+    from app.modules.permits import service
+
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=apiary_activity_id,
+        status="active",
+        sb_load=None,
+        quantity=Decimal("6.0000"),
+    )
+    # A DIFFERENT activity on the SAME contour, same period — must not leak in.
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=haymaking_activity_id,
+        status="active",
+        sb_load=None,
+        quantity=Decimal("30.0000"),
+    )
+
+    total = await service.capacity_load_provider(
+        db, contour.id, apiary_activity_id, date(2027, 6, 1), date(2027, 7, 1)
+    )
+    assert total == Decimal("6.0000")
+
+
+async def test_capacity_load_provider_counts_active_only(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    apiary_activity_id: uuid.UUID,
+) -> None:
+    from app.modules.permits import service
+
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=apiary_activity_id,
+        status="suspended",
+        sb_load=None,
+        quantity=Decimal("6.0000"),
+    )
+    assert await service.capacity_load_provider(
+        db, contour.id, apiary_activity_id, date(2027, 6, 1), date(2027, 7, 1)
+    ) == Decimal("0")
+
+
+async def test_exclusivity_provider_answers_the_latest_occupied_day(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    apiary_activity_id: uuid.UUID,
+) -> None:
+    """Ruling #176, Oybek's option а. The latest `period_to` among overlapping
+    ACTIVE permits for this contour × activity — not a bare boolean, so a
+    refusal can name the day the contour frees up."""
+    from app.modules.permits import service
+
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=apiary_activity_id,
+        status="active",
+        sb_load=None,
+        quantity=Decimal("6.0000"),
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 9, 30),
+    )
+
+    until = await service.exclusivity_provider(
+        db, contour.id, apiary_activity_id, date(2027, 6, 1), date(2027, 7, 1)
+    )
+    assert until == date(2027, 9, 30)
+
+    # A period that shares nothing with the permit answers `None` — free.
+    assert (
+        await service.exclusivity_provider(
+            db, contour.id, apiary_activity_id, date(2028, 1, 1), date(2028, 2, 1)
+        )
+        is None
+    )
+
+
+async def test_exclusivity_provider_is_scoped_to_the_same_activity(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    apiary_activity_id: uuid.UUID,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """Decision #176's own text: exclusivity is scoped to «contour × activity»,
+    never to the whole contour — an apiary and a haymaking permit may sit on
+    the same plot in the same season."""
+    from app.modules.permits import service
+
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=haymaking_activity_id,
+        status="active",
+        sb_load=None,
+        quantity=Decimal("30.0000"),
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 9, 30),
+    )
+
+    assert (
+        await service.exclusivity_provider(
+            db, contour.id, apiary_activity_id, date(2027, 6, 1), date(2027, 7, 1)
+        )
+        is None
+    )
+
+
+def test_all_four_providers_are_registered_exactly_once() -> None:
+    """Ruling P4, extended by ruling #176 (stage 9, T6) to the two NEW
+    seams. `tests/conftest.py::_isolate_subscriptions` calls
     `register_event_subscriptions()` for EVERY test and snapshots only
-    `events._SUBSCRIBERS` — the two provider lists are separate globals it never
-    restores. A bare `.append()` therefore adds one copy per test and occupancy
-    silently doubles, then triples; the failure reads as pollution rather than as
-    a registration bug, and passes when this file is run alone.
+    `events._SUBSCRIBERS` — these four provider lists are separate globals it
+    never restores. A bare `.append()` therefore adds one copy per test and
+    occupancy silently doubles, then triples; the failure reads as pollution
+    rather than as a registration bug, and passes when this file is run
+    alone.
     """
     from app.event_subscriptions import register_event_subscriptions
     from app.modules.gis import service as gis_service
@@ -353,6 +537,8 @@ def test_both_providers_are_registered_exactly_once() -> None:
 
     assert gis_service.OCCUPANCY_PROVIDERS.count(permits_service.occupancy_provider) == 1
     assert norms_service.LOAD_PROVIDERS.count(permits_service.load_provider) == 1
+    assert norms_service.CAPACITY_LOAD_PROVIDERS.count(permits_service.capacity_load_provider) == 1
+    assert norms_service.EXCLUSIVITY_PROVIDERS.count(permits_service.exclusivity_provider) == 1
 
 
 async def test_a_suspension_frees_the_area_and_the_load(
