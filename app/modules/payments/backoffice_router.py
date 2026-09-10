@@ -48,17 +48,18 @@ import uuid
 from datetime import date
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, Query, Request, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files, settings_store
+from app.core import files, settings_store, xlsx
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import PAGING_MAX, Page
+from app.core.time import business_today
 from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.payments import backoffice_service, statement_service
+from app.modules.payments import backoffice_service, export, statement_service
 from app.modules.payments.backoffice_schemas import (
     AllocationOut,
     FiledManualConfirmationOut,
@@ -190,6 +191,25 @@ async def list_bank_statements(
         total=total,
         page=offset // limit + 1,
         page_size=limit,
+    )
+
+
+@router.get("/bank-statements/export.xlsx")
+async def export_bank_statements_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[str | None, Query(pattern=_STATEMENT_STATUS_PATTERN)] = None,
+) -> Response:
+    """`GET /payments/bank-statements` as a spreadsheet (stage 13, ruling
+    #204): the same `payments.view` gate and the same `?status=` filter,
+    every matching import up to the configured cap. Declared BEFORE
+    `/bank-statements/{statement_id}` on purpose — `export.xlsx` is not a
+    UUID, and the two share the same path-segment count."""
+    items, total, cap = await export.statement_rows(db, lang=lang, status=status)
+    filename = f"bank-hisobotlari-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_statements(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 

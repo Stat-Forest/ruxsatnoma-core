@@ -13,14 +13,15 @@ so the file reads like the screen.
 
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
 from app.modules.applications import service as applications_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
-from app.modules.payments import service
-from app.modules.payments.models import Invoice
+from app.modules.payments import service, statement_service
+from app.modules.payments.models import BankStatement, Invoice
 
 # An unknown code renders as itself, never an empty cell that hides it —
 # the same posture `applications/export.py`'s own `_label` takes.
@@ -36,6 +37,25 @@ def _label(table: dict[str, dict[str, str]], code: str, lang: xlsx.Lang) -> str:
 
 def _yes_no(value: bool, lang: xlsx.Lang) -> str:
     return _YES_NO[lang][value]
+
+
+_ACTIVE_LABEL: dict[xlsx.Lang, str] = {"uz_latn": "Faol", "ru": "Активен"}
+_INACTIVE_LABEL: dict[xlsx.Lang, str] = {"uz_latn": "Faol emas", "ru": "Неактивен"}
+
+
+def _active_label(active: bool, lang: xlsx.Lang) -> str:
+    return _ACTIVE_LABEL[lang] if active else _INACTIVE_LABEL[lang]
+
+
+async def _invoice_numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """One query, `{}` for an empty set — the same shape as the batch
+    readers Phase 0 added to the other modules, kept local here since
+    `Invoice` is this module's own model (no cross-module boundary to
+    cross for it)."""
+    if not ids:
+        return {}
+    result = await db.execute(select(Invoice.id, Invoice.number).where(Invoice.id.in_(ids)))
+    return {row.id: row.number for row in result}
 
 
 # --- Invoices (Task C.1, `GET /invoices/export.xlsx`) -----------------------
@@ -140,3 +160,85 @@ async def invoice_rows(
 
 def render_invoices(items: list[InvoiceRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, invoice_columns(lang), lang=lang, title=INVOICES_TITLE[lang])
+
+
+# --- Bank statements (Task C.2, `GET /payments/bank-statements/export.xlsx`)
+# Mirrors `adminka/src/pages/accountant/statusMeta.ts::STATEMENT_STATUS_LABEL_I18N`
+# (`BANK_STATEMENT_STATUSES`), checked 2026-09-11. `list_statements` answers
+# HEADERS only (no lines — those live under `GET /bank-statements/{id}`, a
+# single-item read this export does not mirror), so `stats`/`error_report`
+# stay out of the sheet (never a raw blob) and there is no per-line table
+# here at all.
+STATEMENT_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "pending": {"uz_latn": "Navbatda", "ru": "В очереди"},
+    "parsing": {"uz_latn": "Qayta ishlanmoqda", "ru": "Обрабатывается"},
+    "parsed": {"uz_latn": "Qayta ishlandi", "ru": "Обработано"},
+    "failed": {"uz_latn": "Xatolik", "ru": "Ошибка"},
+}
+STATEMENT_SOURCE_LABELS: dict[str, dict[str, str]] = {
+    "file": {"uz_latn": "Fayl", "ru": "Файл"},
+    "api": {"uz_latn": "API", "ru": "API"},
+}
+STATEMENTS_TITLE: dict[str, str] = {"uz_latn": "Bank hisobotlari", "ru": "Банковские выписки"}
+
+
+class StatementRow:
+    def __init__(self, statement: BankStatement, *, imported_by: str) -> None:
+        self.statement = statement
+        self.id = statement.id
+        self.imported_by = imported_by
+
+
+def statement_columns(lang: xlsx.Lang) -> list[xlsx.Column[StatementRow]]:
+    s = lambda f: lambda r: getattr(r.statement, f)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "statement_date",
+            {"uz_latn": "Hisobot sanasi", "ru": "Дата выписки"},
+            s("statement_date"),
+            16,
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(STATEMENT_STATUS_LABELS, r.statement.status, lang),
+            18,
+        ),
+        xlsx.Column(
+            "source",
+            {"uz_latn": "Manba", "ru": "Источник"},
+            lambda r: _label(STATEMENT_SOURCE_LABELS, r.statement.source, lang),
+            12,
+        ),
+        xlsx.Column(
+            "period_from", {"uz_latn": "Davr boshi", "ru": "Период с"}, s("period_from"), 14
+        ),
+        xlsx.Column("period_to", {"uz_latn": "Davr oxiri", "ru": "Период по"}, s("period_to"), 14),
+        xlsx.Column(
+            "imported_by", {"uz_latn": "Yuklagan", "ru": "Загрузил"}, lambda r: r.imported_by, 24
+        ),
+        xlsx.Column(
+            "created_at", {"uz_latn": "Yaratilgan", "ru": "Загружено"}, s("created_at"), 18
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def statement_rows(
+    db: AsyncSession, *, lang: xlsx.Lang, status: str | None
+) -> tuple[list[StatementRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    statements, total = await statement_service.list_statements(
+        db, status=status, limit=cap, offset=0
+    )
+    importer_ids = {s.imported_by for s in statements if s.imported_by}
+    names = await auth_service.user_names(db, importer_ids)
+    rows = [
+        StatementRow(s, imported_by=names.get(s.imported_by, "") if s.imported_by else "")
+        for s in statements
+    ]
+    return rows, total, cap
+
+
+def render_statements(items: list[StatementRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, statement_columns(lang), lang=lang, title=STATEMENTS_TITLE[lang])

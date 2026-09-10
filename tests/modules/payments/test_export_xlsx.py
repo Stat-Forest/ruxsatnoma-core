@@ -4,10 +4,15 @@ screen on paper — same scope, same filters, readable cells, the id last.
 `/invoices/export.xlsx` (Task C.1) below; the other payments lists (Task
 C.2) land in this same file, one commit each."""
 
+import csv
 import io
+import json
+import uuid
 
 import pytest
 from openpyxl import load_workbook
+
+from app.modules.payments import statement_service
 
 pytestmark = pytest.mark.asyncio
 
@@ -16,6 +21,40 @@ def _sheet(content: bytes):
     sheet = load_workbook(io.BytesIO(content)).active
     assert sheet is not None  # a fresh Workbook always has one active sheet
     return sheet
+
+
+# --- Bank-statement upload helpers, local to this file (mirrors
+# tests/modules/payments/test_statement_import.py's own idiom) ---------------
+
+_STATEMENT_COLUMN_MAP = {"amount": "Amount", "operation_date": "Date", "purpose": "Purpose"}
+_STATEMENT_HEADER = ["Amount", "Date", "Purpose"]
+
+
+def _statement_csv() -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(_STATEMENT_HEADER)
+    writer.writerow(["1000.00", "02.09.2026", "test"])
+    return buffer.getvalue().encode("utf-8")
+
+
+async def _upload_statement(client) -> str:
+    resp = await client.post(
+        "/api/v1/payments/bank-statements",
+        data={"statement_date": "2026-09-02", "column_map": json.dumps(_STATEMENT_COLUMN_MAP)},
+        files={"file": ("vypiska.csv", _statement_csv(), "text/csv")},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()["id"]
+
+
+async def _drain(db) -> None:
+    """Runs the queued parse job on the test's own session — the app's HTTP
+    session already committed the upload, and workers are off in tests
+    (lesson: build a fixture's precondition through the real transition)."""
+    while await statement_service.process_pending(db):
+        pass
 
 
 # --- /invoices/export.xlsx (Task C.1) ---------------------------------------
@@ -110,4 +149,93 @@ async def test_invoices_export_matches_the_list_status_for_a_caller_with_no_scop
 
 async def test_invoices_export_rejects_an_unknown_language(payments_view_client):
     resp = await payments_view_client.get("/api/v1/invoices/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422
+
+
+# --- /payments/bank-statements/export.xlsx (Task C.2) -----------------------
+
+
+async def test_statements_export_holds_exactly_the_rows_the_list_shows(payments_view_client, db):
+    statement_id = await _upload_statement(payments_view_client)
+    await _drain(db)
+
+    listed = (
+        await payments_view_client.get("/api/v1/payments/bank-statements", params={"limit": 200})
+    ).json()
+    listed_ids = {row["id"] for row in listed["items"]}
+    assert statement_id in listed_ids
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/bank-statements/export.xlsx", params={"lang": "ru"}
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Дата выписки" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert statement_id in exported_ids
+    assert exported_ids == listed_ids
+
+
+async def test_statements_export_applies_the_same_filters_as_the_list(payments_view_client, db):
+    statement_id = await _upload_statement(payments_view_client)
+    await _drain(db)
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/bank-statements/export.xlsx", params={"status": "failed"}
+    )
+    assert resp.status_code == 200
+    exported_ids = {
+        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert statement_id not in exported_ids  # a "parsed" statement is not "failed"
+
+
+async def test_statements_export_renders_labels_not_codes(payments_view_client, db):
+    statement_id = await _upload_statement(payments_view_client)
+    await _drain(db)
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/bank-statements/export.xlsx",
+        params={"status": "parsed", "lang": "uz_latn"},
+    )
+    row_by_id = {
+        str(row[-1]): row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert row_by_id[statement_id][1] == "Qayta ishlandi"  # the label, not "parsed"
+
+
+async def test_statements_export_truncates_at_the_cap_and_says_so(
+    payments_view_client, monkeypatch
+):
+    from app.core import settings_store
+
+    original_get_int = settings_store.get_int
+
+    async def capped(db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await original_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", capped)
+    resp = await payments_view_client.get("/api/v1/payments/bank-statements/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_statements_export_matches_the_list_status_for_a_caller_with_no_scope(
+    applicant_client,
+):
+    listed_resp = await applicant_client.get("/api/v1/payments/bank-statements")
+    export_resp = await applicant_client.get("/api/v1/payments/bank-statements/export.xlsx")
+    assert export_resp.status_code == listed_resp.status_code
+
+
+async def test_statements_export_rejects_an_unknown_language(payments_view_client):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/bank-statements/export.xlsx", params={"lang": "en"}
+    )
     assert resp.status_code == 422
