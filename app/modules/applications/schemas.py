@@ -466,21 +466,34 @@ class PrecheckCalculationOut(BaseModel):
         )
 
 
+class PrecheckCheckOut(BaseModel):
+    """One check result as a pre-check reports it — no row id, no author, no
+    timestamp: since stage 12 a pre-check over a filing writes nothing (plan
+    12, R3), and the per-id one on a RETURNED application answers in the same
+    shape (R5) so a client has one thing to render."""
+
+    check_type: str
+    result: str
+    details: Any
+
+
 class PrecheckOut(BaseModel):
-    """`POST /applications/{id}/precheck` — what the checks said, and what it
-    would cost.
+    """`POST /applications/precheck` (a filing, stage 12) and `POST
+    /applications/{id}/precheck` (a RETURNED application) — what the checks
+    said, and what it would cost.
 
     A blocking GIS or norm result is IN `checks`, as data, and the response is
     still 200 (design/03, and 3.7's own `calc_router` docstring): the applicant
     has to be able to see that the herd is over the limit, not merely be
-    refused. Task 5's submission runs the very same `checks.run_all` and turns
-    that same result into an HTTP error.
+    refused. The filing/submission runs the very same checks and turns that
+    same result into an HTTP error.
 
-    `calculation` is null when the draft is not complete enough to price — the
-    fields still missing are named in each `skipped` check's own `details`.
+    `calculation` is null when the filing is not complete enough to price —
+    the fields still missing are named in each `skipped` check's own
+    `details`.
     """
 
-    checks: list[ApplicationCheckOut]
+    checks: list[PrecheckCheckOut]
     calculation: PrecheckCalculationOut | None
 
 
@@ -517,6 +530,81 @@ class ApplicationSubmitIn(BaseModel):
 
     pkcs7: str | None = None
     rules_accepted: bool = False
+
+
+# --- Stage 12: the filing ------------------------------------------------------
+#
+# `DRAFT` is gone (plan 12): an application is created by ONE request carrying
+# everything (`POST /applications`, `ApplicationFileIn`), and the two reads a
+# client needs before it — the pre-check and the package to sign — take the
+# same content without an id (`ApplicationFilingIn`). Every field a draft used
+# to collect through PATCH is here, with the same bounds `ApplicationPatch`
+# applies. Optional on purpose: the pre-check answers an incomplete filing
+# with the fields still to fill (`checks.missing_for_pricing`), exactly as it
+# answered a half-empty draft, and the filing itself refuses one with 400
+# `ERR-APP-001`.
+
+
+class ApplicationFilingIn(BaseModel):
+    """The content of a filing — who, what, where, when, how much, the benefit
+    claim and the documents. The body of `POST /applications/precheck` and
+    `POST /applications/package`, and the base of `ApplicationFileIn`.
+
+    `applicant_id` is meaningful only with `on_behalf="legal"`: for `"self"`
+    the applicant is the caller's own `applicants` row and naming somebody
+    else's is refused by the service with a domain reason
+    (`applicant_is_not_the_caller`), never silently ignored.
+
+    `documents` carry file ids already uploaded through `POST /files` (plan
+    12, R9); each must be the caller's own active upload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    on_behalf: OnBehalf
+    applicant_id: uuid.UUID | None = None
+    activity_type_id: uuid.UUID | None = None
+    contour_id: uuid.UUID | None = None
+    period_from: date | None = None
+    period_to: date | None = None
+    quantity: (
+        Annotated[
+            Decimal,
+            Field(
+                ge=0,
+                allow_inf_nan=False,
+                max_digits=QUANTITY_MAX_DIGITS,
+                decimal_places=QUANTITY_DECIMAL_PLACES,
+            ),
+        ]
+        | None
+    ) = None
+    items: list[ApplicationItemIn] = []
+    benefit_category_item_id: uuid.UUID | None = None
+    benefit_certificate_no: (
+        Annotated[str, Field(max_length=BENEFIT_CERTIFICATE_NO_MAX_LENGTH)] | None
+    ) = None
+    documents: list[ApplicationDocumentIn] = []
+
+
+class ApplicationFileIn(ApplicationFilingIn):
+    """`POST /applications` — the filing (`ApplicationFilingIn`) plus what only
+    the act of filing carries: ruling #184's acceptance, ruling #183's optional
+    envelope, and — with the envelope — the `application_id` the package named
+    (plan 12, R2). `pkcs7` and `application_id` travel together or not at
+    all: the service refuses one without the other."""
+
+    rules_accepted: bool = False
+    pkcs7: str | None = None
+    application_id: uuid.UUID | None = None
+
+
+class FilingPackageOut(BaseModel):
+    """`POST /applications/package` — the id the application WILL have (plan
+    12, R2: the signed bytes name it, so it is minted here and sent back with
+    the signature) and the canonical bytes, base64 so the answer is JSON."""
+
+    application_id: uuid.UUID
+    package: str
 
 
 # --- Task 6: cancelling, and the timeline -------------------------------------

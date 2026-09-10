@@ -306,7 +306,13 @@ async def test_every_written_row_is_source_auto_and_the_run_is_audited_once(
     app_id = draft_ready_for_submission
     result = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
     assert result.status_code == 200, result.text
-    assert {c["source"] for c in result.json()["checks"]} == {"auto"}
+    # Stage 12: the pre-check answers the light `PrecheckCheckOut` shape, so
+    # `source` is read off the STORED rows the card serves, which is where the
+    # requirement lives anyway.
+    card = await applicant_client.get(f"/api/v1/applications/{app_id}")
+    assert card.status_code == 200, card.text
+    assert len(card.json()["checks"]) == len(result.json()["checks"])
+    assert {c["source"] for c in card.json()["checks"]} == {"auto"}
 
     entries = (
         (

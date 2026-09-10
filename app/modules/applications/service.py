@@ -18,6 +18,7 @@ names, unchanged since branch 1."""
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -61,6 +62,7 @@ from app.modules.applications.schemas import (
     ApplicationCheckIn,
     ApplicationCreate,
     ApplicationDocumentIn,
+    ApplicationFilingIn,
     ApplicationPatch,
 )
 from app.modules.audit import service as audit
@@ -864,7 +866,7 @@ async def _assert_in_actor_zone(
 
 
 async def _resolve_applicant(
-    db: AsyncSession, payload: ApplicationCreate, *, actor: User
+    db: AsyncSession, payload: ApplicationCreate | ApplicationFilingIn, *, actor: User
 ) -> tuple[uuid.UUID, uuid.UUID | None]:
     """Whose application this is, and on whose authority — `(applicant_id,
     representation_id)`.
@@ -1665,7 +1667,11 @@ def _package_bytes(
 
 
 async def _assert_complete(
-    db: AsyncSession, application: Application, *, rules_accepted: bool = True
+    db: AsyncSession,
+    application: Application,
+    *,
+    items: list[ApplicationItem] | None = None,
+    rules_accepted: bool = True,
 ) -> None:
     """Step 2. Every field a submission needs, or 400 `ERR-APP-001` NAMING the
     ones that are missing.
@@ -1685,8 +1691,11 @@ async def _assert_complete(
     `GET` carries no body and therefore no opinion on the checkbox) passes
     nothing and gets the default `True`, so only `submit` can ever name
     `rules_accepted` here.
+
+    `items` (stage 12): a transient filing's own herd, handed through to
+    `checks.missing_for_pricing`; `None` reads the stored rows.
     """
-    missing = await checks.missing_for_pricing(db, application)
+    missing = await checks.missing_for_pricing(db, application, items=items)
     if not rules_accepted:
         missing.append("rules_accepted")
     if missing:
@@ -1797,7 +1806,11 @@ async def _published_version_or_refuse(db: AsyncSession, application: Applicatio
 
 
 async def _price(
-    db: AsyncSession, application: Application, *, actor: User
+    db: AsyncSession,
+    application: Application,
+    *,
+    actor: User,
+    items: list[ApplicationItem] | None = None,
 ) -> tuple[CalculationIn, dict[str, Any]]:
     """The `norms` request this application describes, and what `preview` says
     it costs — WRITTEN NOWHERE (ruling 19).
@@ -1811,7 +1824,7 @@ async def _price(
     `preview` and `save_calculation` share one `norms.service._compute` by
     construction, so within one transaction the two cannot disagree.
     """
-    payload = await checks.calculation_payload(db, application)
+    payload = await checks.calculation_payload(db, application, items=items)
     return payload, await norms_service.preview(db, payload=payload, actor=actor)
 
 
@@ -1827,6 +1840,146 @@ async def _notification_recipient(db: AsyncSession, application: Application) ->
     if applicant is not None and applicant.owner_user_id is not None:
         return applicant.owner_user_id
     return application.submitted_by_user_id
+
+
+# --- Stage 12: the filing ------------------------------------------------------
+#
+# `DRAFT` no longer exists (plan 12). The application is built as a TRANSIENT
+# row — never `db.add`ed until the signature is good (R3), because
+# `signatures.service.sign()` commits the caller's whole session on every
+# refusal — evaluated exactly as a draft used to be, and inserted in one go by
+# `file()`. `precheck_filing` and `package_filing` share `_build_filing` so the
+# three cannot disagree about what a filing is.
+
+APPLICATION_FILE = "application.file"
+
+
+@dataclass(frozen=True)
+class Filing:
+    """A filing as `_build_filing` resolves it: the transient application and
+    the rows that will hang off it, none of them in the session."""
+
+    application: Application
+    items: list[ApplicationItem]
+    documents: list[ApplicationDocument]
+
+
+async def _build_filing(
+    db: AsyncSession,
+    payload: ApplicationFilingIn,
+    *,
+    actor: User,
+    kind: str = KIND_NEW,
+    parent_application_id: uuid.UUID | None = None,
+) -> Filing:
+    """The transient application a filing describes, with its items and
+    documents — resolved (`_resolve_applicant`), reference-checked
+    (`_assert_references`) and document-checked (`_own_document_file`,
+    `_assert_doc_type`), and NOT in the session.
+
+    `kind`/`parent_application_id` are parameters, never fields of the body
+    (3.11b ruling 17): `permits.service.extend` proves the permit and the
+    holder before passing them.
+    """
+    if kind not in APPLICATION_KINDS:
+        raise err("ERR-VAL-001", details={"reason": "unknown_kind"})
+    applicant_id, representation_id = await _resolve_applicant(db, payload, actor=actor)
+    fields = payload.model_dump(exclude={"documents", "on_behalf", "applicant_id"})
+    await _assert_references(db, fields)
+    documents: list[ApplicationDocument] = []
+    for doc in payload.documents:
+        await _assert_doc_type(db, doc.doc_type_item_id)
+        file = await _own_document_file(db, doc.file_id, actor=actor)
+        documents.append(
+            ApplicationDocument(
+                doc_type_item_id=doc.doc_type_item_id,
+                file_id=file.id,
+                uploaded_by=actor.id,
+                note=doc.note,
+            )
+        )
+    application = Application(
+        applicant_id=applicant_id,
+        submitted_by_user_id=actor.id,
+        on_behalf=payload.on_behalf,
+        representation_id=representation_id,
+        status=SUBMITTED_STATUS,
+        channel=CHANNEL_PORTAL,
+        kind=kind,
+        parent_application_id=parent_application_id,
+        activity_type_id=payload.activity_type_id,
+        contour_id=payload.contour_id,
+        period_from=payload.period_from,
+        period_to=payload.period_to,
+        quantity=payload.quantity,
+        benefit_category_item_id=payload.benefit_category_item_id,
+        benefit_certificate_no=payload.benefit_certificate_no,
+    )
+    items = [
+        ApplicationItem(livestock_type_id=item.livestock_type_id, head_count=item.head_count)
+        for item in payload.items
+    ]
+    return Filing(application=application, items=items, documents=documents)
+
+
+async def precheck_filing(
+    db: AsyncSession, payload: ApplicationFilingIn, *, actor: User
+) -> dict[str, Any]:
+    """`POST /applications/precheck` — the dry run over a filing that exists
+    only in the request. Same contract as `precheck` on a RETURNED row: a
+    blocking result is DATA in `checks`, an incomplete filing answers
+    `skipped` rows naming the fields, a broken input is still an HTTP error.
+    Writes nothing but the audit entry (plan 12, R3)."""
+    filing = await _build_filing(db, payload, actor=actor)
+    application, items = filing.application, filing.items
+    priced: dict[str, Any] | None = None
+    if not await checks.missing_for_pricing(db, application, items=items):
+        priced = await norms_service.preview(
+            db,
+            payload=await checks.calculation_payload(db, application, items=items),
+            actor=actor,
+        )
+    collected = await checks.evaluate(
+        db, application, norm_results=None if priced is None else priced["checks"], items=items
+    )
+    await audit.log(
+        db,
+        action=APPLICATION_PRECHECK,
+        user_id=actor.id,
+        object_type="application_filing",
+        new_value={
+            "filing": payload.model_dump(mode="json"),
+            "checks": [{"check_type": c, "result": r} for c, r, _ in collected],
+            "priced": priced is not None,
+        },
+    )
+    return {"checks": collected, "calculation": priced}
+
+
+async def package_filing(
+    db: AsyncSession,
+    payload: ApplicationFilingIn,
+    *,
+    actor: User,
+    application_id: uuid.UUID | None = None,
+) -> tuple[uuid.UUID, bytes]:
+    """`POST /applications/package` — mints the id the application will carry
+    (plan 12, R2) and answers the canonical bytes over the filing, priced now
+    (ruling 23 applies unchanged: `file()` prices again and `sign()` tells a
+    moved price apart from a forgery).
+
+    `application_id` is a keyword the ROUTE never passes: `None` mints a fresh
+    id. `test_file.py` passes one to produce a package naming an id that is
+    already filed — the only way to reach `file()`'s `already_filed` refusal
+    with a signature that verifies, which is exactly what a lying client
+    holding the byte shape could send."""
+    filing = await _build_filing(db, payload, actor=actor)
+    application, items = filing.application, filing.items
+    await _assert_complete(db, application, items=items)
+    version = await _published_version_or_refuse(db, application)
+    application.id = application_id or uuid7()
+    _, priced = await _price(db, application, actor=actor, items=items)
+    return application.id, _package_bytes(application, priced, contour_version_id=version.id)
 
 
 async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> bytes:

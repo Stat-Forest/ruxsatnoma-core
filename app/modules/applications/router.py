@@ -24,6 +24,7 @@ replayed create produces a second EMPTY draft, which costs a row and confuses
 nobody: the applicant sees two drafts and abandons one.
 """
 
+import base64
 import uuid
 from datetime import date
 from typing import Annotated
@@ -56,6 +57,7 @@ from app.modules.applications.schemas import (
     ApplicationDecisionOut,
     ApplicationDocumentIn,
     ApplicationDocumentOut,
+    ApplicationFilingIn,
     ApplicationOut,
     ApplicationPatch,
     ApplicationRejectIn,
@@ -65,7 +67,9 @@ from app.modules.applications.schemas import (
     ApplicationStatus,
     ApplicationSubmitIn,
     ApplicationTimelineOut,
+    FilingPackageOut,
     PrecheckCalculationOut,
+    PrecheckCheckOut,
     PrecheckOut,
 )
 from app.modules.auth.deps import (
@@ -82,6 +86,53 @@ from app.modules.auth.models import User
 NUMBER_MAX_LENGTH = 64
 
 router = APIRouter(tags=["applications"])
+
+
+# --- Stage 12: the stateless pre-check and package ---------------------------
+#
+# Registered BEFORE every `/applications/{application_id}…` route: FastAPI
+# matches in declaration order, and `application_id` is a `uuid.UUID`, so a
+# `POST /applications/precheck` reaching a parametrised route first would be
+# answered 422 for a path segment that is not a uuid.
+
+
+@router.post("/applications/precheck")
+async def precheck_filing(
+    payload: ApplicationFilingIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> PrecheckOut:
+    """The dry run over a filing that exists only in this body (plan 12, R3):
+    the checks as data and the price, nothing stored. 200 even when a check
+    blocks; an incomplete filing answers `skipped` rows naming the fields;
+    422 `ERR-VAL-001` for an unknown reference, a filing naming somebody
+    else's applicant, or a document that is not the caller's own upload; 422
+    `ERR-NORM-004` for an unpublished rule parameter."""
+    card = await service.precheck_filing(db, payload, actor=actor)
+    priced = card["calculation"]
+    return PrecheckOut(
+        checks=[PrecheckCheckOut(check_type=c, result=r, details=d) for c, r, d in card["checks"]],
+        calculation=None if priced is None else PrecheckCalculationOut.build(priced),
+    )
+
+
+@router.post("/applications/package")
+async def package_filing(
+    payload: ApplicationFilingIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> FilingPackageOut:
+    """The canonical bytes to sign over a filing that has no row yet, and the
+    `application_id` those bytes name (plan 12, R2) — the client signs the
+    bytes and posts both to `POST /applications`. Only a legal entity needs
+    this: a citizen's simple signature (#183) is taken by the server.
+
+    400 `ERR-APP-001` naming the fields still to fill; 409 `ERR-GIS-005` for a
+    contour with no published version; 422 `ERR-NORM-004`."""
+    application_id, package = await service.package_filing(db, payload, actor=actor)
+    return FilingPackageOut(
+        application_id=application_id, package=base64.b64encode(package).decode("ascii")
+    )
 
 
 @router.post("/applications", status_code=201)
@@ -266,7 +317,10 @@ async def precheck_application(
     card = await service.precheck(db, application_id, actor=actor)
     priced = card["calculation"]
     return PrecheckOut(
-        checks=[ApplicationCheckOut.model_validate(row) for row in card["checks"]],
+        checks=[
+            PrecheckCheckOut(check_type=row.check_type, result=row.result, details=row.details)
+            for row in card["checks"]
+        ],
         calculation=None if priced is None else PrecheckCalculationOut.build(priced),
     )
 
