@@ -9,14 +9,16 @@ from "may this role act at all")."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.inspections import service
+from app.modules.inspections import export, service
 from app.modules.inspections.permissions import (
     ACTS_WRITE,
     CASES_MANAGE,
@@ -121,6 +123,24 @@ async def list_tasks(
     )
 
 
+@router.get("/tasks/export.xlsx")
+async def export_tasks_xlsx(
+    db: AsyncDb,
+    user: CurrentUser,
+    lang: xlsx.Lang = "uz_latn",
+    status: str | None = None,
+) -> Response:
+    """`GET /tasks` as a spreadsheet (stage 13, ruling #204): the same scope,
+    the same filter, every matching row up to the configured cap. Declared
+    before `/tasks/{task_id}` on purpose — `export.xlsx` is not a UUID, and
+    a 404 here beats the 422 the UUID parser would otherwise answer."""
+    items, total, cap = await export.task_rows(db, actor=user, lang=lang, status=status)
+    filename = f"inspection-tasks-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_tasks(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: uuid.UUID, db: AsyncDb, user: CurrentUser) -> TaskOut:
     task = await service.get_task(db, task_id, actor=user)
@@ -194,6 +214,22 @@ async def list_acts(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/acts/export.xlsx")
+async def export_acts_xlsx(
+    db: AsyncDb,
+    user: CurrentUser,
+    lang: xlsx.Lang = "uz_latn",
+    result: str | None = None,
+) -> Response:
+    """`GET /acts` as a spreadsheet — same scope, same filter, declared
+    before `/acts/{act_id}` for the same reason `export_tasks_xlsx` is."""
+    items, total, cap = await export.act_rows(db, actor=user, lang=lang, result=result)
+    filename = f"inspection-acts-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_acts(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
@@ -284,6 +320,26 @@ async def list_cases(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/cases/export.xlsx")
+async def export_cases_xlsx(
+    db: AsyncDb,
+    user: CurrentUser,
+    lang: xlsx.Lang = "uz_latn",
+    status: str | None = None,
+    applicant_id: uuid.UUID | None = None,
+) -> Response:
+    """`GET /cases` as a spreadsheet — same scope, same filters (`status`,
+    `applicant_id` — ruling R8, finding F3), declared before `/cases/{case_id}`
+    for the same reason `export_tasks_xlsx` is."""
+    items, total, cap = await export.case_rows(
+        db, actor=user, lang=lang, status=status, applicant_id=applicant_id
+    )
+    filename = f"violation-cases-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_cases(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
