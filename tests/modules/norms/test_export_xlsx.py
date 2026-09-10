@@ -164,3 +164,110 @@ async def test_norms_export_rejects_an_unknown_language(
 ) -> None:
     resp = await gis_specialist_client.get("/api/v1/norms/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
+
+
+# --- tariffs ---------------------------------------------------------------
+# The seeded VMQ 278 rates (`test_tariffs_api.py`'s own fixtures) are already
+# in force from 2015-09-30 — haymaking (1.5) and grazing's four livestock
+# groups — so these tests read them rather than creating new ones.
+
+
+async def test_tariffs_export_holds_exactly_the_rows_the_list_shows(
+    applicant_client: AsyncClient,
+) -> None:
+    listed = await applicant_client.get(
+        "/api/v1/tariffs", params={"activity_code": "grazing", "on_date": "2026-08-30"}
+    )
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert listed_ids
+
+    resp = await applicant_client.get(
+        "/api/v1/tariffs/export.xlsx",
+        params={"activity_code": "grazing", "on_date": "2026-08-30", "lang": "ru"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-export-truncated"] == "false"
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Вид деятельности" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert exported_ids == listed_ids
+
+
+async def test_tariffs_export_applies_the_same_filter_as_the_list(
+    applicant_client: AsyncClient,
+) -> None:
+    """A date before any rate took effect: empty on both the list and the
+    export (`test_a_tariff_for_a_date_before_it_took_effect_is_not_returned`'s
+    own scenario)."""
+    resp = await applicant_client.get(
+        "/api/v1/tariffs/export.xlsx",
+        params={"activity_code": "haymaking", "on_date": "2015-01-01"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_tariffs_export_renders_labels_not_codes(applicant_client: AsyncClient) -> None:
+    resp = await applicant_client.get(
+        "/api/v1/tariffs/export.xlsx",
+        params={"activity_code": "grazing", "on_date": "2026-08-30", "lang": "uz_latn"},
+    )
+    rows = {row[1]: row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)}
+    assert "Yirik chorva, katta" in rows  # the large_adult label, not the code
+    row = rows["Yirik chorva, katta"]
+    assert row[5] == "Eʼlon qilingan"  # the status label, not "published"
+    assert row[3] == "bosh"  # the quantity_unit label, not "head"
+
+
+async def test_tariffs_export_truncates_at_the_cap_and_says_so(
+    applicant_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core import settings_store
+
+    real_get_int = settings_store.get_int
+
+    async def one(db_arg, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(db_arg, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    resp = await applicant_client.get(
+        "/api/v1/tariffs/export.xlsx",
+        params={"activity_code": "grazing", "on_date": "2026-08-30"},
+    )
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total >= 2  # grazing has four published groups
+    assert resp.headers["x-export-truncated"] == "true"
+    assert resp.headers["x-export-rows"] == "1"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_tariffs_export_is_visible_to_any_authenticated_caller(
+    applicant_client: AsyncClient,
+) -> None:
+    """No zone of its own: a plain applicant sees the same in-force rates
+    the list shows anyone."""
+    listed = await applicant_client.get(
+        "/api/v1/tariffs", params={"activity_code": "haymaking", "on_date": "2026-08-30"}
+    )
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert listed_ids
+
+    resp = await applicant_client.get(
+        "/api/v1/tariffs/export.xlsx",
+        params={"activity_code": "haymaking", "on_date": "2026-08-30"},
+    )
+    assert resp.status_code == 200, resp.text
+    exported_ids = {
+        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert exported_ids == listed_ids
+
+
+async def test_tariffs_export_rejects_an_unknown_language(applicant_client: AsyncClient) -> None:
+    resp = await applicant_client.get("/api/v1/tariffs/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422

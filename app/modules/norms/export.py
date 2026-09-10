@@ -14,6 +14,8 @@ the screen."""
 
 import uuid
 from collections.abc import Sequence
+from datetime import date
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +23,7 @@ from app.core import settings_store, xlsx
 from app.modules.admin import service as admin_service
 from app.modules.gis import service as gis_service
 from app.modules.norms import repo
-from app.modules.norms.models import Norm
+from app.modules.norms.models import Norm, Tariff
 
 # --- shared status vocabulary ------------------------------------------------
 # `norms`'s own five-stage lifecycle (draft/review/approved/published/
@@ -166,3 +168,135 @@ async def rows_norms(
 
 def render_norms(items: Sequence[NormRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, norms_columns(lang), lang=lang, title=NORMS_TITLE[lang])
+
+
+# --- tariffs -------------------------------------------------------------------
+
+TARIFFS_TITLE = {"uz_latn": "Tariflar", "ru": "Тарифы"}
+
+LIVESTOCK_GROUP_LABELS: dict[str, dict[str, str]] = {
+    "large_adult": {"uz_latn": "Yirik chorva, katta", "ru": "Крупный скот, взрослый"},
+    "large_young": {"uz_latn": "Yirik chorva, yosh", "ru": "Крупный скот, молодняк"},
+    "small_adult": {"uz_latn": "Mayda chorva, katta", "ru": "Мелкий скот, взрослый"},
+    "small_young": {"uz_latn": "Mayda chorva, yosh", "ru": "Мелкий скот, молодняк"},
+}
+QUANTITY_UNIT_LABELS: dict[str, dict[str, str]] = {
+    "head": {"uz_latn": "bosh", "ru": "голова"},
+    "ton": {"uz_latn": "tonna", "ru": "тонна"},
+    "hive": {"uz_latn": "ari uyasi", "ru": "улей"},
+    "ha": {"uz_latn": "ga", "ru": "га"},
+    "person_day": {"uz_latn": "kishi-kun", "ru": "человеко-день"},
+    "m3": {"uz_latn": "m³", "ru": "м³"},
+    "unit": {"uz_latn": "dona", "ru": "штука"},
+}
+
+
+def _benefit_modifiers_cell(value: dict[str, Any] | None) -> str:
+    """Flattened the same way `TariffsTab.tsx`'s own column renders it
+    (`code: modifier` pills) — a spreadsheet cell has no pills, so this joins
+    them with a comma."""
+    if not value:
+        return ""
+    return ", ".join(f"{code}: {modifier}" for code, modifier in value.items())
+
+
+class TariffRow:
+    def __init__(self, tariff: Tariff, *, activity_type: str) -> None:
+        self.tariff = tariff
+        self.id = tariff.id
+        self.activity_type = activity_type
+
+
+def tariffs_columns(lang: xlsx.Lang) -> list[xlsx.Column[TariffRow]]:
+    a = lambda f: lambda r: getattr(r.tariff, f)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "activity_type",
+            {"uz_latn": "Faoliyat turi", "ru": "Вид деятельности"},
+            lambda r: r.activity_type,
+            24,
+        ),
+        xlsx.Column(
+            "livestock_group",
+            {"uz_latn": "Chorva guruhi", "ru": "Группа скота"},
+            lambda r: (
+                _label(LIVESTOCK_GROUP_LABELS, r.tariff.livestock_group, lang)
+                if r.tariff.livestock_group
+                else ""
+            ),
+            20,
+        ),
+        xlsx.Column(
+            "coefficient", {"uz_latn": "Koeffitsient", "ru": "Коэффициент"}, a("coefficient"), 14
+        ),
+        xlsx.Column(
+            "quantity_unit",
+            {"uz_latn": "Oʻlchov birligi", "ru": "Единица"},
+            lambda r: _label(QUANTITY_UNIT_LABELS, r.tariff.quantity_unit, lang),
+            14,
+        ),
+        xlsx.Column(
+            "benefit_modifiers",
+            {"uz_latn": "Imtiyozlar", "ru": "Льготы"},
+            lambda r: _benefit_modifiers_cell(r.tariff.benefit_modifiers),
+            24,
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(VERSIONED_STATUS_LABELS, r.tariff.status, lang),
+            16,
+        ),
+        xlsx.Column(
+            "effective_from",
+            {"uz_latn": "Amal qilish boshlanishi", "ru": "Действует с"},
+            a("effective_from"),
+            16,
+        ),
+        xlsx.Column(
+            "effective_to",
+            {"uz_latn": "Amal qilish tugashi", "ru": "Действует по"},
+            a("effective_to"),
+            16,
+        ),
+        xlsx.Column("basis", {"uz_latn": "Asos", "ru": "Основание"}, a("basis"), 30),
+        xlsx.id_column(),
+    ]
+
+
+async def rows_tariffs(
+    db: AsyncSession,
+    *,
+    lang: xlsx.Lang,
+    activity_type_id: uuid.UUID | None,
+    on_date: date | None,
+    status: str | None,
+) -> tuple[list[TariffRow], int, int]:
+    """`activity_type_id` here is already RESOLVED (the router does the
+    `activity_code` -> `activity_type_id` lookup with its own
+    `_resolve_activity_type_id`, exactly once, the same as `list_tariffs`
+    does) — this function does not repeat that resolution."""
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    tariffs, total = await repo.list_tariffs(
+        db,
+        activity_type_id=activity_type_id,
+        on_date=on_date,
+        status=status,
+        limit=cap,
+        offset=0,
+    )
+    activities = await admin_service.activity_type_names(db)
+    return (
+        [
+            TariffRow(
+                tariff, activity_type=xlsx.localized(activities.get(tariff.activity_type_id), lang)
+            )
+            for tariff in tariffs
+        ],
+        total,
+        cap,
+    )
+
+
+def render_tariffs(items: Sequence[TariffRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, tariffs_columns(lang), lang=lang, title=TARIFFS_TITLE[lang])
