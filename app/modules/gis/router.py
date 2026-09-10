@@ -15,14 +15,16 @@ permission check — a read path needs both')."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.gis import checks, service
+from app.modules.gis import checks, export, service
 from app.modules.gis.models import VERSION_STATUSES
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import (
@@ -74,6 +76,29 @@ async def list_contours(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/contours/export.xlsx")
+async def export_contours_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    organization_id: uuid.UUID | None = None,
+    bbox: str | None = None,
+) -> Response:
+    """`GET /gis/contours` as a spreadsheet (stage 13, ruling #204): the
+    same filters, the same zone scoping, every matching row up to the
+    configured cap. NO geometry — this is an attributes register, exactly
+    like the list it mirrors. Declared before `/contours/{contour_id}` on
+    purpose — `export.xlsx` is not a UUID, and the 422 the UUID parser
+    would answer is a worse error than a 404."""
+    items, total, cap = await export.rows_contours(
+        db, actor=user, lang=lang, organization_id=organization_id, bbox=bbox
+    )
+    filename = f"konturlar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_contours(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
