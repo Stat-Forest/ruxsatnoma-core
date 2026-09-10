@@ -274,7 +274,7 @@ async def rating_for_permit(db: AsyncSession, permit_id: uuid.UUID) -> PermitRat
 
 
 async def occupied_area_by_contour(
-    db: AsyncSession, contour_ids: Sequence[uuid.UUID], *, status: str
+    db: AsyncSession, contour_ids: Sequence[uuid.UUID], *, status: str, as_of: date
 ) -> dict[uuid.UUID, Decimal]:
     """How many hectares each of these contours has committed, in ONE statement.
 
@@ -290,10 +290,24 @@ async def occupied_area_by_contour(
     `status` comes from the caller: `service.ACTIVE_STATUS` is the module's one
     source of truth for that word and importing the service from here would be a
     cycle.
-    """
+
+    **`as_of` (ruling #176, stage 9): a permit whose OWN period has already
+    ended no longer occupies its area**, even while its stored `status` still
+    reads `active` in the window before the nightly `jobs.expire_permits`
+    sweep catches up (`service.occupancy_provider`'s own docstring). A permit
+    that has not yet STARTED still counts — reserving a future slot is exactly
+    what must keep a second applicant from being granted the same one — so the
+    only exclusion is `period_to < as_of`, never a symmetric `period_from`
+    check. The caller passes `business_today()`; this file never calls it
+    itself (lesson: business dates come from `business_today()`, decided by
+    the service, never re-derived inside a repo)."""
     rows = await db.execute(
         select(Permit.contour_id, func.sum(Permit.area_ha))
-        .where(Permit.status == status, Permit.contour_id.in_(contour_ids))
+        .where(
+            Permit.status == status,
+            Permit.contour_id.in_(contour_ids),
+            Permit.period_to >= as_of,
+        )
         .group_by(Permit.contour_id)
     )
     return {contour_id: total for contour_id, total in rows.all()}
@@ -305,7 +319,7 @@ async def committed_sb_load(
     period_from: date,
     period_to: date,
     *,
-    status: str,
+    statuses: Sequence[str],
 ) -> Decimal:
     """The conditional heads already committed on this contour over any part of
     `[period_from, period_to]`.
@@ -323,16 +337,112 @@ async def committed_sb_load(
     all, and `SUM` skips nulls; `COALESCE` turns the all-null (and the no-row)
     answer into a real `Decimal("0")` rather than a `None` the caller would have
     to add to a total.
+
+    `statuses` (ruling #176, stage 9): a plain sequence rather than one
+    `status`, so `service.load_provider` (`(ACTIVE_STATUS,)`, the norms-facing
+    seam) and `service._assert_contour_still_has_room` (`ISSUANCE_BLOCKING_
+    STATUSES`, the stricter issuance-time gate — see that constant's own
+    comment for why a `pending_signatures` permit must count there and must
+    not count here) share this ONE query instead of two near-identical copies.
     """
     total = await db.scalar(
         select(func.coalesce(func.sum(Permit.sb_load), 0)).where(
-            Permit.status == status,
+            Permit.status.in_(statuses),
             Permit.contour_id == contour_id,
             Permit.period_from <= period_to,
             Permit.period_to >= period_from,
         )
     )
     return Decimal(total or 0)
+
+
+async def committed_capacity_quantity(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+    *,
+    statuses: Sequence[str],
+) -> Decimal:
+    """`committed_sb_load`'s non-grazing sibling (ruling #176): sums
+    `permits.quantity`, the activity's own unit, filtered additionally by
+    `activity_type_id` — unlike grazing's seam, one contour may carry permits
+    for more than one activity, and their quantities must never be summed
+    into one figure (`norms.service.committed_capacity_load`'s own docstring).
+    Same overlap predicate, same `COALESCE`-to-zero, same `statuses` sequence
+    for the same two callers `committed_sb_load` documents.
+    """
+    total = await db.scalar(
+        select(func.coalesce(func.sum(Permit.quantity), 0)).where(
+            Permit.status.in_(statuses),
+            Permit.contour_id == contour_id,
+            Permit.activity_type_id == activity_type_id,
+            Permit.period_from <= period_to,
+            Permit.period_to >= period_from,
+        )
+    )
+    return Decimal(total or 0)
+
+
+async def latest_occupied_until(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+    *,
+    statuses: Sequence[str],
+) -> date | None:
+    """The latest `period_to` among permits in `statuses`, for this contour ×
+    activity, whose own period overlaps `[period_from, period_to]` — `None`
+    when nothing overlaps. `service.exclusivity_provider` (`(ACTIVE_STATUS,)`)
+    and `service._assert_contour_still_has_room` (`ISSUANCE_BLOCKING_
+    STATUSES`) are its two callers, the exclusivity-side mirror of
+    `committed_capacity_quantity`'s two."""
+    return await db.scalar(
+        select(func.max(Permit.period_to)).where(
+            Permit.status.in_(statuses),
+            Permit.contour_id == contour_id,
+            Permit.activity_type_id == activity_type_id,
+            Permit.period_from <= period_to,
+            Permit.period_to >= period_from,
+        )
+    )
+
+
+async def lock_contour_activity(
+    db: AsyncSession, contour_id: uuid.UUID, activity_type_id: uuid.UUID
+) -> None:
+    """Serialises `service.issue` across every concurrent issuance for the
+    SAME contour × activity (ruling #176's exclusivity scope), without a real
+    row of this module's own to take `SELECT ... FOR UPDATE` on.
+
+    **Why an advisory lock and not a row lock on `gis.contours`, the obvious
+    candidate.** `permit_by_id_for_update` locks a row THIS module owns; the
+    contour identity row lives in `gis`, a module this stage's own contract
+    forbids touching (T5's), and even inside `gis` there would be nothing to
+    lock for the EXCLUSIVE case — no capacity, no norm row at all, nothing but
+    the fact of a competing permit. `pg_advisory_xact_lock` gives the identical
+    guarantee `permit_by_id_for_update`'s comment describes for a real row:
+    every concurrent transaction taking the SAME key blocks until the first
+    COMMITS or ROLLS BACK, at which point the lock is released automatically —
+    no unlock call, no risk of a leaked lock outliving the transaction that
+    took it.
+
+    `hashtextextended(text, seed)` (PostgreSQL, `bigint` result) turns the pair
+    into ONE 64-bit key for the single-key form of the lock — never the two
+    independent 32-bit keys of `pg_advisory_xact_lock(int, int)`, which would
+    let an unrelated `(contour, activity)` pair collide with this one by
+    sharing just one half. `hashtextextended` was chosen over `hashtext`
+    (32-bit) for the same collision reason: two lock keys the size of a mere
+    contour count would find a collision uncomfortably soon.
+    """
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))").bindparams(
+            key=f"{contour_id}:{activity_type_id}"
+        )
+    )
 
 
 async def permits_ending_before(

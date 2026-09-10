@@ -111,6 +111,17 @@ class Permit(Base):
     period_to: Mapped[date]
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     sb_load: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    # Ruling #176 (stage 9): the non-grazing sibling of `sb_load` above — the
+    # committed quantity in the ACTIVITY'S OWN unit (ha/hive/m3/person_day,
+    # `norms.capacity`'s own scale, `Numeric(14, 4)`), captured once at
+    # issuance from `applications.quantity`, never recomputed later. NULL for
+    # grazing (its committed load IS `sb_load`, and a second column would be a
+    # second source of truth for the same fact — the identical reasoning
+    # `norms.Norm.capacity` already carries for the norm side) and for any
+    # other activity that happens to price at zero declared quantity. Summed
+    # by `permits.service.capacity_load_provider`, `norms`' registered seam
+    # for every activity but grazing.
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
     status: Mapped[str] = mapped_column(default="pending_signatures")
     pdf_file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"), index=True)
     doc_hash: Mapped[str | None]
@@ -132,6 +143,7 @@ class Permit(Base):
         # columns and hides the rows it should find (lesson) — and ruling 11's
         # LoadProvider is exactly such a predicate, over exactly this pair.
         CheckConstraint("period_to >= period_from", name="period_ordered"),
+        CheckConstraint("quantity IS NULL OR quantity >= 0", name="quantity_valid"),
     )
 
 

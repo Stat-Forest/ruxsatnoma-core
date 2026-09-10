@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import RowMapping, Select, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
+from app.modules.norms.models import ActivitySeason, Calculation, Norm, RuleParameter, Tariff
 
 
 def _in_force(model: type[RuleParameter] | type[Tariff] | type[Norm], on_date: date):
@@ -70,6 +70,41 @@ async def effective_norm(
         )
     )
     return rows.scalar_one_or_none()
+
+
+async def get_activity_season(
+    db: AsyncSession, organization_id: uuid.UUID, activity_type_id: uuid.UUID
+) -> ActivitySeason | None:
+    """The one row for this organization x activity, if any — unique by
+    construction (`uq_activity_seasons_org_activity`), so no date/status
+    filtering the way `effective_norm`/`effective_tariffs` need: this
+    dictionary is a plain current-value setting, not a published-in-force
+    lookup. The single caller today is `checks.run_checks`/
+    `service.effective_season`, both resolving ruling #177's fallback."""
+    rows = await db.execute(
+        select(ActivitySeason).where(
+            ActivitySeason.organization_id == organization_id,
+            ActivitySeason.activity_type_id == activity_type_id,
+        )
+    )
+    return rows.scalar_one_or_none()
+
+
+async def list_activity_seasons(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[ActivitySeason], int]:
+    stmt = select(ActivitySeason)
+    if organization_id is not None:
+        stmt = stmt.where(ActivitySeason.organization_id == organization_id)
+    if activity_type_id is not None:
+        stmt = stmt.where(ActivitySeason.activity_type_id == activity_type_id)
+    stmt = stmt.order_by(ActivitySeason.organization_id, ActivitySeason.activity_type_id)
+    return await paginate(db, stmt, limit, offset)
 
 
 async def published_overlaps(

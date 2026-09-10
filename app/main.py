@@ -37,6 +37,9 @@ from app.modules.admin.legal_documents_router import router as legal_documents_a
 from app.modules.admin.refs_router import router as refs_router
 from app.modules.admin.router import router as admin_router
 from app.modules.admin.users_router import router as users_router
+from app.modules.applications.benefit_verification_router import (
+    router as benefit_verification_router,
+)
 from app.modules.applications.router import router as applications_router
 from app.modules.archive.router import router as archive_router
 from app.modules.auth.router import router as auth_router
@@ -48,6 +51,7 @@ from app.modules.help.admin_router import router as help_admin_router
 from app.modules.help.router import router as help_router
 from app.modules.inspections.router import router as inspections_router
 from app.modules.integrations.router import router as integrations_router
+from app.modules.norms.activity_seasons_router import router as norms_activity_seasons_router
 from app.modules.norms.calc_router import router as norms_calc_router
 from app.modules.norms.public_router import router as norms_public_router
 from app.modules.norms.refs_router import router as norms_refs_router
@@ -55,6 +59,7 @@ from app.modules.norms.router import router as norms_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.templates_router import router as notification_templates_router
 from app.modules.notifications.webhooks_router import router as notifications_webhooks_router
+from app.modules.occupancy.router import router as occupancy_router
 from app.modules.oversight.router import router as oversight_router
 from app.modules.payments.backoffice_router import router as payments_backoffice_router
 from app.modules.payments.payme_router import router as payme_router
@@ -320,13 +325,26 @@ def create_app() -> FastAPI:
     app.include_router(gis_layers_router, prefix="/api/v1")
     app.include_router(gis_imports_router, prefix="/api/v1")
     app.include_router(gis_router, prefix="/api/v1")
+    # Stage 9 wave 2: the applicant's occupancy calendar (ruling #176/#177) —
+    # a separate module mounted on the SAME `/gis/contours/{id}/...` prefix,
+    # not a route added to `gis_router` itself (`occupancy` owns no `gis`
+    # table).
+    app.include_router(occupancy_router, prefix="/api/v1")
     app.include_router(norms_refs_router, prefix="/api/v1")
     app.include_router(norms_router, prefix="/api/v1")
+    app.include_router(norms_activity_seasons_router, prefix="/api/v1")
     app.include_router(norms_calc_router, prefix="/api/v1")
     # The anonymous public price estimate (decision #63) — no session, no
     # parcel, no permission code; a rate limit instead of all three.
     app.include_router(norms_public_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
+    # Ruling #179: the central benefit-verification office, mounted BEFORE its
+    # sibling `applications_router` — Starlette matches routes in REGISTRATION
+    # order, not by specificity, so `GET /applications/{application_id}` would
+    # otherwise shadow the literal `/applications/benefit-verifications` path
+    # (a 422 `uuid_parsing` on "benefit-verifications", found by this track's
+    # own tests — a wrong-order regression here fails the exact same way).
+    app.include_router(benefit_verification_router, prefix="/api/v1")
     app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
     app.include_router(payments_backoffice_router, prefix="/api/v1")

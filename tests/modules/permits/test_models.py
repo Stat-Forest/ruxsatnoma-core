@@ -237,3 +237,73 @@ async def test_every_event_code_this_module_notifies_on_has_an_active_template(d
         is None
     ]
     assert missing == []
+
+
+async def test_two_issuances_for_one_contour_and_activity_cannot_run_at_once(engine: AsyncEngine):
+    """Ruling #176's last gate has to SERIALISE, not merely re-check.
+
+    `service.issue` re-runs the capacity check before producing a numbered
+    document, but a check alone does not stop two approvals decided in the same
+    second: both read the same "before" picture, both find room, both pass.
+    `repo.lock_contour_activity` is what makes the second wait for the first,
+    and this test is what proves the lock is real — the contract asked for it
+    and the track that wrote the lock did not write it, so nothing had ever
+    demonstrated that two callers actually contend.
+
+    Two REAL sessions, the shape `test_the_counter_hands_out_each_number_once_
+    under_a_real_race` above uses: one session takes the lock, the second must
+    BLOCK on the same key until the first's transaction ends, and must then
+    proceed. A per-transaction advisory lock is released by COMMIT or ROLLBACK
+    with no unlock call, so the rollback below both ends the test cleanly and
+    demonstrates that release.
+    """
+    contour_id = uuid.uuid4()
+    activity_type_id = uuid.uuid4()
+    factory = make_session_factory(engine)
+
+    async with factory() as first, factory() as second:
+        await repo.lock_contour_activity(first, contour_id, activity_type_id)
+
+        racer = asyncio.create_task(
+            repo.lock_contour_activity(second, contour_id, activity_type_id)
+        )
+        await asyncio.sleep(0.5)
+        assert not racer.done(), (
+            "the second issuance must block on the first's lock — without it both"
+            " read the same free contour and both produce a permit over one plot"
+        )
+
+        await first.rollback()
+        await asyncio.wait_for(racer, timeout=10)
+        await second.rollback()
+
+
+async def test_the_lock_does_not_hold_up_a_different_contour_or_activity(engine: AsyncEngine):
+    """The other half, and the reason the key is one 64-bit hash of the PAIR
+    rather than two independent halves: an issuance on a DIFFERENT contour, or
+    on the same contour for a different activity, must not wait at all.
+
+    Without this, a lock that serialised every issuance in the country would
+    pass the test above just as convincingly."""
+    contour_id = uuid.uuid4()
+    other_contour_id = uuid.uuid4()
+    activity_type_id = uuid.uuid4()
+    other_activity_type_id = uuid.uuid4()
+    factory = make_session_factory(engine)
+
+    async with factory() as first, factory() as second, factory() as third:
+        await repo.lock_contour_activity(first, contour_id, activity_type_id)
+
+        # Same activity, another contour — and the same contour, another
+        # activity. Both must complete while the first transaction still holds
+        # its own lock.
+        await asyncio.wait_for(
+            repo.lock_contour_activity(second, other_contour_id, activity_type_id), timeout=10
+        )
+        await asyncio.wait_for(
+            repo.lock_contour_activity(third, contour_id, other_activity_type_id), timeout=10
+        )
+
+        await first.rollback()
+        await second.rollback()
+        await third.rollback()

@@ -34,9 +34,16 @@ from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.norms import calculator, checks, repo
 from app.modules.norms import params as norm_params
-from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
+from app.modules.norms.models import ActivitySeason, Calculation, Norm, RuleParameter, Tariff
 from app.modules.norms.permissions import TARIFFS_PUBLISH
-from app.modules.norms.schemas import CalculationIn, NormIn, NormPatch, PublicEstimateIn
+from app.modules.norms.schemas import (
+    ActivitySeasonIn,
+    ActivitySeasonPatch,
+    CalculationIn,
+    NormIn,
+    NormPatch,
+    PublicEstimateIn,
+)
 
 
 @dataclass(frozen=True)
@@ -795,6 +802,196 @@ async def archive_norm(db: AsyncSession, norm_id: uuid.UUID, *, actor: User) -> 
         new_value=_snapshot(norm),
     )
     return norm
+
+
+# --- Ruling #177 (stage 9): the leshoz x activity season/minimum-term --------
+# dictionary. No lifecycle the way Norm/Tariff/RuleParameter have one — a
+# plain current-value setting, edited in place, unique on (organization_id,
+# activity_type_id) at the database (`uq_activity_seasons_org_activity`).
+# Zone-scoped through the SAME idiom `_assert_norm_zone` uses above, minus
+# the contour lookup: the caller already names the organization directly.
+
+
+async def _activity_season_or_404(
+    db: AsyncSession, activity_season_id: uuid.UUID
+) -> ActivitySeason:
+    row = await db.get(ActivitySeason, activity_season_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    return row
+
+
+async def _assert_organization_zone(
+    db: AsyncSession, actor: User, organization_id: uuid.UUID
+) -> None:
+    """Ruling #177: "editable by the leshoz for itself and by the central
+    admin for anyone" — a zone-scoped actor (the leshoz's own gis_specialist)
+    may act only on THEIR OWN organization; a zone-free actor (central
+    office) may act on any. Identical reasoning to `_assert_norm_zone`,
+    without a contour to resolve first: the caller already names the
+    organization directly (`payload.organization_id` on create, the existing
+    row's own column on update)."""
+    zone = zone_of(actor)
+    if zone == Zone(None, None, None):
+        return
+    org = await admin_repo.get_organization(db, organization_id)
+    if org is None or not _organization_in_zone(zone, org):
+        raise err("ERR-ACL-002")
+
+
+def _activity_season_snapshot(row: ActivitySeason) -> dict[str, Any]:
+    return {
+        "organization_id": str(row.organization_id),
+        "activity_type_id": str(row.activity_type_id),
+        "season": row.season,
+        "min_term_days": row.min_term_days,
+    }
+
+
+async def create_activity_season(
+    db: AsyncSession, payload: ActivitySeasonIn, *, actor: User
+) -> ActivitySeason:
+    await _assert_organization_zone(db, actor, payload.organization_id)
+    if await admin_repo.get_organization(db, payload.organization_id) is None:
+        raise err("ERR-VAL-001", details={"reason": "unknown_organization"})
+    known = await admin_repo.list_activity_types(db)
+    if not any(a.id == payload.activity_type_id for a in known):
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    if (
+        await repo.get_activity_season(db, payload.organization_id, payload.activity_type_id)
+        is not None
+    ):
+        # This module's own state-conflict code (CLAUDE.md: "ERR-NORM-005 —
+        # a state or period conflict"); the DB's own
+        # `uq_activity_seasons_org_activity` is the backstop, never the
+        # first line — an IntegrityError has no handler in main.py and would
+        # surface as ERR-SYS-001/500 (same reasoning `create_norm` gives for
+        # checking `effective_to < effective_from` here rather than trusting
+        # the CHECK).
+        raise err("ERR-NORM-005", details={"reason": "already_exists"})
+    row = ActivitySeason(
+        organization_id=payload.organization_id,
+        activity_type_id=payload.activity_type_id,
+        season=payload.season.model_dump(by_alias=True),
+        min_term_days=payload.min_term_days,
+        created_by=actor.id,
+    )
+    db.add(row)
+    await db.flush()
+    await audit.log(
+        db,
+        action="activity_season.create",
+        user_id=actor.id,
+        object_type="activity_season",
+        object_id=row.id,
+        new_value=_activity_season_snapshot(row),
+    )
+    return row
+
+
+async def get_activity_season(db: AsyncSession, activity_season_id: uuid.UUID) -> ActivitySeason:
+    return await _activity_season_or_404(db, activity_season_id)
+
+
+async def list_activity_seasons(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[ActivitySeason], int]:
+    return await repo.list_activity_seasons(
+        db,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def update_activity_season(
+    db: AsyncSession, activity_season_id: uuid.UUID, patch: ActivitySeasonPatch, *, actor: User
+) -> ActivitySeason:
+    row = await _activity_season_or_404(db, activity_season_id)
+    await _assert_organization_zone(db, actor, row.organization_id)
+    before = _activity_season_snapshot(row)
+    fields = patch.model_dump(exclude_unset=True, by_alias=True)
+    if "season" in fields:
+        row.season = fields["season"]
+    if "min_term_days" in fields:
+        row.min_term_days = fields["min_term_days"]
+    await db.flush()
+    # `updated_at`'s `onupdate=func.now()` is fetched via RETURNING on
+    # INSERT but left EXPIRED after a plain UPDATE (lesson) — reading it
+    # outside the session's async context (`ActivitySeasonOut` serializing
+    # the response) raises `MissingGreenlet` without this refresh.
+    await db.refresh(row)
+    await audit.log(
+        db,
+        action="activity_season.update",
+        user_id=actor.id,
+        object_type="activity_season",
+        object_id=row.id,
+        old_value=before,
+        new_value=_activity_season_snapshot(row),
+    )
+    return row
+
+
+async def effective_season(
+    db: AsyncSession,
+    *,
+    activity_type_id: uuid.UUID,
+    contour_id: uuid.UUID | None,
+    organization_id: uuid.UUID | None,
+) -> dict[str, Any]:
+    """Ruling #177 task 4 — `GET /activity-seasons/effective`: what ACTUALLY
+    applies for the wizard's date pickers, resolved through the SAME function
+    `checks._season_check` calls (`checks.resolve_effective_windows`) so the
+    two can never disagree.
+
+    Exactly one of `contour_id`/`organization_id`: a contour names both an
+    organization (through it) and a norm that may override the dictionary; a
+    bare organization has no norm to consult at all — T8's occupancy
+    calendar and a leshoz's own admin screen are the callers with no contour
+    in hand yet."""
+    if (contour_id is None) == (organization_id is None):
+        raise err("ERR-VAL-001", details={"reason": "need_exactly_one_of_contour_or_organization"})
+    known = await admin_repo.list_activity_types(db)
+    if not any(a.id == activity_type_id for a in known):
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+
+    norm_season: dict[str, Any] | None = None
+    resolved_org_id: uuid.UUID
+    if contour_id is not None:
+        maybe_org_id = await gis_service.contour_organization(db, contour_id)
+        if maybe_org_id is None:
+            raise err("ERR-SYS-003")
+        resolved_org_id = maybe_org_id
+        norm_row = await repo.effective_norm(db, contour_id, activity_type_id, business_today())
+        norm_season = norm_row.season if norm_row is not None else None
+    else:
+        assert organization_id is not None  # narrowed by the xor guard above
+        resolved_org_id = organization_id
+        if await admin_repo.get_organization(db, resolved_org_id) is None:
+            raise err("ERR-SYS-003")
+
+    dictionary_row = await repo.get_activity_season(db, resolved_org_id, activity_type_id)
+    dictionary_season = dictionary_row.season if dictionary_row is not None else None
+    min_term_days = dictionary_row.min_term_days if dictionary_row is not None else None
+
+    windows, season_source = checks.resolve_effective_windows(norm_season, dictionary_season)
+
+    return {
+        "activity_type_id": activity_type_id,
+        "organization_id": resolved_org_id,
+        "contour_id": contour_id,
+        "windows": windows,
+        "season_source": season_source,
+        "min_term_days": min_term_days,
+        "min_term_source": "activity_season" if min_term_days is not None else "none",
+    }
 
 
 # --- Task 7: preview and saved calculations. `_compute` is the ONE path both

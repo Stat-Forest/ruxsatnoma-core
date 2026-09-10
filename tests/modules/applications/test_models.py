@@ -102,6 +102,38 @@ async def test_status_check_accepts_every_status(db, applicant) -> None:
         await db.flush()
 
 
+async def test_benefit_verification_status_check_rejects_a_bogus_value(db, applicant) -> None:
+    """Ruling #179's own CHECK, the same shape as `status_valid` above — a
+    SEPARATE state machine from `status`, so this needs its own guard."""
+    row = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        channel="portal",
+        status="DRAFT",
+        benefit_verification_status="BOGUS",
+    )
+    db.add(row)
+    with pytest.raises(IntegrityError, match="ck_applications_benefit_verification_status_valid"):
+        await db.flush()
+
+
+async def test_benefit_verification_status_defaults_to_not_required(db, applicant) -> None:
+    """Every application, benefit or none, starts `not_required` — only
+    `applications.service.submit` (out of this track's file ownership) ever
+    writes `pending`."""
+    row = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        channel="portal",
+        status="DRAFT",
+    )
+    db.add(row)
+    await db.flush()
+    assert row.benefit_verification_status == "not_required"
+
+
 async def test_check_type_check_rejects_a_bogus_value(db, applicant) -> None:
     """I2: `application_checks` had no test at all before this. `gis_restrictions`
     is design/02's own value, dropped by ruling 21 in favour of `norm_restrictions`
@@ -368,6 +400,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
 
     from app.modules.applications.models import (
         APPLICATION_KINDS,
+        BENEFIT_VERIFICATION_STATUSES,
         CHANNELS,
         CONCLUSION_KINDS,
         CONCLUSION_RECOMMENDATIONS,
@@ -376,6 +409,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     from app.modules.applications.schemas import (
         ApplicationKind,
         ApplicationStatus,
+        BenefitVerificationStatus,
         Channel,
         ConclusionKind,
         ConclusionRecommendation,
@@ -388,3 +422,4 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(ApplicationKind)) == set(APPLICATION_KINDS)
     assert set(get_args(ConclusionKind)) == set(CONCLUSION_KINDS)
     assert set(get_args(ConclusionRecommendation)) == set(CONCLUSION_RECOMMENDATIONS)
+    assert set(get_args(BenefitVerificationStatus)) == set(BENEFIT_VERIFICATION_STATUSES)

@@ -826,6 +826,7 @@ async def make_permit_on_contour(
     status: str,
     area_ha: Decimal = Decimal("12.5000"),
     sb_load: Decimal | None = Decimal("40.0000"),
+    quantity: Decimal | None = None,
     period_from: date = date(2027, 5, 1),
     period_to: date = date(2027, 9, 30),
 ) -> Permit:
@@ -848,6 +849,10 @@ async def make_permit_on_contour(
     The number comes from `permit_counters` through the real statement, never a
     literal: this database is shared and persistent, and a hard-coded number dies
     the first time issuance commits one (lesson).
+
+    `quantity` (ruling #176, stage 9, T6) is `sb_load`'s non-grazing sibling —
+    `None` by default, the same "not applicable" meaning `sb_load=None` already
+    carries, and a caller exercising `capacity_load_provider` sets it directly.
     """
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
     user.full_name = HOLDER_NAME
@@ -891,6 +896,7 @@ async def make_permit_on_contour(
         period_to=period_to,
         amount=Decimal("2060000.00"),
         sb_load=sb_load,
+        quantity=quantity,
         status=status,
         qr_token=secrets.token_urlsafe(32),
         snapshot={"holder_name": HOLDER_NAME},

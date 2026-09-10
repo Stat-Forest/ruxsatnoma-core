@@ -1656,6 +1656,43 @@ async def _benefit_doc_type(db: AsyncSession) -> Any:
     return next((item for item in items if item.code == BENEFIT_DOC_TYPE_CODE), None)
 
 
+async def _open_benefit_verification(db: AsyncSession, application: Application) -> None:
+    """Ruling #179, step 3b: a claim whose category REQUIRES a certificate is
+    filed with its number and enters `pending`; everything else stays
+    `not_required`.
+
+    Integration finding, stage 9 wave 2 — and the exact shape this project's
+    defects keep taking. T9 added the five columns and the verifier's whole
+    workplace, T6 made issuance refuse a `pending` claim, and both were green:
+    nothing ever SET `pending`. Every benefit claim would have sailed past the
+    office built to check it, with the certificate number never asked for, and
+    the only visible symptom would have been a verifier's empty list — which
+    reads exactly like a quiet week.
+
+    Fail-closed on the unconfigurable case, matching `_assert_benefit_documents`
+    right above: a claim whose classifier item cannot be read is refused, not
+    waved through as `not_required`.
+    """
+    item_id = application.benefit_category_item_id
+    if item_id is None:
+        application.benefit_verification_status = "not_required"
+        return
+    item = await admin_repo.get_classifier_item(db, item_id)
+    if item is None:
+        raise err("ERR-APP-003", details={"reason": "unknown_benefit_category"})
+    if not bool((item.props or {}).get("requires_certificate")):
+        application.benefit_verification_status = "not_required"
+        return
+    if not (application.benefit_certificate_no or "").strip():
+        raise err("ERR-APP-003", details={"reason": "benefit_certificate_required"})
+    # A RESUBMISSION must not silently keep a verdict made about the previous
+    # attempt: the applicant may have changed the number since it was rejected.
+    application.benefit_verification_status = "pending"
+    application.benefit_verified_by = None
+    application.benefit_verified_at = None
+    application.benefit_rejection_reason = None
+
+
 async def _assert_benefit_documents(db: AsyncSession, application: Application) -> None:
     """Step 3, ruling 10а: a claimed benefit needs a supporting document of the
     BENEFIT type (`tz/06` § Льготы — «Реестр льготных категорий +
@@ -1879,6 +1916,7 @@ async def submit(
     from_status = application.status
     await _assert_complete(db, application)  # step 2
     await _assert_benefit_documents(db, application)  # step 3
+    await _open_benefit_verification(db, application)  # step 3b (ruling #179)
     # Step 4, ruling 22: the geometry decided upon AND its area, frozen
     # together because they are one fact. Without the second,
     # `max_approve_area` (decision #29) compares against NULL for the rest of

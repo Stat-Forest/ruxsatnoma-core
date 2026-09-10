@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError
 from app.core.models import MediaFile
+from app.modules.admin.models import Organization
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour, GisLayer
@@ -18,8 +19,14 @@ from app.modules.norms import checks
 from app.modules.norms import params as norm_params
 from app.modules.norms import service as norms_service
 from app.modules.norms.calculator import CalcRequest, NormFact, ParamSnapshot
-from app.modules.norms.models import Norm
-from tests.modules.gis.conftest import make_feature, version_wkt
+from app.modules.norms.models import ActivitySeason, Norm
+from tests.modules.gis.conftest import (
+    make_contour,
+    make_feature,
+    make_version,
+    random_box_wkt,
+    version_wkt,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -810,25 +817,38 @@ async def test_a_null_max_sb_for_grazing_is_now_exclusive_not_skipped(
     It now lands in the same exclusive branch as every other capacity-less
     activity, through the real seam."""
     request = _request(date(2026, 5, 1), date(2026, 9, 30), activity_code="grazing")
-    snapshot_no_provider = await norm_params.load_snapshot(
-        db, request=request, contour_id=published_contour.id, activity_type_id=grazing_activity_id
-    )
+    # `permits.service` registers a real exclusivity provider at import time
+    # (T6, same wave), so "nothing registered" has to be arranged deliberately
+    # now. The first half of this test is about exactly that state: the
+    # question could not be asked, which is reported `skipped` and never as a
+    # free contour.
+    registered = list(norms_service.EXCLUSIVITY_PROVIDERS)
+    norms_service.EXCLUSIVITY_PROVIDERS.clear()
+    try:
+        snapshot_no_provider = await norm_params.load_snapshot(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+        )
+        results_no_provider = await checks.run_checks(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+            snapshot=snapshot_no_provider,
+            used_sb=Decimal("10"),
+        )
+    finally:
+        norms_service.EXCLUSIVITY_PROVIDERS.extend(registered)
+    limit_no_provider = next(c for c in results_no_provider if c["check"] == "limit")
+    assert limit_no_provider["result"] == "skipped"
+    assert limit_no_provider["details"] == {"reason": "no_occupancy_provider"}
+
     # No norm at all on `published_contour` for grazing (no fixture inserted
     # one), so `resolve_capacity` already reads `max_sb=None` off nothing —
     # the null-max_sb case and the no-norm-at-all case share this one branch
     # by construction (`calculator.resolve_capacity`'s own contract).
-    results = await checks.run_checks(
-        db,
-        request=request,
-        contour_id=published_contour.id,
-        activity_type_id=grazing_activity_id,
-        snapshot=snapshot_no_provider,
-        used_sb=Decimal("10"),
-    )
-    limit = next(c for c in results if c["check"] == "limit")
-    assert limit["result"] == "skipped"
-    assert limit["details"] == {"reason": "no_occupancy_provider"}
-
     async def occupied(
         db_: AsyncSession,
         contour_id: uuid.UUID,
@@ -865,13 +885,22 @@ async def test_a_null_max_sb_for_grazing_is_now_exclusive_not_skipped(
 async def test_the_capacity_load_seam_reports_none_when_empty(
     db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
 ) -> None:
-    """`CAPACITY_LOAD_PROVIDERS` is empty until T6 registers a provider (the
-    same placeholder `LOAD_PROVIDERS` carried until 3.11) — the committed
-    quantity is reported as zero, but honestly labelled `"none"`, never
-    mistaken for a real measurement."""
-    committed, source = await norms_service.committed_capacity_load(
-        db, published_contour.id, haymaking_activity_id, date(2026, 5, 1), date(2026, 9, 30)
-    )
+    """With NOTHING registered, the committed quantity is zero AND honestly
+    labelled `"none"` — never mistaken for a real measurement.
+
+    `permits.service` registers a real provider at import time (T6, same wave),
+    so the seam is no longer empty in production and this test empties it
+    deliberately. The distinction it guards is the whole point of the seam:
+    "nobody asked" and "asked, and the answer is zero" are different facts, and
+    `"none"` is what stops a caller reading the first as the second."""
+    registered = list(norms_service.CAPACITY_LOAD_PROVIDERS)
+    norms_service.CAPACITY_LOAD_PROVIDERS.clear()
+    try:
+        committed, source = await norms_service.committed_capacity_load(
+            db, published_contour.id, haymaking_activity_id, date(2026, 5, 1), date(2026, 9, 30)
+        )
+    finally:
+        norms_service.CAPACITY_LOAD_PROVIDERS.extend(registered)
     assert (committed, source) == (Decimal("0"), "none")
 
 
@@ -954,3 +983,312 @@ async def test_the_capacity_load_seam_sums_every_registered_provider(
     finally:
         norms_service.CAPACITY_LOAD_PROVIDERS.remove(first)
         norms_service.CAPACITY_LOAD_PROVIDERS.remove(second)
+
+
+# --- Ruling #177 (stage 9): the leshoz x activity dictionary's resolution ---
+# order — a contour's own norm windows override; the leshoz's
+# `activity_seasons` row is the fallback; neither is unchanged today's
+# meaning. `_min_term_check` and the fail-closed malformed-window property
+# are covered here too; the dictionary's own CRUD/zone surface is
+# `test_activity_seasons_api.py`'s territory.
+
+
+async def _make_activity_season(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    season: dict,
+    min_term_days: int | None,
+    created_by: uuid.UUID,
+) -> ActivitySeason:
+    row = ActivitySeason(
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        season=season,
+        min_term_days=min_term_days,
+        created_by=created_by,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def test_the_dictionary_is_used_when_the_contour_has_no_norm_at_all(
+    db: AsyncSession,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    leshoz: Organization,
+    gis_user: User,
+) -> None:
+    """The whole point of ruling #177: a leshoz with no geobotanical survey,
+    and therefore no `Norm`, still states its season once and has it
+    enforced — today's behaviour (`_snapshot(norm=None)`) used to answer
+    `skipped`/`no_norm` unconditionally here."""
+    await _make_activity_season(
+        db,
+        organization_id=leshoz.id,
+        activity_type_id=grazing_activity_id,
+        season=SUMMER,
+        min_term_days=None,
+        created_by=gis_user.id,
+    )
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 9, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    season_check = next(c for c in results if c["check"] == "season")
+    assert season_check["result"] == "pass"
+    assert season_check["details"]["source"] == "activity_season"
+
+    outside = await checks.run_checks(
+        db,
+        request=_request(date(2026, 1, 1), date(2026, 2, 28)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    outside_season = next(c for c in outside if c["check"] == "season")
+    assert outside_season["result"] == "fail"
+    assert outside_season["details"]["reason"] == "outside_season"
+    assert outside_season["details"]["source"] == "activity_season"
+
+
+async def test_one_dictionary_row_covers_every_contour_of_the_leshoz(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+    gis_user: User,
+    approval_doc: MediaFile,
+) -> None:
+    """Acceptance criterion: a leshoz states its season ONCE and every one
+    of its contours inherits it — no per-contour norm at all."""
+    await _make_activity_season(
+        db,
+        organization_id=leshoz.id,
+        activity_type_id=grazing_activity_id,
+        season=SUMMER,
+        min_term_days=None,
+        created_by=gis_user.id,
+    )
+    for _ in range(2):
+        contour = await make_contour(db, contours_layer, leshoz)
+        await make_version(
+            db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+        )
+        await db.flush()
+        results = await checks.run_checks(
+            db,
+            request=_request(date(2026, 5, 1), date(2026, 9, 30)),
+            contour_id=contour.id,
+            activity_type_id=grazing_activity_id,
+            snapshot=_snapshot(norm=None),
+        )
+        season_check = next(c for c in results if c["check"] == "season")
+        assert season_check["result"] == "pass"
+        assert season_check["details"]["source"] == "activity_season"
+
+
+async def test_a_norms_own_windows_override_the_dictionary(
+    db: AsyncSession,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    leshoz: Organization,
+    gis_user: User,
+) -> None:
+    """The dictionary states WINTER for the whole leshoz; this ONE contour's
+    norm overrides it with SUMMER — a May-September request must pass
+    against the norm's own windows, not fail against the dictionary's."""
+    await _make_activity_season(
+        db,
+        organization_id=leshoz.id,
+        activity_type_id=grazing_activity_id,
+        season=WINTER,
+        min_term_days=None,
+        created_by=gis_user.id,
+    )
+    snapshot = _snapshot(
+        norm=NormFact(
+            id=uuid.uuid4(),
+            yield_c_per_ha=Decimal("12"),
+            max_sb=250,
+            season=SUMMER,
+            rotation={"rest_years": []},
+        )
+    )
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 9, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=snapshot,
+    )
+    season_check = next(c for c in results if c["check"] == "season")
+    assert season_check["result"] == "pass"
+    assert season_check["details"]["source"] == "norm"
+
+
+async def test_neither_norm_nor_dictionary_is_still_skipped_no_season_defined(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    """Today's exact meaning, unchanged (ruling #177's own wording): neither
+    source present is `skipped`/`no_season_defined`, never a pass or a fail."""
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 9, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    season_check = next(c for c in results if c["check"] == "season")
+    assert season_check == {
+        "check": "season",
+        "result": "skipped",
+        "details": {"reason": "no_season_defined"},
+    }
+
+
+async def test_a_malformed_dictionary_window_fails_closed_not_crashes(
+    db: AsyncSession,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    leshoz: Organization,
+    gis_user: User,
+) -> None:
+    """`checks._season_check`'s docstring (via `_in_window`) says an
+    unreadable window blocks rather than passing — this is that same
+    property, reached through the NEW dictionary source rather than a
+    pre-existing `Norm` row. A row written outside the API's own
+    `schemas.Season` validation (raw ORM, exactly like a pre-stage-9 `Norm`
+    row could already hold) must not crash the check."""
+    await _make_activity_season(
+        db,
+        organization_id=leshoz.id,
+        activity_type_id=grazing_activity_id,
+        season={"windows": [{"nonsense": True}]},
+        min_term_days=None,
+        created_by=gis_user.id,
+    )
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 9, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    season_check = next(c for c in results if c["check"] == "season")
+    assert season_check["result"] == "fail"
+    assert season_check["details"]["reason"] == "outside_season"
+
+
+async def test_a_period_shorter_than_the_minimum_term_is_refused_by_name(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    leshoz: Organization,
+    gis_user: User,
+) -> None:
+    """Haymaking, not grazing: grazing's own `norm` check would block FIRST
+    (no norm at all here) and `first_blocking_error` reports the first
+    blocking failure in list order — haymaking's `norm` check is `skipped`
+    (`not_required_for_activity`), so `min_term` is the only one that can
+    block, proving `ERR-NORM-003` is really this check's own code."""
+    await _make_activity_season(
+        db,
+        organization_id=leshoz.id,
+        activity_type_id=haymaking_activity_id,
+        season=SUMMER,
+        min_term_days=30,
+        created_by=gis_user.id,
+    )
+    # 10 days, inclusive of both ends — well under the 30-day minimum.
+    results = await checks.run_checks(
+        db,
+        request=_request(
+            date(2026, 5, 1), date(2026, 5, 10), activity_code="haymaking", quantity=Decimal("1")
+        ),
+        contour_id=published_contour.id,
+        activity_type_id=haymaking_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    min_term = next(c for c in results if c["check"] == "min_term")
+    assert min_term["result"] == "fail"
+    assert min_term["details"] == {
+        "reason": "period_too_short",
+        "min_term_days": 30,
+        "requested_days": 10,
+    }
+    assert checks.is_blocked(results) is True
+    blocking_error = checks.first_blocking_error(results)
+    assert blocking_error is not None
+    assert blocking_error.code == "ERR-NORM-003"
+
+
+async def test_a_period_meeting_the_minimum_term_passes(
+    db: AsyncSession,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    leshoz: Organization,
+    gis_user: User,
+) -> None:
+    await _make_activity_season(
+        db,
+        organization_id=leshoz.id,
+        activity_type_id=grazing_activity_id,
+        season=SUMMER,
+        min_term_days=30,
+        created_by=gis_user.id,
+    )
+    # 2026-05-01 .. 2026-05-30 is exactly 30 days inclusive.
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 5, 30)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    min_term = next(c for c in results if c["check"] == "min_term")
+    assert min_term == {
+        "check": "min_term",
+        "result": "pass",
+        "details": {"min_term_days": 30},
+    }
+
+
+async def test_no_dictionary_row_means_min_term_is_skipped_not_zero(
+    db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
+) -> None:
+    results = await checks.run_checks(
+        db,
+        request=_request(date(2026, 5, 1), date(2026, 5, 1)),
+        contour_id=published_contour.id,
+        activity_type_id=grazing_activity_id,
+        snapshot=_snapshot(norm=None),
+    )
+    min_term = next(c for c in results if c["check"] == "min_term")
+    assert min_term == {
+        "check": "min_term",
+        "result": "skipped",
+        "details": {"reason": "no_min_term_defined"},
+    }
+
+
+async def test_resolve_effective_windows_prefers_the_norm_then_the_dictionary_then_none() -> None:
+    """The one function both `_season_check` and `service.effective_season`
+    (the wizard's public read) call — a direct unit test on top of the
+    end-to-end ones above."""
+    assert checks.resolve_effective_windows(SUMMER, WINTER) == (SUMMER["windows"], "norm")
+    assert checks.resolve_effective_windows(None, WINTER) == (WINTER["windows"], "activity_season")
+    assert checks.resolve_effective_windows({"windows": []}, WINTER) == (
+        WINTER["windows"],
+        "activity_season",
+    )
+    assert checks.resolve_effective_windows(None, None) == ([], "none")
+    assert checks.resolve_effective_windows(
+        "garbage",  # type: ignore[arg-type]
+        "also garbage",  # type: ignore[arg-type]
+    ) == ([], "none")
