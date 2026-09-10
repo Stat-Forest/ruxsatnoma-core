@@ -1348,6 +1348,26 @@ async def get_applicant(db: AsyncSession, applicant_id: uuid.UUID) -> Applicant 
     return await db.get(Applicant, applicant_id)
 
 
+async def get_oneid_snapshot_by_pinfl(db: AsyncSession, pinfl: str) -> dict[str, Any] | None:
+    """Read-only seam, the same shape as `get_notification_contact`/
+    `get_applicant` above: another module's SERVICE is the only lawful
+    caller (CLAUDE.md module boundary — no `auth.repo` import from outside).
+
+    First caller: `beekeepers.service.lookup_by_pinfl` (ruling #182's
+    "honest auto-fill" — a beekeeper register form filled from whatever a
+    citizen's own OneID login already told us, never invented). Returns the
+    RAW snapshot dict (`OneIdProfile.to_snapshot()`'s own shape, stage 3.4/
+    5.1) or None when nobody with this PINFL has ever signed in through
+    OneID: `login_or_create_by_pinfl` is the only writer of `users.
+    oneid_profile`, and only an OneID login passes a `snapshot` at all — a
+    user who only ever used E-IMZO, or does not exist, reads the same as
+    each other here, and the caller cannot and need not tell them apart."""
+    user = await repo.get_user_by_pinfl(db, pinfl)
+    if user is None:
+        return None
+    return user.oneid_profile
+
+
 async def role_code(db: AsyncSession, user: User) -> str | None:
     """This user's `roles.code`, or None if the role row vanished (should not
     happen: FK). No permission and no zone rule — the same shape as

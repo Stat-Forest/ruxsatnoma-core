@@ -29,9 +29,10 @@ async def test_role_seeds_present(db):
         "accountant",
         "applicant",
         "prosecutor",
-        # Ruling #179 (stage 9): the central office that checks the
-        # certificates behind a benefit claim, and sees nothing else.
-        "benefit_verifier",
+        # Ruling #182 (stage 10, renamed from `benefit_verifier` by migration
+        # 0053, same row id): the Beekeeping Union's own employee, who keeps
+        # the `beekeepers` register rather than a queue of applications.
+        "beekeeping_registrar",
     } <= codes
     assert (
         await db.execute(select(func.count()).select_from(Role).where(Role.is_system))

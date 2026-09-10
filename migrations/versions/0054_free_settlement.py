@@ -29,7 +29,7 @@ inside one 70-character part even for the longest seeded benefit code
 "nothing to pay" must not be billed 70 tiyin twice for hearing it.
 
 Revision ID: 0054
-Revises: 0052
+Revises: 0053
 Create Date: 2026-09-10 12:00:00.000000
 
 """
@@ -43,7 +43,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "0054"
-down_revision: str | Sequence[str] | None = "0052"
+down_revision: str | Sequence[str] | None = "0053"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

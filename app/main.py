@@ -43,6 +43,7 @@ from app.modules.applications.benefit_verification_router import (
 from app.modules.applications.router import router as applications_router
 from app.modules.archive.router import router as archive_router
 from app.modules.auth.router import router as auth_router
+from app.modules.beekeepers.router import router as beekeepers_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.gis.imports_router import router as gis_imports_router
 from app.modules.gis.layers_router import router as gis_layers_router
@@ -338,6 +339,11 @@ def create_app() -> FastAPI:
     # parcel, no permission code; a rate limit instead of all three.
     app.include_router(norms_public_router, prefix="/api/v1")
     app.include_router(signatures_router, prefix="/api/v1")
+    # Stage 10, rulings #181/#182: the Beekeeping Union's own register — level
+    # 2, no upward dependency on anything below, mounted beside its siblings
+    # rather than near `applications` (its one level-3 caller reaches it only
+    # through `service.match_certificate`, never through this router).
+    app.include_router(beekeepers_router, prefix="/api/v1")
     # Ruling #179: the central benefit-verification office, mounted BEFORE its
     # sibling `applications_router` — Starlette matches routes in REGISTRATION
     # order, not by specificity, so `GET /applications/{application_id}` would

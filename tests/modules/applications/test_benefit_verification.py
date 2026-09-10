@@ -69,6 +69,13 @@ async def certificate_benefit_category_item_id(engine) -> AsyncIterator[uuid.UUI
         try:
             yield item_id
         finally:
+            # A test that FAILED mid-way leaves `db`'s transaction open with
+            # an uncommitted application still pointing at this item, and the
+            # DELETE below then waits on that transaction for ever — the whole
+            # xdist worker hung 17 minutes on the stage 10 integration branch
+            # before anyone read `pg_stat_activity`. A bounded wait turns the
+            # hang into the failure it already is.
+            await own_db.execute(text("SET LOCAL lock_timeout = '5s'"))
             await own_db.execute(
                 text(
                     "UPDATE applications SET benefit_category_item_id = NULL "
@@ -123,13 +130,17 @@ async def _make_pending_claim(
 
 @pytest.fixture
 async def benefit_verifier_client(db: AsyncSession):
-    """A user under the PRODUCTION `benefit_verifier` role (migration 0049),
-    zone-free like every real holder — `_head_client`'s own shape (conftest),
+    """A user under a PRODUCTION role that holds `benefits.verify` —
+    `executor_staff` since migration `0053` (ruling #182 moved the check to
+    the leshoz; the central `benefit_verifier` became `beekeeping_registrar`
+    and lost the permission). Zone-free here only because the routes under
+    test are still #179's zone-less ones — wave 2 (B2) rewrites this file
+    around the leshoz's own zone rule. `_head_client`'s own shape (conftest),
     not `_client_for`'s personal-grant one, because what is under test here
     includes whether the SEEDED role actually holds `benefits.verify` (lesson:
     "A role's identity and its grants have ONE source — the seeding
     migration")."""
-    user = await make_user(db, role_code="benefit_verifier")
+    user = await make_user(db, role_code="executor_staff")
     async for client in _head_client(db, user):
         yield client
 
@@ -186,7 +197,7 @@ async def test_the_list_is_country_wide_not_zone_scoped(
     — "the whole country, but only applications with this claim" (ruling
     #179), proven by a verifier who is not even in the same region as
     `published_contour`'s `leshoz`."""
-    user = await make_user(db, role_code="benefit_verifier")
+    user = await make_user(db, role_code="executor_staff")
     async for client in _head_client(db, user):
         result = await client.get(f"{API}/applications/benefit-verifications")
         assert result.status_code == 200, result.text
@@ -237,11 +248,12 @@ async def test_a_verifier_cannot_verify_or_reject_an_unrelated_application(
     assert reject.json()["error"]["code"] == "ERR-SYS-003"
 
 
-async def test_a_non_verifier_is_refused_the_whole_surface(hodim_client) -> None:
-    """`applications.review` (a real, senior staff permission) is not
-    `benefits.verify` — this office is a NEW code, not folded into an
-    existing staff read."""
-    result = await hodim_client.get(f"{API}/applications/benefit-verifications")
+async def test_a_non_verifier_is_refused_the_whole_surface(gis_specialist_client) -> None:
+    """A real staff role of the same leshoz that does NOT hold
+    `benefits.verify` — `gis_specialist` since `0053` gave the permission to
+    `executor_staff`/`executor_head` alone (ruling #182). The check is a code
+    of its own, not folded into any staff read."""
+    result = await gis_specialist_client.get(f"{API}/applications/benefit-verifications")
     assert result.status_code == 403
     assert result.json()["error"]["code"] == "ERR-ACL-001"
 

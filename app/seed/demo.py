@@ -74,12 +74,15 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Role, User
+from app.modules.beekeepers import repo as beekeepers_repo
+from app.modules.beekeepers import service as beekeepers_service
+from app.modules.beekeepers.schemas import BeekeeperCreateIn
 from app.modules.gis import import_service as gis_import_service
 from app.modules.gis import repo as gis_repo
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour
 from app.modules.norms import service as norms_service
-from app.modules.norms.models import Norm, RuleParameter
+from app.modules.norms.models import Norm, RuleParameter, Tariff
 from app.modules.norms.schemas import NormIn
 from app.modules.norms.service import PARAMETER
 from app.modules.norms.service import publish_versioned as norms_publish_versioned
@@ -320,16 +323,17 @@ DEMO_STAFF: list[DemoUser] = [
         pinfl="30260904000010",
         password="Chorvoq#Nazorat6094",
     ),
-    # Ruling #179: the office that checks the certificates behind a benefit
-    # claim. Deliberately UNZONED, unlike the specialist and the inspector
-    # above — this role is central by design, one office for the country, and
-    # its visibility is not a zone at all: it sees applications carrying a
-    # certificate-bearing claim in any leshoz and no ordinary application
-    # anywhere. Giving it an organization here would misrepresent that.
+    # Ruling #182 (stage 10, renamed from `benefit_verifier` by migration
+    # 0053, same role id): the Beekeeping Union's own employee, who keeps the
+    # `beekeepers` register rather than a queue of applications. Deliberately
+    # UNZONED, unlike the specialist and the inspector above — this role is
+    # central by design, one office for the country. Same pinfl/password as
+    # `demo_benefit_verifier` carried before the rename (`_ensure_user`'s own
+    # pinfl-fallback lookup converges a pre-existing row onto the new login).
     DemoUser(
-        "demo_benefit_verifier",
-        "Demo Benefit Verifier (Agency)",
-        "benefit_verifier",
+        "demo_beekeeping_registrar",
+        "Demo Beekeeping Registrar (Union)",
+        "beekeeping_registrar",
         pinfl="30260904000011",
         password="Imtiyoz#Tekshir5183",
     ),
@@ -342,6 +346,65 @@ DEMO_APPLICANT = DemoUser(
     password="Adirli#Fuqr6390",
 )
 DEMO_APPLICANT_PHONE = "+998901112233"
+
+# `DEMO_APPLICANT.pinfl` is a literal a few lines up, never None — narrowed
+# once here rather than at every `DemoBeekeeper` below (`DemoUser.pinfl` is
+# typed `str | None` for the general case).
+assert DEMO_APPLICANT.pinfl is not None
+
+
+@dataclass(frozen=True)
+class DemoBeekeeper:
+    certificate_no: str
+    pinfl: str
+    passport_series: str
+    passport_number: str
+    full_name: str
+    farm_name: str | None = None
+    stir: str | None = None
+
+
+# Ruling #182: three register rows, one on `DEMO_APPLICANT`'s OWN pinfl — the
+# automatic path (`beekeepers.service.match_certificate`) walked on the stand
+# by filing an apiary application as `demo_applicant` with this certificate
+# number and no register visit at all.
+DEMO_BEEKEEPERS: list[DemoBeekeeper] = [
+    DemoBeekeeper(
+        certificate_no="AUZ-2026-000123",
+        pinfl=DEMO_APPLICANT.pinfl,
+        passport_series="AB",
+        passport_number="1234567",
+        full_name=DEMO_APPLICANT.full_name,
+        farm_name="Demo Applicant's apiary",
+    ),
+    DemoBeekeeper(
+        certificate_no="AUZ-2026-000124",
+        pinfl="30260904100001",
+        passport_series="AC",
+        passport_number="7654321",
+        full_name="Boshqa Asalarichi",
+        farm_name="Namuna fermer xoʻjaligi",
+    ),
+    DemoBeekeeper(
+        certificate_no="AUZ-2026-000125",
+        pinfl="30260904100002",
+        passport_series="AD",
+        passport_number="1111111",
+        full_name="Uchinchi Asalarichi",
+    ),
+]
+
+# Ruling #181: every one of the seven benefit_categories codes is a lawful
+# 100% modifier — which tariff activity each one applies to.
+BENEFIT_CATEGORY_ACTIVITY: dict[str, str] = {
+    "beekeeping_union_member": "apiary",
+    "preschool_children": "recreation",
+    "education_institutions": "recreation",
+    "orphanage_residents": "recreation",
+    "persons_with_disabilities": "recreation",
+    "war_veterans": "recreation",
+    "radiation_victims": "recreation",
+}
 
 
 async def _ensure_organizations(db: AsyncSession) -> tuple[int, int]:
@@ -394,9 +457,31 @@ async def _ensure_user(
         organization_id = org.id
 
     existing = (await db.execute(select(User).where(User.login == spec.login))).scalar_one_or_none()
+    if existing is None and spec.pinfl is not None:
+        # A demo account renamed at the LOGIN level (migration 0053: `demo_
+        # benefit_verifier` -> `demo_beekeeping_registrar`, same role id,
+        # same pinfl) still owns this pinfl on a database that ran the OLD
+        # seed — matching by login alone would try to INSERT a second row
+        # sharing it and fail on `users_pinfl_key`. Fall back to pinfl and
+        # converge the login too, below.
+        existing = (
+            await db.execute(select(User).where(User.pinfl == spec.pinfl))
+        ).scalar_one_or_none()
     if existing is not None:
         secret = decrypt_str(existing.mfa_secret) if existing.mfa_secret else shared_secret
         converged = False
+        if existing.login != spec.login:
+            old_login = existing.login
+            existing.login = spec.login
+            await audit.log(
+                db,
+                action="user.update",
+                object_type="user",
+                object_id=existing.id,
+                basis="demo seed CLI — converge login to its seeded value",
+                extra={"old_login": old_login, "new_login": spec.login},
+            )
+            converged = True
         if spec.pinfl is not None and existing.pinfl != spec.pinfl:
             old_pinfl = existing.pinfl
             existing.pinfl = spec.pinfl
@@ -918,6 +1003,84 @@ async def _ensure_legal_documents(db: AsyncSession, *, actor: User) -> str:
     )
 
 
+async def _ensure_beekeepers(db: AsyncSession, *, actor: User) -> str:
+    """Three register rows (ruling #182), idempotent by `certificate_no` —
+    never a raw insert, `beekeepers.service.create_beekeeper` itself
+    (mirrors `_ensure_grazing_norm`'s own reasoning: drive the real
+    transition, not a status assigned by hand). One row sits on `DEMO_
+    APPLICANT`'s own pinfl so the automatic apiary-benefit path can be
+    walked on the stand with no register visit first."""
+    created = 0
+    for spec in DEMO_BEEKEEPERS:
+        if await beekeepers_repo.get_active_by_certificate_no(db, spec.certificate_no) is not None:
+            continue
+        await beekeepers_service.create_beekeeper(
+            db,
+            data=BeekeeperCreateIn(
+                certificate_no=spec.certificate_no,
+                pinfl=spec.pinfl,
+                passport_series=spec.passport_series,
+                passport_number=spec.passport_number,
+                stir=spec.stir,
+                full_name=spec.full_name,
+                farm_name=spec.farm_name,
+            ),
+            actor=actor,
+        )
+        created += 1
+    if created == 0:
+        return "Beekeepers register: all three demo rows already present"
+    return (
+        f"Beekeepers register: {created} row(s) created — one on demo_applicant's own "
+        "pinfl (certificate AUZ-2026-000123)"
+    )
+
+
+async def _ensure_benefit_modifiers(db: AsyncSession) -> str:
+    """Ruling #181: every one of the seven `benefit_categories` codes is a
+    lawful 100% modifier — data, not code. Sets `benefit_modifiers[code] =
+    "0"` on every PUBLISHED `apiary`/`recreation` tariff (migration 0012
+    seeds exactly one of each), MERGING into whatever is already there
+    rather than overwriting it, so a modifier an admin set by hand — or a
+    previous run of this function — survives. Idempotent: nothing to do once
+    every code already reads "0" on every row it applies to."""
+    codes_by_activity: dict[str, list[str]] = {}
+    for code, activity in BENEFIT_CATEGORY_ACTIVITY.items():
+        codes_by_activity.setdefault(activity, []).append(code)
+
+    activity_types = await admin_repo.list_activity_types(db)
+    updated = 0
+    for activity_code, codes in codes_by_activity.items():
+        activity = next((a for a in activity_types if a.code == activity_code), None)
+        if activity is None:
+            continue
+        rows = (
+            (
+                await db.execute(
+                    select(Tariff).where(
+                        Tariff.activity_type_id == activity.id, Tariff.status == "published"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            modifiers = dict(row.benefit_modifiers or {})
+            if all(modifiers.get(code) == "0" for code in codes):
+                continue
+            for code in codes:
+                modifiers[code] = "0"
+            row.benefit_modifiers = modifiers
+            updated += 1
+    await db.flush()
+    if updated == 0:
+        return (
+            "Benefit modifiers: the apiary/recreation tariffs already carry all seven codes at '0'"
+        )
+    return f"Benefit modifiers: set to '0' on {updated} published tariff row(s)"
+
+
 async def _main() -> None:
     # Every account's own password, not one shared string — and a duplicate is
     # refused outright, so a future edit cannot quietly collapse them back into
@@ -1052,6 +1215,19 @@ async def _main() -> None:
             await db.commit()
         report.append("")
         report.append(documents_message)
+
+        # --- Beekeepers register + the benefit modifiers it needs (rulings
+        # #181/#182) ---------------------------------------------------------
+        async with factory() as db:
+            registrar_user = (
+                await db.execute(select(User).where(User.login == "demo_beekeeping_registrar"))
+            ).scalar_one()
+            beekeepers_message = await _ensure_beekeepers(db, actor=registrar_user)
+            modifiers_message = await _ensure_benefit_modifiers(db)
+            await db.commit()
+        report.append("")
+        report.append(beekeepers_message)
+        report.append(modifiers_message)
     finally:
         await engine.dispose()
 
