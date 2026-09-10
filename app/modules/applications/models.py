@@ -203,6 +203,12 @@ class Application(Base):
             "benefit_verification_status",
             postgresql_where=text("benefit_verification_status <> 'not_required'"),
         ),
+        # `repo.list_applications` orders by `updated_at DESC, id DESC` (a
+        # backward scan of this ascending index), so a country-wide page for a
+        # republic-scoped reader is an index walk with an early stop rather than
+        # a full sort of the table. Declared here as well as in migration 0057
+        # so the autogenerate-diff guard stays empty.
+        Index("ix_applications_updated_at_id", "updated_at", "id"),
     )
 
 

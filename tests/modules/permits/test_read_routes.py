@@ -21,15 +21,17 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.models import MediaFile
 from app.core.schemas import PageParams
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
+from app.modules.gis.models import GisLayer
 from app.modules.permits import service
 from app.modules.permits.models import Permit
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
-from tests.modules.gis.conftest import _client_for
-from tests.modules.permits.conftest import Signer
+from tests.modules.gis.conftest import _client_for, make_contour, make_version, random_box_wkt
+from tests.modules.permits.conftest import Signer, make_permit_on_contour
 
 API = "/api/v1"
 
@@ -529,6 +531,48 @@ async def test_every_filter_narrows_the_list(
         empty = await zone_staff_client.get(f"{API}/permits", params={**base, **miss})
         assert empty.status_code == 200, empty.text
         assert empty.json()["total"] == 0, miss
+
+
+async def test_the_list_puts_the_most_recently_updated_permit_first(
+    db: AsyncSession,
+    zone_staff_client: httpx.AsyncClient,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+):
+    """`updated_at DESC`, `id DESC` only as the tie-break: an older permit that
+    was just moved (suspended here, through the ORM row exactly as
+    `service.set_status` writes it) climbs above a newer untouched one. Two
+    permits on ONE fresh contour, so the `contour_id` filter makes the list
+    exact — the zone alone would not (`leshoz` shares a district across tests).
+
+    The commit between creation and the touch matters: Postgres `now()` is the
+    transaction's start, so an UPDATE in the INSERTs' own transaction would
+    stamp the same `updated_at` the rows were born with and prove nothing."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    older, newer = [
+        await make_permit_on_contour(
+            db,
+            contour=contour,
+            version_id=version.id,
+            org=leshoz,
+            activity_type_id=grazing_activity_id,
+            status="active",
+        )
+        for _ in range(2)
+    ]
+    await db.commit()
+
+    older.status = "suspended"
+    await db.commit()
+
+    listed = await zone_staff_client.get(f"{API}/permits", params={"contour_id": str(contour.id)})
+    assert listed.status_code == 200, listed.text
+    assert [row["id"] for row in listed.json()["items"]] == [str(older.id), str(newer.id)]
 
 
 async def test_a_contour_filter_alone_is_scoped_to_this_permit(
