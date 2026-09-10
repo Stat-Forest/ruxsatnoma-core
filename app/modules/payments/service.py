@@ -51,7 +51,7 @@ unlike the functions above) — not part of the cross-module public surface.
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, NamedTuple
 
 import structlog
@@ -371,7 +371,7 @@ def _free_settlement_benefit_code(calculation: Calculation) -> str | None:
             continue
         try:
             is_zero = Decimal(str(modifier)) == 0
-        except InvalidOperation, ArithmeticError:
+        except ArithmeticError:  # InvalidOperation is one of these
             continue
         if is_zero:
             code = line.get("code")
