@@ -167,3 +167,85 @@ async def test_tasks_export_is_empty_not_403_for_a_caller_with_no_scope(
 async def test_tasks_export_rejects_an_unknown_language(executor_head_client) -> None:
     resp = await executor_head_client.get(f"{API}/tasks/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
+
+
+# --- Acts --------------------------------------------------------------
+
+
+async def test_acts_export_holds_exactly_the_rows_the_list_shows(
+    inspector_client, application: Application, default_checklist_id
+) -> None:
+    act_id = await _create_act(inspector_client, application, default_checklist_id)
+
+    listed = (await inspector_client.get(f"{API}/acts", params={"page_size": 100})).json()
+    listed_ids = {row["id"] for row in listed["items"]}
+    assert act_id in listed_ids
+
+    resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "ru"})
+    assert resp.status_code == 200
+    assert resp.headers["x-export-truncated"] == "false"
+    sheet = _sheet(resp.content)
+    assert [c.value for c in sheet[1]][-1] == "ID"
+    exported_ids = _ids(sheet)
+    assert exported_ids == listed_ids
+    assert act_id in exported_ids
+
+
+async def test_acts_export_applies_the_same_result_filter_as_the_list(
+    inspector_client, application: Application, default_checklist_id
+) -> None:
+    await _create_act(inspector_client, application, default_checklist_id, result="compliant")
+
+    resp = await inspector_client.get(
+        f"{API}/acts/export.xlsx", params={"result": "violation", "lang": "uz_latn"}
+    )
+    assert resp.status_code == 200
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_acts_export_renders_labels_not_codes(
+    inspector_client, application: Application, default_checklist_id
+) -> None:
+    await _create_act(inspector_client, application, default_checklist_id, result="warning")
+
+    resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "uz_latn"})
+    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    assert row[1] == "Qoralama"  # status label ("draft"), not the raw code
+    assert row[2] == "Eslatma"  # result label ("warning"), not the raw code
+
+
+async def test_acts_export_truncates_at_the_cap_and_says_so(
+    inspector_client, application: Application, default_checklist_id, monkeypatch
+) -> None:
+    await _create_act(inspector_client, application, default_checklist_id)
+    from app.core import settings_store
+
+    real_get_int = settings_store.get_int
+
+    async def one(db, key):
+        # `auth.deps.get_current_session` reads `session_idle_minutes`
+        # through this same function on every request — the patch must
+        # fall through to the real one for every key but ours.
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    resp = await inspector_client.get(f"{API}/acts/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_acts_export_is_empty_not_403_for_a_caller_with_no_scope(
+    other_inspector_client,
+) -> None:
+    resp = await other_inspector_client.get(f"{API}/acts/export.xlsx")
+    assert resp.status_code == 200
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_acts_export_rejects_an_unknown_language(inspector_client) -> None:
+    resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422

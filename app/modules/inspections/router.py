@@ -217,6 +217,22 @@ async def list_acts(
     )
 
 
+@router.get("/acts/export.xlsx")
+async def export_acts_xlsx(
+    db: AsyncDb,
+    user: CurrentUser,
+    lang: xlsx.Lang = "uz_latn",
+    result: str | None = None,
+) -> Response:
+    """`GET /acts` as a spreadsheet — same scope, same filter, declared
+    before `/acts/{act_id}` for the same reason `export_tasks_xlsx` is."""
+    items, total, cap = await export.act_rows(db, actor=user, lang=lang, result=result)
+    filename = f"inspection-acts-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_acts(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.get("/acts/{act_id}")
 async def get_act(act_id: uuid.UUID, db: AsyncDb, user: CurrentUser) -> ActCardOut:
     card = await service.act_card(db, act_id, actor=user)

@@ -27,7 +27,7 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.inspections import service
-from app.modules.inspections.models import InspectionTask
+from app.modules.inspections.models import InspectionAct, InspectionTask
 
 TASK_KIND_LABELS: dict[str, dict[str, str]] = {
     "pre_approval_visit": {"uz_latn": "Berishdan oldingi tashrif", "ru": "Выезд перед выдачей"},
@@ -40,6 +40,16 @@ TASK_STATUS_LABELS: dict[str, dict[str, str]] = {
     "cancelled": {"uz_latn": "Bekor qilindi", "ru": "Отменено"},
 }
 TASKS_TITLE = {"uz_latn": "Topshiriqlar", "ru": "Задания"}
+ACT_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "draft": {"uz_latn": "Qoralama", "ru": "Черновик"},
+    "signed": {"uz_latn": "Imzolangan", "ru": "Подписан"},
+}
+ACT_RESULT_LABELS: dict[str, dict[str, str]] = {
+    "compliant": {"uz_latn": "Mos", "ru": "Соответствует"},
+    "warning": {"uz_latn": "Eslatma", "ru": "Замечание"},
+    "violation": {"uz_latn": "Buzilish", "ru": "Нарушение"},
+}
+ACTS_TITLE = {"uz_latn": "Tekshiruv aktlari", "ru": "Акты проверок"}
 
 
 def _label(table: dict[str, dict[str, str]], code: str | None, lang: xlsx.Lang) -> str:
@@ -162,3 +172,107 @@ async def task_rows(
 
 def render_tasks(items: Sequence[TaskRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, task_columns(lang), lang=lang, title=TASKS_TITLE[lang])
+
+
+# --- Acts --------------------------------------------------------------
+
+
+class ActRow:
+    def __init__(
+        self,
+        act: InspectionAct,
+        *,
+        inspector: str,
+        organization: str,
+        application_number: str,
+    ) -> None:
+        self.act = act
+        self.id = act.id
+        self.inspector = inspector
+        self.organization = organization
+        self.application_number = application_number
+
+
+def act_columns(lang: xlsx.Lang) -> list[xlsx.Column[ActRow]]:
+    a = lambda f: lambda r: getattr(r.act, f)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column("occurred_at", {"uz_latn": "Sana", "ru": "Дата"}, a("occurred_at"), 18),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(ACT_STATUS_LABELS, r.act.status, lang),
+            14,
+        ),
+        xlsx.Column(
+            "result",
+            {"uz_latn": "Natija", "ru": "Результат"},
+            lambda r: _label(ACT_RESULT_LABELS, r.act.result, lang),
+            16,
+        ),
+        xlsx.Column(
+            "application",
+            {"uz_latn": "Ariza raqami", "ru": "Номер заявки"},
+            lambda r: r.application_number,
+            20,
+        ),
+        xlsx.Column(
+            "permit_id",
+            {"uz_latn": "Ruxsatnoma ID", "ru": "ID разрешения"},
+            lambda r: str(r.act.permit_id) if r.act.permit_id else "",
+            38,
+        ),
+        xlsx.Column(
+            "task_id",
+            {"uz_latn": "Topshiriq ID", "ru": "ID задания"},
+            lambda r: str(r.act.task_id) if r.act.task_id else "",
+            38,
+        ),
+        xlsx.Column(
+            "inspector", {"uz_latn": "Inspektor", "ru": "Инспектор"}, lambda r: r.inspector, 26
+        ),
+        xlsx.Column(
+            "organization",
+            {"uz_latn": "Oʻrmon xoʻjaligi", "ru": "Лесхоз"},
+            lambda r: r.organization,
+            30,
+        ),
+        xlsx.Column("created_at", {"uz_latn": "Yaratilgan", "ru": "Создан"}, a("created_at"), 18),
+        xlsx.id_column(),
+    ]
+
+
+async def act_rows(
+    db: AsyncSession, *, actor: User, lang: xlsx.Lang, result: str | None
+) -> tuple[list[ActRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    acts, total = await service.list_acts(
+        db, result=result, params=PageParams.model_construct(page=1, page_size=cap), actor=actor
+    )
+    inspectors = await auth_service.user_names(db, {a.inspector_id for a in acts})
+    orgs = await admin_service.organization_names(
+        db, {a.organization_id for a in acts if a.organization_id}
+    )
+    applications = await applications_service.numbers_by_ids(
+        db, {a.application_id for a in acts if a.application_id}
+    )
+    return (
+        [
+            ActRow(
+                act,
+                inspector=inspectors.get(act.inspector_id, ""),
+                organization=xlsx.localized(orgs.get(act.organization_id), lang)
+                if act.organization_id
+                else "",
+                application_number=(applications.get(act.application_id) or "")
+                if act.application_id
+                else "",
+            )
+            for act in acts
+        ],
+        total,
+        cap,
+    )
+
+
+def render_acts(items: Sequence[ActRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, act_columns(lang), lang=lang, title=ACTS_TITLE[lang])
