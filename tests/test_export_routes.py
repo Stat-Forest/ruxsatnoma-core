@@ -19,6 +19,11 @@ EXPORTED: set[str] = {
     "/api/v1/oversight/events",  # Track D
     "/api/v1/admin/public/appeals",  # Track D
     "/api/v1/admin/ratings",  # Track D's remainder, by the coordinator (permits/admin_router.py)
+    "/api/v1/norms",  # Track F
+    "/api/v1/tariffs",  # Track F
+    "/api/v1/rule-parameters",  # Track F
+    "/api/v1/gis/contours",  # Track F
+    "/api/v1/gis/imports",  # Track F
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
@@ -41,14 +46,11 @@ EXPORT_BACKLOG = {
     "/api/v1/admin/notification-templates",
     "/api/v1/admin/integrations/outbox",
     "/api/v1/admin/integrations/dead-letters",
-    # Track F — norms + gis
-    "/api/v1/norms",
-    "/api/v1/tariffs",
-    "/api/v1/rule-parameters",
+    # Track F — norms + gis: the two lists no screen reads as a register (a
+    # calculation is opened from its application; activity seasons are a
+    # calendar) stay here until somebody asks for them
     "/api/v1/calculations",
     "/api/v1/activity-seasons",
-    "/api/v1/gis/contours",
-    "/api/v1/gis/imports",
     # Track G — inspections + help
     "/api/v1/inspections/tasks",
     "/api/v1/inspections/acts",
