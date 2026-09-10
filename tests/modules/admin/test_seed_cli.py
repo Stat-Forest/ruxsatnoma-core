@@ -411,3 +411,50 @@ def test_example_files_parse():
         "aylanma",
         "bolak",
     }
+
+
+async def test_organizations_import_a_leshoz_with_no_map(db, agency):
+    """Ruling #178: `gis_enabled` travels in the import file.
+
+    The Agency says most leshozes have no GIS layers and gave no date, so a
+    map-less leshoz is the COMMON row in a real file. An importer that could
+    not express it would leave every one of them to be edited by hand through
+    the API after the import — which is exactly the kind of manual step that
+    gets skipped and then discovered by a citizen looking at an empty map.
+    """
+    suffix = uuid.uuid4().hex[:6]
+    rows = organization_rows(suffix, agency.code)
+    leshoz_row = dict(rows[1]) | {"gis_enabled": False}
+    await seed_organizations(db, [rows[0], leshoz_row])
+
+    leshoz = (
+        await db.execute(select(Organization).where(Organization.code == f"leshoz-{suffix}"))
+    ).scalar_one()
+    assert leshoz.gis_enabled is False
+
+
+async def test_organizations_preserve_the_map_flag_on_absent_key(db, agency):
+    """Preserve-on-absence, like `stir`/`requisites` (ruling 5): a later file
+    that says nothing about the map must not silently switch one back on."""
+    suffix = uuid.uuid4().hex[:6]
+    rows = organization_rows(suffix, agency.code)
+    await seed_organizations(db, [rows[0], dict(rows[1]) | {"gis_enabled": False}])
+
+    await seed_organizations(db, [rows[0], rows[1]])
+
+    leshoz = (
+        await db.execute(select(Organization).where(Organization.code == f"leshoz-{suffix}"))
+    ).scalar_one()
+    assert leshoz.gis_enabled is False
+
+
+async def test_organizations_reject_a_non_boolean_map_flag(db, agency):
+    """A string "false" is truthy in Python and would silently ENABLE a map for
+    a leshoz that has none — the hiding direction this project's defects keep
+    taking. Refused outright instead."""
+    suffix = uuid.uuid4().hex[:6]
+    rows = organization_rows(suffix, agency.code)
+    with pytest.raises(DomainError) as excinfo:
+        await seed_organizations(db, [rows[0], dict(rows[1]) | {"gis_enabled": "false"}])
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["reason"] == "gis_enabled must be a boolean"
