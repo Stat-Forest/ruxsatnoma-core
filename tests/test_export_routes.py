@@ -31,6 +31,10 @@ EXPORTED: set[str] = {
     "/api/v1/admin/notification-templates",  # Track E
     "/api/v1/admin/integrations/outbox",  # Track E
     "/api/v1/admin/integrations/dead-letters",  # Track E
+    "/api/v1/inspections/tasks",  # Track G
+    "/api/v1/inspections/acts",  # Track G
+    "/api/v1/inspections/cases",  # Track G
+    "/api/v1/help/tickets",  # Track G
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
@@ -50,11 +54,6 @@ EXPORT_BACKLOG = {
     # calendar) stay here until somebody asks for them
     "/api/v1/calculations",
     "/api/v1/activity-seasons",
-    # Track G — inspections + help
-    "/api/v1/inspections/tasks",
-    "/api/v1/inspections/acts",
-    "/api/v1/inspections/cases",
-    "/api/v1/help/tickets",
     # Track H — search, archive, reports, the rest
     "/api/v1/search",
     "/api/v1/archive",
