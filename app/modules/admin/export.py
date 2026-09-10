@@ -23,18 +23,22 @@ router-local `OutboxMessageOut`/`DeadLetterOut` shapes (which would import
 
 import uuid
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
 from app.core.schemas import PageParams
 from app.modules.admin import (
+    announcements_service,
     repo,
     service,
     users_service,
 )
+from app.modules.admin.announcements_service import AnnouncementAdminOut
 from app.modules.admin.models import Organization
 from app.modules.admin.users_schemas import UserAdminOut, UserFilters
+from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 
 _ERROR_MAX = 200
@@ -272,4 +276,119 @@ async def organizations_rows(
 def render_organizations(items: Sequence[OrganizationRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(
         items, organization_columns(lang), lang=lang, title=ORGANIZATIONS_TITLE[lang]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Announcements — GET /admin/announcements/export.xlsx
+# ---------------------------------------------------------------------------
+
+ANNOUNCEMENT_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "draft": {"uz_latn": "Qoralama", "ru": "Черновик"},
+    "published": {"uz_latn": "Chop etilgan", "ru": "Опубликовано"},
+    "archived": {"uz_latn": "Arxivlangan", "ru": "В архиве"},
+}
+ANNOUNCEMENTS_TITLE = {"uz_latn": "Eʼlonlar", "ru": "Объявления"}
+_AUDIENCE_EVERYONE = {"uz_latn": "Barcha foydalanuvchilar", "ru": "Все пользователи"}
+
+
+def _audience_summary(
+    audience: dict[str, Any] | None,
+    roles: dict[str, dict[str, str]],
+    regions: dict[uuid.UUID, dict[str, str]],
+    lang: xlsx.Lang,
+) -> str:
+    """Mirrors the adminka's `describeAudience`, condensed to one cell: no
+    targeting rule at all reads as "everyone", the same way the screen's
+    confirmation dialog does."""
+    if not audience:
+        return _AUDIENCE_EVERYONE[lang]
+    parts: list[str] = []
+    role_codes: list[str] = audience.get("role_codes") or []
+    if role_codes:
+        parts.append(
+            ", ".join(
+                xlsx.localized(roles[code], lang) if code in roles else str(code)
+                for code in role_codes
+            )
+        )
+    region_ids: list[str] = audience.get("region_ids") or []
+    if region_ids:
+        parts.append(
+            ", ".join(xlsx.localized(regions.get(uuid.UUID(str(rid))), lang) for rid in region_ids)
+        )
+    return "; ".join(parts) if parts else _AUDIENCE_EVERYONE[lang]
+
+
+class AnnouncementRow:
+    def __init__(self, ann: AnnouncementAdminOut, *, audience: str, author: str) -> None:
+        self.ann = ann
+        self.id = ann.id
+        self.audience = audience
+        self.author = author
+
+
+def announcement_columns(lang: xlsx.Lang) -> list[xlsx.Column[AnnouncementRow]]:
+    a = lambda f: lambda r: getattr(r.ann, f)  # noqa: E731
+    return [
+        xlsx.Column(
+            "title",
+            {"uz_latn": "Sarlavha", "ru": "Заголовок"},
+            lambda r: xlsx.localized(r.ann.title, lang),
+            34,
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(ANNOUNCEMENT_STATUS_LABELS, r.ann.status, lang),
+            16,
+        ),
+        xlsx.Column(
+            "audience", {"uz_latn": "Kimga koʻrinadi", "ru": "Кому видно"}, lambda r: r.audience, 30
+        ),
+        xlsx.Column(
+            "public_on_landing", {"uz_latn": "Saytda", "ru": "На сайте"}, a("public_on_landing"), 10
+        ),
+        xlsx.Column(
+            "publish_from",
+            {"uz_latn": "Boshlanish sanasi", "ru": "Дата начала"},
+            a("publish_from"),
+            18,
+        ),
+        xlsx.Column(
+            "publish_to", {"uz_latn": "Tugash sanasi", "ru": "Дата окончания"}, a("publish_to"), 18
+        ),
+        xlsx.Column("author", {"uz_latn": "Muallif", "ru": "Автор"}, lambda r: r.author, 26),
+        xlsx.Column("created_at", {"uz_latn": "Yaratilgan", "ru": "Создано"}, a("created_at"), 18),
+        xlsx.id_column(),
+    ]
+
+
+async def announcements_rows(
+    db: AsyncSession, *, lang: xlsx.Lang, status: str | None
+) -> tuple[list[AnnouncementRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    page = await announcements_service.list_admin(
+        db, params=PageParams.model_construct(page=1, page_size=cap), status=status
+    )
+    roles = await _role_names(db)
+    regions = await _region_names(db)
+    authors = await auth_service.user_names(db, {a.created_by for a in page.items if a.created_by})
+    return (
+        [
+            AnnouncementRow(
+                a,
+                audience=_audience_summary(a.audience, roles, regions, lang),
+                author=authors.get(a.created_by, ""),
+            )
+            for a in page.items
+        ],
+        page.total,
+        cap,
+    )
+
+
+def render_announcements(items: Sequence[AnnouncementRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(
+        items, announcement_columns(lang), lang=lang, title=ANNOUNCEMENTS_TITLE[lang]
     )

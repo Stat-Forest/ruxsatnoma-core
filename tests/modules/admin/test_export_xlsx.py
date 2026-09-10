@@ -11,8 +11,12 @@ from openpyxl import load_workbook
 from app.core import settings_store
 from app.main import create_app
 from app.modules.admin.models import Organization
+from app.modules.admin.permissions import (
+    ANNOUNCEMENTS_MANAGE,
+)
 from app.modules.auth.permissions import USERS_MANAGE, USERS_VIEW
 from tests.conftest import make_client
+from tests.modules.admin.test_announcements import make_announcement
 from tests.modules.admin.test_organizations_admin import auth_client, signed_in_with
 from tests.modules.auth.test_sessions import make_user
 from tests.modules.gis.conftest import leshoz as leshoz  # noqa: F401
@@ -275,4 +279,125 @@ async def test_organizations_export_rejects_an_unknown_language(db):
     async with make_client(create_app(), lifespan=True) as client:
         auth_client(client, token, csrf)
         resp = await client.get(f"{API}/refs/organizations/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Announcements — GET /admin/announcements/export.xlsx
+# ---------------------------------------------------------------------------
+
+
+async def test_announcements_export_holds_exactly_the_rows_the_list_shows(db):
+    manager, token, csrf = await signed_in_with(db, ANNOUNCEMENTS_MANAGE)
+    target = await make_announcement(
+        db,
+        created_by=manager.id,
+        status="draft",
+        title={"uz_cyrl": f"Экспорт {uuid.uuid4().hex[:8]}"},
+    )
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(
+            f"{API}/admin/announcements", params={"status": "draft", "page_size": 100}
+        )
+        resp = await client.get(
+            f"{API}/admin/announcements/export.xlsx", params={"status": "draft", "lang": "ru"}
+        )
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert exported_ids == listed_ids
+    assert str(target.id) in exported_ids
+
+
+async def test_announcements_export_applies_the_same_filters_as_the_list(db):
+    manager, token, csrf = await signed_in_with(db, ANNOUNCEMENTS_MANAGE)
+    marker = uuid.uuid4().hex[:8]
+    draft = await make_announcement(
+        db, created_by=manager.id, status="draft", title={"uz_cyrl": f"Д{marker}"}
+    )
+    published = await make_announcement(
+        db, created_by=manager.id, status="published", title={"uz_cyrl": f"П{marker}"}
+    )
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/announcements/export.xlsx", params={"status": "published"}
+        )
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert str(published.id) in exported_ids
+    assert str(draft.id) not in exported_ids
+
+
+async def test_announcements_export_renders_labels_not_codes(db):
+    manager, token, csrf = await signed_in_with(db, ANNOUNCEMENTS_MANAGE)
+    marker = uuid.uuid4().hex[:8]
+    await make_announcement(
+        db,
+        created_by=manager.id,
+        status="draft",
+        title={"uz_latn": f"Export title {marker}"},
+        audience=None,
+    )
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/announcements/export.xlsx", params={"status": "draft", "lang": "uz_latn"}
+        )
+    assert resp.status_code == 200, resp.text
+    rows = list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    row = next(r for r in rows if r[0] == f"Export title {marker}")
+    assert row[1] == "Qoralama"  # status label, not "draft"
+    assert row[2] == "Barcha foydalanuvchilar"  # no audience -> everyone
+
+
+async def test_announcements_export_truncates_at_the_cap_and_says_so(db, monkeypatch):
+    manager, token, csrf = await signed_in_with(db, ANNOUNCEMENTS_MANAGE)
+    await make_announcement(db, created_by=manager.id, status="draft")
+    await make_announcement(db, created_by=manager.id, status="draft")
+    await db.commit()
+
+    real_get_int = settings_store.get_int
+
+    async def one(_db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(_db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/announcements/export.xlsx", params={"status": "draft"}
+        )
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total >= 2
+    assert resp.headers["x-export-truncated"] == "true"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_announcements_export_without_the_permission_matches_the_list_status(db):
+    _, token, csrf = await signed_in_with(db)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(f"{API}/admin/announcements")
+        resp = await client.get(f"{API}/admin/announcements/export.xlsx")
+    assert listed.status_code == 403
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == listed.json()["error"]["code"]
+
+
+async def test_announcements_export_rejects_an_unknown_language(db):
+    _, token, csrf = await signed_in_with(db, ANNOUNCEMENTS_MANAGE)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(f"{API}/admin/announcements/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
