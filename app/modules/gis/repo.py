@@ -216,8 +216,15 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
 
 async def version_geometry(db: AsyncSession, version_id: uuid.UUID) -> str | None:
     """One version's geometry alone, as the GeoJSON string PostGIS renders
-    (`ST_AsGeoJSON`, same conversion `contour_card`/`version_detail` use)
-    — `None` when no such version exists.
+    (`ST_AsGeoJSON`, same conversion `contour_card`/`version_detail` use).
+
+    `None` two different ways since decision #178 made `ContourVersion.geom`
+    nullable: no such version exists at all, OR the version exists but was
+    imported with no delivered geometry (`geom IS NULL`, and
+    `ST_AsGeoJSON(NULL)` is itself SQL `NULL`) — this function cannot and
+    does not tell the two apart. A caller that must knows to call
+    `version_by_id` instead (or first), which returns the row itself and so
+    can.
 
     Deliberately keyed on the VERSION, not on `status`: a permit's frozen
     `contour_version_id` may no longer be the contour's `published` row (a

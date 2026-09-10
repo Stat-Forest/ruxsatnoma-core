@@ -1803,11 +1803,19 @@ async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
 
 
 async def version_geometry(db: AsyncSession, version_id: uuid.UUID) -> dict[str, Any] | None:
-    """One specific version's geometry, as a parsed GeoJSON geometry object —
-    `None` when no such version exists. Like `contour_organization`/
-    `contour_number` beside it: no permission, no zone, no HTTP actor at all,
-    because the caller is another service inside this process rather than a
-    route.
+    """One specific version's geometry, as a parsed GeoJSON geometry object.
+
+    `None` two different ways since decision #178 made `ContourVersion.geom`
+    nullable: no such version exists at all, OR the version exists but was
+    imported with no delivered geometry — `repo.version_geometry`'s own
+    docstring names both and the caveat carries through unchanged, since this
+    is a pure `json.loads` over that function's own result. First and only
+    consumer (`permits.service.public_check`, below) already treats both the
+    same way: no geometry to publish, either way.
+
+    Like `contour_organization`/`contour_number` beside it: no permission, no
+    zone, no HTTP actor at all, because the caller is another service inside
+    this process rather than a route.
 
     Keyed on the VERSION, not the contour, on purpose (this replaced an
     earlier `published_contour_geometry(contour_id)` that a review caught
