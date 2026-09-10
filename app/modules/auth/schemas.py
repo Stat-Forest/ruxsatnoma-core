@@ -17,6 +17,10 @@ class UserOut(BaseModel):
     email: str | None
     must_change_password: bool
     language: str
+    # The caller's own PINFL (nullable: `users.pinfl` is). Read by the
+    # adminka's mock E-IMZO signer (`lib/eimzoMock.ts`) so a staff signature
+    # carries the signed-in user's identity instead of a hand-typed one.
+    pinfl: str | None
 
 
 class RoleOut(BaseModel):

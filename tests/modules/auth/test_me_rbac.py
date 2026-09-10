@@ -1,5 +1,7 @@
 """/auth/me carries permissions; require_permission gates a route; must-change blocks non-exempt."""
 
+import random
+
 import pytest
 
 from app.main import create_app
@@ -202,3 +204,24 @@ async def test_must_change_password_blocks_non_exempt_route(db):
 def test_register_duplicate_code_raises():
     with pytest.raises(ValueError):
         permissions.register({"test.secret": "duplicate registration"})
+
+
+async def test_me_carries_the_callers_own_pinfl(db):
+    """`/auth/me` exposes `user.pinfl` so the adminka's mock E-IMZO signer can
+    build the envelope from the signed-in user's own identity instead of
+    asking the operator to type it (a typo there read back as
+    `certificate_pinfl_mismatch`, indistinguishable from a stranger's key).
+    `None` stays `None` — a staff user created before their PINFL was
+    recorded is the UI's cue to refuse up front, the way
+    `signatures.service._ownership_reason` refuses with
+    `signer_pinfl_unknown`."""
+    pinfl = f"3{random.randint(0, 10**13 - 1):013d}"
+    user = await make_user(db, pinfl=pinfl)
+    _, token, _ = await make_session(db, user)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        client.cookies.set("session", token)
+        r = await client.get(f"{API}/auth/me")
+    assert r.status_code == 200
+    assert r.json()["user"]["pinfl"] == pinfl
