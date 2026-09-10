@@ -6,15 +6,17 @@ own `router`/`admin_router` split."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.ratelimit import rate_limit
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.help import service
+from app.modules.help import export, service
 from app.modules.help.permissions import TICKETS_MANAGE
 from app.modules.help.schemas import (
     FaqOut,
@@ -62,6 +64,24 @@ async def list_tickets(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/tickets/export.xlsx")
+async def export_tickets_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    status: str | None = None,
+) -> Response:
+    """`GET /tickets` as a spreadsheet (stage 13, ruling #204): the same
+    scope, the same filter, every matching row up to the configured cap.
+    Declared before `/tickets/{ticket_id}` on purpose — `export.xlsx` is not
+    a UUID, and a 404 here beats the 422 the UUID parser would answer."""
+    items, total, cap = await export.ticket_rows(db, actor=user, lang=lang, status=status)
+    filename = f"support-tickets-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_tickets(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
