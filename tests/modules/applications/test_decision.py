@@ -155,6 +155,40 @@ async def test_rejection_records_the_reason_and_publishes_its_event(
     assert len(seen) == 1
 
 
+async def test_the_approval_notification_names_both_ends_of_the_transition(
+    db, executor_head_client, application_in_review
+) -> None:
+    """`params.status_from`/`status_to` are what the inbox renders as chips.
+    Asserted per flow verb because each call site fills them in by hand."""
+    from tests.modules.notifications.conftest import inapp_params
+
+    result = await _decide(executor_head_client, application_in_review, "approve")
+    assert result.status_code == 200, result.text
+    params = await inapp_params(
+        db, object_id=uuid.UUID(application_in_review), event_code="application.approved"
+    )
+    assert (params["status_from"], params["status_to"]) == ("IN_REVIEW", "APPROVED")
+
+
+async def test_the_rejection_notification_names_both_ends_of_the_transition(
+    db, executor_head_client, application_in_review, rejection_reason_item
+) -> None:
+    from tests.modules.notifications.conftest import inapp_params
+
+    result = await _decide(
+        executor_head_client,
+        application_in_review,
+        "reject",
+        reason_item_id=str(rejection_reason_item.id),
+        legal_basis="VMQ 278 п.14",
+    )
+    assert result.status_code == 200, result.text
+    params = await inapp_params(
+        db, object_id=uuid.UUID(application_in_review), event_code="application.rejected"
+    )
+    assert (params["status_from"], params["status_to"]) == ("IN_REVIEW", "REJECTED")
+
+
 async def test_a_head_outside_the_zone_cannot_decide(
     other_zone_executor_head_client, application_in_review
 ) -> None:
