@@ -14,14 +14,16 @@ module's own router, never mounted under another module's prefix."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.signatures import service
+from app.modules.signatures import export, service
 from app.modules.signatures.permissions import REVERIFY
 from app.modules.signatures.schemas import CertificateBindIn, CertificateOut, SignatureOut
 
@@ -45,6 +47,22 @@ async def list_certificates(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/certificates/export.xlsx")
+async def export_certificates_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+) -> Response:
+    """`GET /certificates` as a spreadsheet (stage 13, ruling #204): the
+    caller's own bound certificates, exactly as the list route scopes them
+    (ruling R2) — no filters of its own, none on the list either."""
+    items, total, cap = await export.certificate_rows(db, actor=user, lang=lang)
+    filename = f"sertifikatlar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_certificates(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
@@ -106,6 +124,28 @@ async def list_signatures(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/signatures/export.xlsx")
+async def export_signatures_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    object_type: str,
+    object_id: uuid.UUID,
+    lang: xlsx.Lang = "uz_latn",
+    kind: str | None = None,
+) -> Response:
+    """`GET /signatures` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same ownership/oversight check (ruling R2 —
+    `service.list_signatures_page`, the exact function the list route
+    calls), every matching row up to the configured cap."""
+    items, total, cap = await export.signature_rows(
+        db, actor=user, lang=lang, object_type=object_type, object_id=object_id, kind=kind
+    )
+    filename = f"imzolar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_signatures(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
