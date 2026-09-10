@@ -31,16 +31,18 @@ itself."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import PAGING_MAX, Page
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, idempotency_context
 from app.modules.auth.models import User
-from app.modules.payments import service
+from app.modules.payments import export, service
 from app.modules.payments.models import INVOICE_STATUSES, Invoice
 from app.modules.payments.schemas import InvoiceOut, InvoiceRecipientOut, PayIntentIn, PayIntentOut
 
@@ -75,6 +77,29 @@ async def _invoice_out(db: AsyncSession, invoice: Invoice, *, actor: User) -> An
         for row in await service.invoice_recipients(db, invoice.id)
     ]
     return out
+
+
+@router.get("/invoices/export.xlsx")
+async def export_invoices_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    application_id: uuid.UUID | None = None,
+    status: Annotated[str | None, Query(pattern=_INVOICE_STATUS_PATTERN)] = None,
+) -> Response:
+    """`GET /invoices` as a spreadsheet (stage 13, ruling #204): the same
+    scope and filters `list_invoices_for_actor` gives the caller, every
+    matching row up to the configured cap. Declared BEFORE
+    `/invoices/{invoice_id}` on purpose — `export.xlsx` is not a UUID, and
+    the 422 the path parser would answer is a worse error than a 404
+    (FastAPI matches routes in declaration order)."""
+    items, total, cap = await export.invoice_rows(
+        db, actor=actor, lang=lang, application_id=application_id, status=status
+    )
+    filename = f"hisoblar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_invoices(items, lang=lang), filename=filename, total=total, cap=cap
+    )
 
 
 @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
