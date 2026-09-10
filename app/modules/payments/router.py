@@ -67,7 +67,7 @@ async def _invoice_out(db: AsyncSession, invoice: Invoice, *, actor: User) -> An
     null). One access rule, one source: whoever the route already treats
     as staff must see the same thing every other staff reader does."""
     out = InvoiceOut.model_validate(invoice)
-    out.settled_by_benefit = await service.is_settled_by_benefit(db, invoice)
+    out.settled_without_payment = await service.is_settled_without_payment(db, invoice)
     if not await service.holds_payments_read(db, actor):
         return JSONResponse(out.model_dump(mode="json", exclude={"recipients"}))
     out.recipients = [
@@ -116,7 +116,7 @@ async def list_invoices(
     out_items = []
     for item in items:
         out = InvoiceOut.model_validate(item)
-        out.settled_by_benefit = await service.is_settled_by_benefit(db, item)
+        out.settled_without_payment = await service.is_settled_without_payment(db, item)
         out_items.append(out)
     return Page[InvoiceOut](
         items=out_items,

@@ -103,7 +103,18 @@ def split_payment(amount: Decimal, rules: Sequence[RecipientRule]) -> list[Share
     Raises `SplitDoesNotFit` if the configured shares (percentages plus
     fixed amounts) total more than `amount` — the leshoz's remainder would
     go negative. Never clamped: a clamp would silently pay a receiver money
-    the citizen never handed over."""
+    the citizen never handed over.
+
+    **`amount == 0` is the one degenerate case, decided explicitly (ruling
+    #202):** every share is zero, a FIXED rule's included. An invoice that
+    is lawfully zero — a statutory exemption (`science`, `no_tariff_by_law`)
+    or a verified 100 % benefit (#185) — still freezes its receiver snapshot
+    at issuance (#158), and before this a fixed 15 000 receiver on the dev
+    stand turned every such approval into `split_does_not_fit` ("configured
+    shares total 15000.00 on a payment of 0.00"): the head could not approve
+    at all. Zero is not a clamp — nothing arrived, so no receiver is paid a
+    tiyin the citizen never handed over, and `sum(shares) == amount` still
+    holds. One tiyin is a real payment and refuses exactly as before."""
     shares: list[Share] = []
     taken = Decimal("0.00")
     for rule in rules:
@@ -112,7 +123,7 @@ def split_payment(amount: Decimal, rules: Sequence[RecipientRule]) -> list[Share
             part = (amount * rule.percent / HUNDRED).quantize(TIYIN, rounding=ROUND_FLOOR)
         elif rule.kind == "fixed":
             assert rule.fixed_amount is not None
-            part = rule.fixed_amount
+            part = Decimal("0.00") if amount == 0 else rule.fixed_amount
         else:  # pragma: no cover - the DB CHECK on RECIPIENT_KINDS makes this unreachable
             raise SplitDoesNotFit(f"unknown recipient kind {rule.kind!r}")
         shares.append(Share(rule.recipient_id, part))

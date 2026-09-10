@@ -87,6 +87,29 @@ def test_percent_and_fixed_together_still_fit_or_refuse():
         split_payment(Decimal("100000.00"), [percent(BUDGET, "90"), fixed(FUND, "20000.00")])
 
 
+def test_a_zero_payment_divides_into_zero_shares_even_under_a_fixed_amount():
+    """Ruling #202: an invoice that is lawfully zero — a statutory exemption
+    (`science`, `no_tariff_by_law`) or a verified 100 % benefit (#185) —
+    still freezes its receiver snapshot (#158), and a configured FIXED
+    amount must not turn that into `SplitDoesNotFit`: nothing arrived, so
+    every share is zero, the fixed one included, and the invariant
+    `sum(shares) == amount` holds at 0. This is the degenerate case, not a
+    clamp — no receiver is paid a tiyin the citizen never handed over."""
+    shares = split_payment(Decimal("0.00"), [percent(BUDGET, "50"), fixed(FUND, "15000.00")])
+    assert shares == [
+        Share(BUDGET, Decimal("0.00")),
+        Share(FUND, Decimal("0.00")),
+        Share(None, Decimal("0.00")),
+    ]
+
+
+def test_a_positive_payment_smaller_than_a_fixed_amount_still_refuses():
+    """The zero case above must not widen into a clamp: one tiyin is a real
+    payment, and 15 000 does not fit inside it."""
+    with pytest.raises(SplitDoesNotFit):
+        split_payment(Decimal("0.01"), [fixed(FUND, "15000.00")])
+
+
 def _invoice(*, amount: Decimal) -> Invoice:
     return Invoice(
         id=uuid.uuid4(),
