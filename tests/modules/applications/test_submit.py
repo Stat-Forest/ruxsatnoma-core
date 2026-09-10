@@ -16,8 +16,6 @@ first and asserts the DELTA, which is the property ruling 5а actually promises.
 import uuid
 from datetime import date
 
-import pytest
-
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 
 
@@ -756,84 +754,26 @@ async def test_a_missing_address_is_named_in_missing_and_resolved_by_filling_it_
     assert result.status_code == 200, result.text
 
 
-async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfigured(
+async def test_a_benefit_claim_is_accepted_without_a_document(
     applicant_client,
     draft_ready_for_submission,
     benefit_category_item_id,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Ruling 10а, FAIL-CLOSED (review round 2, important 5). With no active
-    `benefit_proof` item in the `doc_types` classifier, a benefit claim cannot
-    be PROVEN at all — and an unconfigurable rule REFUSES; it does not accept
-    the claim on whatever happens to be attached, because a benefit REDUCES the
-    fee.
-
-    **The state is reached by moving the CODE, not the database.** Task 8's
-    migration `0024` seeds `benefit_proof`, because the code is ours rather
-    than the Agency's and a citizen with a real benefit must not be refused
-    for a row we forgot — so "no such item" is no longer where a fresh
-    database starts. `monkeypatch` points the guard at a code nothing carries,
-    which is the same lookup failing for the same reason, and it writes
-    NOTHING: the app under test runs in this very process, so the patched
-    module global is the one the route reads, and the shared, persistent test
-    database is untouched.
-
-    An earlier draft archived the seeded row on a committed session and
-    restored it in `finally` (review round 1): a hard interrupt in between
-    would have left `benefit_proof` archived for every later run and every
-    other worktree, and combining it with `benefit_doc_type_item_id` in one
-    test would have made the restore collide with
-    `uq_classifier_items_active_code`. The refusal, its code and its reason are
-    the ones review round 2 asked for, unaltered.
-    """
-    from app.modules.applications import service
-
-    absent_code = f"benefit_proof_absent_{uuid.uuid4().hex[:8]}"
-    monkeypatch.setattr(service, "BENEFIT_DOC_TYPE_CODE", absent_code)
-    app_id = draft_ready_for_submission
-    patched = await applicant_client.patch(
-        f"/api/v1/applications/{app_id}",
-        json={"benefit_category_item_id": str(benefit_category_item_id)},
-    )
-    assert patched.status_code == 200, patched.text
-
-    refused = await applicant_client.post(
-        f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature", "rules_accepted": True},
-        headers={"Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert refused.status_code == 422, refused.text
-    error = refused.json()["error"]
-    assert error["code"] == "ERR-APP-003"
-    assert error["details"]["reason"] == "benefit_doc_type_not_configured"
-    # The patched code, because the error body names the code the guard
-    # actually looked for — which is the useful thing for an operator to see.
-    # That it is `"benefit_proof"` in production is asserted by
-    # `test_documents.py::test_the_benefit_proof_doc_type_is_seeded_and_active`.
-    assert error["details"]["doc_type_code"] == absent_code
-
-
-async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other(
-    applicant_client,
-    draft_ready_for_submission,
-    benefit_category_item_id,
-    benefit_doc_type_item_id,
     doc_type_item_id,
 ) -> None:
-    """With the type seeded, ruling 10а's real rule: a document of ANOTHER type
-    does not satisfy the claim, and one of the benefit type does.
+    """Ruling #189: the certificate's scan is optional. A claim with its
+    number and NO attachment at all — or with an attachment of some other
+    type, which used to be refused as "not the benefit type" — passes what
+    was step 3 and is answered by the gates behind it. The refusal below is
+    step 7's pricing (decision #50: no seeded tariff carries a modifier for
+    a category a test invented), and what matters is which gate answers: not
+    `ERR-APP-003` with a reason about documents.
 
-    Both halves in one test on purpose — "a document is attached" passing while
-    "a document of the right type is attached" fails is precisely the
-    difference between the fail-open version this replaces and the fail-closed
-    one, and only the pair can tell them apart.
+    The previous version of this test (`..._needs_a_document_of_the_benefit_
+    type_and_no_other`) pinned the opposite — a fail-closed document guard —
+    and was deleted with the guard, together with the "unconfigured doc type"
+    refusal that guard alone could raise.
     """
     app_id = draft_ready_for_submission
-    # `benefit_certificate_no` is set here too (ruling #181: mandatory for
-    # EVERY category now) — otherwise the FIRST refusal below would still be
-    # the true one (step 3's document check runs before step 3b's number
-    # check), but the SECOND attempt, meant to prove step 3 alone is
-    # satisfied, would stop one step earlier than intended.
     await applicant_client.patch(
         f"/api/v1/applications/{app_id}",
         json={
@@ -842,45 +782,29 @@ async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other
         },
     )
 
-    wrong = await applicant_client.post(
+    bare = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert bare.status_code == 422, bare.text
+    assert bare.json()["error"]["code"] == "ERR-VAL-001"
+
+    other = await applicant_client.post(
         f"/api/v1/applications/{app_id}/documents",
         json={
             "doc_type_item_id": str(doc_type_item_id),
             "file_id": await _upload(applicant_client),
         },
     )
-    assert wrong.status_code == 201, wrong.text
-    refused = await applicant_client.post(
+    assert other.status_code == 201, other.text
+    with_other = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
         json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
-    assert refused.status_code == 422, refused.text
-    assert refused.json()["error"]["details"]["reason"] == "benefit_claim_needs_a_document"
-
-    right = await applicant_client.post(
-        f"/api/v1/applications/{app_id}/documents",
-        json={
-            "doc_type_item_id": str(benefit_doc_type_item_id),
-            "file_id": await _upload(applicant_client),
-        },
-    )
-    assert right.status_code == 201, right.text
-    # The claim is now PROVEN: step 3 is satisfied and the submission moves on.
-    # It is still refused — by step 7's pricing, because decision #50 validates
-    # the benefit CODE against the union of every tariff row the request
-    # resolved and no seeded VMQ 278 tariff carries a modifier for a category a
-    # test invented (`benefit_categories` ships empty, `tz/12` #2). That is the
-    # OTHER half of ruling 10а working, and what matters here is which gate now
-    # answers: not `ERR-APP-003` any more.
-    past_step_three = await applicant_client.post(
-        f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature", "rules_accepted": True},
-        headers={"Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert past_step_three.status_code == 422, past_step_three.text
-    assert past_step_three.json()["error"]["code"] != "ERR-APP-003"
-    assert past_step_three.json()["error"]["code"] == "ERR-VAL-001"
+    assert with_other.status_code == 422, with_other.text
+    assert with_other.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_a_draft_on_an_unpublished_contour_cannot_be_submitted(
