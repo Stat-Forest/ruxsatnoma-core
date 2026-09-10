@@ -543,3 +543,25 @@ async def list_allocations(
         page=offset // limit + 1,
         page_size=limit,
     )
+
+
+@router.get("/allocations/export.xlsx")
+async def export_allocations_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    invoice_id: Annotated[uuid.UUID | None, Query()] = None,
+    period_from: Annotated[date | None, Query()] = None,
+    period_to: Annotated[date | None, Query()] = None,
+) -> Response:
+    """`GET /payments/allocations` as a spreadsheet (stage 13, ruling
+    #204): the same `payments.view` gate, the same `invoice_id`-or-period
+    selection (including the route's own `ERR-VAL-001` when neither or a
+    reversed period is given), every matching row up to the configured
+    cap."""
+    items, total, cap = await export.allocation_rows(
+        db, lang=lang, invoice_id=invoice_id, period_from=period_from, period_to=period_to
+    )
+    filename = f"tolovlar-taqsimoti-{business_today().isoformat()}.xlsx"
+    rendered = export.render_allocations(items, lang=lang)
+    return xlsx.xlsx_response(rendered, filename=filename, total=total, cap=cap)

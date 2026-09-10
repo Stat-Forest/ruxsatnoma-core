@@ -9,14 +9,21 @@ import hashlib
 import io
 import json
 import uuid
+from collections.abc import AsyncIterator
 from decimal import Decimal
 
+import httpx
 import pytest
 from openpyxl import load_workbook
 
 from app.core.models import MediaFile
+from app.main import create_app
 from app.modules.payments import statement_service
 from app.modules.payments.models import Invoice
+from tests.conftest import make_client
+from tests.modules.admin.test_organizations_admin import auth_client
+from tests.modules.auth.test_sessions import make_session, make_user
+from tests.modules.gis.conftest import _commit_pending_before_requests
 
 pytestmark = pytest.mark.asyncio
 
@@ -127,6 +134,35 @@ async def filed_manual_confirmation(payments_view_client, pending_invoice, bank_
     )
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+@pytest.fixture
+async def checker_client(db) -> AsyncIterator[httpx.AsyncClient]:
+    """A signed-in `executor_head` — the independent CHECKER half of the
+    manual maker-checker door (`payments.confirm`, migration 0022) —
+    mirrors `payments_view_client`'s own construction."""
+    user = await make_user(db, role_code="executor_head")
+    _, token, csrf = await make_session(db, user)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        _commit_pending_before_requests(client, db)
+        yield client
+
+
+@pytest.fixture
+async def paid_invoice_with_allocations(
+    checker_client, filed_manual_confirmation, pending_invoice
+) -> Invoice:
+    """`filed_manual_confirmation`, CONFIRMED by an independent checker —
+    writes real `allocations` rows through `payments.service.
+    confirm_payment` (mirrors `test_manual_confirmation.py`'s own confirm
+    test) — never an `Allocation(...)` row written by hand."""
+    confirmed = await checker_client.post(
+        f"/api/v1/payments/manual-confirmations/{filed_manual_confirmation['id']}/confirm"
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    return pending_invoice
 
 
 # --- /invoices/export.xlsx (Task C.1) ---------------------------------------
@@ -490,5 +526,100 @@ async def test_manual_confirmations_export_matches_the_list_status_for_a_caller_
 async def test_manual_confirmations_export_rejects_an_unknown_language(payments_view_client):
     resp = await payments_view_client.get(
         "/api/v1/payments/manual-confirmations/export.xlsx", params={"lang": "en"}
+    )
+    assert resp.status_code == 422
+
+
+# --- /payments/allocations/export.xlsx (Task C.2) ---------------------------
+
+
+async def test_allocations_export_holds_exactly_the_rows_the_list_shows(
+    payments_view_client, paid_invoice_with_allocations
+):
+    invoice_id = str(paid_invoice_with_allocations.id)
+    listed = (
+        await payments_view_client.get(
+            "/api/v1/payments/allocations", params={"invoice_id": invoice_id, "limit": 200}
+        )
+    ).json()
+    listed_ids = {row["id"] for row in listed["items"]}
+    assert listed_ids  # at least the leshoz's own remainder row
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/allocations/export.xlsx",
+        params={"invoice_id": invoice_id, "lang": "ru"},
+    )
+    assert resp.status_code == 200
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Счёт" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert exported_ids == listed_ids
+
+
+async def test_allocations_export_applies_the_same_filters_as_the_list(
+    payments_view_client, paid_invoice_with_allocations
+):
+    # An invoice id with no allocations written against it narrows the
+    # export to zero rows exactly as it narrows the list — `list_allocations`
+    # only ever filters `Allocation.invoice_id`, no existence check.
+    resp = await payments_view_client.get(
+        "/api/v1/payments/allocations/export.xlsx", params={"invoice_id": str(uuid.uuid4())}
+    )
+    assert resp.status_code == 200
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_allocations_export_renders_labels_not_codes(
+    payments_view_client, paid_invoice_with_allocations
+):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/allocations/export.xlsx",
+        params={"invoice_id": str(paid_invoice_with_allocations.id), "lang": "uz_latn"},
+    )
+    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    assert row[0] == paid_invoice_with_allocations.number  # the human number first
+    assert row[1] == "Toʻlov"  # the entry-type label, not "payment"
+
+
+async def test_allocations_export_truncates_at_the_cap_and_says_so(
+    payments_view_client, paid_invoice_with_allocations, monkeypatch
+):
+    from app.core import settings_store
+
+    original_get_int = settings_store.get_int
+
+    async def capped(db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await original_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", capped)
+    resp = await payments_view_client.get(
+        "/api/v1/payments/allocations/export.xlsx",
+        params={"invoice_id": str(paid_invoice_with_allocations.id)},
+    )
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_allocations_export_matches_the_list_status_for_a_caller_with_no_scope(
+    applicant_client, paid_invoice_with_allocations
+):
+    invoice_id = str(paid_invoice_with_allocations.id)
+    listed_resp = await applicant_client.get(
+        "/api/v1/payments/allocations", params={"invoice_id": invoice_id}
+    )
+    export_resp = await applicant_client.get(
+        "/api/v1/payments/allocations/export.xlsx", params={"invoice_id": invoice_id}
+    )
+    assert export_resp.status_code == listed_resp.status_code
+
+
+async def test_allocations_export_rejects_an_unknown_language(payments_view_client):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/allocations/export.xlsx", params={"lang": "en"}
     )
     assert resp.status_code == 422

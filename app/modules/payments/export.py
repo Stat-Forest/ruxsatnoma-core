@@ -12,6 +12,7 @@ so the file reads like the screen.
 """
 
 import uuid
+from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,7 @@ from app.modules.applications import service as applications_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service, service, statement_service
+from app.modules.payments.backoffice_schemas import AllocationOut
 from app.modules.payments.models import (
     BankStatement,
     Invoice,
@@ -405,3 +407,91 @@ def render_manual_confirmations(items: list[ManualConfirmationRow], *, lang: xls
     return xlsx.render(
         items, manual_confirmation_columns(lang), lang=lang, title=MANUAL_CONFIRMATIONS_TITLE[lang]
     )
+
+
+# --- Allocations (Task C.2, `GET /payments/allocations/export.xlsx`)
+# Mirrors `adminka/src/pages/accountant/statusMeta.ts::ENTRY_TYPE_LABEL_I18N`
+# / `ALLOCATION_TARGET_LABEL_I18N` (`ALLOCATION_ENTRY_TYPES`/
+# `ALLOCATION_TARGETS`), checked 2026-09-11.
+ALLOCATION_ENTRY_TYPE_LABELS: dict[str, dict[str, str]] = {
+    "payment": {"uz_latn": "Toʻlov", "ru": "Платеж"},
+    "refund": {"uz_latn": "Qaytarish", "ru": "Возврат"},
+    "correction": {"uz_latn": "Tuzatish (bekor qilish)", "ru": "Корректировка (отмена)"},
+}
+ALLOCATION_TARGET_LABELS: dict[str, dict[str, str]] = {
+    "recipient": {"uz_latn": "Ijrochi (leshoz)", "ru": "Исполнитель (лесхоз)"},
+    "receiver": {"uz_latn": "Qabul qiluvchi", "ru": "Получатель"},
+    "other": {"uz_latn": "Boshqa", "ru": "Другое"},
+}
+ALLOCATIONS_TITLE: dict[str, str] = {
+    "uz_latn": "Toʻlovlar taqsimoti",
+    "ru": "Распределение платежей",
+}
+
+
+class AllocationRow:
+    def __init__(self, out: AllocationOut, *, invoice_number: str) -> None:
+        self.out = out
+        self.id = out.id
+        self.invoice_number = invoice_number
+
+
+def allocation_columns(lang: xlsx.Lang) -> list[xlsx.Column[AllocationRow]]:
+    f = lambda name: lambda r: getattr(r.out, name)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "invoice", {"uz_latn": "Hisob-faktura", "ru": "Счёт"}, lambda r: r.invoice_number, 18
+        ),
+        xlsx.Column(
+            "entry_type",
+            {"uz_latn": "Turi", "ru": "Тип"},
+            lambda r: _label(ALLOCATION_ENTRY_TYPE_LABELS, r.out.entry_type, lang),
+            18,
+        ),
+        xlsx.Column(
+            "target",
+            {"uz_latn": "Kimga", "ru": "Кому"},
+            lambda r: _label(ALLOCATION_TARGET_LABELS, r.out.target, lang),
+            18,
+        ),
+        xlsx.Column(
+            "recipient",
+            {"uz_latn": "Qabul qiluvchi nomi", "ru": "Название получателя"},
+            lambda r: xlsx.localized(r.out.recipient_name, lang),
+            24,
+        ),
+        xlsx.Column("amount", {"uz_latn": "Summa", "ru": "Сумма"}, f("amount"), 14),
+        xlsx.Column(
+            "account", {"uz_latn": "Bank hisobi", "ru": "Банковский счёт"}, f("account"), 20
+        ),
+        xlsx.Column("note", {"uz_latn": "Izoh", "ru": "Примечание"}, f("note"), 26),
+        xlsx.Column("occurred_at", {"uz_latn": "Vaqt", "ru": "Время"}, f("occurred_at"), 18),
+        xlsx.id_column(),
+    ]
+
+
+async def allocation_rows(
+    db: AsyncSession,
+    *,
+    lang: xlsx.Lang,
+    invoice_id: uuid.UUID | None,
+    period_from: date | None,
+    period_to: date | None,
+) -> tuple[list[AllocationRow], int, int]:
+    """(rows, total, cap). Calls `backoffice_service.list_allocations` +
+    `allocations_out` — the exact pair `GET /payments/allocations` uses,
+    including its own `ERR-VAL-001` on a missing/reversed period (ruling
+    R2: the export never widens what the route would otherwise refuse)."""
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    rows, total = await backoffice_service.list_allocations(
+        db, invoice_id=invoice_id, period_from=period_from, period_to=period_to, limit=cap, offset=0
+    )
+    outs = await backoffice_service.allocations_out(db, rows)
+    invoice_ids = {out.invoice_id for out in outs}
+    numbers = await _invoice_numbers_by_ids(db, invoice_ids)
+    result = [AllocationRow(out, invoice_number=numbers.get(out.invoice_id, "")) for out in outs]
+    return result, total, cap
+
+
+def render_allocations(items: list[AllocationRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, allocation_columns(lang), lang=lang, title=ALLOCATIONS_TITLE[lang])
