@@ -13,6 +13,7 @@ from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.admin.permissions import (
     ANNOUNCEMENTS_MANAGE,
+    INTEGRATIONS_MANAGE,
     INTEGRATIONS_VIEW,
     LEGAL_DOCUMENTS_MANAGE,
 )
@@ -663,5 +664,134 @@ async def test_outbox_export_rejects_an_unknown_language(db):
         auth_client(client, token, csrf)
         resp = await client.get(
             f"{API}/admin/integrations/outbox/export.xlsx", params={"lang": "en"}
+        )
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Integrations dead letters — GET /admin/integrations/dead-letters/export.xlsx
+# ---------------------------------------------------------------------------
+
+
+async def test_dead_letters_export_holds_exactly_the_rows_the_list_shows(db):
+    from app.modules.integrations.service import record_dead_letter
+
+    viewer, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    source = f"_export_test_{uuid.uuid4().hex[:8]}"
+    letter = await record_dead_letter(db, source=source, payload={"x": 1}, error="bad shape")
+    await db.commit()
+
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(
+            f"{API}/admin/integrations/dead-letters", params={"status": "new", "page_size": 100}
+        )
+        resp = await client.get(
+            f"{API}/admin/integrations/dead-letters/export.xlsx",
+            params={"status": "new", "lang": "ru"},
+        )
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert exported_ids == listed_ids
+    assert str(letter.id) in exported_ids
+
+
+async def test_dead_letters_export_applies_the_same_filters_as_the_list(db):
+    from app.modules.integrations.service import discard_dead_letter, record_dead_letter
+
+    manager, token, csrf = await signed_in_with(db, INTEGRATIONS_MANAGE)
+    marker = uuid.uuid4().hex[:8]
+    new_letter = await record_dead_letter(
+        db, source=f"_new_{marker}", payload={}, error="still new"
+    )
+    to_discard = await record_dead_letter(
+        db, source=f"_discard_{marker}", payload={}, error="will be discarded"
+    )
+    await db.commit()
+    await discard_dead_letter(db, to_discard.id, actor_id=manager.id, ip=None)
+    await db.commit()
+
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/integrations/dead-letters/export.xlsx", params={"status": "discarded"}
+        )
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert str(to_discard.id) in exported_ids
+    assert str(new_letter.id) not in exported_ids
+
+
+async def test_dead_letters_export_renders_labels_not_codes_and_never_the_payload(db):
+    from app.modules.integrations.service import record_dead_letter
+
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    source = f"_export_label_{uuid.uuid4().hex[:8]}"
+    letter = await record_dead_letter(
+        db, source=source, payload={"secret": "should-never-appear"}, error="bad shape"
+    )
+    await db.commit()
+
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/integrations/dead-letters/export.xlsx",
+            params={"status": "new", "lang": "uz_latn"},
+        )
+    assert resp.status_code == 200, resp.text
+    rows = list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    row = next(r for r in rows if r[-1] == str(letter.id))
+    assert row[0] == source
+    assert row[1] == "Yangi"  # status label, not "new"
+    assert "should-never-appear" not in "".join(str(v) for v in row if v is not None)
+
+
+async def test_dead_letters_export_truncates_at_the_cap_and_says_so(db, monkeypatch):
+    from app.modules.integrations.service import record_dead_letter
+
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await record_dead_letter(db, source="cap1", payload={}, error="e1")
+    await record_dead_letter(db, source="cap2", payload={}, error="e2")
+    await db.commit()
+
+    real_get_int = settings_store.get_int
+
+    async def one(_db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(_db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(f"{API}/admin/integrations/dead-letters/export.xlsx")
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total >= 2
+    assert resp.headers["x-export-truncated"] == "true"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_dead_letters_export_without_the_permission_matches_the_list_status(db):
+    _, token, csrf = await signed_in_with(db)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(f"{API}/admin/integrations/dead-letters")
+        resp = await client.get(f"{API}/admin/integrations/dead-letters/export.xlsx")
+    assert listed.status_code == 403
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == listed.json()["error"]["code"]
+
+
+async def test_dead_letters_export_rejects_an_unknown_language(db):
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/integrations/dead-letters/export.xlsx", params={"lang": "en"}
         )
     assert resp.status_code == 422

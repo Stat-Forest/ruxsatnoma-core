@@ -122,6 +122,24 @@ async def list_dead_letters(
     )
 
 
+@router.get("/dead-letters/export.xlsx")
+async def export_dead_letters_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(INTEGRATIONS_VIEW, INTEGRATIONS_MANAGE))],
+    lang: xlsx.Lang = "uz_latn",
+    status: str | None = None,
+) -> Response:
+    """`GET /admin/integrations/dead-letters` as a spreadsheet (stage 13,
+    ruling #204): the same filter, the same view-or-manage gate, every
+    matching row up to the configured cap. `payload` is never exported —
+    same withholding `DeadLetterOut` already applies to the JSON response."""
+    items, total, cap = await export.dead_letters_rows(db, lang=lang, status=status)
+    filename = f"kiruvchi-xatolar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_dead_letters(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.post("/dead-letters/{letter_id}/discard", response_model=DeadLetterOut)
 async def discard_dead_letter(
     letter_id: uuid.UUID,

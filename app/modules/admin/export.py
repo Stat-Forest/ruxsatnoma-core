@@ -43,7 +43,7 @@ from app.modules.admin.users_schemas import UserAdminOut, UserFilters
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.integrations import repo as integrations_repo
-from app.modules.integrations.models import OutboxMessage
+from app.modules.integrations.models import InboundDeadLetter, OutboxMessage
 
 _ERROR_MAX = 200
 
@@ -553,3 +553,83 @@ async def outbox_rows(
 
 def render_outbox(items: Sequence[OutboxMessage], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, outbox_columns(lang), lang=lang, title=OUTBOX_TITLE[lang])
+
+
+# ---------------------------------------------------------------------------
+# Integrations dead letters — GET /admin/integrations/dead-letters/export.xlsx
+# ---------------------------------------------------------------------------
+
+LETTER_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "new": {"uz_latn": "Yangi", "ru": "Новое"},
+    "reprocessed": {"uz_latn": "Qayta ishlangan", "ru": "Переобработано"},
+    "discarded": {"uz_latn": "Rad etilgan", "ru": "Отброшено"},
+}
+DEAD_LETTERS_TITLE = {"uz_latn": "Kiruvchi xatolar", "ru": "Входящие ошибки"}
+
+
+class DeadLetterRow:
+    """`.payload` is on `letter` but no column below reads it — the same
+    withholding `DeadLetterOut` applies to the JSON response."""
+
+    def __init__(self, letter: InboundDeadLetter, *, processed_by: str) -> None:
+        self.letter = letter
+        self.id = letter.id
+        self.processed_by = processed_by
+
+
+def dead_letter_columns(lang: xlsx.Lang) -> list[xlsx.Column[DeadLetterRow]]:
+    g = lambda f: lambda r: getattr(r.letter, f)  # noqa: E731
+    return [
+        xlsx.Column("source", {"uz_latn": "Manba", "ru": "Источник"}, g("source"), 20),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(LETTER_STATUS_LABELS, r.letter.status, lang),
+            16,
+        ),
+        xlsx.Column(
+            "error", {"uz_latn": "Xato", "ru": "Ошибка"}, lambda r: _truncate(r.letter.error), 40
+        ),
+        xlsx.Column(
+            "received_at", {"uz_latn": "Qabul qilingan", "ru": "Получено"}, g("received_at"), 18
+        ),
+        xlsx.Column(
+            "processed_by",
+            {"uz_latn": "Kim koʻrib chiqdi", "ru": "Кто обработал"},
+            lambda r: r.processed_by,
+            24,
+        ),
+        xlsx.Column(
+            "processed_at",
+            {"uz_latn": "Koʻrib chiqilgan", "ru": "Обработано"},
+            g("processed_at"),
+            18,
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def dead_letters_rows(
+    db: AsyncSession, *, lang: xlsx.Lang, status: str | None
+) -> tuple[list[DeadLetterRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    letters, total = await integrations_repo.list_dead_letters(
+        db, status=status, page=1, page_size=cap
+    )
+    names = await auth_service.user_names(
+        db, {ltr.processed_by for ltr in letters if ltr.processed_by}
+    )
+    return (
+        [
+            DeadLetterRow(
+                ltr, processed_by=names.get(ltr.processed_by, "") if ltr.processed_by else ""
+            )
+            for ltr in letters
+        ],
+        total,
+        cap,
+    )
+
+
+def render_dead_letters(items: Sequence[DeadLetterRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, dead_letter_columns(lang), lang=lang, title=DEAD_LETTERS_TITLE[lang])
