@@ -390,6 +390,27 @@ async def list_manual_confirmations(
     )
 
 
+@router.get("/manual-confirmations/export.xlsx")
+async def export_manual_confirmations_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(PAYMENTS_MANAGE, PAYMENTS_CONFIRM))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[
+        str, Query(pattern=_MANUAL_CONFIRMATION_STATUS_PATTERN)
+    ] = MANUAL_CONFIRMATION_STATUSES[0],
+) -> Response:
+    """`GET /payments/manual-confirmations` as a spreadsheet (stage 13,
+    ruling #204): the same maker-or-checker gate, the same default
+    (`pending_check`) and `?status=` filter, every matching row up to the
+    configured cap."""
+    items, total, cap = await export.manual_confirmation_rows(
+        db, actor=actor, lang=lang, status=status
+    )
+    filename = f"qolda-tasdiqlar-{business_today().isoformat()}.xlsx"
+    rendered = export.render_manual_confirmations(items, lang=lang)
+    return xlsx.xlsx_response(rendered, filename=filename, total=total, cap=cap)
+
+
 @router.post("/manual-confirmations", status_code=201, response_model=FiledManualConfirmationOut)
 async def file_manual_confirmation(
     body: ManualConfirmationIn,

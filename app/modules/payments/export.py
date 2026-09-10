@@ -21,7 +21,12 @@ from app.modules.applications import service as applications_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.payments import backoffice_service, service, statement_service
-from app.modules.payments.models import BankStatement, Invoice, Reconciliation
+from app.modules.payments.models import (
+    BankStatement,
+    Invoice,
+    ManualPaymentConfirmation,
+    Reconciliation,
+)
 
 # An unknown code renders as itself, never an empty cell that hides it —
 # the same posture `applications/export.py`'s own `_label` takes.
@@ -319,4 +324,84 @@ async def reconciliation_rows(
 def render_reconciliations(items: list[ReconciliationRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(
         items, reconciliation_columns(lang), lang=lang, title=RECONCILIATIONS_TITLE[lang]
+    )
+
+
+# --- Manual confirmations (Task C.2, `GET /payments/manual-confirmations/export.xlsx`)
+# Mirrors `adminka/src/pages/accountant/statusMeta.ts::MANUAL_CONFIRMATION_STATUS_LABEL_I18N`
+# (`MANUAL_CONFIRMATION_STATUSES`), checked 2026-09-11.
+MANUAL_CONFIRMATION_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "pending_check": {"uz_latn": "Tekshiruv kutilmoqda", "ru": "Ожидает проверки"},
+    "confirmed": {"uz_latn": "Tasdiqlandi", "ru": "Подтверждено"},
+    "rejected": {"uz_latn": "Rad etildi", "ru": "Отклонено"},
+}
+MANUAL_CONFIRMATIONS_TITLE: dict[str, str] = {
+    "uz_latn": "Qoʻlda toʻlov tasdiqlari",
+    "ru": "Ручные подтверждения оплаты",
+}
+
+
+class ManualConfirmationRow:
+    def __init__(
+        self, row: ManualPaymentConfirmation, *, invoice_number: str, maker: str, checker: str
+    ) -> None:
+        self.row = row
+        self.id = row.id
+        self.invoice_number = invoice_number
+        self.maker = maker
+        self.checker = checker
+
+
+def manual_confirmation_columns(lang: xlsx.Lang) -> list[xlsx.Column[ManualConfirmationRow]]:
+    f = lambda name: lambda r: getattr(r.row, name)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "invoice", {"uz_latn": "Hisob-faktura", "ru": "Счёт"}, lambda r: r.invoice_number, 18
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(MANUAL_CONFIRMATION_STATUS_LABELS, r.row.status, lang),
+            20,
+        ),
+        xlsx.Column("amount", {"uz_latn": "Summa", "ru": "Сумма"}, f("amount"), 14),
+        xlsx.Column(
+            "paid_at", {"uz_latn": "Toʻlangan sana", "ru": "Дата оплаты"}, f("paid_at"), 18
+        ),
+        xlsx.Column("maker", {"uz_latn": "Kiritgan", "ru": "Подал"}, lambda r: r.maker, 22),
+        xlsx.Column(
+            "checker", {"uz_latn": "Tekshirgan", "ru": "Проверил"}, lambda r: r.checker, 22
+        ),
+        xlsx.Column("reason", {"uz_latn": "Sabab", "ru": "Причина"}, f("reason"), 26),
+        xlsx.Column("created_at", {"uz_latn": "Yaratilgan", "ru": "Создано"}, f("created_at"), 18),
+        xlsx.id_column(),
+    ]
+
+
+async def manual_confirmation_rows(
+    db: AsyncSession, *, actor: User, lang: xlsx.Lang, status: str
+) -> tuple[list[ManualConfirmationRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    rows, total = await backoffice_service.list_manual_confirmations(
+        db, status=status, limit=cap, offset=0, actor=actor
+    )
+    invoice_ids = {row.invoice_id for row in rows}
+    numbers = await _invoice_numbers_by_ids(db, invoice_ids)
+    user_ids = {row.maker_id for row in rows} | {row.checker_id for row in rows if row.checker_id}
+    names = await auth_service.user_names(db, user_ids)
+    out = [
+        ManualConfirmationRow(
+            row,
+            invoice_number=numbers.get(row.invoice_id, ""),
+            maker=names.get(row.maker_id, ""),
+            checker=names.get(row.checker_id, "") if row.checker_id else "",
+        )
+        for row in rows
+    ]
+    return out, total, cap
+
+
+def render_manual_confirmations(items: list[ManualConfirmationRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(
+        items, manual_confirmation_columns(lang), lang=lang, title=MANUAL_CONFIRMATIONS_TITLE[lang]
     )

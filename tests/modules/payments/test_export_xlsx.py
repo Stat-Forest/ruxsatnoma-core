@@ -5,6 +5,7 @@ screen on paper — same scope, same filters, readable cells, the id last.
 C.2) land in this same file, one commit each."""
 
 import csv
+import hashlib
 import io
 import json
 import uuid
@@ -13,6 +14,7 @@ from decimal import Decimal
 import pytest
 from openpyxl import load_workbook
 
+from app.core.models import MediaFile
 from app.modules.payments import statement_service
 from app.modules.payments.models import Invoice
 
@@ -91,6 +93,40 @@ async def open_reconciliation(payments_view_client, db, matchable_invoice) -> In
     )
     await _drain(db)
     return matchable_invoice
+
+
+@pytest.fixture
+async def bank_doc(db) -> MediaFile:
+    """A genuine `media_files` row — `bank_doc_file_id` is a NOT NULL FK
+    (mirrors `test_manual_confirmation.py`'s own fixture of the same name)."""
+    row = MediaFile(
+        storage_key=f"bank-docs/{uuid.uuid4().hex}.pdf",
+        filename="payment-order.pdf",
+        content_type="application/pdf",
+        size_bytes=2048,
+        sha256=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+@pytest.fixture
+async def filed_manual_confirmation(payments_view_client, pending_invoice, bank_doc) -> dict:
+    """A real `pending_check` filing through `POST /payments/manual-
+    confirmations` (mirrors `test_manual_confirmation.py::_file_via_http`)
+    — never a `ManualPaymentConfirmation(...)` row written by hand."""
+    resp = await payments_view_client.post(
+        "/api/v1/payments/manual-confirmations",
+        json={
+            "invoice_id": str(pending_invoice.id),
+            "amount": str(pending_invoice.amount),
+            "paid_at": "2026-09-01T10:00:00Z",
+            "bank_doc_file_id": str(bank_doc.id),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
 
 
 # --- /invoices/export.xlsx (Task C.1) ---------------------------------------
@@ -364,5 +400,95 @@ async def test_reconciliations_export_matches_the_list_status_for_a_caller_with_
 async def test_reconciliations_export_rejects_an_unknown_language(payments_view_client):
     resp = await payments_view_client.get(
         "/api/v1/payments/reconciliations/export.xlsx", params={"lang": "en"}
+    )
+    assert resp.status_code == 422
+
+
+# --- /payments/manual-confirmations/export.xlsx (Task C.2) ------------------
+
+
+async def test_manual_confirmations_export_holds_exactly_the_rows_the_list_shows(
+    payments_view_client, filed_manual_confirmation
+):
+    listed = (
+        await payments_view_client.get(
+            "/api/v1/payments/manual-confirmations",
+            params={"status": "pending_check", "limit": 200},
+        )
+    ).json()
+    listed_ids = {item["id"] for item in listed["items"]}
+    assert filed_manual_confirmation["id"] in listed_ids
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/manual-confirmations/export.xlsx",
+        params={"status": "pending_check", "lang": "ru"},
+    )
+    assert resp.status_code == 200
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Счёт" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert filed_manual_confirmation["id"] in exported_ids
+    assert exported_ids == listed_ids
+
+
+async def test_manual_confirmations_export_applies_the_same_filters_as_the_list(
+    payments_view_client, filed_manual_confirmation
+):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/manual-confirmations/export.xlsx", params={"status": "confirmed"}
+    )
+    assert resp.status_code == 200
+    exported_ids = {
+        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert filed_manual_confirmation["id"] not in exported_ids  # still "pending_check"
+
+
+async def test_manual_confirmations_export_renders_labels_not_codes(
+    payments_view_client, filed_manual_confirmation
+):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/manual-confirmations/export.xlsx",
+        params={"status": "pending_check", "lang": "uz_latn"},
+    )
+    rows_by_id = {
+        str(row[-1]): row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    row = rows_by_id[filed_manual_confirmation["id"]]
+    assert row[1] == "Tekshiruv kutilmoqda"  # the status label, not "pending_check"
+
+
+async def test_manual_confirmations_export_truncates_at_the_cap_and_says_so(
+    payments_view_client, filed_manual_confirmation, monkeypatch
+):
+    from app.core import settings_store
+
+    original_get_int = settings_store.get_int
+
+    async def capped(db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await original_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", capped)
+    resp = await payments_view_client.get("/api/v1/payments/manual-confirmations/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_manual_confirmations_export_matches_the_list_status_for_a_caller_with_no_scope(
+    applicant_client,
+):
+    listed_resp = await applicant_client.get("/api/v1/payments/manual-confirmations")
+    export_resp = await applicant_client.get("/api/v1/payments/manual-confirmations/export.xlsx")
+    assert export_resp.status_code == listed_resp.status_code
+
+
+async def test_manual_confirmations_export_rejects_an_unknown_language(payments_view_client):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/manual-confirmations/export.xlsx", params={"lang": "en"}
     )
     assert resp.status_code == 422
