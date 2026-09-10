@@ -37,7 +37,6 @@ def columns(lang: xlsx.Lang) -> list[xlsx.Column[BeekeeperOut]]:
             20,
         ),
         xlsx.Column("pinfl", {"uz_latn": "JSHSHIR", "ru": "ПИНФЛ"}, b("pinfl"), 18),
-        xlsx.Column("stir", {"uz_latn": "STIR", "ru": "СТИР"}, b("stir"), 14),
         xlsx.Column("full_name", {"uz_latn": "F.I.Sh.", "ru": "ФИО"}, b("full_name"), 30),
         xlsx.Column(
             "farm_name",
@@ -45,18 +44,11 @@ def columns(lang: xlsx.Lang) -> list[xlsx.Column[BeekeeperOut]]:
             b("farm_name"),
             30,
         ),
-        xlsx.Column(
-            "passport_series",
-            {"uz_latn": "Pasport seriyasi", "ru": "Серия паспорта"},
-            b("passport_series"),
-            14,
-        ),
-        xlsx.Column(
-            "passport_number",
-            {"uz_latn": "Pasport raqami", "ru": "Номер паспорта"},
-            b("passport_number"),
-            14,
-        ),
+        # No passport series/number and no STIR: the screen shows neither, and
+        # identity documents in a bulk file are a step the screen never takes
+        # (ruling R4 adds USEFUL hidden fields, not more personal data). The
+        # PINFL stays — it is a screen column, the register's own key beside
+        # the certificate number.
         xlsx.Column(
             "status",
             {"uz_latn": "Holat", "ru": "Статус"},

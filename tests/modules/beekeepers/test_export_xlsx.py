@@ -121,7 +121,7 @@ async def test_export_renders_labels_not_codes(db):
             if r[-1] == beekeeper_id
         )
         assert row[0] == certificate_no  # the human number first
-        assert row[7] == "Faol"  # the status LABEL, not "active"
+        assert row[4] == "Faol"  # the status LABEL, not "active"
 
 
 async def test_export_truncates_at_the_cap_and_says_so(db, monkeypatch):
@@ -167,3 +167,16 @@ async def test_export_rejects_an_unknown_language(db):
         _auth(client, token, csrf)
         resp = await client.get("/api/v1/beekeepers/export.xlsx", params={"lang": "en"})
         assert resp.status_code == 422
+
+
+async def test_the_file_carries_no_passport_and_no_stir(db):
+    """The screen shows neither; a bulk file must not widen what it shows."""
+    ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
+    async with ctx as client:
+        _auth(client, token, csrf)
+        resp = await client.get("/api/v1/beekeepers/export.xlsx", params={"lang": "ru"})
+        assert resp.status_code == 200, resp.text
+        headers = [c.value for c in _sheet(resp.content)[1]]
+        assert "Серия паспорта" not in headers and "Номер паспорта" not in headers
+        assert "СТИР" not in headers
+        assert "ПИНФЛ" in headers  # a screen column, it stays
