@@ -66,6 +66,9 @@ EXPORT_BACKLOG = {
 # register to keep), and a contour's version history (a sub-list of a card,
 # not a register — ruling R8).
 EXEMPT = {
+    # The cabinet's own news feed — the admin's register of the same rows is
+    # exported at /admin/announcements; a reader's feed is not a register.
+    "/api/v1/announcements",
     "/api/v1/public/announcements",
     "/api/v1/public/legal-documents",
     "/api/v1/gis/contours/{contour_id}/versions",
