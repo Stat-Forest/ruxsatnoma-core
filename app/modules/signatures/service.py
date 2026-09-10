@@ -65,6 +65,14 @@ CERTIFICATE_BIND = "certificate.bind"
 CERTIFICATE_UNBIND = "certificate.unbind"
 SIGNATURE_REVERIFY = "signature.reverify"
 
+# Ruling #183: `sign_simple`'s own action — distinct from SIGNATURE_CREATE so
+# stage 4.2's risk report (RI-05, certificate-standing only) never has to
+# filter out a kind of attempt that never carries a certificate to begin
+# with, and so an oversight reader can tell "an ERI signing attempt" from "a
+# citizen pressed the button" from the action code alone, without parsing
+# `verification`.
+SIGNATURE_CREATE_SIMPLE = "signature.create_simple"
+
 # RI-05 (docs/tz/10-klassifikatory.md): "an attempt to sign with a revoked or
 # expired certificate", severity high. `build_verdict` (verify.py) also
 # reports "certificate_invalid_at_signing" for a certificate that was outside
@@ -527,6 +535,47 @@ def _raised_reason(
     return verdict.reason
 
 
+async def _refuse_duplicate_purpose(
+    db: AsyncSession,
+    *,
+    object_type: str,
+    object_id: uuid.UUID,
+    purpose: str,
+    user: User,
+    action: str,
+) -> None:
+    """The one-per-purpose duplicate guard, shared by `sign()` and
+    `sign_simple()` (ruling #183) rather than kept as two copies that could
+    drift: a purpose that already carries a VALID signature refuses a second
+    one with `ERR-SIGN-002`, audited under `action` before the raise
+    (early-commit pattern — the refusal IS the evidence, ruling 8) so a
+    double-click is recorded rather than rolled back together with the
+    exception that explains it. `action` lets each caller keep its own audit
+    vocabulary (`SIGNATURE_CREATE` for an ERI attempt, `SIGNATURE_CREATE_
+    SIMPLE` for a button one) without a second, separately-maintained copy of
+    this check.
+
+    Only a would-be-VALID insert can conflict with the partial unique index
+    (lesson: a partial index only constrains the rows it covers) — call this
+    only once the caller already knows the attempt would otherwise succeed;
+    `sign_simple()` is unconditionally such an attempt (nothing there can
+    itself be "invalid"), `sign()` calls this only inside its own `verdict.
+    status == "valid"` branch.
+    """
+    if await repo.get_valid_signature(db, object_type, object_id, purpose) is not None:
+        await audit.log(
+            db,
+            action=action,
+            user_id=user.id,
+            object_type=object_type,
+            object_id=object_id,
+            result="denied",
+            basis="already_signed",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-002")
+
+
 async def sign(
     db: AsyncSession,
     *,
@@ -723,25 +772,16 @@ async def sign(
         # Only a would-be-valid insert can conflict with the partial unique
         # index (lesson: a partial index only constrains the rows it covers) —
         # an attempt that is invalid on its own merits is reported as such,
-        # never as a duplicate.
-        if await repo.get_valid_signature(db, object_type, object_id, purpose) is not None:
-            # Evidence-then-raise (fix round 3, fix 1), same shape as every
-            # other refusal here: audit it, but write no `signatures` row —
-            # a duplicate is a double-click far more often than an attack,
-            # and a row per retry would fill the evidence table with noise
-            # stage 4.2 then has to filter back out. The audit entry alone
-            # answers "who tried and when", which is all this event is worth.
-            await audit.log(
-                db,
-                action=SIGNATURE_CREATE,
-                user_id=user.id,
-                object_type=object_type,
-                object_id=object_id,
-                result="denied",
-                basis="already_signed",
-            )
-            await db.commit()
-            raise err("ERR-SIGN-002")
+        # never as a duplicate. Shared with `sign_simple()` (ruling #183) via
+        # `_refuse_duplicate_purpose` rather than kept as two copies.
+        await _refuse_duplicate_purpose(
+            db,
+            object_type=object_type,
+            object_id=object_id,
+            purpose=purpose,
+            user=user,
+            action=SIGNATURE_CREATE,
+        )
 
     try:
         # `begin_nested()` (a SAVEPOINT), not a bare call: this insert can
@@ -777,6 +817,7 @@ async def sign(
                 signed_at=result.signed_at or datetime.now(UTC),
                 verification=verdict.record,
                 verification_status=verdict.status,
+                kind="eri",
             )
     except IntegrityError as exc:
         # IntegrityError IS a DBAPIError subclass — this narrow clause must be
@@ -848,6 +889,159 @@ async def sign(
             },
         )
 
+    return signature
+
+
+async def sign_simple(
+    db: AsyncSession,
+    *,
+    object_type: str,
+    object_id: uuid.UUID,
+    purpose: str,
+    document: bytes,
+    user: User,
+    ip: str | None = None,
+) -> Signature:
+    """Ruling #183: a citizen acting for THEMSELVES signs with a button, not
+    an ERI certificate. Decision #32 gives an applicant no password — their
+    session exists only through a OneID or E-IMZO login — so the signer's
+    identity is already established by PINFL before this is ever called, and
+    there is nothing cryptographic left to verify the way `sign()` verifies a
+    pkcs7 envelope: `verification_status` is always `"valid"` here, honestly,
+    because nothing was checked that could come back invalid.
+
+    **This does NOT decide whether a simple signature is ALLOWED for
+    `(object_type, object_id, purpose)` — that is entirely the caller's
+    rule.** For a permit's holder line the rule is the application's
+    `on_behalf` (`permits.service.add_signature`, ruling #183's other half);
+    a future object type may gate it differently. Call this only once the
+    caller has already decided a simple signature is legitimate here.
+
+    Same TRANSACTION CONTRACT as `sign()` — read that docstring first: every
+    refusal below commits the caller's whole session before raising
+    (early-commit pattern, decision #40), so call this before creating any
+    dependent state you would not want kept on a refusal.
+
+    Order: `purpose` must be in `required_purposes(object_type)` when one is
+    configured — the same string-only check `sign()` makes, for the same
+    reason (stops a typo'd purpose before it reaches storage; it does NOT
+    prove the signer holds the role `purpose` names, same limit `sign()`
+    documents) -> the signer's PINFL must be known: `user.pinfl`, the EXACT
+    field `_ownership_reason` reads for a personal certificate above — set
+    only through a OneID/E-IMZO login (`auth.service.login_or_create_by_
+    pinfl`), never invented here as a second lookup — missing only for a
+    staff account created before its PINFL was ever recorded, which is
+    exactly why this is OUR data gap and gets its own honest reason,
+    `"signer_pinfl_unknown"`, the same string `_ownership_reason` uses for
+    the identical gap -> the one-per-purpose duplicate check, shared with
+    `sign()` (`_refuse_duplicate_purpose`) -> insert.
+
+    The row: `kind="simple"`, `certificate_id=NULL` (the pair CHECK migration
+    0052 added ties the two), `signature_value=""` (nothing was produced to
+    store — there is no envelope), `doc_hash=sha256(document)` — the SAME
+    hashing helper `sign()` uses, over the SAME bytes the caller hands in, so
+    a simple and an ERI signature on the same object are directly comparable
+    evidence. `verification` carries `kind`, the signer's own `pinfl`,
+    `auth_method` (`"oneid"` when `user.oneid_profile` was ever populated,
+    `"eimzo"` otherwise — the same fact `auth.service.register_applicant`
+    already reads off this exact column for its own `verify_source`, reused
+    rather than a second convention) and `ip`.
+    """
+    required = await required_purposes(db, object_type)
+    if required and purpose not in required:
+        await audit.log(
+            db,
+            action=SIGNATURE_CREATE_SIMPLE,
+            user_id=user.id,
+            object_type=object_type,
+            object_id=object_id,
+            result="denied",
+            basis="purpose_not_required",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": "purpose_not_required"})
+
+    if user.pinfl is None:
+        await audit.log(
+            db,
+            action=SIGNATURE_CREATE_SIMPLE,
+            user_id=user.id,
+            object_type=object_type,
+            object_id=object_id,
+            result="denied",
+            basis="signer_pinfl_unknown",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": "signer_pinfl_unknown"})
+
+    await _refuse_duplicate_purpose(
+        db,
+        object_type=object_type,
+        object_id=object_id,
+        purpose=purpose,
+        user=user,
+        action=SIGNATURE_CREATE_SIMPLE,
+    )
+
+    doc_hash = hashlib.sha256(document).hexdigest()
+    verification: dict[str, Any] = {
+        "kind": "simple",
+        "pinfl": user.pinfl,
+        "auth_method": "oneid" if user.oneid_profile is not None else "eimzo",
+        "ip": ip,
+    }
+    try:
+        # SAVEPOINT, `sign()`'s own reasoning (lesson): a concurrent
+        # sign_simple() for the same purpose can still lose the race this
+        # pre-check just cleared, and recovering from THAT failure still
+        # needs to write an audit entry and commit on this SAME session
+        # afterward — a bare `db.flush()` caught with a plain `db.rollback()`
+        # would roll back the WHOLE transaction, not just this insert.
+        async with db.begin_nested():
+            signature = await repo.insert_signature(
+                db,
+                object_type=object_type,
+                object_id=object_id,
+                purpose=purpose,
+                signer_user_id=user.id,
+                certificate_id=None,
+                doc_hash=doc_hash,
+                signature_value="",
+                signed_at=datetime.now(UTC),
+                verification=verification,
+                verification_status="valid",
+                kind="simple",
+            )
+    except IntegrityError as exc:
+        # Same narrow clause `sign()` uses (lesson: IntegrityError IS a
+        # DBAPIError subclass, checked first; `exc.orig.__cause__`, not
+        # `exc.orig`, names the constraint). Only `uq_signatures_valid_
+        # purpose`'s own violation means "lost the race" — anything else on
+        # this insert is a real defect and surfaces as itself, unmapped.
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        if getattr(cause, "constraint_name", None) != "uq_signatures_valid_purpose":
+            raise
+        await audit.log(
+            db,
+            action=SIGNATURE_CREATE_SIMPLE,
+            user_id=user.id,
+            object_type=object_type,
+            object_id=object_id,
+            result="denied",
+            basis="already_signed",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-002") from exc
+
+    await audit.log(
+        db,
+        action=SIGNATURE_CREATE_SIMPLE,
+        user_id=user.id,
+        object_type=object_type,
+        object_id=object_id,
+        result="success",
+        basis="simple",
+    )
     return signature
 
 
@@ -1003,6 +1197,7 @@ async def list_signatures_page(
     object_id: uuid.UUID,
     user: User,
     params: PageParams,
+    kind: str | None = None,
 ) -> tuple[list[Signature], int]:
     """`GET /signatures`: the object's OWNER — defined, in a module that owns
     no `permits`/`applications` table of its own to ask (module docstring,
@@ -1018,7 +1213,9 @@ async def list_signatures_page(
     `_holds_view_any`'s own docstring). `ERR-ACL-001` on denial, matching the
     code `require_permission` itself raises for "no permission for this" —
     there is no territorial axis on `certificates`/`signatures` at all
-    (`ERR-ACL-002` stays reserved for an actual zone mismatch elsewhere)."""
+    (`ERR-ACL-002` stays reserved for an actual zone mismatch elsewhere).
+    `kind` (ruling #183) narrows to `'eri'`/`'simple'`; `None` lists both, as
+    before this stage."""
     if not await _holds_view_any(db, user):
         if not await repo.signed_by(
             db, object_type=object_type, object_id=object_id, signer_user_id=user.id
@@ -1030,6 +1227,7 @@ async def list_signatures_page(
         object_id=object_id,
         offset=params.offset,
         limit=params.page_size,
+        kind=kind,
     )
 
 
@@ -1132,6 +1330,15 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
     original = await repo.get_signature(db, signature_id)
     if original is None:
         raise err("ERR-SYS-003")
+    if original.kind == "simple":
+        # Ruling #183: a simple signature carries no certificate and nothing
+        # cryptographic was ever checked, so there is nothing here for a
+        # reverify to re-examine — the row is returned UNCHANGED, no new
+        # record written, not an error. `original.certificate_id` is NULL by
+        # construction for this kind (migration 0052's pair CHECK), which is
+        # exactly why this must return before the certificate lookup below.
+        return original
+    assert original.certificate_id is not None  # kind == "eri" here, CHECK-guaranteed
     cert = await get_certificate(db, original.certificate_id)
     adapter = get_eimzo_adapter()
     live_status = await adapter.certificate_status(
@@ -1205,6 +1412,11 @@ async def reverify(db: AsyncSession, *, signature_id: uuid.UUID, user: User) -> 
                 signed_at=original.signed_at,
                 verification=record,
                 verification_status=new_status,
+                # Always "eri" in practice — the "simple" branch returns
+                # before this point — but spelled from the original's own
+                # column rather than hard-coded, the same "read the row back"
+                # discipline the rest of this module uses.
+                kind=original.kind,
             )
     except IntegrityError as exc:
         # IntegrityError IS a DBAPIError subclass — this narrow clause must

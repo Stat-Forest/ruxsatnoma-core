@@ -50,6 +50,7 @@ unlike the functions above) — not part of the cross-module public surface.
 
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, NamedTuple
@@ -72,6 +73,7 @@ from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.integrations.adapters import payme as payme_adapter
+from app.modules.norms.models import Calculation
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events, ledger, repo
 from app.modules.payments.models import (
@@ -97,6 +99,11 @@ logger = structlog.get_logger(__name__)
 INVOICE_ISSUE = "invoice.issue"
 INVOICE_CANCEL = "invoice.cancel"
 INVOICE_PAY = "invoice.pay"
+# Ruling #185's own literal, spelled the same way in decisions.md and in the
+# plan — NOT this file's usual present-tense idiom (`invoice.issue`,
+# `invoice.pay`): the ruling names the audit row itself, so it is copied
+# verbatim rather than reshaped to match the sibling constants above.
+INVOICE_SETTLE_BY_BENEFIT = "invoice.settled_by_benefit"
 PAY_INTENT_CREATE = "payment_intent.create"
 # 3.10b task 8: money that was already confirmed going back (`record_reversal`).
 # "record", not "reverse": the money moved outside the system and this action
@@ -334,6 +341,166 @@ def missing_payme_receivers(snapshot: Sequence[InvoiceRecipient]) -> list[Invoic
     return [row for row in snapshot if row.amount > 0 and not row.payme_account_id]
 
 
+def _free_settlement_benefit_code(calculation: Calculation) -> str | None:
+    """Ruling #185's own condition, checked ONCE, here: `calculation.amount
+    == 0` AND its `breakdown` (`norms.calculator._apply_benefit`) carries at
+    least one `{"kind": "benefit", ...}` line whose `modifier` is exactly
+    zero. Returns that line's own `code` — the benefit actually granted —
+    or `None`.
+
+    **Compared as `Decimal`, never as the STRING `_apply_benefit` itself
+    writes** (`str(modifiers[benefit_code])`, which every #181 row seeds as
+    `"0"` but could as well be written `"0.000000"` or `"0E-6"` by a future
+    admin edit) — `"0" == "0.0"` is `False` as strings and `True` as
+    `Decimal`. A line whose `modifier` fails to parse is skipped, not
+    fatal: `breakdown` is JSONB on an APPEND-ONLY table, and a row from a
+    calculator shape older than this ruling must still issue an invoice,
+    just never for free.
+
+    **`None` for every OTHER zero — the fail-closed half of the ruling.**
+    A tariff published at a genuine zero coefficient, or a unit nobody has
+    priced yet, carries no `benefit` line at all, and this returns `None`
+    so `issue_invoice` keeps issuing the plain `pending` invoice it always
+    has — loud in the accountant's list, never silently free."""
+    if calculation.amount != 0:
+        return None
+    for line in calculation.breakdown or []:
+        if not isinstance(line, dict) or line.get("kind") != "benefit":
+            continue
+        modifier = line.get("modifier")
+        if modifier is None:
+            continue
+        try:
+            is_zero = Decimal(str(modifier)) == 0
+        except ArithmeticError:  # InvalidOperation is one of these
+            continue
+        if is_zero:
+            code = line.get("code")
+            if isinstance(code, str):
+                return code
+    return None
+
+
+async def _verified_claim_of(
+    db: AsyncSession, application: Any, benefit_code: str
+) -> BenefitClaim | None:
+    """Ruling #185's missing half (stage 10 review, finding 1): the benefit
+    the CALCULATION priced must be the benefit the APPLICATION claimed and
+    somebody verified — the leshoz inside the review, or the Union register
+    at filing (#182). Returns the claim (code and the category's own name,
+    for the applicant's notice) or `None` when the application's claim is
+    absent, unverified, rejected, or a different category than the line."""
+    if application.benefit_verification_status != "verified":
+        return None
+    item_id = application.benefit_category_item_id
+    if item_id is None:
+        return None
+    item = await admin_repo.get_classifier_item(db, item_id)
+    if item is None or item.code != benefit_code:
+        return None
+    return BenefitClaim(code=item.code, name=str((item.name or {}).get("uz_latn") or item.code))
+
+
+@dataclass(frozen=True)
+class BenefitClaim:
+    code: str
+    name: str
+
+
+async def _settle_free(db: AsyncSession, *, invoice: Invoice, claim: BenefitClaim) -> None:
+    """Ruling #185: a zero-sum invoice from a benefit settles ITSELF, in the
+    SAME transaction `issue_invoice` created it in — called only from
+    there, after the invoice row (and its `invoice_recipients` snapshot)
+    already exist, so reports keep counting what was granted free and
+    under which category even though nothing was ever billed.
+
+    Writes exactly what a confirmed payment writes, MINUS the two things
+    that require money to have actually moved: `invoice.status = 'paid'`,
+    `invoice.paid_at = now()` (ruling #185's own words — a fresh clock read,
+    not a reuse of `issued_at`: the two are the same TRANSACTION but not
+    the same instant, and `confirm_payment`'s own `paid_at` is likewise the
+    moment of confirmation, never the moment of issuance), the application
+    `INVOICED -> PAID` through the SAME `applications.service.set_status`
+    `confirm_payment` calls (never a second way to reach PAID), and
+    `payment_confirmed` published with the IDENTICAL payload shape
+    `confirm_payment` publishes — two identifiers, nothing else — so
+    `permits.subscribers.on_payment_confirmed` cannot tell the two apart.
+    Deliberately does NOT write a `provider_transactions` row and does NOT
+    call `ledger.split_payment`/`repo.add_allocations`: nothing arrived, so
+    there is nothing to divide — a ledger entry here would claim money that
+    was never seen, and `service.is_settled_by_benefit` below reads the
+    resulting ABSENCE of a `provider_transactions` row as this function's
+    own signature."""
+    invoice.status = "paid"
+    invoice.paid_at = datetime.now(UTC)
+
+    await audit.log(
+        db,
+        action=INVOICE_SETTLE_BY_BENEFIT,
+        object_type="invoice",
+        object_id=invoice.id,
+        new_value={"benefit_code": claim.code},
+    )
+
+    application = await applications_service.set_status(
+        db, invoice.application_id, to_status="PAID"
+    )
+
+    await notifications_service.notify(
+        db,
+        event_code=events.INVOICE_SETTLED_BY_BENEFIT,
+        recipient_user_id=application.submitted_by_user_id,
+        params={
+            "invoice_number": invoice.number,
+            # The category's own name, never the code: «To'lov talab
+            # qilinmaydi: war_veterans» is what the review found in the SMS.
+            "benefit": claim.name,
+        },
+        object_type="invoice",
+        object_id=invoice.id,
+    )
+
+    # Same bus name, same two-key payload `confirm_payment` publishes below
+    # (`events.PAYMENT_CONFIRMED`, "no second source of truth for money" —
+    # ruling 15) — `permits.subscribers.on_payment_confirmed` reads
+    # `application_id` off this event and must not be able to tell a free
+    # settlement from a real one.
+    await publish(
+        db,
+        Event(
+            name=events.PAYMENT_CONFIRMED,
+            payload={
+                "invoice_id": str(invoice.id),
+                "application_id": str(invoice.application_id),
+            },
+        ),
+    )
+
+
+async def is_settled_by_benefit(db: AsyncSession, invoice: Invoice) -> bool:
+    """Ruling #185: whether `invoice` was settled through `_settle_free`
+    above — so the cabinet and the register can say "nothing to pay"
+    without parsing audit rows. Named WITHOUT a leading underscore since it
+    is read from `router.py` across files, the same convention `holds_
+    payments_view`'s own docstring states.
+
+    **The cheapest honest derivation** (plan B4), checked in this order so
+    the database is asked only for the rare row that is actually a
+    candidate: `invoice.status == "paid"` AND `invoice.amount == 0` — the
+    ONLY zero this module ever settles for free (the fail-closed half of
+    the ruling: no other zero ever reaches `status='paid'`, since Payme's
+    own `-31001` pins `transaction.amount == invoice.amount` and
+    `ManualConfirmationIn.amount` is bounded `gt=0`) — AND no `provider_
+    transactions` row exists for it. A real payment, Payme's or the manual
+    maker-checker door's synthetic `provider='manual'` row alike, ALWAYS
+    writes one (`confirm_payment`'s own docstring); `_settle_free` never
+    does. Every other invoice answers `False` from its own already-loaded
+    columns, with no query at all."""
+    if invoice.status != "paid" or invoice.amount != 0:
+        return False
+    return not await repo.has_provider_transaction(db, invoice.id)
+
+
 async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     """The whole business action behind `APPLICATION_APPROVED`: freeze the
     application's current calculation into an invoice, move the application to
@@ -370,6 +537,16 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     fixed amounts alone exceed the invoice refuses the WHOLE issuance
     (`ledger.SplitDoesNotFit` -> `ERR-VAL-001`) rather than issuing an
     invoice nobody could divide.
+
+    Ruling #185, checked last, on the branch that CREATES a new invoice:
+    when `calculation.amount == 0` AND its own `breakdown` carries a
+    `benefit` line whose `modifier` is zero (`_free_settlement_benefit_
+    code`), the invoice settles ITSELF in this same transaction
+    (`_settle_free`) instead of sitting `pending` for a payment nobody can
+    ever make — every #181 benefit prices at exactly zero, and `Manual
+    ConfirmationIn.amount` is bounded `gt=0`. Any OTHER zero (a genuine
+    zero tariff, an unpriced unit) carries no such line and issues the
+    plain `pending` invoice unchanged — the fail-closed half of the ruling.
     """
     existing = await invoice_for_application(db, application_id)
     if existing is not None:
@@ -464,22 +641,51 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     )
     await repo.add_invoice_recipients(db, _snapshot_rows(invoice, recipients, shares, leshoz))
 
-    await notifications_service.notify(
-        db,
-        event_code=events.INVOICE_ISSUED,
-        recipient_user_id=application.submitted_by_user_id,
-        params={
-            "application_number": application.number,
-            "amount": invoice.amount,
-            # CLAUDE.md "Time": store UTC, display Asia/Tashkent — a plain
-            # `.date()` here would read the UTC calendar day, off by one for
-            # roughly five hours a day (the same class business_today()
-            # exists to avoid, applied to a stored value rather than "now").
-            "due_date": invoice.due_at.astimezone(TASHKENT).date(),
-        },
-        object_type="invoice",
-        object_id=invoice.id,
-    )
+    # Ruling #185, checked LAST: the invoice above is issued in FULL either
+    # way — the recipients snapshot just frozen included, so reports keep
+    # counting what was granted free and under which category — and only
+    # what happens NEXT forks. `_free_settlement_benefit_code` re-reads
+    # `calculation.amount`/`.breakdown` rather than trusting a flag, so a
+    # calculation whose OWN numbers do not carry a zero-modifier benefit
+    # line NEVER takes this branch, whatever its `amount` happens to be —
+    # the fail-closed half of the ruling.
+    benefit_code = _free_settlement_benefit_code(calculation)
+    claimed = await _verified_claim_of(db, application, benefit_code) if benefit_code else None
+    if benefit_code is not None and claimed is None:
+        # Stage 10 review, finding 1 — the hiding shape again. A head can
+        # POST a calculation with ANY `benefit_code` (`norms` binds it to
+        # the contour only, ruling 20), so a zero-sum calculation is not
+        # proof the APPLICATION earned it: this one claimed nothing, or its
+        # claim is not `verified`, or it claimed a different category. The
+        # invoice stays `pending` at 0 — exactly as loud as before #185 —
+        # and the log says why; nothing is granted free on a line somebody
+        # typed.
+        logger.warning(
+            "payments.free_settlement_refused",
+            invoice_id=str(invoice.id),
+            application_id=str(application.id),
+            benefit_code=benefit_code,
+            claim_status=application.benefit_verification_status,
+        )
+    if claimed is not None:
+        await _settle_free(db, invoice=invoice, claim=claimed)
+    else:
+        await notifications_service.notify(
+            db,
+            event_code=events.INVOICE_ISSUED,
+            recipient_user_id=application.submitted_by_user_id,
+            params={
+                "application_number": application.number,
+                "amount": invoice.amount,
+                # CLAUDE.md "Time": store UTC, display Asia/Tashkent — a plain
+                # `.date()` here would read the UTC calendar day, off by one for
+                # roughly five hours a day (the same class business_today()
+                # exists to avoid, applied to a stored value rather than "now").
+                "due_date": invoice.due_at.astimezone(TASHKENT).date(),
+            },
+            object_type="invoice",
+            object_id=invoice.id,
+        )
     return invoice
 
 

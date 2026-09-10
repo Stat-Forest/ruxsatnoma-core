@@ -338,12 +338,16 @@ async def submit_application(
     resolved once; `ctx.save()` runs before the response so a replay returns
     the stored 200 rather than allocating a second number.
 
-    400 `ERR-APP-001` (missing fields, NAMED); 409 `ERR-APP-004` in any status
-    but DRAFT; 422 `ERR-APP-003` for a benefit claim with no supporting
-    document; 409 `ERR-GIS-005` for a contour with no published version;
-    `ERR-GIS-001/002/005` or `ERR-NORM-001/002/003/006` when a BLOCKING check
-    fails — the difference from the pre-check, which reports the identical
-    result as data; 422 `ERR-SIGN-001` for an invalid signature; 409
+    400 `ERR-APP-001` (missing fields, NAMED — ruling #184's `rules_accepted`
+    is one of them, `false` unless the caller explicitly sends `true`); 409
+    `ERR-APP-004` in any status but DRAFT; 422 `ERR-APP-003` for a benefit
+    claim with no certificate number, no supporting document, or one the
+    auto-verifier seam (ruling #182) reports `unknown`/`not_yours`; 409
+    `ERR-GIS-005` for a contour with no published version; `ERR-GIS-001/002/005`
+    or `ERR-NORM-001/002/003/006` when a BLOCKING check fails — the difference
+    from the pre-check, which reports the identical result as data; 422
+    `ERR-SIGN-001` for an invalid signature, or (ruling #183) `pkcs7` absent on
+    a `on_behalf="legal"` filing (`simple_signature_not_allowed`); 409
     `ERR-APP-002` with the existing number when another active application
     already covers this plot and period.
     """
@@ -351,6 +355,7 @@ async def submit_application(
         db,
         application_id,
         pkcs7=payload.pkcs7,
+        rules_accepted=payload.rules_accepted,
         actor=actor,
         ip=request.client.host if request.client else None,
     )
@@ -781,12 +786,18 @@ async def reject_application(
 ) -> ApplicationDecisionOut:
     """IN_REVIEW -> REJECTED, with the grounds `tz/04` С8 requires.
 
-    `reason_item_id` and `legal_basis` are REQUIRED fields of the body, so a
-    refusal with no grounds is 422 `ERR-VAL-001` from pydantic — before the
-    handler, and therefore before a signature could be spent on a request that
-    cannot succeed. A `reason_item_id` outside the `rejection_reasons`
-    classifier, or archived, is the service's own 422 `ERR-VAL-001`
-    (`unknown_rejection_reason`), still ahead of the ERI.
+    `reason_item_id` is a REQUIRED field of the body, so a refusal naming no
+    reason at all is 422 `ERR-VAL-001` from pydantic — before the handler, and
+    therefore before a signature could be spent on a request that cannot
+    succeed. A `reason_item_id` outside the `rejection_reasons` classifier, or
+    archived, is the service's own 422 `ERR-VAL-001` (`unknown_rejection_
+    reason`), still ahead of the ERI.
+
+    `legal_basis` is OPTIONAL at the wire (ruling #182): omitted while the
+    application's own benefit claim is `rejected`, the leshoz's own reason
+    for THAT becomes the grounds for this; omitted otherwise, still 422
+    `ERR-VAL-001` (`legal_basis_required`) — the mandatory-grounds rule
+    intact, just enforced one layer in.
 
     No role limit: decision #29 caps what a head may GRANT. 404 and 409 exactly
     as on `/approve` above.

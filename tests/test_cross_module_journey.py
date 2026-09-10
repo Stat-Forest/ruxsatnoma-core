@@ -782,3 +782,312 @@ async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
         "provider in a unit test. Ruling #176 stops NEW ones being created; "
         "this signal is how the ones already in the database stay visible"
     )
+
+
+# --- Stage 10: the free path — a 100% benefit, the button, self-settlement ---
+
+
+async def test_the_free_path_from_filing_to_an_active_permit(
+    db: AsyncSession,
+    head_client: Signer,
+    chief_forester_client: Signer,
+    accountant_client: Signer,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+) -> None:
+    """Rulings #181-#185, walked together end to end — each was proven inside
+    its own module's suite (`applications/test_submit.py`,
+    `applications/test_benefit_verification.py`, `payments/
+    test_free_settlement.py`, `permits/test_signatures.py`), and nothing
+    before this test ran the whole chain: a citizen filing WITH the button
+    (#183), a 100% recreation benefit the leshoz verifies (#181/#182), an
+    invoice that settles ITSELF with no Payme step at all (#185), and the
+    holder signing the printed permit with the SAME button (#183) rather
+    than an ERI.
+
+    The tariff mutated below is migration `0012`'s own seeded, published
+    `recreation` row — shared, singleton data `tests/modules/norms/
+    test_seeds.py` asserts a coefficient against but never `benefit_
+    modifiers` — restored in `finally`, the same "own session, undo it"
+    shape `test_submit.py::
+    test_a_tariff_published_between_package_and_submit_is_also_package_changed`
+    already uses for the identical class of row.
+    """
+    from datetime import date
+
+    from sqlalchemy import text
+
+    from app.core import storage
+    from app.modules.applications.models import ApplicationStatusHistory
+    from app.modules.integrations.adapters.eimzo import encode_mock_signature
+    from app.modules.norms.models import Tariff
+    from app.modules.permits.models import PermitTemplate
+    from app.modules.signatures.models import Signature
+    from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
+    from tests.modules.permits.conftest import _signer_for, sign_permit_simple, unique_pinfl
+
+    BENEFIT_CODE = "war_veterans"  # one of #181's six recreation categories
+
+    contour = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    await db.commit()
+
+    recreation_activity_id = await db.scalar(
+        text("SELECT id FROM activity_types WHERE code = 'recreation'")
+    )
+    benefit_category_item_id = await db.scalar(
+        text(
+            "SELECT i.id FROM classifier_items i JOIN classifiers c ON c.id = i.classifier_id "
+            "WHERE c.code = 'benefit_categories' AND i.code = :code AND i.status = 'active'"
+        ).bindparams(code=BENEFIT_CODE)
+    )
+    benefit_doc_type_item_id = await db.scalar(
+        text(
+            "SELECT i.id FROM classifier_items i JOIN classifiers c ON c.id = i.classifier_id "
+            "WHERE c.code = 'doc_types' AND i.code = 'benefit_proof' AND i.status = 'active'"
+        )
+    )
+    assert recreation_activity_id is not None
+    assert benefit_category_item_id is not None
+    assert benefit_doc_type_item_id is not None, "migration 0024 seeds this; go-live checklist item"
+
+    tariff = (
+        await db.execute(
+            select(Tariff).where(
+                Tariff.activity_type_id == recreation_activity_id,
+                Tariff.livestock_group.is_(None),
+                Tariff.status == "published",
+            )
+        )
+    ).scalar_one()
+    original_modifiers = tariff.benefit_modifiers
+    tariff.benefit_modifiers = {BENEFIT_CODE: "0"}
+    await db.commit()
+
+    # Migration 0019 seeds an active template for `grazing` alone — every
+    # other activity has none until an administrator uploads one
+    # (`permits/models.py::PermitTemplate`'s own docstring), and the layout
+    # BUNDLED with the module (`layout_file_id=NULL`) is grazing's own —
+    # `{{sb_load}}` among its placeholders, which a recreation application
+    # never fills (`ERR-VAL-001 unfilled_placeholders`). A STORED layout of
+    # this test's own, the same shape `permits/conftest.py::apiary_template`
+    # uses, sidesteps every activity-specific placeholder.
+    RECREATION_LAYOUT_FILE_ID = uuid.UUID("01a06200-0000-7000-8000-000000000002")
+    RECREATION_LAYOUT_KEY = "t/permits-recreation-layout-b2.html"
+    layout_bytes = (
+        "<html><body><h1>{{ series }} № {{ number }}</h1>"
+        '<p>Recreation — {{ holder_name }}</p><img src="{{ qr }}"></body></html>'
+    ).encode()
+    await storage.ensure_bucket()
+    await storage.put_object(RECREATION_LAYOUT_KEY, layout_bytes, "text/html")
+    layout_file = await db.get(MediaFile, RECREATION_LAYOUT_FILE_ID)
+    if layout_file is None:
+        layout_file = MediaFile(
+            id=RECREATION_LAYOUT_FILE_ID,
+            storage_key=RECREATION_LAYOUT_KEY,
+            filename="recreation_layout.html",
+            content_type="text/html",
+            size_bytes=len(layout_bytes),
+            sha256=hashlib.sha256(layout_bytes).hexdigest(),
+        )
+        db.add(layout_file)
+        await db.flush()
+
+    # Get-or-create: a previous run's row is reused rather than colliding
+    # with `uq_permit_templates_active`.
+    recreation_template = (
+        await db.execute(
+            select(PermitTemplate).where(
+                PermitTemplate.activity_type_id == recreation_activity_id,
+                PermitTemplate.status == "active",
+            )
+        )
+    ).scalar_one_or_none()
+    if recreation_template is None:
+        recreation_template = PermitTemplate(
+            activity_type_id=recreation_activity_id,
+            version=1,
+            name={"uz_cyrl": "Тест бланки", "en": "Test recreation layout"},
+            layout_file_id=layout_file.id,
+            status="active",
+            valid_from=date(2020, 1, 1),
+        )
+        db.add(recreation_template)
+    recreation_template.layout_file_id = layout_file.id
+    await db.commit()
+
+    applicant_user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    db.add(
+        Applicant(
+            kind="individual",
+            pinfl=applicant_user.pinfl,
+            name=applicant_user.full_name,
+            owner_user_id=applicant_user.id,
+            address="Toshkent shahri, Chilonzor tumani, 1-uy",
+        )
+    )
+    await db.flush()
+    await db.commit()
+
+    try:
+        async for reviewer in _signer_for(
+            db, role_code="executor_staff", organization_id=leshoz.id
+        ):
+            async for citizen in _signer_for(db, role_code="applicant", user=applicant_user):
+                # --- file: recreation, self, a real 100% benefit claim ------------
+                created = await citizen.client.post(
+                    f"{API}/applications", json={"on_behalf": "self"}
+                )
+                assert created.status_code == 201, created.text
+                app_id = created.json()["id"]
+
+                patched = await citizen.client.patch(
+                    f"{API}/applications/{app_id}",
+                    json={
+                        "contour_id": str(contour.id),
+                        "activity_type_id": str(recreation_activity_id),
+                        "period_from": "2027-09-01",
+                        "period_to": "2027-09-30",
+                        "quantity": "2",
+                        "benefit_category_item_id": str(benefit_category_item_id),
+                        "benefit_certificate_no": "VET-0001",
+                    },
+                )
+                assert patched.status_code == 200, patched.text
+
+                uploaded = await citizen.client.post(
+                    f"{API}/files",
+                    files={"file": ("proof.pdf", b"%PDF-1.4 test", "application/pdf")},
+                )
+                assert uploaded.status_code == 201, uploaded.text
+                proof = await citizen.client.post(
+                    f"{API}/applications/{app_id}/documents",
+                    json={
+                        "doc_type_item_id": str(benefit_doc_type_item_id),
+                        "file_id": uploaded.json()["id"],
+                    },
+                )
+                assert proof.status_code == 201, proof.text
+
+                # --- the button (ruling #183): on_behalf=self, no envelope -------
+                submitted = await citizen.client.post(
+                    f"{API}/applications/{app_id}/submit",
+                    json={"rules_accepted": True},
+                    headers={"Idempotency-Key": str(uuid.uuid4())},
+                )
+                assert submitted.status_code == 200, submitted.text
+                assert submitted.json()["benefit_verification_status"] == "pending"
+                assert submitted.json()["rules_accepted_at"] is not None
+
+                history = (
+                    await db.scalars(
+                        select(ApplicationStatusHistory).where(
+                            ApplicationStatusHistory.application_id == uuid.UUID(app_id),
+                            ApplicationStatusHistory.to_status == "SUBMITTED",
+                        )
+                    )
+                ).one()
+                submission_signature = (
+                    await db.scalars(
+                        select(Signature).where(
+                            Signature.object_type == "application_submission",
+                            Signature.object_id == history.id,
+                        )
+                    )
+                ).one()
+                assert submission_signature.kind == "simple"
+
+                # --- the leshoz's own review: start, then verify the claim --------
+                started = await reviewer.client.post(f"{API}/applications/{app_id}/start-review")
+                assert started.status_code == 200, started.text
+                verified = await reviewer.client.post(
+                    f"{API}/applications/benefit-verifications/{app_id}/verify"
+                )
+                assert verified.status_code == 200, verified.text
+                assert verified.json()["benefit_verification_status"] == "verified"
+
+                # --- the head approves; the invoice must settle ITSELF -------------
+                doc = (await head_client.client.get(f"{API}/applications/{app_id}/package")).content
+                approved = await head_client.client.post(
+                    f"{API}/applications/{app_id}/approve",
+                    json={
+                        "pkcs7": encode_mock_signature(
+                            document=doc,
+                            serial=head_client.serial,
+                            issuer="ISS-1",
+                            pinfl=head_client.pinfl,
+                        )
+                    },
+                )
+                assert approved.status_code == 200, approved.text
+                # NOT "INVOICED" — ruling #185's `_settle_free` runs INSIDE this
+                # same request's transaction, so a 100% benefit claim is already
+                # PAID by the time this response serializes; the ordinary
+                # (still-to-be-paid) case is what every OTHER decision test in
+                # this file asserts "INVOICED" against.
+                assert approved.json()["status"] == "PAID"
+
+                application = await applications_service.get(db, uuid.UUID(app_id))
+                assert application is not None
+                assert (await _reread(db, application)).status == "PAID", (
+                    "ruling #185: a benefit-settled invoice moves the application "
+                    "straight to PAID — no Payme step, no manual confirmation"
+                )
+
+                invoice = await payments_service.invoice_for_application(db, application.id)
+                assert invoice is not None
+                await db.refresh(invoice)
+                assert invoice.status == "paid"
+                assert invoice.amount == Decimal("0.00")
+                assert await payments_service.is_settled_by_benefit(db, invoice) is True
+
+                provider_txns = await db.scalars(
+                    select(ProviderTransaction).where(ProviderTransaction.invoice_id == invoice.id)
+                )
+                assert list(provider_txns) == [], "ruling #185: nothing arrived, nothing to split"
+
+                # --- a human forms the document -----------------------------------
+                issued = await reviewer.client.post(f"{API}/applications/{app_id}/permit")
+                assert issued.status_code == 201, issued.text
+                permit_id = uuid.UUID(issued.json()["id"])
+
+                pdf_response = await citizen.client.get(f"{API}/permits/{permit_id}/pdf")
+                assert pdf_response.status_code == 200, pdf_response.text
+                pdf = pdf_response.content
+                assert len(pdf) > 0
+
+                # --- the 3+1 signatures: the holder uses the button (ruling #183) -
+                for signer, purpose in (
+                    (head_client, "permit_head"),
+                    (chief_forester_client, "permit_chief_forester"),
+                    (accountant_client, "permit_accountant"),
+                ):
+                    result = await sign_permit(signer, permit_id, purpose, pdf)
+                    assert result.status_code == 200, (purpose, result.text)
+                holder_result = await sign_permit_simple(
+                    citizen, permit_id, signers.RECIPIENT_PURPOSE
+                )
+                assert holder_result.status_code == 200, holder_result.text
+
+                permit = await permits_service.get(db, permit_id)
+                assert permit is not None
+                assert (await _reread(db, permit)).status == "active"
+                assert (await _reread(db, application)).status == "PERMIT_ISSUED"
+
+                holder_signature = (
+                    await db.scalars(
+                        select(Signature).where(
+                            Signature.object_type == "permit",
+                            Signature.object_id == permit_id,
+                            Signature.purpose == signers.RECIPIENT_PURPOSE,
+                        )
+                    )
+                ).one()
+                assert holder_signature.kind == "simple"
+                assert holder_signature.certificate_id is None
+    finally:
+        tariff.benefit_modifiers = original_modifiers
+        await db.commit()

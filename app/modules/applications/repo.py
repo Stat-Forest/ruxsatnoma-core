@@ -708,97 +708,17 @@ async def assigned_open_application_ids_for_org(
     return (await db.execute(stmt)).scalars().all()
 
 
-# --- Ruling #179: the benefit-verification office's own reads/writes --------
+# --- Rulings #179/#182: the benefit claim's own read/write --------------------
 #
-# A query of its own, deliberately not a filter bolted onto `list_applications`
-# above: that function's `scope` is always an applicant-or-zone union
-# (`service.list_applications`'s own docstring — an `applicant_id IN (...)`,
-# `abac.zone_filter`'s expression, or their OR), and this role has neither. It
-# sees every leshoz's rows and ONLY the ones carrying a certificate-bearing
-# claim — "the whole country, but only applications with this claim"
-# (decisions.md #179) is a genuinely new predicate, not a wider zone.
-#
-# `status != "DRAFT"` is asserted explicitly rather than merely trusted. It is
-# redundant today — `applications.service.submit` is the only writer of
-# `benefit_verification_status` (this module's own report to the integrator:
-# it never leaves its `not_required` default before submission), so an
-# unsubmitted draft can never match `CERTIFICATE_BEARING_STATUSES` anyway —
-# but ruling #110 ("no staff caller reads a DRAFT, ever") is exactly the class
-# of rule a SECOND source of truth would silently stop enforcing the day
-# something upstream changes, so this file states it as its own condition
-# rather than leaning on a fact it does not control.
+# `CERTIFICATE_BEARING_STATUSES` used to gate a country-wide query
+# (`list_certificate_claims`, a central office's queue — ruling #179). Ruling
+# #182 moved verification to the leshoz's own review, reached through the
+# ORDINARY application read/zone rule (`service._readable_application`,
+# `._assert_in_actor_zone`) — that query and its two single-row siblings are
+# GONE, not merely unused, and this tuple is kept only as the "does this
+# application carry a claim at all" test `benefit_verification.get_claim`
+# still needs.
 CERTIFICATE_BEARING_STATUSES = ("pending", "verified", "rejected")
-
-
-async def list_certificate_claims(
-    db: AsyncSession,
-    *,
-    verification_status: str | None,
-    offset: int,
-    limit: int,
-) -> tuple[list[Application], int]:
-    """Every application carrying a certificate-bearing benefit claim, in ANY
-    leshoz — the central office's queue. `verification_status`, when given,
-    narrows to exactly one of `CERTIFICATE_BEARING_STATUSES` (`pending` is the
-    office's actual work; `verified`/`rejected` are its own history). Newest
-    first by `id` (`uuid7`, time-ordered) — `list_applications`'s own
-    convention above."""
-    conditions: list[Any] = [
-        Application.status != "DRAFT",
-        Application.benefit_verification_status.in_(CERTIFICATE_BEARING_STATUSES),
-    ]
-    if verification_status is not None:
-        conditions.append(Application.benefit_verification_status == verification_status)
-
-    counted = select(Application.id).where(*conditions)
-    total = (await db.execute(select(func.count()).select_from(counted.subquery()))).scalar_one()
-    rows = await db.execute(
-        select(Application)
-        .where(*conditions)
-        .order_by(Application.id.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-    return list(rows.scalars().all()), total
-
-
-async def get_certificate_claim(db: AsyncSession, application_id: uuid.UUID) -> Application | None:
-    """One application, but ONLY if it qualifies for `list_certificate_claims`
-    above — the read `benefit_verification.get_claim` uses. A stranger's
-    ordinary application (a real row, wrong shape) is `None` here exactly like
-    an id that does not exist at all, which is what lets the router answer
-    both with the same 404 (ruling #179's own negative test: a verifier reads
-    an unrelated application and gets what a stranger gets)."""
-    rows = await db.execute(
-        select(Application).where(
-            Application.id == application_id,
-            Application.status != "DRAFT",
-            Application.benefit_verification_status.in_(CERTIFICATE_BEARING_STATUSES),
-        )
-    )
-    return rows.scalars().first()
-
-
-async def get_certificate_claim_for_update(
-    db: AsyncSession, application_id: uuid.UUID
-) -> Application | None:
-    """`get_certificate_claim`'s locking sibling, `get_application_for_
-    update`'s own shape (line ~46) — `benefit_verification.verify_claim`/
-    `.reject_claim` take this lock so two verifiers deciding the same claim at
-    once serialise on it rather than racing, the identical reasoning
-    `get_application_for_update`'s own docstring states for a status
-    transition."""
-    application = await db.get(
-        Application, application_id, with_for_update=True, populate_existing=True
-    )
-    if application is None:
-        return None
-    if (
-        application.status == "DRAFT"
-        or application.benefit_verification_status not in CERTIFICATE_BEARING_STATUSES
-    ):
-        return None
-    return application
 
 
 async def set_benefit_verification(

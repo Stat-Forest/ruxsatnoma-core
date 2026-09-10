@@ -12,6 +12,7 @@ import app.modules.auth.models  # noqa: F401
 import app.modules.integrations.models  # noqa: F401
 from app.modules.applications import models as applications_models  # noqa: F401
 from app.modules.archive import models as archive_models  # noqa: F401
+from app.modules.beekeepers import models as beekeepers_models  # noqa: F401
 from app.modules.gis import models as gis_models  # noqa: F401
 from app.modules.help import models as help_models  # noqa: F401
 from app.modules.inspections import models as inspections_models  # noqa: F401

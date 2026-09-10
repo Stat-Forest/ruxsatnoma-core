@@ -472,6 +472,114 @@ async def test_0045_downgrade_survives_a_committed_invoice_recipients_row(engine
             )
 
 
+async def test_0052_downgrade_deletes_a_simple_signature_row(engine):
+    """Track B1 (stage 10), ruling #183: `0052`'s downgrade must delete every
+    `kind = 'simple'` row before restoring `certificate_id NOT NULL` — a
+    simple row carries no certificate by construction, so the bare `ALTER
+    COLUMN ... SET NOT NULL` would otherwise refuse the instant one real row
+    sits in the table (lesson: a downgrade must delete whatever its upgrade
+    made possible)."""
+    url = get_settings().database_url_test
+    cfg = _alembic_config(url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    signature_id = uuid.uuid4()
+    object_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        # No `signer_user_id`/FK chain needed at all — the column is nullable
+        # and this test is about the MIGRATION's downgrade, not about what a
+        # real `sign_simple()` row looks like end to end (that is
+        # `tests/modules/signatures/test_simple.py`'s job).
+        await conn.execute(
+            text(
+                "INSERT INTO signatures "
+                "(id, object_type, object_id, purpose, kind, certificate_id, "
+                "doc_hash, signature_value, signed_at, verification, verification_status) "
+                "VALUES (CAST(:id AS uuid), 'permit', CAST(:object_id AS uuid), "
+                "'permit_recipient', 'simple', NULL, "
+                "'deadbeef', '', now(), '{}'::jsonb, 'valid')"
+            ),
+            {"id": signature_id, "object_id": object_id},
+        )
+
+    try:
+        # THE PROOF: this must not raise — before a correct downgrade, restoring
+        # `certificate_id NOT NULL` against this row's own NULL would abort with
+        # a NotNullViolation.
+        await asyncio.to_thread(command.downgrade, cfg, "0051")
+
+        async with engine.connect() as conn:
+            exists = (
+                await conn.execute(
+                    text("SELECT EXISTS (SELECT 1 FROM signatures WHERE id = CAST(:id AS uuid))"),
+                    {"id": signature_id},
+                )
+            ).scalar_one()
+        assert exists is False, "a simple row must not survive the downgrade to 0051"
+    finally:
+        # Leave the schema at head regardless of outcome — the next test in
+        # this file must find it there. Nothing to clean up: the row this
+        # test inserted is exactly what the downgrade deleted (or, had the
+        # downgrade raised, still needs no cleanup of its own since the next
+        # `upgrade head` neither restores nor duplicates it).
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+
+
+async def test_0053_role_rename_keeps_a_users_assignment(engine):
+    """Stage 10, ruling #182: `0053` renames `benefit_verifier` to
+    `beekeeping_registrar` by UPDATE, same row id — a user assigned that
+    role before the migration must still hold it after, because nothing
+    ever touches `users.role_id`. Walked as a real downgrade→upgrade
+    (`test_downgrade_upgrade_roundtrip` only ever runs base→head on an
+    EMPTY database, so it never exercises this): land on `0051` (the OLD
+    role name), assign a user, upgrade to `0053`, and check the SAME row
+    id now reads the NEW code."""
+    url = get_settings().database_url_test
+    cfg = _alembic_config(url)
+    # `upgrade` only ever walks FORWARD — on a DB already at/past `0053` (the
+    # common case: the session migrator already brought it to head) a bare
+    # `command.upgrade(cfg, "0051")` is a silent no-op, not a downgrade. Land
+    # on head first, then walk back explicitly.
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+    await asyncio.to_thread(command.downgrade, cfg, "0051")
+
+    user_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        role_id = (
+            await conn.execute(text("SELECT id FROM roles WHERE code = 'benefit_verifier'"))
+        ).scalar_one()
+        await conn.execute(
+            text(
+                "INSERT INTO users "
+                "(id, full_name, role_id, status, must_change_password, failed_login_count) "
+                "VALUES (CAST(:id AS uuid), 'Migration test registrar', "
+                "CAST(:role_id AS uuid), 'active', false, 0)"
+            ),
+            {"id": user_id, "role_id": role_id},
+        )
+
+    try:
+        await asyncio.to_thread(command.upgrade, cfg, "0053")
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT r.id AS role_id, r.code FROM users u "
+                        "JOIN roles r ON r.id = u.role_id WHERE u.id = CAST(:id AS uuid)"
+                    ),
+                    {"id": user_id},
+                )
+            ).one()
+        assert row.role_id == role_id
+        assert row.code == "beekeeping_registrar"
+    finally:
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM users WHERE id = CAST(:id AS uuid)"), {"id": user_id}
+            )
+
+
 async def test_downgrade_upgrade_roundtrip(engine):
     """upgrade head → downgrade base → upgrade head (plan 03.4 ruling 16).
 
@@ -490,4 +598,4 @@ async def test_downgrade_upgrade_roundtrip(engine):
     # every other test (conftest's migrator is session-scoped and autouse, so a
     # branch point kills the whole suite rather than one case). Move this in the
     # SAME commit as the migration that moves the head.
-    assert version == "0051"
+    assert version == "0055"

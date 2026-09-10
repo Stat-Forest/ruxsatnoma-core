@@ -86,6 +86,7 @@ async def list_signatures(
     params: Annotated[PageParams, Depends()],
     object_type: str,
     object_id: uuid.UUID,
+    kind: str | None = None,
 ) -> Page[SignatureOut]:
     """The object's owner (anyone holding at least one signature row of
     their own against it) or `signatures.view_any` (oversight) — a check
@@ -93,9 +94,12 @@ async def list_signatures(
     would reject the object's own signer before the service ever got a
     chance to say otherwise (lesson: a permission check alone is not enough
     on a read path that also needs an ownership check). Ordered by
-    `(signed_at, id)` and paged from its first commit (lessons)."""
+    `(signed_at, id)` and paged from its first commit (lessons). `kind`
+    (ruling #183) narrows the list to `'eri'` or `'simple'` — unfiltered,
+    like `object_type`, no `Literal`: the service reads it as a plain
+    equality filter, and an unrecognised value simply matches nothing."""
     items, total = await service.list_signatures_page(
-        db, object_type=object_type, object_id=object_id, user=user, params=params
+        db, object_type=object_type, object_id=object_id, user=user, params=params, kind=kind
     )
     return Page[SignatureOut](
         items=[SignatureOut.model_validate(item) for item in items],

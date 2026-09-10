@@ -1402,19 +1402,21 @@ async def add_signature(
     permit_id: uuid.UUID,
     *,
     purpose: str,
-    pkcs7: str,
+    pkcs7: str | None,
     user: User,
     ip: str | None = None,
 ) -> Permit:
-    """Attach one of the four ERI signatures, and activate the permit if it was
+    """Attach one of the four signature lines, and activate the permit if it was
     the last one missing.
 
     The order below is the whole of the task and is load-bearing:
 
     1. the permit exists and is `pending_signatures`;
     2. `purpose` is in the configured requirement set;
-    3. **authorization (ruling 4), BEFORE `sign()`;**
-    4. `sign()` over the STORED bytes;
+    3. **authorization (ruling 4), BEFORE `sign()`/`sign_simple()`;**
+    4. `sign()` over the STORED bytes when `pkcs7` is present, `sign_simple()`
+       when it is not AND this is the holder signing an `on_behalf='self'`
+       application (ruling #183) — everyone else with no envelope is refused;
     5. nothing missing -> active, in one step with the application's own move;
     6. audit, always.
 
@@ -1425,15 +1427,27 @@ async def add_signature(
     `signatures` rows are evidence and are never deleted. Checking first costs a
     role lookup; checking last costs the document.
 
+    **Ruling #183, and why it belongs HERE rather than inside `signatures`.**
+    `signatures.service.sign_simple` deliberately does not decide whether a
+    simple signature is allowed for an object — that is a caller's rule, and
+    this module's own rule is the application's `on_behalf`: `self` may use
+    the button on the RECIPIENT line only, `legal` always needs an envelope
+    (decision #9, narrowed by #183), and every STAFF purpose keeps needing one
+    too, whatever `on_behalf` says. Step 3 has already proven WHO may sign
+    `purpose` by the time step 4 runs — for the recipient line specifically,
+    that `user` really is the application's holder — so step 4 only has to
+    ask WHICH mechanism, never re-derive identity.
+
     Signatures may be taken in ANY order (plan ruling 5). `missing_purposes`
     returns an ordered list, but that is a display order for a signing UI, not a
     gate: enforcing a sequence would deadlock the ordinary case where the
     accountant is at their desk and the head is not.
 
-    Nothing of ours is pending when `sign()` is called, deliberately: its
-    transaction contract says every refusal commits the CALLER's whole session
-    before raising, so a half-built change made before it would be committed by
-    somebody else's rejected signature.
+    Nothing of ours is pending when `sign()`/`sign_simple()` is called,
+    deliberately: both share the same transaction contract — every refusal
+    commits the CALLER's whole session before raising, so a half-built change
+    made before either would be committed by somebody else's rejected
+    signature.
     """
     # LOCKED, not `permit_by_id` (review, fix round 1). Everything below —
     # the status check, `sign()`'s insert, `missing_purposes` and the activation
@@ -1489,16 +1503,55 @@ async def add_signature(
     # 4. The stored bytes, never a re-render (ruling 3). This is what makes the
     # four signatures share one `doc_hash` by construction.
     document = await pdf_bytes(db, permit.id)
-    await signatures_service.sign(
-        db,
-        object_type=OBJECT_TYPE,
-        object_id=permit.id,
-        purpose=purpose,
-        document=document,
-        pkcs7=pkcs7,
-        user=user,
-        ip=ip,
-    )
+    if pkcs7 is not None:
+        # An envelope was posted: nothing changes for anyone, whatever the
+        # purpose or the application's `on_behalf` (ruling #183's own text).
+        await signatures_service.sign(
+            db,
+            object_type=OBJECT_TYPE,
+            object_id=permit.id,
+            purpose=purpose,
+            document=document,
+            pkcs7=pkcs7,
+            user=user,
+            ip=ip,
+        )
+    else:
+        # No envelope. Ruling #183's rule lives HERE, not in `signatures`
+        # (`sign_simple`'s own docstring: it takes no position on whether a
+        # simple signature is allowed for this object). Step 3 has already
+        # proven `user` is entitled to sign `purpose` on THIS permit — for the
+        # recipient line, that they really are the application's holder — so
+        # the only question left is which mechanism: the button, for the
+        # holder of an `on_behalf='self'` application, or a flat refusal for
+        # everyone else (a legal entity's representative, or any staff
+        # purpose) without one.
+        application = await applications_service.get(db, permit.application_id)
+        if application is None:
+            raise err("ERR-SYS-003", details={"application": str(permit.application_id)})
+        if purpose == signers.RECIPIENT_PURPOSE and application.on_behalf == "self":
+            await signatures_service.sign_simple(
+                db,
+                object_type=OBJECT_TYPE,
+                object_id=permit.id,
+                purpose=purpose,
+                document=document,
+                user=user,
+                ip=ip,
+            )
+        else:
+            await audit.log(
+                db,
+                action=PERMIT_SIGN,
+                user_id=user.id,
+                object_type=OBJECT_TYPE,
+                object_id=permit.id,
+                result="denied",
+                basis="simple_signature_not_allowed",
+                new_value={"purpose": purpose},
+            )
+            await db.commit()
+            raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
 
     # 5. C11: ACTIVE if and only if every required signature is valid — asked of
     # `signatures`, never counted here.

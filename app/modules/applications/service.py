@@ -17,7 +17,7 @@ names, unchanged since branch 1."""
 
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -164,6 +164,40 @@ DOC_TYPE_CLASSIFIER_CODE = "doc_types"
 # `_assert_benefit_documents` refuses every benefit claim rather than accepting
 # an unchecked attachment as proof.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
+
+
+# A registered verifier for one benefit-category CODE — `beekeepers.service.
+# match_certificate`'s own signature (`db`, then `certificate_no`/`pinfl`/
+# `stir` keyword-only), returning something carrying a `.status` this module
+# reads. `Callable[..., Awaitable[Any]]` rather than a `Protocol` spelling
+# out the keyword-only parameters and the exact return type: pyright checks
+# a `Protocol.__call__`'s return type INVARIANTLY through `Coroutine`'s
+# covariant slot, so a real registration (`beekeepers.service.MatchResult`,
+# a dataclass this module deliberately never imports — see below) fails
+# `reportArgumentType` even though it is a plain structural match at every
+# call site. `...` also sidesteps the keyword-only-vs-positional mismatch a
+# precisely-typed `Callable[[AsyncSession, str, str | None, str | None],
+# ...]` would have with a keyword-only signature.
+#
+# **Never imported here directly.** `applications` (level 3) could import a
+# level-2 module's service directly (it already does, for `norms`/`gis`),
+# but this seam is deliberately data-driven instead, the same idiom `norms.
+# CAPACITY_LOAD_PROVIDERS`/`.EXCLUSIVITY_PROVIDERS` already use: a category
+# with no registered verifier must cost this module nothing, not even an
+# import, and a test proves the EMPTY seam without `beekeepers` existing in
+# that test process at all.
+BenefitAutoVerifier = Callable[..., Awaitable[Any]]
+
+# Ruling #181/#182: a benefit-category CODE with no registered verifier stays
+# `pending` — the leshoz's own review queue, as today. Keyed by CODE, not
+# appended like `norms.LOAD_PROVIDERS`: at most one verifier owns a given
+# category, and a second registration under the same code would silently
+# shadow the first rather than summing two answers the way a load does.
+# Starts EMPTY; `app/event_subscriptions.py` is the one place that fills it
+# (`beekeeping_union_member -> beekeepers.service.match_certificate`), the
+# same idiom `_register_providers` already uses for `CAPACITY_LOAD_
+# PROVIDERS`/`EXCLUSIVITY_PROVIDERS`.
+BENEFIT_AUTO_VERIFIERS: dict[str, BenefitAutoVerifier] = {}
 
 # tz/05's transition table (plan 03.9a task 8, the brief's own copy). All
 # fourteen `APPLICATION_STATUSES` are keys; `ARCHIVED` is terminal. No status
@@ -1634,7 +1668,9 @@ def _package_bytes(
     return json.dumps(package, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-async def _assert_complete(db: AsyncSession, application: Application) -> None:
+async def _assert_complete(
+    db: AsyncSession, application: Application, *, rules_accepted: bool = True
+) -> None:
     """Step 2. Every field a submission needs, or 400 `ERR-APP-001` NAMING the
     ones that are missing.
 
@@ -1647,8 +1683,16 @@ async def _assert_complete(db: AsyncSession, application: Application) -> None:
     a pre-check that said "ready" and a submission that then refused would make
     that route useless at the one thing it exists for. `applicant_id` is absent
     from the list because the column is NOT NULL and cannot be missing.
+
+    **`rules_accepted` (ruling #184) IS a missing field, folded into the SAME
+    list rather than a separate check** — `package` (the other caller, whose
+    `GET` carries no body and therefore no opinion on the checkbox) passes
+    nothing and gets the default `True`, so only `submit` can ever name
+    `rules_accepted` here.
     """
     missing = await checks.missing_for_pricing(db, application)
+    if not rules_accepted:
+        missing.append("rules_accepted")
     if missing:
         raise err("ERR-APP-001", details={"missing": missing})
 
@@ -1671,9 +1715,35 @@ async def _benefit_doc_type(db: AsyncSession) -> Any:
 
 
 async def _open_benefit_verification(db: AsyncSession, application: Application) -> None:
-    """Ruling #179, step 3b: a claim whose category REQUIRES a certificate is
-    filed with its number and enters `pending`; everything else stays
-    `not_required`.
+    """Step 3b. Ruling #181: EVERY benefit category now needs a certificate
+    number — refused for every category with none, not only the ones a
+    per-item switch used to flag. **`requires_certificate` is no longer read
+    at all; the branch reading it is DELETED, not merely skipped** — the
+    number is universal, so there is nothing left for that property to gate.
+
+    **The seam, ruling #182.** A category with a registered
+    `BENEFIT_AUTO_VERIFIERS` entry (keyed by the classifier item's own
+    `code`) is checked automatically against whatever register that verifier
+    speaks for — today, `beekeeping_union_member` against the Beekeeping
+    Union's own register, wired from `app/event_subscriptions.py`, never
+    imported here directly (see `BenefitAutoVerifier`'s own docstring for
+    why). `matched` verifies the claim ON THE SPOT — `benefit_verified_by =
+    NULL` means "the register", ruling #182's own words, distinct from a
+    human verifier's real id. `unknown`/`not_yours` refuse the SUBMISSION
+    itself (422 `ERR-APP-003`): a number that is not provably the applicant's
+    own is not evidence, and letting the filing through `pending` would ask
+    the leshoz to re-decide what the register already answered. A category
+    with NO registered verifier — every #181 recreation category today —
+    stays `pending`, exactly as before: the leshoz's own review queue.
+
+    **Identity for the auto-verifier is read off the SAME `Applicant` row
+    `submit`'s other steps already use** (`auth_service.get_applicant`), not
+    branched on `on_behalf`: an `individual` applicant (`on_behalf="self"`)
+    carries `pinfl` and no `stir`, a `legal` one (`on_behalf="legal"`) the
+    reverse (`identity_by_kind`, `auth/models.py`), so passing both straight
+    through and letting the verifier's own "PINFL when given, else STIR" rule
+    pick is the SAME split ruling #182 asks for, with no second conditional
+    to drift from the CHECK that already enforces it.
 
     Integration finding, stage 9 wave 2 — and the exact shape this project's
     defects keep taking. T9 added the five columns and the verifier's whole
@@ -1694,17 +1764,36 @@ async def _open_benefit_verification(db: AsyncSession, application: Application)
     item = await admin_repo.get_classifier_item(db, item_id)
     if item is None:
         raise err("ERR-APP-003", details={"reason": "unknown_benefit_category"})
-    if not bool((item.props or {}).get("requires_certificate")):
-        application.benefit_verification_status = "not_required"
-        return
     if not (application.benefit_certificate_no or "").strip():
         raise err("ERR-APP-003", details={"reason": "benefit_certificate_required"})
-    # A RESUBMISSION must not silently keep a verdict made about the previous
-    # attempt: the applicant may have changed the number since it was rejected.
-    application.benefit_verification_status = "pending"
-    application.benefit_verified_by = None
-    application.benefit_verified_at = None
-    application.benefit_rejection_reason = None
+
+    verifier = BENEFIT_AUTO_VERIFIERS.get(item.code)
+    if verifier is None:
+        # A RESUBMISSION must not silently keep a verdict made about the
+        # previous attempt: the applicant may have changed the number since
+        # it was rejected.
+        application.benefit_verification_status = "pending"
+        application.benefit_verified_by = None
+        application.benefit_verified_at = None
+        application.benefit_rejection_reason = None
+        return
+
+    applicant = await auth_service.get_applicant(db, application.applicant_id)
+    result = await verifier(
+        db,
+        certificate_no=(application.benefit_certificate_no or "").strip(),
+        pinfl=applicant.pinfl if applicant is not None else None,
+        stir=applicant.stir if applicant is not None else None,
+    )
+    if result.status == "matched":
+        application.benefit_verification_status = "verified"
+        application.benefit_verified_by = None
+        application.benefit_verified_at = datetime.now(UTC)
+        application.benefit_rejection_reason = None
+    elif result.status == "unknown":
+        raise err("ERR-APP-003", details={"reason": "benefit_certificate_unknown"})
+    else:  # "not_yours"
+        raise err("ERR-APP-003", details={"reason": "benefit_certificate_not_yours"})
 
 
 async def _assert_benefit_documents(db: AsyncSession, application: Application) -> None:
@@ -1718,8 +1807,8 @@ async def _assert_benefit_documents(db: AsyncSession, application: Application) 
     claim accepted on evidence nobody checked. The project's posture on
     benefits is fail-closed everywhere else — `ERR-NORM-004` refuses a grazing
     fee outright rather than guessing a missing `coef_sb:*`, and
-    `benefit_categories` ships EMPTY so no benefit can be claimed at all today
-    — and this matches it:
+    a claim on a code no auto-verifier knows waits `pending` for the leshoz
+    rather than passing (`_open_benefit_verification`) — and this matches it:
 
       * the document must be of the `doc_types` item whose code is
         `BENEFIT_DOC_TYPE_CODE` below; a document of any other type does not
@@ -1731,10 +1820,11 @@ async def _assert_benefit_documents(db: AsyncSession, application: Application) 
     Since migration `0024` a fresh database is NOT in that state — it seeds
     `benefit_proof`, because the code is ours rather than the Agency's — so
     `benefit_doc_type_not_configured` in production now means somebody archived
-    the item, not that the Agency has yet to answer. The claim is nonetheless
-    still fail-closed on its OTHER half: `benefit_categories` ships empty until
-    VMQ 278's list arrives (`tz/12` #2/#13), so there is no category to claim
-    in the first place.
+    the item, not that the Agency has yet to answer. The OTHER half stopped
+    being empty with migration `0053` (ruling #181 — VMQ 278 ¶12 and PQ-3327
+    ¶8, seven categories), and is fail-closed in its own way: every claim
+    needs a certificate number, and one no register can confirm waits for the
+    leshoz (`_open_benefit_verification`).
 
     The claim is separately validated against the benefit classifier at PATCH
     time (`_assert_references`) and against the tariff rows it must resolve at
@@ -1884,7 +1974,13 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
 
 
 async def submit(
-    db: AsyncSession, application_id: uuid.UUID, *, pkcs7: str, actor: User, ip: str | None = None
+    db: AsyncSession,
+    application_id: uuid.UUID,
+    *,
+    pkcs7: str | None,
+    rules_accepted: bool,
+    actor: User,
+    ip: str | None = None,
 ) -> Application:
     """`POST /applications/{id}/submit` — the fourteen steps of the block
     comment above, in one transaction.
@@ -1911,6 +2007,19 @@ async def submit(
     `test_a_price_that_moved_after_signing_is_labeled_package_changed` pins it,
     and the paired `test_an_invalid_signature_refuses_the_submission_whole`
     pins the negative — a genuinely bad signature keeps the generic reason.
+
+    **Ruling #184, `rules_accepted`.** Folded into step 2's completeness list
+    (`_assert_complete`), never a check of its own — `false` is 400
+    `ERR-APP-001` naming `rules_accepted` alongside whatever else is missing.
+
+    **Ruling #183, the signature at step 8.** `pkcs7` present signs exactly as
+    before, whatever `on_behalf` says (a legal entity, or a citizen who still
+    has and used a certificate, is untouched). `pkcs7` absent: `on_behalf ==
+    "self"` signs with the button (`sign_simple`, over the SAME bytes `sign()`
+    would otherwise verify — the package's shape never changes for this); a
+    legal entity with no envelope is refused, 422 `ERR-SIGN-001`
+    `simple_signature_not_allowed` — decision #9 still requires ERI of a
+    representative, and ruling #183 narrows that only for `self`.
     """
     # Step 0. Minted before anything is written, because it is what step 8
     # signs and what step 11 stores as the history row's primary key (ruling
@@ -1928,9 +2037,23 @@ async def submit(
     # the FIRST submission.
     application = await _own_draft_for_update(db, application_id, actor=actor)
     from_status = application.status
-    await _assert_complete(db, application)  # step 2
+    # Ruling #183, decided FIRST (stage 10 review, finding 9): a legal entity
+    # with no envelope can never succeed, and that is known from the body and
+    # `on_behalf` alone — refusing here spends nothing on steps 2-7 and leaves
+    # no half-attempt to commit. Nothing has been written yet, so a plain
+    # raise is the whole refusal; the audit row a refused ATTEMPT earns
+    # belongs to attempts that got as far as the package.
+    if pkcs7 is None and application.on_behalf != "self":
+        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
+    await _assert_complete(db, application, rules_accepted=rules_accepted)  # step 2
+    # Ruling #184: stamped from the SERVER clock, not the client's claim —
+    # `_assert_complete` above already refused a `false` value, so reaching
+    # here means the box was checked. Overwritten on every attempt, including
+    # a RESUBMISSION after RETURNED (each one requires the checkbox again),
+    # never merely left from an earlier try.
+    application.rules_accepted_at = datetime.now(UTC)
     await _assert_benefit_documents(db, application)  # step 3
-    await _open_benefit_verification(db, application)  # step 3b (ruling #179)
+    await _open_benefit_verification(db, application)  # step 3b (rulings #181/#182)
     # Step 4, ruling 22: the geometry decided upon AND its area, frozen
     # together because they are one fact. Without the second,
     # `max_approve_area` (decision #29) compares against NULL for the rest of
@@ -1951,17 +2074,50 @@ async def submit(
     # Step 8. The first thing on this page that can commit — see ruling 19 and
     # `sign()`'s own TRANSACTION CONTRACT. Everything pending right now is
     # evidence of a genuine attempt and is right to keep; nothing else may be.
-    await signatures_service.sign(
-        db,
-        object_type=SUBMISSION_OBJECT_TYPE,
-        object_id=submission_id,
-        purpose=SUBMISSION_PURPOSE,
-        document=_package_bytes(application, priced, contour_version_id=version.id),
-        pkcs7=pkcs7,
-        user=actor,
-        content_changed_reason=STALE_PACKAGE_REASON,
-        ip=ip,
-    )
+    #
+    # Ruling #183: `pkcs7` present signs exactly as before, whatever
+    # `on_behalf` says. Absent: `self` signs with the button — this module's
+    # OWN rule for when a simple signature may stand in for the filing's
+    # signature, the same way `permits.service.add_signature` decides it for
+    # the holder's line on a permit (read, not copied — the filing has one
+    # signer and one purpose, never four). `legal` with no envelope was
+    # refused at step 1; the `else` below is the belt for the same rule,
+    # kept evidence-then-raise like every refusal that got this far.
+    document = _package_bytes(application, priced, contour_version_id=version.id)
+    if pkcs7 is not None:
+        await signatures_service.sign(
+            db,
+            object_type=SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=SUBMISSION_PURPOSE,
+            document=document,
+            pkcs7=pkcs7,
+            user=actor,
+            content_changed_reason=STALE_PACKAGE_REASON,
+            ip=ip,
+        )
+    elif application.on_behalf == "self":
+        await signatures_service.sign_simple(
+            db,
+            object_type=SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=SUBMISSION_PURPOSE,
+            document=document,
+            user=actor,
+            ip=ip,
+        )
+    else:
+        await audit.log(
+            db,
+            action=APPLICATION_SUBMIT,
+            user_id=actor.id,
+            object_type="application",
+            object_id=application.id,
+            result="denied",
+            basis="simple_signature_not_allowed",
+        )
+        await db.commit()
+        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
 
     # Step 9, ruling 8: EXACTLY ONE calculation per application, written here
     # and nowhere earlier — 3.10 builds its invoice from the newest row, so a

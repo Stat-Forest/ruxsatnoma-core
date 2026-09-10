@@ -525,7 +525,7 @@ async def test_moving_a_draft_to_another_contour_clears_the_frozen_version(
     app_id = draft_ready_for_submission
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 422, refused.text

@@ -136,9 +136,15 @@ class SiteSettingsOut(BaseModel):
     that key: it disagreed with the real, per-leshoz windows
     `norms.models.ActivitySeason` and `norms.checks._season_check` had
     started enforcing by the time this branch merged. `GET
-    /public/activity-seasons` (`PublicActivitySeasonOut` below) replaces it."""
+    /public/activity-seasons` (`PublicActivitySeasonOut` below) replaces it.
+
+    `rules_url` (stage 10, ruling #184) is the document the applicant accepts
+    before signing — `site_rules_url`, edited on the H7 screen — read here
+    because the wizard's checkbox links to it and the adminka's public read
+    is this route, the same reason the footer's contacts are."""
 
     contacts: SiteContactsOut
+    rules_url: str
 
 
 class PublicActivitySeasonOut(BaseModel):

@@ -153,6 +153,7 @@ async def a_signature(db: AsyncSession, user_a: User) -> Signature:
 
 @pytest.fixture
 async def bound_cert_of_a(a_signature: Signature) -> uuid.UUID:
+    assert a_signature.certificate_id is not None  # kind == "eri" here (a_signature's own sign())
     return a_signature.certificate_id
 
 
@@ -549,6 +550,7 @@ async def test_reverify_reflects_a_certificate_revoked_after_signing(
         user=user,
     )
     assert row.verification_status == "valid"
+    assert row.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, row.certificate_id)
     cert.serial_number = f"REVOKED-{uuid.uuid4().hex[:10]}"
     await db.commit()

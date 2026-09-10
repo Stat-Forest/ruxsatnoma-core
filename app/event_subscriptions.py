@@ -126,10 +126,24 @@ def _register_providers() -> None:
     """
     from app.modules.admin import open_work as admin_open_work
     from app.modules.applications import service as applications_service
+    from app.modules.beekeepers import service as beekeepers_service
     from app.modules.gis import service as gis_service
     from app.modules.inspections import service as inspections_service
     from app.modules.norms import service as norms_service
     from app.modules.permits import service as permits_service
+
+    # Rulings #181/#182 (stage 10): the ONE benefit category with a register
+    # to check itself against, wired here rather than imported by
+    # `applications` directly — the same "data-driven seam, not a compiled
+    # dependency" reasoning as the four provider lists below, and what lets
+    # `applications`' own tests prove the EMPTY seam (`BENEFIT_AUTO_
+    # VERIFIERS` with nothing registered) without `beekeepers` existing in
+    # that test process at all. A plain dict assignment, not append-if-
+    # absent: keyed by CODE, so re-running this function (autouse per test)
+    # simply re-assigns the same value rather than accumulating anything.
+    applications_service.BENEFIT_AUTO_VERIFIERS["beekeeping_union_member"] = (
+        beekeepers_service.match_certificate
+    )
 
     if permits_service.occupancy_provider not in gis_service.OCCUPANCY_PROVIDERS:
         gis_service.OCCUPANCY_PROVIDERS.append(permits_service.occupancy_provider)

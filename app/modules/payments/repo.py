@@ -114,6 +114,20 @@ async def add_provider_transaction(db: AsyncSession, transaction: ProviderTransa
     await db.flush()
 
 
+async def has_provider_transaction(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
+    """Whether ANY `provider_transactions` row points at `invoice_id` — never
+    which one, never how many. `service.is_settled_by_benefit`'s own
+    signature (ruling #185): a real payment, Payme's or the manual
+    maker-checker door's synthetic `provider='manual'` row alike, ALWAYS
+    writes one through `add_provider_transaction` above; `_settle_free`
+    never calls it at all, so its absence on a `paid` invoice is exactly
+    what tells the two apart."""
+    stmt = (
+        select(ProviderTransaction.id).where(ProviderTransaction.invoice_id == invoice_id).limit(1)
+    )
+    return (await db.execute(stmt)).first() is not None
+
+
 async def add_allocations(db: AsyncSession, allocations: Sequence[Allocation]) -> None:
     """The `ledger.entries_for_shares` rows a confirmed `PerformTransaction`
     writes, one per receiver (`payments.service.confirm_payment`) — plain,

@@ -106,7 +106,12 @@ class PermitSignatureRow(BaseModel):
     id: uuid.UUID
     purpose: str
     signer_user_id: uuid.UUID | None
-    certificate_id: uuid.UUID
+    # Ruling #183: the holder's line may be a SIMPLE signature — `kind`
+    # says so and `certificate_id` is then NULL. Stage 10's integration found
+    # the card answering 500 the moment a citizen pressed the button: the
+    # signature route itself was green, and only the next screen broke.
+    kind: str
+    certificate_id: uuid.UUID | None
     signed_at: datetime
     verification_status: str
 
@@ -215,7 +220,9 @@ class PermitCardOut(PermitOut):
 
 
 class PermitSignIn(BaseModel):
-    """`POST /permits/{id}/signatures`: one of the four ERI signature lines.
+    """`POST /permits/{id}/signatures`: one of the four ERI signature lines —
+    or, since ruling #183, the holder's simple signature with no envelope at
+    all.
 
     `purpose` is a plain bounded string, deliberately NOT a `Literal` over
     `signers.PURPOSE_ROLES`. The required set is admin-editable data (ruling 7),
@@ -228,10 +235,18 @@ class PermitSignIn(BaseModel):
     There is no `document` field. The bytes signed are the permit's own stored
     PDF, never anything the client supplies (ruling 3) — a caller who could name
     the document could sign something other than the permit.
+
+    `pkcs7` is OPTIONAL (ruling #183): a citizen acting for themselves signs
+    with a button, and posts a body carrying no envelope at all. Absent, it is
+    NOT automatically a simple signature — `permits.service.add_signature`
+    decides who may take that path (the holder purpose, `on_behalf='self'`)
+    and refuses everyone else with `ERR-SIGN-001` `simple_signature_not_
+    allowed`. WITH `pkcs7` present, nothing about this route changes for
+    anyone, whatever the purpose or the application's `on_behalf`.
     """
 
     purpose: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")]
-    pkcs7: Annotated[str, Field(min_length=1)]
+    pkcs7: Annotated[str | None, Field(min_length=1)] = None
 
 
 class PermitSignatureOut(BaseModel):

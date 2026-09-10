@@ -273,6 +273,7 @@ async def test_reverify_never_reports_a_revoked_certificates_signature_valid_in_
     )
     await db.commit()
 
+    assert signature.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, signature.certificate_id)
     cert.status = "revoked"
     cert.revoked_at = datetime.now(UTC)
