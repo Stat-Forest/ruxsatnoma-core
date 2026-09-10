@@ -82,6 +82,26 @@ async def list_parameters(
     )
 
 
+@router.get("/rule-parameters/export.xlsx")
+async def export_parameters_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    code: str | None = None,
+    status: str | None = None,
+) -> Response:
+    """`GET /rule-parameters` as a spreadsheet (stage 13, ruling #204): the
+    same filters, every matching row up to the configured cap. Declared
+    before `POST /rule-parameters` for consistency with every other export
+    route, though nothing here collides with a path parameter (there is no
+    `GET /rule-parameters/{id}`)."""
+    items, total, cap = await export.rows_parameters(db, lang=lang, code=code, status=status)
+    filename = f"meyor-parametrlari-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_parameters(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.post("/rule-parameters", response_model=RuleParameterOut, status_code=201)
 async def create_parameter(
     payload: RuleParameterIn,

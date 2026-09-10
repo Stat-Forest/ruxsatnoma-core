@@ -12,18 +12,21 @@ in ONE batch query per table; column headers and status labels are copied
 from the adminka's `norms/*Tab.tsx` and `i18n/*.ts` so the file reads like
 the screen."""
 
+import json
 import uuid
 from collections.abc import Sequence
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
 from app.modules.admin import service as admin_service
+from app.modules.auth import service as auth_service
 from app.modules.gis import service as gis_service
 from app.modules.norms import repo
-from app.modules.norms.models import Norm, Tariff
+from app.modules.norms.models import Norm, RuleParameter, Tariff
 
 # --- shared status vocabulary ------------------------------------------------
 # `norms`'s own five-stage lifecycle (draft/review/approved/published/
@@ -300,3 +303,100 @@ async def rows_tariffs(
 
 def render_tariffs(items: Sequence[TariffRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, tariffs_columns(lang), lang=lang, title=TARIFFS_TITLE[lang])
+
+
+# --- rule parameters -----------------------------------------------------------
+
+PARAMETERS_TITLE = {"uz_latn": "Qoida parametrlari", "ru": "Параметры правил"}
+SEEDED_BY_MIGRATION = {
+    "uz_latn": "Migratsiya orqali toʻldirilgan",
+    "ru": "Заполнено миграцией",
+}
+
+
+def _value_cell(value: Any) -> xlsx.CellValue:
+    """`RuleParameter.value` is a JSONB `Any` — most rows hold a plain
+    number or string, but nothing stops a future row from holding a list or
+    an object (a threshold table), which openpyxl cannot write as a cell on
+    its own. A scalar passes through; anything else is JSON text, never a
+    blank cell that would hide a real value."""
+    if value is None or isinstance(value, (str, int, float, bool, Decimal)):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+class ParameterRow:
+    def __init__(self, parameter: RuleParameter, *, created_by_name: str | None) -> None:
+        self.parameter = parameter
+        self.id = parameter.id
+        self.created_by_name = created_by_name
+
+
+def parameters_columns(lang: xlsx.Lang) -> list[xlsx.Column[ParameterRow]]:
+    a = lambda f: lambda r: getattr(r.parameter, f)  # noqa: E731
+    return [
+        xlsx.Column("code", {"uz_latn": "Kod", "ru": "Код"}, a("code"), 24),
+        xlsx.Column(
+            "value",
+            {"uz_latn": "Qiymat", "ru": "Значение"},
+            lambda r: _value_cell(r.parameter.value),
+            18,
+        ),
+        xlsx.Column("unit", {"uz_latn": "Oʻlchov birligi", "ru": "Единица"}, a("unit"), 14),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(VERSIONED_STATUS_LABELS, r.parameter.status, lang),
+            16,
+        ),
+        xlsx.Column(
+            "effective_from",
+            {"uz_latn": "Amal qilish boshlanishi", "ru": "Действует с"},
+            a("effective_from"),
+            16,
+        ),
+        xlsx.Column(
+            "effective_to",
+            {"uz_latn": "Amal qilish tugashi", "ru": "Действует по"},
+            a("effective_to"),
+            16,
+        ),
+        xlsx.Column("basis", {"uz_latn": "Asos", "ru": "Основание"}, a("basis"), 30),
+        xlsx.Column(
+            "created_by",
+            {"uz_latn": "Kim yaratgan", "ru": "Кем создан"},
+            lambda r: r.created_by_name or SEEDED_BY_MIGRATION[lang],
+            24,
+        ),
+        xlsx.Column(
+            "created_at", {"uz_latn": "Yaratilgan sana", "ru": "Создан"}, a("created_at"), 18
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def rows_parameters(
+    db: AsyncSession, *, lang: xlsx.Lang, code: str | None, status: str | None
+) -> tuple[list[ParameterRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    parameters, total = await repo.list_parameters(
+        db, code=code, status=status, limit=cap, offset=0
+    )
+    creators = await auth_service.user_names(db, {p.created_by for p in parameters if p.created_by})
+    return (
+        [
+            ParameterRow(
+                parameter,
+                created_by_name=creators.get(parameter.created_by)
+                if parameter.created_by
+                else None,
+            )
+            for parameter in parameters
+        ],
+        total,
+        cap,
+    )
+
+
+def render_parameters(items: Sequence[ParameterRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, parameters_columns(lang), lang=lang, title=PARAMETERS_TITLE[lang])

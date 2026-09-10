@@ -271,3 +271,126 @@ async def test_tariffs_export_is_visible_to_any_authenticated_caller(
 async def test_tariffs_export_rejects_an_unknown_language(applicant_client: AsyncClient) -> None:
     resp = await applicant_client.get("/api/v1/tariffs/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
+
+
+# --- rule parameters ---------------------------------------------------------
+
+
+async def _draft_parameter(client: AsyncClient, code: str, value: str = "0.9") -> dict:
+    created = await client.post(
+        "/api/v1/rule-parameters",
+        json={
+            "code": code,
+            "value": value,
+            "effective_from": "2030-01-01",
+            "basis": "test",
+        },
+    )
+    assert created.status_code == 201, created.text
+    return created.json()
+
+
+async def test_parameters_export_holds_exactly_the_rows_the_list_shows(
+    tariffs_maker_client: AsyncClient, unique_suffix: str
+) -> None:
+    code = f"test_param_{unique_suffix}"
+    await _draft_parameter(tariffs_maker_client, code)
+
+    listed = await tariffs_maker_client.get("/api/v1/rule-parameters", params={"code": code})
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert listed_ids
+
+    resp = await tariffs_maker_client.get(
+        "/api/v1/rule-parameters/export.xlsx", params={"code": code, "lang": "ru"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-export-truncated"] == "false"
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Код" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert exported_ids == listed_ids
+
+
+async def test_parameters_export_applies_the_same_filter_as_the_list(
+    tariffs_maker_client: AsyncClient, unique_suffix: str
+) -> None:
+    code = f"test_param_{unique_suffix}"
+    await _draft_parameter(tariffs_maker_client, code)
+
+    resp = await tariffs_maker_client.get(
+        "/api/v1/rule-parameters/export.xlsx", params={"code": f"other_{unique_suffix}"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_parameters_export_renders_labels_not_codes(
+    tariffs_maker_client: AsyncClient, unique_suffix: str
+) -> None:
+    code = f"test_param_{unique_suffix}"
+    await _draft_parameter(tariffs_maker_client, code)
+
+    resp = await tariffs_maker_client.get(
+        "/api/v1/rule-parameters/export.xlsx", params={"code": code, "lang": "uz_latn"}
+    )
+    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    assert row[0] == code  # the code first
+    assert row[3] == "Qoralama"  # the status label, not "draft"
+    assert row[7] == "Test User"  # created_by resolved to a name (make_user's default), not a uuid
+
+
+async def test_parameters_export_truncates_at_the_cap_and_says_so(
+    tariffs_maker_client: AsyncClient, unique_suffix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _draft_parameter(tariffs_maker_client, f"test_param_a_{unique_suffix}")
+    await _draft_parameter(tariffs_maker_client, f"test_param_b_{unique_suffix}")
+
+    from app.core import settings_store
+
+    real_get_int = settings_store.get_int
+
+    async def one(db_arg, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(db_arg, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    # No `code` filter: the shared, persistent test DB always carries more
+    # than one parameter (the seeded `coef_sb:*`/`bhm`/... rows, plus the two
+    # just created), so `total` is guaranteed > the cap of 1 here.
+    resp = await tariffs_maker_client.get("/api/v1/rule-parameters/export.xlsx")
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total > 1
+    assert resp.headers["x-export-truncated"] == "true"
+    assert resp.headers["x-export-rows"] == "1"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_parameters_export_is_visible_to_any_authenticated_caller(
+    tariffs_maker_client: AsyncClient, applicant_client: AsyncClient, unique_suffix: str
+) -> None:
+    code = f"test_param_{unique_suffix}"
+    await _draft_parameter(tariffs_maker_client, code)
+
+    listed = await applicant_client.get("/api/v1/rule-parameters", params={"code": code})
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert listed_ids
+
+    resp = await applicant_client.get("/api/v1/rule-parameters/export.xlsx", params={"code": code})
+    assert resp.status_code == 200, resp.text
+    exported_ids = {
+        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert exported_ids == listed_ids
+
+
+async def test_parameters_export_rejects_an_unknown_language(
+    tariffs_maker_client: AsyncClient,
+) -> None:
+    resp = await tariffs_maker_client.get(
+        "/api/v1/rule-parameters/export.xlsx", params={"lang": "en"}
+    )
+    assert resp.status_code == 422
