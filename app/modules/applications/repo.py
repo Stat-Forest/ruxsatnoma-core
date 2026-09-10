@@ -441,7 +441,7 @@ async def active_overlapping(
 # and excludes only the five terminal ones (a rejected, cancelled, expired,
 # closed or archived extension blocks nothing, the same reasoning
 # `ACTIVE_STATUSES` applies to a fresh filing).
-OPEN_EXTENSION_STATUSES = ("DRAFT", *ACTIVE_STATUSES)
+OPEN_EXTENSION_STATUSES = ACTIVE_STATUSES
 
 
 async def open_extension_of(

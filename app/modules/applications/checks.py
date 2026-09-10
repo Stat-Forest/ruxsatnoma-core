@@ -46,7 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import DomainError, err
 from app.modules.admin import repo as admin_repo
 from app.modules.applications import repo
-from app.modules.applications.models import Application, ApplicationCheck
+from app.modules.applications.models import Application, ApplicationCheck, ApplicationItem
 from app.modules.auth import service as auth_service
 from app.modules.gis import service as gis_service
 from app.modules.norms import service as norms_service
@@ -172,7 +172,9 @@ async def _applicant_address_missing(db: AsyncSession, applicant_id: uuid.UUID) 
     return applicant is None or not (applicant.address or "").strip()
 
 
-async def missing_for_pricing(db: AsyncSession, application: Application) -> list[str]:
+async def missing_for_pricing(
+    db: AsyncSession, application: Application, *, items: list[ApplicationItem] | None = None
+) -> list[str]:
     """Which of the fields `norms` needs are still empty — `[]` when the draft
     can be priced and checked.
 
@@ -221,6 +223,11 @@ async def missing_for_pricing(db: AsyncSession, application: Application) -> lis
     `test_precheck.py::test_a_tariff_exempt_activity_still_has_to_declare_its_
     quantity` pins both halves.
 
+    **`items` (stage 12, plan 12 B1):** a list means a TRANSIENT application's
+    own herd — `service._build_filing` evaluates a filing that has no row yet
+    and nothing to `SELECT` from; `None` reads the stored rows, the persisted
+    (`RETURNED`) path.
+
     **`address` (ruling #113, `tz/12` #20) joins this list too, though it
     prices nothing.** It is a requisite of the PRINTED document, exactly the
     reasoning `quantity` above already carries — and the name on this
@@ -245,14 +252,17 @@ async def missing_for_pricing(db: AsyncSession, application: Application) -> lis
         # produces names the field either way.
         return [*missing, "activity_type_id"]
     if activity.code == GRAZING_ACTIVITY_CODE:
-        if not await repo.list_items(db, application.id):
+        herd = await repo.list_items(db, application.id) if items is None else items
+        if not herd:
             missing.append("items")
     elif application.quantity is None:
         missing.append("quantity")
     return missing
 
 
-async def calculation_payload(db: AsyncSession, application: Application) -> CalculationIn:
+async def calculation_payload(
+    db: AsyncSession, application: Application, *, items: list[ApplicationItem] | None = None
+) -> CalculationIn:
     """The `norms` request this application describes — what `preview`,
     `run_checks` and (task 5) `save_calculation` are all asked with, built once
     so the checks an applicant sees and the price they are quoted can never
@@ -281,7 +291,10 @@ async def calculation_payload(db: AsyncSession, application: Application) -> Cal
     assert application.period_from is not None
     assert application.period_to is not None
 
-    items = await repo.list_items(db, application.id)
+    # `items` given (stage 12): the transient filing's own herd, the same
+    # meaning `missing_for_pricing` gives the keyword; `None` reads the rows.
+    if items is None:
+        items = await repo.list_items(db, application.id)
     codes = {row.id: row.code for row in await admin_repo.list_livestock_types(db)}
     for item in items:
         if item.livestock_type_id not in codes:
@@ -339,7 +352,11 @@ async def _gis_results(db: AsyncSession, application: Application) -> list[tuple
 
 
 async def _norm_results(
-    db: AsyncSession, application: Application, norm_results: list[Any] | None
+    db: AsyncSession,
+    application: Application,
+    norm_results: list[Any] | None,
+    *,
+    items: list[ApplicationItem] | None = None,
 ) -> list[tuple[str, str, Any]]:
     """The six admissibility checks, or `skipped` rows naming the fields that
     are still empty.
@@ -365,7 +382,7 @@ async def _norm_results(
     downstream loosens; only this paragraph's old promise of a uniform
     `skipped` is gone.
     """
-    missing = await missing_for_pricing(db, application)
+    missing = await missing_for_pricing(db, application, items=items)
     if missing:
         return _skipped(
             list(NORM_CHECK_TYPES.values()), {"reason": "incomplete", "missing": missing}
@@ -373,12 +390,58 @@ async def _norm_results(
     results = norm_results
     if results is None:
         results = await norms_service.run_checks(
-            db, payload=await calculation_payload(db, application)
+            db, payload=await calculation_payload(db, application, items=items)
         )
     return [
         (NORM_CHECK_TYPES[result["check"]], result["result"], result["details"])
         for result in results
         if result["check"] in NORM_CHECK_TYPES
+    ]
+
+
+async def evaluate(
+    db: AsyncSession,
+    application: Application,
+    *,
+    norm_results: list[Any] | None = None,
+    items: list[ApplicationItem] | None = None,
+) -> list[tuple[str, str, Any]]:
+    """The pure half of `run_all` (stage 12, plan 12 B1): every check this
+    application needs, computed and returned as `(check_type, result,
+    details)` — nothing written. `service.precheck_filing` and `service.file`
+    evaluate a TRANSIENT application here, and `file` records the rows only
+    after the signature is good (plan 12, R3), because `sign()` commits
+    whatever is pending on the session. `items` is the transient row's own
+    herd; `None` reads the stored rows."""
+    collected = await _gis_results(db, application)
+    collected.extend(await _norm_results(db, application, norm_results, items=items))
+    return collected
+
+
+def record(
+    application_id: uuid.UUID,
+    collected: list[tuple[str, str, Any]],
+    *,
+    created_by: uuid.UUID,
+) -> list[ApplicationCheck]:
+    """`evaluate`'s tuples as the rows `repo.add_checks` stores — built here so
+    `run_all` and `service.file` cannot disagree on a column. Not added to any
+    session: the caller decides when (and whether) the rows are written.
+
+    `created_by` is NOT NULL (migration 0025): an auto check has no reviewer
+    of its own, so it is attributed to whoever filed — the owner
+    (`submitted_by_user_id`), the same actor `precheck`/`submit`/`file` audit
+    under."""
+    return [
+        ApplicationCheck(
+            application_id=application_id,
+            check_type=check_type,
+            result=result,
+            details=_jsonable(details),
+            source=SOURCE_AUTO,
+            created_by=created_by,
+        )
+        for check_type, result, details in collected
     ]
 
 
@@ -410,26 +473,17 @@ async def run_all(
     otherwise its own "a blocking check refuses here" test is refused by
     `save_calculation` two steps later, under a code the recorded evidence does
     not support.
+
+    Since stage 12 this is `evaluate` + `record` + `repo.add_checks` for a
+    PERSISTED application — the `RETURNED` pre-check and resubmission. A
+    transient one (`service.file`, `service.precheck_filing`) uses the two
+    halves directly.
     """
-    collected = await _gis_results(db, application)
-    collected.extend(await _norm_results(db, application, norm_results))
-    rows = [
-        ApplicationCheck(
-            application_id=application.id,
-            check_type=check_type,
-            result=result,
-            details=_jsonable(details),
-            source=SOURCE_AUTO,
-            # `created_by` is NOT NULL (migration 0025): an auto check has no
-            # reviewer of its own, so it is attributed to the application's
-            # owner — the same actor `precheck`/`submit` already audit under
-            # (module boundary: this file never imports `service.py`, so it
-            # reads the id off the `Application` row it was already handed,
-            # never the caller's `actor`).
-            created_by=application.submitted_by_user_id,
-        )
-        for check_type, result, details in collected
-    ]
+    rows = record(
+        application.id,
+        await evaluate(db, application, norm_results=norm_results),
+        created_by=application.submitted_by_user_id,
+    )
     await repo.add_checks(db, rows)
     return rows
 

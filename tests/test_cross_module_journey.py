@@ -938,15 +938,17 @@ async def test_the_free_path_from_filing_to_an_active_permit(
         ):
             async for citizen in _signer_for(db, role_code="applicant", user=applicant_user):
                 # --- file: recreation, self, a real 100% benefit claim ------------
-                created = await citizen.client.post(
-                    f"{API}/applications", json={"on_behalf": "self"}
+                uploaded = await citizen.client.post(
+                    f"{API}/files",
+                    files={"file": ("proof.pdf", b"%PDF-1.4 test", "application/pdf")},
                 )
-                assert created.status_code == 201, created.text
-                app_id = created.json()["id"]
-
-                patched = await citizen.client.patch(
-                    f"{API}/applications/{app_id}",
+                assert uploaded.status_code == 201, uploaded.text
+                # Stage 12: one request files the whole application (plan 12,
+                # R1); the citizen signs with the button (#183).
+                submitted = await citizen.client.post(
+                    f"{API}/applications",
                     json={
+                        "on_behalf": "self",
                         "contour_id": str(contour.id),
                         "activity_type_id": str(recreation_activity_id),
                         "period_from": "2027-09-01",
@@ -954,31 +956,18 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                         "quantity": "2",
                         "benefit_category_item_id": str(benefit_category_item_id),
                         "benefit_certificate_no": "VET-0001",
+                        "documents": [
+                            {
+                                "doc_type_item_id": str(benefit_doc_type_item_id),
+                                "file_id": uploaded.json()["id"],
+                            }
+                        ],
+                        "rules_accepted": True,
                     },
-                )
-                assert patched.status_code == 200, patched.text
-
-                uploaded = await citizen.client.post(
-                    f"{API}/files",
-                    files={"file": ("proof.pdf", b"%PDF-1.4 test", "application/pdf")},
-                )
-                assert uploaded.status_code == 201, uploaded.text
-                proof = await citizen.client.post(
-                    f"{API}/applications/{app_id}/documents",
-                    json={
-                        "doc_type_item_id": str(benefit_doc_type_item_id),
-                        "file_id": uploaded.json()["id"],
-                    },
-                )
-                assert proof.status_code == 201, proof.text
-
-                # --- the button (ruling #183): on_behalf=self, no envelope -------
-                submitted = await citizen.client.post(
-                    f"{API}/applications/{app_id}/submit",
-                    json={"rules_accepted": True},
                     headers={"Idempotency-Key": str(uuid.uuid4())},
                 )
-                assert submitted.status_code == 200, submitted.text
+                assert submitted.status_code == 201, submitted.text
+                app_id = submitted.json()["id"]
                 assert submitted.json()["benefit_verification_status"] == "pending"
                 assert submitted.json()["rules_accepted_at"] is not None
 

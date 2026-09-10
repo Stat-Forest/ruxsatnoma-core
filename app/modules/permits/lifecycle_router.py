@@ -26,9 +26,15 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.core.idempotency import IdempotencyContext
 from app.modules.applications.permissions import APPLICATIONS_CREATE
-from app.modules.applications.schemas import ApplicationOut
-from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
+from app.modules.applications.schemas import ApplicationFileIn, ApplicationOut
+from app.modules.auth.deps import (
+    get_current_user,
+    idempotency_context,
+    require_any_permission,
+    require_permission,
+)
 from app.modules.auth.models import User
 from app.modules.permits import service
 from app.modules.permits.permissions import PERMITS_ISSUE, PERMITS_MANAGE
@@ -234,7 +240,7 @@ async def list_forest_tickets(
     return [ForestTicketOut.model_validate(row) for row in rows]
 
 
-# --- Task 8: extend a permit into a new application draft --------------------
+# --- Task 8: extend a permit into a new application (stage 12: filed outright) --
 #
 # `applications.create` — the HOLDER's own gate (migration 0015), the same
 # permission `POST /applications` itself carries — never `permits.manage` or
@@ -249,21 +255,33 @@ async def list_forest_tickets(
 @router.post("/permits/{permit_id}/extend", status_code=201)
 async def extend_permit(
     permit_id: uuid.UUID,
+    payload: ApplicationFileIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+    ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
 ) -> ApplicationOut:
-    """С13: file a new DRAFT `kind='extension'` application against a permit
-    still in force — never an edit of the issued document itself
-    (`service.extend`'s own docstring: nothing about an issued permit is
-    mutable).
+    """С13: FILE a `kind='extension'` application against a permit still in
+    force, in one request (stage 12, plan 12 R6) — never an edit of the
+    issued document itself (`service.extend`'s own docstring: nothing about
+    an issued permit is mutable). The body is `POST /applications`' own; the
+    pre-check and the package go through `/applications/precheck` and
+    `/applications/package` with the same body. `Idempotency-Key` is
+    mandatory, as on every filing: a replay would mint a second number.
 
     404 `ERR-SYS-003` for an id that does not exist or that this caller is
     not the holder of — the same answer either gets, so the route is not a
     permit-existence oracle. 409 `ERR-PERM-001` `not_extendable` when the
     permit is not `active` or its period has already ended (applied for
     afresh instead, never extended). 409 `ERR-APP-002`
-    `extension_already_open` with the existing draft's id when one is
-    already open against this permit.
+    `extension_already_open` with the existing application's id when one is
+    already open against this permit. 422 `ERR-VAL-001`
+    `applicant_is_not_the_holder` when the body names another applicant;
+    everything `POST /applications` refuses, refused here the same way.
     """
-    application = await service.extend(db, permit_id, actor=actor)
-    return ApplicationOut.model_validate(application)
+    application = await service.extend(
+        db, permit_id, payload, actor=actor, ip=request.client.host if request.client else None
+    )
+    out = ApplicationOut.model_validate(application)
+    await ctx.save(db, status_code=201, body=out.model_dump(mode="json"))
+    return out

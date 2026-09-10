@@ -1261,21 +1261,30 @@ _APPLICATION_RECALCULATE_CODES = frozenset({"applications.review", "applications
 
 # Which statuses each kind of actor may bind a calculation in.
 #
-# **OWNER — `DRAFT` and `RETURNED` only: the two states in which the applicant
-# is the editor.** `DRAFT` is what `applications.service.submit` needs at step 9
-# (the status is still DRAFT there; the SUBMITTED write is step 11), and
-# `RETURNED` is 3.9b's resubmission after a correction. It stops at SUBMITTED
+# **OWNER — `RETURNED` always, and `SUBMITTED` for exactly the filing's own
+# FIRST row (plan 12, R4).** `RETURNED` is 3.9b's resubmission after a
+# correction. `applications.service.file` inserts the row as SUBMITTED and
+# prices it in the SAME transaction, as the owner — R16's attack needs a row
+# to ALREADY exist (the cheap one becomes the newest and is billed); the
+# filing's own first row is exactly what `file` writes at its own step 9. So
+# the owner may also bind in SUBMITTED exactly while the application has no
+# calculation at all — checked against the table (`repo.newest_calculation`),
+# never against a flag — in `_calculable_statuses_for` below. It stops there
 # because the newest calculation is what `payments.issue_invoice` bills: an
 # applicant who submits at 2 060 000,00 — signed, and bound to that submission
 # — and then POSTs the same `application_id` with one head while the filing
 # sits in review would be invoiced for the cheap row, and `permits`' own
 # `calculation_after_decision` defence cannot fire because the row predates the
 # decision. Same divergence the audit probe found, reached from the applicant's
-# side. A speculative row planted in DRAFT before submitting needs no extra
-# rule: the submission writes a NEWER one in a later transaction and
-# `repo.newest_calculation` orders `created_at DESC, id DESC`
-# (pinned by `test_a_row_planted_in_draft_is_not_what_an_invoice_would_bill`).
-_OWNER_CALCULABLE_STATUSES = frozenset({"DRAFT", "RETURNED"})
+# side.
+_OWNER_CALCULABLE_STATUSES = frozenset({"RETURNED"})
+# The owner's ONE narrow exception to the set above (plan 12, R4): the filing's
+# own first calculation, bound in the same transaction that inserts the row.
+# `_calculable_statuses_for` adds this to `_OWNER_CALCULABLE_STATUSES` only
+# while `repo.newest_calculation` finds nothing yet for the application — a
+# second POST, after that first row exists, is refused like any other
+# post-submission attempt.
+_OWNER_FIRST_ROW_STATUS = "SUBMITTED"
 # **REVIEWER — additionally the three states in which the filing is theirs to
 # work on.** That is 3.9b's recalculation: a legitimate, audited staff action
 # on an application under review, and the reason the codes above are the REVIEW
@@ -1381,6 +1390,8 @@ async def _calculable_statuses_for(
     if await _is_entitled_reviewer(db, actor, facts):
         return _REVIEWER_CALCULABLE_STATUSES
     if owner:
+        if await repo.newest_calculation(db, facts["id"]) is None:
+            return _OWNER_CALCULABLE_STATUSES | {_OWNER_FIRST_ROW_STATUS}
         return _OWNER_CALCULABLE_STATUSES
     return None
 

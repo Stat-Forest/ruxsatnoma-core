@@ -209,7 +209,7 @@ async def answer_appeal(
     return appeal
 
 
-# Task 4: every one of `applications.models.APPLICATION_STATUSES`'s fourteen
+# Task 4: every one of `applications.models.APPLICATION_STATUSES`'s thirteen
 # values gets a `label` (`LocalizedName`-shaped: `uz_latn` required, decision
 # #90) and a `next_step` sentence, both held in `uz_latn` AND `ru` in ONE dict
 # so the label and the sentence can never drift out of step with each other.
@@ -220,13 +220,6 @@ async def answer_appeal(
 # `tests/modules/public/test_application_check.py` pins that every member of
 # `APPLICATION_STATUSES` has an entry here.
 _APPLICATION_STATUS_INFO: dict[str, dict[str, dict[str, str]]] = {
-    "DRAFT": {
-        "label": {"uz_latn": "Qoralama", "ru": "Черновик"},
-        "next_step": {
-            "uz_latn": "Arizani toʻldirib, yuboring.",
-            "ru": "Заполните заявку и отправьте её.",
-        },
-    },
     "SUBMITTED": {
         "label": {"uz_latn": "Yuborildi", "ru": "Подана"},
         "next_step": {

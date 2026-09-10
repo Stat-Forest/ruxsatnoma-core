@@ -30,17 +30,18 @@ from app.modules.norms import service as norms_service
 from app.modules.norms.models import Calculation
 
 
-async def _draft(db: AsyncSession, applicant: Applicant) -> Application:
-    """The minimal `applications` row (ruling 7: everything else is
-    nullable) — mirrors `test_models.py`'s own `_app` helper, kept local to
-    this file per this codebase's per-file-helper convention
-    (`test_calculations_api.py` does the same rather than importing across
-    test modules)."""
+async def _filed(db: AsyncSession, applicant: Applicant) -> Application:
+    """The minimal `applications` row, born SUBMITTED (stage 12: there is no
+    earlier status; ruling 7 still leaves everything else nullable) — mirrors
+    `test_models.py`'s own `_app` helper, kept local to this file per this
+    codebase's per-file-helper convention (`test_calculations_api.py` does
+    the same rather than importing across test modules)."""
     row = Application(
         applicant_id=applicant.id,
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
     )
     db.add(row)
     await db.flush()
@@ -50,7 +51,7 @@ async def _draft(db: AsyncSession, applicant: Applicant) -> Application:
 # --- the transition table itself --------------------------------------------
 
 
-def test_transition_table_has_all_fourteen_statuses_and_only_real_targets() -> None:
+def test_transition_table_has_all_thirteen_statuses_and_only_real_targets() -> None:
     """The one-source-of-truth discipline `models.py`'s own docstring
     describes for the CHECK constraints: a status added to
     `APPLICATION_STATUSES` and not here, or a typo'd target, must fail this
@@ -92,7 +93,7 @@ def test_an_applicant_may_withdraw_at_any_point_before_a_decision() -> None:
     Which statuses `POST /cancel` itself accepts is a NARROWER question and is
     pinned separately, on the service's own set, below.
     """
-    for status in ("DRAFT", "SUBMITTED", "IN_REVIEW"):
+    for status in ("SUBMITTED", "IN_REVIEW"):
         assert "CANCELLED" in APPLICATION_TRANSITIONS[status], status
     for status in ("APPROVED", "PAID", "PERMIT_ISSUED", "REJECTED"):
         assert "CANCELLED" not in APPLICATION_TRANSITIONS[status], status
@@ -102,9 +103,10 @@ def test_the_applicants_own_withdrawal_is_narrower_than_the_table() -> None:
     """**The two are not the same set, and the difference is deliberate**
     (controller ruling R26, final review Important 3).
 
-    `POST /cancel` accepts DRAFT, SUBMITTED and IN_REVIEW as a SOURCE and
-    nothing else. `APPLICATION_TRANSITIONS` additionally carries `INVOICED ->
-    CANCELLED` and `PENDING_INFO`/`RETURNED -> CANCELLED`, which are
+    `POST /cancel` accepts SUBMITTED and IN_REVIEW as a SOURCE and nothing
+    else (stage 12 removed DRAFT everywhere). `APPLICATION_TRANSITIONS`
+    additionally carries `INVOICED -> CANCELLED` and `PENDING_INFO`/`RETURNED
+    -> CANCELLED`, which are
     `tz/05`'s and belong to modules and stages that do not exist yet — 3.10b
     for the unpaid invoice, 3.9b for the two return states.
 
@@ -115,7 +117,7 @@ def test_the_applicants_own_withdrawal_is_narrower_than_the_table() -> None:
     """
     from app.modules.applications.service import CANCELLABLE_BY_APPLICANT_STATUSES
 
-    assert CANCELLABLE_BY_APPLICANT_STATUSES == {"DRAFT", "SUBMITTED", "IN_REVIEW"}
+    assert CANCELLABLE_BY_APPLICANT_STATUSES == {"SUBMITTED", "IN_REVIEW"}
     assert "INVOICED" not in CANCELLABLE_BY_APPLICANT_STATUSES
     assert all(
         "CANCELLED" in APPLICATION_TRANSITIONS[status]
@@ -131,11 +133,11 @@ async def test_get_returns_none_for_an_unknown_id(db: AsyncSession) -> None:
 
 
 async def test_get_returns_the_row(db: AsyncSession, applicant: Applicant) -> None:
-    row = await _draft(db, applicant)
+    row = await _filed(db, applicant)
     fetched = await applications_service.get(db, row.id)
     assert fetched is not None
     assert fetched.id == row.id
-    assert fetched.status == "DRAFT"
+    assert fetched.status == "SUBMITTED"
 
 
 # --- service.current_calculation / norms.service.latest_calculation --------
@@ -144,7 +146,7 @@ async def test_get_returns_the_row(db: AsyncSession, applicant: Applicant) -> No
 async def test_current_calculation_is_none_with_no_calculations(
     db: AsyncSession, applicant: Applicant
 ) -> None:
-    application = await _draft(db, applicant)
+    application = await _filed(db, applicant)
     assert await applications_service.current_calculation(db, application.id) is None
     # Agrees with the function it delegates to (ruling C6).
     assert await norms_service.latest_calculation(db, application.id) is None
@@ -157,7 +159,7 @@ async def test_current_calculation_is_the_newest_row(
     `created_at` server default) gives them the IDENTICAL timestamp — the
     exact tie `id` (uuid7, time-ordered) exists to break, and the only way to
     prove the tie-break actually works rather than merely being untested."""
-    application = await _draft(db, applicant)
+    application = await _filed(db, applicant)
     first = Calculation(
         application_id=application.id,
         activity_type_id=grazing_activity_id,
@@ -194,8 +196,8 @@ async def test_current_calculation_is_the_newest_row(
 async def test_current_calculation_ignores_other_applications(
     db: AsyncSession, applicant: Applicant, grazing_activity_id: uuid.UUID
 ) -> None:
-    application_a = await _draft(db, applicant)
-    application_b = await _draft(db, applicant)
+    application_a = await _filed(db, applicant)
+    application_b = await _filed(db, applicant)
     row = Calculation(
         application_id=application_b.id,
         activity_type_id=grazing_activity_id,
@@ -215,8 +217,8 @@ async def test_current_calculation_ignores_other_applications(
 
 # --- service.set_status -------------------------------------------------------
 #
-# These drive whatever legal edge is cheapest to reach from `_draft()` — mostly
-# DRAFT -> SUBMITTED — because what is under test is the MECHANISM: the history
+# These drive whatever legal edge is cheapest to reach from `_filed()` — mostly
+# SUBMITTED -> IN_REVIEW — because what is under test is the MECHANISM: the history
 # row, the audit entry, the refusals, the lock and the re-read. They are not a
 # model of a caller: `service.py`'s public-surface block limits a level-4 module
 # to INVOICED/PAID/EXPIRED_UNPAID/PERMIT_ISSUED/CLOSED (final review I1), and
@@ -226,13 +228,13 @@ async def test_current_calculation_ignores_other_applications(
 async def test_set_status_legal_transition_writes_history_and_audit(
     db: AsyncSession, applicant: Applicant, staff_user: User
 ) -> None:
-    application = await _draft(db, applicant)  # DRAFT
+    application = await _filed(db, applicant)  # SUBMITTED
     updated = await applications_service.set_status(
-        db, application.id, to_status="SUBMITTED", actor=staff_user, reason="filed by staff"
+        db, application.id, to_status="IN_REVIEW", actor=staff_user, reason="filed by staff"
     )
 
     assert updated.id == application.id
-    assert updated.status == "SUBMITTED"
+    assert updated.status == "IN_REVIEW"
 
     history = (
         (
@@ -246,8 +248,8 @@ async def test_set_status_legal_transition_writes_history_and_audit(
         .all()
     )
     assert len(history) == 1
-    assert history[0].from_status == "DRAFT"
-    assert history[0].to_status == "SUBMITTED"
+    assert history[0].from_status == "SUBMITTED"
+    assert history[0].to_status == "IN_REVIEW"
     assert history[0].changed_by == staff_user.id
     assert history[0].reason_text == "filed by staff"
 
@@ -265,8 +267,8 @@ async def test_set_status_legal_transition_writes_history_and_audit(
     assert len(entries) == 1
     assert entries[0].action == APPLICATION_STATUS_CHANGE
     assert entries[0].user_id == staff_user.id
-    assert entries[0].old_value == {"status": "DRAFT"}
-    assert entries[0].new_value == {"status": "SUBMITTED"}
+    assert entries[0].old_value == {"status": "SUBMITTED"}
+    assert entries[0].new_value == {"status": "IN_REVIEW"}
 
 
 async def test_set_status_with_no_actor_leaves_changed_by_and_user_id_null(
@@ -275,9 +277,9 @@ async def test_set_status_with_no_actor_leaves_changed_by_and_user_id_null(
     """`changed_by=None`/`user_id=None` means "the system" (design/02) — a
     worker-driven transition (3.10's EXPIRED_UNPAID job, say) has no actor at
     all."""
-    application = await _draft(db, applicant)
-    updated = await applications_service.set_status(db, application.id, to_status="SUBMITTED")
-    assert updated.status == "SUBMITTED"
+    application = await _filed(db, applicant)
+    updated = await applications_service.set_status(db, application.id, to_status="IN_REVIEW")
+    assert updated.status == "IN_REVIEW"
 
     history = (
         await db.execute(
@@ -301,11 +303,11 @@ async def test_set_status_with_no_actor_leaves_changed_by_and_user_id_null(
 async def test_set_status_chains_through_several_legal_transitions(
     db: AsyncSession, applicant: Applicant, staff_user: User
 ) -> None:
-    """DRAFT -> SUBMITTED -> IN_REVIEW -> APPROVED, the exact chain 3.9b's
+    """SUBMITTED -> IN_REVIEW -> APPROVED -> INVOICED, the exact chain 3.9b's
     own review flow will drive one edge at a time; proves consecutive calls
     each read the row's OWN current status back correctly."""
-    application = await _draft(db, applicant)
-    for target in ("SUBMITTED", "IN_REVIEW", "APPROVED"):
+    application = await _filed(db, applicant)
+    for target in ("IN_REVIEW", "APPROVED", "INVOICED"):
         updated = await applications_service.set_status(
             db, application.id, to_status=target, actor=staff_user
         )
@@ -323,9 +325,9 @@ async def test_set_status_chains_through_several_legal_transitions(
         .all()
     )
     assert [(h.from_status, h.to_status) for h in history] == [
-        ("DRAFT", "SUBMITTED"),
         ("SUBMITTED", "IN_REVIEW"),
         ("IN_REVIEW", "APPROVED"),
+        ("APPROVED", "INVOICED"),
     ]
     # The reason that ORDER BY carries `id` (final review M3): `occurred_at` is
     # `now()` = TRANSACTION start time, so all three rows share it exactly and
@@ -336,41 +338,50 @@ async def test_set_status_chains_through_several_legal_transitions(
 
 
 async def test_set_status_rejects_an_illegal_jump(db: AsyncSession, applicant: Applicant) -> None:
-    application = await _draft(db, applicant)  # DRAFT
+    application = await _filed(db, applicant)  # SUBMITTED
     with pytest.raises(DomainError) as exc_info:
         await applications_service.set_status(db, application.id, to_status="APPROVED")
     assert exc_info.value.code == "ERR-APP-004"
     assert exc_info.value.http_status == 409
-    assert exc_info.value.details == {"reason": "bad_transition", "from": "DRAFT", "to": "APPROVED"}
+    assert exc_info.value.details == {
+        "reason": "bad_transition",
+        "from": "SUBMITTED",
+        "to": "APPROVED",
+    }
 
     # No partial write: the application keeps its original status.
     reloaded = await applications_service.get(db, application.id)
     assert reloaded is not None
-    assert reloaded.status == "DRAFT"
+    assert reloaded.status == "SUBMITTED"
 
 
 async def test_set_status_rejects_a_transition_to_the_current_status(
     db: AsyncSession, applicant: Applicant
 ) -> None:
-    """3.10's retry paths will attempt exactly this (task brief) — DRAFT has
-    no self-loop in tz/05's table, so it fails like any other illegal jump."""
-    application = await _draft(db, applicant)
+    """3.10's retry paths will attempt exactly this (task brief) — SUBMITTED
+    has no self-loop in tz/05's table, so it fails like any other illegal
+    jump."""
+    application = await _filed(db, applicant)
     with pytest.raises(DomainError) as exc_info:
-        await applications_service.set_status(db, application.id, to_status="DRAFT")
+        await applications_service.set_status(db, application.id, to_status="SUBMITTED")
     assert exc_info.value.code == "ERR-APP-004"
 
 
 async def test_set_status_from_a_terminal_status_is_always_illegal(
     db: AsyncSession, applicant: Applicant
 ) -> None:
-    application = await _draft(db, applicant)
+    application = await _filed(db, applicant)
     application.status = "ARCHIVED"  # direct ORM write, bypassing set_status on purpose
     await db.flush()
 
     with pytest.raises(DomainError) as exc_info:
-        await applications_service.set_status(db, application.id, to_status="DRAFT")
+        await applications_service.set_status(db, application.id, to_status="SUBMITTED")
     assert exc_info.value.code == "ERR-APP-004"
-    assert exc_info.value.details == {"reason": "bad_transition", "from": "ARCHIVED", "to": "DRAFT"}
+    assert exc_info.value.details == {
+        "reason": "bad_transition",
+        "from": "ARCHIVED",
+        "to": "SUBMITTED",
+    }
 
 
 async def test_set_status_unknown_application_raises_not_found(db: AsyncSession) -> None:
@@ -402,7 +413,7 @@ async def test_set_status_reads_the_committed_status_not_this_sessions_cached_on
     PAID. INVOICED -> PAID is legal and EXPIRED_UNPAID -> PAID is not, so a
     stale read silently loses the scheduler's write; a correct read refuses.
     """
-    application = await _draft(db, applicant)
+    application = await _filed(db, applicant)
     application.status = "INVOICED"
     await db.flush()
     await db.commit()  # a separate connection cannot see uncommitted work
@@ -469,7 +480,7 @@ async def test_set_status_locks_the_row_so_a_concurrent_transition_loses(
     independent sessions are opened: a different connection cannot see
     another session's uncommitted work.
     """
-    application = await _draft(db, applicant)
+    application = await _filed(db, applicant)
     application.status = "INVOICED"
     await db.flush()
     await db.commit()
@@ -547,14 +558,14 @@ async def test_the_timeline_query_breaks_an_occurred_at_TIE_by_id(
     """
     from app.modules.applications import repo as applications_repo
 
-    application = await _draft(db, applicant)
-    for target in ("SUBMITTED", "IN_REVIEW", "APPROVED"):
+    application = await _filed(db, applicant)
+    for target in ("IN_REVIEW", "APPROVED", "INVOICED"):
         await applications_service.set_status(
             db, application.id, to_status=target, actor=staff_user
         )
 
     history = await applications_repo.list_status_history(db, application.id)
-    assert [row.to_status for row in history] == ["SUBMITTED", "IN_REVIEW", "APPROVED"]
+    assert [row.to_status for row in history] == ["IN_REVIEW", "APPROVED", "INVOICED"]
     assert len({row.occurred_at for row in history}) == 1, (
         "the tie this ordering exists for — if these differ the test proves nothing"
     )
