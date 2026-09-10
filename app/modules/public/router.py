@@ -129,8 +129,8 @@ async def public_activity_seasons(db: Annotated[AsyncSession, Depends(get_db)]) 
     deleted `site_season_windows` settings key. Resolved through the SAME
     function the blocking check itself calls
     (`norms.checks.resolve_effective_windows`); see `service.
-    public_activity_seasons` for what `is_default` means and why every
-    window here is `[]`. Shares `_OPEN_DATA_LIMIT`'s bucket rather than a new
+    public_activity_seasons` for what `is_default` means and whose rows
+    (the Agency's) the anonymous read shows. Shares `_OPEN_DATA_LIMIT`'s bucket rather than a new
     settings key — the same low-volume, cacheable-read shape as
     `/site-settings` and `/ratings/summary` beside it."""
     return await service.public_activity_seasons(db)

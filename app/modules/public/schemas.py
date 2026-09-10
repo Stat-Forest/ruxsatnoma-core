@@ -154,13 +154,13 @@ class PublicActivitySeasonOut(BaseModel):
     tolerated malformed window into a 500 on a READ endpoint would be worse
     than showing it as-is.
 
-    `windows` is always `[]` and `season_source` always `"none"` on this
-    anonymous route: with no leshoz named there is no `activity_seasons`
-    dictionary row to fall back to and no contour whose norm could override
-    it, so nothing is configured to show here — never "open all year".
+    With no leshoz named, the dictionary this anonymous route consults is
+    the AGENCY's own `activity_seasons` rows — the nationwide default
+    (2026-09-10). An activity the Agency has no row for answers `[]` and
+    `"none"`: nothing is configured to show, never "open all year".
     `is_default` marks that on every row: a real leshoz's own window, reached
     through the authenticated `GET /activity-seasons/effective`
-    (`norms.service.effective_season`), may differ."""
+    (`norms.service.effective_season`), overrides it for that leshoz."""
 
     activity_type_code: str
     windows: list[dict[str, Any]]
