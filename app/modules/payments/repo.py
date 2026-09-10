@@ -734,6 +734,32 @@ async def list_refunds(
     return list(rows), total
 
 
+async def list_refunds_by_applications(
+    db: AsyncSession,
+    application_ids: Collection[uuid.UUID],
+    *,
+    status: str | None = None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Refund], int]:
+    """A citizen's own refunds (stage 11, ruling R1) — every refund whose
+    application is one of `application_ids`, newest first, optionally
+    narrowed to one `REFUND_STATUSES` member. Mirrors
+    `list_invoices_by_applications` exactly, empty-set rule included."""
+    if not application_ids:
+        return [], 0
+    stmt = select(Refund).where(Refund.application_id.in_(list(application_ids)))
+    if status is not None:
+        stmt = stmt.where(Refund.status == status)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Refund.requested_at.desc(), Refund.id.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
 # --- 3.10b task 10: the refund SLA sweep --------------------------------------
 
 # Which refund statuses are still "awaiting a decision" for RI-07's purposes
