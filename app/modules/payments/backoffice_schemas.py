@@ -427,7 +427,13 @@ class RefundOut(BaseModel):
     `GET /refunds/{id}` (the one route that already holds the invoice to
     read it from); every other route leaves it `[]`, not because the data
     would be wrong there but because no other handler reads the invoice's
-    snapshot today — a real absence, not a hidden default."""
+    snapshot today — a real absence, not a hidden default.
+
+    Stage 11: for a non-staff reader, `refunds_router._refund_out` blanks
+    `suggested_amount`/`suggestion_reason` always, `components`/
+    `available_sources` always, and `comment` too once the refund has left
+    `requested` — this schema carries the field, the router decides what a
+    given actor actually receives in it."""
 
     model_config = ConfigDict(from_attributes=True)
 

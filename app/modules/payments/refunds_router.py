@@ -65,7 +65,17 @@ async def _refund_out(db: AsyncSession, row: Refund, *, staff: bool, single: boo
     gets `suggested_amount`, `suggestion_reason`, `components` and
     `available_sources` blanked: the hint is the accountant's working
     figure, and the split is the leshoz's bookkeeping; `final_amount`,
-    `status`, `due_at` and their own `comment` are the citizen's fields.
+    `status` and `due_at` are the citizen's fields regardless.
+
+    `comment` is a fourth field blanked conditionally, not always: it is
+    ONE column three writers share (the citizen's own filing text, then
+    `backoffice_service.submit_refund_decision`/`approve_refund`, each
+    `if comment: row.comment = comment`) — once a decision has overwritten
+    it, nobody can tell whose text it holds any more, so a non-staff reader
+    keeps their own `comment` only while the refund is still
+    `backoffice_service._STATUS_REQUESTED`; from `in_review` onward it is
+    blanked too, fail-closed, the same "hide rather than mislabel" posture
+    the hint already has.
 
     `staff` is computed ONCE per request by the caller (`payments_service.
     holds_payments_read` is not free — a permission lookup) and passed in
@@ -75,6 +85,8 @@ async def _refund_out(db: AsyncSession, row: Refund, *, staff: bool, single: boo
     if not staff:
         out.suggested_amount = None
         out.suggestion_reason = None
+        if row.status != backoffice_service._STATUS_REQUESTED:
+            out.comment = None
         return out
     if single:
         out.components = await backoffice_service.refund_components_out(db, row)
@@ -92,7 +104,14 @@ async def request_refund(
     anyone's behalf (ruling 7). Always 201: `suggested_amount` may be `None`
     with a `suggestion_reason` instead — a hint is never a reason to refuse
     filing (ruling 2). `components` is always `[]` here — nothing has been
-    submitted yet."""
+    submitted yet.
+
+    Stage 11 fix wave: the 201 echo goes through `_refund_out` too, the
+    same `staff` predicate `get_refund`/`list_refunds` use — a citizen
+    filing their own refund must not read the accountant's hint back off
+    the very response that confirms their filing. `components` stays `[]`
+    either way (nothing has been submitted yet), so this only ever changes
+    `suggested_amount`/`suggestion_reason` for a non-staff filer."""
     row = await backoffice_service.request_refund(
         db,
         application_id=body.application_id,
@@ -100,7 +119,8 @@ async def request_refund(
         comment=body.comment,
         actor=actor,
     )
-    return RefundOut.model_validate(row)
+    staff = await payments_service.holds_payments_read(db, actor)
+    return await _refund_out(db, row, staff=staff, single=False)
 
 
 @router.post("/refunds/{refund_id}/submit-decision", response_model=RefundOut)

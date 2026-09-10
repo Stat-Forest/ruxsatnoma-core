@@ -41,6 +41,7 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
+from app.modules.auth.models import User
 from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events as payment_events
@@ -1172,7 +1173,7 @@ async def list_refunds(
     status: str | None,
     limit: int,
     offset: int,
-    actor: Any,
+    actor: User,
 ) -> tuple[list[Refund], int]:
     """`GET /refunds` (stage 11, ruling R1 — the gate lived on the route as
     `require_any_permission` until then; it moved here because the route now
@@ -1222,7 +1223,7 @@ async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund:
     return row
 
 
-async def get_refund_for_actor(db: AsyncSession, refund_id: uuid.UUID, *, actor: Any) -> Refund:
+async def get_refund_for_actor(db: AsyncSession, refund_id: uuid.UUID, *, actor: User) -> Refund:
     """`GET /refunds/{id}`'s authorization (stage 11, ruling R3): staff
     (`holds_payments_read`) open any refund, as before; otherwise the actor
     must own the refund's application — the SAME owner-or-representative

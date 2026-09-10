@@ -39,11 +39,18 @@ BLANKED = {
 
 
 async def _file(client: httpx.AsyncClient, application_id: uuid.UUID, rf01: uuid.UUID) -> str:
+    """Every caller in this file files as the owner (never staff), so the
+    201 echo itself must already carry the blanked hint (stage 11 fix
+    wave — `request_refund` now runs the response through `_refund_out`
+    too) — asserted here once rather than in each of this file's own
+    tests."""
     response = await client.post(
         REFUNDS, json={"application_id": str(application_id), "basis_item_id": str(rf01)}
     )
     assert response.status_code == 201, response.text
-    return response.json()["id"]
+    body = response.json()
+    assert body["suggested_amount"] is None
+    return body["id"]
 
 
 async def test_the_owner_lists_their_own_refund_with_the_hint_blanked(
@@ -98,6 +105,45 @@ async def test_the_accountant_still_sees_the_hint_and_the_sources(
     body = response.json()
     assert body["suggested_amount"] is not None
     assert body["available_sources"] != []
+
+
+async def test_a_submitted_decisions_comment_replaces_the_citizens_own(
+    owner_client: httpx.AsyncClient,
+    payments_view_client: httpx.AsyncClient,
+    refund_application: Application,
+    paid_refund_invoice: Invoice,
+    rf01: uuid.UUID,
+) -> None:
+    """`comment` is one column three writers share:
+    `backoffice_service.submit_refund_decision`/`approve_refund` both do
+    `if comment: row.comment = comment`, so the accountant's own note
+    overwrites whatever the citizen wrote when they filed. Once that has
+    happened nobody can tell whose text `comment` holds any more, so
+    `_refund_out` blanks it for the owner from the moment the refund
+    leaves `requested` — the owner's own read shows `comment: null`
+    (never the accountant's note), while the accountant's own read of the
+    same refund still carries it."""
+    refund_id = await _file(owner_client, refund_application.id, rf01)
+
+    decision = await payments_view_client.post(
+        f"{REFUNDS}/{refund_id}/submit-decision",
+        json={
+            "final_amount": "600000.00",
+            "components": [{"recipient_id": None, "amount": "600000.00"}],
+            "comment": "verified against the bank statement",
+        },
+    )
+    assert decision.status_code == 200, decision.text
+
+    owner_read = await owner_client.get(f"{REFUNDS}/{refund_id}")
+    assert owner_read.status_code == 200, owner_read.text
+    owner_body = owner_read.json()
+    assert owner_body["comment"] is None
+    assert owner_body["status"] == "in_review"
+
+    staff_read = await payments_view_client.get(f"{REFUNDS}/{refund_id}")
+    assert staff_read.status_code == 200, staff_read.text
+    assert staff_read.json()["comment"] == "verified against the bank statement"
 
 
 async def test_a_stranger_cannot_open_or_list_somebody_elses_refund(

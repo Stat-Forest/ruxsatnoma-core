@@ -7,8 +7,14 @@ The legal-entity fixtures are `test_intents.py`'s own (the same import idiom
 `conftest.py` uses for `test_organizations_admin.auth_client`)."""
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.main import create_app
 from app.modules.payments.models import Invoice
+from tests.conftest import make_client
+from tests.modules.admin.test_organizations_admin import auth_client
+from tests.modules.auth.test_sessions import make_session, make_user
+from tests.modules.gis.conftest import _commit_pending_before_requests
 from tests.modules.payments.test_intents import legal_applicant as legal_applicant
 from tests.modules.payments.test_intents import legal_invoice as legal_invoice
 from tests.modules.payments.test_intents import representative_client as representative_client
@@ -65,19 +71,13 @@ async def test_the_own_list_honours_the_status_filter(
 
 
 async def test_a_role_with_no_payments_right_and_no_applicant_row_gets_an_empty_page(
-    db, invoice: Invoice
+    db: AsyncSession, invoice: Invoice
 ) -> None:
     """The third kind of caller: staff WITHOUT `payments.view`/`.confirm` (a
     GIS specialist, an inspector). Not the register — they hold no right to
     it — and not a 403 either: the own branch answers them the nothing they
     own. Pins that the branch is "not staff-with-a-right", never "is an
     applicant"."""
-    from app.main import create_app
-    from tests.conftest import make_client
-    from tests.modules.admin.test_organizations_admin import auth_client
-    from tests.modules.auth.test_sessions import make_session, make_user
-    from tests.modules.gis.conftest import _commit_pending_before_requests
-
     user = await make_user(db, role_code="gis_specialist")
     _, token, csrf = await make_session(db, user)
     await db.commit()

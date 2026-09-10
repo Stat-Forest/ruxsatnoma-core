@@ -3,6 +3,8 @@ citizen's "all of mine" invoices and refunds through (stage 11, ruling R2).
 Ownership only: the individual's own row plus every effectively represented
 legal entity, every status including DRAFT, and never a staff zone."""
 
+from datetime import timedelta
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.time import business_today
@@ -14,6 +16,10 @@ from tests.modules.auth.test_sessions import make_user
 
 
 async def _application(db: AsyncSession, applicant: Applicant, *, status: str) -> Application:
+    """`status` is assigned directly, never through `applications.service`:
+    `owned_application_ids` reads ownership only and never looks at
+    `status` itself, so a real transition adds nothing this file's own
+    tests would notice."""
     submitter = applicant.owner_user_id
     if submitter is None:
         submitter = (await make_user(db, role_code="applicant", pinfl=unique_pinfl())).id
@@ -63,6 +69,33 @@ async def test_a_representative_gets_the_legal_entitys_applications(
     theirs = await _application(db, legal_applicant, status="INVOICED")
 
     assert theirs.id in await service.owned_application_ids(db, user)
+
+
+async def test_an_expired_representation_grants_nothing(
+    db: AsyncSession, legal_applicant: Applicant
+) -> None:
+    """The mirror of the test above: a `valid_until` in the past makes the
+    representation no longer effective on `business_today()`
+    (`auth_service.own_applicant_ids`'s own effectiveness check, `status=
+    'active'` and not past `valid_until`), so the legal entity's
+    application must not appear in a lapsed representative's own list."""
+    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    db.add(
+        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
+    )
+    db.add(
+        Representation(
+            applicant_id=legal_applicant.id,
+            user_id=user.id,
+            basis="org_eri",
+            valid_from=business_today() - timedelta(days=30),
+            valid_until=business_today() - timedelta(days=1),
+        )
+    )
+    await db.flush()
+    theirs = await _application(db, legal_applicant, status="INVOICED")
+
+    assert theirs.id not in await service.owned_application_ids(db, user)
 
 
 async def test_a_staff_user_with_no_applicant_row_gets_an_empty_list(db: AsyncSession) -> None:
