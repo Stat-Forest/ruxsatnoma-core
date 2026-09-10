@@ -24,6 +24,13 @@ EXPORTED: set[str] = {
     "/api/v1/rule-parameters",  # Track F
     "/api/v1/gis/contours",  # Track F
     "/api/v1/gis/imports",  # Track F
+    "/api/v1/admin/users",  # Track E
+    "/api/v1/refs/organizations",  # Track E
+    "/api/v1/admin/announcements",  # Track E
+    "/api/v1/admin/legal-documents",  # Track E
+    "/api/v1/admin/notification-templates",  # Track E
+    "/api/v1/admin/integrations/outbox",  # Track E
+    "/api/v1/admin/integrations/dead-letters",  # Track E
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
@@ -38,14 +45,6 @@ EXPORT_BACKLOG = {
     "/api/v1/payments/allocations",
     "/api/v1/refunds",
     "/api/v1/payments/recipients",
-    # Track E — admin + templates
-    "/api/v1/admin/users",
-    "/api/v1/refs/organizations",
-    "/api/v1/admin/announcements",
-    "/api/v1/admin/legal-documents",
-    "/api/v1/admin/notification-templates",
-    "/api/v1/admin/integrations/outbox",
-    "/api/v1/admin/integrations/dead-letters",
     # Track F — norms + gis: the two lists no screen reads as a register (a
     # calculation is opened from its application; activity seasons are a
     # calendar) stay here until somebody asks for them
