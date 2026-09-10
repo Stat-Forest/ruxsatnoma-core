@@ -144,6 +144,11 @@ class Permit(Base):
         # LoadProvider is exactly such a predicate, over exactly this pair.
         CheckConstraint("period_to >= period_from", name="period_ordered"),
         CheckConstraint("quantity IS NULL OR quantity >= 0", name="quantity_valid"),
+        # `repo.list_permits` orders by `updated_at DESC, id DESC` — a backward
+        # scan of this index with an early stop on the page's LIMIT. Declared
+        # here as well as in migration 0057 so the autogenerate-diff guard stays
+        # empty (the applications list has its twin, `ix_applications_updated_at_id`).
+        Index("ix_permits_updated_at_id", "updated_at", "id"),
     )
 
 

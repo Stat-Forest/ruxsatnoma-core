@@ -23,6 +23,39 @@ from app.modules.admin.models import Organization
 from app.modules.auth.models import User
 
 
+async def test_taking_it_into_work_tells_the_applicant(
+    db, hodim_client, submitted_application: str, hodim_user: User
+) -> None:
+    """Ruling #200: SUBMITTED -> IN_REVIEW notifies the APPLICANT, in-app,
+    under the dotted `application.review_started` — with a seeded template
+    (`template_id` set: without one `notify()` writes a raw fallback string)
+    and the transition the inbox draws as chips."""
+    from sqlalchemy import select
+
+    from app.modules.applications.models import Application
+    from app.modules.notifications.models import Notification
+
+    result = await hodim_client.post(f"/api/v1/applications/{submitted_application}/start-review")
+    assert result.status_code == 200, result.text
+
+    rows = (
+        await db.scalars(
+            select(Notification).where(
+                Notification.object_id == uuid.UUID(submitted_application),
+                Notification.event_code == "application.review_started",
+            )
+        )
+    ).all()
+    assert [row.channel for row in rows] == ["inapp"], "cabinet only — no SMS for this one"
+    inapp = rows[0]
+    application = await db.get(Application, uuid.UUID(submitted_application))
+    assert application is not None
+    assert inapp.recipient_user_id == application.submitted_by_user_id
+    assert inapp.recipient_user_id != hodim_user.id
+    assert inapp.template_id is not None
+    assert (inapp.params["status_from"], inapp.params["status_to"]) == ("SUBMITTED", "IN_REVIEW")
+
+
 async def test_a_hodim_in_the_zone_takes_it_into_work(
     hodim_client, submitted_application: str
 ) -> None:

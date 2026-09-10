@@ -390,3 +390,29 @@ async def test_moving_a_returned_application_to_another_contour_clears_the_froze
     assert row.contour_id == elsewhere.id
     assert row.contour_version_id is None, "a version of the OLD contour cannot survive the move"
     assert row.requested_area_ha is None
+
+
+async def test_the_list_puts_the_most_recently_updated_application_first(
+    db, applicant_client, filing_ready_for_submission, another_ready_filing, sheep_type_id
+) -> None:
+    """The queue is ordered by `updated_at DESC`, not by creation (#201): an
+    older application that was just touched must climb above a newer
+    untouched one, or a reviewer's "what changed since I looked" reading of
+    the list is silently wrong. `id` (uuid7, creation-ordered) stays as the
+    tie-break only. Touched through the one edit route a filed application
+    keeps — PATCH on RETURNED (stage 12)."""
+    older = await _submit_with_button(applicant_client, filing_ready_for_submission)
+    newer = await _submit_with_button(applicant_client, another_ready_filing)
+    assert older.status_code == 201 and newer.status_code == 201, (older.text, newer.text)
+
+    await _returned(db, older.json()["id"])
+    touched = await applicant_client.patch(
+        f"/api/v1/applications/{older.json()['id']}",
+        json={"items": [{"livestock_type_id": str(sheep_type_id), "head_count": 41}]},
+    )
+    assert touched.status_code == 200, touched.text
+
+    listed = await applicant_client.get("/api/v1/applications")
+    assert listed.status_code == 200
+    ids = [row["id"] for row in listed.json()["items"]]
+    assert ids == [older.json()["id"], newer.json()["id"]]

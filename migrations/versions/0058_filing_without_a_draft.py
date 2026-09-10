@@ -28,8 +28,8 @@ The downgrade restores the CHECK; the deleted drafts do not come back —
 there is nothing to restore them from, and a downgrade must say so rather
 than pretend.
 
-Revision ID: 0056
-Revises: 0055
+Revision ID: 0058
+Revises: 0057
 Create Date: 2026-09-11 02:00:00.000000
 
 """
@@ -39,8 +39,8 @@ from collections.abc import Sequence
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0056"
-down_revision: str | Sequence[str] | None = "0055"
+revision: str = "0058"
+down_revision: str | Sequence[str] | None = "0057"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
