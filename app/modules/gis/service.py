@@ -1802,6 +1802,43 @@ async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
     return await repo.contour_number(db, contour_id)
 
 
+async def version_geometry(db: AsyncSession, version_id: uuid.UUID) -> dict[str, Any] | None:
+    """One specific version's geometry, as a parsed GeoJSON geometry object.
+
+    `None` two different ways since decision #178 made `ContourVersion.geom`
+    nullable: no such version exists at all, OR the version exists but was
+    imported with no delivered geometry — `repo.version_geometry`'s own
+    docstring names both and the caveat carries through unchanged, since this
+    is a pure `json.loads` over that function's own result. First and only
+    consumer (`permits.service.public_check`, below) already treats both the
+    same way: no geometry to publish, either way.
+
+    Like `contour_organization`/`contour_number` beside it: no permission, no
+    zone, no HTTP actor at all, because the caller is another service inside
+    this process rather than a route.
+
+    Keyed on the VERSION, not the contour, on purpose (this replaced an
+    earlier `published_contour_geometry(contour_id)` that a review caught
+    reading whatever version is published TODAY): `permits.service.
+    public_check` must show the geometry the permit was actually issued
+    against, `permits.contour_version_id`, which the `ContourVersion` model's
+    own docstring says is frozen precisely so "republishing never moves the
+    ground under an issued permit" — `gis.service.publish_version` archives
+    the old published row with no check for permits still referencing it, so
+    a boundary correction or a #91 split after issuance is a normal,
+    unguarded operation that must not change what this reads.
+
+    Reuses `repo.version_geometry`'s own `ST_AsGeoJSON` conversion (module
+    convention: PostGIS renders geometry, this module never reconstructs it in
+    Python) instead of a second query doing the same thing. First and only
+    consumer: `permits.service.public_check`, behind
+    `public_permit_contour_enabled` (ruling R2, default OFF) — the ONE caller
+    with no actor of any kind.
+    """
+    geometry = await repo.version_geometry(db, version_id)
+    return None if geometry is None else json.loads(geometry)
+
+
 async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.CheckResult]:
     """The four topology checks against one version, with no actor and no
     contour id — what a norm or an application pre-check needs.

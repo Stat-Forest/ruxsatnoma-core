@@ -4,11 +4,13 @@ own `ValidationError` (422 `ERR-VAL-001`, handled centrally) never echoes
 field VALUES back for a plain type mismatch, only field names."""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Self
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
+
+from app.core.schemas import LocalizedName
 
 
 class AppealContact(BaseModel):
@@ -102,3 +104,103 @@ class OpenDataStatsOut(BaseModel):
     total_active_area_ha: Decimal
     by_region: list[OpenDataRegionStatOut]
     by_organization: list[OpenDataOrgStatOut]
+
+
+class SiteTextOut(BaseModel):
+    """Two languages only: the landing falls back to `uz_latn` for the other
+    three UI languages (#90)."""
+
+    uz_latn: str
+    ru: str
+
+
+class SiteSocialOut(BaseModel):
+    telegram: str | None = None
+    youtube: str | None = None
+
+
+class SiteContactsOut(BaseModel):
+    phone: str
+    email: str
+    address: SiteTextOut
+    hours: SiteTextOut
+    social: SiteSocialOut
+
+
+class SiteSettingsOut(BaseModel):
+    """Feeds the landing footer in one anonymous request (ruling R3) — an
+    explicit whitelist of `system_settings` keys, never a proxy of the store.
+
+    `season_windows` used to ride along here (`site_season_windows`'s six
+    hard-coded month lists) until the stage 8 fix wave (finding 1) deleted
+    that key: it disagreed with the real, per-leshoz windows
+    `norms.models.ActivitySeason` and `norms.checks._season_check` had
+    started enforcing by the time this branch merged. `GET
+    /public/activity-seasons` (`PublicActivitySeasonOut` below) replaces it."""
+
+    contacts: SiteContactsOut
+
+
+class PublicActivitySeasonOut(BaseModel):
+    """One activity's effective season with no leshoz specified — `GET
+    /public/activity-seasons` (stage 8 fix wave finding 1, supersedes the R3
+    half of decision #175).
+
+    `windows` is the raw JSONB list `norms.checks.resolve_effective_windows`
+    returns (`{"from": "MM-DD", "to": "MM-DD"}` dicts, `norms.schemas.
+    EffectiveSeasonOut`'s own shape) — never re-validated into a stricter
+    model here, for the identical reason that route gives: a pre-existing
+    row may predate the window's own edge validation, and turning an already
+    tolerated malformed window into a 500 on a READ endpoint would be worse
+    than showing it as-is.
+
+    `windows` is always `[]` and `season_source` always `"none"` on this
+    anonymous route: with no leshoz named there is no `activity_seasons`
+    dictionary row to fall back to and no contour whose norm could override
+    it, so nothing is configured to show here — never "open all year".
+    `is_default` marks that on every row: a real leshoz's own window, reached
+    through the authenticated `GET /activity-seasons/effective`
+    (`norms.service.effective_season`), may differ."""
+
+    activity_type_code: str
+    windows: list[dict[str, Any]]
+    season_source: str
+    is_default: bool
+
+
+class RatingSummaryOut(BaseModel):
+    """The landing's single national number for citizens' post-issuance
+    ratings (#174) — suppressed below `service.OPEN_DATA_K_ANONYMITY`: below
+    it `published` is `False` and BOTH `average` and `histogram` are `None`,
+    never a number computed from a handful of rows and presented as if it
+    meant something nationally. `count` is always the true count, published
+    or not — it is what lets the front end say "not enough ratings yet"
+    instead of just hiding the block."""
+
+    published: bool
+    average: Decimal | None
+    count: int
+    histogram: dict[int, int] | None
+    threshold: int
+
+
+class ApplicationStatusOut(BaseModel):
+    """`GET /public/applications/check` — status without logging in (task 4).
+
+    Same "no oracle" posture as `AppealStatusOut`: an unknown `number` and a
+    `number` whose `phone` does not match answer identically, every field
+    `None` but `found`. What this shape may NEVER carry — the applicant's
+    name, the contour geometry, the calculated sum, attachments, the
+    reviewing official — stays behind the cabinet login; only the status,
+    its human label, the activity, the leshoz and what happens next cross
+    this boundary.
+    """
+
+    found: bool
+    number: str | None = None
+    status: str | None = None
+    status_label: LocalizedName | None = None
+    activity_type: str | None = None
+    organization: str | None = None
+    next_step: str | None = None
+    submitted_at: date | None = None

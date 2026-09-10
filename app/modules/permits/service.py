@@ -34,7 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core import files, numbers, storage
+from app.core import files, numbers, settings_store, storage
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
@@ -1859,6 +1859,20 @@ async def public_check(
     keeps `models.py`'s invariant («that null IS the not_found case's whole
     payload») true and keeps the statistics from recording that somebody looked
     at a specific unsigned document.
+
+    **`contour` is `None` unless `public_permit_contour_enabled` says otherwise**
+    (ruling R2). The setting ships OFF: this route publishes a named citizen's
+    land-plot boundaries to anyone holding the QR code or the series and
+    number, and the Agency has not given written consent yet. The flag is read
+    HERE, once, on the found path only — never in the router, which must not
+    grow policy — and a `None` on the permit's own contour (no such version
+    left to draw) answers the same as the flag being off, never a 500.
+
+    **The geometry is pinned to `permit.contour_version_id`, never the
+    contour's currently published version.** `gis.service.version_geometry`
+    reads that exact frozen row; it may since have been archived by a
+    boundary correction or a #91 split, and this page must still show what
+    the permit's own PDF printed, not what the map shows today.
     """
     # One decider for the channel, shared with the router's rate limit.
     channel = check_channel(qr_token=qr_token, series=series, number=number)
@@ -1871,6 +1885,10 @@ async def public_check(
     if permit is None or label is None:
         await repo.add(db, QrCheckLog(permit_id=None, result=RESULT_NOT_FOUND, channel=channel))
         return {"found": False}
+
+    contour = None
+    if await settings_store.get_bool(db, "public_permit_contour_enabled"):
+        contour = await gis_service.version_geometry(db, permit.contour_version_id)
 
     await repo.add(db, QrCheckLog(permit_id=permit.id, result=RESULT_FOUND, channel=channel))
     return {
@@ -1887,6 +1905,7 @@ async def public_check(
         # `mask_name` answers `NOT_STATED` on an empty name itself, so there is no
         # `or` here: a mask applied to the em dash would print «—.***».
         "holder": mask_name(_from_snapshot(permit.snapshot, "holder_name")),
+        "contour": contour,
     }
 
 
@@ -3057,6 +3076,17 @@ async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str
         {"organization_id": org_id, "active_count": count, "active_area_ha": area}
         for org_id, count, area in rows
     ]
+
+
+async def public_rating_histogram(db: AsyncSession) -> dict[int, int]:
+    """Anonymous open-data read, the rating-summary sibling of
+    `public_active_stats_by_organization` right above (design/01 rule 2:
+    cross-module calls go through this service, never `permits.repo`
+    directly). Returns the raw, nationwide, unfiltered per-score counts;
+    `public.service.rating_summary` applies the k-anonymity suppression and
+    the average — this module has no opinion on what "too few to publish"
+    means outside its own walls."""
+    return await repo.rating_histogram(db)
 
 
 # --- Task 5: the Agency's aggregates, without the author (ruling #142) --------

@@ -660,6 +660,19 @@ async def active_stats_by_organization(db: AsyncSession) -> list[tuple[uuid.UUID
     return [(row[0], row[1], row[2]) for row in rows.all()]
 
 
+async def rating_histogram(db: AsyncSession) -> dict[int, int]:
+    """Nationwide count of `permit_ratings` rows per score, 1-5 — no zone, no
+    period, no organization filter, unlike `_ratings_conditions`'s scoped
+    siblings below (4.6 `public`'s rating-summary aggregate, moved here in
+    the stage 8 fix wave, finding 2: `public` may not import `permits.repo`/
+    `.models`, and `permits.service.public_rating_histogram` is the one
+    door). Missing scores are absent from the result, not zero; the caller
+    decides whether to publish at all once it knows the total
+    (`public.service.rating_summary`'s own k-anonymity threshold)."""
+    rows = await db.execute(select(PermitRating.score, func.count()).group_by(PermitRating.score))
+    return {int(score): int(count) for score, count in rows.all()}
+
+
 # --- Task 5: the Agency's aggregates, without the author (ruling #142) --------
 
 

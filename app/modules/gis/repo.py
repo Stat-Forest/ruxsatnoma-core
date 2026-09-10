@@ -214,6 +214,29 @@ async def published_version(db: AsyncSession, contour_id: uuid.UUID) -> ContourV
     return result.scalar_one_or_none()
 
 
+async def version_geometry(db: AsyncSession, version_id: uuid.UUID) -> str | None:
+    """One version's geometry alone, as the GeoJSON string PostGIS renders
+    (`ST_AsGeoJSON`, same conversion `contour_card`/`version_detail` use).
+
+    `None` two different ways since decision #178 made `ContourVersion.geom`
+    nullable: no such version exists at all, OR the version exists but was
+    imported with no delivered geometry (`geom IS NULL`, and
+    `ST_AsGeoJSON(NULL)` is itself SQL `NULL`) — this function cannot and
+    does not tell the two apart. A caller that must knows to call
+    `version_by_id` instead (or first), which returns the row itself and so
+    can.
+
+    Deliberately keyed on the VERSION, not on `status`: a permit's frozen
+    `contour_version_id` may no longer be the contour's `published` row (a
+    boundary correction or a #91 split republishes it and archives the one
+    the permit was actually issued against), and it is that exact row, not
+    "whatever is published today", this reads."""
+    result = await db.execute(
+        select(func.ST_AsGeoJSON(ContourVersion.geom)).where(ContourVersion.id == version_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def has_children(db: AsyncSession, parent_id: uuid.UUID) -> bool:
     """Whether ANY contour already names `parent_id` as its `parent_id` — the
     precondition `service.split_contour` refuses on (decision #91: a split

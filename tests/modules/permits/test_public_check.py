@@ -65,6 +65,10 @@ CARD_FIELDS = {
     "activity_type",
     "signatures_valid",
     "holder",
+    # Task 5: always present, `None` unless `public_permit_contour_enabled`
+    # is on (ruling R2, default OFF) — this suite never flips it, so every
+    # card here carries `"contour": None`.
+    "contour",
 }
 
 

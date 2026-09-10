@@ -1,5 +1,16 @@
-"""Every SQL statement `public` issues. No business rules here — the service
-decides, the repo asks."""
+"""Every SQL statement `public` issues against its OWN table, `citizen_appeals`.
+No business rules here — the service decides, the repo asks.
+
+Stage 8 fix wave, finding 2: this file used to also query `applications`,
+`auth.models.Applicant`, `admin.models.{ActivityType,Organization}` and
+`permits.models.PermitRating` directly — none of those tables are on
+`backend/CLAUDE.md`'s cross-module read whitelist (reports/dashboard/search/
+oversight/archive), and `applications` is named there explicitly: "never an
+import of `applications.repo`/`.models`". Both reads now go through the
+owning module's service — `applications.service.public_status_lookup` and
+`permits.service.public_rating_histogram` — the same pattern
+`public.service.open_data_stats` already used for `permits_service.
+public_active_stats_by_organization`."""
 
 import uuid
 
