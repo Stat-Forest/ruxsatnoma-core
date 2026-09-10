@@ -60,6 +60,7 @@ from app.modules.applications.permissions import (
 )
 from app.modules.applications.schemas import (
     ApplicationCheckIn,
+    ApplicationCloneOut,
     ApplicationDocumentIn,
     ApplicationFileIn,
     ApplicationFilingIn,
@@ -3402,7 +3403,7 @@ APPLICATION_CLONE = "application.clone"
 
 async def clone_template(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
-) -> ApplicationFilingIn:
+) -> ApplicationCloneOut:
     """`GET /applications/{id}/clone` — the filing a caller would send to
     refile an application they own, in WHATEVER status it holds (stage 12,
     plan 12 R6: a read that returns a template, since there is no draft to
@@ -3435,7 +3436,7 @@ async def clone_template(
     if source is None or source.applicant_id not in await _own_applicant_ids(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     items = await repo.list_items(db, source.id)
-    return ApplicationFilingIn(
+    return ApplicationCloneOut(
         on_behalf=source.on_behalf,  # type: ignore[arg-type]  # CHECK-backed literal
         applicant_id=source.applicant_id,
         activity_type_id=source.activity_type_id,

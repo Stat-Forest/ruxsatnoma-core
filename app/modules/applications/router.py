@@ -51,6 +51,7 @@ from app.modules.applications.schemas import (
     ApplicationCardOut,
     ApplicationCheckIn,
     ApplicationCheckOut,
+    ApplicationCloneOut,
     ApplicationConclusionIn,
     ApplicationConclusionOut,
     ApplicationDecisionOut,
@@ -521,7 +522,7 @@ async def clone_application_template(
     application_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
-) -> ApplicationFilingIn:
+) -> ApplicationCloneOut:
     """200 with the FILING a caller would send to refile an application they
     own, in whatever status it holds (stage 12, plan 12 R6: a read, since
     there is no draft to create) — so a herder renewing next season's grazing

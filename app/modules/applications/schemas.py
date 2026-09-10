@@ -598,6 +598,14 @@ class ApplicationFileIn(ApplicationFilingIn):
     application_id: uuid.UUID | None = None
 
 
+class ApplicationCloneOut(ApplicationFilingIn):
+    """`GET /applications/{id}/clone` — an `ApplicationFilingIn` the caller may
+    post back as it is. A subclass under its own name ON PURPOSE: a pydantic
+    model used both as a request body and as a response splits into
+    `-Input`/`-Output` variants in the OpenAPI document, and the generated
+    client (`openapi-typescript`) then has no `ApplicationFilingIn` at all."""
+
+
 class FilingPackageOut(BaseModel):
     """`POST /applications/package` — the id the application WILL have (plan
     12, R2: the signed bytes name it, so it is minted here and sent back with
