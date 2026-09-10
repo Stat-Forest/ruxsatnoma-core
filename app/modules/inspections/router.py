@@ -9,14 +9,16 @@ from "may this role act at all")."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.inspections import service
+from app.modules.inspections import export, service
 from app.modules.inspections.permissions import (
     ACTS_WRITE,
     CASES_MANAGE,
@@ -118,6 +120,24 @@ async def list_tasks(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/tasks/export.xlsx")
+async def export_tasks_xlsx(
+    db: AsyncDb,
+    user: CurrentUser,
+    lang: xlsx.Lang = "uz_latn",
+    status: str | None = None,
+) -> Response:
+    """`GET /tasks` as a spreadsheet (stage 13, ruling #204): the same scope,
+    the same filter, every matching row up to the configured cap. Declared
+    before `/tasks/{task_id}` on purpose — `export.xlsx` is not a UUID, and
+    a 404 here beats the 422 the UUID parser would otherwise answer."""
+    items, total, cap = await export.task_rows(db, actor=user, lang=lang, status=status)
+    filename = f"inspection-tasks-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_tasks(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
