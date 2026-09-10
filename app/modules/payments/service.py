@@ -1106,23 +1106,19 @@ async def list_invoices_for_actor(
     application that is not theirs cannot tell it apart from one that does
     not exist at all).
 
-    Without it (backend-gaps finding 3), the register itself: a `payments.
-    view` holder browses every invoice, not one application's own — the
-    citizen's branch above has no republic to browse, so this half is
-    staff-only, `ERR-ACL-001` for anyone else, the same shape
-    `list_manual_confirmations`/`list_reconciliations` already gate on
-    `PAYMENTS_VIEW`/`PAYMENTS_CONFIRM`. Zone-scoped like every other list in
-    this system (decision #70, fails closed): an empty zone (a central
-    accountant, `sys_admin`) pages straight out of SQL — the common case
-    costs no extra query — a leshoz-scoped one goes through
+    Without `application_id`: staff (`holds_payments_read`) get the
+    register, zone-scoped as before — an empty zone (a central accountant,
+    `sys_admin`) pages straight out of SQL, a leshoz-scoped one goes through
     `_scan_invoices_in_zone`, which walks the WHOLE matching-status set and
     filters it per row through the SAME `_zone_covers_application` the
     single-invoice routes use, because `invoices` carries no
     `organization_id` of its own to filter on in SQL (the same reason
     `list_manual_confirmations` scans instead of filtering). See that
     function's own docstring for why this is a full scan rather than a
-    capped one, and what that costs. Always still reachable by id or by
-    `?application_id=` regardless."""
+    capped one, and what that costs. Anyone else gets their own invoices
+    across every application they own or represent (stage 11, ruling R1) —
+    the `GET /applications`/`GET /permits` shape. Always still reachable by
+    id or by `?application_id=` regardless."""
     if application_id is not None:
         application = await applications_service.get(db, application_id)
         if application is None:
@@ -1136,7 +1132,20 @@ async def list_invoices_for_actor(
         )
 
     if not await holds_payments_read(db, actor):
-        raise err("ERR-ACL-001")
+        # Ruling R1 (stage 11): a caller with no right to the register gets
+        # their OWN invoices — `applications.service.owned_application_ids`'
+        # set, the same one `GET /applications` scopes an owner on, so this
+        # list can never name an application that list would not. Staff who
+        # hold no payments right (a GIS specialist) own nothing and get an
+        # empty page, not a refusal: the branch is "not staff-with-a-right",
+        # never "is an applicant". Staff can never own an application at all
+        # (`applications.create` and the `Applicant` row are the `applicant`
+        # role's alone), which is why this is either/or and not the SQL union
+        # `applications.service.list_applications` builds.
+        owned = await applications_service.owned_application_ids(db, actor)
+        return await repo.list_invoices_by_applications(
+            db, owned, status=status, limit=limit, offset=offset
+        )
     zone = zone_of(actor)
     if zone == Zone(None, None, None):
         return await repo.list_invoices(db, status=status, limit=limit, offset=offset)

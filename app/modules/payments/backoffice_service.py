@@ -41,6 +41,7 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
+from app.modules.auth.models import User
 from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications_service
 from app.modules.payments import events as payment_events
@@ -1172,14 +1173,41 @@ async def list_refunds(
     status: str | None,
     limit: int,
     offset: int,
-    actor: Any,
+    actor: User,
 ) -> tuple[list[Refund], int]:
-    """`GET /refunds` — `payments.view` sees every refund (optionally
-    narrowed by `application_id`/`status`); `actor` is accepted for symmetry
-    with `list_reconciliations` and is not used to filter further — the
-    route's own `PAYMENTS_VIEW` gate already decides who may call this."""
-    return await repo.list_refunds(
-        db, application_id=application_id, status=status, limit=limit, offset=offset
+    """`GET /refunds` (stage 11, ruling R1 — the gate lived on the route as
+    `require_any_permission` until then; it moved here because the route now
+    answers three questions and only the service can tell which is asked).
+
+    With `application_id`: the owner-or-representative-or-staff check
+    `_may_request_refund_for` already gives `POST /refunds`, 404 for a
+    stranger (the `get_invoice_for_actor` oracle rule) — whoever may file
+    for an application may list its refunds. Without it: staff
+    (`payments.service.holds_payments_read` — `payments.view` or `.confirm`;
+    the head approves through `confirm` alone and needs the list to find
+    what to approve) get the register, not zone-scoped, exactly as before;
+    anyone else gets their own refunds across every application they own or
+    represent (`applications.service.owned_application_ids`), and an
+    applicant with none gets an empty page, never a refusal."""
+    if application_id is not None:
+        application = await applications_service.get(db, application_id)
+        if application is None:
+            raise err("ERR-SYS-003", details={"application": str(application_id)})
+        staff = await payments_service.holds_payments_read(db, actor)
+        if not staff and not await _may_request_refund_for(
+            db, application.applicant_id, actor=actor
+        ):
+            raise err("ERR-SYS-003", details={"application": str(application_id)})
+        return await repo.list_refunds(
+            db, application_id=application_id, status=status, limit=limit, offset=offset
+        )
+    if await payments_service.holds_payments_read(db, actor):
+        return await repo.list_refunds(
+            db, application_id=None, status=status, limit=limit, offset=offset
+        )
+    owned = await applications_service.owned_application_ids(db, actor)
+    return await repo.list_refunds_by_applications(
+        db, owned, status=status, limit=limit, offset=offset
     )
 
 
@@ -1193,6 +1221,29 @@ async def get_refund(db: AsyncSession, refund_id: uuid.UUID) -> Refund:
     if row is None:
         raise err("ERR-SYS-003", details={"refund": str(refund_id)})
     return row
+
+
+async def get_refund_for_actor(db: AsyncSession, refund_id: uuid.UUID, *, actor: User) -> Refund:
+    """`GET /refunds/{id}`'s authorization (stage 11, ruling R3): staff
+    (`holds_payments_read`) open any refund, as before; otherwise the actor
+    must own the refund's application — the SAME owner-or-representative
+    rule `request_refund` applies through `_may_request_refund_for`, so
+    whoever could file it can follow it. A stranger and a missing id get the
+    same `ERR-SYS-003` (404), never a 403 that would confirm the id is real
+    (`payments.service.get_invoice_for_actor`'s oracle reasoning). WHAT the
+    owner sees of the row is the router's question (`_refund_out`), not this
+    function's."""
+    row = await repo.get_refund(db, refund_id)
+    if row is None:
+        raise err("ERR-SYS-003", details={"refund": str(refund_id)})
+    if await payments_service.holds_payments_read(db, actor):
+        return row
+    application = await applications_service.get(db, row.application_id)
+    if application is not None and await _may_request_refund_for(
+        db, application.applicant_id, actor=actor
+    ):
+        return row
+    raise err("ERR-SYS-003", details={"refund": str(refund_id)})
 
 
 async def refund_components_out(db: AsyncSession, refund: Refund) -> list[RefundComponentOut]:

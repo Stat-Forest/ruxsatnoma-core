@@ -355,6 +355,20 @@ async def list_applications(
     return list(rows.scalars().all()), total
 
 
+async def list_application_ids_by_applicants(
+    db: AsyncSession, applicant_ids: Collection[uuid.UUID]
+) -> list[uuid.UUID]:
+    """Every application id whose `applicant_id` is one of `applicant_ids`, in
+    every status — DRAFT included: an owner's own history is theirs entire.
+    Empty input answers an empty list and issues NO statement, the same rule
+    `list_applications` states for an empty scope: "nothing" must be nothing,
+    never a WHERE clause one edit away from every application in the country."""
+    if not applicant_ids:
+        return []
+    stmt = select(Application.id).where(Application.applicant_id.in_(list(applicant_ids)))
+    return list((await db.execute(stmt)).scalars().all())
+
+
 # tz/05 invariant 1, and the WHERE clause of migration 0015's
 # `ex_applications_no_duplicate` verbatim: the statuses in which an application
 # OCCUPIES its (applicant, contour, activity, period) slot. DRAFT is outside it

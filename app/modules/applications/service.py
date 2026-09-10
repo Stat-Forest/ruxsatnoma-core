@@ -689,6 +689,24 @@ async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
     return await auth_service.own_applicant_ids(db, actor.id)
 
 
+async def owned_application_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
+    """Every application `actor` may act for as its OWNER — filed by their own
+    individual `applicants` row or by a legal entity they hold an effective
+    representation of (`_own_applicant_ids`, judged on `business_today()`), in
+    every status.
+
+    The seam `payments` needs for a citizen's "all of mine" reads (stage 11,
+    ruling R2): `invoices` and `refunds` carry `application_id` and no
+    `applicant_id`, and `payments` may not join into this module's tables, so
+    it asks for the id set and filters in its own SQL — the same set
+    `list_applications` builds its `holder_ids` scope from, so a list of
+    invoices can never name an application the owner's own list would not.
+    Ownership ONLY: no staff zone, no permission. An accountant who also
+    grazes cattle gets THEIR applications here (usually none), never the
+    leshoz's — which is exactly what a screen called "my payments" must show."""
+    return await repo.list_application_ids_by_applicants(db, await _own_applicant_ids(db, actor))
+
+
 async def _forwarded_here_by(db: AsyncSession, application: Application, *, actor: User) -> bool:
     """Ruling #107 (`tz/12` #27): whether `actor` is the one who forwarded
     THIS application up the ladder, at any level — the one case

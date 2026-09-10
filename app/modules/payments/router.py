@@ -12,9 +12,10 @@ inside `service.py`, exactly like `notifications.service.mark_read`.
 `GET /invoices` without `?application_id=` is the register itself
 (backend-gaps finding 3): before this, only a filtered or by-id lookup
 existed, so an accountant's screen could show one application's invoices but
-never browse the whole book. That path is staff-only and zone-scoped
-(decision #70) — `service.list_invoices_for_actor`'s own docstring carries
-the reasoning; this router stays a thin pass-through for both.
+never browse the whole book. That path is staff (`holds_payments_read`) and
+zone-scoped (decision #70); anyone else gets their own invoices instead
+(stage 11, ruling R1) — `service.list_invoices_for_actor`'s own docstring
+carries the reasoning; this router stays a thin pass-through for both.
 
 Stage 7.9 task 8: `GET /invoices/{id}` additionally attaches `recipients`
 (`_invoice_out` below) for a STAFF reader ONLY — gated on `service.
@@ -92,9 +93,10 @@ async def list_invoices(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(get_current_user)],
     # Optional (backend-gaps finding 3): given, this is the original
-    # application-scoped read; omitted, it is the register itself, gated in
-    # the service to `payments.view` holders only — see this file's own
-    # module docstring and `service.list_invoices_for_actor`'s.
+    # application-scoped read; omitted, it is the register for staff
+    # (`payments.view`/`payments.confirm`) and the caller's own invoices for
+    # anyone else (stage 11, ruling R1) — see this file's own module
+    # docstring and `service.list_invoices_for_actor`'s.
     application_id: uuid.UUID | None = None,
     status: Annotated[str | None, Query(pattern=_INVOICE_STATUS_PATTERN)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
