@@ -271,7 +271,9 @@ async def decide(
         ip=ip,
     )
 
-    # 8.
+    # 8. `from_status` is read BEFORE the move — `set_status` returns the row
+    # already standing on `to_status`.
+    from_status = permit.status
     permit = await service.set_status(
         db,
         permit.id,
@@ -288,7 +290,10 @@ async def decide(
         db,
         event_code=event_code,
         recipient_user_id=await service._holder_recipient(db, permit),
-        params={"permit_number": service._permit_number(permit.series, permit.number)},
+        params={
+            "permit_number": service._permit_number(permit.series, permit.number),
+            **notifications.transition_params(from_status=from_status, to_status=to_status),
+        },
         object_type=service.OBJECT_TYPE,
         object_id=permit.id,
     )

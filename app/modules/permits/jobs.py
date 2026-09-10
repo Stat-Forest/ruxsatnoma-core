@@ -178,7 +178,10 @@ async def _expire_one(db: AsyncSession, permit: Permit, *, correlation: str) -> 
         db,
         event_code=events.PERMIT_EXPIRED,
         recipient_user_id=await service._holder_recipient(db, permit),
-        params={"permit_number": service._permit_number(permit.series, permit.number)},
+        params={
+            "permit_number": service._permit_number(permit.series, permit.number),
+            **notifications.transition_params(from_status=from_status, to_status=EXPIRED_STATUS),
+        },
         object_type=service.OBJECT_TYPE,
         object_id=permit.id,
         correlation_id=correlation,

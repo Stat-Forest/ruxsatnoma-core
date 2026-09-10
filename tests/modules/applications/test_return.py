@@ -75,6 +75,30 @@ async def test_the_return_reason_reaches_the_timeline(
     assert last["legal_basis"] == "ВМҚ 290"
 
 
+async def test_the_return_notification_names_both_ends_of_the_transition(
+    db, hodim_client, application_in_review, rj_01_return_reason
+) -> None:
+    """`params.status_from`/`status_to` — the inbox's chips. Filled in by this
+    call site by hand, so asserted here and not only on `submit`."""
+    import uuid
+
+    from tests.modules.notifications.conftest import inapp_params
+
+    result = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/return",
+        json={
+            "reason_item_id": str(rj_01_return_reason.id),
+            "fields_to_fix": {"period_from": "начало вне сезона"},
+            "legal_basis": "ВМҚ 290",
+        },
+    )
+    assert result.status_code == 200, result.text
+    params = await inapp_params(
+        db, object_id=uuid.UUID(application_in_review), event_code="application.returned"
+    )
+    assert (params["status_from"], params["status_to"]) == ("IN_REVIEW", "RETURNED")
+
+
 async def test_a_returned_application_is_edited_and_resubmitted_keeping_its_number(
     hodim_client, applicant_client, application_in_review, rj_01_return_reason
 ) -> None:

@@ -29,6 +29,26 @@ async def test_the_clock_stops_while_the_applicant_is_being_waited_on(
     )
 
 
+async def test_the_info_request_notification_names_both_ends_of_the_transition(
+    db, hodim_client, application_in_review
+) -> None:
+    """`params.status_from`/`status_to` — the inbox's chips, filled in by this
+    call site by hand."""
+    import uuid
+
+    from tests.modules.notifications.conftest import inapp_params
+
+    asked = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/request-info",
+        json={"message": "Прикрепите ветеринарную справку"},
+    )
+    assert asked.status_code == 200, asked.text
+    params = await inapp_params(
+        db, object_id=uuid.UUID(application_in_review), event_code="application.info_requested"
+    )
+    assert (params["status_from"], params["status_to"]) == ("IN_REVIEW", "PENDING_INFO")
+
+
 async def test_answering_shifts_the_deadline_by_the_pause(
     db, hodim_client, applicant_client, application_in_review, frozen_clock
 ) -> None:

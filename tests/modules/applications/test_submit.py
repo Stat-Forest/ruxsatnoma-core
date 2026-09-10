@@ -817,6 +817,10 @@ async def test_the_applicant_is_notified_under_the_dotted_template_code(
     inapp = next(row for row in rows if row.channel == "inapp")
     assert inapp.template_id is not None
     assert number in inapp.rendered_text
+    # The inbox draws "DRAFT -> SUBMITTED" chips from these two keys; a flow
+    # that moves a status and forgets them ships a notification the cabinet
+    # can only show as bare text.
+    assert (inapp.params["status_from"], inapp.params["status_to"]) == ("DRAFT", "SUBMITTED")
 
 
 async def test_the_filing_publishes_application_id_and_nothing_else(

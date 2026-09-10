@@ -138,6 +138,26 @@ async def test_the_signature_hangs_on_the_history_row_it_explains(
     assert signed[0].verification_status == "valid"
 
 
+async def test_the_decision_notification_names_both_ends_of_the_transition(
+    db, active_permit, head_client, suspend_reason_id, order_file_id
+) -> None:
+    """`params.status_from`/`status_to` — what the cabinet inbox renders as
+    "active -> suspended" chips. One call site serves suspend, resume and
+    revoke, so one decision covers the mechanism."""
+    from app.modules.permits import events
+    from tests.modules.notifications.conftest import inapp_params
+
+    await sign_decision(
+        head_client,
+        active_permit.id,
+        "suspend",
+        reason_item_id=suspend_reason_id,
+        doc_file_id=order_file_id,
+    )
+    params = await inapp_params(db, object_id=active_permit.id, event_code=events.PERMIT_SUSPENDED)
+    assert (params["status_from"], params["status_to"]) == ("active", "suspended")
+
+
 async def test_the_service_wrapper_produces_the_same_decision_as_the_route(
     db, active_permit, head_client, suspend_reason_id, resume_reason_id, order_file_id
 ) -> None:
