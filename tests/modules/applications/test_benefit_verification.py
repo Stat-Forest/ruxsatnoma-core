@@ -374,10 +374,9 @@ async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_ve
 ) -> None:
     """The number alone is enough to pass step 3b on a category with no
     registered auto-verifier — it still ends 422 downstream, for the reason
-    `test_submit.py::test_a_benefit_claim_needs_a_document_of_the_benefit_
-    type_and_no_other` documents at length (no seeded tariff carries a
-    modifier for a code a test invented); what this pins is WHICH gate
-    answers first."""
+    `test_submit.py::test_a_benefit_claim_is_accepted_without_a_document`
+    documents (no seeded tariff carries a modifier for a code a test
+    invented); what this pins is WHICH gate answers first."""
     app_id = draft_ready_for_submission
     await _claim_and_prove(
         applicant_client,

@@ -150,19 +150,15 @@ BENEFIT_CLASSIFIER_CODE = "benefit_categories"
 # membership, not merely that the id names some classifier item — otherwise a
 # rejection reason could be attached as a document type.
 DOC_TYPE_CLASSIFIER_CODE = "doc_types"
-# The ONE `doc_types` item a benefit claim is proven with (ruling 10а, made
-# fail-closed by review round 2's important 5). Named here so a reader can see
-# WHAT the submission looks for.
-#
-# **Migration `0024` seeds it**, and had to: this code is OURS, not the
-# Agency's — no `tz/` document prescribes a doc-type code list — so a missing
-# row would have refused every benefit claim with a message about
-# configuration, making "the Agency has not answered" indistinguishable from
-# "we forgot a row". The other `doc_types` items are still the Agency's, added
-# through the admin CRUD. While no ACTIVE item carries this code (somebody
-# archived it; reference data is superseded, never deleted),
-# `_assert_benefit_documents` refuses every benefit claim rather than accepting
-# an unchecked attachment as proof.
+# The `doc_types` item a benefit certificate's scan is filed under when the
+# citizen attaches one. **Optional since ruling #189** (2026-09-10): the claim
+# is the certificate NUMBER (ruling #181), checked against a register or by the
+# leshoz (`_open_benefit_verification`); the file is supporting material the
+# verifier may want to see, never a gate. Migration `0024` seeds the code —
+# it is ours, not the Agency's — so the adminka can name it; nothing on the
+# submission path looks it up any more. `tests/modules/applications/
+# test_documents.py` holds the literal in the migration and this constant
+# together.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
 
 
@@ -1697,23 +1693,6 @@ async def _assert_complete(
         raise err("ERR-APP-001", details={"missing": missing})
 
 
-async def _benefit_doc_type(db: AsyncSession) -> Any:
-    """The ACTIVE `doc_types` item whose code is `BENEFIT_DOC_TYPE_CODE`, or
-    `None` when the Agency has not seeded it yet.
-
-    Read through `admin.repo`, never a query of `classifier_items` here
-    (CLAUDE.md: reference data is read-only and reached through its owner).
-    `list_classifier_items` already applies "valid today AND active", which is
-    the only sense in which a doc type is usable on a submission — an archived
-    or not-yet-valid one is not proof of anything.
-    """
-    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
-    if classifier is None:
-        return None
-    items = await admin_repo.list_classifier_items(db, classifier.id)
-    return next((item for item in items if item.code == BENEFIT_DOC_TYPE_CODE), None)
-
-
 async def _open_benefit_verification(db: AsyncSession, application: Application) -> None:
     """Step 3b. Ruling #181: EVERY benefit category now needs a certificate
     number — refused for every category with none, not only the ones a
@@ -1753,9 +1732,10 @@ async def _open_benefit_verification(db: AsyncSession, application: Application)
     the only visible symptom would have been a verifier's empty list — which
     reads exactly like a quiet week.
 
-    Fail-closed on the unconfigurable case, matching `_assert_benefit_documents`
-    right above: a claim whose classifier item cannot be read is refused, not
-    waved through as `not_required`.
+    Fail-closed on the unconfigurable case: a claim whose classifier item
+    cannot be read is refused, not waved through as `not_required`. The
+    certificate's scan (`BENEFIT_DOC_TYPE_CODE`) is NOT required here —
+    ruling #189: the number is the claim, the file is optional support.
     """
     item_id = application.benefit_category_item_id
     if item_id is None:
@@ -1794,63 +1774,6 @@ async def _open_benefit_verification(db: AsyncSession, application: Application)
         raise err("ERR-APP-003", details={"reason": "benefit_certificate_unknown"})
     else:  # "not_yours"
         raise err("ERR-APP-003", details={"reason": "benefit_certificate_not_yours"})
-
-
-async def _assert_benefit_documents(db: AsyncSession, application: Application) -> None:
-    """Step 3, ruling 10а: a claimed benefit needs a supporting document of the
-    BENEFIT type (`tz/06` § Льготы — «Реестр льготных категорий +
-    подтверждающие документы»; `tz/04` С3 item 9). 422 `ERR-APP-003`,
-    «неполный комплект документов», which is exactly what this is.
-
-    **FAIL-CLOSED, and deliberately so** (review round 2, important 5). A
-    benefit REDUCES the fee, so "any attachment will do" is a fee-reducing
-    claim accepted on evidence nobody checked. The project's posture on
-    benefits is fail-closed everywhere else — `ERR-NORM-004` refuses a grazing
-    fee outright rather than guessing a missing `coef_sb:*`, and
-    a claim on a code no auto-verifier knows waits `pending` for the leshoz
-    rather than passing (`_open_benefit_verification`) — and this matches it:
-
-      * the document must be of the `doc_types` item whose code is
-        `BENEFIT_DOC_TYPE_CODE` below; a document of any other type does not
-        satisfy the claim;
-      * if that classifier item does not exist or is not active, the claim is
-        REFUSED with `benefit_doc_type_not_configured`, never accepted. An
-        unconfigurable rule refuses; it does not wave things through.
-
-    Since migration `0024` a fresh database is NOT in that state — it seeds
-    `benefit_proof`, because the code is ours rather than the Agency's — so
-    `benefit_doc_type_not_configured` in production now means somebody archived
-    the item, not that the Agency has yet to answer. The OTHER half stopped
-    being empty with migration `0053` (ruling #181 — VMQ 278 ¶12 and PQ-3327
-    ¶8, seven categories), and is fail-closed in its own way: every claim
-    needs a certificate number, and one no register can confirm waits for the
-    leshoz (`_open_benefit_verification`).
-
-    The claim is separately validated against the benefit classifier at PATCH
-    time (`_assert_references`) and against the tariff rows it must resolve at
-    pricing time (decision #50), so an invented category never gets this far.
-    """
-    if application.benefit_category_item_id is None:
-        return
-    doc_type = await _benefit_doc_type(db)
-    if doc_type is None:
-        raise err(
-            "ERR-APP-003",
-            details={
-                "reason": "benefit_doc_type_not_configured",
-                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
-            },
-        )
-    documents = await repo.list_documents(db, application.id)
-    if not any(document.doc_type_item_id == doc_type.id for document in documents):
-        raise err(
-            "ERR-APP-003",
-            details={
-                "reason": "benefit_claim_needs_a_document",
-                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
-                "benefit_category_item_id": str(application.benefit_category_item_id),
-            },
-        )
 
 
 async def _published_version_or_refuse(db: AsyncSession, application: Application) -> Any:
@@ -2052,7 +1975,9 @@ async def submit(
     # a RESUBMISSION after RETURNED (each one requires the checkbox again),
     # never merely left from an earlier try.
     application.rules_accepted_at = datetime.now(UTC)
-    await _assert_benefit_documents(db, application)  # step 3
+    # Step 3 used to demand a `benefit_proof` attachment for every claim;
+    # ruling #189 dropped it — the number below is the claim, the scan is
+    # optional support for the verifier.
     await _open_benefit_verification(db, application)  # step 3b (rulings #181/#182)
     # Step 4, ruling 22: the geometry decided upon AND its area, frozen
     # together because they are one fact. Without the second,
@@ -2799,14 +2724,11 @@ NOTIFY_APPLICATION_INFO_REQUESTED = "application.info_requested"
 PENDING_INFO_STATUS = "PENDING_INFO"
 # The ONE `doc_types` item a `respond_info` attachment is filed under —
 # migration `0025` seeds it (fix round 1, after review found the first draft's
-# "first ACTIVE `doc_types` item" fallback was a REACHABLE BYPASS of
-# `_assert_benefit_documents`'s fail-closed benefit guard below: that fallback
-# resolved to `BENEFIT_DOC_TYPE_CODE` in every migrated database today, so an
-# unrelated `respond-info` attachment was indistinguishable from real benefit
-# proof the moment the application was returned, PATCHed with a benefit claim,
-# and resubmitted. A reserved, unambiguous code closes that path — never a
-# fallback to "the first item of some other type," here or anywhere `doc_
-# types` membership stands in for evidence.
+# "first ACTIVE `doc_types` item" fallback resolved to `BENEFIT_DOC_TYPE_CODE`
+# in every migrated database, so an unrelated `respond-info` attachment was
+# indistinguishable from a benefit certificate's scan. The scan stopped being
+# a gate with ruling #189, but the label still has to be honest: a reserved,
+# unambiguous code, never a fallback to "the first item of some other type".
 INFO_RESPONSE_DOC_TYPE_CODE = "info_response"
 INFO_RESPONSE_DOCUMENT_NOTE = "Attached in response to a request for information."
 
@@ -2823,12 +2745,11 @@ def _now() -> datetime:
 
 async def _info_response_doc_type(db: AsyncSession) -> ClassifierItem | None:
     """The ACTIVE `doc_types` item whose code is `INFO_RESPONSE_DOC_TYPE_CODE`,
-    or `None` when it is missing or archived — `_benefit_doc_type`'s own shape,
-    read through `admin.repo` rather than a direct `classifier_items` query
-    (CLAUDE.md: reference data is read-only and reached through its owner).
-    `respond_info` FAILS CLOSED on `None`, exactly as `_assert_benefit_
-    documents` fails closed on `_benefit_doc_type` returning `None` — never a
-    fallback to some other item, which is the defect fix round 1 found."""
+    or `None` when it is missing or archived, read through `admin.repo` rather
+    than a direct `classifier_items` query (CLAUDE.md: reference data is
+    read-only and reached through its owner). `respond_info` FAILS CLOSED on
+    `None` — never a fallback to some other item, which is the defect fix
+    round 1 found."""
     classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
     if classifier is None:
         return None
