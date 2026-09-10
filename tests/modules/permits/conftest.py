@@ -38,11 +38,12 @@ from app.config import get_settings
 from app.core import files, storage
 from app.core.models import MediaFile, SystemSetting
 from app.core.settings_store import invalidate
+from app.core.time import business_today
 from app.main import create_app
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
-from app.modules.auth.models import Applicant, User
+from app.modules.auth.models import Applicant, Representation, User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.norms.calculator import RULE_CODE_VERSION
@@ -246,6 +247,103 @@ async def make_paid_application(
     )
     await db.flush()
     return row
+
+
+def unique_stir() -> str:
+    """A fresh, valid-shape (`^[0-9]{9}$`) STIR per call — `applicants.stir`
+    is UNIQUE and this test DB is shared and persistent (the same reasoning
+    `unique_pinfl` above gives; `tests/modules/applications/conftest.py`'s own
+    helper of the same name is not imported across modules — see this file's
+    own note on `make_contour`/`make_version`)."""
+    return f"{secrets.randbelow(10**9):09d}"
+
+
+async def make_legal_paid_application(
+    db: AsyncSession,
+    *,
+    layer: GisLayer,
+    org: Organization,
+    approval_doc: MediaFile,
+    activity_type_id: uuid.UUID,
+) -> tuple[Application, User]:
+    """Ruling #183's OTHER branch: a PAID application `on_behalf='legal'`,
+    filed through a REPRESENTATIVE — decision #9 gives a legal entity no
+    account of its own. Returns the application and the representative user,
+    who is who `_is_holder` recognises for the recipient line (`auth.service.
+    own_applicant_ids`, satisfied by an EFFECTIVE `Representation` exactly the
+    way `tests/modules/applications/conftest.py::representative_client`
+    builds one — replicated here rather than imported across modules, the
+    same choice this file already makes for `make_contour`/`make_version`).
+
+    Mirrors `make_paid_application` otherwise: its own contour, its own
+    calculation, the same grazing herd — the only thing this fixture exists to
+    vary is WHO may act for the applicant and HOW `on_behalf` reads.
+    """
+    legal_applicant = Applicant(
+        kind="legal",
+        stir=unique_stir(),
+        name="ООО Тест",
+        address="Тошкент вилояти, Бўстонлиқ тумани, Бурчмулла қишлоғи, 2-уй",
+    )
+    db.add(legal_applicant)
+    await db.flush()
+
+    representative = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
+    representative.full_name = HOLDER_NAME
+    db.add(
+        Applicant(
+            kind="individual",
+            pinfl=representative.pinfl,
+            name=representative.full_name,
+            owner_user_id=representative.id,
+        )
+    )
+    representation = Representation(
+        applicant_id=legal_applicant.id,
+        user_id=representative.id,
+        basis="org_eri",
+        valid_from=business_today(),
+    )
+    db.add(representation)
+    await db.flush()
+
+    contour = await make_contour(db, layer, org)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+
+    row = Application(
+        applicant_id=legal_applicant.id,
+        submitted_by_user_id=representative.id,
+        on_behalf="legal",
+        representation_id=representation.id,
+        activity_type_id=activity_type_id,
+        contour_id=contour.id,
+        contour_version_id=version.id,
+        requested_area_ha=Decimal("12.5000"),
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 9, 30),
+        status="PAID",
+        channel="portal",
+        assigned_org_id=org.id,
+    )
+    db.add(row)
+    await db.flush()
+
+    db.add(
+        Calculation(
+            application_id=row.id,
+            contour_id=contour.id,
+            activity_type_id=activity_type_id,
+            rule_code_version=RULE_CODE_VERSION,
+            input_snapshot=calculation_input_snapshot(GRAZING_HERD),
+            used_sb=Decimal("40.0000"),
+            amount=Decimal("2060000.00"),
+            breakdown={"total": "2060000.00"},
+        )
+    )
+    await db.flush()
+    return row, representative
 
 
 @pytest.fixture
@@ -675,6 +773,75 @@ async def permit_pdf(db: AsyncSession, issued_permit: Permit) -> bytes:
     return await service.pdf_bytes(db, issued_permit.id)
 
 
+# --- Track B1, ruling #183: the simple signature ------------------------------
+
+
+@pytest.fixture
+async def legal_paid_application(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+) -> Application:
+    """Ruling #183's OTHER branch: `on_behalf='legal'`, so the button is never
+    available on this permit's recipient line — see `legal_representative_client`
+    for who may still sign it, with an envelope."""
+    application, _representative = await make_legal_paid_application(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=grazing_activity_id,
+    )
+    return application
+
+
+@pytest.fixture
+async def legal_representative(db: AsyncSession, legal_paid_application: Application) -> User:
+    """Read back from the `Representation` `make_legal_paid_application` built —
+    the legal-entity mirror of `applicant_user` above."""
+    rows = await db.execute(
+        select(Representation).where(
+            Representation.applicant_id == legal_paid_application.applicant_id
+        )
+    )
+    representation = rows.scalar_one()
+    user = await db.get(User, representation.user_id)
+    assert user is not None
+    return user
+
+
+@pytest.fixture
+async def legal_representative_client(
+    db: AsyncSession, legal_representative: User
+) -> AsyncIterator[Signer]:
+    """The representative — the only one who may sign `legal_paid_application`'s
+    recipient line (`_is_holder` via `auth.service.own_applicant_ids`), and
+    always with an ERI envelope: ruling #183 never lifts that for `on_behalf=
+    'legal'`."""
+    async for signer in _signer_for(db, role_code="applicant", user=legal_representative):
+        yield signer
+
+
+@pytest.fixture
+async def legal_issued_permit(
+    db: AsyncSession, legal_paid_application: Application, hodim_client: httpx.AsyncClient
+) -> Permit:
+    """The legal-entity mirror of `issued_permit` — issued through the real
+    route, never inserted by hand (ruling 3)."""
+    result = await hodim_client.post(f"/api/v1/applications/{legal_paid_application.id}/permit")
+    assert result.status_code == 201, result.text
+    permit = await service.for_application(db, legal_paid_application.id)
+    assert permit is not None
+    return permit
+
+
+@pytest.fixture
+async def legal_permit_pdf(db: AsyncSession, legal_issued_permit: Permit) -> bytes:
+    return await service.pdf_bytes(db, legal_issued_permit.id)
+
+
 @pytest.fixture
 async def override_required_signatures(db: AsyncSession):
     """Rewrite `permit_required_signatures` for one test, then take it back.
@@ -724,6 +891,16 @@ async def sign_permit(signer: Signer, permit_id: uuid.UUID, purpose: str, pdf: b
                 document=pdf, serial=signer.serial, issuer="ISS-1", pinfl=signer.pinfl
             ),
         },
+    )
+
+
+async def sign_permit_simple(signer: Signer, permit_id: uuid.UUID, purpose: str):
+    """Ruling #183's button: one signature attempt with NO envelope at all —
+    the body carries the field omitted entirely, matching what a citizen's
+    browser actually sends, rather than `pkcs7: null`."""
+    return await signer.client.post(
+        f"/api/v1/permits/{permit_id}/signatures",
+        json={"purpose": purpose},
     )
 
 

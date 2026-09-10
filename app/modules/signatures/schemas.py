@@ -42,8 +42,11 @@ class SignatureOut(BaseModel):
     object_type: str
     object_id: uuid.UUID
     purpose: str
+    kind: str
     signer_user_id: uuid.UUID | None
-    certificate_id: uuid.UUID
+    # NULL exactly for `kind="simple"` (ruling #183, migration 0052) — a
+    # simple signature presents no certificate at all.
+    certificate_id: uuid.UUID | None
     doc_hash: str
     signature_value: str
     signed_at: datetime

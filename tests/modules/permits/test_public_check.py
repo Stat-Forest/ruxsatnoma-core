@@ -449,6 +449,7 @@ async def test_a_signature_later_found_invalid_makes_the_card_say_so(
         db, object_type=service.OBJECT_TYPE, object_id=active_permit.id
     )
     head = next(row for row in signatures if row.purpose == "permit_head")
+    assert head.certificate_id is not None  # kind == "eri" here — a staff purpose
     certificate = await signatures_service.get_certificate(db, head.certificate_id)
     certificate.serial_number = f"REVOKED-{certificate.serial_number}"
     await db.flush()

@@ -13,6 +13,11 @@ from app.db import Base, uuid7
 
 CERTIFICATE_STATUSES = ("active", "revoked", "expired")
 VERIFICATION_STATUSES = ("valid", "invalid")
+# Ruling #183: a citizen acting for THEMSELVES signs with a button, no ERI
+# certificate at all — `certificate_id` is nullable exactly for `"simple"`
+# (migration 0052), and the pair CHECK below ties the two so a row can never
+# claim one kind while carrying the other's shape.
+SIGNATURE_KINDS = ("eri", "simple")
 
 
 class Certificate(Base):
@@ -59,16 +64,25 @@ class Signature(Base):
     object_id: Mapped[uuid.UUID]
     purpose: Mapped[str]
     signer_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
-    certificate_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("certificates.id"))
+    # NULL exactly for `kind="simple"` (migration 0052) — a simple signature
+    # never presents a certificate at all, so there is nothing here to point at.
+    certificate_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("certificates.id"))
     doc_hash: Mapped[str]
     signature_value: Mapped[str]
     signed_at: Mapped[datetime]
     verification: Mapped[dict[str, Any]] = mapped_column(JSONB)
     verification_status: Mapped[str]
+    kind: Mapped[str] = mapped_column(default="eri")
 
     __table_args__ = (
         CheckConstraint(
             f"verification_status IN {VERIFICATION_STATUSES}", name="verification_status_valid"
+        ),
+        CheckConstraint(f"kind IN {SIGNATURE_KINDS}", name="kind_valid"),
+        CheckConstraint(
+            "(kind = 'eri' AND certificate_id IS NOT NULL)"
+            " OR (kind = 'simple' AND certificate_id IS NULL)",
+            name="kind_certificate_pair",
         ),
         Index("ix_signatures_object", "object_type", "object_id"),
         Index(

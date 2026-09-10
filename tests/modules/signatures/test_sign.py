@@ -121,6 +121,7 @@ async def test_signing_stores_the_row_and_binds_the_certificate(db, a_user):
     )
     assert row.verification_status == "valid"
     assert row.doc_hash == __import__("hashlib").sha256(DOC).hexdigest()
+    assert row.certificate_id is not None  # kind == "eri" here (sign()'s own contract)
     cert = await service.get_certificate(db, row.certificate_id)
     assert cert.user_id == a_user.id  # bound on first use (ruling 4)
 
@@ -277,6 +278,7 @@ async def test_a_certificate_whose_pinfl_differs_from_the_caller_is_refused(db, 
     # (ruling 8) — the certificate itself is recorded but stays unbound.
     rows = await service.get_for_object(db, object_type="permit", object_id=OBJ)
     assert [r.verification_status for r in rows] == ["invalid"]
+    assert rows[0].certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, rows[0].certificate_id)
     assert cert.user_id is None
 
@@ -295,6 +297,7 @@ async def test_a_certificate_whose_pinfl_matches_the_caller_binds_normally(db, a
         user=a_user,
     )
     assert row.verification_status == "valid"
+    assert row.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, row.certificate_id)
     assert cert.user_id == a_user.id
 
@@ -313,6 +316,7 @@ async def test_signing_with_a_previously_unbound_own_certificate_rebinds_it(db, 
         pkcs7=_pkcs7(a_user.pinfl),
         user=a_user,
     )
+    assert first.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, first.certificate_id)
     cert.unbound_at = datetime.now(UTC)
     await db.flush()
@@ -360,6 +364,7 @@ async def test_a_caller_with_an_effective_representation_signs_with_the_org_cert
         user=a_user,
     )
     assert row.verification_status == "valid"
+    assert row.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, row.certificate_id)
     assert cert.user_id == a_user.id  # bound on first use, same as personal PINFL
 
@@ -385,6 +390,7 @@ async def test_a_caller_with_no_representation_for_the_org_stir_is_refused(db, a
     assert exc.value.details["reason"] == "certificate_pinfl_mismatch"
     rows = await service.get_for_object(db, object_type="permit", object_id=OBJ)
     assert [r.verification_status for r in rows] == ["invalid"]
+    assert rows[0].certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, rows[0].certificate_id)
     assert cert.user_id is None
 
@@ -534,6 +540,7 @@ async def test_a_caller_whose_representation_expires_after_binding_is_refused_ne
         user=a_user,
     )
     assert first.verification_status == "valid"
+    assert first.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, first.certificate_id)
     assert cert.user_id == a_user.id  # bound on the first, still-effective sign
 

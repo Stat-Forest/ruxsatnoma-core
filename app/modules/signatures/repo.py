@@ -79,15 +79,21 @@ async def insert_signature(
     object_id: uuid.UUID,
     purpose: str,
     signer_user_id: uuid.UUID | None,
-    certificate_id: uuid.UUID,
+    certificate_id: uuid.UUID | None,
     doc_hash: str,
     signature_value: str,
     signed_at: datetime,
     verification: dict[str, Any],
     verification_status: str,
+    kind: str,
 ) -> Signature:
     """Evidence, not state (`models.py`): written for a valid AND an invalid
-    verdict alike — the service decides which, this function just stores it."""
+    verdict alike — the service decides which, this function just stores it.
+    `kind` is required, never defaulted here (the model's own `default="eri"`
+    is for a bare `Signature(...)` construction elsewhere, not this call) —
+    `sign()` passes `"eri"`, `sign_simple()` passes `"simple"`, `reverify()`
+    passes the original row's own `kind` along: one source, spelled out at
+    every call site rather than assumed."""
     signature = Signature(
         object_type=object_type,
         object_id=object_id,
@@ -99,6 +105,7 @@ async def insert_signature(
         signed_at=signed_at,
         verification=verification,
         verification_status=verification_status,
+        kind=kind,
     )
     db.add(signature)
     await db.flush()
@@ -149,7 +156,13 @@ async def signed_by(
 
 
 async def list_for_object_page(
-    db: AsyncSession, *, object_type: str, object_id: uuid.UUID, offset: int, limit: int
+    db: AsyncSession,
+    *,
+    object_type: str,
+    object_id: uuid.UUID,
+    offset: int,
+    limit: int,
+    kind: str | None = None,
 ) -> tuple[list[Signature], int]:
     """The paged twin of `list_for_object` above — that one stays UNPAGED
     forever, since `missing_purposes`/`is_complete` read EVERY row through it
@@ -157,8 +170,12 @@ async def list_for_object_page(
     (lesson: paging a list breaks assumed membership). This is Task 7's own,
     for `GET /signatures` only, ordered `(signed_at, id)` — `signed_at` alone
     ties whenever two signatures land in the same instant, and an unordered
-    tie leaves `items[0]` to Postgres' own row order (pre-flight ruling P6)."""
+    tie leaves `items[0]` to Postgres' own row order (pre-flight ruling P6).
+    `kind`, added for ruling #183, narrows to `'eri'`/`'simple'` when given;
+    `None` (the default) lists both, unchanged from before this stage."""
     conditions = (Signature.object_type == object_type, Signature.object_id == object_id)
+    if kind is not None:
+        conditions = (*conditions, Signature.kind == kind)
     total = (
         await db.execute(select(func.count()).select_from(Signature).where(*conditions))
     ).scalar_one()
