@@ -191,7 +191,11 @@ async def test_contours_export_rejects_an_unknown_language(applicant_client: Asy
 async def test_imports_export_holds_exactly_the_rows_the_list_shows(
     gis_client: AsyncClient, pending_import
 ) -> None:
-    listed = await gis_client.get("/api/v1/gis/imports")
+    # The test database is persistent, so earlier runs' batches are here too:
+    # read the list at the server's page ceiling and compare against the
+    # export's whole set — the page is a subset of the file, and both count
+    # the same total.
+    listed = await gis_client.get("/api/v1/gis/imports", params={"page_size": 100})
     assert listed.status_code == 200, listed.text
     listed_ids = {row["id"] for row in listed.json()["items"]}
     assert str(pending_import.id) in listed_ids
@@ -200,11 +204,13 @@ async def test_imports_export_holds_exactly_the_rows_the_list_shows(
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
     assert resp.headers["x-export-truncated"] == "false"
+    assert resp.headers["x-export-total"] == str(listed.json()["total"])
     sheet = _sheet(resp.content)
     headers = [c.value for c in sheet[1]]
     assert headers[0] == "Создан" and headers[-1] == "ID"
     exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
-    assert exported_ids == listed_ids
+    assert listed_ids <= exported_ids
+    assert len(exported_ids) == listed.json()["total"]
 
 
 async def test_imports_export_applies_the_same_status_filter_as_the_list(

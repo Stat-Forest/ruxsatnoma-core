@@ -13,16 +13,14 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
-from app.core.models import MediaFile
 from app.core.schemas import PageParams
 from app.modules.admin import service as admin_service
 from app.modules.auth import service as auth_service
-from app.modules.gis import import_service, service
-from app.modules.gis.models import Contour, GisImport
+from app.modules.gis import import_service, repo, service
+from app.modules.gis.models import GisImport
 
 # --- contours ------------------------------------------------------------
 
@@ -157,22 +155,10 @@ async def rows_contours(
         actor=actor,
     )
     ids = {item["id"] for item in items}
-    identity_columns = (
-        Contour.id,
-        Contour.kind,
-        Contour.layer_id,
-        Contour.parent_id,
-        Contour.created_at,
-    )
-    identity_rows = (
-        (await db.execute(select(*identity_columns).where(Contour.id.in_(ids)))).all()
-        if ids
-        else []
-    )
-    identity_by_id = {row.id: row for row in identity_rows}
+    identity_by_id = await repo.contour_identity_by_ids(db, ids)
     orgs = await admin_service.organization_names(db, {item["organization_id"] for item in items})
     layers = {layer.id: dict(layer.name) for layer in await service.list_layers(db)}
-    parent_ids = {row.parent_id for row in identity_rows if row.parent_id}
+    parent_ids = {row.parent_id for row in identity_by_id.values() if row.parent_id}
     parent_numbers = await service.contour_numbers_by_ids(db, parent_ids)
     rows = []
     for item in items:
@@ -289,16 +275,7 @@ async def rows_imports(
     orgs = await admin_service.organization_names(db, {b.organization_id for b in batches})
     layers = {layer.id: dict(layer.name) for layer in await service.list_layers(db)}
     file_ids = {b.file_id for b in batches}
-    files = (
-        (
-            await db.execute(
-                select(MediaFile.id, MediaFile.filename).where(MediaFile.id.in_(file_ids))
-            )
-        ).all()
-        if file_ids
-        else []
-    )
-    filenames = {row.id: row.filename for row in files}
+    filenames = await repo.media_filenames(db, file_ids)
     creators = await auth_service.user_names(db, {b.started_by for b in batches if b.started_by})
     return (
         [
