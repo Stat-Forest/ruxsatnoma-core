@@ -402,6 +402,14 @@ class PublicCheckCard(BaseModel):
     activity_type: str
     signatures_valid: bool
     holder: str
+    # The permit's map contour, as a GeoJSON geometry — `None` unless BOTH
+    # `public_permit_contour_enabled` is on (ruling R2: personal geodata,
+    # stays off until the Agency confirms in writing — see
+    # `app/core/settings_store.py`) AND the permit's contour has a published
+    # version to draw. The flag check lives in `service.public_check`, not
+    # here and not in the router: a schema field only shapes what CAN be
+    # sent, never decides what IS.
+    contour: dict[str, Any] | None = None
 
 
 # --- Task 5: the Agency's aggregates, without the author (ruling #142) --------

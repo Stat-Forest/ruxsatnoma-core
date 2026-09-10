@@ -34,7 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core import files, numbers, storage
+from app.core import files, numbers, settings_store, storage
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.models import MediaFile
@@ -1641,6 +1641,15 @@ async def public_check(
     keeps `models.py`'s invariant («that null IS the not_found case's whole
     payload») true and keeps the statistics from recording that somebody looked
     at a specific unsigned document.
+
+    **`contour` is `None` unless `public_permit_contour_enabled` says otherwise**
+    (ruling R2). The setting ships OFF: this route publishes a named citizen's
+    land-plot boundaries to anyone holding the QR code or the series and
+    number, and the Agency has not given written consent yet. The flag is read
+    HERE, once, on the found path only — never in the router, which must not
+    grow policy — and a `None` on the permit's own contour (no published
+    version left to draw) answers the same as the flag being off, never a
+    500.
     """
     # One decider for the channel, shared with the router's rate limit.
     channel = check_channel(qr_token=qr_token, series=series, number=number)
@@ -1653,6 +1662,10 @@ async def public_check(
     if permit is None or label is None:
         await repo.add(db, QrCheckLog(permit_id=None, result=RESULT_NOT_FOUND, channel=channel))
         return {"found": False}
+
+    contour = None
+    if await settings_store.get_bool(db, "public_permit_contour_enabled"):
+        contour = await gis_service.published_contour_geometry(db, permit.contour_id)
 
     await repo.add(db, QrCheckLog(permit_id=permit.id, result=RESULT_FOUND, channel=channel))
     return {
@@ -1669,6 +1682,7 @@ async def public_check(
         # `mask_name` answers `NOT_STATED` on an empty name itself, so there is no
         # `or` here: a mask applied to the em dash would print «—.***».
         "holder": mask_name(_from_snapshot(permit.snapshot, "holder_name")),
+        "contour": contour,
     }
 
 

@@ -1735,6 +1735,27 @@ async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
     return await repo.contour_number(db, contour_id)
 
 
+async def published_contour_geometry(
+    db: AsyncSession, contour_id: uuid.UUID
+) -> dict[str, Any] | None:
+    """The published version's geometry alone, as a parsed GeoJSON geometry
+    object — `None` when the contour has no published version. Like
+    `contour_organization`/`contour_number` beside it: no permission, no zone,
+    no HTTP actor at all, because the caller is another service inside this
+    process rather than a route.
+
+    Reuses `repo.contour_card`'s own `ST_AsGeoJSON` conversion (module
+    convention: PostGIS renders geometry, this module never reconstructs it in
+    Python) instead of a second query doing the same thing — `contour_card`
+    itself is not the answer here because it requires an `actor: User` and
+    carries occupancy fields nobody asked for. First consumer:
+    `permits.service.public_check`, behind `public_permit_contour_enabled`
+    (ruling R2, default OFF) — the ONE caller with no actor of any kind.
+    """
+    row = await repo.contour_card(db, contour_id)
+    return None if row is None else json.loads(row.geometry)
+
+
 async def run_checks(db: AsyncSession, version_id: uuid.UUID) -> list[checks.CheckResult]:
     """The four topology checks against one version, with no actor and no
     contour id — what a norm or an application pre-check needs.
