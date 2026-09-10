@@ -17,10 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
+from app.core.models import MediaFile
 from app.core.schemas import PageParams
 from app.modules.admin import service as admin_service
-from app.modules.gis import service
-from app.modules.gis.models import Contour
+from app.modules.auth import service as auth_service
+from app.modules.gis import import_service, service
+from app.modules.gis.models import Contour, GisImport
 
 # --- contours ------------------------------------------------------------
 
@@ -192,3 +194,128 @@ async def rows_contours(
 
 def render_contours(items: Sequence[ContourRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, contours_columns(lang), lang=lang, title=CONTOURS_TITLE[lang])
+
+
+# --- imports ---------------------------------------------------------------
+
+IMPORTS_TITLE = {"uz_latn": "Importlar", "ru": "Импорты"}
+
+IMPORT_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "pending": {"uz_latn": "Navbatda", "ru": "В очереди"},
+    "processing": {"uz_latn": "Qayta ishlanmoqda", "ru": "Обрабатывается"},
+    "review": {"uz_latn": "Koʻrib chiqilmoqda", "ru": "На рассмотрении"},
+    "approved": {"uz_latn": "Tasdiqlangan", "ru": "Утверждено"},
+    "done": {"uz_latn": "Yakunlangan", "ru": "Завершено"},
+    "failed": {"uz_latn": "Xato", "ru": "Ошибка"},
+}
+
+
+class ImportRow:
+    """One `gis_imports` batch plus the names/counts the sheet shows — the
+    LIST screen's own columns (created_at, status, layer, organization,
+    format) plus the useful hidden ones a reader would want (the uploaded
+    file's own name, how many rows it created, who uploaded it)."""
+
+    def __init__(
+        self,
+        batch: GisImport,
+        *,
+        organization: str,
+        layer: str,
+        filename: str,
+        rows_created: int | None,
+        created_by_name: str | None,
+    ) -> None:
+        self.batch = batch
+        self.id = batch.id
+        self.organization = organization
+        self.layer = layer
+        self.filename = filename
+        self.rows_created = rows_created
+        self.created_by_name = created_by_name
+
+
+def imports_columns(lang: xlsx.Lang) -> list[xlsx.Column[ImportRow]]:
+    a = lambda f: lambda r: getattr(r.batch, f)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column("created_at", {"uz_latn": "Yaratilgan", "ru": "Создан"}, a("created_at"), 18),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(IMPORT_STATUS_LABELS, r.batch.status, lang),
+            20,
+        ),
+        xlsx.Column("layer", {"uz_latn": "Qatlam", "ru": "Слой"}, lambda r: r.layer, 20),
+        xlsx.Column(
+            "organization",
+            {"uz_latn": "Tashkilot", "ru": "Организация"},
+            lambda r: r.organization,
+            30,
+        ),
+        xlsx.Column("format", {"uz_latn": "Format", "ru": "Формат"}, a("format"), 10),
+        xlsx.Column(
+            "filename", {"uz_latn": "Fayl nomi", "ru": "Имя файла"}, lambda r: r.filename, 26
+        ),
+        xlsx.Column(
+            "rows_created",
+            {"uz_latn": "Yaratilgan qatorlar", "ru": "Создано строк"},
+            lambda r: r.rows_created,
+            16,
+        ),
+        xlsx.Column(
+            "created_by",
+            {"uz_latn": "Yuklagan", "ru": "Загрузил"},
+            lambda r: r.created_by_name or "",
+            24,
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def rows_imports(
+    db: AsyncSession, *, actor: Any, lang: xlsx.Lang, status: str | None
+) -> tuple[list[ImportRow], int, int]:
+    """(rows, total, cap). `import_service.list_imports` is exactly what
+    `GET /gis/imports` calls — same zone scoping, same
+    `require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE)` gate at the
+    route."""
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    batches, total = await import_service.list_imports(
+        db,
+        status=status,
+        params=PageParams.model_construct(page=1, page_size=cap),
+        actor=actor,
+    )
+    orgs = await admin_service.organization_names(db, {b.organization_id for b in batches})
+    layers = {layer.id: dict(layer.name) for layer in await service.list_layers(db)}
+    file_ids = {b.file_id for b in batches}
+    files = (
+        (
+            await db.execute(
+                select(MediaFile.id, MediaFile.filename).where(MediaFile.id.in_(file_ids))
+            )
+        ).all()
+        if file_ids
+        else []
+    )
+    filenames = {row.id: row.filename for row in files}
+    creators = await auth_service.user_names(db, {b.started_by for b in batches if b.started_by})
+    return (
+        [
+            ImportRow(
+                batch,
+                organization=xlsx.localized(orgs.get(batch.organization_id), lang),
+                layer=xlsx.localized(layers.get(batch.layer_id), lang),
+                filename=filenames.get(batch.file_id, ""),
+                rows_created=(batch.stats or {}).get("created"),
+                created_by_name=creators.get(batch.started_by) if batch.started_by else None,
+            )
+            for batch in batches
+        ],
+        total,
+        cap,
+    )
+
+
+def render_imports(items: Sequence[ImportRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, imports_columns(lang), lang=lang, title=IMPORTS_TITLE[lang])

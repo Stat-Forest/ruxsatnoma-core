@@ -183,3 +183,118 @@ async def test_contours_export_is_empty_for_a_caller_with_no_matching_zone(
 async def test_contours_export_rejects_an_unknown_language(applicant_client: AsyncClient) -> None:
     resp = await applicant_client.get("/api/v1/gis/contours/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
+
+
+# --- imports -----------------------------------------------------------------
+
+
+async def test_imports_export_holds_exactly_the_rows_the_list_shows(
+    gis_client: AsyncClient, pending_import
+) -> None:
+    listed = await gis_client.get("/api/v1/gis/imports")
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert str(pending_import.id) in listed_ids
+
+    resp = await gis_client.get("/api/v1/gis/imports/export.xlsx", params={"lang": "ru"})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
+    assert resp.headers["x-export-truncated"] == "false"
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Создан" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert exported_ids == listed_ids
+
+
+async def test_imports_export_applies_the_same_status_filter_as_the_list(
+    rahbar_client: AsyncClient,
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    gis_user,
+) -> None:
+    from tests.modules.gis.conftest import make_import
+
+    review_batch = await make_import(
+        db, layer=contours_layer, org=leshoz, started_by=gis_user, data=b"{}"
+    )
+    review_batch.status = "review"
+    await db.flush()
+    await db.commit()
+    await make_import(db, layer=contours_layer, org=leshoz, started_by=gis_user, data=b"{}")
+
+    resp = await rahbar_client.get("/api/v1/gis/imports/export.xlsx", params={"status": "review"})
+    assert resp.status_code == 200, resp.text
+    ids = {str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)}
+    assert str(review_batch.id) in ids
+
+
+async def test_imports_export_renders_labels_and_the_filename_not_the_file_id(
+    gis_client: AsyncClient, pending_import
+) -> None:
+    resp = await gis_client.get("/api/v1/gis/imports/export.xlsx", params={"lang": "uz_latn"})
+    row = next(
+        r
+        for r in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+        if str(r[-1]) == str(pending_import.id)
+    )
+    assert row[1] == "Navbatda"  # the status label, not "pending"
+    assert row[5] == "import.geojson"  # the filename, not a media_files uuid
+
+
+async def test_imports_export_truncates_at_the_cap_and_says_so(
+    gis_client: AsyncClient,
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    gis_user,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.modules.gis.conftest import make_import
+
+    await make_import(db, layer=contours_layer, org=leshoz, started_by=gis_user, data=b"{}")
+    await make_import(db, layer=contours_layer, org=leshoz, started_by=gis_user, data=b"{}")
+
+    from app.core import settings_store
+
+    real_get_int = settings_store.get_int
+
+    async def one(db_arg, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(db_arg, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    resp = await gis_client.get("/api/v1/gis/imports/export.xlsx")
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total >= 2
+    assert resp.headers["x-export-truncated"] == "true"
+    assert resp.headers["x-export-rows"] == "1"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_imports_export_is_empty_for_a_caller_zoned_elsewhere(
+    org_scoped_rahbar_client: AsyncClient, pending_import
+) -> None:
+    """`pending_import` sits under `leshoz`; `org_scoped_rahbar_client` is
+    zoned to `other_leshoz` — the same shape `test_the_import_list_is_zone_scoped`
+    proves for the JSON list."""
+    resp = await org_scoped_rahbar_client.get("/api/v1/gis/imports/export.xlsx")
+    assert resp.status_code == 200, resp.text
+    ids = {str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)}
+    assert str(pending_import.id) not in ids
+
+
+async def test_imports_export_refuses_a_caller_with_neither_manage_nor_approve(
+    applicant_client: AsyncClient,
+) -> None:
+    resp = await applicant_client.get("/api/v1/gis/imports/export.xlsx")
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_imports_export_rejects_an_unknown_language(gis_client: AsyncClient) -> None:
+    resp = await gis_client.get("/api/v1/gis/imports/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422
