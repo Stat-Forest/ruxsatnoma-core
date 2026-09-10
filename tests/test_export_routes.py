@@ -15,6 +15,9 @@ from app.main import create_app
 EXPORTED: set[str] = {
     "/api/v1/applications",  # Track A
     "/api/v1/permits",  # Track B
+    "/api/v1/oversight/risk-indicators",  # Track D
+    "/api/v1/oversight/events",  # Track D
+    "/api/v1/admin/public/appeals",  # Track D
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
@@ -22,8 +25,6 @@ EXPORTED: set[str] = {
 EXPORT_BACKLOG = {
     # Track C–D (this plan's own tasks)
     "/api/v1/invoices",
-    "/api/v1/oversight/risk-indicators",
-    "/api/v1/oversight/events",
     # Track C — payments, the other lists
     "/api/v1/payments/bank-statements",
     "/api/v1/payments/reconciliations",
@@ -31,9 +32,8 @@ EXPORT_BACKLOG = {
     "/api/v1/payments/allocations",
     "/api/v1/refunds",
     "/api/v1/payments/recipients",
-    # Track D — ratings and appeals
+    # Track D — ratings (lives in permits/admin_router.py; done by the coordinator)
     "/api/v1/admin/ratings",
-    "/api/v1/admin/public/appeals",
     # Track E — admin + templates
     "/api/v1/admin/users",
     "/api/v1/refs/organizations",
