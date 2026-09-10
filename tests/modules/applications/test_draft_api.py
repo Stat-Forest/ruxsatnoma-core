@@ -551,3 +551,26 @@ async def test_moving_a_draft_to_another_contour_clears_the_frozen_version(
     assert row.contour_id == elsewhere.id
     assert row.contour_version_id is None, "a version of the OLD contour cannot survive the move"
     assert row.requested_area_ha is None
+
+
+async def test_the_list_puts_the_most_recently_updated_application_first(
+    applicant_client, grazing_activity_id
+) -> None:
+    """The queue is ordered by `updated_at DESC`, not by creation: an older
+    application that was just touched must climb above a newer untouched one,
+    or a reviewer's "what changed since I looked" reading of the list is
+    silently wrong. `id` (uuid7, creation-ordered) stays as the tie-break only."""
+    older = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    newer = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    assert older.status_code == 201 and newer.status_code == 201
+
+    touched = await applicant_client.patch(
+        f"/api/v1/applications/{older.json()['id']}",
+        json={"activity_type_id": str(grazing_activity_id)},
+    )
+    assert touched.status_code == 200, touched.text
+
+    listed = await applicant_client.get("/api/v1/applications")
+    assert listed.status_code == 200
+    ids = [row["id"] for row in listed.json()["items"]]
+    assert ids == [older.json()["id"], newer.json()["id"]]
