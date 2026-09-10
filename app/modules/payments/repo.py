@@ -4,9 +4,10 @@ idempotency, authorization and the audit trail all belong to `service.py`/
 service -> repo -> models)."""
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -399,6 +400,35 @@ async def list_invoices(
     service.list_manual_confirmations` already does for a table in the same
     position. `status`, when given, narrows to one of `INVOICE_STATUSES`."""
     conditions = [] if status is None else [Invoice.status == status]
+    stmt = select(Invoice).where(*conditions)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(Invoice.issued_at.desc(), Invoice.id.desc()).offset(offset).limit(limit)
+        )
+    ).scalars()
+    return list(rows), total
+
+
+async def list_invoices_by_applications(
+    db: AsyncSession,
+    application_ids: Collection[uuid.UUID],
+    *,
+    status: str | None = None,
+    limit: int,
+    offset: int,
+) -> tuple[list[Invoice], int]:
+    """A citizen's own page (stage 11, ruling R1): every invoice whose
+    application is one of `application_ids` — the owner's set
+    `applications.service.owned_application_ids` answers — newest first,
+    every status, optionally narrowed to one `INVOICE_STATUSES` member. An
+    empty set answers an empty page and issues NO statement
+    (`applications.repo.list_application_ids_by_applicants`'s own rule)."""
+    if not application_ids:
+        return [], 0
+    conditions: list[Any] = [Invoice.application_id.in_(list(application_ids))]
+    if status is not None:
+        conditions.append(Invoice.status == status)
     stmt = select(Invoice).where(*conditions)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     rows = (
