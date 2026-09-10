@@ -11,7 +11,7 @@ of this module for what a caller at those levels may and may not do with
 them."""
 
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -992,6 +992,20 @@ async def effective_season(
         "min_term_days": min_term_days,
         "min_term_source": "activity_season" if min_term_days is not None else "none",
     }
+
+
+def resolve_effective_windows(
+    norm_season: Mapping[str, Any] | None, dictionary_season: Mapping[str, Any] | None
+) -> tuple[list[Any], str]:
+    """Thin pass-through to `checks.resolve_effective_windows` (module
+    boundary, CLAUDE.md: a caller outside this module reaches it only through
+    `norms.service`, never `norms.checks` directly — the same reason
+    `effective_norm` above re-exports `repo.effective_norm`). First caller:
+    `public.service.public_activity_seasons` (stage 8 fix wave finding 1),
+    which has neither a contour nor an organization to resolve against and
+    calls this with `(None, None)` on purpose — see that function's own
+    docstring for why that is the honest answer rather than a gap to fill."""
+    return checks.resolve_effective_windows(norm_season, dictionary_season)
 
 
 # --- Task 7: preview and saved calculations. `_compute` is the ONE path both
