@@ -17,7 +17,7 @@ from app.core.schemas import PageParams
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.help import service
-from app.modules.help.models import SupportTicket
+from app.modules.help.models import FaqItem, SupportTicket
 
 TICKET_STATUS_LABELS: dict[str, dict[str, str]] = {
     "new": {"uz_latn": "Yangi", "ru": "Новое"},
@@ -25,7 +25,13 @@ TICKET_STATUS_LABELS: dict[str, dict[str, str]] = {
     "resolved": {"uz_latn": "Hal qilindi", "ru": "Решено"},
     "closed": {"uz_latn": "Yopilgan", "ru": "Закрыто"},
 }
+FAQ_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "draft": {"uz_latn": "Qoralama", "ru": "Черновик"},
+    "published": {"uz_latn": "Chop etilgan", "ru": "Опубликован"},
+    "archived": {"uz_latn": "Arxivlangan", "ru": "В архиве"},
+}
 TICKETS_TITLE = {"uz_latn": "Yordam soʻrovlari", "ru": "Обращения в поддержку"}
+FAQ_TITLE = {"uz_latn": "Savol-javoblar", "ru": "Вопросы и ответы"}
 
 
 def _label(table: dict[str, dict[str, str]], code: str, lang: xlsx.Lang) -> str:
@@ -98,3 +104,53 @@ async def ticket_rows(
 
 def render_tickets(items: Sequence[TicketRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, ticket_columns(lang), lang=lang, title=TICKETS_TITLE[lang])
+
+
+# --- FAQ (admin) ---------------------------------------------------------
+#
+# No id resolution needed — `FaqItem` carries every column the sheet shows,
+# so the model itself is the row (the same shortcut a `Row` wrapper would
+# be for, with nothing to add).
+
+
+def faq_columns(lang: xlsx.Lang) -> list[xlsx.Column[FaqItem]]:
+    return [
+        xlsx.Column(
+            "question",
+            {"uz_latn": "Savol", "ru": "Вопрос"},
+            lambda r: xlsx.localized(r.question, lang),
+            40,
+        ),
+        xlsx.Column(
+            "category", {"uz_latn": "Turkum", "ru": "Категория"}, lambda r: r.category or "", 18
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(FAQ_STATUS_LABELS, r.status, lang),
+            16,
+        ),
+        xlsx.Column(
+            "sort_order", {"uz_latn": "Tartib", "ru": "Порядок"}, lambda r: r.sort_order, 10
+        ),
+        xlsx.Column(
+            "updated_at", {"uz_latn": "Yangilangan", "ru": "Обновлено"}, lambda r: r.updated_at, 18
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def faq_rows(
+    db: AsyncSession, *, lang: xlsx.Lang, status: str | None
+) -> tuple[list[FaqItem], int, int]:
+    """(rows, total, cap). `service.list_faq_admin` answers the WHOLE
+    catalogue unpaged (the route itself is a bare `list[FaqOut]`) — the cap
+    still bounds what the FILE holds, applied here in Python rather than at
+    the query, and `xlsx_response` still reports it uniformly (ruling R3)."""
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    items = await service.list_faq_admin(db, status=status)
+    return list(items[:cap]), len(items), cap
+
+
+def render_faq(items: Sequence[FaqItem], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, faq_columns(lang), lang=lang, title=FAQ_TITLE[lang])
