@@ -31,11 +31,13 @@ from app.core import settings_store, xlsx
 from app.core.schemas import PageParams
 from app.modules.admin import (
     announcements_service,
+    legal_documents_service,
     repo,
     service,
     users_service,
 )
 from app.modules.admin.announcements_service import AnnouncementAdminOut
+from app.modules.admin.legal_documents_service import LegalDocumentAdminOut
 from app.modules.admin.models import Organization
 from app.modules.admin.users_schemas import UserAdminOut, UserFilters
 from app.modules.auth import service as auth_service
@@ -391,4 +393,89 @@ async def announcements_rows(
 def render_announcements(items: Sequence[AnnouncementRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(
         items, announcement_columns(lang), lang=lang, title=ANNOUNCEMENTS_TITLE[lang]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legal documents — GET /admin/legal-documents/export.xlsx
+# ---------------------------------------------------------------------------
+
+LEGAL_DOCUMENT_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "draft": {"uz_latn": "Qoralama", "ru": "Черновик"},
+    "published": {"uz_latn": "Chop etilgan", "ru": "Опубликован"},
+    "archived": {"uz_latn": "Arxivlangan", "ru": "В архиве"},
+}
+LEGAL_DOCUMENTS_TITLE = {"uz_latn": "Meʼyoriy-huquqiy hujjatlar", "ru": "Нормативно-правовые акты"}
+_SOURCE_FILE = {"uz_latn": "PDF fayl", "ru": "PDF-файл"}
+_SOURCE_LINK = {"uz_latn": "lex.uz havolasi", "ru": "Ссылка на lex.uz"}
+_SOURCE_NONE = {"uz_latn": "Yoʻq", "ru": "Нет"}
+
+
+def _source_label(doc: LegalDocumentAdminOut, lang: xlsx.Lang) -> str:
+    """Mirrors `LegalDocumentsPage.tsx`'s own precedence: a file wins over a
+    bare lex.uz link when a row somehow has both."""
+    if doc.file is not None:
+        return _SOURCE_FILE[lang]
+    if doc.source_url:
+        return _SOURCE_LINK[lang]
+    return _SOURCE_NONE[lang]
+
+
+class LegalDocumentRow:
+    def __init__(self, doc: LegalDocumentAdminOut, *, source: str, author: str) -> None:
+        self.doc = doc
+        self.id = doc.id
+        self.source = source
+        self.author = author
+
+
+def legal_document_columns(lang: xlsx.Lang) -> list[xlsx.Column[LegalDocumentRow]]:
+    d = lambda f: lambda r: getattr(r.doc, f)  # noqa: E731
+    return [
+        xlsx.Column(
+            "doc_number", {"uz_latn": "Hujjat raqami", "ru": "Номер акта"}, d("doc_number"), 20
+        ),
+        xlsx.Column(
+            "title",
+            {"uz_latn": "Nomi", "ru": "Название"},
+            lambda r: xlsx.localized(r.doc.title, lang),
+            34,
+        ),
+        xlsx.Column(
+            "adopted_on", {"uz_latn": "Qabul qilingan", "ru": "Дата принятия"}, d("adopted_on"), 16
+        ),
+        xlsx.Column("source", {"uz_latn": "Manba", "ru": "Источник"}, lambda r: r.source, 18),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(LEGAL_DOCUMENT_STATUS_LABELS, r.doc.status, lang),
+            16,
+        ),
+        xlsx.Column("author", {"uz_latn": "Muallif", "ru": "Автор"}, lambda r: r.author, 26),
+        xlsx.Column("created_at", {"uz_latn": "Yaratilgan", "ru": "Создано"}, d("created_at"), 18),
+        xlsx.id_column(),
+    ]
+
+
+async def legal_documents_rows(
+    db: AsyncSession, *, lang: xlsx.Lang, status: str | None
+) -> tuple[list[LegalDocumentRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    page = await legal_documents_service.list_admin(
+        db, params=PageParams.model_construct(page=1, page_size=cap), status=status
+    )
+    authors = await auth_service.user_names(db, {d.created_by for d in page.items if d.created_by})
+    return (
+        [
+            LegalDocumentRow(d, source=_source_label(d, lang), author=authors.get(d.created_by, ""))
+            for d in page.items
+        ],
+        page.total,
+        cap,
+    )
+
+
+def render_legal_documents(items: Sequence[LegalDocumentRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(
+        items, legal_document_columns(lang), lang=lang, title=LEGAL_DOCUMENTS_TITLE[lang]
     )

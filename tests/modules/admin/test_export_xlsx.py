@@ -13,6 +13,7 @@ from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.admin.permissions import (
     ANNOUNCEMENTS_MANAGE,
+    LEGAL_DOCUMENTS_MANAGE,
 )
 from app.modules.auth.permissions import USERS_MANAGE, USERS_VIEW
 from tests.conftest import make_client
@@ -400,4 +401,127 @@ async def test_announcements_export_rejects_an_unknown_language(db):
     async with make_client(create_app(), lifespan=True) as client:
         auth_client(client, token, csrf)
         resp = await client.get(f"{API}/admin/announcements/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Legal documents — GET /admin/legal-documents/export.xlsx
+# ---------------------------------------------------------------------------
+
+
+async def test_legal_documents_export_holds_exactly_the_rows_the_list_shows(db):
+    _, token, csrf = await signed_in_with(db, LEGAL_DOCUMENTS_MANAGE)
+    await db.commit()
+    marker = uuid.uuid4().hex[:8]
+    body = {**LEGAL_DOCUMENT_BODY, "doc_number": f"TEST-{marker}"}
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(f"{API}/admin/legal-documents", json=body)
+        assert created.status_code == 201, created.text
+        doc_id = created.json()["id"]
+        listed = await client.get(
+            f"{API}/admin/legal-documents", params={"status": "draft", "page_size": 100}
+        )
+        resp = await client.get(
+            f"{API}/admin/legal-documents/export.xlsx", params={"status": "draft", "lang": "ru"}
+        )
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert exported_ids == listed_ids
+    assert doc_id in exported_ids
+
+
+async def test_legal_documents_export_applies_the_same_filters_as_the_list(db):
+    _, token, csrf = await signed_in_with(db, LEGAL_DOCUMENTS_MANAGE)
+    await db.commit()
+    marker = uuid.uuid4().hex[:8]
+    body = {**LEGAL_DOCUMENT_BODY, "doc_number": f"PUB-{marker}"}
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(f"{API}/admin/legal-documents", json=body)
+        doc_id = created.json()["id"]
+        published = await client.post(f"{API}/admin/legal-documents/{doc_id}/publish")
+        assert published.status_code == 200, published.text
+        resp = await client.get(
+            f"{API}/admin/legal-documents/export.xlsx", params={"status": "published"}
+        )
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert doc_id in exported_ids
+
+
+async def test_legal_documents_export_renders_labels_not_codes(db):
+    _, token, csrf = await signed_in_with(db, LEGAL_DOCUMENTS_MANAGE)
+    await db.commit()
+    marker = uuid.uuid4().hex[:8]
+    body = {**LEGAL_DOCUMENT_BODY, "doc_number": f"LBL-{marker}"}
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(f"{API}/admin/legal-documents", json=body)
+        doc_id = created.json()["id"]
+        resp = await client.get(
+            f"{API}/admin/legal-documents/export.xlsx",
+            params={"status": "draft", "lang": "uz_latn"},
+        )
+    assert resp.status_code == 200, resp.text
+    rows = list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    row = next(r for r in rows if r[-1] == doc_id)
+    assert row[0] == f"LBL-{marker}"  # doc_number first
+    assert row[4] == "Qoralama"  # status label
+    assert row[3] == "lex.uz havolasi"  # source label from source_url
+
+
+async def test_legal_documents_export_truncates_at_the_cap_and_says_so(db, monkeypatch):
+    _, token, csrf = await signed_in_with(db, LEGAL_DOCUMENTS_MANAGE)
+    await db.commit()
+    marker = uuid.uuid4().hex[:8]
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        await client.post(
+            f"{API}/admin/legal-documents",
+            json={**LEGAL_DOCUMENT_BODY, "doc_number": f"CAP1-{marker}"},
+        )
+        await client.post(
+            f"{API}/admin/legal-documents",
+            json={**LEGAL_DOCUMENT_BODY, "doc_number": f"CAP2-{marker}"},
+        )
+
+        real_get_int = settings_store.get_int
+
+        async def one(_db, key):
+            if key == "register_export_max_rows":
+                return 1
+            return await real_get_int(_db, key)
+
+        monkeypatch.setattr(settings_store, "get_int", one)
+        resp = await client.get(
+            f"{API}/admin/legal-documents/export.xlsx", params={"status": "draft"}
+        )
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total >= 2
+    assert resp.headers["x-export-truncated"] == "true"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_legal_documents_export_without_the_permission_matches_the_list_status(db):
+    _, token, csrf = await signed_in_with(db)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(f"{API}/admin/legal-documents")
+        resp = await client.get(f"{API}/admin/legal-documents/export.xlsx")
+    assert listed.status_code == 403
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == listed.json()["error"]["code"]
+
+
+async def test_legal_documents_export_rejects_an_unknown_language(db):
+    _, token, csrf = await signed_in_with(db, LEGAL_DOCUMENTS_MANAGE)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(f"{API}/admin/legal-documents/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
