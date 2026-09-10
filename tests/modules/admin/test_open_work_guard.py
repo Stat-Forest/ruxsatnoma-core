@@ -160,11 +160,10 @@ def test_no_status_where_somebody_still_has_to_act_counts_as_terminal():
     again, and nothing would fail — the exact shape of defect this project keeps
     finding, where the system quietly stops looking rather than loudly breaking.
 
-    So the eight statuses somebody must still act on are pinned by name. If a
+    So the seven statuses somebody must still act on are pinned by name. If a
     future edge drags one in here, this test says so.
     """
     still_being_worked_on = {
-        "DRAFT",
         "SUBMITTED",
         "IN_REVIEW",
         "PENDING_INFO",

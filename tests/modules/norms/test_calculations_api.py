@@ -135,6 +135,7 @@ async def test_the_history_for_an_application_lists_newest_first(
         submitted_by_user_id=uuid.UUID(me["user"]["id"]),
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
     )
     db.add(application)
     await db.flush()

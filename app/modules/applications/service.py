@@ -23,7 +23,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Row, and_, or_
+from sqlalchemy import Row, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -136,7 +136,6 @@ CHANNEL_PORTAL = "portal"
 # docstring for why the split lives in the FUNCTION, not the wire schema.
 KIND_NEW = "new"
 KIND_EXTENSION = "extension"
-INITIAL_STATUS = "DRAFT"
 # `_own_draft_for_update`'s OTHER editable status (task 1, 3.9b): a returned
 # application becomes correctable again, per that function's own docstring,
 # written when it was DRAFT-only in 3.9a and already naming this. Not "task
@@ -217,7 +216,6 @@ BENEFIT_AUTO_VERIFIERS: dict[str, BenefitAutoVerifier] = {}
 # public-surface comment below permits, and `cancel` is this module's own flow
 # verb.
 APPLICATION_TRANSITIONS: dict[str, frozenset[str]] = {
-    "DRAFT": frozenset({"SUBMITTED", "CANCELLED"}),
     "SUBMITTED": frozenset({"IN_REVIEW", "RETURNED", "REJECTED", "CANCELLED"}),
     "IN_REVIEW": frozenset({"PENDING_INFO", "APPROVED", "REJECTED", "RETURNED", "CANCELLED"}),
     "PENDING_INFO": frozenset({"IN_REVIEW", "CANCELLED"}),
@@ -809,8 +807,9 @@ async def _readable_application(
         return application
     if not await _holds_staff_read(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if application.status == INITIAL_STATUS:
-        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    # Ruling #110's DRAFT exclusion has nothing left to exclude (stage 12): a
+    # row exists only from the filing on, and a filed application is the
+    # office's to read within its zone.
     if await _forwarded_here_by(db, application, actor=actor):
         return application
     await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_READ)
@@ -964,7 +963,7 @@ async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
 # test_the_owner_may_patch_a_returned_application` and
 # `test_documents.py::test_the_owner_may_attach_and_detach_on_a_returned_
 # application`, each with a stranger-is-still-refused sibling.
-_EDITABLE_STATUSES = frozenset({INITIAL_STATUS, RETURNED_STATUS})
+_EDITABLE_STATUSES = frozenset({RETURNED_STATUS})
 
 
 async def _own_draft_for_update(
@@ -991,7 +990,7 @@ async def _own_draft_for_update(
     """
     application = await _own_application_for_update(db, application_id, actor=actor)
     if application.status not in _EDITABLE_STATUSES:
-        raise err("ERR-APP-004", details={"reason": "not_draft", "status": application.status})
+        raise err("ERR-APP-004", details={"reason": "not_returned", "status": application.status})
     return application
 
 
@@ -1174,14 +1173,10 @@ async def list_applications(
     inverts the layering even where the boundary rule itself is satisfied
     (review I2).
 
-    **Ruling #110 excludes `INITIAL_STATUS` from the STAFF half only** —
-    otherwise this function's own "can never disagree with the card" promise
-    above would be broken by the very ruling that promise is supposed to
-    survive: `_readable_application` now 404s a staff caller on a DRAFT it
-    does not own, and a list that still named that DRAFT would be LEAKING
-    through the one door the card just closed. The owner's own scope
-    (`holder_ids`) is untouched — they see every status of their own,
-    DRAFT included, throughout.
+    Ruling #110's DRAFT exclusion from the STAFF half retired with the draft
+    (stage 12): every row that exists has been filed, and the staff scope is
+    the zone alone. The owner's own scope (`holder_ids`) sees every status of
+    their own, as before.
     """
     scope: list[Any] = []
     holder_ids = await _own_applicant_ids(db, actor)
@@ -1189,14 +1184,11 @@ async def list_applications(
         scope.append(Application.applicant_id.in_(holder_ids))
     if await _holds_staff_read(db, actor):
         scope.append(
-            and_(
-                Application.status != INITIAL_STATUS,
-                zone_filter(
-                    zone_of(actor),
-                    region_col=Organization.region_id,
-                    district_col=Organization.district_id,
-                    organization_col=Organization.id,
-                ),
+            zone_filter(
+                zone_of(actor),
+                region_col=Organization.region_id,
+                district_col=Organization.district_id,
+                organization_col=Organization.id,
             )
         )
     if not scope:
@@ -2145,33 +2137,23 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     """
     application = await _readable_application(db, application_id, actor=actor)
     await _assert_complete(db, application)
-    # **The FROZEN version wins the moment there is one.** A DRAFT has not
-    # reached step 4 yet, so the only honest answer is the version currently
-    # published — and `_published_version_or_refuse` is also the 409 for a
-    # contour whose geometry is still a draft. From SUBMITTED onward the
-    # application is BOUND to the version step 4 froze (`permits.service.issue`
-    # reads that same column), and `gis` allows one published version per
-    # contour which may be superseded at any time: pricing the CURRENT one here
-    # would make the head's decision signature attest to version B while the
-    # application, and the permit printed from it, name version A. A verifier
-    # re-deriving these bytes from the stored row would then get a different
-    # string and the signature would not verify — pinned by
+    # **The FROZEN version wins.** From the filing on the application is BOUND
+    # to the version step 4 froze (`permits.service.issue` reads that same
+    # column), and `gis` allows one published version per contour which may
+    # be superseded at any time: pricing the CURRENT one here would make the
+    # head's decision signature attest to version B while the application,
+    # and the permit printed from it, name version A. A verifier re-deriving
+    # these bytes from the stored row would then get a different string and
+    # the signature would not verify — pinned by
     # `test_decision.py::test_a_republished_contour_does_not_invalidate_the_
     # decision_signature`.
-    # **The DRAFT branch stays status-keyed, not null-keyed.** Ruling 19
-    # leaves a STALE frozen version on a refused submission, so a draft must
-    # always re-resolve the current published version, even when its column
-    # happens to be set from an earlier attempt — `is None` here would serve
-    # the stale one instead.
-    frozen = None if application.status == INITIAL_STATUS else application.contour_version_id
-    # The fallback below can never fire for a SUBMITTED-or-later application:
-    # `submit` freezes `contour_version_id` in the same transaction that sets
-    # the status. The only status that reaches it is CANCELLED-from-DRAFT — a
-    # draft completed and then withdrawn without ever being submitted, so the
-    # column was never frozen — and there `_published_version_or_refuse` gives
-    # the honest 409 for a contour whose geometry has since gone back to draft,
-    # rather than `_package_bytes` finding a null and answering ERR-SYS-001 for
-    # an application that is perfectly able to show what it once priced.
+    # The fallback fires for a RETURNED application whose contour was moved
+    # by a PATCH (`patch_draft` clears the frozen pair with the contour) —
+    # `_published_version_or_refuse` is then the honest 409 for a contour with
+    # no published version, rather than `_package_bytes` finding a null and
+    # answering ERR-SYS-001. A filed application never reaches it otherwise:
+    # `file`/`submit` freeze the column in the transaction that sets the status.
+    frozen = application.contour_version_id
     version_id = frozen or (await _published_version_or_refuse(db, application)).id
     _, priced = await _price(db, application, actor=actor)
     return _package_bytes(application, priced, contour_version_id=version_id)
@@ -2233,12 +2215,12 @@ async def submit(
     # written, and the row says "an attempt was made against submission X and
     # it was rejected".
     submission_id = uuid7()
-    # Step 1. The owner's own DRAFT (or, task 1, 3.9b: RETURNED), locked: 404
-    # for a stranger, 409 `ERR-APP-004` for an application that has moved on
-    # some other way. Captured before anything overwrites `application.status`
-    # below — a RESUBMISSION's history row and audit entry must say
-    # `from_status="RETURNED"`, not a hardcoded "DRAFT" that was true only for
-    # the FIRST submission.
+    # Step 1. The owner's own RETURNED application (stage 12: the one status
+    # this route serves — a first filing is `file()`), locked: 404 for a
+    # stranger, 409 `ERR-APP-004` for an application that has moved on some
+    # other way. Captured before anything overwrites `application.status`
+    # below — the resubmission's history row and audit entry say
+    # `from_status="RETURNED"`.
     application = await _own_draft_for_update(db, application_id, actor=actor)
     from_status = application.status
     # Ruling #183, decided FIRST (stage 10 review, finding 9): a legal entity
@@ -2515,7 +2497,7 @@ CANCELLED_STATUS = "CANCELLED"
 # narrower set than `APPLICATION_TRANSITIONS[...]` contains CANCELLED in, and
 # deliberately so. See `cancel`'s docstring for why the table keeps
 # `INVOICED -> CANCELLED` that this route refuses, and who drives it instead.
-CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({INITIAL_STATUS, SUBMITTED_STATUS, IN_REVIEW_STATUS})
+CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({SUBMITTED_STATUS, IN_REVIEW_STATUS})
 
 # Ruling 25's OTHER half, beside `SUBMISSION_OBJECT_TYPE`/`SUBMISSION_PURPOSE`:
 # a DECISION is signed as `("application", <the application id>,

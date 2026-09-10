@@ -27,7 +27,6 @@ from app.db import Base, uuid7
 # 3.9a only ever writes DRAFT/SUBMITTED/IN_REVIEW/APPROVED/REJECTED/CANCELLED — the
 # rest belong to 3.9b/3.10/3.11/archive (see the plan's ruling 2 for who writes each).
 APPLICATION_STATUSES = (
-    "DRAFT",
     "SUBMITTED",
     "IN_REVIEW",
     "PENDING_INFO",
@@ -42,6 +41,11 @@ APPLICATION_STATUSES = (
     "CLOSED",
     "ARCHIVED",
 )
+# Plan 12, R7: the timeline is append-only and every application filed before
+# stage 12 has a `DRAFT -> SUBMITTED` row. `application_status_history`'s two
+# CHECKs (migration 0015) keep the old vocabulary; this tuple is what a reader
+# of that table may meet, and `schemas.HistoryStatus` mirrors it.
+HISTORY_STATUSES = ("DRAFT", *APPLICATION_STATUSES)
 ON_BEHALF_VALUES = ("self", "legal")
 CHANNELS = ("portal", "mygov")
 APPLICATION_KINDS = ("new", "extension")
@@ -135,7 +139,9 @@ class Application(Base):
     period_from: Mapped[date | None]
     period_to: Mapped[date | None]
     quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
-    status: Mapped[str] = mapped_column(default="DRAFT")
+    # No default (stage 12): every writer names the status — `service.file`
+    # inserts the row SUBMITTED, and nothing earlier than that exists.
+    status: Mapped[str]
     channel: Mapped[str]
     mygov_reference: Mapped[str | None] = mapped_column(unique=True)
     sla_deadline_at: Mapped[datetime | None]

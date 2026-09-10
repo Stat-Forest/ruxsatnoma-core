@@ -59,13 +59,27 @@ async def test_two_active_applications_on_an_overlapping_period_are_refused(
         )
 
 
-async def test_two_drafts_on_the_same_contour_are_allowed(
+async def test_two_returned_applications_on_the_same_contour_are_refused(
     db, applicant, published_contour, grazing_activity_id
 ) -> None:
-    """DRAFT is outside the constraint's WHERE clause (design/02): a duplicate
-    is caught at submission, not while the applicant is still typing."""
-    await _app(db, applicant, published_contour.id, grazing_activity_id, status="DRAFT")
-    await _app(db, applicant, published_contour.id, grazing_activity_id, status="DRAFT")
+    """RETURNED is INSIDE the constraint's WHERE clause (design/02): a returned
+    filing still holds its plot, so a second one on the same period is the
+    duplicate `ex_applications_no_duplicate` exists to refuse. (Stage 12: the
+    old sibling proved DRAFT sat outside the clause; there is no DRAFT.)"""
+    await _app(db, applicant, published_contour.id, grazing_activity_id, status="RETURNED")
+    with pytest.raises(IntegrityError, match="ex_applications_no_duplicate"):
+        await _app(db, applicant, published_contour.id, grazing_activity_id, status="RETURNED")
+    await db.rollback()
+
+
+async def test_a_draft_status_is_refused_by_the_check(
+    db, applicant, published_contour, grazing_activity_id
+) -> None:
+    """Stage 12 (plan 12, R1/R8): `DRAFT` left `applications.status` with
+    migration 0056 — the CHECK refuses it like any other stranger."""
+    with pytest.raises(IntegrityError, match="ck_applications_status_valid"):
+        await _app(db, applicant, published_contour.id, grazing_activity_id, status="DRAFT")
+    await db.rollback()
 
 
 async def test_status_check_rejects_a_bogus_value(db, applicant) -> None:
@@ -110,7 +124,7 @@ async def test_benefit_verification_status_check_rejects_a_bogus_value(db, appli
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
-        status="DRAFT",
+        status="SUBMITTED",
         benefit_verification_status="BOGUS",
     )
     db.add(row)
@@ -127,7 +141,7 @@ async def test_benefit_verification_status_defaults_to_not_required(db, applican
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
-        status="DRAFT",
+        status="SUBMITTED",
     )
     db.add(row)
     await db.flush()
@@ -144,6 +158,7 @@ async def test_check_type_check_rejects_a_bogus_value(db, applicant) -> None:
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
     )
     db.add(app_row)
     await db.flush()
@@ -168,6 +183,7 @@ async def test_check_type_check_accepts_every_check_type(db, applicant) -> None:
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
     )
     db.add(app_row)
     await db.flush()
@@ -191,6 +207,7 @@ async def test_result_check_rejects_a_bogus_value(db, applicant) -> None:
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
     )
     db.add(app_row)
     await db.flush()
@@ -218,6 +235,7 @@ async def test_result_check_accepts_every_result(db, applicant) -> None:
         submitted_by_user_id=applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
     )
     db.add(app_row)
     await db.flush()
@@ -292,7 +310,7 @@ async def test_status_history_cannot_be_updated(
 
     app_row = await _app(db, applicant, published_contour.id, grazing_activity_id)
     row = ApplicationStatusHistory(
-        application_id=app_row.id, from_status=None, to_status="DRAFT", changed_by=None
+        application_id=app_row.id, from_status=None, to_status="SUBMITTED", changed_by=None
     )
     db.add(row)
     await db.flush()
@@ -308,7 +326,7 @@ async def test_status_history_cannot_be_deleted(
     so they stand or fall together in principle, but only UPDATE had a test."""
     app_row = await _app(db, applicant, published_contour.id, grazing_activity_id)
     row = ApplicationStatusHistory(
-        application_id=app_row.id, from_status=None, to_status="DRAFT", changed_by=None
+        application_id=app_row.id, from_status=None, to_status="SUBMITTED", changed_by=None
     )
     db.add(row)
     await db.flush()
@@ -404,6 +422,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         CHANNELS,
         CONCLUSION_KINDS,
         CONCLUSION_RECOMMENDATIONS,
+        HISTORY_STATUSES,
         ON_BEHALF_VALUES,
     )
     from app.modules.applications.schemas import (
@@ -413,10 +432,16 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         Channel,
         ConclusionKind,
         ConclusionRecommendation,
+        HistoryStatus,
         OnBehalf,
     )
 
     assert set(get_args(ApplicationStatus)) == set(APPLICATION_STATUSES)
+    # Plan 12, R7: the timeline's vocabulary keeps DRAFT as a past value;
+    # the live one does not have it at all.
+    assert set(get_args(HistoryStatus)) == set(HISTORY_STATUSES)
+    assert "DRAFT" not in APPLICATION_STATUSES and "DRAFT" in HISTORY_STATUSES
+    assert len(APPLICATION_STATUSES) == 13
     assert set(get_args(OnBehalf)) == set(ON_BEHALF_VALUES)
     assert set(get_args(Channel)) == set(CHANNELS)
     assert set(get_args(ApplicationKind)) == set(APPLICATION_KINDS)

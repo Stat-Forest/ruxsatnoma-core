@@ -36,6 +36,23 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer
 # the_checks_are_built_from` closes the gap (lesson: an enum-ish column has ONE
 # source of truth — the tuple).
 ApplicationStatus = Literal[
+    "SUBMITTED",
+    "IN_REVIEW",
+    "PENDING_INFO",
+    "RETURNED",
+    "APPROVED",
+    "INVOICED",
+    "PAID",
+    "PERMIT_ISSUED",
+    "REJECTED",
+    "CANCELLED",
+    "EXPIRED_UNPAID",
+    "CLOSED",
+    "ARCHIVED",
+]
+# `HISTORY_STATUSES` (plan 12, R7): what a timeline row may say — `DRAFT`
+# included, as the past value every pre-stage-12 filing's first row carries.
+HistoryStatus = Literal[
     "DRAFT",
     "SUBMITTED",
     "IN_REVIEW",
@@ -675,8 +692,8 @@ class TimelineHistoryRow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    from_status: ApplicationStatus | None
-    to_status: ApplicationStatus
+    from_status: HistoryStatus | None
+    to_status: HistoryStatus
     changed_by: uuid.UUID | None
     reason_item_id: uuid.UUID | None
     reason_text: str | None

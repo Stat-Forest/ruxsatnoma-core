@@ -110,7 +110,7 @@ async def guarded_application(
         submitted_by_user_id=guarded_applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
-        status="DRAFT",
+        status="RETURNED",
         contour_id=published_contour.id,
     )
     db.add(row)
@@ -208,7 +208,7 @@ async def test_a_prosecutor_in_zone_cannot_bind_a_calculation(
     Both statuses are tried, because the defect was in the ENTITLEMENT branch
     and would show up whatever the status.
     """
-    for status in ("DRAFT", "SUBMITTED"):
+    for status in ("RETURNED", "SUBMITTED"):
         guarded_application.status = status
         await db.flush()
         refused = await prosecutor_client.post(
@@ -529,16 +529,10 @@ async def test_the_guard_agrees_with_applications_own_vocabulary() -> None:
     assert owner == {"RETURNED"}
     assert owner < reviewer, "a reviewer may do everything the owner may, and three states more"
     assert reviewer & closed == frozenset()
-    # `DRAFT` is a THIRD, orphaned category since plan 12, R4 — nobody may
-    # bind a calculation to it any more (`applications.service.file`, task B4,
-    # inserts the row as SUBMITTED already, so a DRAFT application never
-    # reaches `save_calculation` at all), yet it is not "closed" either: an
-    # owner reaching for it is refused `application_not_editable_by_this_actor`
-    # by `status not in allowed`, not `application_closed_for_calculation`.
-    # `APPLICATION_STATUSES` still carries `DRAFT` until B6 removes it from
-    # the vocabulary, so the partition below is asserted with it carved out.
-    assert reviewer | closed | {"DRAFT"} == set(APPLICATION_STATUSES)
-    assert "DRAFT" not in reviewer | closed
+    # Stage 12 (plan 12, B6): `DRAFT` is gone from the vocabulary, so the two
+    # sets partition it exactly again.
+    assert reviewer | closed == set(APPLICATION_STATUSES)
+    assert "DRAFT" not in APPLICATION_STATUSES
     # The owner's ONE way into SUBMITTED is `file()`'s own first row (R4),
     # never a bare status membership — `_calculable_statuses_for`'s tests
     # above cover that clause directly.
