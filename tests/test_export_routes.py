@@ -12,14 +12,15 @@ from app.main import create_app
 
 # Routes whose `…/export.xlsx` sibling exists. A path listed here without
 # the sibling actually served is a defect the first assertion names.
-EXPORTED: set[str] = set()
+EXPORTED: set[str] = {
+    "/api/v1/applications",  # Track A
+    "/api/v1/permits",  # Track B
+}
 
 # Registers Oybek included («variant a» of question 2) that no track has
 # served yet. Remove a path here in the same commit that adds it to EXPORTED.
 EXPORT_BACKLOG = {
-    # Track A–D (this plan's own tasks)
-    "/api/v1/applications",
-    "/api/v1/permits",
+    # Track C–D (this plan's own tasks)
     "/api/v1/invoices",
     "/api/v1/oversight/risk-indicators",
     "/api/v1/oversight/events",
