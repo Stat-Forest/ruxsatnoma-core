@@ -482,24 +482,37 @@ async def site_settings(db: AsyncSession) -> SiteSettingsOut:
 async def public_activity_seasons(db: AsyncSession) -> list[PublicActivitySeasonOut]:
     """`GET /public/activity-seasons` (stage 8 fix wave finding 1 — supersedes
     the R3 half of decision #175): the REAL season windows, replacing
-    `site_season_windows`'s six hard-coded month lists. Resolved through
-    `norms_service.resolve_effective_windows` — a thin pass-through to
-    `norms.checks.resolve_effective_windows`, the SAME function
-    `norms.checks._season_check` calls — never a second copy of that
-    precedence.
+    `site_season_windows`'s six hard-coded month lists.
 
-    With no leshoz named, there is no `activity_seasons` dictionary row to
-    fall back to and no contour whose norm could override it, so every
-    activity resolves to `([], "none")` here — reported honestly as "nothing
-    configured", never as "open all year" (`resolve_effective_windows`'s own
-    docstring). `is_default=True` on every row marks exactly that: a real
-    leshoz's own window, reached through the authenticated `GET
-    /activity-seasons/effective` (`norms.service.effective_season`), may
-    differ from what this anonymous read shows."""
+    The anonymous read names no leshoz, so the one dictionary it can consult
+    is the Agency's own — the root organization's `activity_seasons` rows,
+    the nationwide default the public calendar shows (2026-09-10, Oybek:
+    "make the calendar real with demo data" — which it could not be while
+    this read resolved `(None, None)` for every activity, whatever anyone
+    had configured). Resolved through `norms_service.effective_season`, the
+    SAME path the wizard's date picker and `norms.checks._season_check` use,
+    never a second copy of ruling #177's precedence. `is_default=True` on
+    every row marks exactly what it says: a real leshoz's own row, reached
+    through the authenticated `GET /activity-seasons/effective`, overrides
+    this for that leshoz.
+
+    No root organization yet, or no row for an activity — reported honestly
+    as "nothing configured" (`[]`, `"none"`), never as "open all year"
+    (`resolve_effective_windows`'s own docstring)."""
     activity_types = await admin_repo.list_activity_types(db)
+    agency = await admin_repo.get_agency(db)
     seasons = []
     for activity_type in activity_types:
-        windows, source = norms_service.resolve_effective_windows(None, None)
+        if agency is None:
+            windows, source = norms_service.resolve_effective_windows(None, None)
+        else:
+            resolved = await norms_service.effective_season(
+                db,
+                activity_type_id=activity_type.id,
+                contour_id=None,
+                organization_id=agency.id,
+            )
+            windows, source = resolved["windows"], resolved["season_source"]
         seasons.append(
             PublicActivitySeasonOut(
                 activity_type_code=activity_type.code,
