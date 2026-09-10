@@ -42,6 +42,8 @@ from app.modules.admin.models import Organization
 from app.modules.admin.users_schemas import UserAdminOut, UserFilters
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
+from app.modules.integrations import repo as integrations_repo
+from app.modules.integrations.models import OutboxMessage
 
 _ERROR_MAX = 200
 
@@ -479,3 +481,75 @@ def render_legal_documents(items: Sequence[LegalDocumentRow], *, lang: xlsx.Lang
     return xlsx.render(
         items, legal_document_columns(lang), lang=lang, title=LEGAL_DOCUMENTS_TITLE[lang]
     )
+
+
+# ---------------------------------------------------------------------------
+# Integrations outbox — GET /admin/integrations/outbox/export.xlsx
+# ---------------------------------------------------------------------------
+
+OUTBOX_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "pending": {"uz_latn": "Navbatda", "ru": "В очереди"},
+    "delivering": {"uz_latn": "Yuborilmoqda", "ru": "Отправляется"},
+    "delivered": {"uz_latn": "Yetkazildi", "ru": "Доставлено"},
+    "dead": {"uz_latn": "Yetkazilmadi", "ru": "Не доставлено"},
+}
+OUTBOX_TITLE = {"uz_latn": "Chiquvchi navbat", "ru": "Очередь отправки"}
+
+
+def outbox_columns(lang: xlsx.Lang) -> list[xlsx.Column[OutboxMessage]]:
+    """Reads the bare `OutboxMessage` row — `.payload` simply never appears
+    below (lesson: a sender's own diagnostics must never carry what it was
+    sending)."""
+    return [
+        xlsx.Column(
+            "destination",
+            {"uz_latn": "Yoʻnalish", "ru": "Направление"},
+            lambda r: r.destination,
+            22,
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(OUTBOX_STATUS_LABELS, r.status, lang),
+            16,
+        ),
+        xlsx.Column(
+            "attempts", {"uz_latn": "Urinishlar", "ru": "Попытки"}, lambda r: r.attempts, 12
+        ),
+        xlsx.Column(
+            "created_at", {"uz_latn": "Yaratilgan", "ru": "Создано"}, lambda r: r.created_at, 18
+        ),
+        xlsx.Column(
+            "next_attempt_at",
+            {"uz_latn": "Keyingi urinish", "ru": "Следующая попытка"},
+            lambda r: r.next_attempt_at,
+            18,
+        ),
+        xlsx.Column(
+            "delivered_at",
+            {"uz_latn": "Yetkazilgan", "ru": "Доставлено"},
+            lambda r: r.delivered_at,
+            18,
+        ),
+        xlsx.Column(
+            "last_error",
+            {"uz_latn": "Oxirgi xato", "ru": "Последняя ошибка"},
+            lambda r: _truncate(r.last_error),
+            40,
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def outbox_rows(
+    db: AsyncSession, *, lang: xlsx.Lang, status: str | None, destination: str | None
+) -> tuple[list[OutboxMessage], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    items, total = await integrations_repo.list_outbox(
+        db, status=status, destination=destination, page=1, page_size=cap
+    )
+    return items, total, cap
+
+
+def render_outbox(items: Sequence[OutboxMessage], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, outbox_columns(lang), lang=lang, title=OUTBOX_TITLE[lang])

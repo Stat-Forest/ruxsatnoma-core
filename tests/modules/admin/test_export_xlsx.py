@@ -13,9 +13,12 @@ from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.admin.permissions import (
     ANNOUNCEMENTS_MANAGE,
+    INTEGRATIONS_VIEW,
     LEGAL_DOCUMENTS_MANAGE,
 )
 from app.modules.auth.permissions import USERS_MANAGE, USERS_VIEW
+from app.modules.integrations import senders
+from app.modules.integrations import service as integrations_service
 from tests.conftest import make_client
 from tests.modules.admin.test_announcements import make_announcement
 from tests.modules.admin.test_organizations_admin import auth_client, signed_in_with
@@ -524,4 +527,141 @@ async def test_legal_documents_export_rejects_an_unknown_language(db):
     async with make_client(create_app(), lifespan=True) as client:
         auth_client(client, token, csrf)
         resp = await client.get(f"{API}/admin/legal-documents/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Integrations outbox — GET /admin/integrations/outbox/export.xlsx
+# ---------------------------------------------------------------------------
+
+
+async def test_outbox_export_holds_exactly_the_rows_the_list_shows(db):
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await db.commit()
+    destination = f"_export_test_{uuid.uuid4().hex[:8]}"
+    msg = await integrations_service.enqueue(db, destination=destination, payload={"x": 1})
+    assert msg is not None
+    await db.commit()
+
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(
+            f"{API}/admin/integrations/outbox", params={"destination": destination}
+        )
+        resp = await client.get(
+            f"{API}/admin/integrations/outbox/export.xlsx",
+            params={"destination": destination, "lang": "ru"},
+        )
+    assert listed.status_code == 200, listed.text
+    listed_ids = {row["id"] for row in listed.json()["items"]}
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert exported_ids == listed_ids == {str(msg.id)}
+
+
+async def test_outbox_export_applies_the_same_filters_as_the_list(db):
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await db.commit()
+    ok_destination = f"_export_ok_{uuid.uuid4().hex[:8]}"
+
+    async def ok_sender(_db, _payload: dict) -> None:
+        return None
+
+    senders.SENDERS[ok_destination] = ok_sender
+    try:
+        delivered = await integrations_service.enqueue(db, destination=ok_destination, payload={})
+        assert delivered is not None
+        await db.commit()
+        assert await integrations_service.deliver_one(db) is True
+
+        pending_destination = f"_export_pending_{uuid.uuid4().hex[:8]}"
+        pending = await integrations_service.enqueue(
+            db, destination=pending_destination, payload={}
+        )
+        assert pending is not None
+        await db.commit()
+    finally:
+        senders.SENDERS.pop(ok_destination, None)
+
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/integrations/outbox/export.xlsx",
+            params={"status": "pending", "destination": pending_destination},
+        )
+    assert resp.status_code == 200, resp.text
+    exported_ids = _exported_ids(resp.content)
+    assert exported_ids == {str(pending.id)}
+
+
+async def test_outbox_export_renders_labels_not_codes_and_never_the_payload(db):
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await db.commit()
+    destination = f"_export_label_{uuid.uuid4().hex[:8]}"
+    msg = await integrations_service.enqueue(
+        db, destination=destination, payload={"secret": "should-never-appear"}
+    )
+    assert msg is not None
+    await db.commit()
+
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/integrations/outbox/export.xlsx",
+            params={"destination": destination, "lang": "uz_latn"},
+        )
+    assert resp.status_code == 200, resp.text
+    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    assert row[0] == destination
+    assert row[1] == "Navbatda"  # status label, not "pending"
+    assert "should-never-appear" not in "".join(str(v) for v in row if v is not None)
+
+
+async def test_outbox_export_truncates_at_the_cap_and_says_so(db, monkeypatch):
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await db.commit()
+    d1 = f"_export_cap1_{uuid.uuid4().hex[:8]}"
+    d2 = f"_export_cap2_{uuid.uuid4().hex[:8]}"
+    await integrations_service.enqueue(db, destination=d1, payload={})
+    await integrations_service.enqueue(db, destination=d2, payload={})
+    await db.commit()
+
+    real_get_int = settings_store.get_int
+
+    async def one(_db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(_db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(f"{API}/admin/integrations/outbox/export.xlsx")
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert total >= 2
+    assert resp.headers["x-export-truncated"] == "true"
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) == 1
+
+
+async def test_outbox_export_without_the_permission_matches_the_list_status(db):
+    _, token, csrf = await signed_in_with(db)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        listed = await client.get(f"{API}/admin/integrations/outbox")
+        resp = await client.get(f"{API}/admin/integrations/outbox/export.xlsx")
+    assert listed.status_code == 403
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == listed.json()["error"]["code"]
+
+
+async def test_outbox_export_rejects_an_unknown_language(db):
+    _, token, csrf = await signed_in_with(db, INTEGRATIONS_VIEW)
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as client:
+        auth_client(client, token, csrf)
+        resp = await client.get(
+            f"{API}/admin/integrations/outbox/export.xlsx", params={"lang": "en"}
+        )
     assert resp.status_code == 422
