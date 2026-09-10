@@ -490,4 +490,4 @@ async def test_downgrade_upgrade_roundtrip(engine):
     # every other test (conftest's migrator is session-scoped and autouse, so a
     # branch point kills the whole suite rather than one case). Move this in the
     # SAME commit as the migration that moves the head.
-    assert version == "0051"
+    assert version == "0054"
