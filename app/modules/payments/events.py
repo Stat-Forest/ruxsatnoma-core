@@ -75,7 +75,7 @@ PAYMENT_MANUAL_CONFIRMED = "payment.manual_confirmed"
 INVOICE_SETTLED_BY_BENEFIT = "invoice.settled_by_benefit"
 # Ruling #202: the same "nothing to pay" notice for a statutory exemption
 # (`science`), in the law's own words rather than the benefit template's
-# «imtiyozi qo'llanildi». Template seeded by migration `0057`.
+# «imtiyozi qo'llanildi». Template seeded by migration `0058`.
 INVOICE_SETTLED_BY_LAW = "invoice.settled_by_law"
 # Ruling #112, `record_reversal`'s notify to the leshoz that a live permit's
 # money just went back. Its template is seeded by migration `0036`, added at

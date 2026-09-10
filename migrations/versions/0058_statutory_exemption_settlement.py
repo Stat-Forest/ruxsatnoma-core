@@ -32,8 +32,8 @@ requires.
 ASCII apostrophes, no dash) and inside one 70-character part with the
 longest seeded activity name substituted (`Ilmiy tadqiqot`, 14 characters).
 
-Revision ID: 0057
-Revises: 0056
+Revision ID: 0058
+Revises: 0057
 Create Date: 2026-09-11 09:00:00.000000
 
 """
@@ -46,8 +46,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "0057"
-down_revision: str | Sequence[str] | None = "0056"
+revision: str = "0058"
+down_revision: str | Sequence[str] | None = "0057"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
