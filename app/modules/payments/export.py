@@ -18,11 +18,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
+from app.core.schemas import PageParams
 from app.modules.admin import service as admin_service
 from app.modules.applications import service as applications_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
-from app.modules.payments import backoffice_service, service, statement_service
+from app.modules.payments import backoffice_service, recipients_service, service, statement_service
 from app.modules.payments.backoffice_schemas import AllocationOut
 from app.modules.payments.models import (
     BankStatement,
@@ -31,6 +32,7 @@ from app.modules.payments.models import (
     Reconciliation,
     Refund,
 )
+from app.modules.payments.schemas import PaymentRecipientOut
 
 # Refunds' `basis_item_id` names an item of this classifier (migration
 # `0022`; `Refund`'s own docstring) — resolved once per export, never per
@@ -596,3 +598,92 @@ async def refund_rows(
 
 def render_refunds(items: list[RefundRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, refund_columns(lang), lang=lang, title=REFUNDS_TITLE[lang])
+
+
+# --- Recipients (Task C.2, `GET /payments/recipients/export.xlsx`)
+# Mirrors `adminka/src/pages/admin/recipients/labels.ts` (`kindPercent`/
+# `kindFixed`, `statusActive`/`statusInactive`), checked 2026-09-11.
+RECIPIENT_KIND_LABELS: dict[str, dict[str, str]] = {
+    "percent": {"uz_latn": "Foiz", "ru": "Процент"},
+    "fixed": {"uz_latn": "Qat'iy summa", "ru": "Фиксированная сумма"},
+}
+RECIPIENTS_TITLE: dict[str, str] = {
+    "uz_latn": "Toʻlovlarni boʻlish — qabul qiluvchilar",
+    "ru": "Разделение платежей — получатели",
+}
+
+
+class RecipientRow:
+    def __init__(self, out: PaymentRecipientOut, *, created_by: str) -> None:
+        self.out = out
+        self.id = out.id
+        self.created_by = created_by
+
+
+def recipient_columns(lang: xlsx.Lang) -> list[xlsx.Column[RecipientRow]]:
+    f = lambda name: lambda r: getattr(r.out, name)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "name",
+            {"uz_latn": "Nomi", "ru": "Название"},
+            lambda r: xlsx.localized(r.out.name, lang),
+            26,
+        ),
+        xlsx.Column(
+            "kind",
+            {"uz_latn": "Qoidasi turi", "ru": "Тип правила"},
+            lambda r: _label(RECIPIENT_KIND_LABELS, r.out.kind, lang),
+            16,
+        ),
+        xlsx.Column("percent", {"uz_latn": "Foiz", "ru": "Процент"}, f("percent"), 10),
+        xlsx.Column(
+            "fixed_amount",
+            {"uz_latn": "Qat'iy summa", "ru": "Фиксированная сумма"},
+            f("fixed_amount"),
+            16,
+        ),
+        xlsx.Column(
+            "payme_account_id",
+            {"uz_latn": "Payme hisobi", "ru": "Счёт Payme"},
+            f("payme_account_id"),
+            22,
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _active_label(r.out.active, lang),
+            12,
+        ),
+        xlsx.Column("sort_order", {"uz_latn": "Tartib", "ru": "Порядок"}, f("sort_order"), 10),
+        xlsx.Column("note", {"uz_latn": "Izoh", "ru": "Примечание"}, f("note"), 26),
+        xlsx.Column(
+            "created_by", {"uz_latn": "Yaratgan", "ru": "Создал"}, lambda r: r.created_by, 22
+        ),
+        xlsx.Column("created_at", {"uz_latn": "Yaratilgan", "ru": "Создано"}, f("created_at"), 18),
+        xlsx.id_column(),
+    ]
+
+
+async def recipient_rows(
+    db: AsyncSession, *, lang: xlsx.Lang
+) -> tuple[list[RecipientRow], int, int]:
+    """(rows, total, cap). Calls `recipients_service.list_all` — the exact
+    function `GET /payments/recipients` uses — with `PageParams.
+    model_construct` (that model validates `page_size <= 100` on
+    construction; the export is the one caller legitimately above it,
+    ruling R2/R3)."""
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    page = await recipients_service.list_all(
+        db, params=PageParams.model_construct(page=1, page_size=cap)
+    )
+    creator_ids = {item.created_by for item in page.items if item.created_by}
+    names = await auth_service.user_names(db, creator_ids)
+    rows = [
+        RecipientRow(item, created_by=names.get(item.created_by, "") if item.created_by else "")
+        for item in page.items
+    ]
+    return rows, page.total, cap
+
+
+def render_recipients(items: list[RecipientRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, recipient_columns(lang), lang=lang, title=RECIPIENTS_TITLE[lang])

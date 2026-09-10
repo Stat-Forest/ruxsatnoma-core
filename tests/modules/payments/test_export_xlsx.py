@@ -729,3 +729,89 @@ async def test_refunds_export_matches_the_list_status_for_a_caller_with_no_scope
 async def test_refunds_export_rejects_an_unknown_language(payments_view_client):
     resp = await payments_view_client.get("/api/v1/refunds/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
+
+
+# --- /payments/recipients/export.xlsx (Task C.2) -----------------------------
+
+
+async def test_recipients_export_holds_exactly_the_rows_the_list_shows(
+    payments_view_client, budget_50
+):
+    listed = (
+        await payments_view_client.get("/api/v1/payments/recipients", params={"page_size": 100})
+    ).json()
+    listed_ids = {item["id"] for item in listed["items"]}
+    assert str(budget_50.id) in listed_ids
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/recipients/export.xlsx", params={"lang": "ru"}
+    )
+    assert resp.status_code == 200
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Название" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert str(budget_50.id) in exported_ids
+    assert exported_ids == listed_ids
+
+
+async def test_recipients_export_includes_inactive_rows_like_the_list(
+    payments_view_client, budget_50_inactive
+):
+    # `payment_recipients` has no filter parameter at all (ruling #157: an
+    # inactive row is never hidden) — this stands in for shape 2, proving
+    # the export does not silently narrow beyond what the list shows.
+    resp = await payments_view_client.get("/api/v1/payments/recipients/export.xlsx")
+    assert resp.status_code == 200
+    exported_ids = {
+        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert str(budget_50_inactive.id) in exported_ids
+
+
+async def test_recipients_export_renders_labels_not_codes(payments_view_client, budget_50):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/recipients/export.xlsx", params={"lang": "uz_latn"}
+    )
+    rows_by_id = {
+        str(row[-1]): row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    row = rows_by_id[str(budget_50.id)]
+    assert row[0] == "Davlat byudjeti"  # the name first
+    assert row[1] == "Foiz"  # the kind label, not "percent"
+    assert row[5] == "Faol"  # the status label, not True
+
+
+async def test_recipients_export_truncates_at_the_cap_and_says_so(
+    payments_view_client, budget_50, monkeypatch
+):
+    from app.core import settings_store
+
+    original_get_int = settings_store.get_int
+
+    async def capped(db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await original_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", capped)
+    resp = await payments_view_client.get("/api/v1/payments/recipients/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_recipients_export_matches_the_list_status_for_a_caller_with_no_scope(
+    applicant_client,
+):
+    listed_resp = await applicant_client.get("/api/v1/payments/recipients")
+    export_resp = await applicant_client.get("/api/v1/payments/recipients/export.xlsx")
+    assert export_resp.status_code == listed_resp.status_code
+
+
+async def test_recipients_export_rejects_an_unknown_language(payments_view_client):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/recipients/export.xlsx", params={"lang": "en"}
+    )
+    assert resp.status_code == 422
