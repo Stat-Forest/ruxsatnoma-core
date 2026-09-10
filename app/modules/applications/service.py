@@ -1807,8 +1807,8 @@ async def _assert_benefit_documents(db: AsyncSession, application: Application) 
     claim accepted on evidence nobody checked. The project's posture on
     benefits is fail-closed everywhere else — `ERR-NORM-004` refuses a grazing
     fee outright rather than guessing a missing `coef_sb:*`, and
-    `benefit_categories` ships EMPTY so no benefit can be claimed at all today
-    — and this matches it:
+    a claim on a code no auto-verifier knows waits `pending` for the leshoz
+    rather than passing (`_open_benefit_verification`) — and this matches it:
 
       * the document must be of the `doc_types` item whose code is
         `BENEFIT_DOC_TYPE_CODE` below; a document of any other type does not
@@ -1820,10 +1820,11 @@ async def _assert_benefit_documents(db: AsyncSession, application: Application) 
     Since migration `0024` a fresh database is NOT in that state — it seeds
     `benefit_proof`, because the code is ours rather than the Agency's — so
     `benefit_doc_type_not_configured` in production now means somebody archived
-    the item, not that the Agency has yet to answer. The claim is nonetheless
-    still fail-closed on its OTHER half: `benefit_categories` ships empty until
-    VMQ 278's list arrives (`tz/12` #2/#13), so there is no category to claim
-    in the first place.
+    the item, not that the Agency has yet to answer. The OTHER half stopped
+    being empty with migration `0053` (ruling #181 — VMQ 278 ¶12 and PQ-3327
+    ¶8, seven categories), and is fail-closed in its own way: every claim
+    needs a certificate number, and one no register can confirm waits for the
+    leshoz (`_open_benefit_verification`).
 
     The claim is separately validated against the benefit classifier at PATCH
     time (`_assert_references`) and against the tariff rows it must resolve at

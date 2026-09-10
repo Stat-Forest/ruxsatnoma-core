@@ -29,6 +29,9 @@ async def test_contacts_are_public_and_shaped(db) -> None:
     assert body["contacts"]["phone"] == "+998 71 207 88 77"
     assert body["contacts"]["address"] == {"uz_latn": "", "ru": ""}
     assert body["contacts"]["hours"]["uz_latn"].startswith("Dushanba")
+    # Ruling #184: the rules the applicant accepts before signing, served
+    # anonymously so the wizard's checkbox can link to them.
+    assert body["rules_url"] == "https://lex.uz/docs/-2770948"
 
 
 async def test_operational_settings_never_leak(db) -> None:

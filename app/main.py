@@ -344,12 +344,14 @@ def create_app() -> FastAPI:
     # rather than near `applications` (its one level-3 caller reaches it only
     # through `service.match_certificate`, never through this router).
     app.include_router(beekeepers_router, prefix="/api/v1")
-    # Ruling #179: the central benefit-verification office, mounted BEFORE its
-    # sibling `applications_router` — Starlette matches routes in REGISTRATION
-    # order, not by specificity, so `GET /applications/{application_id}` would
-    # otherwise shadow the literal `/applications/benefit-verifications` path
-    # (a 422 `uuid_parsing` on "benefit-verifications", found by this track's
-    # own tests — a wrong-order regression here fails the exact same way).
+    # The benefit claim's own routes (ruling #182: the leshoz's executor
+    # verifies inside the review; ruling #179's country-wide list is gone),
+    # still mounted BEFORE their sibling `applications_router` — Starlette
+    # matches routes in REGISTRATION order, not by specificity, and the bare
+    # `GET /applications/benefit-verifications` was once shadowed by
+    # `GET /applications/{application_id}` (a 422 `uuid_parsing` on the
+    # literal). Nothing left here collides today; the order stays so the next
+    # literal path added to this router cannot regress the same way.
     app.include_router(benefit_verification_router, prefix="/api/v1")
     app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")

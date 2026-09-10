@@ -476,7 +476,7 @@ async def site_settings(db: AsyncSession) -> SiteSettingsOut:
         ),
         social=SiteSocialOut(telegram=telegram or None, youtube=youtube or None),
     )
-    return SiteSettingsOut(contacts=contacts)
+    return SiteSettingsOut(contacts=contacts, rules_url=await value("site_rules_url"))
 
 
 async def public_activity_seasons(db: AsyncSession) -> list[PublicActivitySeasonOut]:
