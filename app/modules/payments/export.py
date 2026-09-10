@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
+from app.modules.admin import service as admin_service
 from app.modules.applications import service as applications_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
@@ -28,7 +29,13 @@ from app.modules.payments.models import (
     Invoice,
     ManualPaymentConfirmation,
     Reconciliation,
+    Refund,
 )
+
+# Refunds' `basis_item_id` names an item of this classifier (migration
+# `0022`; `Refund`'s own docstring) — resolved once per export, never per
+# row, through `admin.service` (the cross-module reader for reference data).
+REFUND_REASONS_CLASSIFIER_CODE = "refund_reasons"
 
 # An unknown code renders as itself, never an empty cell that hides it —
 # the same posture `applications/export.py`'s own `_label` takes.
@@ -495,3 +502,97 @@ async def allocation_rows(
 
 def render_allocations(items: list[AllocationRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, allocation_columns(lang), lang=lang, title=ALLOCATIONS_TITLE[lang])
+
+
+# --- Refunds (Task C.2, `GET /refunds/export.xlsx`) --------------------------
+# Mirrors `adminka/src/pages/accountant/statusMeta.ts::REFUND_STATUS_LABEL_I18N`
+# (`REFUND_STATUSES`), checked 2026-09-11.
+REFUND_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "requested": {"uz_latn": "Soʻralgan", "ru": "Запрошено"},
+    "in_review": {"uz_latn": "Koʻrib chiqilmoqda", "ru": "На рассмотрении"},
+    "returned": {"uz_latn": "Qaytarildi", "ru": "Возвращено"},
+    "rejected": {"uz_latn": "Rad etildi", "ru": "Отклонено"},
+}
+REFUNDS_TITLE: dict[str, str] = {"uz_latn": "Qaytarishlar", "ru": "Возвраты"}
+
+
+class RefundRow:
+    def __init__(self, refund: Refund, *, application_number: str, basis_name: str) -> None:
+        self.refund = refund
+        self.id = refund.id
+        self.application_number = application_number
+        self.basis_name = basis_name
+
+
+def refund_columns(lang: xlsx.Lang) -> list[xlsx.Column[RefundRow]]:
+    f = lambda name: lambda r: getattr(r.refund, name)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "application", {"uz_latn": "Ariza", "ru": "Заявка"}, lambda r: r.application_number, 18
+        ),
+        xlsx.Column("basis", {"uz_latn": "Asos", "ru": "Основание"}, lambda r: r.basis_name, 24),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(REFUND_STATUS_LABELS, r.refund.status, lang),
+            20,
+        ),
+        xlsx.Column(
+            "suggested_amount",
+            {"uz_latn": "Tavsiya etilgan", "ru": "Рекомендовано"},
+            f("suggested_amount"),
+            16,
+        ),
+        xlsx.Column(
+            "final_amount",
+            {"uz_latn": "Yakuniy summa", "ru": "Итоговая сумма"},
+            f("final_amount"),
+            16,
+        ),
+        xlsx.Column("comment", {"uz_latn": "Izoh", "ru": "Комментарий"}, f("comment"), 26),
+        xlsx.Column(
+            "requested_at",
+            {"uz_latn": "Soʻralgan sana", "ru": "Дата заявки"},
+            f("requested_at"),
+            18,
+        ),
+        xlsx.Column("due_at", {"uz_latn": "Muddat", "ru": "Срок"}, f("due_at"), 14),
+        xlsx.Column(
+            "decided_at", {"uz_latn": "Qaror sanasi", "ru": "Дата решения"}, f("decided_at"), 18
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def refund_rows(
+    db: AsyncSession,
+    *,
+    actor: User,
+    lang: xlsx.Lang,
+    application_id: uuid.UUID | None,
+    status: str | None,
+) -> tuple[list[RefundRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    rows, total = await backoffice_service.list_refunds(
+        db, application_id=application_id, status=status, limit=cap, offset=0, actor=actor
+    )
+    app_ids = {row.application_id for row in rows}
+    app_numbers = await applications_service.numbers_by_ids(db, app_ids)
+    if rows:
+        reasons = await admin_service.classifier_items_by_code(db, REFUND_REASONS_CLASSIFIER_CODE)
+        basis_names = {item.id: xlsx.localized(item.name, lang) for item in reasons}
+    else:
+        basis_names = {}
+    out = [
+        RefundRow(
+            row,
+            application_number=app_numbers.get(row.application_id) or "",
+            basis_name=basis_names.get(row.basis_item_id, ""),
+        )
+        for row in rows
+    ]
+    return out, total, cap
+
+
+def render_refunds(items: list[RefundRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, refund_columns(lang), lang=lang, title=REFUNDS_TITLE[lang])

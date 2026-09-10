@@ -15,9 +15,11 @@ from decimal import Decimal
 import httpx
 import pytest
 from openpyxl import load_workbook
+from sqlalchemy import select
 
 from app.core.models import MediaFile
 from app.main import create_app
+from app.modules.admin.models import ClassifierItem
 from app.modules.payments import statement_service
 from app.modules.payments.models import Invoice
 from tests.conftest import make_client
@@ -163,6 +165,33 @@ async def paid_invoice_with_allocations(
     )
     assert confirmed.status_code == 200, confirmed.text
     return pending_invoice
+
+
+@pytest.fixture
+async def refund_basis(db) -> uuid.UUID:
+    """The seeded `refund_reasons` item `RF-01` (migration `0022`), looked
+    up by CODE — mirrors `test_refunds.py::rf01` (its own row id is
+    `gen_random_uuid()` at migration time, so no literal is real across
+    databases)."""
+    return (
+        await db.execute(select(ClassifierItem.id).where(ClassifierItem.code == "RF-01"))
+    ).scalar_one()
+
+
+@pytest.fixture
+async def filed_refund(payments_view_client, pending_invoice, refund_basis) -> dict:
+    """A real `requested` refund through `POST /refunds` (mirrors
+    `test_refunds.py`'s own filing calls) — never a `Refund(...)` row
+    written by hand."""
+    resp = await payments_view_client.post(
+        "/api/v1/refunds",
+        json={
+            "application_id": str(pending_invoice.application_id),
+            "basis_item_id": str(refund_basis),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
 
 
 # --- /invoices/export.xlsx (Task C.1) ---------------------------------------
@@ -622,4 +651,81 @@ async def test_allocations_export_rejects_an_unknown_language(payments_view_clie
     resp = await payments_view_client.get(
         "/api/v1/payments/allocations/export.xlsx", params={"lang": "en"}
     )
+    assert resp.status_code == 422
+
+
+# --- /refunds/export.xlsx (Task C.2) -----------------------------------------
+
+
+async def test_refunds_export_holds_exactly_the_rows_the_list_shows(
+    payments_view_client, filed_refund
+):
+    application_id = filed_refund["application_id"]
+    listed = (
+        await payments_view_client.get("/api/v1/refunds", params={"application_id": application_id})
+    ).json()
+    listed_ids = {item["id"] for item in listed["items"]}
+    assert filed_refund["id"] in listed_ids
+
+    resp = await payments_view_client.get(
+        "/api/v1/refunds/export.xlsx", params={"application_id": application_id, "lang": "ru"}
+    )
+    assert resp.status_code == 200
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Заявка" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert exported_ids == listed_ids
+
+
+async def test_refunds_export_applies_the_same_filters_as_the_list(
+    payments_view_client, filed_refund
+):
+    resp = await payments_view_client.get(
+        "/api/v1/refunds/export.xlsx",
+        params={"application_id": filed_refund["application_id"], "status": "returned"},
+    )
+    assert resp.status_code == 200
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_refunds_export_renders_labels_not_codes(payments_view_client, filed_refund):
+    resp = await payments_view_client.get(
+        "/api/v1/refunds/export.xlsx",
+        params={"application_id": filed_refund["application_id"], "lang": "uz_latn"},
+    )
+    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    assert row[2] == "Soʻralgan"  # the status label, not "requested"
+
+
+async def test_refunds_export_truncates_at_the_cap_and_says_so(
+    payments_view_client, filed_refund, monkeypatch
+):
+    from app.core import settings_store
+
+    original_get_int = settings_store.get_int
+
+    async def capped(db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await original_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", capped)
+    resp = await payments_view_client.get("/api/v1/refunds/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_refunds_export_matches_the_list_status_for_a_caller_with_no_scope(
+    applicant_client,
+):
+    listed_resp = await applicant_client.get("/api/v1/refunds")
+    export_resp = await applicant_client.get("/api/v1/refunds/export.xlsx")
+    assert export_resp.status_code == listed_resp.status_code
+
+
+async def test_refunds_export_rejects_an_unknown_language(payments_view_client):
+    resp = await payments_view_client.get("/api/v1/refunds/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
