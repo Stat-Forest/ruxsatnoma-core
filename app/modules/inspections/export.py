@@ -10,10 +10,9 @@ Neither `InspectionTask` nor `InspectionAct` carries a human-readable
 number (unlike `ViolationCase.number`) — the screen itself identifies a
 task/act only by its kind/date and the `ID` column, so there is no "number
 first" column for those two sheets; `xlsx.id_column()` is still the
-mandatory LAST column on all three (ruling R4). `permit_id` is printed as
-a raw id on every sheet that carries one: `permits.service` has no batch
-name reader (`grep -n "def .*_by_ids" app/modules/permits/service.py`
-finds none), and adding one there is out of this track's scope."""
+mandatory LAST column on all three (ruling R4). The permit a row names is
+printed by its display number through `permits.service.permit_numbers_by_ids`
+— one batch per sheet, the same formatter the document itself prints."""
 
 import uuid
 from collections.abc import Sequence
@@ -29,6 +28,7 @@ from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.inspections import service
 from app.modules.inspections.models import InspectionAct, InspectionTask, ViolationCase
+from app.modules.permits import service as permits_service
 
 TASK_KIND_LABELS: dict[str, dict[str, str]] = {
     "pre_approval_visit": {"uz_latn": "Berishdan oldingi tashrif", "ru": "Выезд перед выдачей"},
@@ -93,6 +93,7 @@ class TaskRow:
         organization: str,
         application_number: str,
         contour_number: str,
+        permit_number: str,
     ) -> None:
         self.task = task
         self.id = task.id
@@ -100,6 +101,7 @@ class TaskRow:
         self.organization = organization
         self.application_number = application_number
         self.contour_number = contour_number
+        self.permit_number = permit_number
 
 
 def task_columns(lang: xlsx.Lang) -> list[xlsx.Column[TaskRow]]:
@@ -128,10 +130,10 @@ def task_columns(lang: xlsx.Lang) -> list[xlsx.Column[TaskRow]]:
             "contour", {"uz_latn": "Kontur", "ru": "Контур"}, lambda r: r.contour_number, 14
         ),
         xlsx.Column(
-            "permit_id",
-            {"uz_latn": "Ruxsatnoma ID", "ru": "ID разрешения"},
-            lambda r: str(r.task.permit_id) if r.task.permit_id else "",
-            38,
+            "permit",
+            {"uz_latn": "Ruxsatnoma", "ru": "Разрешение"},
+            lambda r: r.permit_number,
+            16,
         ),
         xlsx.Column(
             "inspector", {"uz_latn": "Inspektor", "ru": "Инспектор"}, lambda r: r.inspector, 26
@@ -167,10 +169,14 @@ async def task_rows(
     contours = await gis_service.contour_numbers_by_ids(
         db, {t.contour_id for t in tasks if t.contour_id}
     )
+    permits = await permits_service.permit_numbers_by_ids(
+        db, {t.permit_id for t in tasks if t.permit_id}
+    )
     return (
         [
             TaskRow(
                 task,
+                permit_number=permits.get(task.permit_id, "") if task.permit_id else "",
                 inspector=inspectors.get(task.assigned_to, ""),
                 organization=xlsx.localized(orgs.get(task.organization_id), lang)
                 if task.organization_id
@@ -202,12 +208,14 @@ class ActRow:
         inspector: str,
         organization: str,
         application_number: str,
+        permit_number: str,
     ) -> None:
         self.act = act
         self.id = act.id
         self.inspector = inspector
         self.organization = organization
         self.application_number = application_number
+        self.permit_number = permit_number
 
 
 def act_columns(lang: xlsx.Lang) -> list[xlsx.Column[ActRow]]:
@@ -233,10 +241,10 @@ def act_columns(lang: xlsx.Lang) -> list[xlsx.Column[ActRow]]:
             20,
         ),
         xlsx.Column(
-            "permit_id",
-            {"uz_latn": "Ruxsatnoma ID", "ru": "ID разрешения"},
-            lambda r: str(r.act.permit_id) if r.act.permit_id else "",
-            38,
+            "permit",
+            {"uz_latn": "Ruxsatnoma", "ru": "Разрешение"},
+            lambda r: r.permit_number,
+            16,
         ),
         xlsx.Column(
             "task_id",
@@ -272,10 +280,14 @@ async def act_rows(
     applications = await applications_service.numbers_by_ids(
         db, {a.application_id for a in acts if a.application_id}
     )
+    permits = await permits_service.permit_numbers_by_ids(
+        db, {a.permit_id for a in acts if a.permit_id}
+    )
     return (
         [
             ActRow(
                 act,
+                permit_number=permits.get(act.permit_id, "") if act.permit_id else "",
                 inspector=inspectors.get(act.inspector_id, ""),
                 organization=xlsx.localized(orgs.get(act.organization_id), lang)
                 if act.organization_id
@@ -299,11 +311,14 @@ def render_acts(items: Sequence[ActRow], *, lang: xlsx.Lang) -> bytes:
 
 
 class CaseRow:
-    def __init__(self, case: ViolationCase, *, applicant: str, organization: str) -> None:
+    def __init__(
+        self, case: ViolationCase, *, applicant: str, organization: str, permit_number: str
+    ) -> None:
         self.case = case
         self.id = case.id
         self.applicant = applicant
         self.organization = organization
+        self.permit_number = permit_number
 
 
 def case_columns(lang: xlsx.Lang) -> list[xlsx.Column[CaseRow]]:
@@ -332,10 +347,10 @@ def case_columns(lang: xlsx.Lang) -> list[xlsx.Column[CaseRow]]:
             30,
         ),
         xlsx.Column(
-            "permit_id",
-            {"uz_latn": "Ruxsatnoma ID", "ru": "ID разрешения"},
-            lambda r: str(r.case.permit_id) if r.case.permit_id else "",
-            38,
+            "permit",
+            {"uz_latn": "Ruxsatnoma", "ru": "Разрешение"},
+            lambda r: r.permit_number,
+            16,
         ),
         xlsx.Column(
             "damage_amount",
@@ -387,10 +402,14 @@ async def case_rows(
     orgs = await admin_service.organization_names(
         db, {c.organization_id for c in cases if c.organization_id}
     )
+    permits = await permits_service.permit_numbers_by_ids(
+        db, {c.permit_id for c in cases if c.permit_id}
+    )
     return (
         [
             CaseRow(
                 case,
+                permit_number=permits.get(case.permit_id, "") if case.permit_id else "",
                 applicant=applicants.get(case.applicant_id, "") if case.applicant_id else "",
                 organization=xlsx.localized(orgs.get(case.organization_id), lang)
                 if case.organization_id
