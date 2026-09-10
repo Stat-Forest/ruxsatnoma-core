@@ -66,6 +66,13 @@ PAYMENT_CONFIRMED_NOTIFICATION_CODE = "payment.confirmed"
 INVOICE_DUE_SOON = "invoice.due_soon"
 REFUND_DECIDED = "refund.decided"
 PAYMENT_MANUAL_CONFIRMED = "payment.manual_confirmed"
+# Ruling #185 (stage 10, track B4): `service._settle_free` sends this INSTEAD
+# of `INVOICE_ISSUED` above when a zero-sum invoice settles itself — the
+# applicant is told there is nothing to pay, never asked to pay it. Its
+# template is seeded by migration `0054`, added at the same commit that
+# registers this code below (the same discipline `PAYMENT_REVERSED`'s own
+# comment states).
+INVOICE_SETTLED_BY_BENEFIT = "invoice.settled_by_benefit"
 # Ruling #112, `record_reversal`'s notify to the leshoz that a live permit's
 # money just went back. Its template is seeded by migration `0036`, added at
 # integration in the same commit that registered this code below — a
@@ -82,6 +89,7 @@ NOTIFIED_EVENT_CODES = (
     REFUND_DECIDED,
     PAYMENT_MANUAL_CONFIRMED,
     PAYMENT_REVERSED,
+    INVOICE_SETTLED_BY_BENEFIT,
 )
 
 PAYMENT_CONFIRMED = "payment_confirmed"

@@ -75,6 +75,17 @@ class InvoiceOut(BaseModel):
     # itself: "a real absence, not a hidden default."
     recipients: list[InvoiceRecipientOut] | None = None
 
+    # Ruling #185 (stage 10, track B4): DERIVED, no column of its own — the
+    # DEFAULT below is a placeholder `model_validate(invoice)` never reads
+    # (the ORM row has no such attribute), always overwritten by the caller
+    # right after validation with `service.is_settled_by_benefit(db,
+    # invoice)`, the same two-step shape `recipients` above already uses.
+    # `False` by default so a caller that forgets the second step fails
+    # closed — a citizen who really owes nothing must never be told the
+    # opposite, but the reverse (telling a payer they owe nothing) is the
+    # worse mistake, and `False` never produces it.
+    settled_by_benefit: bool = False
+
     # Same fixed-scale-NUMERIC lesson as `norms.schemas.TariffOut.coefficient`:
     # money is carried on the wire as a string, never a JSON float.
     @field_serializer("amount")

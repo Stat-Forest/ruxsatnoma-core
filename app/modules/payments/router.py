@@ -67,6 +67,7 @@ async def _invoice_out(db: AsyncSession, invoice: Invoice, *, actor: User) -> An
     null). One access rule, one source: whoever the route already treats
     as staff must see the same thing every other staff reader does."""
     out = InvoiceOut.model_validate(invoice)
+    out.settled_by_benefit = await service.is_settled_by_benefit(db, invoice)
     if not await service.holds_payments_read(db, actor):
         return JSONResponse(out.model_dump(mode="json", exclude={"recipients"}))
     out.recipients = [
@@ -107,8 +108,18 @@ async def list_invoices(
     items, total = await service.list_invoices_for_actor(
         db, application_id, actor=actor, status=status, limit=limit, offset=offset
     )
+    # `service.list_invoices_for_actor` is itself unaffected by ruling #185
+    # (plan B4) — the derivation is per-row and cheap (`is_settled_by_
+    # benefit`'s own docstring: no query at all unless a row is actually
+    # `paid` and zero), so it is applied here, the same two-step shape
+    # `_invoice_out` above uses for a single invoice.
+    out_items = []
+    for item in items:
+        out = InvoiceOut.model_validate(item)
+        out.settled_by_benefit = await service.is_settled_by_benefit(db, item)
+        out_items.append(out)
     return Page[InvoiceOut](
-        items=[InvoiceOut.model_validate(item) for item in items],
+        items=out_items,
         total=total,
         page=offset // limit + 1,
         page_size=limit,
