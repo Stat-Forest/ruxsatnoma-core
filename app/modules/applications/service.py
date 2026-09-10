@@ -62,6 +62,7 @@ from app.modules.applications.schemas import (
     ApplicationCheckIn,
     ApplicationCreate,
     ApplicationDocumentIn,
+    ApplicationFileIn,
     ApplicationFilingIn,
     ApplicationPatch,
 )
@@ -1980,6 +1981,202 @@ async def package_filing(
     application.id = application_id or uuid7()
     _, priced = await _price(db, application, actor=actor, items=items)
     return application.id, _package_bytes(application, priced, contour_version_id=version.id)
+
+
+async def file(
+    db: AsyncSession,
+    payload: ApplicationFileIn,
+    *,
+    actor: User,
+    ip: str | None = None,
+    kind: str = KIND_NEW,
+    parent_application_id: uuid.UUID | None = None,
+) -> Application:
+    """`POST /applications` — the whole filing in one request, the row created
+    SUBMITTED (plan 12, R1). The fourteen steps of `submit`, re-ordered by R3
+    so that NOTHING of the application is pending when `sign()` runs: the
+    filing is evaluated on a transient row, signed, and only then inserted
+    with everything that hangs off it.
+
+    Refusals before step 8 write nothing but (at step 6) an audit row
+    committed by the early-commit pattern; `sign()`'s own refusals commit its
+    evidence as always; a refusal after step 8 (the duplicate, the taken id)
+    rolls the signature back with the row it never got.
+
+    `kind`/`parent_application_id`: see `_build_filing` — a server caller's
+    parameters (`permits.service.extend`), never the body's.
+    """
+    if (payload.pkcs7 is None) != (payload.application_id is None):
+        # R2: the signed bytes name `application_id`, so the two are one fact
+        # — an envelope with no id cannot be verified against anything, and an
+        # id with no envelope is a client choosing its own primary key for no
+        # reason.
+        reason = "package_id_required" if payload.pkcs7 is not None else "package_id_unexpected"
+        raise err("ERR-VAL-001", details={"reason": reason})
+    if payload.pkcs7 is None and payload.on_behalf != "self":  # step 1b (ruling #183)
+        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
+    submission_id = uuid7()  # step 0 — the history row's id, what the signature binds to
+    filing = await _build_filing(  # step 1
+        db, payload, actor=actor, kind=kind, parent_application_id=parent_application_id
+    )
+    application, items = filing.application, filing.items
+    application.id = payload.application_id or uuid7()
+    await _assert_complete(  # step 2
+        db, application, items=items, rules_accepted=payload.rules_accepted
+    )
+    application.rules_accepted_at = datetime.now(UTC)  # ruling #184, the server's clock
+    await _open_benefit_verification(db, application)  # step 3b
+    version = await _published_version_or_refuse(db, application)  # step 4 (ruling 22)
+    application.contour_version_id = version.id
+    application.requested_area_ha = version.area_ha
+    calc_payload, priced = await _price(db, application, actor=actor, items=items)  # step 7
+    collected = await checks.evaluate(  # step 5 — computed, not written
+        db, application, norm_results=priced["checks"], items=items
+    )
+    rows = checks.record(application.id, collected, created_by=actor.id)
+    blocking = checks.first_blocking_error(rows)
+    if blocking is not None:  # step 6
+        # R3: no row to keep evidence on, so the evidence IS the audit entry —
+        # committed before the raise, the early-commit pattern (decision #40).
+        await audit.log(
+            db,
+            action=APPLICATION_FILE,
+            user_id=actor.id,
+            object_type="application_filing",
+            result="denied",
+            basis=blocking.code,
+            new_value={
+                "filing": payload.model_dump(mode="json", exclude={"pkcs7"}),
+                "checks": [{"check_type": c, "result": r} for c, r, _ in collected],
+            },
+        )
+        await db.commit()
+        raise blocking
+
+    # Step 8. The first thing on this page that can commit — and nothing of
+    # ours is pending, which is the whole point of the order above.
+    document = _package_bytes(application, priced, contour_version_id=version.id)
+    if payload.pkcs7 is not None:
+        await signatures_service.sign(
+            db,
+            object_type=SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=SUBMISSION_PURPOSE,
+            document=document,
+            pkcs7=payload.pkcs7,
+            user=actor,
+            content_changed_reason=STALE_PACKAGE_REASON,
+            ip=ip,
+        )
+    else:
+        await signatures_service.sign_simple(
+            db,
+            object_type=SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=SUBMISSION_PURPOSE,
+            document=document,
+            user=actor,
+            ip=ip,
+        )
+
+    # Step 10, ruling 5а — AFTER the signature, so a refused envelope never
+    # reaches the counter; inside the transaction, so a failure below rolls
+    # the counter back with it.
+    number = await next_public_number(db, NUMBER_PREFIX, business_today())
+    submitted_at = datetime.now(UTC)
+    application.number = number
+    application.submitted_at = submitted_at
+    application.sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)  # ruling 13
+    try:  # step 9' — the INSERT, inside a SAVEPOINT so a refusal leaves the session usable
+        async with db.begin_nested():
+            db.add(application)
+            for item in items:
+                item.application_id = application.id
+                db.add(item)
+            for doc in filing.documents:
+                doc.application_id = application.id
+                db.add(doc)
+            await db.flush()
+    except IntegrityError as exc:
+        # The constraint is named through `exc.orig.__cause__` (asyncpg's own
+        # exception), never by matching the message (lesson). The clash key is
+        # read off the TRANSIENT object, which no savepoint snapshot ever
+        # expired — `submit`'s `MissingGreenlet` trap does not apply here.
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        constraint = getattr(cause, "constraint_name", None)
+        if constraint == "pk_applications":
+            # R2: a client naming an id that already has a row — a second
+            # click under a fresh `Idempotency-Key`, or a lie. Refused, never
+            # overwritten.
+            raise err(
+                "ERR-APP-004",
+                details={"reason": "already_filed", "application_id": str(application.id)},
+            ) from exc
+        if constraint != "ex_applications_no_duplicate":
+            raise
+        clash = await repo.active_overlapping(  # ruling 6: NAME the colliding filing
+            db,
+            applicant_id=application.applicant_id,
+            contour_id=application.contour_id,
+            activity_type_id=application.activity_type_id,
+            period_from=application.period_from,
+            period_to=application.period_to,
+            exclude_id=application.id,
+        )
+        if clash is None:
+            raise
+        raise err("ERR-APP-002", details={"existing_number": clash.number}) from exc
+
+    # Step 9, ruling 8: EXACTLY ONE calculation, bound to the row that now
+    # exists — the owner's first row in SUBMITTED, which R4 admits.
+    calculation = await norms_service.save_calculation(
+        db,
+        payload=calc_payload.model_copy(update={"application_id": application.id}),
+        actor=actor,
+    )
+    await repo.add_checks(db, rows)  # step 5' — the evidence, now that there is a row
+    await repo.add_status_history(  # step 11, ruling 25: `id = submission_id`
+        db,
+        ApplicationStatusHistory(
+            id=submission_id,
+            application_id=application.id,
+            from_status=None,
+            to_status=SUBMITTED_STATUS,
+            changed_by=actor.id,
+        ),
+    )
+    await db.refresh(application)  # server defaults, NUMERIC scale (lesson)
+    await audit.log(  # step 12
+        db,
+        action=APPLICATION_FILE,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        new_value={
+            "status": SUBMITTED_STATUS,
+            "number": number,
+            "kind": kind,
+            "submission_id": str(submission_id),
+            "contour_version_id": str(version.id),
+            "requested_area_ha": _json_safe(application.requested_area_ha),
+            "calculation_id": str(calculation.id),
+            "documents": len(filing.documents),
+        },
+    )
+    await notifications_service.notify(  # step 13 — DOTTED, see the constant
+        db,
+        event_code=NOTIFY_APPLICATION_SUBMITTED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={"application_number": number},
+        object_type="application",
+        object_id=application.id,
+    )
+    # Step 14 — `application_id` and nothing else (`events.py`'s frozen
+    # payload); then the assignment, which must exist for every SUBMITTED row.
+    await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
+    await _auto_assign_on_submission(db, application)
+    await db.refresh(application)
+    return application
 
 
 async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> bytes:

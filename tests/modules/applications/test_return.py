@@ -85,7 +85,7 @@ async def test_a_returned_application_is_edited_and_resubmitted_keeping_its_numb
     `test_a_resubmission_does_not_re_fire_auto_assignment` already covers
     that guard (ruling 6) directly against `submit`, so this test does not
     repeat the assertion."""
-    from tests.modules.applications.test_submit import _submit
+    from tests.modules.applications.test_submit import _resubmit
 
     before = (await applicant_client.get(f"/api/v1/applications/{application_in_review}")).json()
 
@@ -102,7 +102,7 @@ async def test_a_returned_application_is_edited_and_resubmitted_keeping_its_numb
     )
     assert patched.status_code == 200, "a RETURNED application must be editable again"
 
-    again = await _submit(applicant_client, application_in_review)
+    again = await _resubmit(applicant_client, application_in_review)
     assert again.status_code == 200, again.text
 
     after = again.json()
@@ -152,7 +152,7 @@ async def test_a_return_that_moves_the_contour_to_another_leshoz_reassigns_the_o
     active assignment already exists, and only when that disagrees with what
     is stored does it drop the stale assignment and pick again — which is
     exactly what this test proves end to end."""
-    from tests.modules.applications.test_submit import _submit
+    from tests.modules.applications.test_submit import _resubmit
 
     returned = await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/return",
@@ -170,7 +170,7 @@ async def test_a_return_that_moves_the_contour_to_another_leshoz_reassigns_the_o
     )
     assert patched.status_code == 200, patched.text
 
-    again = await _submit(applicant_client, application_in_review)
+    again = await _resubmit(applicant_client, application_in_review)
     assert again.status_code == 200, again.text
     assert again.json()["status"] == "SUBMITTED"
 
@@ -204,7 +204,7 @@ async def test_a_return_resubmitted_on_the_same_contour_keeps_its_reviewer(
     through the actual `/return` route the final review's Critical walks
     through, so the fix is checked against both the changed and the unchanged
     path."""
-    from tests.modules.applications.test_submit import _submit
+    from tests.modules.applications.test_submit import _resubmit
 
     returned = await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/return",
@@ -221,7 +221,7 @@ async def test_a_return_resubmitted_on_the_same_contour_keeps_its_reviewer(
     )
     assert patched.status_code == 200, patched.text
 
-    again = await _submit(applicant_client, application_in_review)
+    again = await _resubmit(applicant_client, application_in_review)
     assert again.status_code == 200, again.text
 
     timeline = (

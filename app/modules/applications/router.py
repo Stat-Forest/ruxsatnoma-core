@@ -53,10 +53,10 @@ from app.modules.applications.schemas import (
     ApplicationCheckOut,
     ApplicationConclusionIn,
     ApplicationConclusionOut,
-    ApplicationCreate,
     ApplicationDecisionOut,
     ApplicationDocumentIn,
     ApplicationDocumentOut,
+    ApplicationFileIn,
     ApplicationFilingIn,
     ApplicationOut,
     ApplicationPatch,
@@ -136,20 +136,35 @@ async def package_filing(
 
 
 @router.post("/applications", status_code=201)
-async def create_application(
-    payload: ApplicationCreate,
+async def file_application(
+    payload: ApplicationFileIn,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+    ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
 ) -> ApplicationOut:
-    """201 with an empty DRAFT: a draft is autosaved field by field (ruling 7),
-    so everything except who is filing and for whom arrives through PATCH.
+    """The whole filing in one request → 201, the application SUBMITTED with
+    its public number (plan 12, R1). `Idempotency-Key` is MANDATORY (422
+    `ERR-VAL-001` `idempotency_key_required`, 409 `ERR-SYS-005` on a
+    conflicting replay) — a replayed filing would mint a second number; `ctx`
+    is declared AFTER `actor` so the one `get_current_user` resolves once.
 
-    422 `ERR-VAL-001` when the caller has no `applicants` row of their own
-    (`on_behalf="self"`) or names an applicant that is not theirs; 403
-    `ERR-ACL-001` when `on_behalf="legal"` names a legal entity the caller holds
-    no effective representation of.
+    400 `ERR-APP-001` naming the fields still to fill (`rules_accepted` among
+    them); 422 `ERR-VAL-001` (`package_id_required` / `package_id_unexpected`,
+    an unknown reference, somebody else's applicant, a document that is not
+    the caller's upload); 422 `ERR-APP-003` (benefit claim); 409 `ERR-GIS-005`
+    (no published version); `ERR-GIS-*`/`ERR-NORM-*` for a blocking check; 422
+    `ERR-SIGN-001` (bad envelope, `package_changed`,
+    `simple_signature_not_allowed`); 409 `ERR-APP-002` with the existing
+    number for an overlapping active filing; 409 `ERR-APP-004` `already_filed`
+    for an id that already has a row.
     """
-    return ApplicationOut.model_validate(await service.create_draft(db, payload, actor=actor))
+    application = await service.file(
+        db, payload, actor=actor, ip=request.client.host if request.client else None
+    )
+    out = ApplicationOut.model_validate(application)
+    await ctx.save(db, status_code=201, body=out.model_dump(mode="json"))
+    return out
 
 
 @router.patch("/applications/{application_id}")

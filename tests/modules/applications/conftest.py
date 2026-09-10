@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from sqlalchemy import select, text
@@ -206,29 +207,22 @@ async def preschool_children_priced(db: AsyncSession) -> AsyncIterator[None]:
 
 
 @pytest.fixture
-async def recreation_draft_ready_for_submission(
-    applicant_client,
+def recreation_filing_ready_for_submission(
+    applicant: Applicant,
     published_contour: Contour,
     recreation_activity_id: uuid.UUID,
-) -> str:
-    """A DRAFT ready to submit on the RECREATION activity — `_ready_draft`'s
+) -> dict[str, Any]:
+    """A FILING ready to submit on the RECREATION activity — `_ready_filing`'s
     own template does not fit here: recreation prices by `quantity`, never
     `items` (grazing's own herd list)."""
-    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
-    assert created.status_code == 201, created.text
-    application_id = created.json()["id"]
-    patched = await applicant_client.patch(
-        f"/api/v1/applications/{application_id}",
-        json={
-            "contour_id": str(published_contour.id),
-            "activity_type_id": str(recreation_activity_id),
-            "period_from": "2027-09-01",
-            "period_to": "2027-09-30",
-            "quantity": "2",
-        },
-    )
-    assert patched.status_code == 200, patched.text
-    return application_id
+    return {
+        "on_behalf": "self",
+        "contour_id": str(published_contour.id),
+        "activity_type_id": str(recreation_activity_id),
+        "period_from": "2027-09-01",
+        "period_to": "2027-09-30",
+        "quantity": "2",
+    }
 
 
 @pytest.fixture
@@ -470,67 +464,55 @@ async def representative_client(db: AsyncSession, legal_applicant: Applicant):
         yield client
 
 
-async def _ready_draft(
-    applicant_client,
+def _ready_filing(
     contour_id: uuid.UUID,
     activity_type_id: uuid.UUID,
     livestock_type_id: uuid.UUID,
     *,
     period_from: str,
     period_to: str,
-) -> str:
-    """One complete grazing draft, built through the REAL routes (`POST
-    /applications` + `PATCH`), never by inserting an `Application` row (lesson:
-    build a fixture's precondition through the real transition).
-
-    Shared by the three draft fixtures below so that "complete" means the same
-    thing in all of them: a second hand-written body is how two fixtures that
-    are supposed to differ only in their period end up differing in more.
-    """
-    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
-    assert created.status_code == 201, created.text
-    application_id = created.json()["id"]
-    patched = await applicant_client.patch(
-        f"/api/v1/applications/{application_id}",
-        json={
-            "contour_id": str(contour_id),
-            "activity_type_id": str(activity_type_id),
-            "period_from": period_from,
-            "period_to": period_to,
-            "items": [{"livestock_type_id": str(livestock_type_id), "head_count": 40}],
-        },
-    )
-    assert patched.status_code == 200, patched.text
-    return application_id
+    on_behalf: str = "self",
+    applicant_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """One complete grazing FILING — the body `POST /applications` takes since
+    stage 12 (plan 12, R1); a draft is no longer a thing a fixture can build.
+    Shared by the filing fixtures below so that "complete" means the same thing
+    in all of them: a second hand-written body is how two fixtures that are
+    supposed to differ only in their period end up differing in more."""
+    body: dict[str, Any] = {
+        "on_behalf": on_behalf,
+        "contour_id": str(contour_id),
+        "activity_type_id": str(activity_type_id),
+        "period_from": period_from,
+        "period_to": period_to,
+        "items": [{"livestock_type_id": str(livestock_type_id), "head_count": 40}],
+    }
+    if applicant_id is not None:
+        body["applicant_id"] = str(applicant_id)
+    return body
 
 
 @pytest.fixture
-async def draft_ready_for_submission(
-    applicant_client,
+def filing_ready_for_submission(
+    applicant: Applicant,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     sheep_type_id: uuid.UUID,
     published_coef_sb: None,
     published_grazing_norm: uuid.UUID,
-) -> str:
-    """A DRAFT carrying everything a submission needs: the contour, grazing, a
-    May-September 2027 period and a 40-head sheep herd.
+) -> dict[str, Any]:
+    """A FILING carrying everything `POST /applications` needs: the contour,
+    grazing, a May-September 2027 period and a 40-head sheep herd — the body,
+    not an id (stage 12: there is no draft to hold one).
 
-    Built through the REAL routes (`POST /applications` + `PATCH`), never by
-    inserting an `Application` row (lesson: build a fixture's precondition
-    through the real transition) — a draft assembled by hand would not prove
-    that the shape task 5 refuses to submit is the shape task 3 lets an
-    applicant reach.
+    `applicant` is a dependency so the caller's own `applicants` row exists,
+    with its address (`checks.missing_for_pricing` refuses a blank one).
 
     40 head is deliberately well inside `published_grazing_norm`'s MaxSB of 250,
     so a test that wants an over-limit herd raises it itself and a test that
     does not gets a clean pass.
-
-    Returns the id as a STRING: every consumer interpolates it into a URL, and
-    task 5's own tests re-parse it with `uuid.UUID(...)`.
     """
-    return await _ready_draft(
-        applicant_client,
+    return _ready_filing(
         published_contour.id,
         grazing_activity_id,
         sheep_type_id,
@@ -540,25 +522,47 @@ async def draft_ready_for_submission(
 
 
 @pytest.fixture
-async def draft_in_reviewerless_leshoz(draft_ready_for_submission: str) -> str:
-    """Ruling 7's empty case: `draft_ready_for_submission`'s own `leshoz` is a
-    FRESH organization every test (random code), so it is already reviewerless
-    unless the SAME test also pulls in `hodim_user`/`hodim_client` — this name
-    just states that intent explicitly for the one test exercising it, rather
-    than relying on the reader to notice an absence."""
-    return draft_ready_for_submission
-
-
-@pytest.fixture
-async def second_draft_same_contour(
-    applicant_client,
+def legal_filing_ready_for_submission(
+    legal_applicant: Applicant,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     sheep_type_id: uuid.UUID,
     published_coef_sb: None,
     published_grazing_norm: uuid.UUID,
-) -> str:
-    """The SAME applicant, contour and activity as `draft_ready_for_submission`,
+) -> dict[str, Any]:
+    """`filing_ready_for_submission` for the LEGAL entity `representative_client`
+    represents — the ERI path of plan 12's R2 (package → sign → file)."""
+    return _ready_filing(
+        published_contour.id,
+        grazing_activity_id,
+        sheep_type_id,
+        period_from="2027-05-01",
+        period_to="2027-09-30",
+        on_behalf="legal",
+        applicant_id=legal_applicant.id,
+    )
+
+
+@pytest.fixture
+def filing_in_reviewerless_leshoz(filing_ready_for_submission: dict[str, Any]) -> dict[str, Any]:
+    """Ruling 7's empty case: `filing_ready_for_submission`'s own `leshoz` is a
+    FRESH organization every test (random code), so it is already reviewerless
+    unless the SAME test also pulls in `hodim_user`/`hodim_client` — this name
+    just states that intent explicitly for the one test exercising it, rather
+    than relying on the reader to notice an absence."""
+    return filing_ready_for_submission
+
+
+@pytest.fixture
+def second_filing_same_contour(
+    applicant: Applicant,
+    published_contour: Contour,
+    grazing_activity_id: uuid.UUID,
+    sheep_type_id: uuid.UUID,
+    published_coef_sb: None,
+    published_grazing_norm: uuid.UUID,
+) -> dict[str, Any]:
+    """The SAME applicant, contour and activity as `filing_ready_for_submission`,
     over a period that OVERLAPS its 2027-05-01..2027-09-30 — the four columns
     `ex_applications_no_duplicate` keys on (ruling 6, `tz/05` invariant 1).
 
@@ -566,8 +570,7 @@ async def second_draft_same_contour(
     by a pre-SELECT: a "check then insert" is a race that lets two clicks a
     millisecond apart both succeed.
     """
-    return await _ready_draft(
-        applicant_client,
+    return _ready_filing(
         published_contour.id,
         grazing_activity_id,
         sheep_type_id,
@@ -577,16 +580,16 @@ async def second_draft_same_contour(
 
 
 @pytest.fixture
-async def another_ready_draft(
-    applicant_client,
+def another_ready_filing(
+    applicant: Applicant,
     published_contour: Contour,
     grazing_activity_id: uuid.UUID,
     sheep_type_id: uuid.UUID,
     published_coef_sb: None,
     published_grazing_norm: uuid.UUID,
-) -> str:
-    """A second submittable draft for the same applicant that CANNOT collide
-    with `draft_ready_for_submission`: the same contour and activity, a season a
+) -> dict[str, Any]:
+    """A second submittable filing for the same applicant that CANNOT collide
+    with `filing_ready_for_submission`: the same contour and activity, a season a
     year later, so `daterange(period_from, period_to, '[]') &&` is false and the
     EXCLUDE constraint has nothing to say about the pair.
 
@@ -595,8 +598,7 @@ async def another_ready_draft(
     would be refused `ERR-NORM-001` before it ever reached the number allocator
     this fixture exists to observe.
     """
-    return await _ready_draft(
-        applicant_client,
+    return _ready_filing(
         published_contour.id,
         grazing_activity_id,
         sheep_type_id,
@@ -799,12 +801,13 @@ async def overlapping_published_contour(
 
 @pytest.fixture
 async def submitted_application(
-    applicant_client, draft_ready_for_submission: str, hodim_user: User
+    applicant_client, filing_ready_for_submission: dict[str, Any], hodim_user: User
 ) -> str:
-    """`draft_ready_for_submission`, actually SUBMITTED — through `GET
-    /package` + a real ERI over those exact bytes + `POST /submit`, never by
-    writing `status='SUBMITTED'` on the row (lesson: build a fixture's
-    precondition through the real transition).
+    """`filing_ready_for_submission`, actually FILED — through `POST
+    /applications/package` + a real ERI over those exact bytes + `POST
+    /applications` (stage 12), never by writing `status='SUBMITTED'` on a row
+    (lesson: build a fixture's precondition through the real transition).
+    Returns the new application's id as a STRING, as every consumer expects.
 
     That matters here more than usual: task 6's timeline reads the SUBMITTED
     history row's `id` as the object the submission signature is bound to
@@ -828,9 +831,9 @@ async def submitted_application(
     """
     from tests.modules.applications.test_submit import _submit
 
-    result = await _submit(applicant_client, draft_ready_for_submission)
-    assert result.status_code == 200, result.text
-    return draft_ready_for_submission
+    result = await _submit(applicant_client, filing_ready_for_submission)
+    assert result.status_code == 201, result.text
+    return result.json()["id"]
 
 
 @pytest.fixture
@@ -1273,26 +1276,28 @@ async def application_in_review_at_agency(
     owns — so the application sits IN_REVIEW at an organization with no parent
     and an escalation has nowhere to go.
 
-    Built end to end through the real routes (`POST /applications` -> `PATCH` ->
-    `GET /package` + a real ERI -> `POST /submit` -> `POST /start-review`): a
-    hand-set `assigned_org_id` would reach the same state without proving that
-    the state is reachable.
+    Built end to end through the real routes (`POST /applications/package` + a
+    real ERI -> `POST /applications` -> `POST /start-review`): a hand-set
+    `assigned_org_id` would reach the same state without proving that the
+    state is reachable.
 
-    A 2029 season keeps it clear of every other draft in this package;
+    A 2029 season keeps it clear of every other filing in this package;
     `ex_applications_no_duplicate` keys on the contour too, so the different
     contour alone would already be enough."""
     from tests.modules.applications.test_submit import _submit
 
-    application_id = await _ready_draft(
+    submitted = await _submit(
         applicant_client,
-        agency_published_contour.id,
-        grazing_activity_id,
-        sheep_type_id,
-        period_from="2029-05-01",
-        period_to="2029-09-30",
+        _ready_filing(
+            agency_published_contour.id,
+            grazing_activity_id,
+            sheep_type_id,
+            period_from="2029-05-01",
+            period_to="2029-09-30",
+        ),
     )
-    submitted = await _submit(applicant_client, application_id)
-    assert submitted.status_code == 200, submitted.text
+    assert submitted.status_code == 201, submitted.text
+    application_id = submitted.json()["id"]
     started = await agency_hodim_client.post(f"/api/v1/applications/{application_id}/start-review")
     assert started.status_code == 200, started.text
     return application_id
