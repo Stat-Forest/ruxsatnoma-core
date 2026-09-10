@@ -12,6 +12,8 @@ number with.
 
 import uuid
 from collections.abc import Sequence
+from datetime import date
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -168,3 +170,71 @@ async def rows(
 
 def render(items: Sequence[Row], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, columns(lang), lang=lang, title=TITLE[lang])
+
+
+# --- the anonymous rating feed, `GET /admin/ratings/export.xlsx` -------------
+# Ruling #141 holds in the file as on the screen: date, service, leshoz,
+# score, text — never who rated. The id column is the RATING's own id.
+
+RATINGS_TITLE = {"uz_latn": "Baholar", "ru": "Оценки"}
+RATINGS_FILENAME_STEM = "baholar"
+
+
+class RatingRow:
+    """One row of `service.list_rating_comments` — a dict with `id`,
+    `created_at`, `score`, `comment`, `organization_name`, `activity_type_name`."""
+
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self.raw = raw
+        self.id = raw["id"]
+
+
+def ratings_columns(lang: xlsx.Lang) -> list[xlsx.Column[RatingRow]]:
+    return [
+        xlsx.Column(
+            "created_at", {"uz_latn": "Sana", "ru": "Дата"}, lambda r: r.raw["created_at"], 18
+        ),
+        xlsx.Column(
+            "activity_type",
+            {"uz_latn": "Xizmat", "ru": "Услуга"},
+            lambda r: xlsx.localized(r.raw["activity_type_name"], lang),
+            24,
+        ),
+        xlsx.Column(
+            "organization",
+            {"uz_latn": "Oʻrmon xoʻjaligi", "ru": "Лесхоз"},
+            lambda r: xlsx.localized(r.raw["organization_name"], lang),
+            30,
+        ),
+        xlsx.Column("score", {"uz_latn": "Baho", "ru": "Оценка"}, lambda r: r.raw["score"], 8),
+        xlsx.Column(
+            "comment", {"uz_latn": "Izoh", "ru": "Комментарий"}, lambda r: r.raw["comment"], 60
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def ratings_rows(
+    db: AsyncSession,
+    *,
+    actor: User,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    period_from: date,
+    period_to: date,
+) -> tuple[list[RatingRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    raw_rows, total = await service.list_rating_comments(
+        db,
+        actor=actor,
+        params=PageParams.model_construct(page=1, page_size=cap),
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    return [RatingRow(r) for r in raw_rows], total, cap
+
+
+def render_ratings(items: Sequence[RatingRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, ratings_columns(lang), lang=lang, title=RATINGS_TITLE[lang])

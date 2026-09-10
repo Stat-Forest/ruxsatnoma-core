@@ -874,6 +874,10 @@ async def rating_comments(
     total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
     rows = await db.execute(
         select(
+            # The rating's OWN id — for the stage-13 export's mandatory last
+            # column (ruling R4). It names nobody: `RatingCommentRow` has no
+            # `id` field, so the feed's JSON stays exactly as ruling #141 left it.
+            PermitRating.id,
             PermitRating.created_at,
             PermitRating.score,
             PermitRating.comment,

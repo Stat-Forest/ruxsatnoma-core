@@ -11,14 +11,16 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
-from app.modules.permits import service
+from app.modules.permits import export, service
 from app.modules.permits.permissions import RATINGS_VIEW
 from app.modules.permits.schemas import RatingCommentRow, RatingsSummaryOut
 
@@ -83,4 +85,31 @@ async def list_ratings(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/export.xlsx")
+async def export_ratings_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, _VIEW],
+    period_from: date,
+    period_to: date,
+    lang: xlsx.Lang = "uz_latn",
+    organization_id: uuid.UUID | None = None,
+    activity_type_id: uuid.UUID | None = None,
+) -> Response:
+    """The comment feed as a spreadsheet (stage 13, ruling #204): the same
+    period and the same two optional filters, the same zone through the
+    same service call, and ruling #141's anonymity by construction."""
+    items, total, cap = await export.ratings_rows(
+        db,
+        actor=actor,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    filename = f"{export.RATINGS_FILENAME_STEM}-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_ratings(items, lang=lang), filename=filename, total=total, cap=cap
     )

@@ -18,6 +18,7 @@ EXPORTED: set[str] = {
     "/api/v1/oversight/risk-indicators",  # Track D
     "/api/v1/oversight/events",  # Track D
     "/api/v1/admin/public/appeals",  # Track D
+    "/api/v1/admin/ratings",  # Track D's remainder, by the coordinator (permits/admin_router.py)
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
@@ -32,8 +33,6 @@ EXPORT_BACKLOG = {
     "/api/v1/payments/allocations",
     "/api/v1/refunds",
     "/api/v1/payments/recipients",
-    # Track D — ratings (lives in permits/admin_router.py; done by the coordinator)
-    "/api/v1/admin/ratings",
     # Track E — admin + templates
     "/api/v1/admin/users",
     "/api/v1/refs/organizations",
