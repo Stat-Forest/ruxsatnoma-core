@@ -24,6 +24,7 @@ replayed create produces a second EMPTY draft, which costs a row and confuses
 nobody: the applicant sees two drafts and abandons one.
 """
 
+import base64
 import uuid
 from datetime import date
 from typing import Annotated
@@ -52,12 +53,14 @@ from app.modules.applications.schemas import (
     ApplicationCardOut,
     ApplicationCheckIn,
     ApplicationCheckOut,
+    ApplicationCloneOut,
     ApplicationConclusionIn,
     ApplicationConclusionOut,
-    ApplicationCreate,
     ApplicationDecisionOut,
     ApplicationDocumentIn,
     ApplicationDocumentOut,
+    ApplicationFileIn,
+    ApplicationFilingIn,
     ApplicationOut,
     ApplicationPatch,
     ApplicationRejectIn,
@@ -67,7 +70,9 @@ from app.modules.applications.schemas import (
     ApplicationStatus,
     ApplicationSubmitIn,
     ApplicationTimelineOut,
+    FilingPackageOut,
     PrecheckCalculationOut,
+    PrecheckCheckOut,
     PrecheckOut,
 )
 from app.modules.auth.deps import (
@@ -86,21 +91,83 @@ NUMBER_MAX_LENGTH = 64
 router = APIRouter(tags=["applications"])
 
 
-@router.post("/applications", status_code=201)
-async def create_application(
-    payload: ApplicationCreate,
+# --- Stage 12: the stateless pre-check and package ---------------------------
+#
+# Registered BEFORE every `/applications/{application_id}…` route: FastAPI
+# matches in declaration order, and `application_id` is a `uuid.UUID`, so a
+# `POST /applications/precheck` reaching a parametrised route first would be
+# answered 422 for a path segment that is not a uuid.
+
+
+@router.post("/applications/precheck")
+async def precheck_filing(
+    payload: ApplicationFilingIn,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
-) -> ApplicationOut:
-    """201 with an empty DRAFT: a draft is autosaved field by field (ruling 7),
-    so everything except who is filing and for whom arrives through PATCH.
+) -> PrecheckOut:
+    """The dry run over a filing that exists only in this body (plan 12, R3):
+    the checks as data and the price, nothing stored. 200 even when a check
+    blocks; an incomplete filing answers `skipped` rows naming the fields;
+    422 `ERR-VAL-001` for an unknown reference, a filing naming somebody
+    else's applicant, or a document that is not the caller's own upload; 422
+    `ERR-NORM-004` for an unpublished rule parameter."""
+    card = await service.precheck_filing(db, payload, actor=actor)
+    priced = card["calculation"]
+    return PrecheckOut(
+        checks=[PrecheckCheckOut(check_type=c, result=r, details=d) for c, r, d in card["checks"]],
+        calculation=None if priced is None else PrecheckCalculationOut.build(priced),
+    )
 
-    422 `ERR-VAL-001` when the caller has no `applicants` row of their own
-    (`on_behalf="self"`) or names an applicant that is not theirs; 403
-    `ERR-ACL-001` when `on_behalf="legal"` names a legal entity the caller holds
-    no effective representation of.
+
+@router.post("/applications/package")
+async def package_filing(
+    payload: ApplicationFilingIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+) -> FilingPackageOut:
+    """The canonical bytes to sign over a filing that has no row yet, and the
+    `application_id` those bytes name (plan 12, R2) — the client signs the
+    bytes and posts both to `POST /applications`. Only a legal entity needs
+    this: a citizen's simple signature (#183) is taken by the server.
+
+    400 `ERR-APP-001` naming the fields still to fill; 409 `ERR-GIS-005` for a
+    contour with no published version; 422 `ERR-NORM-004`."""
+    application_id, package = await service.package_filing(db, payload, actor=actor)
+    return FilingPackageOut(
+        application_id=application_id, package=base64.b64encode(package).decode("ascii")
+    )
+
+
+@router.post("/applications", status_code=201)
+async def file_application(
+    payload: ApplicationFileIn,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
+    ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
+) -> ApplicationOut:
+    """The whole filing in one request → 201, the application SUBMITTED with
+    its public number (plan 12, R1). `Idempotency-Key` is MANDATORY (422
+    `ERR-VAL-001` `idempotency_key_required`, 409 `ERR-SYS-005` on a
+    conflicting replay) — a replayed filing would mint a second number; `ctx`
+    is declared AFTER `actor` so the one `get_current_user` resolves once.
+
+    400 `ERR-APP-001` naming the fields still to fill (`rules_accepted` among
+    them); 422 `ERR-VAL-001` (`package_id_required` / `package_id_unexpected`,
+    an unknown reference, somebody else's applicant, a document that is not
+    the caller's upload); 422 `ERR-APP-003` (benefit claim); 409 `ERR-GIS-005`
+    (no published version); `ERR-GIS-*`/`ERR-NORM-*` for a blocking check; 422
+    `ERR-SIGN-001` (bad envelope, `package_changed`,
+    `simple_signature_not_allowed`); 409 `ERR-APP-002` with the existing
+    number for an overlapping active filing; 409 `ERR-APP-004` `already_filed`
+    for an id that already has a row.
     """
-    return ApplicationOut.model_validate(await service.create_draft(db, payload, actor=actor))
+    application = await service.file(
+        db, payload, actor=actor, ip=request.client.host if request.client else None
+    )
+    out = ApplicationOut.model_validate(application)
+    await ctx.save(db, status_code=201, body=out.model_dump(mode="json"))
+    return out
 
 
 @router.patch("/applications/{application_id}")
@@ -308,7 +375,10 @@ async def precheck_application(
     card = await service.precheck(db, application_id, actor=actor)
     priced = card["calculation"]
     return PrecheckOut(
-        checks=[ApplicationCheckOut.model_validate(row) for row in card["checks"]],
+        checks=[
+            PrecheckCheckOut(check_type=row.check_type, result=row.result, details=row.details)
+            for row in card["checks"]
+        ],
         calculation=None if priced is None else PrecheckCalculationOut.build(priced),
     )
 
@@ -489,24 +559,26 @@ async def cancel_application(
     )
 
 
-@router.post("/applications/{application_id}/clone", status_code=201)
-async def clone_application(
+@router.get("/applications/{application_id}/clone")
+async def clone_application_template(
     application_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_CREATE))],
-) -> ApplicationOut:
-    """201 with a fresh DRAFT pre-filled from an application the caller owns,
-    in whatever status it holds — so a herder renewing next season's grazing
-    does not retype the plot, the activity or the herd.
+) -> ApplicationCloneOut:
+    """200 with the FILING a caller would send to refile an application they
+    own, in whatever status it holds (stage 12, plan 12 R6: a read, since
+    there is no draft to create) — so a herder renewing next season's grazing
+    does not retype the plot, the activity or the herd. Post it, edited or
+    not, to `POST /applications`.
 
     `applications.create` is the gate, the same one `POST /applications`
-    itself uses: filing a fresh draft, pre-filled or not, is one right.
-    Ownership is the service's own check, so a holder of the code who does not
-    own the source gets 404 — never a 403, which would confirm the
-    application exists (`service.clone`'s own docstring has the field-by-field
-    account of what is carried over and what is deliberately left behind).
+    itself uses. Ownership is the service's own check, so a holder of the
+    code who does not own the source gets 404 — never a 403, which would
+    confirm the application exists (`service.clone_template`'s own docstring
+    has the field-by-field account of what is carried over and what is
+    deliberately left behind).
     """
-    return ApplicationOut.model_validate(await service.clone(db, application_id, actor=actor))
+    return await service.clone_template(db, application_id, actor=actor)
 
 
 @router.get("/applications/{application_id}/timeline")

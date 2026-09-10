@@ -44,7 +44,7 @@ from app.db import uuid7
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
-from app.modules.applications.schemas import ApplicationCreate
+from app.modules.applications.schemas import ApplicationFileIn
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
@@ -2619,18 +2619,30 @@ async def list_forest_tickets(
 # (design/03 had it there): `applications` is level 3 and may not ask "does a
 # valid permit exist" (3.11a ruling 12), which is exactly the question
 # extending one is built on. `extend` itself never moves `permits.status` —
-# `service.set_status` stays the only writer of that column — it only opens a
-# new `applications` row, through `applications.service.create_draft`.
+# `service.set_status` stays the only writer of that column — it only files a
+# new `applications` row, through `applications.service.file` (stage 12).
 
 PERMIT_EXTEND = "permit.extend"
 
 
-async def extend(db: AsyncSession, permit_id: uuid.UUID, *, actor: User):
-    """`POST /permits/{id}/extend` — a new DRAFT `kind='extension'` against a
-    permit still in force.
+async def extend(
+    db: AsyncSession,
+    permit_id: uuid.UUID,
+    payload: ApplicationFileIn,
+    *,
+    actor: User,
+    ip: str | None = None,
+):
+    """`POST /permits/{id}/extend` — FILE a `kind='extension'` application
+    against a permit still in force, in one request (stage 12, plan 12 R6:
+    there is no draft to open any more; the body is the whole filing and the
+    row is born SUBMITTED through `applications.service.file`). `on_behalf`
+    and `applicant_id` are derived from the holder, never trusted from the
+    body — a body naming another applicant is refused
+    `applicant_is_not_the_holder`.
 
     No `-> Application` on this signature, deliberately: the return type IS
-    `applications.models.Application` (inferred from `create_draft`'s own
+    `applications.models.Application` (inferred from `file`'s own
     annotation below), but spelling it here would import that model into a
     level-4 module for a type hint alone — the same import `applications`'s
     own docstring says a caller here must NEVER make.
@@ -2694,12 +2706,18 @@ async def extend(db: AsyncSession, permit_id: uuid.UUID, *, actor: User):
     # legal-entity applicant), so this asks the identical question. Copying
     # the parent's `on_behalf` would refuse a representative lawfully
     # extending a permit the citizen filed in person — and the reverse.
+    if payload.applicant_id is not None and payload.applicant_id != permit.applicant_id:
+        raise err("ERR-VAL-001", details={"reason": "applicant_is_not_the_holder"})
     own = await auth_service.get_own_applicant(db, actor.id)
     on_behalf = "self" if own is not None and own.id == permit.applicant_id else "legal"
-    draft = await applications_service.create_draft(
+    filing = payload.model_copy(
+        update={"on_behalf": on_behalf, "applicant_id": permit.applicant_id}
+    )
+    application = await applications_service.file(
         db,
-        ApplicationCreate(on_behalf=on_behalf, applicant_id=permit.applicant_id),
+        filing,
         actor=actor,
+        ip=ip,
         kind=applications_service.KIND_EXTENSION,
         parent_application_id=parent.id,
     )
@@ -2709,9 +2727,9 @@ async def extend(db: AsyncSession, permit_id: uuid.UUID, *, actor: User):
         user_id=actor.id,
         object_type=OBJECT_TYPE,
         object_id=permit.id,
-        new_value={"application_id": str(draft.id)},
+        new_value={"application_id": str(application.id)},
     )
-    return draft
+    return application
 
 
 # --- the three read routes' service side -------------------------------------

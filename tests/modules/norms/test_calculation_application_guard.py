@@ -110,7 +110,7 @@ async def guarded_application(
         submitted_by_user_id=guarded_applicant.owner_user_id,
         on_behalf="self",
         channel="portal",
-        status="DRAFT",
+        status="RETURNED",
         contour_id=published_contour.id,
     )
     db.add(row)
@@ -208,7 +208,7 @@ async def test_a_prosecutor_in_zone_cannot_bind_a_calculation(
     Both statuses are tried, because the defect was in the ENTITLEMENT branch
     and would show up whatever the status.
     """
-    for status in ("DRAFT", "SUBMITTED"):
+    for status in ("RETURNED", "SUBMITTED"):
         guarded_application.status = status
         await db.flush()
         refused = await prosecutor_client.post(
@@ -221,14 +221,18 @@ async def test_a_prosecutor_in_zone_cannot_bind_a_calculation(
 # --- Critical 2: the owner stops being the editor at SUBMITTED ---------------
 
 
-async def test_the_owner_may_bind_in_draft_and_returned_and_nowhere_else(
+async def test_the_owner_may_bind_in_returned_and_nowhere_else(
     db: AsyncSession,
     owner_client: httpx.AsyncClient,
     guarded_application: Application,
     haymaking_activity_id: uuid.UUID,
 ) -> None:
-    """**Critical 2's regression pin.** `DRAFT` and `RETURNED` are the two
-    states in which the applicant is the editor. `SUBMITTED`, `IN_REVIEW` and
+    """**Critical 2's regression pin.** `RETURNED` is the one state, besides
+    the filing's own first SUBMITTED row (plan 12, R4, its own pair of tests
+    below), in which the applicant is the editor — `DRAFT` dropped out of
+    `_OWNER_CALCULABLE_STATUSES` in the same stage, since an owner no longer
+    binds a calculation before `applications.service.file` inserts the row at
+    all. `SUBMITTED` (once a row is already there), `IN_REVIEW` and
     `PENDING_INFO` are not: an applicant who submits at 2 060 000,00 — signed,
     and bound to that submission — and then posts a one-head calculation while
     the filing sits in review would be INVOICED for the cheap row, since
@@ -243,7 +247,7 @@ async def test_the_owner_may_bind_in_draft_and_returned_and_nowhere_else(
     """
     body = _body(guarded_application, haymaking_activity_id)
 
-    for status in ("DRAFT", "RETURNED"):
+    for status in ("RETURNED",):
         guarded_application.status = status
         await db.flush()
         allowed = await owner_client.post(f"{API}/calculations", json=body)
@@ -260,19 +264,21 @@ async def test_the_owner_may_bind_in_draft_and_returned_and_nowhere_else(
         assert error["details"]["status"] == status
 
 
-async def test_a_row_planted_in_draft_is_not_what_an_invoice_would_bill(
+async def test_a_row_planted_in_returned_is_not_what_an_invoice_would_bill(
     db: AsyncSession,
     owner_client: httpx.AsyncClient,
     guarded_application: Application,
     haymaking_activity_id: uuid.UUID,
 ) -> None:
     """The other half of Critical 2's ruling, and the reason a speculative row
-    in DRAFT needs no extra rule: whatever an applicant plants before
-    submitting, the submission writes a NEWER row in a later transaction, and
-    `repo.newest_calculation` orders `created_at DESC, id DESC` — so
-    `applications.service.current_calculation`, which is what
-    `payments.issue_invoice` and `permits.issue` both read, returns the
-    submission's row and not the plant.
+    the owner plants (in RETURNED — stage 12, R4 closed the DRAFT route this
+    test used to plant through, since the owner may no longer bind a
+    calculation to a DRAFT application at all) needs no extra rule: whatever
+    an applicant plants before resubmitting, the resubmission writes a NEWER
+    row in a later transaction, and `repo.newest_calculation` orders
+    `created_at DESC, id DESC` — so `applications.service.current_calculation`,
+    which is what `payments.issue_invoice` and `permits.issue` both read,
+    returns the resubmission's row and not the plant.
 
     Simulated at the seam rather than through `submit` (which needs the whole
     grazing/ERI apparatus): the plant goes through the REAL route, the later
@@ -283,6 +289,8 @@ async def test_a_row_planted_in_draft_is_not_what_an_invoice_would_bill(
     from app.modules.norms.calculator import RULE_CODE_VERSION
     from app.modules.norms.models import Calculation
 
+    guarded_application.status = "RETURNED"
+    await db.flush()
     planted = await owner_client.post(
         f"{API}/calculations", json=_body(guarded_application, haymaking_activity_id)
     )
@@ -518,14 +526,17 @@ async def test_the_guard_agrees_with_applications_own_vocabulary() -> None:
     reviewer = service._REVIEWER_CALCULABLE_STATUSES
     closed = service._APPLICATION_CLOSED_FOR_CALCULATION
 
-    assert owner == {"DRAFT", "RETURNED"}
+    assert owner == {"RETURNED"}
     assert owner < reviewer, "a reviewer may do everything the owner may, and three states more"
     assert reviewer & closed == frozenset()
+    # Stage 12 (plan 12, B6): `DRAFT` is gone from the vocabulary, so the two
+    # sets partition it exactly again.
     assert reviewer | closed == set(APPLICATION_STATUSES)
-    # `submit` writes its calculation at step 9, while the status is still
-    # DRAFT (the SUBMITTED write is step 11) — so DRAFT being in the OWNER set
-    # is what keeps the whole submission path working.
-    assert "DRAFT" in owner
+    assert "DRAFT" not in APPLICATION_STATUSES
+    # The owner's ONE way into SUBMITTED is `file()`'s own first row (R4),
+    # never a bare status membership — `_calculable_statuses_for`'s tests
+    # above cover that clause directly.
+    assert "DRAFT" not in owner
 
 
 # --- Final review, Important 2: WHICH PLOT the calculation prices ------------
@@ -617,3 +628,90 @@ async def test_the_application_s_own_contour_is_still_accepted(
         f"{API}/calculations", json=_body(guarded_application, haymaking_activity_id)
     )
     assert allowed.status_code == 201, allowed.text
+
+
+# --- Plan 12, R4: the owner binds the filing's own FIRST row in SUBMITTED ----
+#
+# `applications.service.file` (task B4, not yet written) will insert the
+# application row as SUBMITTED and price it in the SAME transaction, as the
+# owner — so `guarded_application` (a hand-built row, this file's own
+# convention throughout) is moved straight to SUBMITTED rather than through
+# `submit()`: that route still writes its calculation while the row is DRAFT
+# (task B4's own territory) and is not what this guard clause is about.
+
+
+async def test_the_owner_binds_the_first_row_of_a_submitted_application_and_not_a_second(
+    db: AsyncSession,
+    owner_client: httpx.AsyncClient,
+    guarded_application: Application,
+    haymaking_activity_id: uuid.UUID,
+) -> None:
+    """R4: `file()` inserts the row as SUBMITTED and then prices it as the
+    owner. That first row is allowed; a second one — R16's cheap
+    post-submission row — is still refused."""
+    from app.modules.norms import repo as norms_repo
+
+    guarded_application.status = "SUBMITTED"
+    await db.flush()
+    assert await norms_repo.newest_calculation(db, guarded_application.id) is None
+    body = _body(guarded_application, haymaking_activity_id)
+
+    first = await owner_client.post(f"{API}/calculations", json=body)
+    assert first.status_code == 201, first.text
+    assert await norms_repo.newest_calculation(db, guarded_application.id) is not None
+
+    refused = await owner_client.post(f"{API}/calculations", json=body)
+    assert refused.status_code == 409, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-NORM-005"
+    assert error["details"]["reason"] == "application_not_editable_by_this_actor"
+
+
+async def test_the_owner_may_bind_submitted_only_while_no_calculation_exists_yet(
+    db: AsyncSession,
+    guarded_applicant: Applicant,
+    guarded_application: Application,
+    haymaking_activity_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same clause at the service level, isolated from the route and from
+    `save_calculation`'s own write (a service-level test that inserts no
+    `calculations` row of its own through the API, `calculations` being
+    append-only): `_calculable_statuses_for` adds SUBMITTED to the owner's set
+    only while `repo.newest_calculation` reports nothing yet — never as a bare
+    status membership test."""
+    from unittest.mock import AsyncMock
+
+    from app.modules.norms import repo as norms_repo
+    from app.modules.norms import service as norms_service
+    from app.modules.norms.calculator import RULE_CODE_VERSION
+    from app.modules.norms.models import Calculation
+
+    guarded_application.status = "SUBMITTED"
+    await db.flush()
+    owner_user = await db.get(User, guarded_applicant.owner_user_id)
+    assert owner_user is not None
+    facts = await norms_repo.application_facts(db, guarded_application.id)
+    assert facts is not None
+
+    monkeypatch.setattr(norms_service.repo, "newest_calculation", AsyncMock(return_value=None))
+    allowed = await norms_service._calculable_statuses_for(db, owner_user, facts)
+    assert allowed is not None
+    assert "SUBMITTED" in allowed
+    monkeypatch.undo()
+
+    db.add(
+        Calculation(
+            application_id=guarded_application.id,
+            contour_id=guarded_application.contour_id,
+            activity_type_id=haymaking_activity_id,
+            rule_code_version=RULE_CODE_VERSION,
+            input_snapshot={},
+            amount=Decimal("100.00"),
+            breakdown=[],
+        )
+    )
+    await db.flush()
+    allowed = await norms_service._calculable_statuses_for(db, owner_user, facts)
+    assert allowed is not None
+    assert "SUBMITTED" not in allowed

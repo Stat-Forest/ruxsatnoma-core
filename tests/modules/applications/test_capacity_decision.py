@@ -140,23 +140,17 @@ async def test_a_second_applicant_is_refused_at_approval_before_any_invoice(
     approval exists for is the one where the slot is lost in between: filed
     against a free contour, occupied while it sat in review.
     """
-    created = await other_applicant_client.post(f"{API}/applications", json={"on_behalf": "self"})
-    assert created.status_code == 201, created.text
-    app_id = created.json()["id"]
-    patched = await other_applicant_client.patch(
-        f"{API}/applications/{app_id}",
-        json={
-            "contour_id": str(published_contour.id),
-            "activity_type_id": str(apiary_activity_id),
-            "period_from": "2027-06-01",
-            "period_to": "2027-07-31",
-            "quantity": "5",
-        },
-    )
-    assert patched.status_code == 200, patched.text
-
-    submitted = await _submit(other_applicant_client, app_id)
-    assert submitted.status_code == 200, submitted.text
+    filing = {
+        "on_behalf": "self",
+        "contour_id": str(published_contour.id),
+        "activity_type_id": str(apiary_activity_id),
+        "period_from": "2027-06-01",
+        "period_to": "2027-07-31",
+        "quantity": "5",
+    }
+    submitted = await _submit(other_applicant_client, filing)
+    assert submitted.status_code == 201, submitted.text
+    app_id = submitted.json()["id"]
 
     started = await hodim_client.post(f"{API}/applications/{app_id}/start-review")
     assert started.status_code == 200, started.text

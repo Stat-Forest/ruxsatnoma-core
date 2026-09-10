@@ -54,6 +54,7 @@ async def make_bare_application(
         submitted_by_user_id=user.id,
         on_behalf="self",
         channel="portal",
+        status="SUBMITTED",
         assigned_org_id=org.id,
         contour_id=contour_id,
         submitted_at=datetime(2027, 1, 1, tzinfo=UTC),

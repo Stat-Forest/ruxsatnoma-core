@@ -18,11 +18,12 @@ names, unchanged since branch 1."""
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Row, and_, or_
+from sqlalchemy import Row, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,8 +60,11 @@ from app.modules.applications.permissions import (
 )
 from app.modules.applications.schemas import (
     ApplicationCheckIn,
-    ApplicationCreate,
+    ApplicationCloneOut,
     ApplicationDocumentIn,
+    ApplicationFileIn,
+    ApplicationFilingIn,
+    ApplicationItemIn,
     ApplicationPatch,
 )
 from app.modules.audit import service as audit
@@ -89,10 +93,11 @@ from app.modules.signatures import service as signatures_service
 # it writes its transition through `set_status` — and `submit` cannot write it
 # through `set_status` at all (ruling 25; see `set_status`'s own docstring).
 APPLICATION_STATUS_CHANGE = "application.status_change"
-# Task 3's own two flow verbs, plus the one a REFUSED read writes. A verb that
-# does more than move a status audits under its own name (the same split
-# `permits.service` makes) — and `create`/`update` move no status at all.
-APPLICATION_CREATE = "application.create"
+# Task 3's flow verb for a PATCH on a RETURNED application, plus the one a
+# REFUSED read writes. A verb that does more than move a status audits under
+# its own name (the same split `permits.service` makes) — and `update` moves
+# no status at all. `application.create` retired with the draft (stage 12):
+# a filing audits as `application.file`.
 APPLICATION_UPDATE = "application.update"
 # Written ONLY on a territorial denial, never on a successful read (the shape
 # `permits.service.PERMIT_READ` established): a GET that audits every hit lets
@@ -128,11 +133,10 @@ CHANNEL_PORTAL = "portal"
 # `applications.kind`: an `extension` is a child of an existing application
 # (`parent_application_id`), created only by `permits.service.extend`
 # (3.11b's `POST /permits/{id}/extend`) — a citizen files `POST /applications`
-# itself for a `new` one, never an `extension`; see `create_draft`'s own
+# itself for a `new` one, never an `extension`; see `_build_filing`'s own
 # docstring for why the split lives in the FUNCTION, not the wire schema.
 KIND_NEW = "new"
 KIND_EXTENSION = "extension"
-INITIAL_STATUS = "DRAFT"
 # `_own_draft_for_update`'s OTHER editable status (task 1, 3.9b): a returned
 # application becomes correctable again, per that function's own docstring,
 # written when it was DRAFT-only in 3.9a and already naming this. Not "task
@@ -213,7 +217,6 @@ BENEFIT_AUTO_VERIFIERS: dict[str, BenefitAutoVerifier] = {}
 # public-surface comment below permits, and `cancel` is this module's own flow
 # verb.
 APPLICATION_TRANSITIONS: dict[str, frozenset[str]] = {
-    "DRAFT": frozenset({"SUBMITTED", "CANCELLED"}),
     "SUBMITTED": frozenset({"IN_REVIEW", "RETURNED", "REJECTED", "CANCELLED"}),
     "IN_REVIEW": frozenset({"PENDING_INFO", "APPROVED", "REJECTED", "RETURNED", "CANCELLED"}),
     "PENDING_INFO": frozenset({"IN_REVIEW", "CANCELLED"}),
@@ -689,6 +692,24 @@ async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
     return await auth_service.own_applicant_ids(db, actor.id)
 
 
+async def owned_application_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
+    """Every application `actor` may act for as its OWNER — filed by their own
+    individual `applicants` row or by a legal entity they hold an effective
+    representation of (`_own_applicant_ids`, judged on `business_today()`), in
+    every status.
+
+    The seam `payments` needs for a citizen's "all of mine" reads (stage 11,
+    ruling R2): `invoices` and `refunds` carry `application_id` and no
+    `applicant_id`, and `payments` may not join into this module's tables, so
+    it asks for the id set and filters in its own SQL — the same set
+    `list_applications` builds its `holder_ids` scope from, so a list of
+    invoices can never name an application the owner's own list would not.
+    Ownership ONLY: no staff zone, no permission. An accountant who also
+    grazes cattle gets THEIR applications here (usually none), never the
+    leshoz's — which is exactly what a screen called "my payments" must show."""
+    return await repo.list_application_ids_by_applicants(db, await _own_applicant_ids(db, actor))
+
+
 async def _forwarded_here_by(db: AsyncSession, application: Application, *, actor: User) -> bool:
     """Ruling #107 (`tz/12` #27): whether `actor` is the one who forwarded
     THIS application up the ladder, at any level — the one case
@@ -805,8 +826,9 @@ async def _readable_application(
         return application
     if not await _holds_staff_read(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    if application.status == INITIAL_STATUS:
-        raise err("ERR-SYS-003", details={"application": str(application_id)})
+    # Ruling #110's DRAFT exclusion has nothing left to exclude (stage 12): a
+    # row exists only from the filing on, and a filed application is the
+    # office's to read within its zone.
     if await _forwarded_here_by(db, application, actor=actor):
         return application
     await _assert_in_actor_zone(db, application, actor=actor, action=APPLICATION_READ)
@@ -864,7 +886,7 @@ async def _assert_in_actor_zone(
 
 
 async def _resolve_applicant(
-    db: AsyncSession, payload: ApplicationCreate, *, actor: User
+    db: AsyncSession, payload: ApplicationFilingIn, *, actor: User
 ) -> tuple[uuid.UUID, uuid.UUID | None]:
     """Whose application this is, and on whose authority — `(applicant_id,
     representation_id)`.
@@ -896,85 +918,6 @@ async def _resolve_applicant(
     if representation is None:
         raise err("ERR-ACL-001", details={"reason": "no_effective_representation"})
     return payload.applicant_id, representation.id
-
-
-async def create_draft(
-    db: AsyncSession,
-    payload: ApplicationCreate,
-    *,
-    actor: User,
-    kind: str = KIND_NEW,
-    parent_application_id: uuid.UUID | None = None,
-) -> Application:
-    """`POST /applications` — an EMPTY draft, and deliberately so (ruling 7):
-    tz/04 С3 autosaves a draft field by field, so everything except who is
-    filing and for whom arrives later through `PATCH`.
-
-    The `DRAFT` row of `application_status_history` is written HERE, directly,
-    and not through `set_status`: `APPLICATION_TRANSITIONS` has no edge INTO
-    `DRAFT` — nothing may return an application to it — so `set_status` could
-    not write this row even if asked. It is written all the same because a
-    timeline that starts at `SUBMITTED` cannot say when the citizen began, and
-    nothing else in the system will ever be in a position to add it.
-
-    `kind` and `parent_application_id` are PARAMETERS and NOT fields of
-    `ApplicationCreate`, on purpose (3.11b ruling 17): that model is the body
-    of the public `POST /applications` and forbids nothing it does not list
-    (`extra="forbid"`), so a field there is a field a citizen may set —
-    `kind="extension"` against any parent id, with no permit and no holder
-    behind it. Here they are supplied only by a server caller that has
-    already proved both (`permits.service.extend`, 3.11a ruling 12). They
-    default to today's behaviour, so `POST /applications` itself is
-    unchanged, and `applications` learns nothing about permits: an extension
-    is an application shape `APPLICATION_KINDS` has carried since migration
-    0015.
-    """
-    if kind not in APPLICATION_KINDS:
-        # Before `flush()`: the `kind_valid` CHECK would otherwise surface a
-        # caller's typo as an `IntegrityError` — no handler maps it, so it
-        # would reach the client as a 500 (lesson: walk every caller-settable
-        # field that is an FK or an enum-ish column before `flush()`).
-        raise err("ERR-VAL-001", details={"reason": "unknown_kind"})
-    applicant_id, representation_id = await _resolve_applicant(db, payload, actor=actor)
-    application = Application(
-        applicant_id=applicant_id,
-        submitted_by_user_id=actor.id,
-        on_behalf=payload.on_behalf,
-        representation_id=representation_id,
-        status=INITIAL_STATUS,
-        channel=CHANNEL_PORTAL,
-        kind=kind,
-        parent_application_id=parent_application_id,
-    )
-    db.add(application)
-    await db.flush()
-    await repo.add_status_history(
-        db,
-        ApplicationStatusHistory(
-            application_id=application.id,
-            from_status=None,
-            to_status=INITIAL_STATUS,
-            changed_by=actor.id,
-        ),
-    )
-    # `created_at`/`updated_at` are `server_default=func.now()`, so the row in
-    # memory is not what Postgres stored until it is read back (lesson) — and
-    # this row is serialized into the 201 response.
-    await db.refresh(application)
-    await audit.log(
-        db,
-        action=APPLICATION_CREATE,
-        user_id=actor.id,
-        object_type="application",
-        object_id=application.id,
-        new_value={
-            "applicant_id": str(applicant_id),
-            "on_behalf": payload.on_behalf,
-            "representation_id": None if representation_id is None else str(representation_id),
-            "status": INITIAL_STATUS,
-        },
-    )
-    return application
 
 
 async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
@@ -1039,7 +982,7 @@ async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
 # test_the_owner_may_patch_a_returned_application` and
 # `test_documents.py::test_the_owner_may_attach_and_detach_on_a_returned_
 # application`, each with a stranger-is-still-refused sibling.
-_EDITABLE_STATUSES = frozenset({INITIAL_STATUS, RETURNED_STATUS})
+_EDITABLE_STATUSES = frozenset({RETURNED_STATUS})
 
 
 async def _own_draft_for_update(
@@ -1066,7 +1009,7 @@ async def _own_draft_for_update(
     """
     application = await _own_application_for_update(db, application_id, actor=actor)
     if application.status not in _EDITABLE_STATUSES:
-        raise err("ERR-APP-004", details={"reason": "not_draft", "status": application.status})
+        raise err("ERR-APP-004", details={"reason": "not_returned", "status": application.status})
     return application
 
 
@@ -1249,14 +1192,10 @@ async def list_applications(
     inverts the layering even where the boundary rule itself is satisfied
     (review I2).
 
-    **Ruling #110 excludes `INITIAL_STATUS` from the STAFF half only** —
-    otherwise this function's own "can never disagree with the card" promise
-    above would be broken by the very ruling that promise is supposed to
-    survive: `_readable_application` now 404s a staff caller on a DRAFT it
-    does not own, and a list that still named that DRAFT would be LEAKING
-    through the one door the card just closed. The owner's own scope
-    (`holder_ids`) is untouched — they see every status of their own,
-    DRAFT included, throughout.
+    Ruling #110's DRAFT exclusion from the STAFF half retired with the draft
+    (stage 12): every row that exists has been filed, and the staff scope is
+    the zone alone. The owner's own scope (`holder_ids`) sees every status of
+    their own, as before.
     """
     scope: list[Any] = []
     holder_ids = await _own_applicant_ids(db, actor)
@@ -1264,14 +1203,11 @@ async def list_applications(
         scope.append(Application.applicant_id.in_(holder_ids))
     if await _holds_staff_read(db, actor):
         scope.append(
-            and_(
-                Application.status != INITIAL_STATUS,
-                zone_filter(
-                    zone_of(actor),
-                    region_col=Organization.region_id,
-                    district_col=Organization.district_id,
-                    organization_col=Organization.id,
-                ),
+            zone_filter(
+                zone_of(actor),
+                region_col=Organization.region_id,
+                district_col=Organization.district_id,
+                organization_col=Organization.id,
             )
         )
     if not scope:
@@ -1665,7 +1601,11 @@ def _package_bytes(
 
 
 async def _assert_complete(
-    db: AsyncSession, application: Application, *, rules_accepted: bool = True
+    db: AsyncSession,
+    application: Application,
+    *,
+    items: list[ApplicationItem] | None = None,
+    rules_accepted: bool = True,
 ) -> None:
     """Step 2. Every field a submission needs, or 400 `ERR-APP-001` NAMING the
     ones that are missing.
@@ -1685,8 +1625,11 @@ async def _assert_complete(
     `GET` carries no body and therefore no opinion on the checkbox) passes
     nothing and gets the default `True`, so only `submit` can ever name
     `rules_accepted` here.
+
+    `items` (stage 12): a transient filing's own herd, handed through to
+    `checks.missing_for_pricing`; `None` reads the stored rows.
     """
-    missing = await checks.missing_for_pricing(db, application)
+    missing = await checks.missing_for_pricing(db, application, items=items)
     if not rules_accepted:
         missing.append("rules_accepted")
     if missing:
@@ -1797,7 +1740,11 @@ async def _published_version_or_refuse(db: AsyncSession, application: Applicatio
 
 
 async def _price(
-    db: AsyncSession, application: Application, *, actor: User
+    db: AsyncSession,
+    application: Application,
+    *,
+    actor: User,
+    items: list[ApplicationItem] | None = None,
 ) -> tuple[CalculationIn, dict[str, Any]]:
     """The `norms` request this application describes, and what `preview` says
     it costs — WRITTEN NOWHERE (ruling 19).
@@ -1811,7 +1758,7 @@ async def _price(
     `preview` and `save_calculation` share one `norms.service._compute` by
     construction, so within one transaction the two cannot disagree.
     """
-    payload = await checks.calculation_payload(db, application)
+    payload = await checks.calculation_payload(db, application, items=items)
     return payload, await norms_service.preview(db, payload=payload, actor=actor)
 
 
@@ -1827,6 +1774,351 @@ async def _notification_recipient(db: AsyncSession, application: Application) ->
     if applicant is not None and applicant.owner_user_id is not None:
         return applicant.owner_user_id
     return application.submitted_by_user_id
+
+
+# --- Stage 12: the filing ------------------------------------------------------
+#
+# `DRAFT` no longer exists (plan 12). The application is built as a TRANSIENT
+# row — never `db.add`ed until the signature is good (R3), because
+# `signatures.service.sign()` commits the caller's whole session on every
+# refusal — evaluated exactly as a draft used to be, and inserted in one go by
+# `file()`. `precheck_filing` and `package_filing` share `_build_filing` so the
+# three cannot disagree about what a filing is.
+
+APPLICATION_FILE = "application.file"
+
+
+@dataclass(frozen=True)
+class Filing:
+    """A filing as `_build_filing` resolves it: the transient application and
+    the rows that will hang off it, none of them in the session."""
+
+    application: Application
+    items: list[ApplicationItem]
+    documents: list[ApplicationDocument]
+
+
+async def _build_filing(
+    db: AsyncSession,
+    payload: ApplicationFilingIn,
+    *,
+    actor: User,
+    kind: str = KIND_NEW,
+    parent_application_id: uuid.UUID | None = None,
+) -> Filing:
+    """The transient application a filing describes, with its items and
+    documents — resolved (`_resolve_applicant`), reference-checked
+    (`_assert_references`) and document-checked (`_own_document_file`,
+    `_assert_doc_type`), and NOT in the session.
+
+    `kind`/`parent_application_id` are parameters, never fields of the body
+    (3.11b ruling 17): `permits.service.extend` proves the permit and the
+    holder before passing them.
+    """
+    if kind not in APPLICATION_KINDS:
+        raise err("ERR-VAL-001", details={"reason": "unknown_kind"})
+    applicant_id, representation_id = await _resolve_applicant(db, payload, actor=actor)
+    fields = payload.model_dump(exclude={"documents", "on_behalf", "applicant_id"})
+    await _assert_references(db, fields)
+    documents: list[ApplicationDocument] = []
+    for doc in payload.documents:
+        await _assert_doc_type(db, doc.doc_type_item_id)
+        file = await _own_document_file(db, doc.file_id, actor=actor)
+        documents.append(
+            ApplicationDocument(
+                doc_type_item_id=doc.doc_type_item_id,
+                file_id=file.id,
+                uploaded_by=actor.id,
+                note=doc.note,
+            )
+        )
+    application = Application(
+        applicant_id=applicant_id,
+        submitted_by_user_id=actor.id,
+        on_behalf=payload.on_behalf,
+        representation_id=representation_id,
+        status=SUBMITTED_STATUS,
+        channel=CHANNEL_PORTAL,
+        kind=kind,
+        parent_application_id=parent_application_id,
+        activity_type_id=payload.activity_type_id,
+        contour_id=payload.contour_id,
+        period_from=payload.period_from,
+        period_to=payload.period_to,
+        quantity=payload.quantity,
+        benefit_category_item_id=payload.benefit_category_item_id,
+        benefit_certificate_no=payload.benefit_certificate_no,
+    )
+    items = [
+        ApplicationItem(livestock_type_id=item.livestock_type_id, head_count=item.head_count)
+        for item in payload.items
+    ]
+    return Filing(application=application, items=items, documents=documents)
+
+
+async def precheck_filing(
+    db: AsyncSession, payload: ApplicationFilingIn, *, actor: User
+) -> dict[str, Any]:
+    """`POST /applications/precheck` — the dry run over a filing that exists
+    only in the request. Same contract as `precheck` on a RETURNED row: a
+    blocking result is DATA in `checks`, an incomplete filing answers
+    `skipped` rows naming the fields, a broken input is still an HTTP error.
+    Writes nothing but the audit entry (plan 12, R3)."""
+    filing = await _build_filing(db, payload, actor=actor)
+    application, items = filing.application, filing.items
+    priced: dict[str, Any] | None = None
+    if not await checks.missing_for_pricing(db, application, items=items):
+        priced = await norms_service.preview(
+            db,
+            payload=await checks.calculation_payload(db, application, items=items),
+            actor=actor,
+        )
+    collected = await checks.evaluate(
+        db, application, norm_results=None if priced is None else priced["checks"], items=items
+    )
+    await audit.log(
+        db,
+        action=APPLICATION_PRECHECK,
+        user_id=actor.id,
+        object_type="application_filing",
+        new_value={
+            "filing": payload.model_dump(mode="json"),
+            "checks": [{"check_type": c, "result": r} for c, r, _ in collected],
+            "priced": priced is not None,
+        },
+    )
+    return {"checks": collected, "calculation": priced}
+
+
+async def package_filing(
+    db: AsyncSession,
+    payload: ApplicationFilingIn,
+    *,
+    actor: User,
+    application_id: uuid.UUID | None = None,
+) -> tuple[uuid.UUID, bytes]:
+    """`POST /applications/package` — mints the id the application will carry
+    (plan 12, R2) and answers the canonical bytes over the filing, priced now
+    (ruling 23 applies unchanged: `file()` prices again and `sign()` tells a
+    moved price apart from a forgery).
+
+    `application_id` is a keyword the ROUTE never passes: `None` mints a fresh
+    id. `test_file.py` passes one to produce a package naming an id that is
+    already filed — the only way to reach `file()`'s `already_filed` refusal
+    with a signature that verifies, which is exactly what a lying client
+    holding the byte shape could send."""
+    filing = await _build_filing(db, payload, actor=actor)
+    application, items = filing.application, filing.items
+    await _assert_complete(db, application, items=items)
+    version = await _published_version_or_refuse(db, application)
+    application.id = application_id or uuid7()
+    _, priced = await _price(db, application, actor=actor, items=items)
+    return application.id, _package_bytes(application, priced, contour_version_id=version.id)
+
+
+async def file(
+    db: AsyncSession,
+    payload: ApplicationFileIn,
+    *,
+    actor: User,
+    ip: str | None = None,
+    kind: str = KIND_NEW,
+    parent_application_id: uuid.UUID | None = None,
+) -> Application:
+    """`POST /applications` — the whole filing in one request, the row created
+    SUBMITTED (plan 12, R1). The fourteen steps of `submit`, re-ordered by R3
+    so that NOTHING of the application is pending when `sign()` runs: the
+    filing is evaluated on a transient row, signed, and only then inserted
+    with everything that hangs off it.
+
+    Refusals before step 8 write nothing but (at step 6) an audit row
+    committed by the early-commit pattern; `sign()`'s own refusals commit its
+    evidence as always; a refusal after step 8 (the duplicate, the taken id)
+    rolls the signature back with the row it never got.
+
+    `kind`/`parent_application_id`: see `_build_filing` — a server caller's
+    parameters (`permits.service.extend`), never the body's.
+    """
+    if (payload.pkcs7 is None) != (payload.application_id is None):
+        # R2: the signed bytes name `application_id`, so the two are one fact
+        # — an envelope with no id cannot be verified against anything, and an
+        # id with no envelope is a client choosing its own primary key for no
+        # reason.
+        reason = "package_id_required" if payload.pkcs7 is not None else "package_id_unexpected"
+        raise err("ERR-VAL-001", details={"reason": reason})
+    submission_id = uuid7()  # step 0 — the history row's id, what the signature binds to
+    filing = await _build_filing(  # step 1
+        db, payload, actor=actor, kind=kind, parent_application_id=parent_application_id
+    )
+    application, items = filing.application, filing.items
+    # Step 1b (ruling #183), AFTER step 1 on purpose: who is filing and on
+    # whose authority is answered first — a caller with no representation at
+    # all hears `no_effective_representation`, not "sign with ERI". Nothing
+    # is pending yet either way; `_build_filing` only reads.
+    if payload.pkcs7 is None and payload.on_behalf != "self":
+        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
+    application.id = payload.application_id or uuid7()
+    await _assert_complete(  # step 2
+        db, application, items=items, rules_accepted=payload.rules_accepted
+    )
+    application.rules_accepted_at = datetime.now(UTC)  # ruling #184, the server's clock
+    await _open_benefit_verification(db, application)  # step 3b
+    version = await _published_version_or_refuse(db, application)  # step 4 (ruling 22)
+    application.contour_version_id = version.id
+    application.requested_area_ha = version.area_ha
+    calc_payload, priced = await _price(db, application, actor=actor, items=items)  # step 7
+    collected = await checks.evaluate(  # step 5 — computed, not written
+        db, application, norm_results=priced["checks"], items=items
+    )
+    rows = checks.record(application.id, collected, created_by=actor.id)
+    blocking = checks.first_blocking_error(rows)
+    if blocking is not None:  # step 6
+        # R3: no row to keep evidence on, so the evidence IS the audit entry —
+        # committed before the raise, the early-commit pattern (decision #40).
+        await audit.log(
+            db,
+            action=APPLICATION_FILE,
+            user_id=actor.id,
+            object_type="application_filing",
+            result="denied",
+            basis=blocking.code,
+            new_value={
+                "filing": payload.model_dump(mode="json", exclude={"pkcs7"}),
+                "checks": [{"check_type": c, "result": r} for c, r, _ in collected],
+            },
+        )
+        await db.commit()
+        raise blocking
+
+    # Step 8. The first thing on this page that can commit — and nothing of
+    # ours is pending, which is the whole point of the order above.
+    document = _package_bytes(application, priced, contour_version_id=version.id)
+    if payload.pkcs7 is not None:
+        await signatures_service.sign(
+            db,
+            object_type=SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=SUBMISSION_PURPOSE,
+            document=document,
+            pkcs7=payload.pkcs7,
+            user=actor,
+            content_changed_reason=STALE_PACKAGE_REASON,
+            ip=ip,
+        )
+    else:
+        await signatures_service.sign_simple(
+            db,
+            object_type=SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=SUBMISSION_PURPOSE,
+            document=document,
+            user=actor,
+            ip=ip,
+        )
+
+    # Step 10, ruling 5а — AFTER the signature, so a refused envelope never
+    # reaches the counter; inside the transaction, so a failure below rolls
+    # the counter back with it.
+    number = await next_public_number(db, NUMBER_PREFIX, business_today())
+    submitted_at = datetime.now(UTC)
+    application.number = number
+    application.submitted_at = submitted_at
+    application.sla_deadline_at = submitted_at + timedelta(days=SLA_DAYS)  # ruling 13
+    try:  # step 9' — the INSERT, inside a SAVEPOINT so a refusal leaves the session usable
+        async with db.begin_nested():
+            db.add(application)
+            for item in items:
+                item.application_id = application.id
+                db.add(item)
+            for doc in filing.documents:
+                doc.application_id = application.id
+                db.add(doc)
+            await db.flush()
+    except IntegrityError as exc:
+        # The constraint is named through `exc.orig.__cause__` (asyncpg's own
+        # exception), never by matching the message (lesson). The clash key is
+        # read off the TRANSIENT object, which no savepoint snapshot ever
+        # expired — `submit`'s `MissingGreenlet` trap does not apply here.
+        cause = exc.orig.__cause__ if exc.orig is not None else None
+        constraint = getattr(cause, "constraint_name", None)
+        if constraint == "pk_applications":
+            # R2: a client naming an id that already has a row — a second
+            # click under a fresh `Idempotency-Key`, or a lie. Refused, never
+            # overwritten.
+            raise err(
+                "ERR-APP-004",
+                details={"reason": "already_filed", "application_id": str(application.id)},
+            ) from exc
+        if constraint != "ex_applications_no_duplicate":
+            raise
+        clash = await repo.active_overlapping(  # ruling 6: NAME the colliding filing
+            db,
+            applicant_id=application.applicant_id,
+            contour_id=application.contour_id,
+            activity_type_id=application.activity_type_id,
+            period_from=application.period_from,
+            period_to=application.period_to,
+            exclude_id=application.id,
+        )
+        if clash is None:
+            raise
+        raise err("ERR-APP-002", details={"existing_number": clash.number}) from exc
+
+    # Step 9, ruling 8: EXACTLY ONE calculation, bound to the row that now
+    # exists — the owner's first row in SUBMITTED, which R4 admits.
+    calculation = await norms_service.save_calculation(
+        db,
+        payload=calc_payload.model_copy(update={"application_id": application.id}),
+        actor=actor,
+    )
+    await repo.add_checks(db, rows)  # step 5' — the evidence, now that there is a row
+    await repo.add_status_history(  # step 11, ruling 25: `id = submission_id`
+        db,
+        ApplicationStatusHistory(
+            id=submission_id,
+            application_id=application.id,
+            from_status=None,
+            to_status=SUBMITTED_STATUS,
+            changed_by=actor.id,
+        ),
+    )
+    await db.refresh(application)  # server defaults, NUMERIC scale (lesson)
+    await audit.log(  # step 12
+        db,
+        action=APPLICATION_FILE,
+        user_id=actor.id,
+        object_type="application",
+        object_id=application.id,
+        new_value={
+            "status": SUBMITTED_STATUS,
+            "number": number,
+            "kind": kind,
+            "submission_id": str(submission_id),
+            "contour_version_id": str(version.id),
+            "requested_area_ha": _json_safe(application.requested_area_ha),
+            "calculation_id": str(calculation.id),
+            "documents": len(filing.documents),
+        },
+    )
+    await notifications_service.notify(  # step 13 — DOTTED, see the constant
+        db,
+        event_code=NOTIFY_APPLICATION_SUBMITTED,
+        recipient_user_id=await _notification_recipient(db, application),
+        params={
+            "application_number": number,
+            # The inbox's chips (PR #95): a filing has no `from` — the row was
+            # born SUBMITTED — and says so rather than inventing a DRAFT.
+            **notifications_service.transition_params(from_status=None, to_status=SUBMITTED_STATUS),
+        },
+        object_type="application",
+        object_id=application.id,
+    )
+    # Step 14 — `application_id` and nothing else (`events.py`'s frozen
+    # payload); then the assignment, which must exist for every SUBMITTED row.
+    await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
+    await _auto_assign_on_submission(db, application)
+    await db.refresh(application)
+    return application
 
 
 async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> bytes:
@@ -1864,33 +2156,23 @@ async def package(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -
     """
     application = await _readable_application(db, application_id, actor=actor)
     await _assert_complete(db, application)
-    # **The FROZEN version wins the moment there is one.** A DRAFT has not
-    # reached step 4 yet, so the only honest answer is the version currently
-    # published — and `_published_version_or_refuse` is also the 409 for a
-    # contour whose geometry is still a draft. From SUBMITTED onward the
-    # application is BOUND to the version step 4 froze (`permits.service.issue`
-    # reads that same column), and `gis` allows one published version per
-    # contour which may be superseded at any time: pricing the CURRENT one here
-    # would make the head's decision signature attest to version B while the
-    # application, and the permit printed from it, name version A. A verifier
-    # re-deriving these bytes from the stored row would then get a different
-    # string and the signature would not verify — pinned by
+    # **The FROZEN version wins.** From the filing on the application is BOUND
+    # to the version step 4 froze (`permits.service.issue` reads that same
+    # column), and `gis` allows one published version per contour which may
+    # be superseded at any time: pricing the CURRENT one here would make the
+    # head's decision signature attest to version B while the application,
+    # and the permit printed from it, name version A. A verifier re-deriving
+    # these bytes from the stored row would then get a different string and
+    # the signature would not verify — pinned by
     # `test_decision.py::test_a_republished_contour_does_not_invalidate_the_
     # decision_signature`.
-    # **The DRAFT branch stays status-keyed, not null-keyed.** Ruling 19
-    # leaves a STALE frozen version on a refused submission, so a draft must
-    # always re-resolve the current published version, even when its column
-    # happens to be set from an earlier attempt — `is None` here would serve
-    # the stale one instead.
-    frozen = None if application.status == INITIAL_STATUS else application.contour_version_id
-    # The fallback below can never fire for a SUBMITTED-or-later application:
-    # `submit` freezes `contour_version_id` in the same transaction that sets
-    # the status. The only status that reaches it is CANCELLED-from-DRAFT — a
-    # draft completed and then withdrawn without ever being submitted, so the
-    # column was never frozen — and there `_published_version_or_refuse` gives
-    # the honest 409 for a contour whose geometry has since gone back to draft,
-    # rather than `_package_bytes` finding a null and answering ERR-SYS-001 for
-    # an application that is perfectly able to show what it once priced.
+    # The fallback fires for a RETURNED application whose contour was moved
+    # by a PATCH (`patch_draft` clears the frozen pair with the contour) —
+    # `_published_version_or_refuse` is then the honest 409 for a contour with
+    # no published version, rather than `_package_bytes` finding a null and
+    # answering ERR-SYS-001. A filed application never reaches it otherwise:
+    # `file`/`submit` freeze the column in the transaction that sets the status.
+    frozen = application.contour_version_id
     version_id = frozen or (await _published_version_or_refuse(db, application)).id
     _, priced = await _price(db, application, actor=actor)
     return _package_bytes(application, priced, contour_version_id=version_id)
@@ -1952,12 +2234,12 @@ async def submit(
     # written, and the row says "an attempt was made against submission X and
     # it was rejected".
     submission_id = uuid7()
-    # Step 1. The owner's own DRAFT (or, task 1, 3.9b: RETURNED), locked: 404
-    # for a stranger, 409 `ERR-APP-004` for an application that has moved on
-    # some other way. Captured before anything overwrites `application.status`
-    # below — a RESUBMISSION's history row and audit entry must say
-    # `from_status="RETURNED"`, not a hardcoded "DRAFT" that was true only for
-    # the FIRST submission.
+    # Step 1. The owner's own RETURNED application (stage 12: the one status
+    # this route serves — a first filing is `file()`), locked: 404 for a
+    # stranger, 409 `ERR-APP-004` for an application that has moved on some
+    # other way. Captured before anything overwrites `application.status`
+    # below — the resubmission's history row and audit entry say
+    # `from_status="RETURNED"`.
     application = await _own_draft_for_update(db, application_id, actor=actor)
     from_status = application.status
     # Ruling #183, decided FIRST (stage 10 review, finding 9): a legal entity
@@ -2234,7 +2516,7 @@ CANCELLED_STATUS = "CANCELLED"
 # narrower set than `APPLICATION_TRANSITIONS[...]` contains CANCELLED in, and
 # deliberately so. See `cancel`'s docstring for why the table keeps
 # `INVOICED -> CANCELLED` that this route refuses, and who drives it instead.
-CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({INITIAL_STATUS, SUBMITTED_STATUS, IN_REVIEW_STATUS})
+CANCELLABLE_BY_APPLICANT_STATUSES = frozenset({SUBMITTED_STATUS, IN_REVIEW_STATUS})
 
 # Ruling 25's OTHER half, beside `SUBMISSION_OBJECT_TYPE`/`SUBMISSION_PURPOSE`:
 # a DECISION is signed as `("application", <the application id>,
@@ -3176,108 +3458,56 @@ async def cancel(
 APPLICATION_CLONE = "application.clone"
 
 
-async def clone(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
-    """`POST /applications/{id}/clone` — a fresh DRAFT pre-filled from an
-    application the caller owns, in WHATEVER status it holds: a herder
-    renewing next season's grazing should not have to retype the plot, the
-    activity or the herd every filing.
+async def clone_template(
+    db: AsyncSession, application_id: uuid.UUID, *, actor: User
+) -> ApplicationCloneOut:
+    """`GET /applications/{id}/clone` — the filing a caller would send to
+    refile an application they own, in WHATEVER status it holds (stage 12,
+    plan 12 R6: a read that returns a template, since there is no draft to
+    create): a herder renewing next season's grazing should not have to
+    retype the plot, the activity or the herd every filing.
 
     **The point of a clone is what it does NOT copy.** Everything the source
     EARNED by being reviewed, priced, signed or decided stays behind — the
-    public `number`, `status` (always a fresh `DRAFT`), the frozen
-    `contour_version_id`, every timestamp, the SLA deadline, the assignment,
-    the documents, the checks, the calculation and the whole status history:
-    the clone's own timeline holds exactly the one `DRAFT` row this function
-    writes. Documents are excluded ON PURPOSE, not merely deferred: a
-    veterinary certificate has a validity period, and silently carrying last
-    year's into a new filing is exactly the kind of quiet error this system
-    exists to prevent — the applicant attaches a fresh one.
+    public `number`, the status, the frozen `contour_version_id`, every
+    timestamp, the SLA deadline, the assignment, the documents, the checks,
+    the calculation and the whole status history. Documents are excluded ON
+    PURPOSE, not merely deferred: a veterinary certificate has a validity
+    period, and silently carrying last year's into a new filing is exactly
+    the kind of quiet error this system exists to prevent — the applicant
+    attaches a fresh one.
 
     What copies is the request itself: who is filing and on whose authority
-    (`applicant_id`, `on_behalf`, `representation_id`), the plot and activity
-    (`contour_id`, `activity_type_id`), the declared period, area, quantity and
-    herd (`period_from`, `period_to`, `requested_area_ha`, `quantity`,
-    `items`) and the claimed `benefit_category_item_id`. The period comes
-    along with the rest of the request rather than being left for a mandatory
-    `PATCH`: `checks.REQUIRED_FOR_PRICING` refuses a submission missing it, and
-    a clone an applicant cannot submit without editing fields that did not
-    change (the plot, the herd) would save them nothing. `contour_version_id`
-    is deliberately NOT among them: the clone reprices against whichever
-    version is published at ITS OWN submission (ruling 22), never the one the
-    source was decided against.
+    (`applicant_id`, `on_behalf`), the plot and activity (`contour_id`,
+    `activity_type_id`), the declared period, quantity and herd
+    (`period_from`, `period_to`, `quantity`, `items`) and the claimed
+    `benefit_category_item_id` with its certificate number. The period comes
+    along with the rest of the request rather than being left blank: a
+    template an applicant cannot file without retyping fields that did not
+    change (the plot, the herd) would save them nothing.
 
-    `parent_application_id` is set to the SOURCE while `kind` stays `"new"`
-    (`KIND_NEW`): a clone is a brand-new filing that happens to remember where
-    it came from, not `extend` (`tz/12` #6) — that verb belongs to 3.11's
-    `POST /permits/{id}/extend`, on an already-ISSUED permit, and is out of
-    scope here.
-
-    The OWNER only, in ANY status — a stranger is told 404, the same answer
-    every other refusal in this module gives, never 403 (`_readable_
-    application`'s own reasoning: an application carries a citizen's name,
-    plot and herd from the moment it exists). Unlocked, deliberately unlike
-    `_own_application_for_update`: the source is only ever READ here, never
-    written, so there is nothing to serialise against a concurrent writer.
-
-    No event is published and no notification sent: nothing subscribes to a
-    clone and no template is seeded for one — inventing either here would be
-    exactly the mistake `events.NOTIFIED_EVENT_CODES`'s own note on
-    `application.cancelled` warns against.
+    Ownership only — 404 for a stranger, never 403 (the module's one answer
+    to "does this id exist"). No lock, no write, no audit: a read.
     """
     source = await repo.get_application(db, application_id)
     if source is None or source.applicant_id not in await _own_applicant_ids(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    application = Application(
+    items = await repo.list_items(db, source.id)
+    return ApplicationCloneOut(
+        on_behalf=source.on_behalf,  # type: ignore[arg-type]  # CHECK-backed literal
         applicant_id=source.applicant_id,
-        submitted_by_user_id=actor.id,
-        on_behalf=source.on_behalf,
-        representation_id=source.representation_id,
         activity_type_id=source.activity_type_id,
         contour_id=source.contour_id,
-        requested_area_ha=source.requested_area_ha,
         period_from=source.period_from,
         period_to=source.period_to,
         quantity=source.quantity,
+        items=[
+            ApplicationItemIn(livestock_type_id=item.livestock_type_id, head_count=item.head_count)
+            for item in items
+        ],
         benefit_category_item_id=source.benefit_category_item_id,
-        status=INITIAL_STATUS,
-        channel=CHANNEL_PORTAL,
-        kind=KIND_NEW,
-        parent_application_id=source.id,
+        benefit_certificate_no=source.benefit_certificate_no,
     )
-    db.add(application)
-    await db.flush()
-    for item in await repo.list_items(db, source.id):
-        db.add(
-            ApplicationItem(
-                application_id=application.id,
-                livestock_type_id=item.livestock_type_id,
-                head_count=item.head_count,
-            )
-        )
-    await repo.add_status_history(
-        db,
-        ApplicationStatusHistory(
-            application_id=application.id,
-            from_status=None,
-            to_status=INITIAL_STATUS,
-            changed_by=actor.id,
-        ),
-    )
-    # `created_at`/`updated_at`/`requested_area_ha`/`quantity` all round-trip
-    # through Postgres defaults or `NUMERIC`'s own scale (the same lesson
-    # `create_draft` and `patch_draft` both carry) — refreshed before this row
-    # is serialized into the 201 response.
-    await db.refresh(application)
-    await audit.log(
-        db,
-        action=APPLICATION_CLONE,
-        user_id=actor.id,
-        object_type="application",
-        object_id=application.id,
-        old_value={"parent_application_id": str(source.id)},
-        new_value=_snapshot(application, await repo.list_items(db, application.id)),
-    )
-    return application
 
 
 async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:

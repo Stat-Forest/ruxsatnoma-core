@@ -13,6 +13,7 @@ no registered auto-verifier) for the pending/leshoz-review path.
 """
 
 import uuid
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -29,7 +30,7 @@ from app.modules.auth.models import User
 from app.modules.beekeepers import service as beekeepers_service
 from app.modules.beekeepers.schemas import BeekeeperCreateIn
 from tests.modules.applications.conftest import unique_pinfl
-from tests.modules.applications.test_submit import _submit, _upload
+from tests.modules.applications.test_submit import _submit, _submit_with_button, _upload
 
 API = "/api/v1"
 
@@ -56,35 +57,35 @@ async def _benefit_category_item_id(db: AsyncSession, code: str) -> uuid.UUID:
 
 async def _claim_and_prove(
     applicant_client,
-    app_id: str,
+    filing: dict[str, Any],
     *,
     benefit_category_item_id: uuid.UUID,
     benefit_doc_type_item_id: uuid.UUID,
     certificate_no: str | None,
-):
-    """PATCH the claim onto a draft and attach the one document type that
-    proves it — `test_submit.py`'s own two-step shape, factored out because
-    every test below needs it before it can even attempt `/submit`."""
-    body: dict[str, object] = {"benefit_category_item_id": str(benefit_category_item_id)}
+) -> dict[str, Any]:
+    """The filing with the claim on it and the one document type that proves
+    it attached — stage 12's one-request shape (plan 12, R1/R9): the scan is
+    uploaded first, the filing carries its id."""
+    body: dict[str, Any] = {
+        **filing,
+        "benefit_category_item_id": str(benefit_category_item_id),
+        "documents": [
+            {
+                "doc_type_item_id": str(benefit_doc_type_item_id),
+                "file_id": await _upload(applicant_client),
+            }
+        ],
+    }
     if certificate_no is not None:
         body["benefit_certificate_no"] = certificate_no
-    patched = await applicant_client.patch(f"{API}/applications/{app_id}", json=body)
-    assert patched.status_code == 200, patched.text
-    proof = await applicant_client.post(
-        f"{API}/applications/{app_id}/documents",
-        json={
-            "doc_type_item_id": str(benefit_doc_type_item_id),
-            "file_id": await _upload(applicant_client),
-        },
-    )
-    assert proof.status_code == 201, proof.text
+    return body
 
 
 @pytest.fixture
 async def pending_claim_application(
     applicant_client,
     hodim_client,
-    recreation_draft_ready_for_submission: str,
+    recreation_filing_ready_for_submission: dict[str, Any],
     preschool_children_item_id: uuid.UUID,
     preschool_children_priced: None,
     benefit_doc_type_item_id: uuid.UUID,
@@ -102,16 +103,16 @@ async def pending_claim_application(
     tariff a real (non-zero, non-self-settling) modifier for exactly this
     code.
     """
-    app_id = recreation_draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        recreation_filing_ready_for_submission,
         benefit_category_item_id=preschool_children_item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no="CERT-0001",
     )
-    submitted = await _submit(applicant_client, app_id)
-    assert submitted.status_code == 200, submitted.text
+    submitted = await _submit(applicant_client, filing)
+    assert submitted.status_code == 201, submitted.text
+    app_id = submitted.json()["id"]
     assert submitted.json()["benefit_verification_status"] == "pending"
 
     started = await hodim_client.post(f"{API}/applications/{app_id}/start-review")
@@ -122,7 +123,7 @@ async def pending_claim_application(
 @pytest.fixture
 async def submitted_claim_not_yet_in_review(
     applicant_client,
-    recreation_draft_ready_for_submission: str,
+    recreation_filing_ready_for_submission: dict[str, Any],
     preschool_children_item_id: uuid.UUID,
     preschool_children_priced: None,
     benefit_doc_type_item_id: uuid.UUID,
@@ -131,16 +132,16 @@ async def submitted_claim_not_yet_in_review(
     `start-review` never runs, so the application is `SUBMITTED`, not
     `IN_REVIEW`. The one row `test_verify_before_review_started_is_refused`
     needs."""
-    app_id = recreation_draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        recreation_filing_ready_for_submission,
         benefit_category_item_id=preschool_children_item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no="CERT-0002",
     )
-    submitted = await _submit(applicant_client, app_id)
-    assert submitted.status_code == 200, submitted.text
+    submitted = await _submit(applicant_client, filing)
+    assert submitted.status_code == 201, submitted.text
+    app_id = submitted.json()["id"]
     return app_id
 
 
@@ -340,7 +341,7 @@ async def test_reject_moves_pending_to_rejected_with_the_reason_and_is_audited(
 
 async def test_a_claim_without_a_number_is_refused_at_submission_on_any_category(
     applicant_client,
-    draft_ready_for_submission,
+    filing_ready_for_submission,
     benefit_category_item_id: uuid.UUID,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
@@ -350,16 +351,15 @@ async def test_a_claim_without_a_number_is_refused_at_submission_on_any_category
     longer read) — and a claim naming it with no certificate number is STILL
     refused, exactly like a "flagged" one used to be. `requires_certificate`
     is gone from the code, not merely false for this row."""
-    app_id = draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        filing_ready_for_submission,
         benefit_category_item_id=benefit_category_item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no=None,
     )
 
-    result = await _submit(applicant_client, app_id)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     error = result.json()["error"]
     assert error["code"] == "ERR-APP-003"
@@ -368,7 +368,7 @@ async def test_a_claim_without_a_number_is_refused_at_submission_on_any_category
 
 async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_verification(
     applicant_client,
-    draft_ready_for_submission,
+    filing_ready_for_submission,
     benefit_category_item_id: uuid.UUID,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
@@ -377,27 +377,31 @@ async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_ve
     `test_submit.py::test_a_benefit_claim_is_accepted_without_a_document`
     documents (no seeded tariff carries a modifier for a code a test
     invented); what this pins is WHICH gate answers first."""
-    app_id = draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        filing_ready_for_submission,
         benefit_category_item_id=benefit_category_item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no="CERT-7788",
     )
 
-    result = await _submit(applicant_client, app_id)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     body = result.json()
     assert body["error"]["code"] != "ERR-APP-003"
 
 
 # --- ruling #182: the wired seam, real register, three outcomes ---------------
+#
+# The refusal tests below file with the BUTTON (`_submit_with_button`): an ERI
+# filing prices at `POST /applications/package` first, and a claim that is
+# not in the tariff's modifiers is refused there — before `file()`'s step 3b
+# could ever answer. The button path reaches step 3b directly.
 
 
 async def test_the_wired_seam_empty_for_every_other_category(
     applicant_client,
-    recreation_draft_ready_for_submission: str,
+    recreation_filing_ready_for_submission: dict[str, Any],
     preschool_children_item_id: uuid.UUID,
     preschool_children_priced: None,
     benefit_doc_type_item_id: uuid.UUID,
@@ -408,23 +412,22 @@ async def test_the_wired_seam_empty_for_every_other_category(
     `pending` queue, restated as this file's own negative control against
     the wired seam specifically: a category that is not `beekeeping_union_
     member` must never be auto-verified, whatever it prices to."""
-    app_id = recreation_draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        recreation_filing_ready_for_submission,
         benefit_category_item_id=preschool_children_item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no="CERT-9001",
     )
-    submitted = await _submit(applicant_client, app_id)
-    assert submitted.status_code == 200, submitted.text
+    submitted = await _submit(applicant_client, filing)
+    assert submitted.status_code == 201, submitted.text
     assert submitted.json()["benefit_verification_status"] == "pending"
 
 
 async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
     db: AsyncSession,
     applicant_client,
-    draft_ready_for_submission,
+    filing_ready_for_submission,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
     """The REAL `beekeeping_union_member` category (migration `0053`) and the
@@ -433,16 +436,15 @@ async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
     subscriptions()` runs autouse) against a certificate number nobody has
     ever registered: `unknown`."""
     item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
-    app_id = draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        filing_ready_for_submission,
         benefit_category_item_id=item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no=f"BEE-{uuid.uuid4().hex[:10]}",
     )
 
-    result = await _submit(applicant_client, app_id)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     error = result.json()["error"]
     assert error["code"] == "ERR-APP-003"
@@ -452,7 +454,7 @@ async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
 async def test_the_wired_seam_refuses_someone_elses_certificate_number(
     db: AsyncSession,
     applicant_client,
-    draft_ready_for_submission,
+    filing_ready_for_submission,
     benefit_doc_type_item_id: uuid.UUID,
     hodim_user: User,
 ) -> None:
@@ -474,16 +476,15 @@ async def test_the_wired_seam_refuses_someone_elses_certificate_number(
     )
     await db.commit()
 
-    app_id = draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        filing_ready_for_submission,
         benefit_category_item_id=item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no=certificate_no,
     )
 
-    result = await _submit(applicant_client, app_id)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     error = result.json()["error"]
     assert error["code"] == "ERR-APP-003"
@@ -493,7 +494,7 @@ async def test_the_wired_seam_refuses_someone_elses_certificate_number(
 async def test_the_wired_seam_matched_passes_step_3b(
     db: AsyncSession,
     applicant_client,
-    draft_ready_for_submission,
+    filing_ready_for_submission,
     benefit_doc_type_item_id: uuid.UUID,
     hodim_user: User,
 ) -> None:
@@ -522,16 +523,15 @@ async def test_the_wired_seam_matched_passes_step_3b(
     )
     await db.commit()
 
-    app_id = draft_ready_for_submission
-    await _claim_and_prove(
+    filing = await _claim_and_prove(
         applicant_client,
-        app_id,
+        filing_ready_for_submission,
         benefit_category_item_id=item_id,
         benefit_doc_type_item_id=benefit_doc_type_item_id,
         certificate_no=certificate_no,
     )
 
-    result = await _submit(applicant_client, app_id)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     body = result.json()
     assert body["error"]["code"] != "ERR-APP-003"
@@ -540,7 +540,7 @@ async def test_the_wired_seam_matched_passes_step_3b(
 async def test_the_wired_seam_matched_verifies_the_claim_on_the_spot(
     db: AsyncSession,
     applicant,
-    draft_ready_for_submission: str,
+    submitted_application: str,
     hodim_user: User,
 ) -> None:
     """In-process, so the committed COLUMNS can be asserted directly — the
@@ -566,7 +566,7 @@ async def test_the_wired_seam_matched_verifies_the_claim_on_the_spot(
     )
     await db.flush()
 
-    application = await service.get(db, uuid.UUID(draft_ready_for_submission))
+    application = await service.get(db, uuid.UUID(submitted_application))
     assert application is not None
     application.benefit_category_item_id = item_id
     application.benefit_certificate_no = certificate_no

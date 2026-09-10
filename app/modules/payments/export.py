@@ -13,6 +13,7 @@ so the file reads like the screen.
 
 import uuid
 from datetime import date
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -519,11 +520,31 @@ REFUNDS_TITLE: dict[str, str] = {"uz_latn": "Qaytarishlar", "ru": "Возвра�
 
 
 class RefundRow:
-    def __init__(self, refund: Refund, *, application_number: str, basis_name: str) -> None:
+    """One refund plus what THIS reader may see of it. `staff=False` is the
+    citizen reading their own refund (stage 11, ruling R3): the accountant's
+    working figure (`suggested_amount`) is blanked, and `comment` — one
+    column three writers share — only while the refund is still requested,
+    exactly what `refunds_router._refund_out` blanks on the screen. The file
+    must never show a citizen a cell their own screen hides."""
+
+    def __init__(
+        self, refund: Refund, *, application_number: str, basis_name: str, staff: bool
+    ) -> None:
         self.refund = refund
         self.id = refund.id
         self.application_number = application_number
         self.basis_name = basis_name
+        self.staff = staff
+
+    @property
+    def suggested_amount(self) -> Any:
+        return self.refund.suggested_amount if self.staff else None
+
+    @property
+    def comment(self) -> str | None:
+        if self.staff or self.refund.status == backoffice_service._STATUS_REQUESTED:
+            return self.refund.comment
+        return None
 
 
 def refund_columns(lang: xlsx.Lang) -> list[xlsx.Column[RefundRow]]:
@@ -542,7 +563,7 @@ def refund_columns(lang: xlsx.Lang) -> list[xlsx.Column[RefundRow]]:
         xlsx.Column(
             "suggested_amount",
             {"uz_latn": "Tavsiya etilgan", "ru": "Рекомендовано"},
-            f("suggested_amount"),
+            lambda r: r.suggested_amount,
             16,
         ),
         xlsx.Column(
@@ -551,7 +572,7 @@ def refund_columns(lang: xlsx.Lang) -> list[xlsx.Column[RefundRow]]:
             f("final_amount"),
             16,
         ),
-        xlsx.Column("comment", {"uz_latn": "Izoh", "ru": "Комментарий"}, f("comment"), 26),
+        xlsx.Column("comment", {"uz_latn": "Izoh", "ru": "Комментарий"}, lambda r: r.comment, 26),
         xlsx.Column(
             "requested_at",
             {"uz_latn": "Soʻralgan sana", "ru": "Дата заявки"},
@@ -585,11 +606,13 @@ async def refund_rows(
         basis_names = {item.id: xlsx.localized(item.name, lang) for item in reasons}
     else:
         basis_names = {}
+    staff = await service.holds_payments_read(db, actor)
     out = [
         RefundRow(
             row,
             application_number=app_numbers.get(row.application_id) or "",
             basis_name=basis_names.get(row.basis_item_id, ""),
+            staff=staff,
         )
         for row in rows
     ]

@@ -1126,7 +1126,7 @@ async def effective_representation_of(
 ) -> Representation | None:
     """The ROW behind `has_effective_representation_of` above, for a caller that
     has to STORE which power of attorney it acted under rather than merely check
-    that one exists — `applications.service.create_draft` fills
+    that one exists — `applications.service._build_filing` fills
     `applications.representation_id`, the column that says on whose authority a
     representative filed for a legal entity.
 

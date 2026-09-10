@@ -268,14 +268,18 @@ async def _request_refund(client, application_id: uuid.UUID, rf01: uuid.UUID) ->
 
 async def test_request_refund_files_with_the_frozen_calculations_hint(
     owner_client,
+    payments_view_client,
     refund_application: Application,
     paid_refund_invoice: Invoice,
     rf01: uuid.UUID,
 ):
     """Test 5: `POST /refunds` on a `paid` invoice creates `status=
-    "requested"`, `suggested_amount` from the FROZEN calculation
-    (`invoice.calculation_id`, never the newest one), and `due_at ==
-    add_working_days(today, 20)`."""
+    "requested"` and `due_at == add_working_days(today, 20)`. Stage 11 fix
+    wave: the 201 echo now goes through `_refund_out` too, so a non-staff
+    filer's own response no longer carries the hint — `suggested_amount`/
+    `suggestion_reason` are asserted through the accountant's own
+    `GET /refunds/{id}` instead, which still reads it from the FROZEN
+    calculation (`invoice.calculation_id`, never the newest one)."""
     response = await owner_client.post(
         REFUNDS,
         json={
@@ -287,10 +291,16 @@ async def test_request_refund_files_with_the_frozen_calculations_hint(
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["status"] == "requested"
-    assert body["suggested_amount"] == "600000.00"
+    assert body["suggested_amount"] is None
     assert body["suggestion_reason"] is None
     assert body["invoice_id"] == str(paid_refund_invoice.id)
     assert date.fromisoformat(body["due_at"]) == add_working_days(business_today(), 20)
+
+    staff_read = await payments_view_client.get(f"{REFUNDS}/{body['id']}")
+    assert staff_read.status_code == 200, staff_read.text
+    staff_body = staff_read.json()
+    assert staff_body["suggested_amount"] == "600000.00"
+    assert staff_body["suggestion_reason"] is None
 
 
 async def test_a_stranger_applicant_cannot_request_a_refund_for_another_application(

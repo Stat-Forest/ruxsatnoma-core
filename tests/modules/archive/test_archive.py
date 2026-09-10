@@ -44,7 +44,7 @@ async def test_archive_an_eligible_application_moves_it_and_records_the_item(db,
 
 
 async def test_archiving_an_ineligible_status_is_refused(db, leshoz):
-    application = await make_application(db, org=leshoz, status="DRAFT", applicant_name="A A")
+    application = await make_application(db, org=leshoz, status="SUBMITTED", applicant_name="A A")
     await db.commit()
 
     async for client in _client_for(db, ARCHIVE_MANAGE, organization_id=leshoz.id):
@@ -85,7 +85,7 @@ async def test_zone_wins_over_status_when_both_would_refuse(db, leshoz, other_le
     application = await make_application(
         db,
         org=other_leshoz,
-        status="DRAFT",
+        status="SUBMITTED",
         applicant_name="A A",  # also status-ineligible
     )
     await db.commit()

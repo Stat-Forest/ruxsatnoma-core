@@ -202,15 +202,17 @@ async def test_the_owner_sees_their_own_invoice_regardless_of_zone(
 # outside the invoice's leshoz must not see it on the register either.
 
 
-async def test_a_plain_applicant_cannot_browse_the_invoice_register(
-    owner_client: httpx.AsyncClient,
+async def test_a_plain_applicant_browsing_the_register_gets_their_own_invoices(
+    owner_client: httpx.AsyncClient, invoice_in_home_leshoz: Invoice
 ) -> None:
-    """Omitting `application_id` is the register; a citizen has no republic
-    to browse, so it is staff-only, `ERR-ACL-001` for anyone else."""
+    """Stage 11 (ruling R1): omitting `application_id` is the register for
+    staff and the OWN list for everyone else — a citizen has no republic to
+    browse, so they get their own, not a refusal. The zone plays no part in
+    the own branch: ownership is not territorial."""
     response = await owner_client.get("/api/v1/invoices")
 
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "ERR-ACL-001"
+    assert response.status_code == 200, response.text
+    assert str(invoice_in_home_leshoz.id) in {item["id"] for item in response.json()["items"]}
 
 
 async def test_a_republic_wide_accountant_browses_every_invoice(
