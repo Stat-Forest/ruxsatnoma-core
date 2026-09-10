@@ -26,12 +26,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files
+from app.core import files, xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.permits import service
+from app.modules.permits import export, service
 from app.modules.permits.permissions import PERMITS_ISSUE, PERMITS_SIGN
 from app.modules.permits.schemas import (
     PermitCardOut,
@@ -170,6 +171,42 @@ async def list_permits(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/permits/export.xlsx")
+async def export_permits_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    status: PermitStatus | None = None,
+    applicant_id: uuid.UUID | None = None,
+    contour_id: uuid.UUID | None = None,
+    organization_id: uuid.UUID | None = None,
+    series: Annotated[str | None, Query(max_length=service.SERIES_MAX_LENGTH)] = None,
+    number: Annotated[int | None, Query(ge=1, le=service.MAX_PERMIT_NUMBER)] = None,
+) -> Response:
+    """`GET /permits` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same scope, every matching row up to the configured cap.
+
+    Declared before `/permits/{permit_id}` on purpose: `export.xlsx` is not a
+    UUID and the 422 the path parser would answer there is a worse error than
+    the 404 a real unmatched id deserves.
+    """
+    items, total, cap = await export.rows(
+        db,
+        actor=user,
+        lang=lang,
+        status=status,
+        applicant_id=applicant_id,
+        contour_id=contour_id,
+        organization_id=organization_id,
+        series=series,
+        number=number,
+    )
+    filename = f"ruxsatnomalar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
