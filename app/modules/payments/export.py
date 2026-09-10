@@ -20,8 +20,8 @@ from app.core import settings_store, xlsx
 from app.modules.applications import service as applications_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
-from app.modules.payments import service, statement_service
-from app.modules.payments.models import BankStatement, Invoice
+from app.modules.payments import backoffice_service, service, statement_service
+from app.modules.payments.models import BankStatement, Invoice, Reconciliation
 
 # An unknown code renders as itself, never an empty cell that hides it —
 # the same posture `applications/export.py`'s own `_label` takes.
@@ -242,3 +242,81 @@ async def statement_rows(
 
 def render_statements(items: list[StatementRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, statement_columns(lang), lang=lang, title=STATEMENTS_TITLE[lang])
+
+
+# --- Reconciliations (Task C.2, `GET /payments/reconciliations/export.xlsx`)
+# Mirrors `adminka/src/pages/accountant/statusMeta.ts::RECONCILIATION_RESULT_LABEL_I18N`
+# / `RECONCILIATION_STATUS_LABEL_I18N` (`RECONCILIATION_RESULTS`/
+# `RECONCILIATION_STATUSES`), checked 2026-09-11.
+RECONCILIATION_RESULT_LABELS: dict[str, dict[str, str]] = {
+    "matched": {"uz_latn": "Mos keldi", "ru": "Сопоставлено"},
+    "discrepancy": {"uz_latn": "Nomuvofiqlik", "ru": "Расхождение"},
+    "unknown": {"uz_latn": "Noma'lum", "ru": "Неизвестно"},
+}
+RECONCILIATION_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "open": {"uz_latn": "Ochiq", "ru": "Открыто"},
+    "resolved": {"uz_latn": "Yopildi", "ru": "Закрыто"},
+}
+RECONCILIATIONS_TITLE: dict[str, str] = {"uz_latn": "Nomuvofiqliklar", "ru": "Несоответствия"}
+
+
+class ReconciliationRow:
+    def __init__(self, row: Reconciliation, *, invoice_number: str) -> None:
+        self.row = row
+        self.id = row.id
+        self.invoice_number = invoice_number
+
+
+def reconciliation_columns(lang: xlsx.Lang) -> list[xlsx.Column[ReconciliationRow]]:
+    f = lambda name: lambda r: getattr(r.row, name)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column(
+            "invoice", {"uz_latn": "Hisob-faktura", "ru": "Счёт"}, lambda r: r.invoice_number, 18
+        ),
+        xlsx.Column(
+            "result",
+            {"uz_latn": "Natija", "ru": "Результат"},
+            lambda r: _label(RECONCILIATION_RESULT_LABELS, r.row.result, lang),
+            16,
+        ),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(RECONCILIATION_STATUS_LABELS, r.row.status, lang),
+            14,
+        ),
+        xlsx.Column("difference", {"uz_latn": "Farq", "ru": "Разница"}, f("difference"), 14),
+        xlsx.Column("comment", {"uz_latn": "Izoh", "ru": "Комментарий"}, f("comment"), 30),
+        xlsx.Column("occurred_at", {"uz_latn": "Sana", "ru": "Дата"}, f("occurred_at"), 18),
+        xlsx.Column(
+            "resolved_at",
+            {"uz_latn": "Yopilgan sana", "ru": "Дата закрытия"},
+            f("resolved_at"),
+            18,
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def reconciliation_rows(
+    db: AsyncSession, *, actor: User, lang: xlsx.Lang, status: str
+) -> tuple[list[ReconciliationRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    rows, total = await backoffice_service.list_reconciliations(
+        db, status=status, limit=cap, offset=0, actor=actor
+    )
+    invoice_ids = {row.invoice_id for row in rows if row.invoice_id}
+    numbers = await _invoice_numbers_by_ids(db, invoice_ids)
+    out = [
+        ReconciliationRow(
+            row, invoice_number=numbers.get(row.invoice_id, "") if row.invoice_id else ""
+        )
+        for row in rows
+    ]
+    return out, total, cap
+
+
+def render_reconciliations(items: list[ReconciliationRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(
+        items, reconciliation_columns(lang), lang=lang, title=RECONCILIATIONS_TITLE[lang]
+    )

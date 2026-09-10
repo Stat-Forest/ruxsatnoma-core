@@ -8,11 +8,13 @@ import csv
 import io
 import json
 import uuid
+from decimal import Decimal
 
 import pytest
 from openpyxl import load_workbook
 
 from app.modules.payments import statement_service
+from app.modules.payments.models import Invoice
 
 pytestmark = pytest.mark.asyncio
 
@@ -30,19 +32,19 @@ _STATEMENT_COLUMN_MAP = {"amount": "Amount", "operation_date": "Date", "purpose"
 _STATEMENT_HEADER = ["Amount", "Date", "Purpose"]
 
 
-def _statement_csv() -> bytes:
+def _statement_csv(*, amount: str = "1000.00", purpose: str = "test") -> bytes:
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer)
     writer.writerow(_STATEMENT_HEADER)
-    writer.writerow(["1000.00", "02.09.2026", "test"])
+    writer.writerow([amount, "02.09.2026", purpose])
     return buffer.getvalue().encode("utf-8")
 
 
-async def _upload_statement(client) -> str:
+async def _upload_statement(client, *, amount: str = "1000.00", purpose: str = "test") -> str:
     resp = await client.post(
         "/api/v1/payments/bank-statements",
         data={"statement_date": "2026-09-02", "column_map": json.dumps(_STATEMENT_COLUMN_MAP)},
-        files={"file": ("vypiska.csv", _statement_csv(), "text/csv")},
+        files={"file": ("vypiska.csv", _statement_csv(amount=amount, purpose=purpose), "text/csv")},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert resp.status_code == 202, resp.text
@@ -55,6 +57,40 @@ async def _drain(db) -> None:
     (lesson: build a fixture's precondition through the real transition)."""
     while await statement_service.process_pending(db):
         pass
+
+
+@pytest.fixture
+async def matchable_invoice(db, approved_application) -> Invoice:
+    """An invoice numbered so the statement matcher can find it in free
+    text (`matcher.INVOICE_NUMBER_RE` needs `INV-\\d{4}-\\d{6,}`) — mirrors
+    `test_statement_import.py::bank_invoice`, duplicated here rather than
+    imported cross-file to keep this test file self-contained."""
+    row = Invoice(
+        application_id=approved_application.id,
+        number=f"INV-2026-{uuid.uuid4().int % 10**6:06d}",
+        amount=Decimal("2060000.00"),
+        status="pending",
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+@pytest.fixture
+async def open_reconciliation(payments_view_client, db, matchable_invoice) -> Invoice:
+    """An OPEN `discrepancy` row for `matchable_invoice`, produced through
+    the real upload + matcher path (mirrors `test_statement_import.py`'s
+    own discrepancy test: an amount that disagrees with the invoice, in a
+    statement whose purpose names it) — never a `Reconciliation(...)` row
+    written by hand. Returns the invoice itself, the one deterministic key
+    this register offers no id-filter for."""
+    await _upload_statement(
+        payments_view_client,
+        amount="2 000 000,00",
+        purpose=f"Оплата по счёту {matchable_invoice.number}",
+    )
+    await _drain(db)
+    return matchable_invoice
 
 
 # --- /invoices/export.xlsx (Task C.1) ---------------------------------------
@@ -237,5 +273,96 @@ async def test_statements_export_matches_the_list_status_for_a_caller_with_no_sc
 async def test_statements_export_rejects_an_unknown_language(payments_view_client):
     resp = await payments_view_client.get(
         "/api/v1/payments/bank-statements/export.xlsx", params={"lang": "en"}
+    )
+    assert resp.status_code == 422
+
+
+# --- /payments/reconciliations/export.xlsx (Task C.2) -----------------------
+
+
+async def test_reconciliations_export_holds_exactly_the_rows_the_list_shows(
+    payments_view_client, open_reconciliation
+):
+    listed = (
+        await payments_view_client.get(
+            "/api/v1/payments/reconciliations", params={"status": "open", "limit": 200}
+        )
+    ).json()
+    mine = next(
+        item for item in listed["items"] if item["invoice_id"] == str(open_reconciliation.id)
+    )
+    listed_ids = {item["id"] for item in listed["items"]}
+
+    resp = await payments_view_client.get(
+        "/api/v1/payments/reconciliations/export.xlsx", params={"status": "open", "lang": "ru"}
+    )
+    assert resp.status_code == 200
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Счёт" and headers[-1] == "ID"
+    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    assert mine["id"] in exported_ids
+    assert exported_ids == listed_ids
+
+
+async def test_reconciliations_export_applies_the_same_filters_as_the_list(
+    payments_view_client, open_reconciliation
+):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/reconciliations/export.xlsx", params={"status": "resolved"}
+    )
+    assert resp.status_code == 200
+    exported_numbers = {
+        str(row[0]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    assert open_reconciliation.number not in exported_numbers
+
+
+async def test_reconciliations_export_renders_labels_not_codes(
+    payments_view_client, open_reconciliation
+):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/reconciliations/export.xlsx",
+        params={"status": "open", "lang": "uz_latn"},
+    )
+    rows_by_invoice_number = {
+        row[0]: row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
+    }
+    row = rows_by_invoice_number[open_reconciliation.number]
+    assert row[1] == "Nomuvofiqlik"  # the result label, not "discrepancy"
+    assert row[2] == "Ochiq"  # the status label, not "open"
+
+
+async def test_reconciliations_export_truncates_at_the_cap_and_says_so(
+    payments_view_client, open_reconciliation, monkeypatch
+):
+    from app.core import settings_store
+
+    original_get_int = settings_store.get_int
+
+    async def capped(db, key):
+        if key == "register_export_max_rows":
+            return 1
+        return await original_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", capped)
+    resp = await payments_view_client.get("/api/v1/payments/reconciliations/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_reconciliations_export_matches_the_list_status_for_a_caller_with_no_scope(
+    applicant_client,
+):
+    listed_resp = await applicant_client.get("/api/v1/payments/reconciliations")
+    export_resp = await applicant_client.get("/api/v1/payments/reconciliations/export.xlsx")
+    assert export_resp.status_code == listed_resp.status_code
+
+
+async def test_reconciliations_export_rejects_an_unknown_language(payments_view_client):
+    resp = await payments_view_client.get(
+        "/api/v1/payments/reconciliations/export.xlsx", params={"lang": "en"}
     )
     assert resp.status_code == 422

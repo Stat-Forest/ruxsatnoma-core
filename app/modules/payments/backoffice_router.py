@@ -290,6 +290,23 @@ async def list_reconciliations(
     )
 
 
+@router.get("/reconciliations/export.xlsx")
+async def export_reconciliations_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[str, Query(pattern=_STATUS_PATTERN)] = RECONCILIATION_STATUSES[0],
+) -> Response:
+    """`GET /payments/reconciliations` as a spreadsheet (stage 13, ruling
+    #204): the same `payments.view` gate, the same default (`open`) and
+    `?status=` filter, every matching row up to the configured cap."""
+    items, total, cap = await export.reconciliation_rows(db, actor=actor, lang=lang, status=status)
+    filename = f"nomuvofiqliklar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_reconciliations(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.post(
     "/reconciliations/{reconciliation_id}/resolve",
     response_model=ReconciliationOut,
