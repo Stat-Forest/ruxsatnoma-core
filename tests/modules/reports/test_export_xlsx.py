@@ -230,10 +230,15 @@ async def test_forms_export_truncates_at_the_cap_and_says_so(
         json={
             "code": f"3-ilova-{grazing_form.id.hex[:8]}",
             "version": 1,
-            "name": {"uz_cyrl": "3-илова"},
+            "name": {"uz_cyrl": "3-илова", "uz_latn": "3-ilova"},
             "period_type": "month",
             "columns": [
-                {"code": "a", "label": {"uz_cyrl": "A"}, "source": "manual", "type": "text"}
+                {
+                    "code": "a",
+                    "label": {"uz_cyrl": "A", "uz_latn": "A"},
+                    "source": "manual",
+                    "type": "text",
+                }
             ],
         },
     )
