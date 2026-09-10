@@ -249,3 +249,115 @@ async def test_acts_export_is_empty_not_403_for_a_caller_with_no_scope(
 async def test_acts_export_rejects_an_unknown_language(inspector_client) -> None:
     resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "en"})
     assert resp.status_code == 422
+
+
+# --- Cases -----------------------------------------------------------------
+
+
+async def test_cases_export_holds_exactly_the_rows_the_list_shows(
+    db,
+    executor_head_client,
+    inspector_client,
+    inspector,
+    application: Application,
+    default_checklist_id,
+    vt_01,
+) -> None:
+    case_id = await _open_case(
+        db, inspector_client, inspector, application, default_checklist_id, vt_01
+    )
+
+    listed = (await executor_head_client.get(f"{API}/cases", params={"page_size": 100})).json()
+    listed_ids = {row["id"] for row in listed["items"]}
+    assert case_id in listed_ids
+
+    resp = await executor_head_client.get(f"{API}/cases/export.xlsx", params={"lang": "ru"})
+    assert resp.status_code == 200
+    assert resp.headers["x-export-truncated"] == "false"
+    sheet = _sheet(resp.content)
+    headers = [c.value for c in sheet[1]]
+    assert headers[0] == "Номер дела" and headers[-1] == "ID"
+    exported_ids = _ids(sheet)
+    assert exported_ids == listed_ids
+    assert case_id in exported_ids
+
+
+async def test_cases_export_applies_the_same_status_filter_as_the_list(
+    db,
+    executor_head_client,
+    inspector_client,
+    inspector,
+    application: Application,
+    default_checklist_id,
+    vt_01,
+) -> None:
+    await _open_case(db, inspector_client, inspector, application, default_checklist_id, vt_01)
+
+    resp = await executor_head_client.get(
+        f"{API}/cases/export.xlsx", params={"status": "closed", "lang": "uz_latn"}
+    )
+    assert resp.status_code == 200
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_cases_export_renders_labels_not_codes(
+    db,
+    executor_head_client,
+    inspector_client,
+    inspector,
+    application: Application,
+    default_checklist_id,
+    vt_01,
+) -> None:
+    await _open_case(db, inspector_client, inspector, application, default_checklist_id, vt_01)
+
+    resp = await executor_head_client.get(f"{API}/cases/export.xlsx", params={"lang": "uz_latn"})
+    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    assert row[1] == "Ochilgan"  # status label ("opened"), not the raw code
+    number = row[0]
+    # the human case number comes first (service.NUMBER_PREFIX)
+    assert isinstance(number, str) and number.startswith("VC-")
+
+
+async def test_cases_export_truncates_at_the_cap_and_says_so(
+    db,
+    executor_head_client,
+    inspector_client,
+    inspector,
+    application: Application,
+    default_checklist_id,
+    vt_01,
+    monkeypatch,
+) -> None:
+    await _open_case(db, inspector_client, inspector, application, default_checklist_id, vt_01)
+    from app.core import settings_store
+
+    real_get_int = settings_store.get_int
+
+    async def one(db, key):
+        # `auth.deps.get_current_session` reads `session_idle_minutes`
+        # through this same function on every request — the patch must
+        # fall through to the real one for every key but ours.
+        if key == "register_export_max_rows":
+            return 1
+        return await real_get_int(db, key)
+
+    monkeypatch.setattr(settings_store, "get_int", one)
+    resp = await executor_head_client.get(f"{API}/cases/export.xlsx")
+    assert resp.status_code == 200
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
+    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+
+
+async def test_cases_export_is_empty_not_403_for_a_caller_with_no_scope(
+    other_inspector_client,
+) -> None:
+    resp = await other_inspector_client.get(f"{API}/cases/export.xlsx")
+    assert resp.status_code == 200
+    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+
+
+async def test_cases_export_rejects_an_unknown_language(executor_head_client) -> None:
+    resp = await executor_head_client.get(f"{API}/cases/export.xlsx", params={"lang": "en"})
+    assert resp.status_code == 422

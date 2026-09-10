@@ -15,6 +15,7 @@ a raw id on every sheet that carries one: `permits.service` has no batch
 name reader (`grep -n "def .*_by_ids" app/modules/permits/service.py`
 finds none), and adding one there is out of this track's scope."""
 
+import uuid
 from collections.abc import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +28,7 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.inspections import service
-from app.modules.inspections.models import InspectionAct, InspectionTask
+from app.modules.inspections.models import InspectionAct, InspectionTask, ViolationCase
 
 TASK_KIND_LABELS: dict[str, dict[str, str]] = {
     "pre_approval_visit": {"uz_latn": "Berishdan oldingi tashrif", "ru": "Выезд перед выдачей"},
@@ -39,7 +40,6 @@ TASK_STATUS_LABELS: dict[str, dict[str, str]] = {
     "done": {"uz_latn": "Bajarildi", "ru": "Выполнено"},
     "cancelled": {"uz_latn": "Bekor qilindi", "ru": "Отменено"},
 }
-TASKS_TITLE = {"uz_latn": "Topshiriqlar", "ru": "Задания"}
 ACT_STATUS_LABELS: dict[str, dict[str, str]] = {
     "draft": {"uz_latn": "Qoralama", "ru": "Черновик"},
     "signed": {"uz_latn": "Imzolangan", "ru": "Подписан"},
@@ -49,7 +49,24 @@ ACT_RESULT_LABELS: dict[str, dict[str, str]] = {
     "warning": {"uz_latn": "Eslatma", "ru": "Замечание"},
     "violation": {"uz_latn": "Buzilish", "ru": "Нарушение"},
 }
+CASE_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "opened": {"uz_latn": "Ochilgan", "ru": "Открыто"},
+    "explanation_requested": {"uz_latn": "Tushuntirish soʻralgan", "ru": "Запрошено объяснение"},
+    "explained": {"uz_latn": "Tushuntirish berilgan", "ru": "Объяснение получено"},
+    "decided": {"uz_latn": "Qaror qabul qilingan", "ru": "Решение принято"},
+    "appealed": {"uz_latn": "Shikoyat qilingan", "ru": "Обжаловано"},
+    "closed": {"uz_latn": "Yopilgan", "ru": "Закрыто"},
+    "archived": {"uz_latn": "Arxivda", "ru": "В архиве"},
+}
+CASE_DECISION_LABELS: dict[str, dict[str, str]] = {
+    "warning": {"uz_latn": "Ogohlantirish", "ru": "Предупреждение"},
+    "suspend": {"uz_latn": "Ruxsatnomani toʻxtatish", "ru": "Приостановка разрешения"},
+    "revoke": {"uz_latn": "Ruxsatnomani bekor qilish", "ru": "Аннулирование разрешения"},
+    "transfer": {"uz_latn": "Boshqa organga oʻtkazish", "ru": "Передача в другой орган"},
+}
+TASKS_TITLE = {"uz_latn": "Topshiriqlar", "ru": "Задания"}
 ACTS_TITLE = {"uz_latn": "Tekshiruv aktlari", "ru": "Акты проверок"}
+CASES_TITLE = {"uz_latn": "Buzilish ishlari", "ru": "Дела о нарушениях"}
 
 
 def _label(table: dict[str, dict[str, str]], code: str | None, lang: xlsx.Lang) -> str:
@@ -276,3 +293,115 @@ async def act_rows(
 
 def render_acts(items: Sequence[ActRow], *, lang: xlsx.Lang) -> bytes:
     return xlsx.render(items, act_columns(lang), lang=lang, title=ACTS_TITLE[lang])
+
+
+# --- Cases ---------------------------------------------------------------
+
+
+class CaseRow:
+    def __init__(self, case: ViolationCase, *, applicant: str, organization: str) -> None:
+        self.case = case
+        self.id = case.id
+        self.applicant = applicant
+        self.organization = organization
+
+
+def case_columns(lang: xlsx.Lang) -> list[xlsx.Column[CaseRow]]:
+    a = lambda f: lambda r: getattr(r.case, f)  # noqa: E731 - column accessors read alike
+    return [
+        xlsx.Column("number", {"uz_latn": "Ish raqami", "ru": "Номер дела"}, a("number"), 18),
+        xlsx.Column(
+            "status",
+            {"uz_latn": "Holati", "ru": "Статус"},
+            lambda r: _label(CASE_STATUS_LABELS, r.case.status, lang),
+            20,
+        ),
+        xlsx.Column(
+            "decision",
+            {"uz_latn": "Qaror", "ru": "Решение"},
+            lambda r: _label(CASE_DECISION_LABELS, r.case.decision, lang),
+            22,
+        ),
+        xlsx.Column(
+            "applicant", {"uz_latn": "Buzuvchi", "ru": "Нарушитель"}, lambda r: r.applicant, 30
+        ),
+        xlsx.Column(
+            "organization",
+            {"uz_latn": "Oʻrmon xoʻjaligi", "ru": "Лесхоз"},
+            lambda r: r.organization,
+            30,
+        ),
+        xlsx.Column(
+            "permit_id",
+            {"uz_latn": "Ruxsatnoma ID", "ru": "ID разрешения"},
+            lambda r: str(r.case.permit_id) if r.case.permit_id else "",
+            38,
+        ),
+        xlsx.Column(
+            "damage_amount",
+            {"uz_latn": "Zarar summasi", "ru": "Сумма ущерба"},
+            a("damage_amount"),
+            16,
+        ),
+        xlsx.Column(
+            "explanation_due_at",
+            {"uz_latn": "Tushuntirish muddati", "ru": "Срок объяснения"},
+            a("explanation_due_at"),
+            18,
+        ),
+        xlsx.Column(
+            "decision_due_at",
+            {"uz_latn": "Qaror muddati", "ru": "Срок решения"},
+            a("decision_due_at"),
+            16,
+        ),
+        xlsx.Column(
+            "decided_at", {"uz_latn": "Qaror sanasi", "ru": "Дата решения"}, a("decided_at"), 18
+        ),
+        xlsx.Column(
+            "created_at", {"uz_latn": "Ochilgan sana", "ru": "Дата открытия"}, a("created_at"), 18
+        ),
+        xlsx.id_column(),
+    ]
+
+
+async def case_rows(
+    db: AsyncSession,
+    *,
+    actor: User,
+    lang: xlsx.Lang,
+    status: str | None,
+    applicant_id: uuid.UUID | None,
+) -> tuple[list[CaseRow], int, int]:
+    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
+    cases, total = await service.list_cases(
+        db,
+        status=status,
+        applicant_id=applicant_id,
+        params=PageParams.model_construct(page=1, page_size=cap),
+        actor=actor,
+    )
+    applicants = await auth_service.applicant_names(
+        db, {c.applicant_id for c in cases if c.applicant_id}
+    )
+    orgs = await admin_service.organization_names(
+        db, {c.organization_id for c in cases if c.organization_id}
+    )
+    return (
+        [
+            CaseRow(
+                case,
+                applicant=applicants.get(case.applicant_id, "") if case.applicant_id else "",
+                organization=xlsx.localized(orgs.get(case.organization_id), lang)
+                if case.organization_id
+                else "",
+            )
+            for case in cases
+        ],
+        total,
+        cap,
+    )
+
+
+def render_cases(items: Sequence[CaseRow], *, lang: xlsx.Lang) -> bytes:
+    return xlsx.render(items, case_columns(lang), lang=lang, title=CASES_TITLE[lang])

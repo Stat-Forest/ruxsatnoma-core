@@ -323,6 +323,26 @@ async def list_cases(
     )
 
 
+@router.get("/cases/export.xlsx")
+async def export_cases_xlsx(
+    db: AsyncDb,
+    user: CurrentUser,
+    lang: xlsx.Lang = "uz_latn",
+    status: str | None = None,
+    applicant_id: uuid.UUID | None = None,
+) -> Response:
+    """`GET /cases` as a spreadsheet — same scope, same filters (`status`,
+    `applicant_id` — ruling R8, finding F3), declared before `/cases/{case_id}`
+    for the same reason `export_tasks_xlsx` is."""
+    items, total, cap = await export.case_rows(
+        db, actor=user, lang=lang, status=status, applicant_id=applicant_id
+    )
+    filename = f"violation-cases-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_cases(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.get("/cases/{case_id}")
 async def get_case(case_id: uuid.UUID, db: AsyncDb, user: CurrentUser) -> CaseCardOut:
     card = await service.case_card(db, case_id, actor=user)
