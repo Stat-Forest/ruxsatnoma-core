@@ -7,12 +7,14 @@ also getting the write). The zone restriction lives in `service.py`."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
-from app.modules.archive import service
+from app.core.time import business_today
+from app.modules.archive import export, service
 from app.modules.archive.permissions import ARCHIVE_MANAGE, ARCHIVE_VIEW
 from app.modules.archive.schemas import (
     ArchivableObjectType,
@@ -46,6 +48,27 @@ async def list_archive_items(
 ) -> Page[ArchiveItemOut]:
     return await service.list_items(
         db, actor=actor, params=params, object_type=object_type, status=filter_status
+    )
+
+
+@router.get("/archive/export.xlsx")
+async def export_archive_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(ARCHIVE_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    object_type: ArchivableObjectType | None = None,
+    filter_status: Annotated[ArchiveItemStatus | None, Query(alias="status")] = None,
+) -> Response:
+    """`GET /archive` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same zone, every matching row up to the configured cap.
+    Declared before `/archive/{item_id}` on purpose — a UUID path parser
+    would otherwise answer this literal path with a worse error than a 404."""
+    items, total, cap = await export.rows(
+        db, actor=actor, lang=lang, object_type=object_type, status=filter_status
+    )
+    filename = f"arxiv-reyestri-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 

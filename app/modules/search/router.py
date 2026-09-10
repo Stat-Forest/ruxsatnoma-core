@@ -8,12 +8,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files
+from app.core import files, xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
-from app.modules.search import service
+from app.modules.search import export, service
 from app.modules.search.permissions import SEARCH_USE
 from app.modules.search.schemas import (
     ExportCreate,
@@ -50,6 +51,40 @@ async def search(
         organization_id=organization_id,
         activity_type_id=activity_type_id,
         series=series,
+    )
+
+
+@router.get("/search/export.xlsx")
+async def export_search_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
+    kind: SearchKind,
+    lang: xlsx.Lang = "uz_latn",
+    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    filter_status: Annotated[str | None, Query(alias="status")] = None,
+    organization_id: uuid.UUID | None = None,
+    activity_type_id: uuid.UUID | None = None,
+    series: Annotated[str | None, Query(max_length=10)] = None,
+) -> Response:
+    """`GET /search` as a spreadsheet — the same filters, the same zone
+    (ruling R2: `service._rows_for`, the exact function `search()` itself
+    calls), every matching row up to the configured cap. The PLAIN register
+    export (ruling #204) beside the prosecutor's watermarked `POST
+    /search/exports` (С22) — that route is untouched."""
+    items, total, cap = await export.rows(
+        db,
+        actor=actor,
+        lang=lang,
+        kind=kind,
+        q=q,
+        status=filter_status,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        series=series,
+    )
+    filename = f"qidiruv-{kind}-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 

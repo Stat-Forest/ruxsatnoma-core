@@ -42,6 +42,14 @@ EXPORTED: set[str] = {
     "/api/v1/payments/allocations",  # Track C
     "/api/v1/refunds",  # Track C
     "/api/v1/payments/recipients",  # Track C
+    "/api/v1/search",  # Track H
+    "/api/v1/archive",  # Track H
+    "/api/v1/reports",  # Track H
+    "/api/v1/reports/forms",  # Track H
+    "/api/v1/beekeepers",  # Track H
+    "/api/v1/certificates",  # Track H
+    "/api/v1/signatures",  # Track H
+    "/api/v1/notifications",  # Track H
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
@@ -52,16 +60,6 @@ EXPORT_BACKLOG = {
     # calendar) stay here until somebody asks for them
     "/api/v1/calculations",
     "/api/v1/activity-seasons",
-    # Track H — search, archive, reports, the rest
-    "/api/v1/search",
-    "/api/v1/archive",
-    "/api/v1/reports",
-    "/api/v1/reports/forms",
-    "/api/v1/beekeepers",
-    "/api/v1/certificates",
-    "/api/v1/signatures",
-    "/api/v1/notifications",
-    "/api/v1/announcements",
 }
 
 # No export by design: the public site's lists (anonymous callers, no

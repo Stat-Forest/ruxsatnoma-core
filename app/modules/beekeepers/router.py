@@ -6,14 +6,16 @@ row stops being active, and it always leaves the row in place."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
-from app.modules.beekeepers import service
+from app.modules.beekeepers import export, service
 from app.modules.beekeepers.permissions import BEEKEEPERS_MANAGE
 from app.modules.beekeepers.schemas import (
     BeekeeperCreateIn,
@@ -35,6 +37,24 @@ async def list_beekeepers(
     status: str | None = None,
 ) -> Page[BeekeeperOut]:
     return await service.list_beekeepers(db, params=params, q=q, status=status)
+
+
+@router.get("/beekeepers/export.xlsx")
+async def export_beekeepers_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(require_permission(BEEKEEPERS_MANAGE))],
+    lang: xlsx.Lang = "uz_latn",
+    q: str | None = Query(default=None, max_length=200),
+    status: str | None = None,
+) -> Response:
+    """`GET /beekeepers` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same scope (ruling R2 — no zone here, ruling #182's single
+    central role), every matching row up to the configured cap."""
+    items, total, cap = await export.rows(db, q=q, status=status)
+    filename = f"asalarichilar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render(items, lang=lang), filename=filename, total=total, cap=cap
+    )
 
 
 @router.get("/beekeepers/lookup", response_model=BeekeeperLookupOut)
