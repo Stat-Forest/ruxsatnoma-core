@@ -35,20 +35,18 @@ EXPORTED: set[str] = {
     "/api/v1/inspections/acts",  # Track G
     "/api/v1/inspections/cases",  # Track G
     "/api/v1/help/tickets",  # Track G
+    "/api/v1/invoices",  # Track C
+    "/api/v1/payments/bank-statements",  # Track C
+    "/api/v1/payments/reconciliations",  # Track C
+    "/api/v1/payments/manual-confirmations",  # Track C
+    "/api/v1/payments/allocations",  # Track C
+    "/api/v1/refunds",  # Track C
+    "/api/v1/payments/recipients",  # Track C
 }
 
 # Registers Oybek included («variant a» of question 2) that no track has
 # served yet. Remove a path here in the same commit that adds it to EXPORTED.
 EXPORT_BACKLOG = {
-    # Track C–D (this plan's own tasks)
-    "/api/v1/invoices",
-    # Track C — payments, the other lists
-    "/api/v1/payments/bank-statements",
-    "/api/v1/payments/reconciliations",
-    "/api/v1/payments/manual-confirmations",
-    "/api/v1/payments/allocations",
-    "/api/v1/refunds",
-    "/api/v1/payments/recipients",
     # Track F — norms + gis: the two lists no screen reads as a register (a
     # calculation is opened from its application; activity seasons are a
     # calendar) stay here until somebody asks for them
