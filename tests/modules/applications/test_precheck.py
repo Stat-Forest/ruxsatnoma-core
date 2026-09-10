@@ -323,3 +323,60 @@ async def test_every_written_row_is_source_auto_and_the_run_is_audited_once(
     assert len(entries) == 1
     assert entries[0].object_type == "application"
     assert len(entries[0].new_value["checks"]) == len(result.json()["checks"])
+
+
+# --- Stage 12, B1: the pure half of `run_all`, and items from memory ---------
+
+
+async def test_evaluate_computes_the_same_rows_run_all_records_but_writes_none(
+    db, applicant_client, draft_ready_for_submission
+):
+    """B1: `evaluate` is the pure half of `run_all` — identical (check_type,
+    result) pairs, and not one `application_checks` row."""
+    from app.modules.applications import checks, repo
+    from app.modules.applications.models import ApplicationCheck
+
+    application = await repo.get_application(db, uuid.UUID(draft_ready_for_submission))
+    assert application is not None
+    count = (
+        select(func.count())
+        .select_from(ApplicationCheck)
+        .where(ApplicationCheck.application_id == application.id)
+    )
+    before = await db.scalar(count)
+    collected = await checks.evaluate(db, application)
+    assert await db.scalar(count) == before, "evaluate must not write"
+    recorded = await checks.run_all(db, application)
+    assert [(c, r) for c, r, _ in collected] == [(row.check_type, row.result) for row in recorded]
+
+
+async def test_missing_for_pricing_reads_items_from_memory_when_handed_them(
+    db, applicant, published_contour, grazing_activity_id, sheep_type_id
+):
+    """B1: a transient grazing application with in-memory items is complete;
+    the same object with `items=[]` is missing them — and nothing was read
+    from `application_items`, because the row was never inserted."""
+    from datetime import date
+
+    from app.modules.applications import checks
+    from app.modules.applications.models import Application, ApplicationItem
+
+    application = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        status="SUBMITTED",
+        channel="portal",
+        kind="new",
+        activity_type_id=grazing_activity_id,
+        contour_id=published_contour.id,
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 9, 30),
+    )
+    herd = [ApplicationItem(livestock_type_id=sheep_type_id, head_count=40)]
+    assert "items" not in await checks.missing_for_pricing(db, application, items=herd)
+    assert "items" in await checks.missing_for_pricing(db, application, items=[])
+    payload = await checks.calculation_payload(db, application, items=herd)
+    assert payload.items[0].count == 40
+    collected = await checks.evaluate(db, application, items=herd)
+    assert {c for c, _, _ in collected} >= {"norm_limit", "gis_within_fund"}
