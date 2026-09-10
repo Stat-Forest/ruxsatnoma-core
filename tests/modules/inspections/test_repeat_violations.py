@@ -95,6 +95,36 @@ async def test_applicant_id_filter_returns_only_that_applicants_cases(
     assert other_case["case_id"] not in ids
 
 
+async def test_the_list_puts_the_most_recently_updated_case_first(
+    db,
+    executor_head_client,
+    inspector,
+    inspector_client,
+    application: Application,
+    default_checklist_id: uuid.UUID,
+    vt_01: uuid.UUID,
+) -> None:
+    """`updated_at DESC`, `id DESC` only as the tie-break — the same rule
+    `GET /applications` and `GET /permits` follow: the older case, once the
+    head asks the violator for an explanation, climbs above the newer one
+    nobody has touched. The `applicant_id` filter makes the list exact."""
+    older = await _open_case_for(
+        db, inspector, inspector_client, application, default_checklist_id, vt_01
+    )
+    newer = await _open_case_for(
+        db, inspector, inspector_client, application, default_checklist_id, vt_01
+    )
+
+    touched = await executor_head_client.post(f"{API}/cases/{older['case_id']}/request-explanation")
+    assert touched.status_code == 200, touched.text
+
+    resp = await executor_head_client.get(
+        f"{API}/cases", params={"applicant_id": str(application.applicant_id)}
+    )
+    assert resp.status_code == 200, resp.text
+    assert [item["id"] for item in resp.json()["items"]] == [older["case_id"], newer["case_id"]]
+
+
 async def test_the_applicant_id_filter_still_obeys_the_case_scope(
     db,
     executor_head_client,

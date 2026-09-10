@@ -178,9 +178,14 @@ async def list_permits(
     which `admin.users_service.create_user` can create today, needs those two
     columns present in the statement.
 
-    Newest first by `id`: it is uuid7 and therefore time-ordered, so this is
-    `created_at DESC` served by the primary key rather than by a second index
-    (the same tie-break reasoning `norms.repo.newest_calculation` uses).
+    Most recently UPDATED first — `updated_at DESC`, then `id DESC` as the
+    tie-break (uuid7 is creation-ordered; `norms.repo.newest_calculation` uses
+    the same tie-break reasoning). The same rule as `applications.repo.
+    list_applications`, for the same reason: a permit that was just suspended,
+    resumed or activated belongs at the top of the leshoz's list, not under
+    every permit issued after it. `updated_at` moves on every ORM write to the
+    row (`service.set_status`, `_activate`, the expiry sweep) and not on a
+    child-table write alone. Served by `ix_permits_updated_at_id`.
     """
     conditions: list[Any] = [scope]
     for column, value in (
@@ -203,7 +208,7 @@ async def list_permits(
         select(Permit)
         .join(Organization, Organization.id == Permit.organization_id)
         .where(*conditions)
-        .order_by(Permit.id.desc())
+        .order_by(Permit.updated_at.desc(), Permit.id.desc())
         .offset(offset)
         .limit(limit)
     )

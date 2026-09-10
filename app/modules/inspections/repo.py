@@ -206,8 +206,14 @@ async def list_cases(
         # own zone's cases against that applicant.
         stmt = stmt.where(ViolationCase.applicant_id == applicant_id)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    # Most recently updated first, `id DESC` as the tie-break — the rule
+    # `applications.repo.list_applications` and `permits.repo.list_permits`
+    # follow, for the same reason: a case that just moved (explanation
+    # requested, explained, decided) belongs at the top of the head's list,
+    # not under every case opened after it. Served by
+    # `ix_violation_cases_updated_at_id`.
     stmt = (
-        stmt.order_by(ViolationCase.created_at.desc(), ViolationCase.id)
+        stmt.order_by(ViolationCase.updated_at.desc(), ViolationCase.id.desc())
         .limit(params.page_size)
         .offset(params.offset)
     )

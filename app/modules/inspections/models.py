@@ -220,6 +220,10 @@ class ViolationCase(Base):
             name="decision_valid",
         ),
         CheckConstraint("damage_amount IS NULL OR damage_amount >= 0", name="damage_non_negative"),
+        # `repo.list_cases` orders by `updated_at DESC, id DESC` — a backward
+        # scan of this index. Declared here as well as in migration 0057 so the
+        # autogenerate-diff guard stays empty (twin of `ix_applications_updated_at_id`).
+        Index("ix_violation_cases_updated_at_id", "updated_at", "id"),
     )
 
 
