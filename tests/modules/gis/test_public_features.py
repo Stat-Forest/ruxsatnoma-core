@@ -17,9 +17,16 @@ async def _layer(db: AsyncSession, code: str) -> GisLayer:
 
 
 async def test_a_public_layers_published_features_are_readable_anonymously(db: AsyncSession):
+    """`flush`, never `commit`: `service.public_features` reads through this
+    same session, and a COMMITTED published `forest_fund` row outlives the
+    test in the worker's shared database — from then on `gis.checks.
+    _within_fund` sees a non-empty layer and every later contour placed at
+    its own random spot fails `outside_forest_fund` on submit (the cross-
+    module journey did, under `-n 4`, once #202's tests shifted the
+    distribution). The `db` fixture's teardown rollback undoes a flush."""
     layer = await _layer(db, "forest_fund")
     published = await make_feature(db, layer, random_box_wkt(), status="published")
-    await db.commit()
+    await db.flush()
 
     collection = await service.public_features(db, "forest_fund")
     assert collection["type"] == "FeatureCollection"
@@ -32,7 +39,7 @@ async def test_a_draft_feature_on_a_public_layer_is_not_returned(db: AsyncSessio
     own id is absent, not that the whole collection is empty."""
     layer = await _layer(db, "forest_fund")
     draft = await make_feature(db, layer, random_box_wkt(), status="draft")
-    await db.commit()
+    await db.flush()
 
     collection = await service.public_features(db, "forest_fund")
     assert str(draft.id) not in {f["id"] for f in collection["features"]}

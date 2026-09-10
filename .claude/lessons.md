@@ -99,22 +99,20 @@ Tooling and environment.
 - **How to apply:** `alembic merge heads -m "merge"`; `make heads` is the gate — grep the
   test for the previous head string, since no task brief lists that file.
 - **Three confirmed mirrors, all from re-pointing `down_revision` by hand instead of merging:**
-  3.11b (2026-09-07) re-pointed `0023`'s parent from `0022` to `0025`; a database already past
-  `0023` never runs `0025` (`upgrade head` walks forward only, never back for a spliced-in
-  ancestor) — symptom `alembic_version = 0035` with `application_checks.created_by` missing,
-  500 on submit. 7.7 (2026-09-08) did the same reconciling `0038`/`0039` against `dev`'s
-  `0040`-`0042`: re-pointed `0039`→`0042` and `0040`→`0038`. A database stamped `0042` would
-  then run only `0039`, never `0038` — `admin/repo.py::list_activity_types` would 500 the
-  catalog, wizard and price calculator. Both fixed with a merge revision instead
-  (`merge_0039_0042`, verified from both heads on a scratch DB first). **A recorded revision
-  does not prove a schema** — only a `base`-up roundtrip sees a splice; an already-migrated DB doesn't.
-- **The one exception, 2026-09-07 — same id, not a splice:** stage 5.1 and stage 7.6 each
-  minted `0041` off `0040` five minutes apart; both CI runs passed (each against the base as
-  it was), so `dev` got `heads: 0041, 0041`, which `alembic merge heads` cannot merge (identical
-  ids). The second one is RENUMBERED and re-pointed at the first — the one case where editing
-  `down_revision` by hand is correct, since nothing has run it anywhere yet. Numbering by
-  convention has no lock, so the only real guard is repository-side ("branch up to date before
-  merging"), never a local hook.
+  3.11b (2026-09-07) re-pointed `0023`'s parent `0022`→`0025`; a database already past `0023`
+  never runs `0025` (`upgrade head` walks forward only, never back for a spliced-in ancestor) —
+  symptom `alembic_version = 0035` with `application_checks.created_by` missing, 500 on submit.
+  7.7 (2026-09-08) re-pointed `0039`→`0042` and `0040`→`0038` reconciling against `dev`: a
+  database stamped `0042` would run only `0039`, never `0038`, and `list_activity_types` would
+  500 the catalog. Both fixed with a merge revision (`merge_0039_0042`, verified from both heads
+  on a scratch DB). **A recorded revision does not prove a schema** — only a `base`-up roundtrip
+  sees a splice.
+- **The one exception, 2026-09-07 — same id, not a splice:** stages 5.1 and 7.6 each minted
+  `0041` off `0040` minutes apart; both CI runs passed against the base as it was, so `dev` got
+  `heads: 0041, 0041`, which `alembic merge heads` cannot merge. The second is RENUMBERED and
+  re-pointed at the first — the one case where editing `down_revision` by hand is right, since
+  nothing has run it anywhere yet (again 2026-09-11: `0056` twice, renumbered to `0057` before
+  the PR). Numbering has no lock; the only real guard is "branch up to date before merging".
 
 ## The PostGIS image installs extensions Alembic will then want to drop
 
@@ -157,9 +155,8 @@ Tooling and environment.
   shared DB ahead of your files (hit building 3.8).
 - **How to apply:** Before any manual Alembic CLI use, set the override. A revision error
   naming a version you don't have locally means check which DB you connected to first.
-- **Recovery:** Already ran it bare? Check `alembic_version` on the dev DB immediately; if it
-  now names one of YOUR unmerged revisions, `alembic downgrade` it back to where `dev`
-  actually is before touching anything else (hit and recovered clean in 3.10a t6, back to `0014`).
+- **Recovery:** Already ran it bare? Check `alembic_version` on the dev DB at once; if it names
+  one of YOUR unmerged revisions, `alembic downgrade` back to where `dev` is (3.10a t6, to `0014`).
 
 ## Amending an unmerged migration needs the OLD script to downgrade, the NEW one to upgrade
 
@@ -580,6 +577,11 @@ Tooling and environment.
   they assert `omitted` is reported HONESTLY — nothing asserts the REASON still holds.
 - **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
   fails once that module ships, or tie it to a tracked ticket.
+- **The claim can be wrong the day it is written (ruling #202):** #185 hard-coded "a zero with
+  no `benefit` line is a mispriced tariff, keep it pending" while `norms/calculator.py` already
+  wrote a SECOND lawful zero (`no_tariff_by_law`): every `science` application sat `INVOICED`
+  forever, and a fixed receiver made `split_payment(0, …)` refuse approval (dev, 2026-09-10).
+  Before an `else` over a value another module computes, grep that module for every writer.
 
 ## A guard that corrects a row's own column must be read back from that column, not from the raw answer it was given
 
@@ -926,7 +928,9 @@ Tooling and environment.
   default via `settings_store`'s 60-second cache (3.8 t6).
 - **How to apply:** Before combining a settings-override write with a call that could be
   refused, ask whether that call's whole point IS the refusal — if so, keep the write out of
-  that test entirely.
+  that test entirely. The test body's OWN `db.commit()` does the same: a `PaymentRecipient`
+  flushed on `db` survived `_issue_and_read`'s commit and stacked 15 000 onto every later split
+  (#202) — write such rows through `engine` and delete them at teardown (`platform_fixed_15000`).
 
 ## An unannotated test fixture parameter hides a `str | None` argument-type error pyright would catch
 

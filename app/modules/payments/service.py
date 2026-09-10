@@ -104,6 +104,12 @@ INVOICE_PAY = "invoice.pay"
 # `invoice.pay`): the ruling names the audit row itself, so it is copied
 # verbatim rather than reshaped to match the sibling constants above.
 INVOICE_SETTLE_BY_BENEFIT = "invoice.settled_by_benefit"
+# Ruling #202's sibling: the OTHER lawful zero — a statutory exemption
+# (`science`, priced `no_tariff_by_law` under the versioned
+# `tariff_exempt:<activity>` parameter) — settles the same way, under its
+# own audit action so a report can tell a benefit granted from a fee the law
+# never set. Same past-participle shape as #185's, for the same reason.
+INVOICE_SETTLE_BY_LAW = "invoice.settled_by_law"
 PAY_INTENT_CREATE = "payment_intent.create"
 # 3.10b task 8: money that was already confirmed going back (`record_reversal`).
 # "record", not "reverse": the money moved outside the system and this action
@@ -407,12 +413,70 @@ class BenefitClaim:
     name: str
 
 
-async def _settle_free(db: AsyncSession, *, invoice: Invoice, claim: BenefitClaim) -> None:
-    """Ruling #185: a zero-sum invoice from a benefit settles ITSELF, in the
-    SAME transaction `issue_invoice` created it in — called only from
-    there, after the invoice row (and its `invoice_recipients` snapshot)
-    already exist, so reports keep counting what was granted free and
-    under which category even though nothing was ever billed.
+def _exempt_activity_code(calculation: Calculation) -> str | None:
+    """Ruling #202's own condition, the twin of `_free_settlement_benefit_
+    code` above: `calculation.amount == 0` AND its `breakdown` carries a
+    `{"kind": "tariff", "reason": "no_tariff_by_law", ...}` line — the
+    statement `norms.calculator.calculate` writes ONLY when the versioned
+    `tariff_exempt:<activity>` parameter is published as `"true"` (a merely
+    missing tariff row raises `ERR-NORM-004` instead), so the line is a
+    fact of law, never an accident of an empty table. Returns that line's
+    own `activity_code`, or `None` for every other zero — the same
+    fail-closed half #185 keeps for itself."""
+    if calculation.amount != 0:
+        return None
+    for line in calculation.breakdown or []:
+        if not isinstance(line, dict) or line.get("kind") != "tariff":
+            continue
+        if line.get("reason") != "no_tariff_by_law":
+            continue
+        code = line.get("activity_code")
+        if isinstance(code, str):
+            return code
+    return None
+
+
+@dataclass(frozen=True)
+class StatutoryExemption:
+    activity_code: str
+    activity_name: str
+
+
+async def _exemption_of(
+    db: AsyncSession, application: Any, activity_code: str
+) -> StatutoryExemption | None:
+    """Ruling #202's pairing, mirroring `_verified_claim_of`: the activity
+    the CALCULATION was priced exempt for must be the APPLICATION's own
+    `activity_type_id`. `norms.service.save_calculation` binds a
+    calculation to the application's contour only (ruling 20), so a head
+    could bind one the calculator priced as `science` to a grazing
+    application, and a `no_tariff_by_law` line alone proves nothing about
+    THIS application. Returns the exemption (code and the activity's own
+    name, for the applicant's notice) or `None` — an application with no
+    activity, or a different one, keeps its plain `pending` invoice."""
+    activity_type_id = application.activity_type_id
+    if activity_type_id is None:
+        return None
+    activity = await admin_repo.get_activity_type(db, activity_type_id)
+    if activity is None or activity.code != activity_code:
+        return None
+    return StatutoryExemption(
+        activity_code=activity.code,
+        activity_name=str((activity.name or {}).get("uz_latn") or activity.code),
+    )
+
+
+async def _settle_free(
+    db: AsyncSession, *, invoice: Invoice, reason: BenefitClaim | StatutoryExemption
+) -> None:
+    """Rulings #185 and #202: a zero-sum invoice that is lawfully zero
+    settles ITSELF, in the SAME transaction `issue_invoice` created it in —
+    called only from there, after the invoice row (and its
+    `invoice_recipients` snapshot) already exist, so reports keep counting
+    what was granted free and why even though nothing was ever billed.
+    `reason` is the verified benefit claim (#185) or the statutory
+    exemption (#202); the two differ ONLY in the audit action and in the
+    notice the applicant reads — everything that moves state is shared.
 
     Writes exactly what a confirmed payment writes, MINUS the two things
     that require money to have actually moved: `invoice.status = 'paid'`,
@@ -428,18 +492,31 @@ async def _settle_free(db: AsyncSession, *, invoice: Invoice, claim: BenefitClai
     Deliberately does NOT write a `provider_transactions` row and does NOT
     call `ledger.split_payment`/`repo.add_allocations`: nothing arrived, so
     there is nothing to divide — a ledger entry here would claim money that
-    was never seen, and `service.is_settled_by_benefit` below reads the
+    was never seen, and `service.is_settled_without_payment` below reads the
     resulting ABSENCE of a `provider_transactions` row as this function's
     own signature."""
     invoice.status = "paid"
     invoice.paid_at = datetime.now(UTC)
 
+    if isinstance(reason, BenefitClaim):
+        audit_action = INVOICE_SETTLE_BY_BENEFIT
+        audit_value: dict[str, str] = {"benefit_code": reason.code}
+        notice_code = events.INVOICE_SETTLED_BY_BENEFIT
+        # The category's own name, never the code: «To'lov talab
+        # qilinmaydi: war_veterans» is what the review found in the SMS.
+        notice_params: dict[str, Any] = {"benefit": reason.name}
+    else:
+        audit_action = INVOICE_SETTLE_BY_LAW
+        audit_value = {"activity_code": reason.activity_code}
+        notice_code = events.INVOICE_SETTLED_BY_LAW
+        notice_params = {"activity": reason.activity_name}
+
     await audit.log(
         db,
-        action=INVOICE_SETTLE_BY_BENEFIT,
+        action=audit_action,
         object_type="invoice",
         object_id=invoice.id,
-        new_value={"benefit_code": claim.code},
+        new_value=audit_value,
     )
 
     application = await applications_service.set_status(
@@ -448,14 +525,9 @@ async def _settle_free(db: AsyncSession, *, invoice: Invoice, claim: BenefitClai
 
     await notifications_service.notify(
         db,
-        event_code=events.INVOICE_SETTLED_BY_BENEFIT,
+        event_code=notice_code,
         recipient_user_id=application.submitted_by_user_id,
-        params={
-            "invoice_number": invoice.number,
-            # The category's own name, never the code: «To'lov talab
-            # qilinmaydi: war_veterans» is what the review found in the SMS.
-            "benefit": claim.name,
-        },
+        params={"invoice_number": invoice.number, **notice_params},
         object_type="invoice",
         object_id=invoice.id,
     )
@@ -477,18 +549,21 @@ async def _settle_free(db: AsyncSession, *, invoice: Invoice, claim: BenefitClai
     )
 
 
-async def is_settled_by_benefit(db: AsyncSession, invoice: Invoice) -> bool:
-    """Ruling #185: whether `invoice` was settled through `_settle_free`
-    above — so the cabinet and the register can say "nothing to pay"
-    without parsing audit rows. Named WITHOUT a leading underscore since it
-    is read from `router.py` across files, the same convention `holds_
-    payments_view`'s own docstring states.
+async def is_settled_without_payment(db: AsyncSession, invoice: Invoice) -> bool:
+    """Rulings #185 and #202: whether `invoice` was settled through
+    `_settle_free` above — by a verified benefit OR a statutory exemption,
+    which this reader deliberately does not tell apart (the audit row does)
+    — so the cabinet and the register can say "nothing to pay" without
+    parsing audit rows. Renamed from `is_settled_by_benefit` when #202 made
+    that name a lie for a `science` invoice. Named WITHOUT a leading
+    underscore since it is read from `router.py` across files, the same
+    convention `holds_payments_view`'s own docstring states.
 
     **The cheapest honest derivation** (plan B4), checked in this order so
     the database is asked only for the rare row that is actually a
     candidate: `invoice.status == "paid"` AND `invoice.amount == 0` — the
-    ONLY zero this module ever settles for free (the fail-closed half of
-    the ruling: no other zero ever reaches `status='paid'`, since Payme's
+    ONLY zeros this module ever settles for free (the fail-closed half of
+    both rulings: no other zero ever reaches `status='paid'`, since Payme's
     own `-31001` pins `transaction.amount == invoice.amount` and
     `ManualConfirmationIn.amount` is bounded `gt=0`) — AND no `provider_
     transactions` row exists for it. A real payment, Payme's or the manual
@@ -651,6 +726,10 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     # the fail-closed half of the ruling.
     benefit_code = _free_settlement_benefit_code(calculation)
     claimed = await _verified_claim_of(db, application, benefit_code) if benefit_code else None
+    # Ruling #202, the other lawful zero, paired with the application's own
+    # activity the same way the benefit is paired with its claim.
+    exempt_code = _exempt_activity_code(calculation)
+    exemption = await _exemption_of(db, application, exempt_code) if exempt_code else None
     if benefit_code is not None and claimed is None:
         # Stage 10 review, finding 1 — the hiding shape again. A head can
         # POST a calculation with ANY `benefit_code` (`norms` binds it to
@@ -667,8 +746,18 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
             benefit_code=benefit_code,
             claim_status=application.benefit_verification_status,
         )
+    if exempt_code is not None and exemption is None:
+        logger.warning(
+            "payments.free_settlement_refused",
+            invoice_id=str(invoice.id),
+            application_id=str(application.id),
+            exempt_activity_code=exempt_code,
+            application_activity_type_id=str(application.activity_type_id),
+        )
     if claimed is not None:
-        await _settle_free(db, invoice=invoice, claim=claimed)
+        await _settle_free(db, invoice=invoice, reason=claimed)
+    elif exemption is not None:
+        await _settle_free(db, invoice=invoice, reason=exemption)
     else:
         await notifications_service.notify(
             db,

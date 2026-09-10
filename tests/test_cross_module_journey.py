@@ -1042,7 +1042,7 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                 await db.refresh(invoice)
                 assert invoice.status == "paid"
                 assert invoice.amount == Decimal("0.00")
-                assert await payments_service.is_settled_by_benefit(db, invoice) is True
+                assert await payments_service.is_settled_without_payment(db, invoice) is True
 
                 provider_txns = await db.scalars(
                     select(ProviderTransaction).where(ProviderTransaction.invoice_id == invoice.id)

@@ -116,7 +116,7 @@ async def add_provider_transaction(db: AsyncSession, transaction: ProviderTransa
 
 async def has_provider_transaction(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
     """Whether ANY `provider_transactions` row points at `invoice_id` — never
-    which one, never how many. `service.is_settled_by_benefit`'s own
+    which one, never how many. `service.is_settled_without_payment`'s own
     signature (ruling #185): a real payment, Payme's or the manual
     maker-checker door's synthetic `provider='manual'` row alike, ALWAYS
     writes one through `add_provider_transaction` above; `_settle_free`
