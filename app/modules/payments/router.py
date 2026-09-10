@@ -93,9 +93,10 @@ async def list_invoices(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(get_current_user)],
     # Optional (backend-gaps finding 3): given, this is the original
-    # application-scoped read; omitted, it is the register itself, gated in
-    # the service to `payments.view` holders only — see this file's own
-    # module docstring and `service.list_invoices_for_actor`'s.
+    # application-scoped read; omitted, it is the register for staff
+    # (`payments.view`/`payments.confirm`) and the caller's own invoices for
+    # anyone else (stage 11, ruling R1) — see this file's own module
+    # docstring and `service.list_invoices_for_actor`'s.
     application_id: uuid.UUID | None = None,
     status: Annotated[str | None, Query(pattern=_INVOICE_STATUS_PATTERN)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
