@@ -4,7 +4,10 @@ signature list on paper. Each `rows()` calls the list's own service
 function — `service.list_my_certificates` / `service.list_signatures_page`
 (ruling R2) — with the cap as the page size, then resolves every user id
 the sheet shows in ONE batch query (`auth.service.user_names`). Neither
-route has an adminka screen of its own today (backend only)."""
+route gets an Excel button from this track (out of its screen list) —
+`CertificatesSection.tsx` and `PermitSignaturesPanel.tsx` do read these
+routes, but each shows a small, single-owner/single-object list rather
+than a register."""
 
 import uuid
 from collections.abc import Sequence

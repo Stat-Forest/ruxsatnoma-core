@@ -1,9 +1,13 @@
 """Stage 13: `GET /certificates/export.xlsx` and `GET /signatures/export.xlsx`
 — the caller's own bound certificates and one object's signature list on
-paper. Neither route has an adminka screen of its own today (backend only).
-Fixtures reused from `test_api.py` (pre-flight ruling P4: this file adds its
-own where `test_api.py`'s do not fit, rather than growing the shared
-`conftest.py`)."""
+paper. Neither is wired to an Excel button by this track (out of its screen
+list): `src/pages/admin/profile/certificates/CertificatesSection.tsx` and
+`src/pages/permits/PermitSignaturesPanel.tsx` DO read these routes today,
+but each shows a small, single-owner/single-object list ("a handful of
+keys at most", that file's own comment) rather than a register — track
+report flags the correction. Fixtures reused from `test_api.py` (pre-flight
+ruling P4: this file adds its own where `test_api.py`'s do not fit, rather
+than growing the shared `conftest.py`)."""
 
 import io
 import uuid
