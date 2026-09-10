@@ -6,11 +6,14 @@ requires manage. Every route is audited inside the service it calls.
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
+from app.modules.admin import export
 from app.modules.admin import users_service as service
 from app.modules.admin.users_schemas import (
     OneTimePasswordOut,
@@ -46,6 +49,25 @@ async def list_users(
     actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
 ) -> Page[UserAdminOut]:
     return await service.list_users(db, params=params, filters=filters, actor=actor)
+
+
+@router.get("/users/export.xlsx")
+async def export_users_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    filters: Annotated[UserFilters, Depends()],
+    actor: Annotated[User, Depends(require_any_permission(USERS_VIEW, USERS_MANAGE))],
+    lang: xlsx.Lang = "uz_latn",
+) -> Response:
+    """`GET /admin/users` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same view-vs-manage scope, every matching row up to the
+    configured cap. Declared before `/admin/users/{user_id}` on purpose —
+    `export.xlsx` is not a UUID, and the 422 the UUID parser would answer is
+    a worse error than a 404."""
+    items, total, cap = await export.users_rows(db, actor=actor, filters=filters, lang=lang)
+    filename = f"foydalanuvchilar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_users(items, lang=lang), filename=filename, total=total, cap=cap
+    )
 
 
 @router.get("/users/stats", response_model=UserStatsOut)
