@@ -1647,9 +1647,14 @@ async def public_check(
     land-plot boundaries to anyone holding the QR code or the series and
     number, and the Agency has not given written consent yet. The flag is read
     HERE, once, on the found path only — never in the router, which must not
-    grow policy — and a `None` on the permit's own contour (no published
-    version left to draw) answers the same as the flag being off, never a
-    500.
+    grow policy — and a `None` on the permit's own contour (no such version
+    left to draw) answers the same as the flag being off, never a 500.
+
+    **The geometry is pinned to `permit.contour_version_id`, never the
+    contour's currently published version.** `gis.service.version_geometry`
+    reads that exact frozen row; it may since have been archived by a
+    boundary correction or a #91 split, and this page must still show what
+    the permit's own PDF printed, not what the map shows today.
     """
     # One decider for the channel, shared with the router's rate limit.
     channel = check_channel(qr_token=qr_token, series=series, number=number)
@@ -1665,7 +1670,7 @@ async def public_check(
 
     contour = None
     if await settings_store.get_bool(db, "public_permit_contour_enabled"):
-        contour = await gis_service.published_contour_geometry(db, permit.contour_id)
+        contour = await gis_service.version_geometry(db, permit.contour_version_id)
 
     await repo.add(db, QrCheckLog(permit_id=permit.id, result=RESULT_FOUND, channel=channel))
     return {
