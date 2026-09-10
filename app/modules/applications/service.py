@@ -2176,7 +2176,12 @@ async def submit(
         db,
         event_code=NOTIFY_APPLICATION_SUBMITTED,
         recipient_user_id=await _notification_recipient(db, application),
-        params={"application_number": number},
+        params={
+            "application_number": number,
+            **notifications_service.transition_params(
+                from_status=from_status, to_status=SUBMITTED_STATUS
+            ),
+        },
         object_type="application",
         object_id=application.id,
     )
@@ -2691,7 +2696,7 @@ async def return_to_applicant(
     if unknown:
         raise err("ERR-VAL-001", details={"reason": "unknown_field", "fields": unknown})
 
-    await _apply_transition(
+    entry = await _apply_transition(
         db,
         application,
         to_status=RETURNED_STATUS,
@@ -2705,7 +2710,12 @@ async def return_to_applicant(
         db,
         event_code=NOTIFY_APPLICATION_RETURNED,
         recipient_user_id=await _notification_recipient(db, application),
-        params={"application_number": application.number},
+        params={
+            "application_number": application.number,
+            **notifications_service.transition_params(
+                from_status=entry.from_status, to_status=entry.to_status
+            ),
+        },
         object_type="application",
         object_id=application.id,
     )
@@ -2804,7 +2814,7 @@ async def request_info(
             requested_at=_now(),
         ),
     )
-    await _apply_transition(
+    entry = await _apply_transition(
         db,
         application,
         to_status=PENDING_INFO_STATUS,
@@ -2816,7 +2826,12 @@ async def request_info(
         db,
         event_code=NOTIFY_APPLICATION_INFO_REQUESTED,
         recipient_user_id=await _notification_recipient(db, application),
-        params={"application_number": application.number},
+        params={
+            "application_number": application.number,
+            **notifications_service.transition_params(
+                from_status=entry.from_status, to_status=entry.to_status
+            ),
+        },
         object_type="application",
         object_id=application.id,
     )
