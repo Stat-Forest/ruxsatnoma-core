@@ -27,9 +27,10 @@ import uuid
 from datetime import date
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.schemas import PAGING_MAX, Page
@@ -37,7 +38,7 @@ from app.core.time import business_today
 from app.modules.admin import repo as admin_repo
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.norms import repo, service
+from app.modules.norms import export, repo, service
 from app.modules.norms.permissions import TARIFFS_MANAGE, TARIFFS_PUBLISH
 from app.modules.norms.schemas import (
     PublishOut,
@@ -78,6 +79,26 @@ async def list_parameters(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/rule-parameters/export.xlsx")
+async def export_parameters_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    code: str | None = None,
+    status: str | None = None,
+) -> Response:
+    """`GET /rule-parameters` as a spreadsheet (stage 13, ruling #204): the
+    same filters, every matching row up to the configured cap. Declared
+    before `POST /rule-parameters` for consistency with every other export
+    route, though nothing here collides with a path parameter (there is no
+    `GET /rule-parameters/{id}`)."""
+    items, total, cap = await export.rows_parameters(db, lang=lang, code=code, status=status)
+    filename = f"meyor-parametrlari-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_parameters(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
@@ -170,6 +191,38 @@ async def list_tariffs(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/tariffs/export.xlsx")
+async def export_tariffs_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    activity_code: str | None = None,
+    activity_type_id: uuid.UUID | None = None,
+    on_date: date | None = None,
+    status: str | None = None,
+) -> Response:
+    """`GET /tariffs` as a spreadsheet (stage 13, ruling #204): the same
+    filters (`activity_code` resolved the same way `list_tariffs` resolves
+    it), every matching row up to the configured cap. Declared before
+    `POST /tariffs` for consistency with every other export route, though
+    nothing here collides with a path parameter (there is no
+    `GET /tariffs/{id}`)."""
+    resolved_activity_type_id = await _resolve_activity_type_id(
+        db, activity_code=activity_code, activity_type_id=activity_type_id
+    )
+    items, total, cap = await export.rows_tariffs(
+        db,
+        lang=lang,
+        activity_type_id=resolved_activity_type_id,
+        on_date=on_date or business_today(),
+        status=status,
+    )
+    filename = f"tariflar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_tariffs(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 

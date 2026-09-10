@@ -27,17 +27,18 @@ import json
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, Query, Request, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files, settings_store
+from app.core import files, settings_store, xlsx
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.gis import import_service
+from app.modules.gis import export, import_service
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import IMPORT_STATUSES
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
@@ -141,6 +142,25 @@ async def list_imports(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/imports/export.xlsx")
+async def export_imports_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_any_permission(CONTOURS_MANAGE, CONTOURS_APPROVE))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[str | None, Query(pattern=_IMPORT_STATUS_PATTERN)] = None,
+) -> Response:
+    """`GET /gis/imports` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same zone scoping and permission gate, every matching row
+    up to the configured cap. Declared before `/imports/{import_id}` on
+    purpose — `export.xlsx` is not a UUID, and the 422 the UUID parser
+    would answer is a worse error than a 404."""
+    items, total, cap = await export.rows_imports(db, actor=user, lang=lang, status=status)
+    filename = f"importlar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_imports(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
