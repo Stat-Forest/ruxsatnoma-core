@@ -312,6 +312,21 @@ async def update_contour(
     return contour
 
 
+def _assert_geometry_or_declared_area(fields: Mapping[str, Any]) -> None:
+    """Decision #178: a version with neither geometry nor a declared area has
+    nothing to make `area_ha` (NOT NULL, > 0) out of. Pre-checked here, the
+    same way `create_contour` pre-checks its own same-request fields, so this
+    never reaches the DB CHECK (`geom_or_declared_area`) as an `IntegrityError`
+    — which `create_version`'s own `except IntegrityError` below would
+    misreport as `version_conflict`, the one collision that clause actually
+    owns."""
+    if fields.get("geojson") is not None or fields.get("wkb") is not None:
+        return
+    declared = fields.get("declared_area_ha")
+    if declared is None or declared <= 0:
+        raise err("ERR-VAL-001", details={"reason": "geometry_or_declared_area_required"})
+
+
 async def create_version(
     db: AsyncSession, contour_id: uuid.UUID, *, actor: Any, **fields: Any
 ) -> ContourVersion:
@@ -319,6 +334,7 @@ async def create_version(
     if contour is None:
         raise err("ERR-SYS-003")
     await _assert_in_zone(db, actor, contour.organization_id)
+    _assert_geometry_or_declared_area(fields)
     version_no = await repo.next_version_no(db, contour_id)
     try:
         version = await repo.insert_version(
@@ -453,6 +469,19 @@ async def split_contour(
     - `ERR-GIS-005 parent_not_published` — nothing to partition yet: a draft
       or never-drawn contour has no geometry of record for the two pieces to
       reconstruct.
+    - `ERR-GIS-005 parent_has_no_geometry` — decision #178: the parent's
+      published version was filed by requisites alone. There is no shape for
+      the two pieces to reconstruct either way, but this is a DIFFERENT state
+      from `parent_not_published` (the version genuinely is published) and a
+      caller acting on the refusal needs to tell them apart — attaching real
+      geometry to this contour later is a new version, `POST .../versions`,
+      never a split. Checked before the one PostGIS round trip
+      (`repo.split_partition_metrics`) reaches a NULL parent geometry, which
+      that function's own SQL has no branch for (every `CASE` there guards
+      the PIECES' own nullability, never the parent's) — unguarded, it would
+      leave `mismatch_m2` `None` for an entirely different reason than
+      `piece_zero_area` names, and the `assert` right after reading it back
+      would raise `AssertionError`, a 500, instead of a clean refusal.
     - `ERR-GIS-005 active_permit_on_parent` — the occupancy seam
       (`occupancy_ha`, filled by `permits.service.occupancy_provider` per
       `app/event_subscriptions.py`; ZERO through this seam with nothing
@@ -513,6 +542,8 @@ async def split_contour(
     parent_version = await repo.published_version(db, parent_id)
     if parent_version is None:
         raise err("ERR-GIS-005", details={"reason": "parent_not_published"})
+    if parent_version.geom is None:
+        raise err("ERR-GIS-005", details={"reason": "parent_has_no_geometry"})
     occupied_ha, _source = await occupancy_ha(db, parent_id)
     if occupied_ha > Decimal("0"):
         raise err("ERR-GIS-005", details={"reason": "active_permit_on_parent"})
@@ -611,7 +642,17 @@ async def update_version(
     db: AsyncSession, contour_id: uuid.UUID, version_id: uuid.UUID, *, actor: User, **fields: Any
 ) -> ContourVersion:
     """`PATCH /gis/contours/{id}/versions/{vid}` — draft only; anything else is a
-    409 (a published/archived/etc. version is a fact of record, not editable)."""
+    409 (a published/archived/etc. version is a fact of record, not editable).
+
+    Decision #178: a geometry-less draft's `area_ha` IS its `declared_area_ha`
+    (`repo.insert_version`'s own copy, on write) — patching the latter without
+    keeping the former in step would leave `area_ha` reporting a figure the
+    caller just corrected away from, silently, for every downstream reader that
+    trusts `area_ha` alone (module docstring: "every consumer keeps reading one
+    column"). Clearing `declared_area_ha` to `null` on such a version is
+    refused outright: it is the ONLY area this version has, and the DB CHECK
+    (`geom_or_declared_area`) would otherwise turn this into an `IntegrityError`
+    this function has no clause mapping to a clear reason."""
     contour = await repo.contour_by_id(db, contour_id)
     if contour is None:
         raise err("ERR-SYS-003")
@@ -621,6 +662,11 @@ async def update_version(
         raise err("ERR-SYS-003")
     if version.status != "draft":
         raise err("ERR-GIS-005", details={"reason": "not_draft"})
+    if version.geom is None and "declared_area_ha" in fields:
+        declared = fields["declared_area_ha"]
+        if declared is None or declared <= 0:
+            raise err("ERR-VAL-001", details={"reason": "declared_area_required_without_geometry"})
+        fields["area_ha"] = declared
     before = {key: _json_safe(getattr(version, key)) for key in fields}
     for key, value in fields.items():
         setattr(version, key, value)
@@ -1586,12 +1632,27 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
     same occupancy placeholder `list_contours` carries (ruling 14). Requires a
     published version to exist, for every role alike (mirrors `list_contours`'
     own join) — a contour that never reached `published` has nothing here yet
-    to show as its card."""
+    to show as its card.
+
+    Decision #178: `geometry` is `None` whenever there is none to show —
+    either the version itself carries no `geom` (`ST_AsGeoJSON(NULL)` is
+    `NULL`, and `json.loads(None)` raises `TypeError`, so this can never be
+    unconditional again) or the owning organization's `gis_enabled` switch is
+    off, in which case `geometry` stays `None` even on the rare row that
+    happens to carry real geometry anyway — the switch is the authoritative
+    "does this leshoz show a map" answer, matching `repo.contour_features_
+    geojson`'s own reasoning for the multi-contour layer. Every OTHER field
+    (`area_ha`, `occupied_ha`, `s_available_ha`, …) is unaffected either way:
+    pricing and capacity read those, never `geometry`."""
     row = await repo.contour_card(db, contour_id)
     if row is None:
         raise err("ERR-SYS-003")
     occupied, source = await occupancy_ha(db, contour_id)
     available, over_allocated = _available_ha(row.area_ha, occupied)
+    org = await admin_repo.get_organization(db, row.organization_id)
+    geometry = json.loads(row.geometry) if row.geometry is not None else None
+    if org is None or not org.gis_enabled:
+        geometry = None
     return {
         "id": row.contour_id,
         "number": row.number,
@@ -1599,7 +1660,7 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
         "kind": row.kind,
         "version_id": row.version_id,
         "area_ha": row.area_ha,
-        "geometry": json.loads(row.geometry),
+        "geometry": geometry,
         "occupied_ha": occupied,
         "s_available_ha": available,
         "over_allocated": over_allocated,
@@ -1644,7 +1705,13 @@ async def version_detail(
     as `list_versions`; a version outside it answers `ERR-SYS-003`, the same
     not-found shape `contour_card` uses for a contour with no published
     version — existence outside your own zone is not information this route
-    hands out."""
+    hands out.
+
+    `geometry` is `None` for a version filed by requisites alone (decision
+    #178) — `ST_AsGeoJSON(NULL)` is `NULL`, and this is the specialist's own
+    detail view of THEIR record, so unlike `contour_card` it reports whatever
+    is actually there rather than also gating on the organization's
+    `gis_enabled` switch."""
     zone = zone_filter(
         zone_of(actor),
         region_col=Organization.region_id,
@@ -1668,7 +1735,7 @@ async def version_detail(
         "approval_doc_id": row.approval_doc_id,
         "approved_by": row.approved_by,
         "published_at": row.published_at,
-        "geometry": json.loads(row.geometry),
+        "geometry": json.loads(row.geometry) if row.geometry is not None else None,
     }
 
 

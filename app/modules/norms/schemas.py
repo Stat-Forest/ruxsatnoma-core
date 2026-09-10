@@ -8,7 +8,15 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_serializer
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+)
 
 
 def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
@@ -185,6 +193,11 @@ class NormIn(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    # Ruling #176 (stage 9): the general capacity limit, in the activity's own
+    # `quantity_unit` — grazing keeps `max_sb` alone and refuses this field
+    # (`service.create_norm`), so a second source of truth for the same fact
+    # can never be written.
+    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -197,6 +210,7 @@ class NormPatch(BaseModel):
     the same way `TariffPatch` excludes its own key fields."""
 
     yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -215,6 +229,7 @@ class NormOut(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
     yield_c_per_ha: Decimal | None
+    capacity: Decimal | None
     season: dict[str, Any] | None
     rotation: dict[str, Any] | None
     max_sb: int | None
@@ -230,12 +245,95 @@ class NormOut(BaseModel):
 
     # Same fixed-scale-NUMERIC lesson as `TariffOut.coefficient` (plain `str`,
     # not the trim-then-rstrip dance `gis.schemas._trim_decimal` uses for a
-    # measured area): a yield figure is a caller-supplied rate like a
-    # coefficient, not a measured quantity, so the response shows the STORED
-    # precision rather than echoing the caller's own input shape.
-    @field_serializer("yield_c_per_ha")
-    def _yield_c_per_ha(self, value: Decimal | None) -> str | None:
+    # measured area): a yield figure — and `capacity`, ruling #176 — is a
+    # caller-supplied rate/limit like a coefficient, not a measured quantity,
+    # so the response shows the STORED precision rather than echoing the
+    # caller's own input shape.
+    @field_serializer("yield_c_per_ha", "capacity")
+    def _stored_precision_decimal(self, value: Decimal | None) -> str | None:
         return str(value) if value is not None else None
+
+
+# --- Ruling #177 (stage 9): the leshoz x activity season/minimum-term ------
+# dictionary (`activity_seasons`). No lifecycle (draft/review/published/…)
+# unlike Norm/Tariff/RuleParameter above — a plain current-value setting a
+# leshoz or the central office edits in place, unique on (organization_id,
+# activity_type_id) at the database. `season` reuses `Season` verbatim, the
+# same malformed-window guard `checks._in_window` already applies at read.
+
+
+class ActivitySeasonIn(BaseModel):
+    organization_id: uuid.UUID
+    activity_type_id: uuid.UUID
+    season: Season = Field(default_factory=Season)
+    min_term_days: Annotated[int, Field(gt=0)] | None = None
+
+
+class ActivitySeasonPatch(BaseModel):
+    """`organization_id`/`activity_type_id` are identity and stay out of this
+    patch, the same way `NormPatch` excludes `contour_id`/`activity_type_id`.
+
+    `min_term_days` backs a NULLABLE column — an explicit `null` clears the
+    minimum (no minimum enforced), the same `exclude_unset=True` idiom
+    `NormPatch.geobotanic_doc_id` already relies on. `season` backs a NOT
+    NULL column instead, so an explicit `null` here has no legal meaning —
+    to clear the windows a caller sends `{"windows": []}`, a real value, not
+    JSON `null` (same reasoning as `OrganizationPatch._reject_explicit_null_
+    gis_enabled`)."""
+
+    season: Season | None = None
+    min_term_days: Annotated[int, Field(gt=0)] | None = None
+
+    @field_validator("season", mode="after")
+    @classmethod
+    def _reject_explicit_null_season(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
+
+
+class ActivitySeasonOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    activity_type_id: uuid.UUID
+    season: dict[str, Any]
+    min_term_days: int | None
+    created_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class EffectiveSeasonOut(BaseModel):
+    """`GET /activity-seasons/effective` — task 4's public read for the
+    wizard: what ACTUALLY applies after ruling #177's override resolves,
+    through the SAME function the blocking check itself calls
+    (`checks.resolve_effective_windows`), so a date picker built from this
+    can never disagree with the check that fires if the applicant ignores it.
+
+    `windows` is the raw JSONB list (`{"from": "MM-DD", "to": "MM-DD"}`
+    dicts), not `list[SeasonWindow]` — deliberately: a contour's norm may
+    predate `schemas.Season`'s edge validation (`checks._in_window`'s own
+    docstring), and re-validating its windows through `SeasonWindow` here
+    would turn a pre-existing row's already-tolerated malformed window into
+    a 500 on a READ endpoint, the opposite of the fail-closed-but-never-
+    crashing property this stage exists to preserve.
+
+    `season_source` says WHICH source won: `"norm"` (the contour's own,
+    overriding), `"activity_season"` (the leshoz dictionary, the fallback)
+    or `"none"` (neither states one — today's unchanged meaning, no
+    restriction at all). `min_term_source` is always `"activity_season"` or
+    `"none"`: the minimum term has no norm-level override (ruling #177 only
+    speaks of overriding the WINDOWS)."""
+
+    activity_type_id: uuid.UUID
+    organization_id: uuid.UUID
+    contour_id: uuid.UUID | None
+    windows: list[dict[str, Any]]
+    season_source: Literal["norm", "activity_season", "none"]
+    min_term_days: int | None
+    min_term_source: Literal["activity_season", "none"]
 
 
 class PublishWarning(BaseModel):

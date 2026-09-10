@@ -104,10 +104,45 @@ async def insert_version(
 
     Geometry arrives EITHER as `geojson` (the API path, already WGS84) OR as
     `wkb=` + `srid=` (the import path — `gis.importer` reads the source file's
-    own projection and lets PostGIS transform it). Exactly one; neither or both
-    is an `AssertionError`. Both feed the SAME normalisation expression below,
-    so an imported version and a hand-drawn one are repaired identically.
+    own projection and lets PostGIS transform it) OR as NEITHER (decision #178:
+    a leshoz with no delivered GIS layer files a contour by requisites alone).
+    Both `geojson`/`wkb` feed the SAME normalisation expression below, so an
+    imported version and a hand-drawn one are repaired identically; the caller
+    (`gis.service.create_version`) has already confirmed a positive
+    `declared_area_ha` before reaching this branch, since that is the only
+    figure left to make `area_ha` (which stays NOT NULL either way) out of.
     """
+    if geojson is None and wkb is None:
+        row = (
+            await db.execute(
+                text(
+                    "INSERT INTO contour_versions (id, contour_id, version_no, geom, area_ha,"
+                    " declared_area_ha, source, accuracy_m, survey_date, effective_from,"
+                    " approval_doc_id, import_id, status, created_by)"
+                    " VALUES (:id, :contour_id, :version_no, NULL, :declared_area_ha,"
+                    " :declared_area_ha, :source, :accuracy_m, :survey_date, :effective_from,"
+                    " :approval_doc_id, :import_id, :status, :created_by)"
+                    " RETURNING id"
+                ),
+                {
+                    "id": uuid7(),
+                    "contour_id": contour_id,
+                    "version_no": version_no,
+                    "declared_area_ha": declared_area_ha,
+                    "source": source,
+                    "accuracy_m": accuracy_m,
+                    "survey_date": survey_date,
+                    "effective_from": effective_from,
+                    "approval_doc_id": approval_doc_id,
+                    "import_id": import_id,
+                    "status": status,
+                    "created_by": created_by,
+                },
+            )
+        ).scalar_one()
+        version = await db.get(ContourVersion, row)
+        assert version is not None  # just inserted in this transaction
+        return version
     geom_sql, geom_params = _geom_source_sql(geojson, wkb, srid)
     row = (
         await db.execute(
@@ -788,8 +823,22 @@ async def contour_features_geojson(
     per-contour aggregate over permits (`contour_card`'s own provider seam),
     and a map that draws 2,000 polygons would pay it 2,000 times for figures
     only the picked one ever shows.
+
+    Two conditions decision #178 adds, both load-bearing for the SAME reason
+    (`ST_AsGeoJSON(NULL)` is NULL, and `json.loads(None)` raises — never a row
+    this collection may return): `ContourVersion.geom.is_not(None)` drops any
+    contour filed by requisites alone, and `Organization.gis_enabled.is_(True)`
+    drops every contour of an organization the switch turns off, REGARDLESS of
+    whether that contour happens to carry geometry — the flag is the
+    authoritative "does this leshoz show a map" answer, not an inference from
+    what any one row happens to have on it today.
     """
-    conditions: list[Any] = [ContourVersion.status == "published", zone]
+    conditions: list[Any] = [
+        ContourVersion.status == "published",
+        ContourVersion.geom.is_not(None),
+        Organization.gis_enabled.is_(True),
+        zone,
+    ]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
     if bbox is not None:

@@ -8,7 +8,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.norms import repo, service
+from app.modules.admin import repo as admin_repo
+from app.modules.norms import calculator, repo, service
 from app.modules.norms.calculator import CalcRequest, NormFact, ParamSnapshot, TariffFact
 
 BASE_CODES = (
@@ -54,6 +55,15 @@ async def load_snapshot(
     values.update({code: row.value for code, row in group_rows.items()})
     values.update({code: row.value for code, row in exempt_rows.items()})
 
+    # The unit belongs to the ACTIVITY, not to its tariff: `science` has no
+    # tariff row by law and still measures something. Read through `admin.repo`
+    # like every other reference-data lookup here, never a direct
+    # `activity_types` query (module boundary, 'Reference data').
+    activity_types = await admin_repo.list_activity_types(db)
+    quantity_unit = next(
+        (a.quantity_unit for a in activity_types if a.id == activity_type_id), None
+    )
+
     tariff_rows = await repo.effective_tariffs(db, activity_type_id, request.on_date)
     tariffs = tuple(
         TariffFact(
@@ -68,6 +78,9 @@ async def load_snapshot(
 
     norm: NormFact | None = None
     load_sb, load_source = Decimal("0"), "none"
+    capacity_load, capacity_load_source = Decimal("0"), "none"
+    occupied_until: date | None = None
+    occupied_until_source = "none"
     if contour_id is not None:
         norm_row = await repo.effective_norm(db, contour_id, activity_type_id, request.on_date)
         if norm_row is not None:
@@ -77,11 +90,38 @@ async def load_snapshot(
                 max_sb=norm_row.max_sb,
                 season=norm_row.season,
                 rotation=norm_row.rotation,
+                capacity=norm_row.capacity,
             )
         load_sb, load_source = await service.committed_load_sb(
             db, contour_id, request.period_from, request.period_to
         )
+        # Ruling #176: which of the two NEW seams this request needs depends
+        # on whether a capacity resolves at all — never both, and never the
+        # wrong one. A capacity contour needs its committed quantity (this
+        # activity's own unit, `CAPACITY_LOAD_PROVIDERS`); a capacity-less one
+        # needs `EXCLUSIVITY_PROVIDERS` instead, since a sum can never answer
+        # "which day does it free up". Grazing resolves through `max_sb`
+        # above and its own `LOAD_PROVIDERS`-backed `load_sb`, so neither call
+        # below ever fires for it.
+        capacity = calculator.resolve_capacity(request.activity_code, norm)
+        if capacity is None:
+            occupied_until, occupied_until_source = await service.occupied_until(
+                db, contour_id, activity_type_id, request.period_from, request.period_to
+            )
+        elif request.activity_code != calculator.GRAZING:
+            capacity_load, capacity_load_source = await service.committed_capacity_load(
+                db, contour_id, activity_type_id, request.period_from, request.period_to
+            )
 
     return ParamSnapshot(
-        values=values, tariffs=tariffs, norm=norm, load_sb=load_sb, load_source=load_source
+        values=values,
+        tariffs=tariffs,
+        norm=norm,
+        load_sb=load_sb,
+        load_source=load_source,
+        capacity_load=capacity_load,
+        capacity_load_source=capacity_load_source,
+        occupied_until=occupied_until,
+        occupied_until_source=occupied_until_source,
+        quantity_unit=quantity_unit,
     )

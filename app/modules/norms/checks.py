@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError, err
 from app.modules.gis import service as gis_service
-from app.modules.norms import calculator
+from app.modules.norms import calculator, repo
 from app.modules.norms.calculator import (
     GRAZING,
     CalcRequest,
@@ -31,7 +31,7 @@ class CheckResult(TypedDict):
     details: dict[str, Any]
 
 
-BLOCKING = frozenset({"norm", "season", "rotation", "fire_ban", "limit"})
+BLOCKING = frozenset({"norm", "season", "min_term", "rotation", "fire_ban", "limit"})
 
 SEASON_ERROR = "ERR-NORM-003"
 
@@ -57,6 +57,7 @@ _ERROR_BY_CHECK = {
     "norm": "ERR-NORM-001",
     "limit": "ERR-NORM-002",
     "season": SEASON_ERROR,
+    "min_term": SEASON_ERROR,
     "rotation": SEASON_ERROR,
     "fire_ban": SEASON_ERROR,
 }
@@ -103,8 +104,37 @@ def _in_window(day: date, window: Any) -> bool:
     return start <= stamp <= end if start <= end else stamp >= start or stamp <= end
 
 
+def resolve_effective_windows(
+    norm_season: Mapping[str, Any] | None, dictionary_season: Mapping[str, Any] | None
+) -> tuple[list[Any], str]:
+    """Ruling #177's override order, and the ONE place it is decided — both
+    `_season_check` below and `service.effective_season` (task 4's public
+    read for the wizard) call this rather than each re-deriving the
+    precedence, so a date picker built from the public read can never
+    disagree with the check that fires if the applicant ignores it (lesson:
+    a precondition/decision shared by several callers belongs in one
+    function every one of them calls).
+
+    The contour's own norm wins when it states windows of its own; the
+    leshoz dictionary (`activity_seasons`, keyed by organization × activity)
+    is the fallback a leshoz states once instead of on every one of its
+    contours; neither present is `("none", [])` — today's exact meaning,
+    unchanged: `no_season_defined`. Reads both defensively (`isinstance`
+    before `.get`), the same fail-closed posture `_in_window` already uses —
+    a malformed `season`/`windows` value never crashes this function, it
+    simply does not count as "has windows"."""
+    if isinstance(norm_season, Mapping) and norm_season.get("windows"):
+        return list(norm_season["windows"]), "norm"
+    if isinstance(dictionary_season, Mapping) and dictionary_season.get("windows"):
+        return list(dictionary_season["windows"]), "activity_season"
+    return [], "none"
+
+
 def _season_check(
-    period_from: date, period_to: date, season: Mapping[str, Any] | None
+    period_from: date,
+    period_to: date,
+    norm_season: Mapping[str, Any] | None,
+    dictionary_season: Mapping[str, Any] | None,
 ) -> CheckResult:
     """Walks every day of the requested period, not just its two ends: two
     windows can each cover one end of a period while leaving a gap between them
@@ -115,18 +145,58 @@ def _season_check(
     is both correct and cheap — no need to reason about which window edges
     could matter.
 
-    No `windows` configured is not the same as "always in season" — it means
-    this norm never recorded one, so the check reports `skipped` rather than
-    asserting something nobody verified."""
-    if not season or not season.get("windows"):
+    No windows resolved at all (`resolve_effective_windows` — neither the
+    contour's own norm nor the leshoz dictionary states any) is not the same
+    as "always in season" — it means nobody has recorded one anywhere, so the
+    check reports `skipped` rather than asserting something nobody verified.
+    `details.source` says which of the two won when one did (ruling #177),
+    so a caller can tell a norm override from the leshoz default without a
+    second round trip."""
+    windows, source = resolve_effective_windows(norm_season, dictionary_season)
+    if not windows:
         return {"check": "season", "result": "skipped", "details": {"reason": "no_season_defined"}}
-    windows = season["windows"]
     day = period_from
     while day <= period_to:
         if not any(_in_window(day, window) for window in windows):
-            return {"check": "season", "result": "fail", "details": {"reason": "outside_season"}}
+            return {
+                "check": "season",
+                "result": "fail",
+                "details": {"reason": "outside_season", "source": source},
+            }
         day += timedelta(days=1)
-    return {"check": "season", "result": "pass", "details": {}}
+    return {"check": "season", "result": "pass", "details": {"source": source}}
+
+
+def _min_term_check(period_from: date, period_to: date, min_term_days: int | None) -> CheckResult:
+    """Ruling #177 task 3: the leshoz dictionary's own `min_term_days`,
+    blocking, `details.min_term_days` carried on every outcome (not just the
+    failure) so the UI can STATE the rule rather than merely enforce it.
+
+    No norm-level override exists for this figure — the ruling only speaks
+    of overriding the WINDOWS — so it reads `activity_seasons` alone; no
+    dictionary row, or the column left NULL, means no minimum is enforced
+    (`skipped`), never a manufactured zero. `requested_days` is inclusive
+    of both ends (`payments.refunds`'s own `total_days` convention for "how
+    many days is this period"), so a one-day request against a one-day
+    minimum passes rather than failing by construction."""
+    if min_term_days is None:
+        return {
+            "check": "min_term",
+            "result": "skipped",
+            "details": {"reason": "no_min_term_defined"},
+        }
+    requested_days = (period_to - period_from).days + 1
+    if requested_days < min_term_days:
+        return {
+            "check": "min_term",
+            "result": "fail",
+            "details": {
+                "reason": "period_too_short",
+                "min_term_days": min_term_days,
+                "requested_days": requested_days,
+            },
+        }
+    return {"check": "min_term", "result": "pass", "details": {"min_term_days": min_term_days}}
 
 
 def _rotation_check(
@@ -235,37 +305,137 @@ async def _territory_checks(
     return fire_ban, restriction_result
 
 
-def _limit_check(snapshot: ParamSnapshot, used_sb: Decimal | None) -> CheckResult:
-    """Open question #1 from Task 5's review: nothing compared `used_sb`
-    against `remaining_sb` until this check exists — `remaining_sb` here is
-    the SAME NUMBER `calculator.calculate` stores, because both call
-    `calculator.remaining_sb` (`max_sb −` committed load, excluding the
-    request's own load, rounded by `rounding_heads`) rather than each
-    subtracting for itself. Until I1 they each recomputed it identically and
-    unrounded, which is how they would have drifted — and the unrounded form
-    compared a request against a fraction of a conditional head that ruling
-    19 says to take away.
+def _resolve_requested(request: CalcRequest, used_sb: Decimal | None) -> Decimal | None:
+    """What is being asked for, in the capacity's own unit. Grazing compares
+    conditional heads (`used_sb`) — a PRICED fact `calculator.calculate`
+    derives from `coef_sb:<code>` and hands in, never re-derived here, the
+    same "checks without the money" boundary this module's own reviewer path
+    already drew (`run_checks`'s `used_sb=None` caller). Every other activity
+    compares the plain declared `request.quantity` instead: VMQ 278's
+    quantity needs no pricing step to be known, so it is available even on
+    that unpriced path — which is why a haymaking/apiary/deadwood/recreation
+    admissibility screen can now show a real capacity comparison where
+    grazing's own screen still shows `skipped`."""
+    if request.activity_code == GRAZING:
+        return used_sb
+    return request.quantity
 
-    `used_sb=None` is the reviewer-facing path — checks without the money —
-    and is reported `skipped`, never a manufactured zero load. A norm with no
-    `max_sb` (never frozen, or no norm at all) has nothing to compare against
-    either, and is `skipped` the same way."""
-    if used_sb is None:
+
+def _capacity_unit(request: CalcRequest, snapshot: ParamSnapshot) -> str | None:
+    """The unit the three capacity numbers are counted in — the one thing
+    `requested`/`capacity`/`remaining` cannot be read without.
+
+    Integration finding, stage 9 wave 1: T4 generalised the check across every
+    activity and T3 rendered it, but nothing carried the unit, so a refusal
+    said «40 of 100» with no way to know whether that meant hectares, hives or
+    cubic metres. Grazing answers `"sb"` (условная голова) because its numbers
+    are conditional heads rather than the tariff's own billing unit; every
+    other activity answers its own `activity_types.quantity_unit`, carried on
+    the snapshot. It is deliberately NOT read off the tariff rows beside it:
+    `science` has no tariff row by law (`tz/06`) and still measures something.
+    A snapshot built without a unit — every construction predating this stage,
+    tests included — answers `None`, and the refusal then states no unit
+    instead of inventing one.
+    """
+    if request.activity_code == GRAZING:
+        return "sb"
+    return snapshot.quantity_unit
+
+
+def _capacity_result(
+    request: CalcRequest,
+    snapshot: ParamSnapshot,
+    capacity: Decimal,
+    used_sb: Decimal | None,
+) -> CheckResult:
+    """Ruling #176: `requested ≤ capacity − committed` — the same shape for
+    every activity, differing only in which committed-load seam and which
+    rounding rule apply. Open question #1 from Task 5's original review:
+    nothing compared a request against its remainder until this check
+    existed for grazing; the three keys below (`requested`/`capacity`/
+    `remaining`) are the generalised, activity-agnostic names the front-end
+    renders — never the grazing-only `used_sb`/`max_sb`/`remaining_sb` this
+    check used to answer with."""
+    requested = _resolve_requested(request, used_sb)
+    if requested is None:
+        # The reviewer-facing path for grazing (`used_sb=None`) — checks
+        # without the money — never a manufactured zero demand.
         return {"check": "limit", "result": "skipped", "details": {"reason": "not_computed"}}
-    norm = snapshot.norm
-    if norm is None or norm.max_sb is None:
-        return {"check": "limit", "result": "skipped", "details": {"reason": "no_limit"}}
-    committed_sb = snapshot.load_sb
-    remaining_sb = calculator.remaining_sb(norm.max_sb, committed_sb, snapshot.values)
+    if request.activity_code == GRAZING:
+        # Unchanged math: `calculator.remaining_sb` floors by `rounding_heads`
+        # (ruling 19 — a limit is never rounded in the applicant's favour),
+        # the SAME number `calculator.calculate` stores, so the two can never
+        # drift apart (Task 5/I1's own reasoning, preserved).
+        committed = snapshot.load_sb
+        remaining = calculator.remaining_sb(int(capacity), committed, snapshot.values)
+        load_source = snapshot.load_source
+    else:
+        # A continuous unit (ha, m3, person_day, hive) — no integer floor to
+        # apply; the raw Decimal comparison is the whole rule.
+        committed = snapshot.capacity_load
+        remaining = capacity - committed
+        load_source = snapshot.capacity_load_source
     details = {
-        "used_sb": jsonable(used_sb),
-        "max_sb": norm.max_sb,
-        "committed_sb": jsonable(committed_sb),
-        "remaining_sb": jsonable(remaining_sb),
-        "load_source": snapshot.load_source,
+        "requested": jsonable(requested),
+        "capacity": jsonable(capacity),
+        "committed": jsonable(committed),
+        "remaining": jsonable(remaining),
+        "load_source": load_source,
+        "unit": _capacity_unit(request, snapshot),
     }
-    result = "fail" if used_sb > remaining_sb else "pass"
+    result = "fail" if requested > remaining else "pass"
     return {"check": "limit", "result": result, "details": details}
+
+
+def _exclusivity_result(snapshot: ParamSnapshot) -> CheckResult:
+    """Ruling #176, Oybek's option а: NO capacity at all — no norm, or the
+    relevant column left unset — is EXCLUSIVE for the period, never
+    unlimited. This deliberately changes grazing too: a norm with a null
+    `max_sb` used to report `skipped`/`no_limit` here; it now lands in this
+    same exclusive branch as every other capacity-less activity, because
+    absence of a number was never permission to double-book.
+
+    `occupied_until_source` tells apart the two HONEST outcomes from a third
+    one this never reports: `"none"` means `EXCLUSIVITY_PROVIDERS` has
+    nothing registered yet and the question could not be asked at all
+    (`skipped`, never a manufactured "free"); `"permits"` means it WAS asked,
+    and answers either the day the contour frees up or that nothing
+    overlaps."""
+    if snapshot.occupied_until_source == "none":
+        return {
+            "check": "limit",
+            "result": "skipped",
+            "details": {"reason": "no_occupancy_provider"},
+        }
+    if snapshot.occupied_until is not None:
+        return {
+            "check": "limit",
+            "result": "fail",
+            "details": {
+                "reason": "exclusive_occupied",
+                "occupied_until": jsonable(snapshot.occupied_until),
+            },
+        }
+    return {"check": "limit", "result": "pass", "details": {"reason": "exclusive_available"}}
+
+
+def _limit_check(
+    request: CalcRequest, snapshot: ParamSnapshot, used_sb: Decimal | None
+) -> CheckResult:
+    """Ruling #176 (stage 9): the one general limit check, replacing the
+    grazing-only pair this function used to be. Resolves the capacity for
+    THIS activity (`calculator.resolve_capacity` — grazing's `max_sb`,
+    everything else's own `capacity`) and, when one exists, refuses a
+    request that would exceed what remains after the committed load for an
+    OVERLAPPING period (`_capacity_result`); when none exists at all, the
+    contour is EXCLUSIVE for the period, not unlimited (`_exclusivity_result`).
+    `ERR-NORM-002`, BLOCKING either way — `checks.BLOCKING`/`_ERROR_BY_CHECK`
+    are unchanged, only what fills `details` for the same `"limit"` check
+    name differs by branch."""
+    capacity = calculator.resolve_capacity(request.activity_code, snapshot.norm)
+    if capacity is None:
+        return _exclusivity_result(snapshot)
+    return _capacity_result(request, snapshot, capacity, used_sb)
 
 
 async def run_checks(
@@ -304,19 +474,38 @@ async def run_checks(
     if (period_to - period_from).days > MAX_PERIOD_DAYS:
         raise err("ERR-VAL-001", details={"reason": "period_too_long"})
 
+    # Ruling #177: the leshoz dictionary (`activity_seasons`) is resolved
+    # once per contour × activity, regardless of whether a norm exists at
+    # all — the whole point of the ruling is a season stated even where no
+    # geobotanical survey, and therefore no `Norm`, exists yet.
+    # `organization_id` is None only when the contour itself cannot be
+    # resolved, which `service._build_request_and_snapshot` already refuses
+    # before this function is ever reached — kept defensive here since this
+    # module is the shared entry point 3.9 also calls directly.
+    organization_id = await gis_service.contour_organization(db, contour_id)
+    dictionary_row = (
+        await repo.get_activity_season(db, organization_id, activity_type_id)
+        if organization_id is not None
+        else None
+    )
+    dictionary_season = dictionary_row.season if dictionary_row is not None else None
+    dictionary_min_term = dictionary_row.min_term_days if dictionary_row is not None else None
+
     results: list[CheckResult] = [_norm_check(request, snapshot.norm)]
 
+    norm_season = snapshot.norm.season if snapshot.norm is not None else None
+    results.append(_season_check(period_from, period_to, norm_season, dictionary_season))
+    results.append(_min_term_check(period_from, period_to, dictionary_min_term))
+
     if snapshot.norm is not None:
-        results.append(_season_check(period_from, period_to, snapshot.norm.season))
         results.append(_rotation_check(period_from, period_to, snapshot.norm.rotation))
     else:
-        results.append({"check": "season", "result": "skipped", "details": {"reason": "no_norm"}})
         results.append({"check": "rotation", "result": "skipped", "details": {"reason": "no_norm"}})
 
     fire_ban, restrictions = await _territory_checks(db, contour_id, period_from, period_to)
     results.append(fire_ban)
     results.append(restrictions)
 
-    results.append(_limit_check(snapshot, used_sb))
+    results.append(_limit_check(request, snapshot, used_sb))
 
     return results

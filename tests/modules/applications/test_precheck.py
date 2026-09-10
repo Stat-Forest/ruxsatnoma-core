@@ -31,7 +31,10 @@ async def test_an_over_limit_herd_is_reported_not_refused(
 
     limit = next(c for c in result.json()["checks"] if c["check_type"] == "norm_limit")
     assert limit["result"] == "fail"
-    assert "max_sb" in limit["details"]
+    # Renamed by ruling #176: the check is no longer grazing-only, so the
+    # capacity and what is left of it are stated in the activity's own unit.
+    assert "capacity" in limit["details"]
+    assert "remaining" in limit["details"]
 
 
 async def test_a_precheck_writes_a_new_row_every_time(

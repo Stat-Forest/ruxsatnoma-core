@@ -85,10 +85,34 @@ def jsonable(value: Any) -> Any:
     return value
 
 
+_NO_GEOMETRY_CHECK_NAMES = ("validity", "within_fund", "restrictions", "overlap")
+
+
 async def run_checks(
     db: AsyncSession, *, version_id: uuid.UUID, on_date: date | None = None
 ) -> list[CheckResult]:
+    """Decision #178: a version filed by requisites alone (`geom IS NULL`) can
+    never be asserted valid, inside the fund, clear of restrictions or clear of
+    an overlap — nobody can know any of that with no geometry to test. Every
+    check reports `skipped`/`no_geometry` instead, the same shape `_within_fund`
+    already uses for an empty reference layer, rather than the four sub-checks
+    below silently reading a NULL `geom` as "nothing to complain about" (`ST_*`
+    over NULL is NULL, which `ST_IsValid`/`ST_Intersects` et al. would each turn
+    into their own `pass` — the hiding direction this project's defects keep
+    failing in). `db.scalar` on a non-existent `version_id` returns `None` too,
+    which is falsy here exactly like `False` — deliberately: that case falls
+    through to the ordinary checks below and fails exactly as it did before
+    this guard existed (the caller resolves the version's existence, not this
+    function)."""
     on_date = on_date or business_today()
+    geom_is_null = await db.scalar(
+        text("SELECT geom IS NULL FROM contour_versions WHERE id = :vid"), {"vid": version_id}
+    )
+    if geom_is_null:
+        return [
+            {"check": name, "result": "skipped", "details": {"reason": "no_geometry"}}
+            for name in _NO_GEOMETRY_CHECK_NAMES
+        ]
     tolerance = await settings_store.get_int(db, "gis_overlap_tolerance_m2")
     return [
         await _validity(db, version_id),

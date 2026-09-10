@@ -311,6 +311,84 @@ async def test_patch_updates_and_audits_old_value(db, agency):
     assert entry.new_value["name"]["uz_cyrl"] == "Янги ном"
 
 
+async def test_new_organizations_default_to_gis_enabled(db, agency):
+    """Decision #178: the switch defaults ON, so nothing else has to opt in."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.post(
+            f"{API}/admin/organizations",
+            json={
+                "kind": "leshoz",
+                "parent_id": str(agency.id),
+                "code": f"gis-default-{suffix}",
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+            },
+        )
+    assert r.status_code == 201, r.text
+    assert r.json()["gis_enabled"] is True
+
+
+async def test_the_central_admin_switches_gis_enabled_off_and_it_is_audited(db, agency):
+    """Decision #178: a per-leshoz switch, editable through the existing admin
+    surface — false means that leshoz files contours by requisites and shows no
+    map (`gis.service.contour_card`/`contour_features_geojson` read it back)."""
+    suffix = uuid.uuid4().hex[:6]
+    user, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    org = Organization(
+        kind="leshoz",
+        code=f"gis-off-{suffix}",
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
+        parent_id=agency.id,
+    )
+    db.add(org)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.patch(f"{API}/admin/organizations/{org.id}", json={"gis_enabled": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["gis_enabled"] is False
+
+    entry = (
+        await db.execute(
+            select(AuditLog)
+            .where(AuditLog.action == "organization.update", AuditLog.object_id == org.id)
+            .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    assert entry.old_value["gis_enabled"] is True
+    assert entry.new_value["gis_enabled"] is False
+
+
+async def test_patch_rejects_an_explicit_null_for_gis_enabled(db, agency):
+    """`gis_enabled` backs a NOT NULL column — an explicit JSON `null` must 422,
+    never reach `setattr` and fail the CHECK as an unhandled 500."""
+    suffix = uuid.uuid4().hex[:6]
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    org = Organization(
+        kind="leshoz",
+        code=f"gis-null-{suffix}",
+        name={"uz_cyrl": "Х", "uz_latn": "X"},
+        parent_id=agency.id,
+    )
+    db.add(org)
+    await db.flush()
+    await db.commit()
+
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.patch(f"{API}/admin/organizations/{org.id}", json={"gis_enabled": None})
+    assert r.status_code == 422
+
+
 async def test_archive_blocked_while_active_children_exist(db, agency):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)

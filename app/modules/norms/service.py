@@ -34,9 +34,16 @@ from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
 from app.modules.norms import calculator, checks, repo
 from app.modules.norms import params as norm_params
-from app.modules.norms.models import Calculation, Norm, RuleParameter, Tariff
+from app.modules.norms.models import ActivitySeason, Calculation, Norm, RuleParameter, Tariff
 from app.modules.norms.permissions import TARIFFS_PUBLISH
-from app.modules.norms.schemas import CalculationIn, NormIn, NormPatch, PublicEstimateIn
+from app.modules.norms.schemas import (
+    ActivitySeasonIn,
+    ActivitySeasonPatch,
+    CalculationIn,
+    NormIn,
+    NormPatch,
+    PublicEstimateIn,
+)
 
 
 @dataclass(frozen=True)
@@ -448,6 +455,82 @@ async def committed_load_sb(
     return total, "permits"
 
 
+# --- Ruling #176 (stage 9, docs/decisions.md): capacity generalises beyond ---
+# grazing's `max_sb`/`LOAD_PROVIDERS` pair to every other activity, in its own
+# `quantity_unit` — a SEPARATE seam because the unit differs per activity and
+# grazing's own `sb_load` column carries none of it. Same registration idiom,
+# same "never manufacture a measurement" property: T6 (wave 2 of this stage)
+# registers the permits-side query; left empty here, exactly like
+# `LOAD_PROVIDERS` was until 3.11 registered `permits.service.load_provider`.
+CapacityLoadProvider = Callable[
+    [AsyncSession, uuid.UUID, uuid.UUID, date, date], Awaitable[Decimal]
+]
+CAPACITY_LOAD_PROVIDERS: list[CapacityLoadProvider] = []
+
+
+async def committed_capacity_load(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+) -> tuple[Decimal, str]:
+    """The non-grazing sibling of `committed_load_sb`: quantity already
+    committed on this contour, in the ACTIVITY'S OWN unit, for an overlapping
+    period — `activity_type_id` is part of the question (unlike grazing's
+    seam) because one contour may carry permits for more than one activity,
+    each in a unit the others' quantities must never be summed into. Empty
+    until a provider registers, and the source string says so — the same
+    `LOAD_PROVIDERS` property, preserved exactly: a caller can never read the
+    placeholder zero as a measurement."""
+    if not CAPACITY_LOAD_PROVIDERS:
+        return Decimal("0"), "none"
+    total = Decimal("0")
+    for provider in CAPACITY_LOAD_PROVIDERS:
+        total += await provider(db, contour_id, activity_type_id, period_from, period_to)
+    return total, "permits"
+
+
+# Ruling #176, Oybek's option а: a contour with NO capacity at all — no norm,
+# or the relevant column left unset — is EXCLUSIVE for the requested period,
+# never unlimited. Answering "is it free" needs more than a boolean: a refusal
+# must name the day the contour frees up, so this seam reports the LATEST day
+# still covered by an overlapping ACTIVE permit (for this contour × activity),
+# or `None` when nothing overlaps. Same registration idiom as the two seams
+# above; T6 registers the query against `permits` in the next wave. Left
+# empty, this seam can prove nothing occupied — `checks._limit_check` reports
+# `skipped`/`no_occupancy_provider` rather than a manufactured "free", the
+# same discipline `LOAD_PROVIDERS`'s own placeholder observes for a load.
+ExclusivityProvider = Callable[
+    [AsyncSession, uuid.UUID, uuid.UUID, date, date], Awaitable[date | None]
+]
+EXCLUSIVITY_PROVIDERS: list[ExclusivityProvider] = []
+
+
+async def occupied_until(
+    db: AsyncSession,
+    contour_id: uuid.UUID,
+    activity_type_id: uuid.UUID,
+    period_from: date,
+    period_to: date,
+) -> tuple[date | None, str]:
+    """The latest day an overlapping ACTIVE permit (for this contour ×
+    activity) still covers, across every registered provider — `None` when
+    nothing overlaps. The source distinguishes "asked, and the answer is
+    free" (`"permits"` with `None`) from "never asked at all" (`"none"`,
+    because `EXCLUSIVITY_PROVIDERS` is still empty) — `checks._limit_check`
+    is refused the second reading on purpose, the same way an empty
+    `LOAD_PROVIDERS` is never read as a real zero load."""
+    if not EXCLUSIVITY_PROVIDERS:
+        return None, "none"
+    latest: date | None = None
+    for provider in EXCLUSIVITY_PROVIDERS:
+        until = await provider(db, contour_id, activity_type_id, period_from, period_to)
+        if until is not None and (latest is None or until > latest):
+            latest = until
+    return latest, "permits"
+
+
 async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm:
     """A fresh draft (VMQ 689: the leshoz GIS specialist drafts from a
     geobotanical survey). No period check yet — like `create_versioned`, that
@@ -455,8 +538,14 @@ async def create_norm(db: AsyncSession, payload: NormIn, *, actor: User) -> Norm
     required only to submit for review (`submit_norm_review`)."""
     await _assert_norm_zone(db, actor, payload.contour_id)
     known = await admin_repo.list_activity_types(db)
-    if not any(activity.id == payload.activity_type_id for activity in known):
+    activity = next((a for a in known if a.id == payload.activity_type_id), None)
+    if activity is None:
         raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    # Ruling #176: grazing's capacity IS `max_sb` — a `capacity` value here
+    # too would be a second source of truth for the same fact, so it is
+    # refused rather than silently ignored.
+    if payload.capacity is not None and activity.code == calculator.GRAZING:
+        raise err("ERR-VAL-001", details={"reason": "capacity_not_allowed_for_grazing"})
     if payload.geobotanic_doc_id is not None:
         # An EXISTENCE check (lesson), the same one `approve_norm` already
         # applies to `approval_doc_id` — reusing `_assert_doc_active` rather
@@ -502,6 +591,13 @@ async def update_norm(
     if norm.status not in ("draft", "review"):
         raise err("ERR-NORM-005", details={"reason": "not_draft"})
     fields = patch.model_dump(exclude_unset=True, by_alias=True)
+    if fields.get("capacity") is not None:
+        # Same ruling #176 guard `create_norm` applies — a PATCH is one HTTP
+        # verb over from that create-time check, and `activity_type_id` is
+        # identity here (excluded from `NormPatch`), so it is read off the
+        # existing row rather than the request body.
+        if await _resolve_activity_code(db, norm.activity_type_id) == calculator.GRAZING:
+            raise err("ERR-VAL-001", details={"reason": "capacity_not_allowed_for_grazing"})
     if fields.get("geobotanic_doc_id") is not None:
         await _assert_doc_active(db, fields["geobotanic_doc_id"], reason="geobotanic_doc_required")
     effective_from = fields.get("effective_from", norm.effective_from)
@@ -706,6 +802,196 @@ async def archive_norm(db: AsyncSession, norm_id: uuid.UUID, *, actor: User) -> 
         new_value=_snapshot(norm),
     )
     return norm
+
+
+# --- Ruling #177 (stage 9): the leshoz x activity season/minimum-term --------
+# dictionary. No lifecycle the way Norm/Tariff/RuleParameter have one — a
+# plain current-value setting, edited in place, unique on (organization_id,
+# activity_type_id) at the database (`uq_activity_seasons_org_activity`).
+# Zone-scoped through the SAME idiom `_assert_norm_zone` uses above, minus
+# the contour lookup: the caller already names the organization directly.
+
+
+async def _activity_season_or_404(
+    db: AsyncSession, activity_season_id: uuid.UUID
+) -> ActivitySeason:
+    row = await db.get(ActivitySeason, activity_season_id)
+    if row is None:
+        raise err("ERR-SYS-003")
+    return row
+
+
+async def _assert_organization_zone(
+    db: AsyncSession, actor: User, organization_id: uuid.UUID
+) -> None:
+    """Ruling #177: "editable by the leshoz for itself and by the central
+    admin for anyone" — a zone-scoped actor (the leshoz's own gis_specialist)
+    may act only on THEIR OWN organization; a zone-free actor (central
+    office) may act on any. Identical reasoning to `_assert_norm_zone`,
+    without a contour to resolve first: the caller already names the
+    organization directly (`payload.organization_id` on create, the existing
+    row's own column on update)."""
+    zone = zone_of(actor)
+    if zone == Zone(None, None, None):
+        return
+    org = await admin_repo.get_organization(db, organization_id)
+    if org is None or not _organization_in_zone(zone, org):
+        raise err("ERR-ACL-002")
+
+
+def _activity_season_snapshot(row: ActivitySeason) -> dict[str, Any]:
+    return {
+        "organization_id": str(row.organization_id),
+        "activity_type_id": str(row.activity_type_id),
+        "season": row.season,
+        "min_term_days": row.min_term_days,
+    }
+
+
+async def create_activity_season(
+    db: AsyncSession, payload: ActivitySeasonIn, *, actor: User
+) -> ActivitySeason:
+    await _assert_organization_zone(db, actor, payload.organization_id)
+    if await admin_repo.get_organization(db, payload.organization_id) is None:
+        raise err("ERR-VAL-001", details={"reason": "unknown_organization"})
+    known = await admin_repo.list_activity_types(db)
+    if not any(a.id == payload.activity_type_id for a in known):
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+    if (
+        await repo.get_activity_season(db, payload.organization_id, payload.activity_type_id)
+        is not None
+    ):
+        # This module's own state-conflict code (CLAUDE.md: "ERR-NORM-005 —
+        # a state or period conflict"); the DB's own
+        # `uq_activity_seasons_org_activity` is the backstop, never the
+        # first line — an IntegrityError has no handler in main.py and would
+        # surface as ERR-SYS-001/500 (same reasoning `create_norm` gives for
+        # checking `effective_to < effective_from` here rather than trusting
+        # the CHECK).
+        raise err("ERR-NORM-005", details={"reason": "already_exists"})
+    row = ActivitySeason(
+        organization_id=payload.organization_id,
+        activity_type_id=payload.activity_type_id,
+        season=payload.season.model_dump(by_alias=True),
+        min_term_days=payload.min_term_days,
+        created_by=actor.id,
+    )
+    db.add(row)
+    await db.flush()
+    await audit.log(
+        db,
+        action="activity_season.create",
+        user_id=actor.id,
+        object_type="activity_season",
+        object_id=row.id,
+        new_value=_activity_season_snapshot(row),
+    )
+    return row
+
+
+async def get_activity_season(db: AsyncSession, activity_season_id: uuid.UUID) -> ActivitySeason:
+    return await _activity_season_or_404(db, activity_season_id)
+
+
+async def list_activity_seasons(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID | None,
+    activity_type_id: uuid.UUID | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[ActivitySeason], int]:
+    return await repo.list_activity_seasons(
+        db,
+        organization_id=organization_id,
+        activity_type_id=activity_type_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def update_activity_season(
+    db: AsyncSession, activity_season_id: uuid.UUID, patch: ActivitySeasonPatch, *, actor: User
+) -> ActivitySeason:
+    row = await _activity_season_or_404(db, activity_season_id)
+    await _assert_organization_zone(db, actor, row.organization_id)
+    before = _activity_season_snapshot(row)
+    fields = patch.model_dump(exclude_unset=True, by_alias=True)
+    if "season" in fields:
+        row.season = fields["season"]
+    if "min_term_days" in fields:
+        row.min_term_days = fields["min_term_days"]
+    await db.flush()
+    # `updated_at`'s `onupdate=func.now()` is fetched via RETURNING on
+    # INSERT but left EXPIRED after a plain UPDATE (lesson) — reading it
+    # outside the session's async context (`ActivitySeasonOut` serializing
+    # the response) raises `MissingGreenlet` without this refresh.
+    await db.refresh(row)
+    await audit.log(
+        db,
+        action="activity_season.update",
+        user_id=actor.id,
+        object_type="activity_season",
+        object_id=row.id,
+        old_value=before,
+        new_value=_activity_season_snapshot(row),
+    )
+    return row
+
+
+async def effective_season(
+    db: AsyncSession,
+    *,
+    activity_type_id: uuid.UUID,
+    contour_id: uuid.UUID | None,
+    organization_id: uuid.UUID | None,
+) -> dict[str, Any]:
+    """Ruling #177 task 4 — `GET /activity-seasons/effective`: what ACTUALLY
+    applies for the wizard's date pickers, resolved through the SAME function
+    `checks._season_check` calls (`checks.resolve_effective_windows`) so the
+    two can never disagree.
+
+    Exactly one of `contour_id`/`organization_id`: a contour names both an
+    organization (through it) and a norm that may override the dictionary; a
+    bare organization has no norm to consult at all — T8's occupancy
+    calendar and a leshoz's own admin screen are the callers with no contour
+    in hand yet."""
+    if (contour_id is None) == (organization_id is None):
+        raise err("ERR-VAL-001", details={"reason": "need_exactly_one_of_contour_or_organization"})
+    known = await admin_repo.list_activity_types(db)
+    if not any(a.id == activity_type_id for a in known):
+        raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
+
+    norm_season: dict[str, Any] | None = None
+    resolved_org_id: uuid.UUID
+    if contour_id is not None:
+        maybe_org_id = await gis_service.contour_organization(db, contour_id)
+        if maybe_org_id is None:
+            raise err("ERR-SYS-003")
+        resolved_org_id = maybe_org_id
+        norm_row = await repo.effective_norm(db, contour_id, activity_type_id, business_today())
+        norm_season = norm_row.season if norm_row is not None else None
+    else:
+        assert organization_id is not None  # narrowed by the xor guard above
+        resolved_org_id = organization_id
+        if await admin_repo.get_organization(db, resolved_org_id) is None:
+            raise err("ERR-SYS-003")
+
+    dictionary_row = await repo.get_activity_season(db, resolved_org_id, activity_type_id)
+    dictionary_season = dictionary_row.season if dictionary_row is not None else None
+    min_term_days = dictionary_row.min_term_days if dictionary_row is not None else None
+
+    windows, season_source = checks.resolve_effective_windows(norm_season, dictionary_season)
+
+    return {
+        "activity_type_id": activity_type_id,
+        "organization_id": resolved_org_id,
+        "contour_id": contour_id,
+        "windows": windows,
+        "season_source": season_source,
+        "min_term_days": min_term_days,
+        "min_term_source": "activity_season" if min_term_days is not None else "none",
+    }
 
 
 # --- Task 7: preview and saved calculations. `_compute` is the ONE path both

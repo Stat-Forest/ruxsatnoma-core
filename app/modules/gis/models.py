@@ -100,15 +100,23 @@ class Contour(Base):
 class ContourVersion(Base):
     """Versioned geometry. Exactly one published version per contour (partial unique);
     an application/permit freezes `contour_version_id`, so republishing never moves
-    the ground under an issued permit."""
+    the ground under an issued permit.
+
+    `geom` is nullable (decision #178): most leshozes have no delivered GIS layer yet,
+    and waiting for it is not an option. A geometry-less version carries its area as
+    `declared_area_ha` (the documents' own figure) instead, and `geom_or_declared_area`
+    is what stops a version with NEITHER — `area_ha` itself stays NOT NULL and > 0
+    either way (`insert_version`/`update_version` copy `declared_area_ha` onto it when
+    there is no geometry to compute it from), so every downstream reader keeps reading
+    one column and needs no branch."""
 
     __tablename__ = "contour_versions"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
     contour_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contours.id"), index=True)
     version_no: Mapped[int] = mapped_column(default=1)
-    geom: Mapped[Any] = mapped_column(
-        Geometry("MULTIPOLYGON", srid=4326, spatial_index=True, nullable=False)
+    geom: Mapped[Any | None] = mapped_column(
+        Geometry("MULTIPOLYGON", srid=4326, spatial_index=True, nullable=True)
     )
     area_ha: Mapped[Decimal] = mapped_column(Numeric(12, 4))
     declared_area_ha: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
@@ -141,6 +149,9 @@ class ContourVersion(Base):
         CheckConstraint(
             "effective_to IS NULL OR effective_from IS NULL OR effective_to >= effective_from",
             name="effective_period_valid",
+        ),
+        CheckConstraint(
+            "geom IS NOT NULL OR declared_area_ha IS NOT NULL", name="geom_or_declared_area"
         ),
         UniqueConstraint("contour_id", "version_no", name="uq_contour_version_no"),
         Index(

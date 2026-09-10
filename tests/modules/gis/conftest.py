@@ -276,6 +276,63 @@ async def published_contour(
     return version
 
 
+# --- Stage 9 T5: geometry-less contours (decision #178) ----------------------
+#
+# A leshoz with no delivered GIS layer files a contour by requisites alone:
+# `geom` stays NULL, `declared_area_ha` is the area of record and is copied
+# onto `area_ha` (which stays NOT NULL either way). Neither fixture below
+# needs `random_box_wkt`'s isolation trick — a NULL geometry can never collide
+# with anything else spatially, unlike every geometry-bearing fixture above.
+
+
+@pytest.fixture
+async def geometryless_draft_version(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization
+) -> ContourVersion:
+    """A fresh contour with one `draft` version filed by requisites alone —
+    the lifecycle's own starting point for decision #178, ready to run
+    submit-review -> approve -> publish exactly like `contour_with_draft`,
+    minus the geometry."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = ContourVersion(
+        contour_id=contour.id,
+        version_no=1,
+        geom=None,
+        area_ha=Decimal("2.5000"),
+        declared_area_ha=Decimal("2.5000"),
+        source="cadastre",
+        status="draft",
+    )
+    db.add(version)
+    await db.flush()
+    await db.refresh(version)
+    return version
+
+
+@pytest.fixture
+async def published_contour_without_geometry(
+    db: AsyncSession, contours_layer: GisLayer, leshoz: Organization, approval_doc: MediaFile
+) -> ContourVersion:
+    """`published_contour`'s own shape, minus the geometry — a leshoz that has
+    no delivered GIS layer still publishes, prices and lists its contours."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = ContourVersion(
+        contour_id=contour.id,
+        version_no=1,
+        geom=None,
+        area_ha=Decimal("2.5000"),
+        declared_area_ha=Decimal("2.5000"),
+        source="cadastre",
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    db.add(version)
+    await db.flush()
+    await db.refresh(version)
+    return version
+
+
 # --- Task 4: topology-check fixtures ------------------------------------------
 #
 # None of these ever call `db.commit()` — only `db.add`/`db.flush` through the

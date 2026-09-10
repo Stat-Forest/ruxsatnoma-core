@@ -29,10 +29,13 @@ async def test_role_seeds_present(db):
         "accountant",
         "applicant",
         "prosecutor",
+        # Ruling #179 (stage 9): the central office that checks the
+        # certificates behind a benefit claim, and sees nothing else.
+        "benefit_verifier",
     } <= codes
     assert (
         await db.execute(select(func.count()).select_from(Role).where(Role.is_system))
-    ).scalar() == 11
+    ).scalar() == 12
 
 
 async def test_user_insert_minimal(db):

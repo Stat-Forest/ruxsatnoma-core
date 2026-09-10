@@ -52,13 +52,14 @@ from app.core.events import Event, publish
 from app.modules.admin import repo as admin_repo
 from app.modules.admin import service as admin_service
 from app.modules.admin.models import ClassifierItem
-from app.modules.applications import repo
+from app.modules.applications import checks, repo
 from app.modules.applications import service as flow
 from app.modules.applications.events import APPLICATION_APPROVED, APPLICATION_REJECTED
 from app.modules.applications.models import Application, ApplicationStatusHistory
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
+from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications_service
 from app.modules.signatures import service as signatures_service
 
@@ -475,6 +476,37 @@ async def _recipient_language(db: AsyncSession, application: Application) -> str
     return contact.language if contact is not None else FALLBACK_LANGUAGE
 
 
+async def _assert_capacity_available(
+    db: AsyncSession, application: Application, *, actor: User
+) -> None:
+    """Ruling #176's DECISION-time refusal point (T6, stage 9 wave 2): a
+    contour's capacity can run out between submission and approval — two
+    applicants racing the same contour × activity slot — and the SECOND must
+    be refused here, before `_sign_decision` spends an ERI and before
+    `APPLICATION_APPROVED` raises the invoice a moment later in this same
+    transaction. `permits.service._assert_contour_still_has_room` is the
+    LOCKED, final gate at issuance; this one is neither locked nor final —
+    its job is cheaper and earlier: never let a doomed applicant pay.
+
+    Re-runs `norms.service.preview` — the SAME call `service.submit`/
+    `service.precheck` already make, off the frozen request
+    `checks.calculation_payload` builds from this application — at TODAY's
+    committed load rather than the load at submission, and reads back only
+    the `limit` check it produces. Deliberately NOT `checks.run_all`'s whole
+    battery (season, rotation, fire ban, GIS topology): those belong to a
+    DIFFERENT ruling (#177) and re-running them here would refuse an approval
+    for a reason this stage never asked for. `preview` itself still raises
+    fail-closed for a broken input (`ERR-NORM-004`, an unpublished
+    parameter; `ERR-VAL-001`, an unknown benefit code) — the same behaviour
+    every other caller of it already has.
+    """
+    payload = await checks.calculation_payload(db, application)
+    priced = await norms_service.preview(db, payload=payload, actor=actor)
+    limit = next((c for c in priced["checks"] if c["check"] == "limit"), None)
+    if limit is not None and limit["result"] == "fail":
+        raise err("ERR-NORM-002", details=limit["details"])
+
+
 async def approve(
     db: AsyncSession,
     application_id: uuid.UUID,
@@ -498,7 +530,9 @@ async def approve(
     caller's zone (RI-12 recorded first); 422 `ERR-VAL-001` when the application
     has no stored calculation, when `requested_area_ha` is unknown while the
     role caps area, and when an over-limit application has no parent
-    organization to escalate to; 422 `ERR-SIGN-001` for an invalid ERI.
+    organization to escalate to; 422 `ERR-NORM-002` when the contour's capacity
+    no longer covers this request (ruling #176 — see `_assert_capacity_
+    available`); 422 `ERR-SIGN-001` for an invalid ERI.
     """
     application = await _decidable(
         db, application_id, to_status=APPROVED_STATUS, actor=actor, action=APPLICATION_APPROVE
@@ -510,6 +544,12 @@ async def approve(
         return application, await _forward(
             db, application, actor=actor, amount=amount, area=area, over=over
         )
+
+    # Ruling #176: refused HERE, before `_sign_decision` spends an ERI and
+    # before `APPLICATION_APPROVED` raises an invoice a few lines below — a
+    # second applicant for the same contour × activity slot must never pay
+    # for a slot that is already gone.
+    await _assert_capacity_available(db, application, actor=actor)
 
     await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)
     # `decided_at` belongs to the flow verb that owns the decision, never to

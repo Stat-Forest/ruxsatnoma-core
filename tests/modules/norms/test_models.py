@@ -140,6 +140,34 @@ async def test_a_published_norm_needs_an_approval_document(
     await db.rollback()
 
 
+async def test_a_negative_capacity_is_refused_by_the_database(
+    db: AsyncSession,
+    published_contour: Contour,
+    haymaking_activity_id: uuid.UUID,
+    gis_user: User,
+) -> None:
+    """Ruling #176: `capacity` mirrors `yield_c_per_ha`'s own
+    non-negative CHECK — the service layer never even builds a negative one
+    (`NormIn.capacity` is `ge=0`), but the database is the guarantee, not the
+    service (`ck_norms_yield_valid`'s own reasoning, applied to the new
+    column)."""
+    with pytest.raises(IntegrityError):
+        await db.execute(
+            text(
+                "INSERT INTO norms (id, contour_id, activity_type_id, capacity, "
+                "effective_from, status, created_by) VALUES "
+                "(:id, :contour, :activity, -1, :ef, 'draft', :u)"
+            ).bindparams(
+                id=uuid7(),
+                contour=published_contour.id,
+                activity=haymaking_activity_id,
+                ef=date(2025, 1, 1),
+                u=gis_user.id,
+            )
+        )
+    await db.rollback()
+
+
 async def test_a_calculation_cannot_be_updated_or_deleted(
     db: AsyncSession, published_contour: Contour, grazing_activity_id: uuid.UUID
 ) -> None:

@@ -30,6 +30,7 @@ from app.modules.norms import calculator
 from app.modules.norms import params as norm_params
 from app.modules.norms.models import Norm
 from app.modules.norms.permissions import (
+    ACTIVITY_SEASONS_MANAGE,
     NORMS_APPROVE,
     NORMS_MANAGE,
     NORMS_PUBLISH,
@@ -296,6 +297,34 @@ async def executor_head_client(db: AsyncSession, leshoz) -> AsyncIterator[httpx.
 async def central_admin_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
     """The central office: zone-free, publishes norms and parameters."""
     async for client in _client_for(db, NORMS_PUBLISH):
+        yield client
+
+
+@pytest.fixture
+async def activity_seasons_leshoz_client(
+    db: AsyncSession, leshoz
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Ruling #177: "the leshoz for itself" — zoned to its own organization,
+    the same idiom `gis_specialist_client` uses for `NORMS_MANAGE`."""
+    async for client in _client_for(db, ACTIVITY_SEASONS_MANAGE, organization_id=leshoz.id):
+        yield client
+
+
+@pytest.fixture
+async def activity_seasons_other_leshoz_client(
+    db: AsyncSession, other_leshoz
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Holds the permission but is zoned to a DIFFERENT organization than the
+    one it will try to act on — proves `service._assert_organization_zone`
+    refuses a leshoz editing a neighbour's row."""
+    async for client in _client_for(db, ACTIVITY_SEASONS_MANAGE, organization_id=other_leshoz.id):
+        yield client
+
+
+@pytest.fixture
+async def activity_seasons_central_client(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
+    """Ruling #177: "the central admin for anyone" — zone-free."""
+    async for client in _client_for(db, ACTIVITY_SEASONS_MANAGE):
         yield client
 
 

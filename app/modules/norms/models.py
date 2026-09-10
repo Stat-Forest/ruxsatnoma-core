@@ -11,7 +11,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -140,6 +140,16 @@ class Norm(Base):
     season: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     rotation: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     max_sb: Mapped[int | None]
+    # Ruling #176: capacity generalises `max_sb` to every non-grazing activity,
+    # expressed in that activity's own `activity_types.quantity_unit` (ha for
+    # haymaking, hive for an apiary, m3 for deadwood, person_day for
+    # recreation). Grazing does NOT use this column — its capacity IS `max_sb`
+    # above, and a second field would be a second source of truth for the same
+    # fact (`service.create_norm`/`update_norm` refuse a grazing norm that sets
+    # it). NULL is not "no limit": `checks._limit_check` treats an absent
+    # capacity (no norm at all, or this column left NULL) as EXCLUSIVE for the
+    # requested period, never as unlimited.
+    capacity: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
     geobotanic_doc_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
     approval_doc_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
     effective_from: Mapped[date]
@@ -157,10 +167,51 @@ class Norm(Base):
             "effective_to IS NULL OR effective_to >= effective_from", name="period_valid"
         ),
         CheckConstraint("yield_c_per_ha IS NULL OR yield_c_per_ha >= 0", name="yield_valid"),
+        CheckConstraint("capacity IS NULL OR capacity >= 0", name="capacity_valid"),
         CheckConstraint(
             "status <> 'published' OR approval_doc_id IS NOT NULL", name="published_needs_doc"
         ),
         Index("ix_norms_lookup", "contour_id", "activity_type_id", "status", "effective_from"),
+    )
+
+
+class ActivitySeason(Base):
+    """Ruling #177 (stage 9): the season windows and minimum term for a WHOLE
+    leshoz × activity, rather than repeated on every one of its contours — a
+    leshoz with 151 contours used to have to state its grazing season 151
+    times, and stated it nowhere at all where no geobotanical survey exists
+    and therefore no `Norm` can be published.
+
+    `season` carries the exact same JSONB shape `Norm.season` already uses
+    (`schemas.Season`'s edge validation applies here too, via
+    `schemas.ActivitySeasonIn`/`ActivitySeasonPatch` — the same malformed-
+    window guard `checks._in_window` already reads defensively). Unlike
+    `Norm`, there is no lifecycle here (draft/review/approved/…): this is a
+    plain, current-value setting the leshoz or the central office edits in
+    place, not a versioned catalog row.
+
+    `checks._season_check` prefers a contour's OWN norm windows when it has
+    any; this row is the fallback resolved when it does not
+    (`checks.resolve_effective_windows`). `min_term_days` has NO norm-level
+    override — ruling #177 only speaks of overriding the WINDOWS — so
+    `checks._min_term_check` reads this table alone."""
+
+    __tablename__ = "activity_seasons"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id"))
+    activity_type_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("activity_types.id"))
+    season: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    min_term_days: Mapped[int | None]
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "activity_type_id", name="uq_activity_seasons_org_activity"
+        ),
+        CheckConstraint("min_term_days IS NULL OR min_term_days > 0", name="min_term_days_valid"),
     )
 
 

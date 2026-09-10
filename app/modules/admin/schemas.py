@@ -34,7 +34,12 @@ class OrganizationOut(BaseModel):
     """The public /refs shape (ruling 10: no permission code, no zone filtering) —
     `requisites` (bank details) is deliberately excluded; the admin write surface
     (Task 5's `OrganizationAdminOut`, gated behind `admin.organizations.manage`)
-    is where that belongs."""
+    is where that belongs.
+
+    `gis_enabled` (decision #178) is here, not only on the admin shape: an
+    applicant picking a leshoz needs to know whether to expect a map before
+    ever reaching a gis route, and this is the one place every authenticated
+    caller already reads an organization's own row."""
 
     id: uuid.UUID
     parent_id: uuid.UUID | None
@@ -45,6 +50,7 @@ class OrganizationOut(BaseModel):
     region_id: uuid.UUID | None
     district_id: uuid.UUID | None
     status: str
+    gis_enabled: bool
 
 
 class OrganizationAdminOut(BaseModel):
@@ -61,6 +67,7 @@ class OrganizationAdminOut(BaseModel):
     district_id: uuid.UUID | None
     requisites: dict[str, Any]
     status: str
+    gis_enabled: bool
 
 
 class ActivityTypeOut(BaseModel):
@@ -119,7 +126,9 @@ class ClassifierItemOut(BaseModel):
 
 
 class OrganizationIn(BaseModel):
-    """Create payload; `kind`/`parent_id` pairing is validated in the service (ruling 6)."""
+    """Create payload; `kind`/`parent_id` pairing is validated in the service (ruling 6).
+    `gis_enabled` defaults to the column's own `true` (decision #178) — most creates
+    never need to set it explicitly."""
 
     parent_id: uuid.UUID | None = None
     kind: str
@@ -129,15 +138,34 @@ class OrganizationIn(BaseModel):
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
     requisites: dict[str, Any] = {}
+    gis_enabled: bool = True
 
 
 class OrganizationPatch(BaseModel):
+    """`gis_enabled` (decision #178) is the central admin's switch: false means this
+    leshoz files contours by requisites and shows no map (`gis.service.contour_card`/
+    `contour_features_geojson` read it back)."""
+
     parent_id: uuid.UUID | None = None
     name: LocalizedName | None = None
     stir: Stir | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
     requisites: dict[str, Any] | None = None
+    gis_enabled: bool | None = None
+
+    # `gis_enabled` backs a NOT NULL column — an explicit JSON `null` has no
+    # legal meaning (same reasoning as `ActivityTypePatch._reject_explicit_null`
+    # above: an *omitted* field still takes this `None` default and is skipped
+    # by `exclude_unset=True` untouched, so this only catches a payload that
+    # names the field with a JSON `null`, which would otherwise reach `setattr`
+    # and fail the NOT NULL constraint as an unhandled 500).
+    @field_validator("gis_enabled", mode="after")
+    @classmethod
+    def _reject_explicit_null_gis_enabled(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
 
 
 class ClassifierIn(BaseModel):

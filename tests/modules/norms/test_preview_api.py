@@ -82,7 +82,9 @@ async def test_a_preview_over_the_limit_reports_the_failure_without_refusing(
     assert response.status_code == 200
     limit = next(c for c in response.json()["checks"] if c["check"] == "limit")
     assert limit["result"] == "fail"
-    assert limit["details"]["used_sb"] == "3000.0"
+    # Ruling #176: the generalised key is `requested`, not grazing's old
+    # `used_sb` — same number, front-end-facing name.
+    assert limit["details"]["requested"] == "3000.0"
 
 
 async def test_a_preview_writes_nothing(
