@@ -68,6 +68,7 @@ from app.core.security import (
     verify_password,
 )
 from app.db import make_engine, make_session_factory
+from app.event_subscriptions import register_event_subscriptions
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import LegalDocument
 from app.modules.audit import service as audit
@@ -76,7 +77,7 @@ from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Role, User
 from app.modules.beekeepers import repo as beekeepers_repo
 from app.modules.beekeepers import service as beekeepers_service
-from app.modules.beekeepers.schemas import BeekeeperCreateIn
+from app.modules.beekeepers.schemas import BeekeeperCreateIn, BeekeeperPatchIn
 from app.modules.gis import import_service as gis_import_service
 from app.modules.gis import repo as gis_repo
 from app.modules.gis import service as gis_service
@@ -382,15 +383,16 @@ DEMO_BEEKEEPERS: list[DemoBeekeeper] = [
         pinfl="30260904100001",
         passport_series="AC",
         passport_number="7654321",
-        full_name="Boshqa Asalarichi",
-        farm_name="Namuna fermer xoʻjaligi",
+        full_name="Qodirov Bahodir Shavkatovich",
+        farm_name="«Asal buloq» fermer xoʻjaligi",
+        stir="306451278",
     ),
     DemoBeekeeper(
         certificate_no="AUZ-2026-000125",
         pinfl="30260904100002",
         passport_series="AD",
-        passport_number="1111111",
-        full_name="Uchinchi Asalarichi",
+        passport_number="2233445",
+        full_name="Yusupova Dilnoza Rustamovna",
     ),
 ]
 
@@ -1011,8 +1013,26 @@ async def _ensure_beekeepers(db: AsyncSession, *, actor: User) -> str:
     APPLICANT`'s own pinfl so the automatic apiary-benefit path can be
     walked on the stand with no register visit first."""
     created = 0
+    converged = 0
     for spec in DEMO_BEEKEEPERS:
-        if await beekeepers_repo.get_active_by_certificate_no(db, spec.certificate_no) is not None:
+        existing = await beekeepers_repo.get_active_by_certificate_no(db, spec.certificate_no)
+        if existing is not None:
+            # Converge on the spec (the first stand seed carried placeholder
+            # names) — through the service, so the audit row is written.
+            wanted = {
+                "pinfl": spec.pinfl,
+                "passport_series": spec.passport_series,
+                "passport_number": spec.passport_number,
+                "stir": spec.stir,
+                "full_name": spec.full_name,
+                "farm_name": spec.farm_name,
+            }
+            diff = {k: v for k, v in wanted.items() if getattr(existing, k) != v}
+            if diff:
+                await beekeepers_service.patch_beekeeper(
+                    db, beekeeper_id=existing.id, data=BeekeeperPatchIn(**diff), actor=actor
+                )
+                converged += 1
             continue
         await beekeepers_service.create_beekeeper(
             db,
@@ -1029,11 +1049,221 @@ async def _ensure_beekeepers(db: AsyncSession, *, actor: User) -> str:
         )
         created += 1
     if created == 0:
-        return "Beekeepers register: all three demo rows already present"
+        return "Beekeepers register: all three demo rows already present" + (
+            f" ({converged} converged on the spec)" if converged else ""
+        )
     return (
         f"Beekeepers register: {created} row(s) created — one on demo_applicant's own "
         "pinfl (certificate AUZ-2026-000123)"
     )
+
+
+@dataclass(frozen=True)
+class DemoClaim:
+    """One recreation application by `DEMO_APPLICANT` carrying a benefit the
+    LESHOZ checks (ruling #182), left in the state named by `outcome`."""
+
+    benefit_code: str
+    certificate_no: str
+    period_from: date
+    period_to: date
+    quantity: Decimal
+    outcome: str  # pending | verified_paid | rejected
+    reject_reason: str | None = None
+
+
+# The three states a leshoz meets on its own claims, so every branch of the
+# card can be shown without filing anything first: one waiting for the
+# executor, one the leshoz verified and the head approved (the free path of
+# ruling #185 — a 0-sum invoice settled by itself), one the executor rejected.
+DEMO_CLAIMS: list[DemoClaim] = [
+    DemoClaim(
+        benefit_code="persons_with_disabilities",
+        certificate_no="NOG-2019-04471",
+        period_from=date(2027, 7, 5),
+        period_to=date(2027, 7, 11),
+        quantity=Decimal("20"),
+        outcome="pending",
+    ),
+    DemoClaim(
+        benefit_code="war_veterans",
+        certificate_no="UQ-1945-000317",
+        period_from=date(2027, 8, 1),
+        period_to=date(2027, 8, 7),
+        quantity=Decimal("12"),
+        outcome="verified_paid",
+    ),
+    DemoClaim(
+        benefit_code="preschool_children",
+        certificate_no="MTM-2026-0042",
+        period_from=date(2027, 7, 20),
+        period_to=date(2027, 7, 26),
+        quantity=Decimal("30"),
+        outcome="rejected",
+        reject_reason="Ma'lumotnoma muddati o'tgan — 2025-yil uchun berilgan.",
+    ),
+]
+
+_DEMO_CERTIFICATE_PDF = b"%PDF-1.4\n%demo benefit certificate - not a real document\n%%EOF\n"
+
+
+async def _ensure_benefit_claims(
+    db: AsyncSession,
+    *,
+    applicant: User,
+    executor: User,
+    head: User,
+) -> str:
+    """`DEMO_CLAIMS`, each filed the way a citizen files — `create_draft`,
+    `patch_draft`, a `benefit_proof` document through `core_files.save_upload`,
+    `submit` with the BUTTON (ruling #183, `pkcs7=None`, `rules_accepted=True`)
+    — and then walked by the leshoz's own services: `start_review`,
+    `benefit_verification.verify_claim`/`reject_claim`, `decision.approve`
+    under the head's MOCK ERI (`EIMZO_MODE=mock`; refused loudly on a real
+    adapter, never faked). Idempotent by certificate number: a claim the
+    applicant already filed (any status but CANCELLED) is left alone, whatever
+    state a demo has since moved it to. Each claim takes a Burchmulla contour
+    no application or permit has touched — recreation has no capacity norm,
+    so a contour is EXCLUSIVE per activity (ruling #176)."""
+    from sqlalchemy import text
+
+    from app.modules.applications import benefit_verification, decision
+    from app.modules.applications import service as applications_service
+    from app.modules.applications.schemas import (
+        ApplicationCreate,
+        ApplicationDocumentIn,
+        ApplicationPatch,
+    )
+    from app.modules.integrations.adapters.eimzo import encode_mock_signature
+
+    benefit_classifier = await admin_repo.get_classifier_by_code(db, "benefit_categories")
+    doc_classifier = await admin_repo.get_classifier_by_code(db, "doc_types")
+    if benefit_classifier is None or doc_classifier is None:
+        return "Benefit claims: classifiers missing — skipped"
+    benefit_items = {
+        item.code: item.id
+        for item in await admin_repo.list_classifier_items(db, benefit_classifier.id)
+    }
+    proof_type_id = next(
+        (
+            item.id
+            for item in await admin_repo.list_classifier_items(db, doc_classifier.id)
+            if item.code == "benefit_proof"
+        ),
+        None,
+    )
+    recreation = next(
+        (a for a in await admin_repo.list_activity_types(db) if a.code == "recreation"), None
+    )
+    if proof_type_id is None or recreation is None:
+        return (
+            "Benefit claims: `benefit_proof` doc type or the recreation activity missing — skipped"
+        )
+
+    existing = {
+        row[0]
+        for row in (
+            await db.execute(
+                text(
+                    "SELECT benefit_certificate_no FROM applications "
+                    "WHERE submitted_by_user_id = :uid AND status <> 'CANCELLED' "
+                    "AND benefit_certificate_no IS NOT NULL"
+                ),
+                {"uid": applicant.id},
+            )
+        ).all()
+    }
+    free_contours = [
+        row[0]
+        for row in (
+            await db.execute(
+                text(
+                    "SELECT c.id FROM contours c JOIN organizations o ON o.id = c.organization_id "
+                    "WHERE o.code = :org AND c.status = 'active' AND c.kind = 'contour' "
+                    "AND EXISTS (SELECT 1 FROM contour_versions v "
+                    "            WHERE v.contour_id = c.id AND v.status = 'published') "
+                    "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.contour_id = c.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM permits p WHERE p.contour_id = c.id) "
+                    "ORDER BY c.number LIMIT 20"
+                ),
+                {"org": BURCHMULLA_CODE},
+            )
+        ).all()
+    ]
+    if get_settings().eimzo_mode != "mock":
+        return "Benefit claims: the head's decision needs a MOCK E-IMZO — skipped on a real adapter"
+    # The seed runs outside the app: without the bus wired, `decision.approve`
+    # would leave APPROVED with no invoice and the free settlement never fires.
+    register_event_subscriptions()
+
+    filed: list[str] = []
+    for spec in DEMO_CLAIMS:
+        if spec.certificate_no in existing:
+            continue
+        if not free_contours:
+            filed.append(f"{spec.certificate_no}: no free Burchmulla contour left")
+            continue
+        contour_id = free_contours.pop(0)
+        draft = await applications_service.create_draft(
+            db, ApplicationCreate(on_behalf="self"), actor=applicant
+        )
+        await applications_service.patch_draft(
+            db,
+            draft.id,
+            ApplicationPatch(
+                activity_type_id=recreation.id,
+                contour_id=contour_id,
+                period_from=spec.period_from,
+                period_to=spec.period_to,
+                quantity=spec.quantity,
+                benefit_category_item_id=benefit_items[spec.benefit_code],
+                benefit_certificate_no=spec.certificate_no,
+            ),
+            actor=applicant,
+        )
+        proof = await core_files.save_upload(
+            db,
+            data=_DEMO_CERTIFICATE_PDF,
+            filename=f"{spec.certificate_no}.pdf",
+            content_type="application/pdf",
+            actor=applicant,
+        )
+        await applications_service.add_document(
+            db,
+            draft.id,
+            ApplicationDocumentIn(doc_type_item_id=proof_type_id, file_id=proof.id),
+            actor=applicant,
+        )
+        application = await applications_service.submit(
+            db, draft.id, pkcs7=None, rules_accepted=True, actor=applicant, ip=None
+        )
+        if spec.outcome == "pending":
+            filed.append(f"{application.number} {spec.benefit_code}: pending, for the executor")
+            continue
+        await applications_service.start_review(db, application.id, actor=executor)
+        if spec.outcome == "rejected":
+            assert spec.reject_reason is not None
+            await benefit_verification.reject_claim(
+                db, application.id, actor=executor, reason=spec.reject_reason
+            )
+            filed.append(
+                f"{application.number} {spec.benefit_code}: claim rejected by the executor"
+            )
+            continue
+        await benefit_verification.verify_claim(db, application.id, actor=executor)
+        document = await applications_service.package(db, application.id, actor=head)
+        assert head.pinfl is not None
+        pkcs7 = encode_mock_signature(
+            document, serial=f"SER-{head.pinfl}", issuer="ISS-DEMO", pinfl=head.pinfl
+        )
+        approved, _forwarded = await decision.approve(db, application.id, pkcs7=pkcs7, actor=head)
+        filed.append(
+            f"{application.number} {spec.benefit_code}: verified by the leshoz, approved, "
+            f"{approved.status} (0-sum invoice settled by the benefit)"
+        )
+    if not filed:
+        return "Benefit claims: the three demo claims already filed"
+    return "Benefit claims:\n  " + "\n  ".join(filed)
 
 
 async def _ensure_benefit_modifiers(db: AsyncSession) -> str:
@@ -1228,6 +1458,22 @@ async def _main() -> None:
         report.append("")
         report.append(beekeepers_message)
         report.append(modifiers_message)
+
+        # --- The leshoz's own claims, in the three states its card shows ----
+        async with factory() as db:
+            users = {
+                login: (await db.execute(select(User).where(User.login == login))).scalar_one()
+                for login in ("demo_applicant", "demo_executor", "demo_executor_head")
+            }
+            claims_message = await _ensure_benefit_claims(
+                db,
+                applicant=users["demo_applicant"],
+                executor=users["demo_executor"],
+                head=users["demo_executor_head"],
+            )
+            await db.commit()
+        report.append("")
+        report.append(claims_message)
     finally:
         await engine.dispose()
 
