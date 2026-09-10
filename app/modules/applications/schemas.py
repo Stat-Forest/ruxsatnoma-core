@@ -557,7 +557,8 @@ class ApplicationAssignIn(BaseModel):
 
 
 class TimelineSignatureRow(BaseModel):
-    """One ERI signature as the timeline shows it.
+    """One signature as the timeline shows it — ERI, or a citizen's simple
+    one (ruling #183: `kind`, and then `certificate_id` is NULL).
 
     A REDUCED view of a `signatures` row, not `signatures.schemas.SignatureOut`
     — exactly the choice `permits.schemas.PermitSignatureRow` made and for the
@@ -575,7 +576,11 @@ class TimelineSignatureRow(BaseModel):
     object_id: uuid.UUID
     purpose: str
     signer_user_id: uuid.UUID | None
-    certificate_id: uuid.UUID
+    # Stage 10's review found the timeline answering 500 for every filing made
+    # with the button — the same defect the permit card had, one screen over:
+    # the route that took the signature was green and the next read broke.
+    kind: str
+    certificate_id: uuid.UUID | None
     signed_at: datetime
     verification_status: str
 

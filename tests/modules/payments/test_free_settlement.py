@@ -129,6 +129,8 @@ async def _approved_application_with_calculation(
     amount: Decimal,
     breakdown: list[dict],
     assigned_user_id: uuid.UUID,
+    claim_code: str | None = None,
+    claim_status: str = "verified",
 ) -> Application:
     """Built directly through the ORM, the same idiom `payments/conftest.py`
     `_new_approved_application` uses (`applications` ships no HTTP surface
@@ -146,6 +148,13 @@ async def _approved_application_with_calculation(
         status="APPROVED",
         assigned_user_id=assigned_user_id,
     )
+    if claim_code is not None:
+        # Stage 10 review, finding 1: the free settlement is tied to the
+        # APPLICATION's own verified claim, not to a breakdown line alone —
+        # so the positive path needs the claim `0053` seeded, verified.
+        application.benefit_category_item_id = await _benefit_item_id(db, claim_code)
+        application.benefit_certificate_no = "TEST-0001"
+        application.benefit_verification_status = claim_status
     db.add(application)
     await db.flush()
     db.add(
@@ -160,6 +169,22 @@ async def _approved_application_with_calculation(
     )
     await db.flush()
     return application
+
+
+async def _benefit_item_id(db: AsyncSession, code: str) -> uuid.UUID:
+    """The `benefit_categories` item migration `0053` seeded for `code`."""
+    from sqlalchemy import text
+
+    row = (
+        await db.execute(
+            text(
+                "SELECT ci.id FROM classifier_items ci "
+                "JOIN classifiers c ON c.id = ci.classifier_id "
+                "WHERE c.code = 'benefit_categories' AND ci.code = :code"
+            ).bindparams(code=code)
+        )
+    ).scalar_one()
+    return row
 
 
 async def _executor(db: AsyncSession) -> User:
@@ -178,6 +203,7 @@ async def test_a_zero_sum_benefit_invoice_settles_itself_end_to_end(
         amount=amount,
         breakdown=breakdown,
         assigned_user_id=executor.id,
+        claim_code="beekeeping_union_member",
     )
 
     await publish(db, Event(name=APPLICATION_APPROVED, payload={"application_id": application.id}))
@@ -235,7 +261,9 @@ async def test_a_zero_sum_benefit_invoice_settles_itself_end_to_end(
     ).scalar_one_or_none()
     assert settlement_notification is not None
     assert settlement_notification.recipient_user_id == applicant.owner_user_id
-    assert "beekeeping_union_member" in settlement_notification.rendered_text
+    # The category's NAME, never its code (stage 10 review, finding 8).
+    assert "beekeeping_union_member" not in settlement_notification.rendered_text
+    assert "Asalarichilar uyushmasi" in settlement_notification.rendered_text
     issued_notification = (
         await db.execute(
             select(Notification).where(
@@ -262,6 +290,86 @@ async def test_a_zero_sum_benefit_invoice_settles_itself_end_to_end(
         )
     ).scalar_one_or_none()
     assert permit_due_notification is not None
+
+
+async def _issue_and_read(db: AsyncSession, application: Application):
+    await publish(db, Event(name=APPLICATION_APPROVED, payload={"application_id": application.id}))
+    await db.commit()
+    invoice = await payments_service.invoice_for_application(db, application.id)
+    assert invoice is not None
+    await db.refresh(invoice)
+    updated = await applications_service.get(db, application.id)
+    assert updated is not None
+    await db.refresh(updated)
+    return invoice, updated
+
+
+async def test_a_benefit_line_the_application_never_claimed_does_not_settle(
+    db: AsyncSession, applicant: Applicant, grazing_activity_id: uuid.UUID
+):
+    """Stage 10 review, finding 1 — CONFIRMED before this test existed: a
+    head may POST a calculation with any `benefit_code` (`norms` binds it to
+    the contour only), so a zero-sum breakdown alone proved nothing about
+    the application. No claim at all → the invoice stays `pending` at 0,
+    exactly as loud as before ruling #185."""
+    executor = await _executor(db)
+    amount, breakdown = _free_calculation_fields("war_veterans")
+    application = await _approved_application_with_calculation(
+        db,
+        applicant=applicant,
+        grazing_activity_id=grazing_activity_id,
+        amount=amount,
+        breakdown=breakdown,
+        assigned_user_id=executor.id,
+        claim_code=None,
+    )
+    invoice, updated = await _issue_and_read(db, application)
+    assert invoice.status == "pending"
+    assert updated.status == "INVOICED"
+    assert await payments_service.is_settled_by_benefit(db, invoice) is False
+
+
+async def test_an_unverified_claim_does_not_settle(
+    db: AsyncSession, applicant: Applicant, grazing_activity_id: uuid.UUID
+):
+    """The claim exists but nobody verified it (`pending`) — the leshoz's
+    check (#182) is what makes the zero lawful, so the settlement waits."""
+    executor = await _executor(db)
+    amount, breakdown = _free_calculation_fields("war_veterans")
+    application = await _approved_application_with_calculation(
+        db,
+        applicant=applicant,
+        grazing_activity_id=grazing_activity_id,
+        amount=amount,
+        breakdown=breakdown,
+        assigned_user_id=executor.id,
+        claim_code="war_veterans",
+        claim_status="pending",
+    )
+    invoice, updated = await _issue_and_read(db, application)
+    assert invoice.status == "pending"
+    assert updated.status == "INVOICED"
+
+
+async def test_a_verified_claim_of_another_category_does_not_settle(
+    db: AsyncSession, applicant: Applicant, grazing_activity_id: uuid.UUID
+):
+    """Verified as `preschool_children`, priced as `war_veterans`: the line
+    and the claim disagree, and a disagreement is not a free permit."""
+    executor = await _executor(db)
+    amount, breakdown = _free_calculation_fields("war_veterans")
+    application = await _approved_application_with_calculation(
+        db,
+        applicant=applicant,
+        grazing_activity_id=grazing_activity_id,
+        amount=amount,
+        breakdown=breakdown,
+        assigned_user_id=executor.id,
+        claim_code="preschool_children",
+    )
+    invoice, updated = await _issue_and_read(db, application)
+    assert invoice.status == "pending"
+    assert updated.status == "INVOICED"
 
 
 async def test_a_zero_with_no_benefit_line_stays_a_plain_pending_invoice(
@@ -337,6 +445,7 @@ async def test_settled_by_benefit_appears_in_the_api_output_for_both_cases(
         amount=free_amount,
         breakdown=free_breakdown,
         assigned_user_id=executor.id,
+        claim_code="war_veterans",
     )
     await publish(
         db, Event(name=APPLICATION_APPROVED, payload={"application_id": free_application.id})

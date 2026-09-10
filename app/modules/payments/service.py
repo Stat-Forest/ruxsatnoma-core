@@ -50,6 +50,7 @@ unlike the functions above) — not part of the cross-module public surface.
 
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, NamedTuple
@@ -380,7 +381,33 @@ def _free_settlement_benefit_code(calculation: Calculation) -> str | None:
     return None
 
 
-async def _settle_free(db: AsyncSession, *, invoice: Invoice, benefit_code: str) -> None:
+async def _verified_claim_of(
+    db: AsyncSession, application: Any, benefit_code: str
+) -> BenefitClaim | None:
+    """Ruling #185's missing half (stage 10 review, finding 1): the benefit
+    the CALCULATION priced must be the benefit the APPLICATION claimed and
+    somebody verified — the leshoz inside the review, or the Union register
+    at filing (#182). Returns the claim (code and the category's own name,
+    for the applicant's notice) or `None` when the application's claim is
+    absent, unverified, rejected, or a different category than the line."""
+    if application.benefit_verification_status != "verified":
+        return None
+    item_id = application.benefit_category_item_id
+    if item_id is None:
+        return None
+    item = await admin_repo.get_classifier_item(db, item_id)
+    if item is None or item.code != benefit_code:
+        return None
+    return BenefitClaim(code=item.code, name=str((item.name or {}).get("uz_latn") or item.code))
+
+
+@dataclass(frozen=True)
+class BenefitClaim:
+    code: str
+    name: str
+
+
+async def _settle_free(db: AsyncSession, *, invoice: Invoice, claim: BenefitClaim) -> None:
     """Ruling #185: a zero-sum invoice from a benefit settles ITSELF, in the
     SAME transaction `issue_invoice` created it in — called only from
     there, after the invoice row (and its `invoice_recipients` snapshot)
@@ -412,7 +439,7 @@ async def _settle_free(db: AsyncSession, *, invoice: Invoice, benefit_code: str)
         action=INVOICE_SETTLE_BY_BENEFIT,
         object_type="invoice",
         object_id=invoice.id,
-        new_value={"benefit_code": benefit_code},
+        new_value={"benefit_code": claim.code},
     )
 
     application = await applications_service.set_status(
@@ -425,7 +452,9 @@ async def _settle_free(db: AsyncSession, *, invoice: Invoice, benefit_code: str)
         recipient_user_id=application.submitted_by_user_id,
         params={
             "invoice_number": invoice.number,
-            "benefit": benefit_code,
+            # The category's own name, never the code: «To'lov talab
+            # qilinmaydi: war_veterans» is what the review found in the SMS.
+            "benefit": claim.name,
         },
         object_type="invoice",
         object_id=invoice.id,
@@ -621,8 +650,25 @@ async def issue_invoice(db: AsyncSession, application_id: uuid.UUID) -> Invoice:
     # line NEVER takes this branch, whatever its `amount` happens to be —
     # the fail-closed half of the ruling.
     benefit_code = _free_settlement_benefit_code(calculation)
-    if benefit_code is not None:
-        await _settle_free(db, invoice=invoice, benefit_code=benefit_code)
+    claimed = await _verified_claim_of(db, application, benefit_code) if benefit_code else None
+    if benefit_code is not None and claimed is None:
+        # Stage 10 review, finding 1 — the hiding shape again. A head can
+        # POST a calculation with ANY `benefit_code` (`norms` binds it to
+        # the contour only, ruling 20), so a zero-sum calculation is not
+        # proof the APPLICATION earned it: this one claimed nothing, or its
+        # claim is not `verified`, or it claimed a different category. The
+        # invoice stays `pending` at 0 — exactly as loud as before #185 —
+        # and the log says why; nothing is granted free on a line somebody
+        # typed.
+        logger.warning(
+            "payments.free_settlement_refused",
+            invoice_id=str(invoice.id),
+            application_id=str(application.id),
+            benefit_code=benefit_code,
+            claim_status=application.benefit_verification_status,
+        )
+    if claimed is not None:
+        await _settle_free(db, invoice=invoice, claim=claimed)
     else:
         await notifications_service.notify(
             db,

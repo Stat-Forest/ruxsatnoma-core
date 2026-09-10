@@ -40,10 +40,10 @@ async def list_beekeepers(
 @router.get("/beekeepers/lookup", response_model=BeekeeperLookupOut)
 async def lookup_beekeeper(
     db: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[User, Depends(require_permission(BEEKEEPERS_MANAGE))],
+    actor: Annotated[User, Depends(require_permission(BEEKEEPERS_MANAGE))],
     pinfl: Annotated[str, Query(pattern=r"^[0-9]{14}$")],
 ) -> Any:
-    return await service.lookup_by_pinfl(db, pinfl=pinfl)
+    return await service.lookup_by_pinfl(db, pinfl=pinfl, actor=actor)
 
 
 @router.post("/beekeepers", response_model=BeekeeperOut, status_code=201)

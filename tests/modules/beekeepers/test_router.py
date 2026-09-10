@@ -88,7 +88,8 @@ async def test_lookup_requires_the_permission(db):
 async def test_create_then_list_patch_and_remove(db):
     _, token, csrf = await registrar_client(db, BEEKEEPERS_MANAGE)
     app = create_app()
-    certificate_no = f"AUZ-{uuid.uuid4().hex[:8]}"
+    # Upper-case on purpose: the register stores the folded form (finding 6).
+    certificate_no = f"AUZ-{uuid.uuid4().hex[:8].upper()}"
     pinfl = unique_pinfl()
 
     async with make_client(app, lifespan=True) as client:
@@ -227,3 +228,96 @@ async def test_lookup_404_without_a_prior_oneid_login(db):
         r = await client.get(f"{API}/beekeepers/lookup", params={"pinfl": unique_pinfl()})
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "ERR-SYS-003"
+
+
+# --- Stage 10 review findings 5-7 -----------------------------------------------
+
+
+async def test_a_lookup_leaves_an_audit_row_hit_or_miss(db):
+    """Finding 5: a personal-data read keyed on a guessable identifier is
+    visible in the audit log either way, so walking PINFLs is not silent."""
+    user, token, csrf = await registrar_client(db, BEEKEEPERS_MANAGE)
+    app = create_app()
+    missing = unique_pinfl()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r = await client.get(f"{API}/beekeepers/lookup", params={"pinfl": missing})
+    assert r.status_code == 404
+    rows = (
+        await db.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "beekeeper.lookup", AuditLog.user_id == user.id
+            )
+        )
+    ).all()
+    assert [(row.result, row.basis, (row.extra or {}).get("pinfl")) for row in rows] == [
+        ("denied", "not_found", missing)
+    ]
+
+
+async def test_certificate_numbers_are_stored_folded_so_the_index_arbitrates(db):
+    """Finding 6: reads fold case and whitespace, the unique index is exact —
+    so the WRITE folds too, and `abc-1` after `ABC-1` is the same number to
+    both (a 422, never two active rows and a `MultipleResultsFound` later)."""
+    _, token, csrf = await registrar_client(db, BEEKEEPERS_MANAGE)
+    app = create_app()
+    stem = uuid.uuid4().hex[:8].upper()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        first = await client.post(
+            f"{API}/beekeepers",
+            json={
+                "certificate_no": f"  auz-{stem.lower()} ",
+                "pinfl": unique_pinfl(),
+                "passport_series": "AB",
+                "passport_number": "1234567",
+                "full_name": "Folded",
+            },
+        )
+        assert first.status_code == 201, first.text
+        assert first.json()["certificate_no"] == f"AUZ-{stem}"
+        second = await client.post(
+            f"{API}/beekeepers",
+            json={
+                "certificate_no": f"AUZ-{stem}",
+                "pinfl": unique_pinfl(),
+                "passport_series": "AB",
+                "passport_number": "7654321",
+                "full_name": "Duplicate",
+            },
+        )
+        assert second.status_code == 422
+        patched = await client.patch(
+            f"{API}/beekeepers/{first.json()['id']}",
+            json={"certificate_no": f" auz-{stem.lower()}-b "},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["certificate_no"] == f"AUZ-{stem}-B"
+
+
+async def test_an_explicit_null_on_a_required_field_is_a_422_not_a_500(db):
+    """Finding 7: `BeekeeperPatchIn` types the NOT NULL columns `X | None`
+    (absent = untouched), so an explicit `null` used to reach `flush()` as
+    an `IntegrityError`."""
+    _, token, csrf = await registrar_client(db, BEEKEEPERS_MANAGE)
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        created = await client.post(
+            f"{API}/beekeepers",
+            json={
+                "certificate_no": f"AUZ-{uuid.uuid4().hex[:8]}",
+                "pinfl": unique_pinfl(),
+                "passport_series": "AB",
+                "passport_number": "1234567",
+                "full_name": "Nullable?",
+            },
+        )
+        assert created.status_code == 201, created.text
+        r = await client.patch(
+            f"{API}/beekeepers/{created.json()['id']}",
+            json={"full_name": None, "pinfl": None, "farm_name": None},
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "ERR-VAL-001"
+    assert r.json()["error"]["details"]["fields"] == ["full_name", "pinfl"]

@@ -1195,6 +1195,20 @@ async def test_a_citizen_signs_with_the_button_and_it_is_a_simple_signature(
     assert signature.certificate_id is None
     assert signature.verification_status == "valid"
 
+    # The NEXT screen (stage 10 review finding 2): the timeline embeds this
+    # row through `TimelineSignatureRow`, which required a certificate id — a
+    # simple row has none, and the read answered 500 while `/submit` was 200.
+    timeline = await applicant_client.get(f"/api/v1/applications/{app_id}/timeline")
+    assert timeline.status_code == 200, timeline.text
+    submitted_rows = [
+        row for row in timeline.json()["status_history"] if row["to_status"] == "SUBMITTED"
+    ]
+    assert len(submitted_rows) == 1
+    (signature_row,) = submitted_rows[0]["signatures"]
+    assert signature_row["kind"] == "simple"
+    assert signature_row["certificate_id"] is None
+    assert signature_row["verification_status"] == "valid"
+
 
 async def test_a_legal_entity_without_an_envelope_is_refused(
     representative_client,

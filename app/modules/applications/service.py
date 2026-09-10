@@ -2037,6 +2037,14 @@ async def submit(
     # the FIRST submission.
     application = await _own_draft_for_update(db, application_id, actor=actor)
     from_status = application.status
+    # Ruling #183, decided FIRST (stage 10 review, finding 9): a legal entity
+    # with no envelope can never succeed, and that is known from the body and
+    # `on_behalf` alone — refusing here spends nothing on steps 2-7 and leaves
+    # no half-attempt to commit. Nothing has been written yet, so a plain
+    # raise is the whole refusal; the audit row a refused ATTEMPT earns
+    # belongs to attempts that got as far as the package.
+    if pkcs7 is None and application.on_behalf != "self":
+        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
     await _assert_complete(db, application, rules_accepted=rules_accepted)  # step 2
     # Ruling #184: stamped from the SERVER clock, not the client's claim —
     # `_assert_complete` above already refused a `false` value, so reaching
@@ -2072,10 +2080,9 @@ async def submit(
     # OWN rule for when a simple signature may stand in for the filing's
     # signature, the same way `permits.service.add_signature` decides it for
     # the holder's line on a permit (read, not copied — the filing has one
-    # signer and one purpose, never four); `legal` with no envelope is
-    # refused outright, following the SAME evidence-then-raise shape every
-    # other refusal on this page (steps 1-7's work is a genuine attempt and
-    # stays committed).
+    # signer and one purpose, never four). `legal` with no envelope was
+    # refused at step 1; the `else` below is the belt for the same rule,
+    # kept evidence-then-raise like every refusal that got this far.
     document = _package_bytes(application, priced, contour_version_id=version.id)
     if pkcs7 is not None:
         await signatures_service.sign(

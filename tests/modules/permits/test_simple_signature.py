@@ -70,6 +70,21 @@ async def test_a_citizens_holder_signature_with_no_envelope_activates_the_permit
         " ERI one — sha256(document), never a literal"
     )
 
+    # The NEXT screen: the permit card embeds the signature rows through
+    # `PermitSignatureRow`, which carried `certificate_id: uuid.UUID` — a
+    # simple row has none, and the card answered 500 while this route was
+    # green (stage 10 integration finding). Read it the way the holder's
+    # browser does, right after the button.
+    card = await holder_client.client.get(f"/api/v1/permits/{issued_permit.id}")
+    assert card.status_code == 200, card.text
+    holder_rows = [r for r in card.json()["signatures"] if r["purpose"] == "permit_recipient"]
+    assert holder_rows == [
+        {**holder_rows[0], "kind": "simple", "certificate_id": None, "verification_status": "valid"}
+    ]
+    assert {r["kind"] for r in card.json()["signatures"] if r["purpose"] != "permit_recipient"} == {
+        "eri"
+    }
+
 
 async def test_a_legal_entitys_holder_signature_needs_an_envelope(
     db: AsyncSession,

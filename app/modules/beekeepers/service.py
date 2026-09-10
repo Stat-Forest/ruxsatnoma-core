@@ -75,6 +75,12 @@ async def list_beekeepers(
 
 
 async def create_beekeeper(db: AsyncSession, *, data: BeekeeperCreateIn, actor: User) -> Beekeeper:
+    # Stage 10 review, finding 6: the partial unique index is exact-match
+    # while every read folds case and whitespace, so two writers racing with
+    # `abc-1` and `ABC-1` could both pass the pre-check and every later
+    # `match_certificate` would raise `MultipleResultsFound`. Storing the
+    # folded form makes the index the arbiter of the SAME rule the reads use.
+    data = data.model_copy(update={"certificate_no": _fold(data.certificate_no)})
     if await repo.get_active_by_certificate_no(db, data.certificate_no) is not None:
         raise err(
             "ERR-VAL-001",
@@ -104,6 +110,17 @@ async def create_beekeeper(db: AsyncSession, *, data: BeekeeperCreateIn, actor: 
     return row
 
 
+# The NOT NULL columns of the register: a PATCH may leave them alone or
+# change them, never blank them (finding 7 above).
+_REQUIRED_FIELDS = ("certificate_no", "pinfl", "passport_series", "passport_number", "full_name")
+
+
+def _fold(certificate_no: str) -> str:
+    """The one normalisation of a certificate number — the same the reads
+    apply (`repo.get_active_by_certificate_no`)."""
+    return certificate_no.strip().upper()
+
+
 _PATCHABLE_FIELDS = (
     "certificate_no",
     "pinfl",
@@ -122,6 +139,13 @@ async def patch_beekeeper(
     fields = data.model_dump(exclude_unset=True)
     if not fields:
         return row
+    # Stage 10 review, finding 7: an explicit `null` on a NOT NULL column is
+    # a 422 here, never an `IntegrityError` out of `flush()` (a 500).
+    nulled = sorted(name for name in _REQUIRED_FIELDS if name in fields and fields[name] is None)
+    if nulled:
+        raise err("ERR-VAL-001", details={"reason": "null_not_allowed", "fields": nulled})
+    if fields.get("certificate_no") is not None:
+        fields["certificate_no"] = _fold(fields["certificate_no"])
     before = _snapshot(row)
 
     new_certificate_no = fields.get("certificate_no")
@@ -204,7 +228,7 @@ def _split_passport(raw: str | None) -> tuple[str | None, str | None]:
     return match.group(1).upper(), match.group(2)
 
 
-async def lookup_by_pinfl(db: AsyncSession, *, pinfl: str) -> BeekeeperLookupOut:
+async def lookup_by_pinfl(db: AsyncSession, *, pinfl: str, actor: User) -> BeekeeperLookupOut:
     """Ruling #182's "honest auto-fill, as far as we honestly can": the name
     and passport come from a OneID profile snapshot ALREADY on file for this
     PINFL — never typed here, never invented. 404 `ERR-SYS-003` when nobody
@@ -213,7 +237,23 @@ async def lookup_by_pinfl(db: AsyncSession, *, pinfl: str) -> BeekeeperLookupOut
     something this module can reach (added to the Agency letter, per the
     ruling, not built against nothing)."""
     snapshot = await auth_service.get_oneid_snapshot_by_pinfl(db, pinfl)
+    # Stage 10 review, finding 5: a personal-data read keyed on a guessable
+    # identifier leaves a row either way — a registrar walking PINFLs one by
+    # one is visible in the audit log, hit or miss. `extra`, not `object_id`:
+    # the thing looked up is a person, not a register row.
+    await audit.log(
+        db,
+        action="beekeeper.lookup",
+        user_id=actor.id,
+        object_type="beekeeper",
+        result="success" if snapshot is not None else "denied",
+        basis=None if snapshot is not None else "not_found",
+        extra={"pinfl": pinfl},
+    )
     if snapshot is None:
+        # Evidence-then-raise (decision #40): the miss is the row worth
+        # keeping, and the 404 would roll it back with everything else.
+        await db.commit()
         raise err("ERR-SYS-003", details={"pinfl": pinfl})
     full_name = str(snapshot.get("full_name") or "").strip()
     series, number = _split_passport(snapshot.get("passport"))

@@ -106,7 +106,12 @@ class PermitSignatureRow(BaseModel):
     id: uuid.UUID
     purpose: str
     signer_user_id: uuid.UUID | None
-    certificate_id: uuid.UUID
+    # Ruling #183: the holder's line may be a SIMPLE signature — `kind`
+    # says so and `certificate_id` is then NULL. Stage 10's integration found
+    # the card answering 500 the moment a citizen pressed the button: the
+    # signature route itself was green, and only the next screen broke.
+    kind: str
+    certificate_id: uuid.UUID | None
     signed_at: datetime
     verification_status: str
 

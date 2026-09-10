@@ -361,13 +361,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         # rules_accepted`). The text the checkbox links to is a setting, not a
         # page this system renders itself — VMQ 278 on lex.uz by default, the
         # Agency's own act, editable from the settings screen like every other
-        # `site_*` key. **This key is admin-editable through `GET`/`PATCH
-        # /admin/settings` (generic over every `SETTING_SPECS` entry) but is
-        # NOT on the public `site_settings` whitelist** (`public.service.
-        # site_settings`/`schemas.SiteSettingsOut`, both outside this module's
-        # ownership) — a caller reaching for it from the anonymous landing or
-        # the applicant wizard needs that whitelist widened first; see this
-        # stage's own report.
+        # `site_*` key. Admin-editable through `GET`/`PATCH /admin/settings`
+        # (generic over every `SETTING_SPECS` entry) AND on the public
+        # `site_settings` whitelist as `rules_url` (`public.service.
+        # site_settings`), which is where the wizard's checkbox reads it.
         SettingSpec(
             "site_rules_url",
             str,
