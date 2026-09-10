@@ -312,8 +312,15 @@ async def list_applications(
     active in this window" is the question a reviewer's queue asks, and an
     exact-match filter on either end would answer a question nobody has.
 
-    Newest first by `id`: it is uuid7 and therefore time-ordered, so this is
-    `created_at DESC` served by the primary key rather than by a second index.
+    Most recently UPDATED first — `updated_at DESC`, then `id DESC` as the
+    tie-break (uuid7 is creation-ordered, so equal timestamps still read newest
+    first). A queue read as "what changed since I looked" must float an old
+    application that was just touched above a new one nobody has opened;
+    `created_at DESC` (the primary key, what this list did before) buried it.
+    `updated_at` is `onupdate=func.now()` on the ORM row, so it moves on every
+    status transition and field edit, and NOT on a child-table write alone (a
+    document or an item added to an otherwise untouched row). Served by
+    `ix_applications_updated_at_id`.
     """
     conditions: list[Any] = [scope]
     for column, value in (
@@ -341,7 +348,7 @@ async def list_applications(
         select(Application)
         .outerjoin(Organization, Organization.id == join_target)
         .where(*conditions)
-        .order_by(Application.id.desc())
+        .order_by(Application.updated_at.desc(), Application.id.desc())
         .offset(offset)
         .limit(limit)
     )

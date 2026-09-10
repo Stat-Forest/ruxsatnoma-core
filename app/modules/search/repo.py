@@ -124,7 +124,10 @@ async def search_applications(
             select(func.count()).select_from(base.with_only_columns(Application.id).subquery())
         )
     ).scalar_one()
-    order = Application.id.desc()
+    # No `q`: the same order `applications.repo.list_applications` serves
+    # (most recently updated first, `id DESC` as the tie-break), so the search
+    # screen and the applications screen never disagree on what is on top.
+    order = Application.updated_at.desc()
     if q:
         order = _similarity_rank(q, Application.number, Applicant.name).desc()
     rows = await db.execute(base.order_by(order, Application.id.desc()).offset(offset).limit(limit))
@@ -191,7 +194,9 @@ async def search_permits(
             select(func.count()).select_from(base.with_only_columns(Permit.id).subquery())
         )
     ).scalar_one()
-    order = Permit.id.desc()
+    # No `q`: the order `permits.repo.list_permits` serves — see the
+    # applications twin above.
+    order = Permit.updated_at.desc()
     if q:
         order = _similarity_rank(q, display_number, Applicant.name).desc()
     rows = await db.execute(base.order_by(order, Permit.id.desc()).offset(offset).limit(limit))

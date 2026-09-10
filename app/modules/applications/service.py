@@ -2499,6 +2499,9 @@ async def _auto_assign_on_submission(db: AsyncSession, application: Application)
     )
 
 
+NOTIFY_APPLICATION_REVIEW_STARTED = "application.review_started"
+
+
 async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
     """`POST /applications/{id}/start-review` — SUBMITTED -> IN_REVIEW, plus the
     `application_assignments` row that says who holds it.
@@ -2556,12 +2559,30 @@ async def start_review(db: AsyncSession, application_id: uuid.UUID, *, actor: Us
         reason=ASSIGNMENT_MANUAL,
         actor=actor,
     )
-    await _apply_transition(
+    entry = await _apply_transition(
         db,
         application,
         to_status=IN_REVIEW_STATUS,
         action=APPLICATION_START_REVIEW,
         actor=actor,
+    )
+    # Ruling #200: the applicant hears the file is being looked at. Cabinet
+    # only — no SMS for this beside «подана» and the decision that follows,
+    # the same reading decision #152 gave the approval (`0056` seeds the
+    # `sms` template all the same, for the registry guard's sake).
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_REVIEW_STARTED,
+        recipient_user_id=await _notification_recipient(db, application),
+        channels=("inapp",),
+        params={
+            "application_number": application.number,
+            **notifications_service.transition_params(
+                from_status=entry.from_status, to_status=entry.to_status
+            ),
+        },
+        object_type="application",
+        object_id=application.id,
     )
     return application
 
@@ -2749,6 +2770,7 @@ APPLICATION_RESPOND_INFO = "application.respond_info"
 # applicant's own act and notifies nobody, the same shape `cancel` gives its
 # own withdrawal.
 NOTIFY_APPLICATION_INFO_REQUESTED = "application.info_requested"
+NOTIFY_APPLICATION_INFO_RESPONDED = "application.info_responded"
 PENDING_INFO_STATUS = "PENDING_INFO"
 # The ONE `doc_types` item a `respond_info` attachment is filed under —
 # migration `0025` seeds it (fix round 1, after review found the first draft's
@@ -2927,13 +2949,30 @@ async def respond_info(
         application.sla_deadline_at = sla.shift_deadline(
             application.sla_deadline_at, paused_for=now - info_request.requested_at
         )
-    await _apply_transition(
+    entry = await _apply_transition(
         db,
         application,
         to_status=IN_REVIEW_STATUS,
         action=APPLICATION_RESPOND_INFO,
         actor=actor,
         reason=text,
+    )
+    # Ruling #200: the answer goes to whoever ASKED (`requested_by`), not to
+    # "the assigned executor" — the request may have come from a reviewer the
+    # assignment row does not name, and it is their question being answered.
+    # Staff never receive SMS (decision #150), so this is in-app by nature.
+    await notifications_service.notify(
+        db,
+        event_code=NOTIFY_APPLICATION_INFO_RESPONDED,
+        recipient_user_id=info_request.requested_by,
+        params={
+            "application_number": application.number,
+            **notifications_service.transition_params(
+                from_status=entry.from_status, to_status=entry.to_status
+            ),
+        },
+        object_type="application",
+        object_id=application.id,
     )
     return application
 

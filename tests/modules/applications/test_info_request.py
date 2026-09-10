@@ -73,6 +73,46 @@ async def test_answering_shifts_the_deadline_by_the_pause(
     ) == timedelta(days=3)
 
 
+async def test_the_answer_tells_whoever_asked(
+    db, hodim_client, applicant_client, application_in_review, hodim_user
+) -> None:
+    """Ruling #200: PENDING_INFO -> IN_REVIEW notifies the staff member who
+    opened the request (`info_requests.requested_by`), in-app, under the
+    dotted `application.info_responded` — with a seeded template and the
+    transition the inbox draws as chips. The applicant, who just wrote the
+    answer, is not told about it."""
+    import uuid
+
+    from sqlalchemy import select
+
+    from app.modules.notifications.models import Notification
+
+    asked = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/request-info",
+        json={"message": "Прикрепите справку"},
+    )
+    assert asked.status_code == 200, asked.text
+    answered = await applicant_client.post(
+        f"/api/v1/applications/{application_in_review}/respond-info",
+        json={"text": "Прикрепил", "file_ids": []},
+    )
+    assert answered.status_code == 200, answered.text
+
+    rows = (
+        await db.scalars(
+            select(Notification).where(
+                Notification.object_id == uuid.UUID(application_in_review),
+                Notification.event_code == "application.info_responded",
+            )
+        )
+    ).all()
+    assert [row.channel for row in rows] == ["inapp"]
+    inapp = rows[0]
+    assert inapp.recipient_user_id == hodim_user.id
+    assert inapp.template_id is not None
+    assert (inapp.params["status_from"], inapp.params["status_to"]) == ("PENDING_INFO", "IN_REVIEW")
+
+
 async def test_a_second_open_request_is_refused(hodim_client, application_in_review) -> None:
     """Two open pauses make the arithmetic ambiguous — refuse rather than guess.
 

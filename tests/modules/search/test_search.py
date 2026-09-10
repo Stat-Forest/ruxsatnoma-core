@@ -151,6 +151,66 @@ async def test_status_filter_narrows_results(db: AsyncSession, leshoz: Organizat
         assert str(cancelled.id) not in ids
 
 
+async def test_without_a_query_applications_come_most_recently_updated_first(
+    db: AsyncSession, leshoz: Organization
+):
+    """No `q` means no relevance rank, and the fallback order is the one
+    `GET /applications` uses — `updated_at DESC`, `id DESC` as the tie-break —
+    so the search screen and the applications screen never disagree on what
+    is "on top". The commit before the touch is load-bearing: `now()` is the
+    transaction's start, so an UPDATE inside the INSERTs' own transaction
+    would stamp the birth timestamp again and prove nothing."""
+    older = await make_application(db, org=leshoz, status="CLOSED", applicant_name="A A")
+    newer = await make_application(db, org=leshoz, status="CLOSED", applicant_name="B B")
+    await db.commit()
+    older.status = "CANCELLED"
+    await db.commit()
+
+    async for client in _client_for(db, SEARCH_USE, organization_id=leshoz.id):
+        resp = await client.get(
+            "/api/v1/search",
+            params={"kind": "applications", "organization_id": str(leshoz.id)},
+        )
+        assert resp.status_code == 200, resp.text
+        assert [row["id"] for row in resp.json()["items"]] == [str(older.id), str(newer.id)]
+
+
+async def test_without_a_query_permits_come_most_recently_updated_first(
+    db: AsyncSession,
+    leshoz: Organization,
+    contours_layer,
+    grazing_activity_id: uuid.UUID,
+    approval_doc,
+):
+    """The permits twin of the test above: the fallback order matches
+    `GET /permits`, most recently updated first."""
+    contour = await make_contour(db, contours_layer, leshoz)
+    version = await make_version(
+        db, contour.id, random_box_wkt(), status="published", approval_doc_id=approval_doc.id
+    )
+    older, newer = [
+        await make_permit_on_contour(
+            db,
+            contour=contour,
+            version_id=version.id,
+            org=leshoz,
+            activity_type_id=grazing_activity_id,
+            status="active",
+        )
+        for _ in range(2)
+    ]
+    await db.commit()
+    older.status = "suspended"
+    await db.commit()
+
+    async for client in _client_for(db, SEARCH_USE, organization_id=leshoz.id):
+        resp = await client.get(
+            "/api/v1/search", params={"kind": "permits", "organization_id": str(leshoz.id)}
+        )
+        assert resp.status_code == 200, resp.text
+        assert [row["id"] for row in resp.json()["items"]] == [str(older.id), str(newer.id)]
+
+
 async def test_zone_scoped_actor_does_not_see_another_orgs_permit(
     db: AsyncSession,
     leshoz: Organization,
