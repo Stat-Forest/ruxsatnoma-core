@@ -482,3 +482,24 @@ async def any_effective_representative(
         .order_by(Representation.created_at)
         .limit(1)
     )
+
+
+# --- Stage 13 (ruling #204): batch name readers for the register exports ------
+
+
+async def applicant_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Display names for a batch of applicants in ONE query; `{}` for an
+    empty set without touching the database."""
+    if not ids:
+        return {}
+    rows = await db.execute(select(Applicant.id, Applicant.name).where(Applicant.id.in_(ids)))
+    return {row.id: row.name for row in rows}
+
+
+async def user_full_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Full names for a batch of users in ONE query (the responsible or
+    assigned staff member a register row names)."""
+    if not ids:
+        return {}
+    rows = await db.execute(select(User.id, User.full_name).where(User.id.in_(ids)))
+    return {row.id: row.full_name for row in rows}

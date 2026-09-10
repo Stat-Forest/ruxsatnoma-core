@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Iterable
 from datetime import date
+from typing import Any
 
 from sqlalchemy import Select, and_, delete, exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -452,3 +453,18 @@ async def list_admin_legal_documents(
         await db.execute(stmt.order_by(*_legal_document_order()).offset(offset).limit(limit))
     ).scalars()
     return list(rows), total
+
+
+# --- Stage 13 (ruling #204): batch name readers for the register exports ------
+
+
+async def organization_names(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """`LocalizedName` dicts for a batch of organizations in ONE query."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Organization.id, Organization.name).where(Organization.id.in_(ids))
+    )
+    return {row.id: dict(row.name) for row in rows}

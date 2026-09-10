@@ -1040,3 +1040,13 @@ async def features_intersecting(
         )
     )
     return list(rows.all())
+
+
+async def contour_numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Stage 13 (ruling #204): numbers for a batch of contours in ONE query.
+    Not `contour_numbers` above — that one answers an organization's whole
+    set and has a different question."""
+    if not ids:
+        return {}
+    rows = await db.execute(select(Contour.id, Contour.number).where(Contour.id.in_(ids)))
+    return {row.id: row.number for row in rows}

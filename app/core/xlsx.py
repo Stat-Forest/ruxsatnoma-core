@@ -67,6 +67,26 @@ def id_column(header: dict[str, str] | None = None) -> Column[Any]:
     )
 
 
+# The order a `LocalizedName` is read in when the requested language is
+# missing: decision #90 makes `uz_latn` the one language every API-written
+# name carries, `uz_cyrl` is what the seeds and the older rows carry, `ru`
+# is the administrative fallback `reports/render.py` already uses.
+_NAME_FALLBACK = ("uz_latn", "uz_cyrl", "ru")
+
+
+def localized(name: dict[str, Any] | None, lang: Lang) -> str:
+    """One display string out of a `LocalizedName` dict: the requested
+    language, else the fallback order above, else whatever value the dict
+    holds first — never an empty cell for a row that HAS a name."""
+    if not name:
+        return ""
+    for code in (lang, *_NAME_FALLBACK):
+        value = name.get(code)
+        if value:
+            return str(value)
+    return next((str(v) for v in name.values() if v), "")
+
+
 def _cell(value: CellValue) -> CellValue:
     if isinstance(value, datetime):
         if value.tzinfo is not None:

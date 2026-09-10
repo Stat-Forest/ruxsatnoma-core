@@ -91,3 +91,13 @@ def test_xlsx_response_reports_truncation_in_headers():
     ok = xlsx.xlsx_response(b"x", filename="a.xlsx", total=5, cap=10000)
     assert ok.headers["X-Export-Rows"] == "5"
     assert ok.headers["X-Export-Truncated"] == "false"
+
+
+def test_localized_prefers_the_requested_language_then_falls_back_in_order():
+    assert xlsx.localized({"uz_latn": "Lat", "ru": "Ру"}, lang="ru") == "Ру"
+    assert xlsx.localized({"uz_latn": "Lat", "ru": "Ру"}, lang="uz_latn") == "Lat"
+    assert xlsx.localized({"uz_cyrl": "Кир", "ru": "Ру"}, lang="uz_latn") == "Кир"
+    assert xlsx.localized({"ru": "Ру"}, lang="uz_latn") == "Ру"
+    assert xlsx.localized({"kaa": "Qq"}, lang="ru") == "Qq"
+    assert xlsx.localized({"uz_latn": ""}, lang="uz_latn") == ""
+    assert xlsx.localized(None, lang="ru") == ""

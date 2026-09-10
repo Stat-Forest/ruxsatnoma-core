@@ -1444,3 +1444,17 @@ async def set_language(db: AsyncSession, user: User, language: str, *, ip: str |
         ip=ip,
         extra={"language": language},
     )
+
+
+# --- Stage 13 (ruling #204): batch name readers for the register exports ------
+# Other modules' `export.py` resolve the ids their rows carry into names
+# through these — one query per table, never one per row, and always via
+# this service (cross-module calls go through `service`, never `repo`).
+
+
+async def applicant_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    return await repo.applicant_names(db, ids)
+
+
+async def user_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    return await repo.user_full_names(db, ids)
