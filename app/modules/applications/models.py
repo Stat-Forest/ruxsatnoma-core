@@ -50,13 +50,15 @@ APPLICATION_KINDS = ("new", "extension")
 # itself are decided by different people at different moments, and a claim
 # rejection must never be confused with `status="REJECTED"` (the head's own
 # refusal of the whole filing). `not_required` is the default for every
-# application, benefit or none: only a claim whose classifier item carries
-# `props.requires_certificate = true` ever leaves it. `pending` -> `verified`
-# or `rejected` is the only transition this module's router drives
-# (`benefit_verification.py`); nothing here writes `pending` — that belongs to
-# `applications.service.submit`, which this branch does not touch (see this
-# module's own report to the integrator: `applications/service.py` must set it
-# at step 3, beside `_assert_benefit_documents`).
+# application, benefit or none: only a row that actually CLAIMS a category
+# (`benefit_category_item_id` set) ever leaves it — ruling #181 made the
+# certificate number mandatory for every category, so `requires_certificate`
+# is no longer read anywhere; a claimed category with no number is refused at
+# submission rather than filed as `not_required`. `pending` -> `verified` or
+# `rejected` is either the seam `service._open_benefit_verification` calls at
+# submission (ruling #182's registered auto-verifiers, `verified` on the
+# spot) or the leshoz's own `benefit_verification.py` (`verify_claim`/
+# `.reject_claim`, `benefits.verify`, in zone).
 BENEFIT_VERIFICATION_STATUSES = ("not_required", "pending", "verified", "rejected")
 
 # ruling 21: what gis.checks and norms.checks actually emit. gis's own `restrictions`
@@ -170,6 +172,12 @@ class Application(Base):
     decision_basis: Mapped[str | None]
     submitted_at: Mapped[datetime | None]
     decided_at: Mapped[datetime | None]
+    # Ruling #184: "I have read the rules" is a mandatory acceptance before any
+    # signature. NULL for every DRAFT/RETURNED row (nothing accepted yet) and
+    # for a row submitted before this column existed — a historical submission
+    # is not retroactively un-accepted. Written server-side, once, by
+    # `service.submit` alone; never a client-settable field.
+    rules_accepted_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -182,10 +190,11 @@ class Application(Base):
             f"benefit_verification_status IN {BENEFIT_VERIFICATION_STATUSES}",
             name="benefit_verification_status_valid",
         ),
-        # `repo.list_certificate_claims`'s own query, materialised: every row
-        # the benefit-verification office may ever read (ruling #179), and a
-        # small fraction of the table otherwise. A manually named partial
-        # index, declared here (not just in the migration) so the
+        # Every row carrying an active benefit claim — a small fraction of the
+        # table. Ruling #179 built this for the (now-retired, ruling #182) central
+        # office's own country-wide query; kept as a general-purpose filter for
+        # any future reader of "which applications carry a claim". A manually
+        # named partial index, declared here (not just in the migration) so the
         # autogenerate-diff guard stays empty — `ApplicationAssignment.
         # __table_args__`'s `uq_application_assignments_active` below is the
         # identical shape, one class over.

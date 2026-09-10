@@ -778,3 +778,163 @@ async def test_the_approval_takes_the_cabinet_and_the_invoice_takes_the_sms(
         "the approval must not take the SMS channel — the invoice notification"
         " that follows it in this same transaction says everything it did"
     )
+
+
+# --- Ruling #182: the leshoz's own verify/reject pair blocks the decision ----
+
+
+async def _in_review_with_benefit_claim(
+    applicant_client,
+    hodim_client,
+    recreation_draft_ready_for_submission: str,
+    preschool_children_item_id: uuid.UUID,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> str:
+    """A genuinely IN_REVIEW application carrying a `pending` claim, built end
+    to end through the real routes — `test_benefit_verification.py`'s own
+    shape, local here because that file's fixtures are its own.
+
+    A REAL category (`preschool_children`), not an invented one — since
+    #181, decision #50 refuses ANY code missing from the resolved tariff's
+    `benefit_modifiers` at pricing time, so an invented code can never reach
+    SUBMITTED (the whole transaction, `pending` included, rolls back with
+    it). `preschool_children_priced` (a fixture dependency of the caller
+    below) gives the seeded recreation tariff a real, non-zero modifier for
+    this code first.
+    """
+    from tests.modules.applications.test_submit import _submit, _upload
+
+    app_id = recreation_draft_ready_for_submission
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={
+            "benefit_category_item_id": str(preschool_children_item_id),
+            "benefit_certificate_no": "CERT-DEC-1",
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    proof = await applicant_client.post(
+        f"/api/v1/applications/{app_id}/documents",
+        json={
+            "doc_type_item_id": str(benefit_doc_type_item_id),
+            "file_id": await _upload(applicant_client),
+        },
+    )
+    assert proof.status_code == 201, proof.text
+    submitted = await _submit(applicant_client, app_id)
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["benefit_verification_status"] == "pending"
+    started = await hodim_client.post(f"/api/v1/applications/{app_id}/start-review")
+    assert started.status_code == 200, started.text
+    return app_id
+
+
+@pytest.fixture
+async def application_in_review_with_pending_benefit_claim(
+    applicant_client,
+    hodim_client,
+    recreation_draft_ready_for_submission: str,
+    preschool_children_item_id: uuid.UUID,
+    preschool_children_priced: None,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> str:
+    return await _in_review_with_benefit_claim(
+        applicant_client,
+        hodim_client,
+        recreation_draft_ready_for_submission,
+        preschool_children_item_id,
+        benefit_doc_type_item_id,
+    )
+
+
+async def test_approve_refuses_a_pending_benefit_claim(
+    executor_head_client, application_in_review_with_pending_benefit_claim
+) -> None:
+    result = await _decide(
+        executor_head_client, application_in_review_with_pending_benefit_claim, "approve"
+    )
+    assert result.status_code == 409, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-APP-004"
+    assert error["details"]["reason"] == "benefit_unverified"
+
+
+async def test_approve_refuses_a_rejected_benefit_claim_with_its_reason(
+    hodim_client, executor_head_client, application_in_review_with_pending_benefit_claim
+) -> None:
+    reason = "the certificate number does not match any registry entry"
+    app_id = application_in_review_with_pending_benefit_claim
+    rejected = await hodim_client.post(
+        f"/api/v1/applications/benefit-verifications/{app_id}/reject", json={"reason": reason}
+    )
+    assert rejected.status_code == 200, rejected.text
+
+    result = await _decide(executor_head_client, app_id, "approve")
+    assert result.status_code == 409, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-APP-004"
+    assert error["details"]["reason"] == "benefit_rejected"
+    assert error["details"]["benefit_rejection_reason"] == reason
+
+
+async def test_approve_passes_once_the_leshoz_verifies_the_claim(
+    hodim_client, executor_head_client, application_in_review_with_pending_benefit_claim
+) -> None:
+    app_id = application_in_review_with_pending_benefit_claim
+    verified = await hodim_client.post(
+        f"/api/v1/applications/benefit-verifications/{app_id}/verify"
+    )
+    assert verified.status_code == 200, verified.text
+
+    result = await _decide(executor_head_client, app_id, "approve")
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "INVOICED"
+
+
+async def test_reject_uses_the_verifiers_own_reason_as_the_grounds_when_none_is_given(
+    db: AsyncSession,
+    hodim_client,
+    executor_head_client,
+    application_in_review_with_pending_benefit_claim,
+    rejection_reason_item,
+) -> None:
+    """Ruling #182: a `rejected` claim IS the grounds for rejecting the
+    APPLICATION too — the head need not retype what a colleague already
+    wrote down. `legal_basis` is deliberately absent from `_decide`'s own
+    kwargs here."""
+    from app.modules.applications.models import Application
+
+    reason = "no matching registry entry"
+    app_id = application_in_review_with_pending_benefit_claim
+    rejected_claim = await hodim_client.post(
+        f"/api/v1/applications/benefit-verifications/{app_id}/reject", json={"reason": reason}
+    )
+    assert rejected_claim.status_code == 200, rejected_claim.text
+
+    result = await _decide(
+        executor_head_client, app_id, "reject", reason_item_id=str(rejection_reason_item.id)
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "REJECTED"
+
+    row = await db.get(Application, uuid.UUID(app_id))
+    assert row is not None
+    await db.refresh(row)
+    assert row.decision_basis == reason
+
+
+async def test_reject_without_legal_basis_is_still_refused_when_the_claim_is_not_rejected(
+    executor_head_client, application_in_review_with_pending_benefit_claim, rejection_reason_item
+) -> None:
+    """The mandatory-grounds rule stays intact: a `pending` (not `rejected`)
+    claim gives `reject` nothing of its own to default `legal_basis` from."""
+    result = await _decide(
+        executor_head_client,
+        application_in_review_with_pending_benefit_claim,
+        "reject",
+        reason_item_id=str(rejection_reason_item.id),
+    )
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-VAL-001"
+    assert error["details"]["reason"] == "legal_basis_required"

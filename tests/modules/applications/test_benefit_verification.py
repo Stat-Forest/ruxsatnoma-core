@@ -1,265 +1,209 @@
-"""The central benefit-verification office (decisions.md #179; wave-2 track
-T9, `docs/plans/09-odilxon-demo-fixes.md`).
+"""A benefit claim's verify/reject pair, moved to the leshoz by ruling #182
+(wave-2 track B2; `docs/plans/10-benefits-and-simple-signature.md`).
 
-**Why the pending-claim application below is stamped directly, not filed
-through a real submission.** `applications.service.submit` is the file this
-track may not touch, and it does not yet compute `benefit_verification_
-status` at all (this module's own report to the integrator names exactly
-where that belongs). `benefit_categories` also ships EMPTY — ruling #179's
-own closing paragraph, VMQ 278 section IV has not arrived — so no real
-category with `props.requires_certificate = true` exists in a fresh database
-either. There is therefore no REAL transition yet to build the fixture
-through (the lesson's own exception: "reaches that state by running the code
-that produces it" only applies where such code exists) — `_make_pending_
-claim` below stamps a genuinely SUBMITTED application (built through `POST
-/applications` + `PATCH` + the real ERI submission, `test_submit.py::
-_submit`) with the five columns exactly as `submit()` is asked to compute
-them, so every test past that point exercises the real read/write surface
-this track owns (`repo.py`, `benefit_verification.py`, the router) rather
-than a shortcut through it.
+Rulings #179/#181/#182. Every positive test below is built through the REAL
+routes end to end — `POST /applications` -> `PATCH` -> a document of the
+benefit type -> `/submit` -> `/start-review` -> `/verify`|`/reject` — never by
+stamping `benefit_verification_status` on the row directly (lesson: build a
+fixture's precondition through the real transition). `benefit_categories` is
+no longer empty (ruling #181, migration `0053`), so this file uses the REAL
+seven seeded categories — `beekeeping_union_member` for the wired seam,
+`conftest.py`'s own `benefit_category_item_id` (a fresh, unrelated code with
+no registered auto-verifier) for the pending/leshoz-review path.
 """
 
 import uuid
-from collections.abc import AsyncIterator
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import make_session_factory, uuid7
+from app.modules.admin.models import Classifier, ClassifierItem
+from app.modules.applications import service
 from app.modules.applications.benefit_verification import (
     BENEFIT_CLAIM_REJECT,
     BENEFIT_CLAIM_VERIFY,
 )
-from app.modules.applications.models import Application
 from app.modules.audit.models import AuditLog
-from tests.modules.applications.conftest import _head_client
-from tests.modules.applications.test_submit import _submit
-from tests.modules.auth.test_sessions import make_user
+from app.modules.auth.models import User
+from app.modules.beekeepers import service as beekeepers_service
+from app.modules.beekeepers.schemas import BeekeeperCreateIn
+from tests.modules.applications.conftest import unique_pinfl
+from tests.modules.applications.test_submit import _submit, _upload
 
 API = "/api/v1"
 
 
-@pytest.fixture
-async def certificate_benefit_category_item_id(engine) -> AsyncIterator[uuid.UUID]:
-    """A `benefit_categories` item whose `props` carries `requires_certificate
-    = true` — the shape ruling #179 keys `benefit_verification_status=
-    'pending'` on. Same own-session-plus-teardown shape as conftest's own
-    `benefit_category_item_id` fixture, and deliberately not that one with
-    `props` patched in: a certificate-requiring category is this file's own
-    concern alone."""
-    item_id = uuid7()
-    factory = make_session_factory(engine)
-    async with factory() as own_db:
-        await own_db.execute(
-            text(
-                "INSERT INTO classifier_items "
-                "(id, classifier_id, code, name, props, valid_from, sort_order, status) "
-                "SELECT :id, c.id, :code, CAST(:name AS jsonb), CAST(:props AS jsonb), "
-                "DATE '2020-01-01', 0, 'active' "
-                "FROM classifiers c WHERE c.code = 'benefit_categories'"
-            ).bindparams(
-                id=item_id,
-                code=f"beekeeper_{uuid.uuid4().hex[:8]}",
-                name='{"en": "Beekeeper (test)"}',
-                props='{"requires_certificate": true}',
+async def _benefit_category_item_id(db: AsyncSession, code: str) -> uuid.UUID:
+    """One ACTIVE `benefit_categories` item by its CODE — the seven ruling
+    #181 seeds via migration `0053`, fetched rather than duplicated: a
+    private copy inserted per test would leave rows in this shared,
+    persistent database that `GET /refs/classifiers/benefit_categories`
+    would then offer on a real form."""
+    classifier_id = (
+        await db.execute(select(Classifier.id).where(Classifier.code == "benefit_categories"))
+    ).scalar_one()
+    return (
+        await db.execute(
+            select(ClassifierItem.id).where(
+                ClassifierItem.classifier_id == classifier_id,
+                ClassifierItem.code == code,
+                ClassifierItem.status == "active",
             )
         )
-        await own_db.commit()
-        try:
-            yield item_id
-        finally:
-            # A test that FAILED mid-way leaves `db`'s transaction open with
-            # an uncommitted application still pointing at this item, and the
-            # DELETE below then waits on that transaction for ever — the whole
-            # xdist worker hung 17 minutes on the stage 10 integration branch
-            # before anyone read `pg_stat_activity`. A bounded wait turns the
-            # hang into the failure it already is.
-            await own_db.execute(text("SET LOCAL lock_timeout = '5s'"))
-            await own_db.execute(
-                text(
-                    "UPDATE applications SET benefit_category_item_id = NULL "
-                    "WHERE benefit_category_item_id = :id"
-                ).bindparams(id=item_id)
-            )
-            await own_db.execute(
-                text("DELETE FROM classifier_items WHERE id = :id").bindparams(id=item_id)
-            )
-            await own_db.commit()
+    ).scalar_one()
 
 
-async def _submitted_second_application(
-    applicant_client, published_contour, grazing_activity_id, sheep_type_id
-) -> str:
-    """A SECOND real submission on `submitted_application`'s own contour and
-    activity, over a period that does NOT overlap its 2027-05-01..2027-09-30
-    (`ex_applications_no_duplicate`, ruling 6) — so a test naming both
-    `submitted_application` and this one gets two genuinely independent rows
-    rather than a duplicate-guard `IntegrityError`."""
-    from tests.modules.applications.conftest import _ready_draft
-
-    draft_id = await _ready_draft(
-        applicant_client,
-        published_contour.id,
-        grazing_activity_id,
-        sheep_type_id,
-        period_from="2028-05-01",
-        period_to="2028-09-30",
+async def _claim_and_prove(
+    applicant_client,
+    app_id: str,
+    *,
+    benefit_category_item_id: uuid.UUID,
+    benefit_doc_type_item_id: uuid.UUID,
+    certificate_no: str | None,
+):
+    """PATCH the claim onto a draft and attach the one document type that
+    proves it — `test_submit.py`'s own two-step shape, factored out because
+    every test below needs it before it can even attempt `/submit`."""
+    body: dict[str, object] = {"benefit_category_item_id": str(benefit_category_item_id)}
+    if certificate_no is not None:
+        body["benefit_certificate_no"] = certificate_no
+    patched = await applicant_client.patch(f"{API}/applications/{app_id}", json=body)
+    assert patched.status_code == 200, patched.text
+    proof = await applicant_client.post(
+        f"{API}/applications/{app_id}/documents",
+        json={
+            "doc_type_item_id": str(benefit_doc_type_item_id),
+            "file_id": await _upload(applicant_client),
+        },
     )
-    result = await _submit(applicant_client, draft_id)
-    assert result.status_code == 200, result.text
-    return draft_id
-
-
-async def _make_pending_claim(
-    db: AsyncSession, application_id: str, benefit_item_id: uuid.UUID, *, certificate_no: str
-) -> None:
-    """Stamp a real SUBMITTED application with a certificate-bearing claim —
-    this module's own docstring explains why this is a direct write rather
-    than a second real submission. Flushed, not committed: every client in
-    this file carries `_commit_pending_before_requests` (conftest), which
-    commits `db` right before its own next request — the same convention
-    every fixture in this package already relies on."""
-    application = await db.get(Application, uuid.UUID(application_id))
-    assert application is not None
-    application.benefit_category_item_id = benefit_item_id
-    application.benefit_certificate_no = certificate_no
-    application.benefit_verification_status = "pending"
-    await db.flush()
-
-
-@pytest.fixture
-async def benefit_verifier_client(db: AsyncSession):
-    """A user under a PRODUCTION role that holds `benefits.verify` —
-    `executor_staff` since migration `0053` (ruling #182 moved the check to
-    the leshoz; the central `benefit_verifier` became `beekeeping_registrar`
-    and lost the permission). Zone-free here only because the routes under
-    test are still #179's zone-less ones — wave 2 (B2) rewrites this file
-    around the leshoz's own zone rule. `_head_client`'s own shape (conftest),
-    not `_client_for`'s personal-grant one, because what is under test here
-    includes whether the SEEDED role actually holds `benefits.verify` (lesson:
-    "A role's identity and its grants have ONE source — the seeding
-    migration")."""
-    user = await make_user(db, role_code="executor_staff")
-    async for client in _head_client(db, user):
-        yield client
+    assert proof.status_code == 201, proof.text
 
 
 @pytest.fixture
 async def pending_claim_application(
-    db: AsyncSession,
     applicant_client,
-    published_contour,
-    grazing_activity_id: uuid.UUID,
-    sheep_type_id: uuid.UUID,
-    certificate_benefit_category_item_id: uuid.UUID,
-    published_coef_sb: None,
-    published_grazing_norm: uuid.UUID,
+    hodim_client,
+    recreation_draft_ready_for_submission: str,
+    preschool_children_item_id: uuid.UUID,
+    preschool_children_priced: None,
+    benefit_doc_type_item_id: uuid.UUID,
 ) -> str:
-    """A genuinely SUBMITTED application carrying a `pending` certificate
-    claim — the row every positive test in this file acts on.
+    """A genuinely SUBMITTED-then-`IN_REVIEW` application carrying a `pending`
+    claim on a category with NO registered auto-verifier — the row every
+    positive verify/reject test below acts on.
 
-    `published_coef_sb`/`published_grazing_norm` are DEPENDENCIES, not merely
-    used by the body — `draft_ready_for_submission`'s own template (conftest):
-    without the published rate and norm, `_submit` cannot price the draft at
-    all and refuses with `ERR-NORM-004`."""
-    application_id = await _submitted_second_application(
-        applicant_client, published_contour, grazing_activity_id, sheep_type_id
+    **A REAL category (`preschool_children`), not an invented one.** Since
+    #181, an invented code can never reach SUBMITTED at all: decision #50
+    refuses any benefit code absent from the resolved tariff's `benefit_
+    modifiers` at PRICING time, inside the same transaction step 3b runs in
+    — so a fixture built on a made-up code rolls back before `pending` is
+    ever committed. `preschool_children_priced` gives the seeded recreation
+    tariff a real (non-zero, non-self-settling) modifier for exactly this
+    code.
+    """
+    app_id = recreation_draft_ready_for_submission
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=preschool_children_item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no="CERT-0001",
     )
-    await _make_pending_claim(
-        db, application_id, certificate_benefit_category_item_id, certificate_no="CERT-0001"
+    submitted = await _submit(applicant_client, app_id)
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["benefit_verification_status"] == "pending"
+
+    started = await hodim_client.post(f"{API}/applications/{app_id}/start-review")
+    assert started.status_code == 200, started.text
+    return app_id
+
+
+@pytest.fixture
+async def submitted_claim_not_yet_in_review(
+    applicant_client,
+    recreation_draft_ready_for_submission: str,
+    preschool_children_item_id: uuid.UUID,
+    preschool_children_priced: None,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> str:
+    """The SAME shape as `pending_claim_application`, stopped one step short —
+    `start-review` never runs, so the application is `SUBMITTED`, not
+    `IN_REVIEW`. The one row `test_verify_before_review_started_is_refused`
+    needs."""
+    app_id = recreation_draft_ready_for_submission
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=preschool_children_item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no="CERT-0002",
     )
-    return application_id
+    submitted = await _submit(applicant_client, app_id)
+    assert submitted.status_code == 200, submitted.text
+    return app_id
 
 
-# --- Visibility: the queue, and the stranger's 404 ---------------------------
+# --- Visibility: the leshoz's own read/zone rule, not a central one ----------
 
 
-async def test_the_list_shows_only_certificate_bearing_applications(
-    benefit_verifier_client, pending_claim_application, submitted_application
+async def test_a_reviewer_reading_an_unrelated_application_gets_the_same_404_as_a_stranger(
+    hodim_client, submitted_application
 ) -> None:
-    """`submitted_application` (conftest's own, no benefit claim at all) must
-    NOT appear — this is not a zone widening, a verifier sees ONLY claims
-    (ruling #179)."""
-    result = await benefit_verifier_client.get(f"{API}/applications/benefit-verifications")
-    assert result.status_code == 200, result.text
-    body = result.json()
-    ids = {row["id"] for row in body["items"]}
-    assert pending_claim_application in ids
-    assert submitted_application not in ids
-
-
-async def test_the_list_is_country_wide_not_zone_scoped(
-    db: AsyncSession, pending_claim_application
-) -> None:
-    """A `benefit_verifier` holding NO organization/region/district still sees
-    a claim filed against a leshoz it has no zone relationship to whatsoever
-    — "the whole country, but only applications with this claim" (ruling
-    #179), proven by a verifier who is not even in the same region as
-    `published_contour`'s `leshoz`."""
-    user = await make_user(db, role_code="executor_staff")
-    async for client in _head_client(db, user):
-        result = await client.get(f"{API}/applications/benefit-verifications")
-        assert result.status_code == 200, result.text
-        assert pending_claim_application in {row["id"] for row in result.json()["items"]}
-
-
-async def test_a_verifier_reading_an_unrelated_application_gets_the_same_404_as_a_stranger(
-    benefit_verifier_client, submitted_application
-) -> None:
-    """The task's own required negative test: `submitted_application` is a
-    real, submitted, otherwise-fully-readable-by-staff row — and this role
-    still gets exactly the answer a stranger to the whole system gets."""
-    unrelated = await benefit_verifier_client.get(
+    """`submitted_application` (conftest's own, no benefit claim at all) is a
+    real, submitted, otherwise-fully-readable-by-`hodim_client` row in the
+    SAME leshoz — and this route still answers exactly what a stranger to the
+    whole system gets, because it carries no certificate-bearing claim."""
+    unrelated = await hodim_client.get(
         f"{API}/applications/benefit-verifications/{submitted_application}"
     )
     assert unrelated.status_code == 404
     assert unrelated.json()["error"]["code"] == "ERR-SYS-003"
 
-    nonexistent = await benefit_verifier_client.get(
-        f"{API}/applications/benefit-verifications/{uuid.uuid4()}"
-    )
+    nonexistent = await hodim_client.get(f"{API}/applications/benefit-verifications/{uuid.uuid4()}")
     assert nonexistent.status_code == 404
     assert nonexistent.json()["error"]["code"] == "ERR-SYS-003"
-    # Same status, same code, same message shape both times — a real
-    # application with no claim and an id that never existed must be
-    # indistinguishable on the wire, or this route would be an
-    # application-existence oracle.
     assert unrelated.json()["error"]["message"] == nonexistent.json()["error"]["message"]
 
 
-async def test_a_verifier_cannot_verify_or_reject_an_unrelated_application(
-    benefit_verifier_client, submitted_application
+async def test_an_executor_of_another_leshoz_gets_404(
+    other_zone_hodim_client, pending_claim_application
 ) -> None:
-    """The write paths answer the identical 404 the read does — a verifier
-    may not even learn that `submitted_application` exists by probing the
-    write routes."""
-    verify = await benefit_verifier_client.post(
-        f"{API}/applications/benefit-verifications/{submitted_application}/verify"
+    """Ruling #182's whole point: this is the leshoz's OWN review now, not a
+    country-wide one — a reviewer zoned to a DIFFERENT leshoz gets the same
+    404 `GET /applications/{id}` would give them."""
+    read = await other_zone_hodim_client.get(
+        f"{API}/applications/benefit-verifications/{pending_claim_application}"
+    )
+    assert read.status_code == 404
+    assert read.json()["error"]["code"] == "ERR-SYS-003"
+
+    verify = await other_zone_hodim_client.post(
+        f"{API}/applications/benefit-verifications/{pending_claim_application}/verify"
     )
     assert verify.status_code == 404
     assert verify.json()["error"]["code"] == "ERR-SYS-003"
 
-    reject = await benefit_verifier_client.post(
-        f"{API}/applications/benefit-verifications/{submitted_application}/reject",
-        json={"reason": "not this one"},
+
+async def test_a_gis_specialist_is_refused_the_whole_surface(
+    gis_specialist_client, pending_claim_application
+) -> None:
+    """A real staff role of the SAME leshoz that does not hold
+    `benefits.verify` — `gis_specialist` holds neither `.review` nor
+    `benefits.verify` since migration `0053` (ruling #182)."""
+    result = await gis_specialist_client.get(
+        f"{API}/applications/benefit-verifications/{pending_claim_application}"
     )
-    assert reject.status_code == 404
-    assert reject.json()["error"]["code"] == "ERR-SYS-003"
-
-
-async def test_a_non_verifier_is_refused_the_whole_surface(gis_specialist_client) -> None:
-    """A real staff role of the same leshoz that does NOT hold
-    `benefits.verify` — `gis_specialist` since `0053` gave the permission to
-    `executor_staff`/`executor_head` alone (ruling #182). The check is a code
-    of its own, not folded into any staff read."""
-    result = await gis_specialist_client.get(f"{API}/applications/benefit-verifications")
     assert result.status_code == 403
     assert result.json()["error"]["code"] == "ERR-ACL-001"
 
 
-async def test_an_applicant_is_refused_the_whole_surface(applicant_client) -> None:
-    result = await applicant_client.get(f"{API}/applications/benefit-verifications")
+async def test_an_applicant_is_refused_the_whole_surface(
+    applicant_client, pending_claim_application
+) -> None:
+    result = await applicant_client.get(
+        f"{API}/applications/benefit-verifications/{pending_claim_application}"
+    )
     assert result.status_code == 403
     assert result.json()["error"]["code"] == "ERR-ACL-001"
 
@@ -268,13 +212,9 @@ async def test_an_applicant_is_refused_the_whole_surface(applicant_client) -> No
 
 
 async def test_the_detail_read_carries_the_certificate_and_its_documents(
-    benefit_verifier_client, pending_claim_application
+    hodim_client, pending_claim_application
 ) -> None:
-    """`documents` — ruling #179's "optional supporting file uses the
-    existing document mechanism" — is present on the DETAIL read and starts
-    empty (`repo.list_documents`'s own shape, nothing attached by this
-    fixture)."""
-    result = await benefit_verifier_client.get(
+    result = await hodim_client.get(
         f"{API}/applications/benefit-verifications/{pending_claim_application}"
     )
     assert result.status_code == 200, result.text
@@ -284,16 +224,16 @@ async def test_the_detail_read_carries_the_certificate_and_its_documents(
     assert body["benefit_verification_status"] == "pending"
     assert body["benefit_verified_by"] is None
     assert body["benefit_verified_at"] is None
-    assert body["documents"] == []
+    assert len(body["documents"]) == 1
 
 
 # --- verify --------------------------------------------------------------------
 
 
-async def test_verify_moves_pending_to_verified_and_is_audited(
-    db: AsyncSession, benefit_verifier_client, pending_claim_application
+async def test_an_executor_in_zone_verifies_and_it_is_audited(
+    db: AsyncSession, hodim_client, pending_claim_application
 ) -> None:
-    result = await benefit_verifier_client.post(
+    result = await hodim_client.post(
         f"{API}/applications/benefit-verifications/{pending_claim_application}/verify"
     )
     assert result.status_code == 200, result.text
@@ -312,44 +252,53 @@ async def test_verify_moves_pending_to_verified_and_is_audited(
         )
     ).scalar_one()
     assert entry.result == "success"
-    # An audited decision without its own `new_value` would be a trail that
-    # records that something happened and not what — assert it, then read it.
     assert entry.new_value is not None
     assert entry.new_value["benefit_verification_status"] == "verified"
 
 
-async def test_verifying_an_already_decided_claim_is_refused(
-    benefit_verifier_client, pending_claim_application
+async def test_verify_before_review_started_is_refused(
+    hodim_client, submitted_claim_not_yet_in_review
 ) -> None:
-    first = await benefit_verifier_client.post(
+    """Ruling #182: verify/reject require the application to be `IN_REVIEW` —
+    "the moderator checks it when the application comes in", not while it is
+    still sitting `SUBMITTED`."""
+    result = await hodim_client.post(
+        f"{API}/applications/benefit-verifications/{submitted_claim_not_yet_in_review}/verify"
+    )
+    assert result.status_code == 409, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-APP-004"
+    assert error["details"]["reason"] == "not_in_review"
+    assert error["details"]["status"] == "SUBMITTED"
+
+
+async def test_verifying_an_already_decided_claim_is_refused(
+    hodim_client, pending_claim_application
+) -> None:
+    first = await hodim_client.post(
         f"{API}/applications/benefit-verifications/{pending_claim_application}/verify"
     )
     assert first.status_code == 200, first.text
 
-    second = await benefit_verifier_client.post(
+    second = await hodim_client.post(
         f"{API}/applications/benefit-verifications/{pending_claim_application}/verify"
     )
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "ERR-APP-004"
     assert second.json()["error"]["details"]["reason"] == "not_pending"
 
-    # A DECIDED claim leaves the office's own queue — ruling #179's list is
-    # "certificate-bearing", not merely "still pending", but this is the
-    # natural place to pin that a verified row no longer offers a second
-    # verify/reject rather than silently no-op-ing.
-
 
 # --- reject ----------------------------------------------------------------
 
 
-async def test_reject_requires_a_reason(benefit_verifier_client, pending_claim_application) -> None:
-    missing = await benefit_verifier_client.post(
+async def test_reject_requires_a_reason(hodim_client, pending_claim_application) -> None:
+    missing = await hodim_client.post(
         f"{API}/applications/benefit-verifications/{pending_claim_application}/reject", json={}
     )
     assert missing.status_code == 422
     assert missing.json()["error"]["code"] == "ERR-VAL-001"
 
-    blank = await benefit_verifier_client.post(
+    blank = await hodim_client.post(
         f"{API}/applications/benefit-verifications/{pending_claim_application}/reject",
         json={"reason": ""},
     )
@@ -358,10 +307,10 @@ async def test_reject_requires_a_reason(benefit_verifier_client, pending_claim_a
 
 
 async def test_reject_moves_pending_to_rejected_with_the_reason_and_is_audited(
-    db: AsyncSession, benefit_verifier_client, pending_claim_application
+    db: AsyncSession, hodim_client, pending_claim_application
 ) -> None:
     reason = "the certificate's serial does not match the registry"
-    result = await benefit_verifier_client.post(
+    result = await hodim_client.post(
         f"{API}/applications/benefit-verifications/{pending_claim_application}/reject",
         json={"reason": reason},
     )
@@ -386,137 +335,249 @@ async def test_reject_moves_pending_to_rejected_with_the_reason_and_is_audited(
     assert entry.new_value["reason"] == reason
 
 
-async def test_a_rejected_claim_still_reaches_the_office_own_list_as_its_own_history(
-    benefit_verifier_client, pending_claim_application
-) -> None:
-    """`verification_status=rejected` is not merely a mutation nobody can see
-    again — the office's own history of what it decided (module docstring)."""
-    rejected = await benefit_verifier_client.post(
-        f"{API}/applications/benefit-verifications/{pending_claim_application}/reject",
-        json={"reason": "no matching registry entry"},
-    )
-    assert rejected.status_code == 200, rejected.text
-
-    listed = await benefit_verifier_client.get(
-        f"{API}/applications/benefit-verifications", params={"verification_status": "rejected"}
-    )
-    assert listed.status_code == 200, listed.text
-    assert pending_claim_application in {row["id"] for row in listed.json()["items"]}
-
-    still_pending = await benefit_verifier_client.get(
-        f"{API}/applications/benefit-verifications", params={"verification_status": "pending"}
-    )
-    assert pending_claim_application not in {row["id"] for row in still_pending.json()["items"]}
+# --- ruling #181: a number is mandatory for EVERY category, flagged or not --
 
 
-# --- The patchable field itself --------------------------------------------
-
-
-async def test_the_certificate_number_is_a_patchable_draft_field(applicant_client) -> None:
-    """`benefit_certificate_no` round-trips through the ordinary draft PATCH —
-    the one field of ruling #179's five that IS client-settable."""
-    created = await applicant_client.post(f"{API}/applications", json={"on_behalf": "self"})
-    assert created.status_code == 201, created.text
-    application_id = created.json()["id"]
-    assert created.json()["benefit_certificate_no"] is None
-    assert created.json()["benefit_verification_status"] == "not_required"
-
-    patched = await applicant_client.patch(
-        f"{API}/applications/{application_id}", json={"benefit_certificate_no": "AB-12345"}
-    )
-    assert patched.status_code == 200, patched.text
-    assert patched.json()["benefit_certificate_no"] == "AB-12345"
-    # Never client-settable, even though it is on the same response shape —
-    # ApplicationPatch's own `extra="forbid"` refuses the field by name.
-    rejected = await applicant_client.patch(
-        f"{API}/applications/{application_id}",
-        json={"benefit_verification_status": "verified"},
-    )
-    assert rejected.status_code == 422
-
-
-# --- The seam the whole feature hangs on (integration, stage 9 wave 2) -------
-#
-# Every test above stamps `pending` directly, for the reason this module's own
-# docstring gives. That convenience hid the defect these two tests exist to
-# pin: nothing in `submit()` ever SET `pending`, so a claim never reached the
-# office built to check it, the certificate number was never demanded, and the
-# only symptom was an empty verifier list — indistinguishable from a quiet day.
-
-
-async def test_submitting_a_certificate_claim_opens_its_verification(
+async def test_a_claim_without_a_number_is_refused_at_submission_on_any_category(
     applicant_client,
     draft_ready_for_submission,
-    certificate_benefit_category_item_id: uuid.UUID,
+    benefit_category_item_id: uuid.UUID,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
-    """The REAL path, with the number present: step 3b passes and the
-    submission moves on to pricing.
-
-    It still ends 422, for the reason `test_submit.py::test_a_benefit_claim_
-    needs_a_document_of_the_benefit_type_and_no_other` documents at length —
-    decision #50 validates the benefit CODE against the tariff rows the
-    request resolved, and no seeded VMQ 278 tariff carries a modifier for a
-    category a test invented (`benefit_categories` ships empty, `tz/12` #2).
-    What this test pins is WHICH gate answers: not `benefit_certificate_
-    required` any more, which is exactly the difference between a claim that
-    reached the verification step and one that was turned back before it.
-    """
-    from tests.modules.applications.test_submit import _upload
-
+    """Ruling #181's own change: `benefit_category_item_id` here is an
+    ordinary, unflagged category (conftest's fixture carries no
+    `props.requires_certificate` at all any more, because that property is no
+    longer read) — and a claim naming it with no certificate number is STILL
+    refused, exactly like a "flagged" one used to be. `requires_certificate`
+    is gone from the code, not merely false for this row."""
     app_id = draft_ready_for_submission
-    patched = await applicant_client.patch(
-        f"{API}/applications/{app_id}",
-        json={
-            "benefit_category_item_id": str(certificate_benefit_category_item_id),
-            "benefit_certificate_no": "CERT-7788",
-        },
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=benefit_category_item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no=None,
     )
-    assert patched.status_code == 200, patched.text
-    proof = await applicant_client.post(
-        f"{API}/applications/{app_id}/documents",
-        json={
-            "doc_type_item_id": str(benefit_doc_type_item_id),
-            "file_id": await _upload(applicant_client),
-        },
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-APP-003"
+    assert error["details"]["reason"] == "benefit_certificate_required"
+
+
+async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_verification(
+    applicant_client,
+    draft_ready_for_submission,
+    benefit_category_item_id: uuid.UUID,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> None:
+    """The number alone is enough to pass step 3b on a category with no
+    registered auto-verifier — it still ends 422 downstream, for the reason
+    `test_submit.py::test_a_benefit_claim_needs_a_document_of_the_benefit_
+    type_and_no_other` documents at length (no seeded tariff carries a
+    modifier for a code a test invented); what this pins is WHICH gate
+    answers first."""
+    app_id = draft_ready_for_submission
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=benefit_category_item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no="CERT-7788",
     )
-    assert proof.status_code == 201, proof.text
 
     result = await _submit(applicant_client, app_id)
     assert result.status_code == 422, result.text
     body = result.json()
-    assert body["error"]["details"].get("reason") != "benefit_certificate_required"
     assert body["error"]["code"] != "ERR-APP-003"
 
 
-async def test_a_certificate_claim_without_its_number_is_refused_at_submission(
+# --- ruling #182: the wired seam, real register, three outcomes ---------------
+
+
+async def test_the_wired_seam_empty_for_every_other_category(
     applicant_client,
-    draft_ready_for_submission,
-    certificate_benefit_category_item_id: uuid.UUID,
+    recreation_draft_ready_for_submission: str,
+    preschool_children_item_id: uuid.UUID,
+    preschool_children_priced: None,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
-    """Same claim, proven by a document, but with no certificate number:
-    refused AT SUBMISSION rather than accepted and left for a verifier to
-    puzzle over a claim naming no certificate at all."""
-    from tests.modules.applications.test_submit import _upload
+    """`BENEFIT_AUTO_VERIFIERS` holds exactly one entry (`beekeeping_union_
+    member`); every other REAL #181 category — `preschool_children` here —
+    genuinely reaches SUBMITTED and falls through to the leshoz's own
+    `pending` queue, restated as this file's own negative control against
+    the wired seam specifically: a category that is not `beekeeping_union_
+    member` must never be auto-verified, whatever it prices to."""
+    app_id = recreation_draft_ready_for_submission
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=preschool_children_item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no="CERT-9001",
+    )
+    submitted = await _submit(applicant_client, app_id)
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["benefit_verification_status"] == "pending"
+
+
+async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
+    db: AsyncSession,
+    applicant_client,
+    draft_ready_for_submission,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> None:
+    """The REAL `beekeeping_union_member` category (migration `0053`) and the
+    REAL `beekeepers.service.match_certificate` (wired from `app/
+    event_subscriptions.py`, active in every test process — `register_event_
+    subscriptions()` runs autouse) against a certificate number nobody has
+    ever registered: `unknown`."""
+    item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
+    app_id = draft_ready_for_submission
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no=f"BEE-{uuid.uuid4().hex[:10]}",
+    )
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-APP-003"
+    assert error["details"]["reason"] == "benefit_certificate_unknown"
+
+
+async def test_the_wired_seam_refuses_someone_elses_certificate_number(
+    db: AsyncSession,
+    applicant_client,
+    draft_ready_for_submission,
+    benefit_doc_type_item_id: uuid.UUID,
+    hodim_user: User,
+) -> None:
+    """A REAL, ACTIVE `beekeepers` row — seeded through `beekeepers.service.
+    create_beekeeper`, never a stub — under a PINFL that is NOT the
+    applicant's own: `not_yours`."""
+    item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
+    certificate_no = f"BEE-{uuid.uuid4().hex[:10]}"
+    await beekeepers_service.create_beekeeper(
+        db,
+        data=BeekeeperCreateIn(
+            certificate_no=certificate_no,
+            pinfl=unique_pinfl(),
+            passport_series="AB",
+            passport_number="1234567",
+            full_name="Someone Else",
+        ),
+        actor=hodim_user,
+    )
+    await db.commit()
 
     app_id = draft_ready_for_submission
-    patched = await applicant_client.patch(
-        f"{API}/applications/{app_id}",
-        json={"benefit_category_item_id": str(certificate_benefit_category_item_id)},
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no=certificate_no,
     )
-    assert patched.status_code == 200, patched.text
-    proof = await applicant_client.post(
-        f"{API}/applications/{app_id}/documents",
-        json={
-            "doc_type_item_id": str(benefit_doc_type_item_id),
-            "file_id": await _upload(applicant_client),
-        },
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 422, result.text
+    error = result.json()["error"]
+    assert error["code"] == "ERR-APP-003"
+    assert error["details"]["reason"] == "benefit_certificate_not_yours"
+
+
+async def test_the_wired_seam_matched_passes_step_3b(
+    db: AsyncSession,
+    applicant_client,
+    draft_ready_for_submission,
+    benefit_doc_type_item_id: uuid.UUID,
+    hodim_user: User,
+) -> None:
+    """A REAL, ACTIVE `beekeepers` row under the APPLICANT's OWN PINFL: the
+    claim is `matched` and step 3b passes it through — the submission still
+    ends 422 downstream (no seeded apiary tariff carries a `beekeeping_
+    union_member` modifier for a GRAZING filing, the same reason every other
+    "past step 3b" test in this file ends 422), which is exactly why the
+    committed STATE of a matched claim is proven separately, in-process,
+    below (`test_the_wired_seam_matched_verifies_the_claim_on_the_spot`) —
+    the pricing failure rolls the whole transaction back before this route
+    ever gets to observe the row it set."""
+    item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
+    pinfl = (await applicant_client.get(f"{API}/auth/me")).json()["applicant"]["pinfl"]
+    certificate_no = f"BEE-{uuid.uuid4().hex[:10]}"
+    await beekeepers_service.create_beekeeper(
+        db,
+        data=BeekeeperCreateIn(
+            certificate_no=certificate_no,
+            pinfl=pinfl,
+            passport_series="AB",
+            passport_number="1234567",
+            full_name="The Applicant",
+        ),
+        actor=hodim_user,
     )
-    assert proof.status_code == 201, proof.text
+    await db.commit()
+
+    app_id = draft_ready_for_submission
+    await _claim_and_prove(
+        applicant_client,
+        app_id,
+        benefit_category_item_id=item_id,
+        benefit_doc_type_item_id=benefit_doc_type_item_id,
+        certificate_no=certificate_no,
+    )
 
     result = await _submit(applicant_client, app_id)
     assert result.status_code == 422, result.text
     body = result.json()
-    assert body["error"]["code"] == "ERR-APP-003"
-    assert body["error"]["details"]["reason"] == "benefit_certificate_required"
+    assert body["error"]["code"] != "ERR-APP-003"
+
+
+async def test_the_wired_seam_matched_verifies_the_claim_on_the_spot(
+    db: AsyncSession,
+    applicant,
+    draft_ready_for_submission: str,
+    hodim_user: User,
+) -> None:
+    """In-process, so the committed COLUMNS can be asserted directly — the
+    HTTP test above cannot, because the same request's downstream pricing
+    failure rolls the whole transaction back. `service._open_benefit_
+    verification` is called exactly as `submit`'s own step 3b calls it, over
+    the REAL registered verifier (`register_event_subscriptions()` runs
+    autouse, so `BENEFIT_AUTO_VERIFIERS["beekeeping_union_member"]` already
+    IS `beekeepers.service.match_certificate` here, no stub)."""
+    assert applicant.pinfl is not None
+    item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
+    certificate_no = f"BEE-{uuid.uuid4().hex[:10]}"
+    await beekeepers_service.create_beekeeper(
+        db,
+        data=BeekeeperCreateIn(
+            certificate_no=certificate_no,
+            pinfl=applicant.pinfl,
+            passport_series="AB",
+            passport_number="1234567",
+            full_name=applicant.name,
+        ),
+        actor=hodim_user,
+    )
+    await db.flush()
+
+    application = await service.get(db, uuid.UUID(draft_ready_for_submission))
+    assert application is not None
+    application.benefit_category_item_id = item_id
+    application.benefit_certificate_no = certificate_no
+    await db.flush()
+
+    await service._open_benefit_verification(db, application)
+
+    assert application.benefit_verification_status == "verified"
+    assert application.benefit_verified_by is None, (
+        "ruling #182: NULL means the register, not a human"
+    )
+    assert application.benefit_verified_at is not None
+    assert application.benefit_rejection_reason is None

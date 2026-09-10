@@ -507,6 +507,34 @@ async def _assert_capacity_available(
         raise err("ERR-NORM-002", details=limit["details"])
 
 
+def _assert_benefit_decided(application: Application) -> None:
+    """Ruling #182's mandatory block: the leshoz's own verify/reject pair
+    (`benefit_verification.py`) must have run before `approve` moves this
+    application anywhere — including a forward, which is also "deciding" in
+    the sense this ruling cares about (nobody may escalate a claim nobody has
+    looked at either).
+
+    A `pending` claim has not been looked at: 409 `ERR-APP-004`
+    `benefit_unverified`. A `rejected` one means the leshoz already refused
+    the CLAIM — the head rejects the APPLICATION for that reason instead of
+    approving it: 409 `ERR-APP-004` `benefit_rejected`, carrying the
+    verifier's own `benefit_rejection_reason` so the caller can show it
+    without a second read. `not_required`/`verified` pass through untouched —
+    the second line of the same guard (`permits.service`'s own issuance
+    check, ruling #179) is what this reuses rather than duplicates.
+    """
+    if application.benefit_verification_status == "pending":
+        raise err("ERR-APP-004", details={"reason": "benefit_unverified"})
+    if application.benefit_verification_status == "rejected":
+        raise err(
+            "ERR-APP-004",
+            details={
+                "reason": "benefit_rejected",
+                "benefit_rejection_reason": application.benefit_rejection_reason,
+            },
+        )
+
+
 async def approve(
     db: AsyncSession,
     application_id: uuid.UUID,
@@ -527,7 +555,10 @@ async def approve(
     `application_status_history` and nowhere else.
 
     409 `ERR-APP-004` in any status but IN_REVIEW; 404 `ERR-SYS-003` outside the
-    caller's zone (RI-12 recorded first); 422 `ERR-VAL-001` when the application
+    caller's zone (RI-12 recorded first); 409 `ERR-APP-004` `benefit_unverified`/
+    `benefit_rejected` when the application carries a benefit claim the
+    leshoz has not verified or has refused (ruling #182 — see
+    `_assert_benefit_decided`); 422 `ERR-VAL-001` when the application
     has no stored calculation, when `requested_area_ha` is unknown while the
     role caps area, and when an over-limit application has no parent
     organization to escalate to; 422 `ERR-NORM-002` when the contour's capacity
@@ -537,6 +568,7 @@ async def approve(
     application = await _decidable(
         db, application_id, to_status=APPROVED_STATUS, actor=actor, action=APPLICATION_APPROVE
     )
+    _assert_benefit_decided(application)
     amount, area, over = await _limits(db, application, actor=actor)
     if over:
         # Ruling 9а: nothing is signed and the status does not change, because
@@ -592,18 +624,29 @@ async def reject(
     *,
     pkcs7: str,
     reason_item_id: uuid.UUID,
-    legal_basis: str,
+    legal_basis: str | None,
     actor: User,
     ip: str | None = None,
 ) -> Application:
     """`POST /applications/{id}/reject` — IN_REVIEW -> REJECTED, with grounds.
 
     **`tz/04` С8: a refusal by the state carries an RJ-* reason AND a legal
-    basis**, and both are required by `ApplicationRejectIn` rather than
-    validated here, so a body missing either is 422 `ERR-VAL-001` before this
+    basis.** `reason_item_id` is required by `ApplicationRejectIn` rather than
+    validated here, so a body missing it is 422 `ERR-VAL-001` before this
     function — and therefore before `sign()` — is ever reached. The one thing
     the schema cannot check is that the id names an ACTIVE
     `rejection_reasons` item, and that runs here, still ahead of the signature.
+
+    **`legal_basis` is OPTIONAL at the wire (ruling #182).** When the
+    application's own benefit claim was `rejected` by the leshoz's own
+    verify/reject pair, that verdict IS the grounds — `legal_basis` defaults
+    to the claim's own `benefit_rejection_reason` rather than making the head
+    retype what a colleague already wrote down. Every OTHER case keeps the
+    ORIGINAL rule: a missing `legal_basis` is refused HERE, still ahead of
+    `sign()`, with the SAME `ERR-VAL-001` code the wire-level 422 used to
+    carry — the mandatory-grounds rule is unchanged for a claim that is not
+    `rejected`, only its enforcement point moved for the one case ruling #182
+    added.
 
     The grounds land in three places, each answering a different question: the
     `application_status_history` row (what the timeline shows), the
@@ -619,6 +662,14 @@ async def reject(
     application = await _decidable(
         db, application_id, to_status=REJECTED_STATUS, actor=actor, action=APPLICATION_REJECT
     )
+    if legal_basis is None:
+        if (
+            application.benefit_verification_status == "rejected"
+            and application.benefit_rejection_reason
+        ):
+            legal_basis = application.benefit_rejection_reason
+        else:
+            raise err("ERR-VAL-001", details={"reason": "legal_basis_required"})
     item = await _reason_item(db, reason_item_id)
 
     await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)

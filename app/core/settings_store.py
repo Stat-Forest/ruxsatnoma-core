@@ -356,6 +356,24 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "site_social_youtube", str, "", "Public site: YouTube channel URL", allow_blank=True
         ),
+        # Ruling #184: "I have read the rules" is a mandatory acceptance before
+        # any signature (`applications.service.submit`, `ApplicationSubmitIn.
+        # rules_accepted`). The text the checkbox links to is a setting, not a
+        # page this system renders itself — VMQ 278 on lex.uz by default, the
+        # Agency's own act, editable from the settings screen like every other
+        # `site_*` key. **This key is admin-editable through `GET`/`PATCH
+        # /admin/settings` (generic over every `SETTING_SPECS` entry) but is
+        # NOT on the public `site_settings` whitelist** (`public.service.
+        # site_settings`/`schemas.SiteSettingsOut`, both outside this module's
+        # ownership) — a caller reaching for it from the anonymous landing or
+        # the applicant wizard needs that whitelist widened first; see this
+        # stage's own report.
+        SettingSpec(
+            "site_rules_url",
+            str,
+            "https://lex.uz/docs/-2770948",
+            "Filing: the rules the applicant accepts",
+        ),
         # `site_season_windows` (six hard-coded per-activity month lists, ruling
         # R3) lived here until the stage 8 fix wave: `origin/dev` had by then
         # merged stage 9's ruling #177, which put the REAL windows in

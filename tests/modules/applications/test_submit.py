@@ -33,7 +33,7 @@ async def _upload(client) -> str:
     return result.json()["id"]
 
 
-async def _submit(client, app_id, pinfl=None, *, key=None):
+async def _submit(client, app_id, pinfl=None, *, key=None, rules_accepted: bool = True):
     """`GET /package`, sign those exact bytes, `POST /submit` — the real client
     flow, and the only one that can work: a detached PKCS#7 cannot be produced
     over bytes the client has never seen.
@@ -51,6 +51,11 @@ async def _submit(client, app_id, pinfl=None, *, key=None):
       `"SER-1"/"ISS-1"` binds to whoever ran first and is refused for every
       applicant afterwards — passing once and failing on the second run of the
       suite.
+
+    `rules_accepted` defaults `True` (ruling #184): every caller of this
+    helper wants the ERI path to reach past step 2, and the one test that
+    wants the refusal passes `False` explicitly rather than leaving every
+    OTHER caller in this suite to discover the new required field.
     """
     if pinfl is None:
         pinfl = (await client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
@@ -60,8 +65,20 @@ async def _submit(client, app_id, pinfl=None, *, key=None):
         json={
             "pkcs7": encode_mock_signature(
                 document=doc, serial=f"SER-{uuid.uuid4().hex[:12]}", issuer="ISS-TEST", pinfl=pinfl
-            )
+            ),
+            "rules_accepted": rules_accepted,
         },
+        headers={"Idempotency-Key": key or str(uuid.uuid4())},
+    )
+
+
+async def _submit_with_button(client, app_id, *, key=None, rules_accepted: bool = True):
+    """Ruling #183: `on_behalf="self"` signs with no envelope at all — the
+    citizen's own button. No PKCS#7 to build, so no `GET /package` fetch is
+    needed here either; the server prices and signs over what IT computes."""
+    return await client.post(
+        f"/api/v1/applications/{app_id}/submit",
+        json={"rules_accepted": rules_accepted},
         headers={"Idempotency-Key": key or str(uuid.uuid4())},
     )
 
@@ -124,7 +141,7 @@ async def test_an_invalid_signature_refuses_the_submission_whole(
     app_id = draft_ready_for_submission
     result = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert result.status_code == 422
@@ -177,7 +194,8 @@ async def test_a_price_that_moved_after_signing_is_labeled_package_changed(
         json={
             "pkcs7": encode_mock_signature(
                 document=doc, serial=f"SER-{uuid.uuid4().hex[:12]}", issuer="ISS-TEST", pinfl=pinfl
-            )
+            ),
+            "rules_accepted": True,
         },
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
@@ -237,7 +255,8 @@ async def test_a_tariff_published_between_package_and_submit_is_also_package_cha
                         serial=f"SER-{uuid.uuid4().hex[:12]}",
                         issuer="ISS-TEST",
                         pinfl=pinfl,
-                    )
+                    ),
+                    "rules_accepted": True,
                 },
                 headers={"Idempotency-Key": str(uuid.uuid4())},
             )
@@ -315,7 +334,7 @@ async def test_three_failed_signatures_accumulate_checks_and_nothing_else(
     for _ in range(3):
         refused = await applicant_client.post(
             f"/api/v1/applications/{app_id}/submit",
-            json={"pkcs7": "not-a-signature"},
+            json={"pkcs7": "not-a-signature", "rules_accepted": True},
             headers={"Idempotency-Key": str(uuid.uuid4())},
         )
         assert refused.status_code == 422
@@ -371,7 +390,7 @@ async def test_the_number_is_not_consumed_by_a_failed_submission(
     before = await counter()
     refused = await applicant_client.post(
         f"/api/v1/applications/{draft_ready_for_submission}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 422
@@ -466,7 +485,7 @@ async def test_a_stranger_cannot_submit_my_draft(
 ) -> None:
     refused = await other_applicant_client.post(
         f"/api/v1/applications/{draft_ready_for_submission}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 404
@@ -480,7 +499,7 @@ async def test_the_submit_route_requires_an_idempotency_key(
     `POST /applications` and the pre-check carry no key on purpose."""
     refused = await applicant_client.post(
         f"/api/v1/applications/{draft_ready_for_submission}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
     )
     assert refused.status_code == 422
     assert refused.json()["error"]["details"]["reason"] == "idempotency_key_required"
@@ -503,7 +522,8 @@ async def test_a_replayed_key_returns_the_stored_response_and_not_a_second_numbe
     body = {
         "pkcs7": encode_mock_signature(
             document=doc, serial=f"SER-{uuid.uuid4().hex[:12]}", issuer="ISS-TEST", pinfl=pinfl
-        )
+        ),
+        "rules_accepted": True,
     }
     first = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit", json=body, headers={"Idempotency-Key": key}
@@ -546,7 +566,7 @@ async def test_a_same_key_retry_after_a_refused_submission_replays_it_not_in_fli
 
     first = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": key},
     )
     assert first.status_code == 400, first.text
@@ -554,7 +574,7 @@ async def test_a_same_key_retry_after_a_refused_submission_replays_it_not_in_fli
 
     replay = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": key},
     )
     assert replay.status_code == 400, replay.text
@@ -562,7 +582,7 @@ async def test_a_same_key_retry_after_a_refused_submission_replays_it_not_in_fli
 
     retried = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert retried.status_code == 400, retried.text
@@ -574,12 +594,19 @@ async def test_a_same_key_retry_after_a_malformed_body_replays_the_422(
 ) -> None:
     """The `RequestValidationError` handler's own half of the fix (3.9b task
     3, fix round 1, 2026-09-05): `idempotency_context` is a SIBLING
-    dependency FastAPI resolves — and COMMITS — before it ever discovers a
-    missing `pkcs7` makes the body itself invalid. Without
-    `_settle_idempotency_record` closing the record here too, the SAME key
-    would answer 409 `in_flight` (or `fingerprint_mismatch` for a corrected
-    body) for the whole `IN_FLIGHT_TTL` instead of replaying this 422 — the
-    lockout through the OTHER door `domain_error_handler` alone left open.
+    dependency FastAPI resolves — and COMMITS — before it ever discovers the
+    body itself is invalid. Without `_settle_idempotency_record` closing the
+    record here too, the SAME key would answer 409 `in_flight` (or
+    `fingerprint_mismatch` for a corrected body) for the whole
+    `IN_FLIGHT_TTL` instead of replaying this 422 — the lockout through the
+    OTHER door `domain_error_handler` alone left open.
+
+    **`json={"pkcs7": 123}`, not `json={}`** (ruling #183 made `pkcs7`
+    optional, so an empty body is a VALID `ApplicationSubmitIn` now —
+    `rules_accepted` defaults `False` and reaches the handler as a 400
+    `ERR-APP-001`, not a wire-level 422). A `pkcs7` of the wrong TYPE is
+    still a pydantic `RequestValidationError`, the exact shape this test
+    exists to exercise.
     """
     created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
     app_id = created.json()["id"]
@@ -587,7 +614,7 @@ async def test_a_same_key_retry_after_a_malformed_body_replays_the_422(
 
     first = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={},  # missing the required `pkcs7` — fails BEFORE the endpoint runs
+        json={"pkcs7": 123},  # wrong type — fails BEFORE the endpoint runs
         headers={"Idempotency-Key": key},
     )
     assert first.status_code == 422, first.text
@@ -595,7 +622,7 @@ async def test_a_same_key_retry_after_a_malformed_body_replays_the_422(
 
     replay = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={},
+        json={"pkcs7": 123},
         headers={"Idempotency-Key": key},
     )
     assert replay.status_code == 422, replay.text
@@ -629,7 +656,7 @@ async def test_a_same_key_retry_after_a_server_error_is_not_locked_out(
     monkeypatch.setattr(service, "_assert_complete", _boom)
     first = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": key},
     )
     assert first.status_code == 500, first.text
@@ -637,7 +664,7 @@ async def test_a_same_key_retry_after_a_server_error_is_not_locked_out(
 
     retry = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": key},
     )
     assert retry.status_code != 409, retry.text
@@ -656,7 +683,7 @@ async def test_an_incomplete_draft_is_refused_400_naming_the_missing_fields(
 
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 400, refused.text
@@ -687,7 +714,7 @@ async def test_a_grazing_draft_with_no_herd_names_items_as_the_missing_field(
 
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 400, refused.text
@@ -713,7 +740,7 @@ async def test_a_missing_address_is_named_in_missing_and_resolved_by_filling_it_
 
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 400, refused.text
@@ -772,7 +799,7 @@ async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfig
 
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 422, refused.text
@@ -802,9 +829,17 @@ async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other
     one, and only the pair can tell them apart.
     """
     app_id = draft_ready_for_submission
+    # `benefit_certificate_no` is set here too (ruling #181: mandatory for
+    # EVERY category now) — otherwise the FIRST refusal below would still be
+    # the true one (step 3's document check runs before step 3b's number
+    # check), but the SECOND attempt, meant to prove step 3 alone is
+    # satisfied, would stop one step earlier than intended.
     await applicant_client.patch(
         f"/api/v1/applications/{app_id}",
-        json={"benefit_category_item_id": str(benefit_category_item_id)},
+        json={
+            "benefit_category_item_id": str(benefit_category_item_id),
+            "benefit_certificate_no": "CERT-DOC-1",
+        },
     )
 
     wrong = await applicant_client.post(
@@ -817,7 +852,7 @@ async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other
     assert wrong.status_code == 201, wrong.text
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 422, refused.text
@@ -840,7 +875,7 @@ async def test_a_benefit_claim_needs_a_document_of_the_benefit_type_and_no_other
     # answers: not `ERR-APP-003` any more.
     past_step_three = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert past_step_three.status_code == 422, past_step_three.text
@@ -877,7 +912,7 @@ async def test_a_draft_on_an_unpublished_contour_cannot_be_submitted(
 
     refused = await applicant_client.post(
         f"/api/v1/applications/{app_id}/submit",
-        json={"pkcs7": "not-a-signature"},
+        json={"pkcs7": "not-a-signature", "rules_accepted": True},
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert refused.status_code == 409, refused.text
@@ -1094,3 +1129,122 @@ def test_the_package_is_canonical_json_with_no_whitespace() -> None:
     assert service._package_bytes(application, stored) == service._package_bytes(
         application, priced
     )
+
+
+# --- Rulings #183/#184: the button, the legal-entity refusal, the mandatory
+#     rules acceptance ------------------------------------------------------
+
+
+async def test_rules_accepted_false_is_refused_naming_the_field(
+    applicant_client, draft_ready_for_submission
+) -> None:
+    """Ruling #184: `rules_accepted` is folded into the SAME `missing` list
+    `_assert_complete` already builds, not a separate check — the draft here
+    is otherwise COMPLETE, so this is the one field named."""
+    refused = await _submit(applicant_client, draft_ready_for_submission, rules_accepted=False)
+    assert refused.status_code == 400, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-APP-001"
+    assert error["details"]["missing"] == ["rules_accepted"]
+
+
+async def test_a_citizen_signs_with_the_button_and_it_is_a_simple_signature(
+    db, applicant_client, draft_ready_for_submission
+) -> None:
+    """Ruling #183: `on_behalf="self"` and no `pkcs7` in the body signs with
+    the button — `signatures.service.sign_simple`, over the SAME package
+    bytes `sign()` would otherwise verify. `kind='simple'` on the row is the
+    whole point: nothing cryptographic was checked, and the row says so
+    honestly rather than pretending an ERI ran.
+
+    Scoped to THIS submission's own history row (ruling 25: the ATTEMPT is
+    signed, `object_id` is `application_status_history.id`, not the
+    application) — the test DB is shared and persistent, so a query filtered
+    only by `object_type`/`purpose` would match every OTHER submission ever
+    signed in it.
+    """
+    from sqlalchemy import select
+
+    from app.modules.applications.models import ApplicationStatusHistory
+    from app.modules.signatures.models import Signature
+
+    app_id = draft_ready_for_submission
+    result = await _submit_with_button(applicant_client, app_id)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["status"] == "SUBMITTED"
+    assert body["rules_accepted_at"] is not None
+
+    history = (
+        await db.scalars(
+            select(ApplicationStatusHistory).where(
+                ApplicationStatusHistory.application_id == uuid.UUID(app_id),
+                ApplicationStatusHistory.to_status == "SUBMITTED",
+            )
+        )
+    ).one()
+    signature = (
+        await db.scalars(
+            select(Signature).where(
+                Signature.object_type == "application_submission",
+                Signature.object_id == history.id,
+            )
+        )
+    ).one()
+    assert signature.kind == "simple"
+    assert signature.certificate_id is None
+    assert signature.verification_status == "valid"
+
+
+async def test_a_legal_entity_without_an_envelope_is_refused(
+    representative_client,
+    legal_applicant,
+    published_contour,
+    grazing_activity_id,
+    sheep_type_id,
+    published_coef_sb,
+    published_grazing_norm,
+) -> None:
+    """Ruling #183's OTHER half: decision #9 still requires ERI of a legal
+    entity's representative — the button is `on_behalf="self"` alone.
+
+    **Not `_ready_draft`** (conftest's own helper): it hard-codes
+    `on_behalf="self"`, which would file this draft under the
+    representative's OWN individual `Applicant` row instead of `legal_
+    applicant` — proving nothing about a legal entity at all, and failing
+    for an unrelated reason (that individual row carries no `address`).
+    """
+    created = await representative_client.post(
+        "/api/v1/applications",
+        json={"on_behalf": "legal", "applicant_id": str(legal_applicant.id)},
+    )
+    assert created.status_code == 201, created.text
+    app_id = created.json()["id"]
+    patched = await representative_client.patch(
+        f"/api/v1/applications/{app_id}",
+        json={
+            "contour_id": str(published_contour.id),
+            "activity_type_id": str(grazing_activity_id),
+            "period_from": "2027-05-01",
+            "period_to": "2027-09-30",
+            "items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+
+    refused = await _submit_with_button(representative_client, app_id)
+    assert refused.status_code == 422, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-SIGN-001"
+    assert error["details"]["reason"] == "simple_signature_not_allowed"
+
+
+async def test_the_eri_path_also_stamps_rules_accepted_at(
+    applicant_client, draft_ready_for_submission
+) -> None:
+    """`rules_accepted_at` is not a `sign_simple`-only side effect — every
+    submission stamps it, `pkcs7` present or not (step 2 runs before step 8
+    either way)."""
+    result = await _submit(applicant_client, draft_ready_for_submission)
+    assert result.status_code == 200, result.text
+    assert result.json()["rules_accepted_at"] is not None

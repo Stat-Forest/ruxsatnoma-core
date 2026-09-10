@@ -351,6 +351,9 @@ class ApplicationOut(BaseModel):
     sla_deadline_at: datetime | None
     submitted_at: datetime | None
     decided_at: datetime | None
+    # Ruling #184: when "I have read the rules" was accepted, server-stamped —
+    # `None` until the first real submission.
+    rules_accepted_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -486,19 +489,34 @@ class PrecheckOut(BaseModel):
 
 class ApplicationSubmitIn(BaseModel):
     """`POST /applications/{id}/submit` — the detached PKCS#7 the client
-    produced over the bytes `GET /applications/{id}/package` served, and
-    nothing else.
+    produced over the bytes `GET /applications/{id}/package` served, plus
+    ruling #184's mandatory acceptance.
 
     The package itself is deliberately NOT echoed back in the body: the server
     signs what IT computes (`service._package_bytes`), and a client-supplied
     copy would only give an attacker a second thing to disagree with. What the
     client signed is proven by the signature verifying, not by it being
     re-sent.
+
+    **`pkcs7` is now OPTIONAL** (ruling #183): a citizen filing for themselves
+    (`on_behalf="self"`) signs with the button and posts no envelope at all —
+    `service.submit` calls `signatures.service.sign_simple` over the SAME
+    package bytes `sign()` would otherwise verify. A legal entity, or an
+    envelope actually posted, is unchanged: `sign()` runs exactly as before.
+
+    **`rules_accepted` is mandatory** (ruling #184, decisions.md): `false`
+    (the default, so an old client that never learned the field is refused
+    rather than silently accepted) is one of the fields `service._assert_
+    complete` treats as MISSING — 400 `ERR-APP-001` naming `rules_accepted`
+    alongside `contour_id`/`activity_type_id`/etc., not a separate check with
+    its own reason. The server stamps `applications.rules_accepted_at` from
+    its OWN clock; the client's claim is a gate, never a timestamp source.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    pkcs7: str
+    pkcs7: str | None = None
+    rules_accepted: bool = False
 
 
 # --- Task 6: cancelling, and the timeline -------------------------------------
@@ -708,11 +726,21 @@ class ApplicationRejectIn(BaseModel):
     requires of a refusal BY the state: an RJ-* reason from the
     `rejection_reasons` classifier AND a legal basis.
 
-    **Both are REQUIRED here rather than validated in the service**, which is
-    what makes «missing grounds» a 422 `ERR-VAL-001` before the request body is
-    ever handed to a function that could reach `sign()` — a signature must never
-    be spent on a request that cannot succeed. `min_length=1` closes the half a
-    plain `str` would leave open: an empty legal basis is a missing one.
+    **`reason_item_id` is REQUIRED here rather than validated in the
+    service**, which is what makes a missing one a 422 `ERR-VAL-001` before
+    the request body is ever handed to a function that could reach `sign()` —
+    a signature must never be spent on a request that cannot succeed.
+
+    **`legal_basis` is OPTIONAL** (ruling #182): when the application's own
+    benefit claim was `rejected` by the leshoz's own verify/reject pair, that
+    verdict IS the grounds for rejecting the application too, and the head
+    need not retype it — `decision.reject` fills `legal_basis` from the
+    claim's own `benefit_rejection_reason` when the caller leaves it out.
+    Every OTHER case keeps the ORIGINAL rule intact: a missing `legal_basis`
+    is refused (`ERR-VAL-001`, `reason="legal_basis_required"`) before
+    `sign()` is ever reached, exactly as when it was required at the wire.
+    `min_length=1` closes the half a plain `str` would leave open when one
+    IS given: an empty legal basis is a missing one.
 
     This is the opposite of `ApplicationCancelIn` beside it, whose reason is
     optional because a citizen withdrawing their own application owes nobody an
@@ -723,7 +751,9 @@ class ApplicationRejectIn(BaseModel):
 
     pkcs7: str
     reason_item_id: uuid.UUID
-    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)] | None = (
+        None
+    )
 
 
 class ApplicationReturnIn(BaseModel):
@@ -866,12 +896,23 @@ class ApplicationDecisionOut(ApplicationOut):
         )
 
 
-# --- Ruling #179: the benefit-verification office's own surface --------------
+# --- Rulings #179/#182: the benefit claim's verify/reject surface ------------
 #
 # `benefit_verification.py`/`benefit_verification_router.py` — a sibling of
 # `service.py`/`router.py`, the same "second file of the same module, not a
-# second module" shape `decision.py` already uses, because the ONE file this
-# track may not touch is `service.py` itself.
+# second module" shape `decision.py` already uses.
+#
+# Ruling #182 moved this from a central, country-wide office to the leshoz's
+# own review (`benefits.verify` now sits on `executor_staff`/`executor_head`):
+# the list route `GET /applications/benefit-verifications` and
+# `repo`'s country-wide claim-visibility predicate it was built for are GONE —
+# a leshoz reviewer works this claim from the application card it already
+# reads (`GET /applications/{id}`), the same route everyone else uses. What
+# is left here is the single-claim read, `verify` and `reject`, all three
+# gated on `benefits.verify` PLUS the application's OWN read rule
+# (`service._readable_application` — the same one `GET /applications/{id}`
+# applies, so a leshoz reviewer who could not otherwise read this application
+# cannot verify its claim either).
 
 # `application_status_history.reason_text`/`applications.decision_basis` both
 # cap at 2000 (see `REASON_MAX_LENGTH`/`LEGAL_BASIS_MAX_LENGTH` above);
@@ -882,21 +923,16 @@ BENEFIT_REJECTION_REASON_MAX_LENGTH = REASON_MAX_LENGTH
 
 
 class BenefitClaimDetailOut(ApplicationOut):
-    """`GET /applications/benefit-verifications/{id}` — the verifier's own
-    single-item read. `GET /applications/benefit-verifications` (the list)
-    answers `Page[ApplicationOut]` directly and needs no schema of its own:
-    every column this office cares about is already on that shape, including
-    the five ruling #179 added.
+    """`GET /applications/benefit-verifications/{id}` — the leshoz reviewer's
+    single-claim read, plus its supporting document.
 
-    Deliberately NOT `ApplicationCardOut`: that shape is built by `service.
-    get_card`, which gates through `service._readable_application` — a
-    function this role never satisfies (it holds no `applications.view_any`
-    and, being central, no zone match either), so reusing it would 404 the
-    very role it is meant to serve. `documents` is the one thing beyond the
-    application's own columns this office needs on the DETAIL read (`tz/06`
-    §Льготы: the certificate's supporting file, attached through the ordinary
-    document mechanism — see `repo.list_documents`) — left off the list
-    response so paging the queue costs one query, not one plus N.
+    Deliberately NOT `ApplicationCardOut`: that shape is `service.get_card`'s,
+    with `items`/`checks`/`calculation`/`conclusions`/`sla_overdue` this route
+    has no use for — the reviewer already sees the whole card through
+    `GET /applications/{id}` and reaches this route to decide ONE thing.
+    `documents` is the one addition beyond the application's own columns
+    (`tz/06` §Льготы: the certificate's supporting file, attached through the
+    ordinary document mechanism — see `repo.list_documents`).
     """
 
     documents: list[ApplicationDocumentOut]

@@ -137,6 +137,101 @@ async def grazing_activity_id(db: AsyncSession) -> uuid.UUID:
 
 
 @pytest.fixture
+async def recreation_activity_id(db: AsyncSession) -> uuid.UUID:
+    """`activity_types.code = 'recreation'` — the one non-grazing activity
+    #181's six recreation benefit categories claim against."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'recreation'"))
+    return rows.scalar_one()
+
+
+@pytest.fixture
+async def preschool_children_item_id(db: AsyncSession) -> uuid.UUID:
+    """A REAL #181 benefit category (migration `0053`) with NO registered
+    auto-verifier — `BENEFIT_AUTO_VERIFIERS` holds `beekeeping_union_member`
+    alone, so this one stays the leshoz's own `pending` review.
+
+    Deliberately NOT an invented code (`benefit_category_item_id` below):
+    since #181, `_open_benefit_verification`'s certificate check is no
+    longer the only gate a claim must clear — pricing itself (decision #50)
+    refuses ANY code absent from the resolved tariff's `benefit_modifiers`,
+    so an invented code can never reach SUBMITTED at all any more. A test
+    that needs a genuinely `pending`, IN_REVIEW application has to file a
+    REAL category — see `preschool_children_priced` beside it.
+    """
+    rows = await db.execute(
+        text(
+            "SELECT i.id FROM classifier_items i JOIN classifiers c ON c.id = i.classifier_id "
+            "WHERE c.code = 'benefit_categories' AND i.code = 'preschool_children' "
+            "AND i.status = 'active'"
+        )
+    )
+    return rows.scalar_one()
+
+
+@pytest.fixture
+async def preschool_children_priced(db: AsyncSession) -> AsyncIterator[None]:
+    """A non-zero modifier for `preschool_children` on the seeded, published
+    `recreation` tariff (migration `0012`) — just enough for pricing to
+    accept the code (decision #50) without also triggering ruling #185's
+    self-settlement, which the leshoz's own verify/reject tests have no
+    interest in (that path is `tests/test_cross_module_journey.py`'s own).
+
+    Flips a SHARED, singleton seed row and restores it in `finally` —
+    `test_submit.py::
+    test_a_tariff_published_between_package_and_submit_is_also_package_changed`'s
+    own shape for the identical class of row. Safe: `tests/modules/norms/
+    test_seeds.py` asserts this row's coefficient, never its
+    `benefit_modifiers`.
+    """
+    from app.modules.norms.models import Tariff
+
+    activity_id = await db.scalar(text("SELECT id FROM activity_types WHERE code = 'recreation'"))
+    tariff = (
+        await db.execute(
+            select(Tariff).where(
+                Tariff.activity_type_id == activity_id,
+                Tariff.livestock_group.is_(None),
+                Tariff.status == "published",
+            )
+        )
+    ).scalar_one()
+    original = tariff.benefit_modifiers
+    tariff.benefit_modifiers = {"preschool_children": "0.5"}
+    await db.commit()
+    try:
+        yield
+    finally:
+        tariff.benefit_modifiers = original
+        await db.commit()
+
+
+@pytest.fixture
+async def recreation_draft_ready_for_submission(
+    applicant_client,
+    published_contour: Contour,
+    recreation_activity_id: uuid.UUID,
+) -> str:
+    """A DRAFT ready to submit on the RECREATION activity — `_ready_draft`'s
+    own template does not fit here: recreation prices by `quantity`, never
+    `items` (grazing's own herd list)."""
+    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
+    assert created.status_code == 201, created.text
+    application_id = created.json()["id"]
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_id}",
+        json={
+            "contour_id": str(published_contour.id),
+            "activity_type_id": str(recreation_activity_id),
+            "period_from": "2027-09-01",
+            "period_to": "2027-09-30",
+            "quantity": "2",
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    return application_id
+
+
+@pytest.fixture
 async def published_contour(
     db: AsyncSession, contours_layer: GisLayer, leshoz, approval_doc: MediaFile
 ) -> Contour:
