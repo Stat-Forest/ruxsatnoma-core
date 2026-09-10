@@ -1271,6 +1271,7 @@ async def _activate(db: AsyncSession, permit: Permit, *, actor: User) -> None:
             "permit_number": _permit_number(permit.series, permit.number),
             "valid_from": permit.period_from,
             "valid_to": permit.period_to,
+            **notifications.transition_params(from_status=INITIAL_STATUS, to_status=ACTIVE_STATUS),
         },
         object_type=OBJECT_TYPE,
         object_id=permit.id,

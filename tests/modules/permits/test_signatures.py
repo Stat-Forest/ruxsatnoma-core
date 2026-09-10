@@ -211,6 +211,12 @@ async def test_activation_stamps_issued_at_and_leaves_a_timeline_and_a_notice(
         )
     ).all()
     assert notices, "the holder is told their permit is in force"
+    inapp = next(row for row in notices if row.channel == "inapp")
+    # The inbox's "pending_signatures -> active" chips.
+    assert (inapp.params["status_from"], inapp.params["status_to"]) == (
+        "pending_signatures",
+        "active",
+    )
 
 
 # --- ruling 4: who may sign what ---------------------------------------------

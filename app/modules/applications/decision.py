@@ -594,7 +594,7 @@ async def approve(
     # the router's serialization then lazy-loads it outside the async context —
     # `MissingGreenlet`, i.e. a 500 on a decision that actually succeeded.
     application.decided_at = datetime.now(UTC)
-    await flow._apply_transition(
+    entry = await flow._apply_transition(
         db,
         application,
         to_status=APPROVED_STATUS,
@@ -605,7 +605,12 @@ async def approve(
         db,
         application,
         event_code=NOTIFY_APPLICATION_APPROVED,
-        params={"application_number": application.number},
+        params={
+            "application_number": application.number,
+            **notifications_service.transition_params(
+                from_status=entry.from_status, to_status=entry.to_status
+            ),
+        },
         # Cabinet only — the invoice notification a few lines below carries the
         # SMS for both. See `_notify_decision`'s docstring (decision #152).
         channels=("inapp",),
@@ -679,7 +684,7 @@ async def reject(
     application.rejection_reason_item_id = reason_item_id
     application.decision_basis = legal_basis
     application.decided_at = datetime.now(UTC)
-    await flow._apply_transition(
+    entry = await flow._apply_transition(
         db,
         application,
         to_status=REJECTED_STATUS,
@@ -696,6 +701,9 @@ async def reject(
         event_code=NOTIFY_APPLICATION_REJECTED,
         params={
             "application_number": application.number,
+            **notifications_service.transition_params(
+                from_status=entry.from_status, to_status=entry.to_status
+            ),
             # The reason as the citizen reads it. `classifier_items.name` is
             # multilingual and `uz_latn` is the one key `LocalizedName` guarantees
             # (decision #90), so it is the fallback — never `item.code`, which

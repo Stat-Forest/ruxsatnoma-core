@@ -382,6 +382,13 @@ async def test_expiry_notifies_the_holder_once(
         )
     )
     assert sent == 1
+    from tests.modules.notifications.conftest import inapp_params
+
+    params = await inapp_params(
+        db, object_id=active_permit_ending_yesterday.id, event_code=events.PERMIT_EXPIRED
+    )
+    # The inbox's "active -> expired" chips.
+    assert (params["status_from"], params["status_to"]) == ("active", "expired")
 
 
 async def test_the_expiry_is_audited_as_a_job(

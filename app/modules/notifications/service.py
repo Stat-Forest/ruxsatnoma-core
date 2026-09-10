@@ -240,6 +240,16 @@ async def _transport_allowed(
     )
 
 
+def transition_params(*, from_status: str | None, to_status: str) -> dict[str, str | None]:
+    """The two `params` keys the cabinet inbox renders as "from -> to" status
+    chips under a notification (`NotificationsPage.tsx`). A flow that moves the
+    notification's own object supplies them; one that only reminds or
+    recalculates does not, and the inbox shows plain text for that row. One
+    function so the key names have one spelling on both sides of the wire.
+    """
+    return {"status_from": from_status, "status_to": to_status}
+
+
 async def notify(
     db: AsyncSession,
     *,
