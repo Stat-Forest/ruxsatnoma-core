@@ -22,7 +22,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, or_
+from sqlalchemy import Row, and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -372,6 +372,20 @@ async def current_calculation(db: AsyncSession, application_id: uuid.UUID) -> Ca
     through its service, never by querying `calculations` itself or
     importing `norms.repo` (module boundary, CLAUDE.md)."""
     return await norms_service.latest_calculation(db, application_id)
+
+
+async def public_status_lookup(db: AsyncSession, *, number: str) -> Row[Any] | None:
+    """Public surface for `public.service.check_application_status` (stage 8
+    fix wave finding 2): `public` may hold no import of `applications.repo`/
+    `.models` (CLAUDE.md's cross-module whitelist names reports/dashboard/
+    search/oversight/archive, not `public`), so this thin wrapper is the one
+    door. Delegates to `repo.get_public_status_row` — see its docstring for
+    exactly what the six columns are and why nothing else crosses this
+    boundary. No permission or zone rule, the same as `get`/
+    `current_calculation` above: the caller is another SERVICE, and the "no
+    oracle" posture that makes an unknown number and a wrong phone answer
+    identically is `public.service`'s own job, not this one's."""
+    return await repo.get_public_status_row(db, number=number)
 
 
 async def open_extension_of(

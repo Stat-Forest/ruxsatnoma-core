@@ -1,7 +1,14 @@
-"""`GET /public/site-settings` — feeds the landing footer and its season
-calendar in one anonymous request (ruling R3). The whitelist is the point:
-`system_settings` also holds operational parameters (`login_max_attempts`,
-`mfa_enabled`, `session_absolute_hours`, ...) that must never appear here."""
+"""`GET /public/site-settings` — feeds the landing footer in one anonymous
+request (ruling R3). The whitelist is the point: `system_settings` also holds
+operational parameters (`login_max_attempts`, `mfa_enabled`,
+`session_absolute_hours`, ...) that must never appear here.
+
+`season_windows` used to travel alongside `contacts` here
+(`site_season_windows`'s six hard-coded month lists); the stage 8 fix wave
+(finding 1) deleted that key — it disagreed with the real, per-leshoz windows
+`norms.models.ActivitySeason` enforces — so this route is contacts only now.
+The season read moved to its own route, `GET /public/activity-seasons`,
+tested in `test_activity_seasons.py` beside this file."""
 
 from sqlalchemy import delete
 
@@ -25,26 +32,19 @@ async def test_contacts_are_public_and_shaped(db) -> None:
 
 
 async def test_operational_settings_never_leak(db) -> None:
-    """The store also holds auth parameters; this route serves a whitelist."""
+    """The store also holds auth parameters; this route serves a whitelist.
+
+    Asserts the status code (finding 5, stage 8 fix wave): without it, this
+    test passed just as happily against a 404 from a broken route as against
+    a real 200 whose body merely lacks the forbidden keys — the ONE guard
+    this branch has on "must never proxy the settings store" proved nothing
+    at all."""
     async with make_client(create_app(), lifespan=True) as client:
-        body = (await client.get(f"{API}/public/site-settings")).json()
-    flat = str(body)
+        response = await client.get(f"{API}/public/site-settings")
+    assert response.status_code == 200
+    flat = str(response.json())
     for secret in ("login_max_attempts", "mfa_enabled", "session_absolute_hours"):
         assert secret not in flat
-
-
-async def test_season_windows_travel_with_the_contacts(db) -> None:
-    async with make_client(create_app(), lifespan=True) as client:
-        body = (await client.get(f"{API}/public/site-settings")).json()
-    assert set(body["season_windows"]) == {
-        "grazing",
-        "haymaking",
-        "apiary",
-        "recreation",
-        "deadwood",
-        "science",
-    }
-    assert body["season_windows"]["science"] == list(range(1, 13))
 
 
 async def test_an_edited_contact_is_served(db) -> None:

@@ -6,25 +6,29 @@ functions below, for `service.get` and `service.set_status`; branch 2's task 3
 adds the draft's own reads and writes, and later tasks add the rest (the
 duplicate-guard read, submission writes, precheck/decision queries).
 
-`Organization` is read here for ONE reason and in ONE place: `list_applications`
-JOINs it so a region- or district-scoped actor's zone can be enforced.
-`applications` carries an organization id and no region or district, and
-`abac.zone_filter` FAILS CLOSED — it raises when a zone axis is set and its
-column was not supplied. Reference data is read-only to every module
-(CLAUDE.md); the CONTOUR half of that same JOIN is not ours to build and is not
-ours to FETCH either, so `service.list_applications` obtains it from
-`gis.service.contour_organization_column` and passes it in as an expression —
-this file imports no other module's service (review I2)."""
+`Organization` is read here in TWO places: `list_applications` JOINs it so a
+region- or district-scoped actor's zone can be enforced (`applications`
+carries an organization id and no region or district, and `abac.zone_filter`
+FAILS CLOSED — it raises when a zone axis is set and its column was not
+supplied), and `get_public_status_row` JOINs it, alongside `ActivityType` and
+`auth.models.Applicant`, purely to NAME the leshoz/activity/applicant-phone
+on the one row `public.service.check_application_status` needs (stage 8 fix
+wave finding 2: `public` may not import this module's own repo/models, so
+this is the one door). Reference data is read-only to every module
+(CLAUDE.md); the CONTOUR half of `list_applications`'s own JOIN is not ours
+to build and is not ours to FETCH either, so `service.list_applications`
+obtains it from `gis.service.contour_organization_column` and passes it in as
+an expression — this file imports no other module's service (review I2)."""
 
 import uuid
 from collections.abc import Collection, Sequence
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import Row, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.admin.models import Organization
+from app.modules.admin.models import ActivityType, Organization
 from app.modules.applications.assignment import Candidate
 from app.modules.applications.models import (
     Application,
@@ -37,10 +41,43 @@ from app.modules.applications.models import (
     InfoRequest,
 )
 from app.modules.applications.sla import SLA_ACTIVE_STATUSES
+from app.modules.auth.models import Applicant
 
 
 async def get_application(db: AsyncSession, application_id: uuid.UUID) -> Application | None:
     return await db.get(Application, application_id)
+
+
+async def get_public_status_row(db: AsyncSession, *, number: str) -> Row[Any] | None:
+    """One row for `GET /public/applications/check` (task 4; moved here in
+    the stage 8 fix wave, finding 2 — `public` may not hold an import of
+    `applications.repo`/`.models`, and this module is the one door onto its
+    own table): the application's own `number`/`status`/`submitted_at`, its
+    applicant's `phone` (the contact `public.service` matches against) and
+    the display names of its activity type and assigned organization — the
+    leshoz. Nothing else: no contour, no calculation, no document, no
+    reviewing official, and the applicant's own NAME is deliberately not
+    selected either, unlike `phone`, which is read only to be compared and
+    never echoed back.
+
+    Filtered by `number` alone — the phone match happens in the caller, so a
+    wrong number and a wrong phone answer identically
+    (`public.service.check_application_status`'s own docstring)."""
+    stmt = (
+        select(
+            Application.number,
+            Application.status,
+            Application.submitted_at,
+            Applicant.phone,
+            ActivityType.name.label("activity_type_name"),
+            Organization.name.label("organization_name"),
+        )
+        .join(Applicant, Applicant.id == Application.applicant_id)
+        .outerjoin(ActivityType, ActivityType.id == Application.activity_type_id)
+        .outerjoin(Organization, Organization.id == Application.assigned_org_id)
+        .where(Application.number == number)
+    )
+    return (await db.execute(stmt)).first()
 
 
 async def get_application_for_update(

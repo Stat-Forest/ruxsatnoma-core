@@ -35,7 +35,6 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.db import uuid7
 from app.main import create_app
 from app.modules.admin.models import Organization
@@ -49,17 +48,6 @@ from tests.modules.permits.conftest import grazing_activity_id as grazing_activi
 from tests.modules.permits.conftest import unique_pinfl
 
 API = "/api/v1"
-
-
-@pytest.fixture(autouse=True)
-def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
-    """Same guard every module under `tests/modules/` carries (lesson):
-    without it `create_app()` opens the shared DEV database instead of the
-    test one."""
-    monkeypatch.setenv("DATABASE_URL", get_settings().database_url_test)
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
 
 
 @pytest.fixture

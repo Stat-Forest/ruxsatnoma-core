@@ -3078,6 +3078,17 @@ async def public_active_stats_by_organization(db: AsyncSession) -> list[dict[str
     ]
 
 
+async def public_rating_histogram(db: AsyncSession) -> dict[int, int]:
+    """Anonymous open-data read, the rating-summary sibling of
+    `public_active_stats_by_organization` right above (design/01 rule 2:
+    cross-module calls go through this service, never `permits.repo`
+    directly). Returns the raw, nationwide, unfiltered per-score counts;
+    `public.service.rating_summary` applies the k-anonymity suppression and
+    the average — this module has no opinion on what "too few to publish"
+    means outside its own walls."""
+    return await repo.rating_histogram(db)
+
+
 # --- Task 5: the Agency's aggregates, without the author (ruling #142) --------
 
 

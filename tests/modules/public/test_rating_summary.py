@@ -12,14 +12,21 @@ shared, persistent test database's leftover rows out of its count.
 `.claude/lessons.md`'s own rule ("The test DB is shared, persistent, and
 never empty") forbids working around that with an unscoped `DELETE` or by
 assuming the table starts empty, so the suppression CONTRACT below is proven
-by monkeypatching `repo.rating_histogram` — the same idiom `tests/modules/
-permits/test_ratings.py::test_a_double_clicked_rating_answers_409_not_500`
-already uses to get a deterministic repo answer under a real, HTTP-driven
-request — rather than by depending on the real table's exact population. A
-separate, real-DB test at the bottom proves the wiring end to end with a
-BEFORE/AFTER delta on `count`, never an absolute value: the lesson's own
-remedy for a global aggregate ("assert on rows carrying your fixture's own
-ids").
+by monkeypatching `permits.repo.rating_histogram` — the same idiom
+`tests/modules/permits/test_ratings.py::test_a_double_clicked_rating_answers_
+409_not_500` already uses to get a deterministic repo answer under a real,
+HTTP-driven request — rather than by depending on the real table's exact
+population. Monkeypatched at `permits.repo` (not `public.repo`, which held
+this function before the stage 8 fix wave's finding 2 moved it: `public` may
+not query `permits.models.PermitRating` directly, and
+`public.service.rating_summary` now calls `permits.service.
+public_rating_histogram`, which reads `permits.repo.rating_histogram` by
+module attribute the same way `permits.service` calls every other repo
+function) — the patch still lands on the exact function
+`public.service.rating_summary` ends up calling. A separate, real-DB test at
+the bottom proves the wiring end to end with a BEFORE/AFTER delta on `count`,
+never an absolute value: the lesson's own remedy for a global aggregate
+("assert on rows carrying your fixture's own ids").
 
 No `permit_rating_factory` exists anywhere in the suite (checked
 `tests/conftest.py` and `tests/modules/permits/conftest.py`); the one below
@@ -34,12 +41,11 @@ threshold this task is about.
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.main import create_app
 from app.modules.admin.models import Organization
 from app.modules.gis.models import GisLayer
+from app.modules.permits import repo
 from app.modules.permits.models import PermitRating
-from app.modules.public import repo
 from tests.conftest import make_client
 from tests.modules.gis.conftest import approval_doc as approval_doc  # noqa: F401
 from tests.modules.gis.conftest import contours_layer as contours_layer  # noqa: F401
@@ -49,17 +55,6 @@ from tests.modules.permits.conftest import grazing_activity_id as grazing_activi
 from tests.modules.permits.conftest import make_permit_on_contour
 
 API = "/api/v1"
-
-
-@pytest.fixture(autouse=True)
-def _app_on_test_db(monkeypatch: pytest.MonkeyPatch):
-    """Same guard every module under `tests/modules/` carries (lesson):
-    without it `create_app()` opens the shared DEV database instead of the
-    test one."""
-    monkeypatch.setenv("DATABASE_URL", get_settings().database_url_test)
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
 
 
 def _stub_histogram(histogram: dict[int, int]):
@@ -87,6 +82,23 @@ async def test_thin_data_is_not_published(monkeypatch: pytest.MonkeyPatch) -> No
     assert body["histogram"] is None
     assert body["count"] == 2
     assert body["threshold"] == 5
+
+
+async def test_just_below_the_threshold_is_still_not_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The boundary was only covered from above (`count == threshold`, the
+    test right below) until this one: `count == threshold - 1` (4) must still
+    suppress, proving the comparison is `<`, not `<=`."""
+    monkeypatch.setattr(repo, "rating_histogram", _stub_histogram({5: 2, 4: 1, 3: 1}))  # count 4
+
+    async with make_client(create_app(), lifespan=True) as client:
+        body = (await client.get(f"{API}/public/ratings/summary")).json()
+
+    assert body["published"] is False
+    assert body["average"] is None
+    assert body["histogram"] is None
+    assert body["count"] == 4
 
 
 async def test_the_average_appears_once_the_threshold_is_met(

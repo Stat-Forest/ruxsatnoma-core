@@ -1,6 +1,6 @@
 """public service — the module's only door for everyone else (design/01 rule 1).
 
-Three surfaces, each with its own trust boundary:
+Seven surfaces, each with its own trust boundary:
 
 1. **Citizen appeals** (обращения) — `submit_appeal`/`check_appeal_status` are
    reached with NO authentication at all. `subject`/`body`/`answer_text`/
@@ -16,15 +16,14 @@ Three surfaces, each with its own trust boundary:
    `answer_appeal` require `public.appeals.manage` (checked by the router's
    `require_permission`, not repeated here).
 4. **Site settings** — `site_settings` is read-only, anonymous, and serves an
-   EXPLICIT whitelist of `system_settings` keys for the landing's footer and
-   season calendar — never the whole store (`login_max_attempts`,
-   `mfa_enabled` and the other operational parameters live in the same table
-   and must never leak here).
+   EXPLICIT whitelist of `system_settings` keys for the landing's footer —
+   never the whole store (`login_max_attempts`, `mfa_enabled` and the other
+   operational parameters live in the same table and must never leak here).
 5. **Rating summary** — `rating_summary` is read-only, anonymous, and
    publishes the national average of citizens' post-issuance ratings ONLY
-   once `repo.rating_histogram`'s total meets `OPEN_DATA_K_ANONYMITY` — the
-   same threshold `open_data_stats` already reads, not a second constant
-   (#174).
+   once `permits_service.public_rating_histogram`'s total meets
+   `OPEN_DATA_K_ANONYMITY` — the same threshold `open_data_stats` already
+   reads, not a second constant (#174).
 6. **Application status** — `check_application_status` (task 4) answers a
    citizen who never logged in, on the same "no oracle" posture as
    `check_appeal_status`: a `number` that does not exist and one that exists
@@ -34,6 +33,12 @@ Three surfaces, each with its own trust boundary:
    status this dict has never heard of (impossible while the CHECK
    constraint holds, but worth naming) answers `status_label`/`next_step`
    as `None` rather than raising.
+7. **Activity seasons** — `public_activity_seasons` (stage 8 fix wave finding
+   1, supersedes the R3 half of decision #175) replaces the deleted
+   `site_season_windows` settings key with the REAL windows, resolved through
+   `norms_service.resolve_effective_windows` — the same function
+   `norms.checks._season_check` calls — so this anonymous read can never
+   disagree with the check that fires if the applicant ignores it.
 """
 
 import uuid
@@ -43,20 +48,23 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import numbers
+from app.core import numbers, settings_store
 from app.core.errors import err
 from app.core.schemas import PageParams
-from app.core.settings_store import get_setting
 from app.core.time import business_today
+from app.modules.admin import repo as admin_repo
 from app.modules.admin import service as admin_service
+from app.modules.applications import service as applications_service
 from app.modules.audit import service as audit
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
+from app.modules.norms import service as norms_service
 from app.modules.permits import service as permits_service
 from app.modules.public import repo
 from app.modules.public.models import APPEAL_NUMBER_PREFIX, APPEAL_TRANSITIONS, CitizenAppeal
 from app.modules.public.schemas import (
     AppealContact,
+    PublicActivitySeasonOut,
     RatingSummaryOut,
     SiteContactsOut,
     SiteSettingsOut,
@@ -75,7 +83,7 @@ def _normalize_contact(contact: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     phone = contact.get("phone")
     if phone:
-        normalized["phone"] = "".join(ch for ch in str(phone) if ch.isdigit())
+        normalized["phone"] = _digits(phone)
     email = contact.get("email")
     if email:
         normalized["email"] = str(email).strip().lower()
@@ -253,7 +261,7 @@ _APPLICATION_STATUS_INFO: dict[str, dict[str, dict[str, str]]] = {
     "APPROVED": {
         "label": {"uz_latn": "Maʼqullandi", "ru": "Одобрена"},
         "next_step": {
-            "uz_latn": "Toʻlov hisobvarag‘i tayyorlanmoqda.",
+            "uz_latn": "Toʻlov hisobvaragʻi tayyorlanmoqda.",
             "ru": "Готовится счёт на оплату.",
         },
     },
@@ -317,11 +325,11 @@ _APPLICATION_STATUS_INFO: dict[str, dict[str, dict[str, str]]] = {
 
 
 def _digits(value: str | None) -> str:
-    """The same normalization `_normalize_contact` applies to a phone: strip
-    everything but digits, so `"+998 90 123-45-67"` and `"998901234567"`
-    compare equal. A free function rather than reusing `_normalize_contact`
-    (dict-shaped, `AppealContact`-specific) — this route's `phone` is a bare
-    query parameter, not that shape."""
+    """Strip everything but digits, so `"+998 90 123-45-67"` and
+    `"998901234567"` compare equal. Shared by `_normalize_contact` (a
+    phone read off `AppealContact`'s dict shape) and `_phone_matches` below
+    (a bare query parameter, not that shape) — one normalization, not two
+    copies of the same `isdigit()` filter."""
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
@@ -341,11 +349,14 @@ async def check_application_status(db: AsyncSession, *, number: str, phone: str)
     like `MR-YYYY-NNNNNN`, so a distinguishable answer would let a caller
     learn which application numbers are real.
 
-    Only `repo.get_application_status_row`'s six columns ever reach the
-    response — no contour, no calculation, no attachment, no reviewing
+    Only `applications_service.public_status_lookup`'s six columns ever reach
+    the response — no contour, no calculation, no attachment, no reviewing
     official — and the applicant's own NAME is never selected in the first
-    place (unlike `phone`, read only to be compared, never echoed back)."""
-    row = await repo.get_application_status_row(db, number=number)
+    place (unlike `phone`, read only to be compared, never echoed back).
+    Routed through `applications.service` rather than a direct table read
+    (stage 8 fix wave finding 2): `applications` is not on CLAUDE.md's
+    cross-module read whitelist, and its own docstring says so categorically."""
+    row = await applications_service.public_status_lookup(db, number=number)
     if row is None or not _phone_matches(row.phone, phone):
         return {"found": False}
     info = _APPLICATION_STATUS_INFO.get(row.status)
@@ -439,10 +450,16 @@ async def site_settings(db: AsyncSession) -> SiteSettingsOut:
     store. `system_settings` also holds operational parameters
     (`login_max_attempts`, `mfa_enabled`, `session_absolute_hours`, ...); this
     whitelist is the point of the route, so a future key added to the store
-    must never appear here by accident."""
+    must never appear here by accident.
+
+    Contacts only since the stage 8 fix wave (finding 1): `season_windows`
+    used to ride along here as `site_season_windows`'s six hard-coded month
+    lists (ruling R3) — deleted along with that key, superseded by
+    `public_activity_seasons` below, which reads the REAL windows instead of
+    a settings row nobody keeps in sync with them."""
 
     async def value(key: str) -> str:
-        return await get_setting(db, key)
+        return await settings_store.get_setting(db, key)
 
     telegram = await value("site_social_telegram")
     youtube = await value("site_social_youtube")
@@ -459,10 +476,39 @@ async def site_settings(db: AsyncSession) -> SiteSettingsOut:
         ),
         social=SiteSocialOut(telegram=telegram or None, youtube=youtube or None),
     )
-    return SiteSettingsOut(
-        contacts=contacts,
-        season_windows=await get_setting(db, "site_season_windows"),
-    )
+    return SiteSettingsOut(contacts=contacts)
+
+
+async def public_activity_seasons(db: AsyncSession) -> list[PublicActivitySeasonOut]:
+    """`GET /public/activity-seasons` (stage 8 fix wave finding 1 — supersedes
+    the R3 half of decision #175): the REAL season windows, replacing
+    `site_season_windows`'s six hard-coded month lists. Resolved through
+    `norms_service.resolve_effective_windows` — a thin pass-through to
+    `norms.checks.resolve_effective_windows`, the SAME function
+    `norms.checks._season_check` calls — never a second copy of that
+    precedence.
+
+    With no leshoz named, there is no `activity_seasons` dictionary row to
+    fall back to and no contour whose norm could override it, so every
+    activity resolves to `([], "none")` here — reported honestly as "nothing
+    configured", never as "open all year" (`resolve_effective_windows`'s own
+    docstring). `is_default=True` on every row marks exactly that: a real
+    leshoz's own window, reached through the authenticated `GET
+    /activity-seasons/effective` (`norms.service.effective_season`), may
+    differ from what this anonymous read shows."""
+    activity_types = await admin_repo.list_activity_types(db)
+    seasons = []
+    for activity_type in activity_types:
+        windows, source = norms_service.resolve_effective_windows(None, None)
+        seasons.append(
+            PublicActivitySeasonOut(
+                activity_type_code=activity_type.code,
+                windows=list(windows),
+                season_source=source,
+                is_default=True,
+            )
+        )
+    return seasons
 
 
 async def rating_summary(db: AsyncSession) -> RatingSummaryOut:
@@ -475,8 +521,13 @@ async def rating_summary(db: AsyncSession) -> RatingSummaryOut:
     zeroed number. Reuses `OPEN_DATA_K_ANONYMITY` rather than a second,
     independent threshold constant — the same value `open_data_stats` reads
     for its own per-cell suppression.
+
+    Routed through `permits.service.public_rating_histogram` (stage 8 fix
+    wave finding 2) rather than a direct `permits.models.PermitRating` read
+    — `permits` is not on CLAUDE.md's cross-module read whitelist, the same
+    reason `open_data_stats` above already goes through `permits_service`.
     """
-    histogram = await repo.rating_histogram(db)
+    histogram = await permits_service.public_rating_histogram(db)
     full = {score: histogram.get(score, 0) for score in range(1, 6)}
     count = sum(full.values())
     if count < OPEN_DATA_K_ANONYMITY:

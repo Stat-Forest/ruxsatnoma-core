@@ -128,13 +128,44 @@ class SiteContactsOut(BaseModel):
 
 
 class SiteSettingsOut(BaseModel):
-    """Feeds the landing footer and its season calendar in one anonymous
-    request (ruling R3) — an explicit whitelist of `system_settings` keys,
-    never a proxy of the store."""
+    """Feeds the landing footer in one anonymous request (ruling R3) — an
+    explicit whitelist of `system_settings` keys, never a proxy of the store.
+
+    `season_windows` used to ride along here (`site_season_windows`'s six
+    hard-coded month lists) until the stage 8 fix wave (finding 1) deleted
+    that key: it disagreed with the real, per-leshoz windows
+    `norms.models.ActivitySeason` and `norms.checks._season_check` had
+    started enforcing by the time this branch merged. `GET
+    /public/activity-seasons` (`PublicActivitySeasonOut` below) replaces it."""
 
     contacts: SiteContactsOut
-    # Ruling R3: provisional until the Agency answers; the strip says so on screen.
-    season_windows: dict[str, list[int]]
+
+
+class PublicActivitySeasonOut(BaseModel):
+    """One activity's effective season with no leshoz specified — `GET
+    /public/activity-seasons` (stage 8 fix wave finding 1, supersedes the R3
+    half of decision #175).
+
+    `windows` is the raw JSONB list `norms.checks.resolve_effective_windows`
+    returns (`{"from": "MM-DD", "to": "MM-DD"}` dicts, `norms.schemas.
+    EffectiveSeasonOut`'s own shape) — never re-validated into a stricter
+    model here, for the identical reason that route gives: a pre-existing
+    row may predate the window's own edge validation, and turning an already
+    tolerated malformed window into a 500 on a READ endpoint would be worse
+    than showing it as-is.
+
+    `windows` is always `[]` and `season_source` always `"none"` on this
+    anonymous route: with no leshoz named there is no `activity_seasons`
+    dictionary row to fall back to and no contour whose norm could override
+    it, so nothing is configured to show here — never "open all year".
+    `is_default` marks that on every row: a real leshoz's own window, reached
+    through the authenticated `GET /activity-seasons/effective`
+    (`norms.service.effective_season`), may differ."""
+
+    activity_type_code: str
+    windows: list[dict[str, Any]]
+    season_source: str
+    is_default: bool
 
 
 class RatingSummaryOut(BaseModel):
