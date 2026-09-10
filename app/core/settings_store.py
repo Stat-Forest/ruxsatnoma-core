@@ -307,6 +307,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             10000,
             "Maximum rows in one search/oversight export (С22, ruling #20)",
         ),
+        # Stage 13 (ruling #204): every register's own `.xlsx` export is capped
+        # here — a key of its own, because the prosecutor's figure above is a
+        # legal one and this one is operational; the Agency may tune them apart.
+        # Past the cap the file holds the first N rows and the response says so
+        # (`X-Export-Truncated`); it never refuses.
+        SettingSpec(
+            "register_export_max_rows",
+            int,
+            10000,
+            "Maximum rows in one register .xlsx export (stage 13)",
+        ),
         # Ruling #104: RI-14 «long active with no inspection» — the strictest
         # of three options Oybek was offered, and his own text names the
         # consequence: at 30 days it fires often, and an indicator that always
