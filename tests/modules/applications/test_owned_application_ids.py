@@ -1,7 +1,8 @@
 """`applications.service.owned_application_ids` — the seam `payments` reads a
 citizen's "all of mine" invoices and refunds through (stage 11, ruling R2).
 Ownership only: the individual's own row plus every effectively represented
-legal entity, every status including DRAFT, and never a staff zone."""
+legal entity, every status (a just-filed SUBMITTED one included — stage 12 has no
+DRAFT), and never a staff zone."""
 
 from datetime import timedelta
 
@@ -38,7 +39,7 @@ async def _application(db: AsyncSession, applicant: Applicant, *, status: str) -
 async def test_the_owner_gets_every_status_of_their_own_and_nothing_of_a_strangers(
     db: AsyncSession, applicant: Applicant, legal_applicant: Applicant
 ) -> None:
-    draft = await _application(db, applicant, status="DRAFT")
+    submitted = await _application(db, applicant, status="SUBMITTED")
     approved = await _application(db, applicant, status="APPROVED")
     strangers = await _application(db, legal_applicant, status="APPROVED")
     owner = await db.get(User, applicant.owner_user_id)
@@ -46,7 +47,7 @@ async def test_the_owner_gets_every_status_of_their_own_and_nothing_of_a_strange
 
     ids = await service.owned_application_ids(db, owner)
 
-    assert {draft.id, approved.id} <= set(ids)
+    assert {submitted.id, approved.id} <= set(ids)
     assert strangers.id not in ids
 
 
