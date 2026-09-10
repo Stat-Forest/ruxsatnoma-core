@@ -81,8 +81,20 @@ SITE_KEYS = (
     "site_contact_hours_ru",
     "site_social_telegram",
     "site_social_youtube",
-    "site_season_windows",
     "public_permit_contour_enabled",
+)
+
+# `site_contact_phone`/`site_contact_hours_uz`/`site_contact_hours_ru` ship
+# with a real default and stay required; these four ship blank (no address,
+# no social link yet) and must be allowed to STAY blank — an admin who fills
+# one in and then clears it again must be able to (finding 4, stage 8 fix
+# wave: `coerce`'s string branch used to reject `""` unconditionally, so the
+# Agency could set an address but never clear it).
+BLANK_ALLOWED_SITE_KEYS = (
+    "site_contact_address_uz",
+    "site_contact_address_ru",
+    "site_social_telegram",
+    "site_social_youtube",
 )
 
 
@@ -96,13 +108,25 @@ async def test_contour_disclosure_is_off_until_the_agency_answers(db):
     assert await settings_store.get_bool(db, "public_permit_contour_enabled") is False
 
 
-async def test_season_windows_ship_provisional_and_shaped(db):
-    windows = await settings_store.get_setting(db, "site_season_windows")
-    assert set(windows) == {"grazing", "haymaking", "apiary", "recreation", "deadwood", "science"}
-    assert windows["science"] == list(range(1, 13))
-    assert all(1 <= month <= 12 for months in windows.values() for month in months)
+def test_blank_is_accepted_only_for_the_specs_that_allow_it():
+    for key in BLANK_ALLOWED_SITE_KEYS:
+        spec = settings_store.SETTING_SPECS[key]
+        assert spec.allow_blank is True, key
+        assert settings_store.coerce(spec, "") == ""
+
+    phone_spec = settings_store.SETTING_SPECS["site_contact_phone"]
+    assert phone_spec.allow_blank is False
+    with pytest.raises(DomainError):
+        settings_store.coerce(phone_spec, "")
 
 
-def test_dict_setting_round_trips_through_coerce():
-    spec = settings_store.SETTING_SPECS["site_season_windows"]
-    assert settings_store.coerce(spec, {"grazing": [4, 5]}) == {"grazing": [4, 5]}
+async def test_a_blank_address_round_trips_through_get_and_set(db):
+    """The real failure finding 4 named: a blank value written by the admin
+    API must be readable back as the blank it is, not fall back to the
+    non-blank default (or, before the fix, be refused outright by `coerce`
+    at write time)."""
+    key = "site_contact_address_uz"
+    await settings_store.set_setting(db, key, "")
+    await db.flush()
+    settings_store.invalidate(key)
+    assert await settings_store.get_str(db, key) == ""

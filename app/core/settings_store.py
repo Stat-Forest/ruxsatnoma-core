@@ -31,6 +31,13 @@ class SettingSpec:
     type: type
     default: Any
     description: str
+    # A `str` spec's blank value is illegal by default (`coerce`'s ERR-VAL-001
+    # guard against an admin accidentally clearing a required field). A few
+    # keys are legitimately optional — an address or a social link the Agency
+    # may not have yet — and for those a blank IS the valid "not set" value,
+    # so it must round-trip through the admin API rather than being the one
+    # value that API can never write back (finding 4, stage 8 fix wave).
+    allow_blank: bool = False
 
 
 SETTING_SPECS: dict[str, SettingSpec] = {
@@ -317,8 +324,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "site_contact_email", str, "urmoninfo@gmail.com", "Public site: contact e-mail"
         ),
-        SettingSpec("site_contact_address_uz", str, "", "Public site: address, Latin Uzbek"),
-        SettingSpec("site_contact_address_ru", str, "", "Public site: address, Russian"),
+        SettingSpec(
+            "site_contact_address_uz",
+            str,
+            "",
+            "Public site: address, Latin Uzbek",
+            allow_blank=True,
+        ),
+        SettingSpec(
+            "site_contact_address_ru", str, "", "Public site: address, Russian", allow_blank=True
+        ),
         SettingSpec(
             "site_contact_hours_uz",
             str,
@@ -331,22 +346,28 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "Понедельник – пятница, 9:00 – 18:00",
             "Public site: working hours, Russian",
         ),
-        SettingSpec("site_social_telegram", str, "", "Public site: Telegram channel URL"),
-        SettingSpec("site_social_youtube", str, "", "Public site: YouTube channel URL"),
-        # Ruling R3: provisional windows, editable the day the Agency answers.
         SettingSpec(
-            "site_season_windows",
-            dict,
-            {
-                "grazing": [4, 5, 6, 7, 8, 9, 10, 11],
-                "haymaking": [6, 7, 8],
-                "apiary": [4, 5, 6, 7, 8],
-                "recreation": [5, 6, 7, 8, 9, 10],
-                "deadwood": [1, 2, 3, 10, 11, 12],
-                "science": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-            },
-            "Public site: provisional season windows per activity, months 1-12",
+            "site_social_telegram",
+            str,
+            "",
+            "Public site: Telegram channel URL",
+            allow_blank=True,
         ),
+        SettingSpec(
+            "site_social_youtube", str, "", "Public site: YouTube channel URL", allow_blank=True
+        ),
+        # `site_season_windows` (six hard-coded per-activity month lists, ruling
+        # R3) lived here until the stage 8 fix wave: `origin/dev` had by then
+        # merged stage 9's ruling #177, which put the REAL windows in
+        # `norms.models.ActivitySeason`, admin-editable per leshoz. Keeping
+        # both would have let the landing print "grazing: April-November" while
+        # `norms.checks._season_check` refused the citizen's dates against
+        # their leshoz's actual window — deleted rather than kept as a second,
+        # disagreeing source. The public read is now `GET
+        # /public/activity-seasons` (`public.service.public_activity_seasons`),
+        # resolved through `norms.service.resolve_effective_windows`, the same
+        # function the blocking check calls. Supersedes the R3 half of
+        # decision #175.
         # Ruling R2: personal geodata — stays OFF until the Agency confirms in writing.
         SettingSpec(
             "public_permit_contour_enabled",
@@ -395,11 +416,14 @@ def coerce(spec: SettingSpec, raw: Any) -> Any:
         if not isinstance(raw, bool):
             raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected boolean"})
         return raw
-    if spec.type is dict:
-        if not isinstance(raw, dict):
-            raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected object"})
-        return raw
-    if not isinstance(raw, str) or not raw.strip():
+    # No `dict`-typed spec remains (the last one, `site_season_windows`, was
+    # deleted in the stage 8 fix wave) — removed along with it rather than
+    # left as an unvalidated `isinstance(raw, dict)` branch waiting for the
+    # next key to fall into (finding 3): a dict spec added later must bring
+    # its OWN shape validation here, not inherit this one's "any object goes".
+    if not isinstance(raw, str):
+        raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
+    if not spec.allow_blank and not raw.strip():
         raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
     return raw
 
