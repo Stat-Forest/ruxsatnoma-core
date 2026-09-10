@@ -88,4 +88,9 @@ NOTIFIED_EVENT_CODES = (
     "application.returned",
     "application.info_requested",
     "application.recalculated",
+    # Ruling #200 — the two transitions that told nobody: the applicant hears
+    # the file was taken into work, the staff member who asked hears the
+    # answer arrived. Templates seeded by migration `0056`, in-app only.
+    "application.review_started",
+    "application.info_responded",
 )
