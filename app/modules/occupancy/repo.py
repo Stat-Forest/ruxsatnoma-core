@@ -41,12 +41,20 @@ ACTIVE_STATUS = "active"
 
 @dataclass(frozen=True)
 class PermitPeriod:
-    """One ACTIVE permit's own dates and conditional-head load — nothing that
-    could identify who holds it."""
+    """One ACTIVE permit's own dates and committed load — nothing that could
+    identify who holds it.
+
+    TWO load columns, because the permit carries two: `sb_load` is grazing's
+    conditional-head count, `quantity` is every other activity's committed
+    amount in its own unit (`permits.models.Permit`). Each is null wherever
+    the other applies; `service._committed_of` picks by activity rather than
+    coalescing them, since a coalesce would silently read hectares as heads
+    the day a permit ever carried both."""
 
     period_from: date
     period_to: date
     sb_load: Decimal | None
+    quantity: Decimal | None
 
 
 async def active_permit_periods(
@@ -67,7 +75,7 @@ async def active_permit_periods(
     find (lesson) — `occupancy.service.get_occupancy` guards that fail-closed
     before this is ever called."""
     rows = await db.execute(
-        select(Permit.period_from, Permit.period_to, Permit.sb_load).where(
+        select(Permit.period_from, Permit.period_to, Permit.sb_load, Permit.quantity).where(
             Permit.contour_id == contour_id,
             Permit.activity_type_id == activity_type_id,
             Permit.status == ACTIVE_STATUS,
@@ -76,5 +84,6 @@ async def active_permit_periods(
         )
     )
     return [
-        PermitPeriod(period_from=row[0], period_to=row[1], sb_load=row[2]) for row in rows.all()
+        PermitPeriod(period_from=row[0], period_to=row[1], sb_load=row[2], quantity=row[3])
+        for row in rows.all()
     ]

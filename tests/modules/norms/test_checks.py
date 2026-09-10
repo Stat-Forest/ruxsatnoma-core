@@ -817,25 +817,38 @@ async def test_a_null_max_sb_for_grazing_is_now_exclusive_not_skipped(
     It now lands in the same exclusive branch as every other capacity-less
     activity, through the real seam."""
     request = _request(date(2026, 5, 1), date(2026, 9, 30), activity_code="grazing")
-    snapshot_no_provider = await norm_params.load_snapshot(
-        db, request=request, contour_id=published_contour.id, activity_type_id=grazing_activity_id
-    )
+    # `permits.service` registers a real exclusivity provider at import time
+    # (T6, same wave), so "nothing registered" has to be arranged deliberately
+    # now. The first half of this test is about exactly that state: the
+    # question could not be asked, which is reported `skipped` and never as a
+    # free contour.
+    registered = list(norms_service.EXCLUSIVITY_PROVIDERS)
+    norms_service.EXCLUSIVITY_PROVIDERS.clear()
+    try:
+        snapshot_no_provider = await norm_params.load_snapshot(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+        )
+        results_no_provider = await checks.run_checks(
+            db,
+            request=request,
+            contour_id=published_contour.id,
+            activity_type_id=grazing_activity_id,
+            snapshot=snapshot_no_provider,
+            used_sb=Decimal("10"),
+        )
+    finally:
+        norms_service.EXCLUSIVITY_PROVIDERS.extend(registered)
+    limit_no_provider = next(c for c in results_no_provider if c["check"] == "limit")
+    assert limit_no_provider["result"] == "skipped"
+    assert limit_no_provider["details"] == {"reason": "no_occupancy_provider"}
+
     # No norm at all on `published_contour` for grazing (no fixture inserted
     # one), so `resolve_capacity` already reads `max_sb=None` off nothing —
     # the null-max_sb case and the no-norm-at-all case share this one branch
     # by construction (`calculator.resolve_capacity`'s own contract).
-    results = await checks.run_checks(
-        db,
-        request=request,
-        contour_id=published_contour.id,
-        activity_type_id=grazing_activity_id,
-        snapshot=snapshot_no_provider,
-        used_sb=Decimal("10"),
-    )
-    limit = next(c for c in results if c["check"] == "limit")
-    assert limit["result"] == "skipped"
-    assert limit["details"] == {"reason": "no_occupancy_provider"}
-
     async def occupied(
         db_: AsyncSession,
         contour_id: uuid.UUID,
@@ -872,13 +885,22 @@ async def test_a_null_max_sb_for_grazing_is_now_exclusive_not_skipped(
 async def test_the_capacity_load_seam_reports_none_when_empty(
     db: AsyncSession, published_contour: Contour, haymaking_activity_id: uuid.UUID
 ) -> None:
-    """`CAPACITY_LOAD_PROVIDERS` is empty until T6 registers a provider (the
-    same placeholder `LOAD_PROVIDERS` carried until 3.11) — the committed
-    quantity is reported as zero, but honestly labelled `"none"`, never
-    mistaken for a real measurement."""
-    committed, source = await norms_service.committed_capacity_load(
-        db, published_contour.id, haymaking_activity_id, date(2026, 5, 1), date(2026, 9, 30)
-    )
+    """With NOTHING registered, the committed quantity is zero AND honestly
+    labelled `"none"` — never mistaken for a real measurement.
+
+    `permits.service` registers a real provider at import time (T6, same wave),
+    so the seam is no longer empty in production and this test empties it
+    deliberately. The distinction it guards is the whole point of the seam:
+    "nobody asked" and "asked, and the answer is zero" are different facts, and
+    `"none"` is what stops a caller reading the first as the second."""
+    registered = list(norms_service.CAPACITY_LOAD_PROVIDERS)
+    norms_service.CAPACITY_LOAD_PROVIDERS.clear()
+    try:
+        committed, source = await norms_service.committed_capacity_load(
+            db, published_contour.id, haymaking_activity_id, date(2026, 5, 1), date(2026, 9, 30)
+        )
+    finally:
+        norms_service.CAPACITY_LOAD_PROVIDERS.extend(registered)
     assert (committed, source) == (Decimal("0"), "none")
 
 

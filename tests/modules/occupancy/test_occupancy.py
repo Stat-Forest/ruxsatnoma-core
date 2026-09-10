@@ -125,7 +125,7 @@ async def test_exclusive_contour_with_no_permits_is_free_throughout(
     assert body["periods"][0]["result"] == "free"
 
 
-async def test_non_grazing_capacity_has_no_committed_data_yet(
+async def test_a_haymaking_permit_takes_its_hectares_off_the_calendar(
     db,
     published_contour,
     leshoz,
@@ -134,12 +134,17 @@ async def test_non_grazing_capacity_has_no_committed_data_yet(
     haymaking_activity_id,
     applicant_client,
 ):
-    """The one gap this track's report names: `permits` carries no committed-
-    quantity column for a non-grazing activity yet (`sb_load` stays null for
-    haymaking by construction), so even a permit that genuinely overlaps the
-    window cannot move the calendar off `free` — `load_source` says `"none"`
-    rather than a fabricated number, the same idiom `norms.service.
-    committed_capacity_load` itself answers while unregistered."""
+    """A non-grazing activity commits its amount in `permits.quantity`, and the
+    calendar must spend it.
+
+    This test used to assert the opposite — that a haymaking permit could not
+    move the calendar off `free`, because `permits` carried no committed-
+    quantity column at all and `sb_load` is null for haymaking by
+    construction. That was honest while it was true, and it stopped being
+    true in the same wave: T6 added the column, and an occupied meadow drawing
+    GREEN is precisely the failure this project keeps meeting — the refusal
+    that quietly stops refusing. 20 ha of 50 taken leaves 30 and reads
+    `partial`, on the days the permit actually covers and not one day more."""
     await make_published_norm(
         db,
         contour=published_contour,
@@ -156,6 +161,7 @@ async def test_non_grazing_capacity_has_no_committed_data_yet(
         period_from=date(2028, 4, 10),
         period_to=date(2028, 4, 20),
         sb_load=None,
+        quantity=Decimal("20"),
     )
     await db.commit()
 
@@ -170,12 +176,15 @@ async def test_non_grazing_capacity_has_no_committed_data_yet(
     assert body["capacity"] == "50.0000"
     assert body["unit"] == "ha"
     assert body["exclusive"] is False
-    assert body["load_source"] == "none"
-    assert len(body["periods"]) == 1
-    period = body["periods"][0]
-    assert period["committed"] == "0"
-    assert period["remaining"] == "50.0000"
-    assert period["result"] == "free"
+    assert body["load_source"] == "permits"
+    # Three stretches: free before the permit, partial while it runs, free
+    # after it ends — the calendar's whole point is where the answer changes.
+    assert [p["result"] for p in body["periods"]] == ["free", "partial", "free"]
+    taken = body["periods"][1]
+    assert taken["period_from"] == "2028-04-10"
+    assert taken["period_to"] == "2028-04-20"
+    assert taken["committed"] == "20.0000"
+    assert taken["remaining"] == "30.0000"
 
 
 async def test_period_reversed_is_refused(

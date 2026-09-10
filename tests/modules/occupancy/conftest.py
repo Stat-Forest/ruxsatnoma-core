@@ -117,6 +117,7 @@ async def issue_permit(
     period_from: date,
     period_to: date,
     sb_load: Decimal | None,
+    quantity: Decimal | None = None,
     status: str = "active",
 ):
     """A permit on `contour`'s own published version — a thin wrapper over
@@ -131,6 +132,7 @@ async def issue_permit(
         activity_type_id=activity_type_id,
         status=status,
         sb_load=sb_load,
+        quantity=quantity,
         period_from=period_from,
         period_to=period_to,
     )

@@ -780,24 +780,24 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         raise err("ERR-PERM-001", details={"reason": "already_issued"})
 
     # 2.5. Ruling #179's route point: issuance refuses an unverified benefit
-    # claim. T9 (stage 9, wave 2) owns the columns — `benefit_verification_
-    # status`, `benefit_rejection_reason` — on `applications.models`, a file
-    # this track may not touch; `getattr(..., None)` is therefore the guard,
-    # not a style choice: on a branch where T9's migration has not landed yet,
-    # the attribute does not exist on the ORM class at all and `getattr`
-    # degrades to `None` exactly as it would for a genuinely `not_required`
-    # row, never an `AttributeError`. `pending` blocks (the claim has not been
-    # looked at); `verified` and `not_required` pass; `rejected` blocks and
-    # names the reason a reviewer already recorded.
-    benefit_status = getattr(application, "benefit_verification_status", None)
-    if benefit_status == "pending":
+    # claim. `pending` blocks (nobody has looked at the certificate yet);
+    # `verified` and `not_required` pass; `rejected` blocks and names the
+    # reason the verifier recorded, so the applicant is not left guessing.
+    #
+    # Written with a defensive `getattr` while T6 and T9 ran in parallel and
+    # the columns did not yet exist in this branch; read straight off the ORM
+    # now that they do (integration, stage 9 wave 2). The difference matters:
+    # `getattr(..., None)` would keep silently passing a `pending` claim if
+    # the attribute were ever renamed, which is exactly the "refusal quietly
+    # stops refusing" failure this project keeps meeting.
+    if application.benefit_verification_status == "pending":
         raise err("ERR-VAL-001", details={"reason": "benefit_unverified"})
-    if benefit_status == "rejected":
+    if application.benefit_verification_status == "rejected":
         raise err(
             "ERR-VAL-001",
             details={
                 "reason": "benefit_rejected",
-                "benefit_rejection_reason": getattr(application, "benefit_rejection_reason", None),
+                "benefit_rejection_reason": application.benefit_rejection_reason,
             },
         )
 

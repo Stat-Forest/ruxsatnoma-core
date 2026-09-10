@@ -421,3 +421,90 @@ async def test_the_certificate_number_is_a_patchable_draft_field(applicant_clien
         json={"benefit_verification_status": "verified"},
     )
     assert rejected.status_code == 422
+
+
+# --- The seam the whole feature hangs on (integration, stage 9 wave 2) -------
+#
+# Every test above stamps `pending` directly, for the reason this module's own
+# docstring gives. That convenience hid the defect these two tests exist to
+# pin: nothing in `submit()` ever SET `pending`, so a claim never reached the
+# office built to check it, the certificate number was never demanded, and the
+# only symptom was an empty verifier list — indistinguishable from a quiet day.
+
+
+async def test_submitting_a_certificate_claim_opens_its_verification(
+    applicant_client,
+    draft_ready_for_submission,
+    certificate_benefit_category_item_id: uuid.UUID,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> None:
+    """The REAL path, with the number present: step 3b passes and the
+    submission moves on to pricing.
+
+    It still ends 422, for the reason `test_submit.py::test_a_benefit_claim_
+    needs_a_document_of_the_benefit_type_and_no_other` documents at length —
+    decision #50 validates the benefit CODE against the tariff rows the
+    request resolved, and no seeded VMQ 278 tariff carries a modifier for a
+    category a test invented (`benefit_categories` ships empty, `tz/12` #2).
+    What this test pins is WHICH gate answers: not `benefit_certificate_
+    required` any more, which is exactly the difference between a claim that
+    reached the verification step and one that was turned back before it.
+    """
+    from tests.modules.applications.test_submit import _upload
+
+    app_id = draft_ready_for_submission
+    patched = await applicant_client.patch(
+        f"{API}/applications/{app_id}",
+        json={
+            "benefit_category_item_id": str(certificate_benefit_category_item_id),
+            "benefit_certificate_no": "CERT-7788",
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    proof = await applicant_client.post(
+        f"{API}/applications/{app_id}/documents",
+        json={
+            "doc_type_item_id": str(benefit_doc_type_item_id),
+            "file_id": await _upload(applicant_client),
+        },
+    )
+    assert proof.status_code == 201, proof.text
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 422, result.text
+    body = result.json()
+    assert body["error"]["details"].get("reason") != "benefit_certificate_required"
+    assert body["error"]["code"] != "ERR-APP-003"
+
+
+async def test_a_certificate_claim_without_its_number_is_refused_at_submission(
+    applicant_client,
+    draft_ready_for_submission,
+    certificate_benefit_category_item_id: uuid.UUID,
+    benefit_doc_type_item_id: uuid.UUID,
+) -> None:
+    """Same claim, proven by a document, but with no certificate number:
+    refused AT SUBMISSION rather than accepted and left for a verifier to
+    puzzle over a claim naming no certificate at all."""
+    from tests.modules.applications.test_submit import _upload
+
+    app_id = draft_ready_for_submission
+    patched = await applicant_client.patch(
+        f"{API}/applications/{app_id}",
+        json={"benefit_category_item_id": str(certificate_benefit_category_item_id)},
+    )
+    assert patched.status_code == 200, patched.text
+    proof = await applicant_client.post(
+        f"{API}/applications/{app_id}/documents",
+        json={
+            "doc_type_item_id": str(benefit_doc_type_item_id),
+            "file_id": await _upload(applicant_client),
+        },
+    )
+    assert proof.status_code == 201, proof.text
+
+    result = await _submit(applicant_client, app_id)
+    assert result.status_code == 422, result.text
+    body = result.json()
+    assert body["error"]["code"] == "ERR-APP-003"
+    assert body["error"]["details"]["reason"] == "benefit_certificate_required"

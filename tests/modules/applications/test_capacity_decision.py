@@ -130,16 +130,16 @@ async def test_a_second_applicant_is_refused_at_approval_before_any_invoice(
     """Ruling #176's own worked case: money must never be collected from a
     second applicant whose slot is already gone. `POST /approve` answers
     422 `ERR-NORM-002`, the application stays exactly where it was, and no
-    invoice was ever raised for it."""
-    occupant = await _active_apiary_permit(
-        db,
-        contour=published_contour,
-        org=leshoz,
-        activity_type_id=apiary_activity_id,
-        period_from="2027-05-01",
-        period_to="2027-09-30",
-    )
+    invoice was ever raised for it.
 
+    **The occupant appears AFTER this application was filed**, and that is the
+    whole point of a second refusal point. A contour already taken when the
+    applicant files is refused at SUBMISSION — the same check, blocking there
+    too — so a test that occupies the contour first never reaches the decision
+    at all; it was written that way and proved only the earlier gate. The case
+    approval exists for is the one where the slot is lost in between: filed
+    against a free contour, occupied while it sat in review.
+    """
     created = await other_applicant_client.post(f"{API}/applications", json={"on_behalf": "self"})
     assert created.status_code == 201, created.text
     app_id = created.json()["id"]
@@ -160,6 +160,18 @@ async def test_a_second_applicant_is_refused_at_approval_before_any_invoice(
 
     started = await hodim_client.post(f"{API}/applications/{app_id}/start-review")
     assert started.status_code == 200, started.text
+
+    # The slot is lost WHILE the application sits in review — somebody else's
+    # permit becomes active over the same contour, activity and period.
+    occupant = await _active_apiary_permit(
+        db,
+        contour=published_contour,
+        org=leshoz,
+        activity_type_id=apiary_activity_id,
+        period_from="2027-05-01",
+        period_to="2027-09-30",
+    )
+    await db.commit()
 
     result = await _decide(executor_head_client, app_id, "approve")
     assert result.status_code == 422, result.text

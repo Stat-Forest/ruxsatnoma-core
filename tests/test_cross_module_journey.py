@@ -621,6 +621,7 @@ async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
     from tests.modules.permits.conftest import (
         GRAZING_HERD,
         calculation_input_snapshot,
+        make_permit_on_contour,
         unique_pinfl,
     )
 
@@ -674,7 +675,12 @@ async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
         await db.commit()
         return application
 
-    async def _issue_and_activate(application: Application) -> None:
+    async def _pay(application: Application) -> None:
+        """Invoice the approved application and settle it — everything that
+        must be true before issuance is even attempted. Split out of
+        `_issue_and_activate` so the SECOND applicant can reach the issuance
+        gate genuinely paid: refused there for the right reason (the slot is
+        gone) rather than for the wrong one (ERR-PAY-001, not paid)."""
         app_id = application.id
         await publish(db, Event(name=APPLICATION_APPROVED, payload={"application_id": app_id}))
         await db.commit()
@@ -694,6 +700,10 @@ async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
         await db.flush()
         await payments_service.confirm_payment(db, invoice=invoice, transaction=transaction)
         await db.commit()
+
+    async def _issue_and_activate(application: Application) -> None:
+        app_id = application.id
+        await _pay(application)
 
         issued = await hodim_client.post(f"{API}/applications/{app_id}/permit")
         assert issued.status_code == 201, issued.text
@@ -722,20 +732,53 @@ async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
     first = await _paid_application_requesting(Decimal("30.0000"))
     second = await _paid_application_requesting(Decimal("30.0000"))
     await _issue_and_activate(first)
-    await _issue_and_activate(second)
+
+    # SINCE RULING #176 THE SECOND ISSUANCE IS REFUSED — this is the defect
+    # above, fixed. The contour carries no norm and therefore no capacity, so
+    # it is EXCLUSIVE for the period, and the second paid, approved, perfectly
+    # legal-on-its-own-terms application cannot become a permit over the same
+    # plot and dates. That refusal is what this half now pins; the applicant
+    # has paid, and the money question is a refund, not a second document.
+    await _pay(second)
+    refused = await hodim_client.post(f"{API}/applications/{second.id}/permit")
+    assert refused.status_code == 422, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-NORM-002"
+    assert error["details"]["reason"] == "exclusive_occupied"
+
+    # The gis reading side still has to be exercised against a genuinely
+    # over-allocated contour, because databases predating this stage contain
+    # exactly that: two active permits on one parcel, issued when nothing
+    # refused them. Built through the ORM, since issuance — correctly — will
+    # not produce one any more.
+    legacy = await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version.id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="active",
+        area_ha=Decimal("30.0000"),
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 9, 30),
+    )
+    assert legacy.status == "active"
+    await db.commit()
 
     card = await applicant_client.get(f"{API}/gis/contours/{contour.id}")
     assert card.status_code == 200, card.text
     body = card.json()
     assert body["occupancy_source"] == "permits"
     assert body["occupied_ha"] == "60.0000", (
-        "permits.occupancy_provider should already count both real, active "
-        "permits — if this drops to one, the seam between issuance and the "
-        "occupancy provider broke, not gis's own arithmetic"
+        "permits.occupancy_provider should count both active permits — the one "
+        "issued through the real flow and the legacy one — if this drops to "
+        "30, the seam between issuance and the occupancy provider broke, not "
+        "gis's own arithmetic"
     )
     assert body["s_available_ha"] == "0", "defect 2's floor: never a negative available area"
     assert body["over_allocated"] is True, (
         "defect 2's explicit signal: 60 ga committed on a 50 ga contour is a "
-        "real over-allocation across TWO real permits, not a fabricated "
-        "provider in a unit test — the exact shape the demo hit live"
+        "real over-allocation across two active permits, not a fabricated "
+        "provider in a unit test. Ruling #176 stops NEW ones being created; "
+        "this signal is how the ones already in the database stay visible"
     )

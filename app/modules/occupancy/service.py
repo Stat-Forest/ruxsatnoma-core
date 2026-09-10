@@ -16,22 +16,18 @@ exactly as `norms.params.load_snapshot` calls it. The unit mirrors
 `checks.py` exports nothing across the module boundary and is T7's file this
 wave besides.
 
-**Committed load, and the one gap this track found.** For grazing, `permits.
-sb_load` is a real, populated column and every sub-period below carries a
-real committed figure swept from the ACTIVE permits' own date ranges. For
-every OTHER capacity-bearing activity (haymaking ha, apiary hives, deadwood
-m3, recreation person-days), `permits` carries NO committed-quantity column
-at all yet — `sb_load` is null by construction for those
-(`permits.models.Permit`'s own docstring: "`sb_load` stays null for an
-activity that commits no conditional-head load at all"), and stage 9's T6
-(wave 2, running in parallel with this track) is the one registering
-`norms.service.CAPACITY_LOAD_PROVIDERS`, the seam that would need a REAL
-column to sum. Until that column exists, this module reports `committed=0`,
-`load_source="none"` for that one combination — the same "never manufacture a
-measurement" idiom `LOAD_PROVIDERS`/`CAPACITY_LOAD_PROVIDERS` themselves use
-while unregistered, applied here because the underlying DATA does not exist
-yet, not because a seam was left uncalled. See this track's own report for
-the precise ask this leaves for T6/the integrator.
+**Committed load.** Both columns the permit carries are read, chosen by
+activity: `sb_load` for grazing (conditional heads) and `quantity` for every
+other capacity activity (haymaking ha, apiary hives, deadwood m3, recreation
+person-days), each swept from the ACTIVE permits' own date ranges.
+
+Written when `permits` had `sb_load` and nothing else, this module reported
+`committed=0`/`load_source="none"` for every non-grazing activity — honest
+about the missing column, but it meant an occupied meadow drew GREEN on the
+calendar, and green is the colour an applicant acts on. T6 added
+`permits.quantity` in the same wave and the integration wired it here: the
+placeholder branch is gone, and a track's honest "no data yet" survived
+exactly as long as the data was genuinely missing.
 
 **Exclusivity needs no quantity at all.** `period_from`/`period_to` exist on
 every permit regardless of activity, so the EXCLUSIVE branch (no capacity at
@@ -195,19 +191,43 @@ def _boundaries(
     return sorted(points)
 
 
+def _committed_of(permit: PermitPeriod, activity_code: str) -> Decimal:
+    """What this permit committed, in the unit its activity counts in.
+
+    Picked BY ACTIVITY rather than by coalescing the two columns: grazing
+    counts conditional heads (`sb_load`) and everything else counts its own
+    quantity, and a coalesce would read hectares as heads the day a row ever
+    carried both. A null means the permit committed nothing measurable, which
+    is zero — never a reason to skip the sub-period."""
+    if activity_code == calculator.GRAZING:
+        return permit.sb_load or Decimal("0")
+    return permit.quantity or Decimal("0")
+
+
 def _capacity_sub_periods(
     period_from: date,
     period_to: date,
     permits: list[PermitPeriod],
     capacity: Decimal,
+    activity_code: str,
 ) -> list[SubPeriod]:
-    """Grazing only (the one activity `permits.sb_load` is real for): a sweep
-    over the permits' own clipped date ranges, summing concurrent `sb_load`
-    per stretch and labelling it against `capacity` — the finer-grained
-    sibling of `norms.checks._capacity_result`'s own whole-window sum, exactly
-    because a calendar's whole point is where the answer changes over time."""
+    """Every capacity activity: a sweep over the permits' own clipped date
+    ranges, summing the concurrent committed load per stretch and labelling it
+    against `capacity` — the finer-grained sibling of
+    `norms.checks._capacity_result`'s own whole-window sum, exactly because a
+    calendar's whole point is where the answer changes over time.
+
+    Grazing-only when this was written: `permits` then carried `sb_load` and
+    nothing else, so a haymaking permit committed a number this module could
+    not see and the calendar painted an occupied meadow green. T6 added
+    `permits.quantity` in the same wave; `_committed_of` reads whichever
+    column the activity actually uses (integration, stage 9 wave 2)."""
     intervals = [
-        (max(p.period_from, period_from), min(p.period_to, period_to), p.sb_load or Decimal("0"))
+        (
+            max(p.period_from, period_from),
+            min(p.period_to, period_to),
+            _committed_of(p, activity_code),
+        )
         for p in permits
     ]
     if not intervals:
@@ -219,17 +239,6 @@ def _capacity_sub_periods(
         committed = sum((load for s, e, load in intervals if s <= start <= e), Decimal("0"))
         sub_periods.append(_label(start, end, committed, capacity))
     return _collapse(sub_periods)
-
-
-def _capacity_sub_periods_unknown(
-    period_from: date, period_to: date, capacity: Decimal
-) -> list[SubPeriod]:
-    """The gap this track's report names: no committed-quantity column exists
-    on `permits` yet for a non-grazing activity, so there is no basis to
-    split the window at all — one sub-period, `committed=0`, the same
-    `load_source="none"` placeholder `norms.service.committed_capacity_load`
-    itself answers while `CAPACITY_LOAD_PROVIDERS` is unregistered."""
-    return [_label(period_from, period_to, Decimal("0"), capacity)]
 
 
 async def get_occupancy(
@@ -274,12 +283,9 @@ async def get_occupancy(
     if capacity is None:
         periods = _exclusive_sub_periods(period_from, period_to, permits)
         load_source = "permits"
-    elif activity.code == calculator.GRAZING:
-        periods = _capacity_sub_periods(period_from, period_to, permits, capacity)
-        load_source = "permits"
     else:
-        periods = _capacity_sub_periods_unknown(period_from, period_to, capacity)
-        load_source = "none"
+        periods = _capacity_sub_periods(period_from, period_to, permits, capacity, activity.code)
+        load_source = "permits"
 
     return OccupancyResult(
         contour_id=contour_id,
