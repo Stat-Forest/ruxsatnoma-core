@@ -24,12 +24,17 @@ Two things happen here, in this order:
    `DRAFT -> SUBMITTED` row; `models.HISTORY_STATUSES` is that table's
    vocabulary, `APPLICATION_STATUSES` the live one.
 
+Renumbered twice on its way to `dev` — `0056` when `0056`/`0057` landed, `0059` when
+`0058_statutory_exemption_settlement` (#202) merged five minutes ahead of it: the
+lessons.md "same id, not a splice" case, re-pointed by hand because nothing had run it
+anywhere yet.
+
 The downgrade restores the CHECK; the deleted drafts do not come back —
 there is nothing to restore them from, and a downgrade must say so rather
 than pretend.
 
-Revision ID: 0058
-Revises: 0057
+Revision ID: 0059
+Revises: 0058
 Create Date: 2026-09-11 02:00:00.000000
 
 """
@@ -39,8 +44,8 @@ from collections.abc import Sequence
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0058"
-down_revision: str | Sequence[str] | None = "0057"
+revision: str = "0059"
+down_revision: str | Sequence[str] | None = "0058"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -76,7 +76,7 @@ async def test_a_draft_status_is_refused_by_the_check(
     db, applicant, published_contour, grazing_activity_id
 ) -> None:
     """Stage 12 (plan 12, R1/R8): `DRAFT` left `applications.status` with
-    migration 0058 — the CHECK refuses it like any other stranger."""
+    migration 0059 — the CHECK refuses it like any other stranger."""
     with pytest.raises(IntegrityError, match="ck_applications_status_valid"):
         await _app(db, applicant, published_contour.id, grazing_activity_id, status="DRAFT")
     await db.rollback()
