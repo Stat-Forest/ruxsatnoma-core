@@ -216,6 +216,18 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
             raise err(
                 "ERR-VAL-001", details={"code": code, "reason": "requisites must be an object"}
             )
+        # Ruling #178: whether this organization has GIS layers at all. The
+        # Agency says most leshozes do not and gave no date, so this is the
+        # common case in a real import file rather than an exotic one — and a
+        # bulk importer that cannot express it would force every such leshoz
+        # to be edited by hand through the API afterwards. Preserve-on-absence
+        # like `stir`/`requisites` (ruling 5), and strictly boolean when
+        # present: a string "false" is exactly the shape that would silently
+        # enable a map for a leshoz that has none.
+        if "gis_enabled" in row and not isinstance(row["gis_enabled"], bool):
+            raise err(
+                "ERR-VAL-001", details={"code": code, "reason": "gis_enabled must be a boolean"}
+            )
         default_stir = None if existing is None else existing.stir
         stir = _validated_stir(code, row.get("stir", default_stir))
 
@@ -232,6 +244,7 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
                     region_id=region_id,
                     district_id=district_id,
                     requisites=row.get("requisites", {}),
+                    gis_enabled=row.get("gis_enabled", True),
                 )
             )
             created += 1
@@ -244,6 +257,7 @@ async def seed_organizations(db: AsyncSession, rows: list[dict[str, Any]]) -> tu
             if "district_code" in row:
                 existing.district_id = await _district_id(db, row["district_code"])
             existing.requisites = row.get("requisites", existing.requisites)
+            existing.gis_enabled = row.get("gis_enabled", existing.gis_enabled)
             updated += 1
         await db.flush()
     await audit.log(

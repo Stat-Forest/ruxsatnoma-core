@@ -75,6 +75,7 @@ from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import OtpCode, Role, User
 from app.modules.gis import import_service as gis_import_service
+from app.modules.gis import repo as gis_repo
 from app.modules.gis import service as gis_service
 from app.modules.gis.models import Contour
 from app.modules.norms import service as norms_service
@@ -92,6 +93,7 @@ from app.seed import seed_organizations
 # purpose: an operator writes them down once. Dev only — production accounts come
 # from `app/bootstrap.py` and a real password change, never from this module.
 BURCHMULLA_CODE = "burchmulla"
+NOMAP_CODE = "demo_nomap"
 
 # The agency root + the Burchmulla leshoz (decision #45), for a truly empty
 # database — `app.seed.seed_organizations` is idempotent by `code`, so this is
@@ -115,6 +117,22 @@ _ORGANIZATION_ROWS = [
             "uz_cyrl": "Бурчмулла ДЎХ",
             "uz_latn": "Burchmulla DOʻX",
             "en": "Burchmulla forestry",
+        },
+    },
+    # Ruling #178: the leshoz WITHOUT geodata — the common case in the country,
+    # not an exotic one, since the Agency says most layers are not ready and
+    # gave no date. Burchmulla keeps its map (it is the one leshoz whose real
+    # polygons this seed imports); this second one exists so the map-less path
+    # can be walked end to end on the stand instead of only in tests.
+    {
+        "code": NOMAP_CODE,
+        "kind": "leshoz",
+        "parent_code": "agency",
+        "gis_enabled": False,
+        "name": {
+            "uz_cyrl": "Демо ДЎХ (харитасиз)",
+            "uz_latn": "Demo DOʻX (xaritasiz)",
+            "en": "Demo forestry (no map)",
         },
     },
 ]
@@ -301,6 +319,19 @@ DEMO_STAFF: list[DemoUser] = [
         "burchmulla",
         pinfl="30260904000010",
         password="Chorvoq#Nazorat6094",
+    ),
+    # Ruling #179: the office that checks the certificates behind a benefit
+    # claim. Deliberately UNZONED, unlike the specialist and the inspector
+    # above — this role is central by design, one office for the country, and
+    # its visibility is not a zone at all: it sees applications carrying a
+    # certificate-bearing claim in any leshoz and no ordinary application
+    # anywhere. Giving it an organization here would misrepresent that.
+    DemoUser(
+        "demo_benefit_verifier",
+        "Demo Benefit Verifier (Agency)",
+        "benefit_verifier",
+        pinfl="30260904000011",
+        password="Imtiyoz#Tekshir5183",
     ),
 ]
 DEMO_APPLICANT = DemoUser(
@@ -715,6 +746,84 @@ async def _ensure_burchmulla_contours(db: AsyncSession, *, actor: User) -> str:
     return msg
 
 
+# Two plots for the map-less leshoz, filed the way ruling #178 says such a
+# leshoz files them: by requisites and a declared area, with no geometry at all.
+_NOMAP_CONTOURS = [
+    ("D-101", Decimal("12.5000")),
+    ("D-102", Decimal("4.7500")),
+]
+
+
+async def _ensure_nomap_contours(db: AsyncSession, *, actor: User) -> str:
+    """Publish the map-less leshoz's plots through `gis`'s OWN lifecycle —
+    create -> version -> submit-review -> approve -> publish — never a raw
+    insert, so what lands is a genuinely published version that
+    `GET /gis/contours` serves like any other.
+
+    The version carries `declared_area_ha` and NO `geom`: that is the whole
+    point of #178, and `service.create_version`'s own
+    `_assert_geometry_or_declared_area` is what proves the path is real rather
+    than a fixture shortcut. Its GIS checks then report `skipped`/`no_geometry`
+    instead of a silent pass, which is what the applicant sees on the stand.
+
+    Idempotent by CONTENT, the same way `_ensure_burchmulla_contours` is: if
+    the leshoz already has a published contour, this does nothing rather than
+    creating `D-101/2` siblings on every rerun.
+    """
+    org = await admin_repo.get_organization_by_code(db, NOMAP_CODE)
+    if org is None:
+        return f"SKIPPED: organization {NOMAP_CODE!r} not found — seed organizations first"
+
+    _items, total = await gis_service.list_contours(
+        db,
+        organization_id=org.id,
+        bbox=None,
+        params=PageParams(page=1, page_size=1),
+        actor=actor,
+    )
+    if total > 0:
+        return f"{NOMAP_CODE} already has {total} published contour(s) — skipped"
+
+    layer = await gis_repo.layer_by_code(db, "contours")
+    if layer is None:
+        return "SKIPPED: the 'contours' layer is missing"
+
+    approval_doc = await core_files.save_upload(
+        db,
+        data=_MIN_PDF,
+        filename="demo-nomap-approval.pdf",
+        content_type="application/pdf",
+        actor=actor,
+    )
+
+    published = 0
+    for number, declared_area_ha in _NOMAP_CONTOURS:
+        contour = await gis_service.create_contour(
+            db,
+            layer_id=layer.id,
+            organization_id=org.id,
+            number=number,
+            actor=actor,
+        )
+        version = await gis_service.create_version(
+            db,
+            contour.id,
+            actor=actor,
+            # `cadastre` — the plot is described by its documents, which is
+            # precisely what a leshoz with no layers has to go on.
+            source="cadastre",
+            declared_area_ha=declared_area_ha,
+        )
+        await gis_service.submit_review(db, version.id, actor=actor)
+        await gis_service.approve_version(
+            db, version.id, actor=actor, approval_doc_id=approval_doc.id
+        )
+        await gis_service.publish_version(db, version.id, actor=actor)
+        published += 1
+
+    return f"Published {published} geometry-less contour(s) for {NOMAP_CODE}"
+
+
 # --- Legal documents (`0043`) -------------------------------------------------
 
 # The four acts the public site's /documents page listed as hard-coded strings
@@ -910,10 +1019,12 @@ async def _main() -> None:
                 await db.execute(select(User).where(User.login == "demo_sysadmin"))
             ).scalar_one()
             gis_message = await _ensure_burchmulla_contours(db, actor=sysadmin_user)
+            nomap_message = await _ensure_nomap_contours(db, actor=sysadmin_user)
             await db.commit()
         report.append("")
         report.append(f"Geodata source: {_SHAPEFILE_DIR}")
         report.append(gis_message)
+        report.append(nomap_message)
 
         # --- Grazing norm (UNCONFIRMED placeholder — see _ensure_grazing_norm's
         # own docstring before touching DEMO_YIELD_C_PER_HA) --------------------
