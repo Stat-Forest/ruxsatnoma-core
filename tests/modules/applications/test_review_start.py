@@ -34,7 +34,6 @@ async def test_a_hodim_in_the_zone_takes_it_into_work(
         await hodim_client.get(f"/api/v1/applications/{submitted_application}/timeline")
     ).json()
     assert [e["to_status"] for e in timeline["status_history"]] == [
-        "DRAFT",
         "SUBMITTED",
         "IN_REVIEW",
     ]
@@ -52,12 +51,12 @@ async def test_a_hodim_outside_the_zone_is_refused(
     assert result.status_code in (403, 404)
 
 
-async def test_taking_a_draft_into_work_is_refused(
-    hodim_client, draft_ready_for_submission: str
+async def test_taking_an_application_into_work_twice_is_refused(
+    hodim_client, application_in_review: str
 ) -> None:
-    result = await hodim_client.post(
-        f"/api/v1/applications/{draft_ready_for_submission}/start-review"
-    )
+    """409 `ERR-APP-004`: `start-review` requires SUBMITTED, and since stage 12
+    nothing earlier than SUBMITTED exists to refuse."""
+    result = await hodim_client.post(f"/api/v1/applications/{application_in_review}/start-review")
     assert result.status_code == 409
     assert result.json()["error"]["code"] == "ERR-APP-004"
 
@@ -77,33 +76,25 @@ async def test_the_applicant_cancels_an_application_already_in_review(
 
 
 async def test_a_cancelled_application_stops_blocking_a_new_one(
-    applicant_client, submitted_application: str, second_draft_same_contour: str
+    applicant_client, submitted_application: str, second_filing_same_contour: dict
 ) -> None:
     """The EXCLUDE constraint's WHERE clause excludes CANCELLED — worth an
     explicit test, because it is the reason the applicant can refile."""
     await applicant_client.post(f"/api/v1/applications/{submitted_application}/cancel", json={})
     from tests.modules.applications.test_submit import _submit
 
-    result = await _submit(applicant_client, second_draft_same_contour)
-    assert result.status_code == 200, result.text
+    result = await _submit(applicant_client, second_filing_same_contour)
+    assert result.status_code == 201, result.text
 
 
-async def test_a_draft_is_withdrawn_with_no_body_at_all(
-    applicant_client, draft_ready_for_submission: str
+async def test_a_submitted_application_is_withdrawn_with_no_body_at_all(
+    applicant_client, submitted_application: str
 ) -> None:
-    """Two gaps in one test (final review: the deferred minor, and Important
-    3's fifth item).
-
-    **No HTTP test cancelled a DRAFT** — the source status every applicant
-    actually uses — and **the body was mandatory**: `design/03` writes it as
-    `{reason?}`, while the route required an `ApplicationCancelIn` and answered
-    422 to a bare POST. A citizen who withdraws their own unfiled draft owes
-    nobody an explanation, so both the reason and the body around it are
-    optional.
-    """
-    result = await applicant_client.post(
-        f"/api/v1/applications/{draft_ready_for_submission}/cancel"
-    )
+    """The body is optional (final review of 3.9a: `design/03` writes it as
+    `{reason?}`, and a citizen who withdraws their own filing owes nobody an
+    explanation) — so a bare POST with no body at all is a valid withdrawal.
+    SUBMITTED is now the earliest status there is (stage 12)."""
+    result = await applicant_client.post(f"/api/v1/applications/{submitted_application}/cancel")
     assert result.status_code == 200, result.text
     assert result.json()["status"] == "CANCELLED"
 
@@ -179,7 +170,7 @@ async def test_the_timeline_resolves_the_submission_signature_to_its_own_entry(
     # whole point of `submit` supplying it rather than letting `uuid7` default.
     assert uuid.UUID(submitted["id"])
 
-    assert by_status["DRAFT"]["signatures"] == []
+    assert "DRAFT" not in by_status, "stage 12: the timeline starts at the filing"
     assert timeline["signatures"] == [], "no decision signature exists yet"
     assert timeline["info_requests"] == [], "no request-info has been opened on this application"
 

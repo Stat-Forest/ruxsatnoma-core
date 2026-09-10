@@ -30,7 +30,7 @@ from app.modules.auth.models import User
 from app.modules.beekeepers import service as beekeepers_service
 from app.modules.beekeepers.schemas import BeekeeperCreateIn
 from tests.modules.applications.conftest import unique_pinfl
-from tests.modules.applications.test_submit import _submit, _upload
+from tests.modules.applications.test_submit import _submit, _submit_with_button, _upload
 
 API = "/api/v1"
 
@@ -359,7 +359,7 @@ async def test_a_claim_without_a_number_is_refused_at_submission_on_any_category
         certificate_no=None,
     )
 
-    result = await _submit(applicant_client, filing)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     error = result.json()["error"]
     assert error["code"] == "ERR-APP-003"
@@ -385,13 +385,18 @@ async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_ve
         certificate_no="CERT-7788",
     )
 
-    result = await _submit(applicant_client, filing)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     body = result.json()
     assert body["error"]["code"] != "ERR-APP-003"
 
 
 # --- ruling #182: the wired seam, real register, three outcomes ---------------
+#
+# The refusal tests below file with the BUTTON (`_submit_with_button`): an ERI
+# filing prices at `POST /applications/package` first, and a claim that is
+# not in the tariff's modifiers is refused there — before `file()`'s step 3b
+# could ever answer. The button path reaches step 3b directly.
 
 
 async def test_the_wired_seam_empty_for_every_other_category(
@@ -439,7 +444,7 @@ async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
         certificate_no=f"BEE-{uuid.uuid4().hex[:10]}",
     )
 
-    result = await _submit(applicant_client, filing)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     error = result.json()["error"]
     assert error["code"] == "ERR-APP-003"
@@ -479,7 +484,7 @@ async def test_the_wired_seam_refuses_someone_elses_certificate_number(
         certificate_no=certificate_no,
     )
 
-    result = await _submit(applicant_client, filing)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     error = result.json()["error"]
     assert error["code"] == "ERR-APP-003"
@@ -526,7 +531,7 @@ async def test_the_wired_seam_matched_passes_step_3b(
         certificate_no=certificate_no,
     )
 
-    result = await _submit(applicant_client, filing)
+    result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
     body = result.json()
     assert body["error"]["code"] != "ERR-APP-003"

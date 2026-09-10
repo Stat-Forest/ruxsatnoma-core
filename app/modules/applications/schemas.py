@@ -111,23 +111,6 @@ def _trim_decimal(value: Decimal | None) -> str | None:
     return text or "0"
 
 
-class ApplicationCreate(BaseModel):
-    """`POST /applications` — the whole body. Everything else about a draft
-    arrives through PATCH (ruling 7).
-
-    `applicant_id` is meaningful only with `on_behalf="legal"`: for `"self"` the
-    applicant is the caller's own `applicants` row and naming somebody else's
-    would be the first half of filing in another citizen's name. The service
-    refuses the mismatch rather than a validator here, so the refusal carries a
-    domain reason instead of a pydantic field error.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    on_behalf: OnBehalf
-    applicant_id: uuid.UUID | None = None
-
-
 class ApplicationItemIn(BaseModel):
     """One livestock line of a grazing application."""
 

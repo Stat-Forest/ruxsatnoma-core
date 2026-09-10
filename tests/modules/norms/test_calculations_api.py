@@ -230,7 +230,9 @@ async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_
     assert unknown.status_code == 404, unknown.text
     assert unknown.json()["error"]["code"] == "ERR-SYS-003"
 
-    # The caller's own DRAFT, ON THE CONTOUR BEING PRICED: allowed, and the
+    # The caller's own RETURNED application (stage 12, plan 12 R4: the owner
+    # binds in RETURNED — and in SUBMITTED only while the row has no
+    # calculation), ON THE CONTOUR BEING PRICED: allowed, and the
     # binding is what is stored. The `contour_id` is not decoration — the final
     # review's Important 2 added a third refusal beside the two above, so a
     # calculation must also DESCRIBE the application it binds to, and a draft
@@ -243,7 +245,7 @@ async def test_a_calculation_can_only_be_bound_to_an_application_the_caller_may_
         submitted_by_user_id=uuid.UUID(me["user"]["id"]),
         on_behalf="self",
         channel="portal",
-        status="DRAFT",
+        status="RETURNED",
         contour_id=published_contour.id,
     )
     db.add(application)

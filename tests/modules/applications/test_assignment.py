@@ -32,15 +32,15 @@ def test_no_eligible_reviewer_returns_none_rather_than_raising() -> None:
 
 
 async def test_submission_assigns_the_contours_organization_and_a_reviewer(
-    db, applicant_client, draft_ready_for_submission, hodim_user, leshoz
+    db, applicant_client, filing_ready_for_submission, hodim_user, leshoz
 ) -> None:
     from tests.modules.applications.test_submit import _submit
 
-    result = await _submit(applicant_client, draft_ready_for_submission)
-    assert result.status_code == 200, result.text
+    result = await _submit(applicant_client, filing_ready_for_submission)
+    assert result.status_code == 201, result.text
 
     timeline = (
-        await applicant_client.get(f"/api/v1/applications/{draft_ready_for_submission}/timeline")
+        await applicant_client.get(f"/api/v1/applications/{result.json()['id']}/timeline")
     ).json()
     assert len(timeline["assignments"]) == 1
     assert timeline["assignments"][0]["org_id"] == str(leshoz.id)
@@ -49,15 +49,15 @@ async def test_submission_assigns_the_contours_organization_and_a_reviewer(
 
 
 async def test_an_organization_with_no_reviewer_still_gets_the_application(
-    db, applicant_client, draft_in_reviewerless_leshoz
+    db, applicant_client, filing_in_reviewerless_leshoz
 ) -> None:
     from tests.modules.applications.test_submit import _submit
 
-    result = await _submit(applicant_client, draft_in_reviewerless_leshoz)
-    assert result.status_code == 200, result.text
+    result = await _submit(applicant_client, filing_in_reviewerless_leshoz)
+    assert result.status_code == 201, result.text
 
     timeline = (
-        await applicant_client.get(f"/api/v1/applications/{draft_in_reviewerless_leshoz}/timeline")
+        await applicant_client.get(f"/api/v1/applications/{result.json()['id']}/timeline")
     ).json()
     assert timeline["assignments"][0]["user_id"] is None
 
@@ -112,7 +112,7 @@ async def test_a_resubmission_does_not_re_fire_auto_assignment(
     from sqlalchemy import update
 
     from app.modules.applications.models import Application
-    from tests.modules.applications.test_submit import _submit
+    from tests.modules.applications.test_submit import _resubmit
 
     await db.execute(
         update(Application)
@@ -121,7 +121,7 @@ async def test_a_resubmission_does_not_re_fire_auto_assignment(
     )
     await db.commit()
 
-    result = await _submit(applicant_client, submitted_application)
+    result = await _resubmit(applicant_client, submitted_application)
     assert result.status_code == 200, result.text
 
     timeline = (

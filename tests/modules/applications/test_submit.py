@@ -330,21 +330,21 @@ async def test_three_failed_signatures_leave_evidence_and_no_application(
 ) -> None:
     """Raised by the 3.8 session on 2026-09-02, re-based on stage 12: `sign()`
     commits on refusal (ruling 19), so each refused attempt leaves its OWN
-    `signatures` evidence row behind — and, now that there is no draft to
-    keep check rows on, nothing else: no application, no number, no
-    calculation (plan 12, R3)."""
+    evidence behind — and, now that there is no draft to keep check rows on,
+    nothing else: no application, no number, no calculation (plan 12, R3)."""
     from sqlalchemy import func, select
 
     from app.modules.applications.models import Application
-    from app.modules.signatures.models import Signature
+    from app.modules.audit.models import AuditLog
+    from app.modules.signatures.service import SIGNATURE_CREATE
 
+    # An envelope this broken never binds a certificate, so `sign()` has no
+    # `signatures` row to write for it — the evidence of the attempt is its
+    # own denied audit entry, committed before the raise.
     evidence = (
         select(func.count())
-        .select_from(Signature)
-        .where(
-            Signature.object_type == "application_submission",
-            Signature.verification_status != "valid",
-        )
+        .select_from(AuditLog)
+        .where(AuditLog.action == SIGNATURE_CREATE, AuditLog.result == "denied")
     )
     applications = select(func.count()).select_from(Application)
     evidence_before = await db.scalar(evidence)
@@ -817,10 +817,11 @@ async def test_the_applicant_is_notified_under_the_dotted_template_code(
     inapp = next(row for row in rows if row.channel == "inapp")
     assert inapp.template_id is not None
     assert number in inapp.rendered_text
-    # The inbox draws "DRAFT -> SUBMITTED" chips from these two keys; a flow
+    # The inbox draws "-> SUBMITTED" chips from these two keys; a flow
     # that moves a status and forgets them ships a notification the cabinet
     # can only show as bare text.
-    assert (inapp.params["status_from"], inapp.params["status_to"]) == ("DRAFT", "SUBMITTED")
+    # Stage 12: the row is born SUBMITTED — there is no `from` to chip.
+    assert (inapp.params["status_from"], inapp.params["status_to"]) == (None, "SUBMITTED")
 
 
 async def test_the_filing_publishes_application_id_and_nothing_else(

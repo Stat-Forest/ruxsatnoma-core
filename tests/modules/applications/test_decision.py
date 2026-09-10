@@ -357,7 +357,6 @@ async def test_the_forward_is_visible_on_the_timeline_as_a_bounce_with_its_reaso
     assert bounces[0]["reason_text"] == "role_limit_exceeded"
     assert bounces[0]["signatures"] == [], "a bounce is nobody's signed act"
     assert [row["to_status"] for row in timeline["status_history"]] == [
-        "DRAFT",
         "SUBMITTED",
         "IN_REVIEW",
         "IN_REVIEW",
@@ -820,7 +819,7 @@ async def test_the_approval_takes_the_cabinet_and_the_invoice_takes_the_sms(
 async def _in_review_with_benefit_claim(
     applicant_client,
     hodim_client,
-    recreation_draft_ready_for_submission: str,
+    recreation_filing_ready_for_submission: dict,
     preschool_children_item_id: uuid.UUID,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> str:
@@ -838,25 +837,20 @@ async def _in_review_with_benefit_claim(
     """
     from tests.modules.applications.test_submit import _submit, _upload
 
-    app_id = recreation_draft_ready_for_submission
-    patched = await applicant_client.patch(
-        f"/api/v1/applications/{app_id}",
-        json={
-            "benefit_category_item_id": str(preschool_children_item_id),
-            "benefit_certificate_no": "CERT-DEC-1",
-        },
-    )
-    assert patched.status_code == 200, patched.text
-    proof = await applicant_client.post(
-        f"/api/v1/applications/{app_id}/documents",
-        json={
-            "doc_type_item_id": str(benefit_doc_type_item_id),
-            "file_id": await _upload(applicant_client),
-        },
-    )
-    assert proof.status_code == 201, proof.text
-    submitted = await _submit(applicant_client, app_id)
-    assert submitted.status_code == 200, submitted.text
+    filing = {
+        **recreation_filing_ready_for_submission,
+        "benefit_category_item_id": str(preschool_children_item_id),
+        "benefit_certificate_no": "CERT-DEC-1",
+        "documents": [
+            {
+                "doc_type_item_id": str(benefit_doc_type_item_id),
+                "file_id": await _upload(applicant_client),
+            }
+        ],
+    }
+    submitted = await _submit(applicant_client, filing)
+    assert submitted.status_code == 201, submitted.text
+    app_id = submitted.json()["id"]
     assert submitted.json()["benefit_verification_status"] == "pending"
     started = await hodim_client.post(f"/api/v1/applications/{app_id}/start-review")
     assert started.status_code == 200, started.text
@@ -867,7 +861,7 @@ async def _in_review_with_benefit_claim(
 async def application_in_review_with_pending_benefit_claim(
     applicant_client,
     hodim_client,
-    recreation_draft_ready_for_submission: str,
+    recreation_filing_ready_for_submission: dict,
     preschool_children_item_id: uuid.UUID,
     preschool_children_priced: None,
     benefit_doc_type_item_id: uuid.UUID,
@@ -875,7 +869,7 @@ async def application_in_review_with_pending_benefit_claim(
     return await _in_review_with_benefit_claim(
         applicant_client,
         hodim_client,
-        recreation_draft_ready_for_submission,
+        recreation_filing_ready_for_submission,
         preschool_children_item_id,
         benefit_doc_type_item_id,
     )

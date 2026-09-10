@@ -45,31 +45,26 @@ async def test_one_application_walks_the_whole_path(
     grazing_activity_id,
     sheep_type_id,
 ) -> None:
-    """DRAFT -> SUBMITTED -> IN_REVIEW -> APPROVED, with a real ERI at both
+    """A filing -> SUBMITTED -> IN_REVIEW -> APPROVED, with a real ERI at both
     ends, the price from `norms`, the site from `gis`, and the event 3.10
     subscribes to. If this passes, the spine of the process works."""
     from tests.modules.applications.test_submit import _submit
 
-    created = await applicant_client.post("/api/v1/applications", json={"on_behalf": "self"})
-    app_id = created.json()["id"]
-
-    await applicant_client.patch(
-        f"/api/v1/applications/{app_id}",
-        json={
-            "activity_type_id": str(grazing_activity_id),
-            "contour_id": str(published_contour.id),
-            "period_from": "2027-05-01",
-            "period_to": "2027-09-30",
-            "items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}],
-        },
-    )
-
-    prechecked = await applicant_client.post(f"/api/v1/applications/{app_id}/precheck")
+    filing = {
+        "on_behalf": "self",
+        "activity_type_id": str(grazing_activity_id),
+        "contour_id": str(published_contour.id),
+        "period_from": "2027-05-01",
+        "period_to": "2027-09-30",
+        "items": [{"livestock_type_id": str(sheep_type_id), "head_count": 40}],
+    }
+    prechecked = await applicant_client.post("/api/v1/applications/precheck", json=filing)
     assert prechecked.status_code == 200
     assert all(c["result"] != "fail" for c in prechecked.json()["checks"])
 
-    submitted = await _submit(applicant_client, app_id)
-    assert submitted.status_code == 200, submitted.text
+    submitted = await _submit(applicant_client, filing)
+    assert submitted.status_code == 201, submitted.text
+    app_id = submitted.json()["id"]
     number = submitted.json()["number"]
 
     await hodim_client.post(f"/api/v1/applications/{app_id}/start-review")
@@ -89,7 +84,6 @@ async def test_one_application_walks_the_whole_path(
 
     timeline = (await applicant_client.get(f"/api/v1/applications/{app_id}/timeline")).json()
     assert [e["to_status"] for e in timeline["status_history"]] == [
-        "DRAFT",
         "SUBMITTED",
         "IN_REVIEW",
         "APPROVED",
@@ -107,7 +101,7 @@ async def test_one_application_walks_the_whole_path(
     # attempts extend, one signature per attempt.
     assert [
         len(e["signatures"]) for e in timeline["status_history"] if e["to_status"] != "SUBMITTED"
-    ] == [0, 0, 0, 0]
+    ] == [0, 0, 0]
 
     # --- the same facts, read the way 3.10a and 3.11a read them: IN PROCESS.
     # Nothing above this line touches `service.get` or

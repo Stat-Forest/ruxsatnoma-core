@@ -60,10 +60,10 @@ from app.modules.applications.permissions import (
 )
 from app.modules.applications.schemas import (
     ApplicationCheckIn,
-    ApplicationCreate,
     ApplicationDocumentIn,
     ApplicationFileIn,
     ApplicationFilingIn,
+    ApplicationItemIn,
     ApplicationPatch,
 )
 from app.modules.audit import service as audit
@@ -92,10 +92,11 @@ from app.modules.signatures import service as signatures_service
 # it writes its transition through `set_status` — and `submit` cannot write it
 # through `set_status` at all (ruling 25; see `set_status`'s own docstring).
 APPLICATION_STATUS_CHANGE = "application.status_change"
-# Task 3's own two flow verbs, plus the one a REFUSED read writes. A verb that
-# does more than move a status audits under its own name (the same split
-# `permits.service` makes) — and `create`/`update` move no status at all.
-APPLICATION_CREATE = "application.create"
+# Task 3's flow verb for a PATCH on a RETURNED application, plus the one a
+# REFUSED read writes. A verb that does more than move a status audits under
+# its own name (the same split `permits.service` makes) — and `update` moves
+# no status at all. `application.create` retired with the draft (stage 12):
+# a filing audits as `application.file`.
 APPLICATION_UPDATE = "application.update"
 # Written ONLY on a territorial denial, never on a successful read (the shape
 # `permits.service.PERMIT_READ` established): a GET that audits every hit lets
@@ -131,7 +132,7 @@ CHANNEL_PORTAL = "portal"
 # `applications.kind`: an `extension` is a child of an existing application
 # (`parent_application_id`), created only by `permits.service.extend`
 # (3.11b's `POST /permits/{id}/extend`) — a citizen files `POST /applications`
-# itself for a `new` one, never an `extension`; see `create_draft`'s own
+# itself for a `new` one, never an `extension`; see `_build_filing`'s own
 # docstring for why the split lives in the FUNCTION, not the wire schema.
 KIND_NEW = "new"
 KIND_EXTENSION = "extension"
@@ -867,7 +868,7 @@ async def _assert_in_actor_zone(
 
 
 async def _resolve_applicant(
-    db: AsyncSession, payload: ApplicationCreate | ApplicationFilingIn, *, actor: User
+    db: AsyncSession, payload: ApplicationFilingIn, *, actor: User
 ) -> tuple[uuid.UUID, uuid.UUID | None]:
     """Whose application this is, and on whose authority — `(applicant_id,
     representation_id)`.
@@ -899,85 +900,6 @@ async def _resolve_applicant(
     if representation is None:
         raise err("ERR-ACL-001", details={"reason": "no_effective_representation"})
     return payload.applicant_id, representation.id
-
-
-async def create_draft(
-    db: AsyncSession,
-    payload: ApplicationCreate,
-    *,
-    actor: User,
-    kind: str = KIND_NEW,
-    parent_application_id: uuid.UUID | None = None,
-) -> Application:
-    """`POST /applications` — an EMPTY draft, and deliberately so (ruling 7):
-    tz/04 С3 autosaves a draft field by field, so everything except who is
-    filing and for whom arrives later through `PATCH`.
-
-    The `DRAFT` row of `application_status_history` is written HERE, directly,
-    and not through `set_status`: `APPLICATION_TRANSITIONS` has no edge INTO
-    `DRAFT` — nothing may return an application to it — so `set_status` could
-    not write this row even if asked. It is written all the same because a
-    timeline that starts at `SUBMITTED` cannot say when the citizen began, and
-    nothing else in the system will ever be in a position to add it.
-
-    `kind` and `parent_application_id` are PARAMETERS and NOT fields of
-    `ApplicationCreate`, on purpose (3.11b ruling 17): that model is the body
-    of the public `POST /applications` and forbids nothing it does not list
-    (`extra="forbid"`), so a field there is a field a citizen may set —
-    `kind="extension"` against any parent id, with no permit and no holder
-    behind it. Here they are supplied only by a server caller that has
-    already proved both (`permits.service.extend`, 3.11a ruling 12). They
-    default to today's behaviour, so `POST /applications` itself is
-    unchanged, and `applications` learns nothing about permits: an extension
-    is an application shape `APPLICATION_KINDS` has carried since migration
-    0015.
-    """
-    if kind not in APPLICATION_KINDS:
-        # Before `flush()`: the `kind_valid` CHECK would otherwise surface a
-        # caller's typo as an `IntegrityError` — no handler maps it, so it
-        # would reach the client as a 500 (lesson: walk every caller-settable
-        # field that is an FK or an enum-ish column before `flush()`).
-        raise err("ERR-VAL-001", details={"reason": "unknown_kind"})
-    applicant_id, representation_id = await _resolve_applicant(db, payload, actor=actor)
-    application = Application(
-        applicant_id=applicant_id,
-        submitted_by_user_id=actor.id,
-        on_behalf=payload.on_behalf,
-        representation_id=representation_id,
-        status=INITIAL_STATUS,
-        channel=CHANNEL_PORTAL,
-        kind=kind,
-        parent_application_id=parent_application_id,
-    )
-    db.add(application)
-    await db.flush()
-    await repo.add_status_history(
-        db,
-        ApplicationStatusHistory(
-            application_id=application.id,
-            from_status=None,
-            to_status=INITIAL_STATUS,
-            changed_by=actor.id,
-        ),
-    )
-    # `created_at`/`updated_at` are `server_default=func.now()`, so the row in
-    # memory is not what Postgres stored until it is read back (lesson) — and
-    # this row is serialized into the 201 response.
-    await db.refresh(application)
-    await audit.log(
-        db,
-        action=APPLICATION_CREATE,
-        user_id=actor.id,
-        object_type="application",
-        object_id=application.id,
-        new_value={
-            "applicant_id": str(applicant_id),
-            "on_behalf": payload.on_behalf,
-            "representation_id": None if representation_id is None else str(representation_id),
-            "status": INITIAL_STATUS,
-        },
-    )
-    return application
 
 
 async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
@@ -2013,13 +1935,17 @@ async def file(
         # reason.
         reason = "package_id_required" if payload.pkcs7 is not None else "package_id_unexpected"
         raise err("ERR-VAL-001", details={"reason": reason})
-    if payload.pkcs7 is None and payload.on_behalf != "self":  # step 1b (ruling #183)
-        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
     submission_id = uuid7()  # step 0 — the history row's id, what the signature binds to
     filing = await _build_filing(  # step 1
         db, payload, actor=actor, kind=kind, parent_application_id=parent_application_id
     )
     application, items = filing.application, filing.items
+    # Step 1b (ruling #183), AFTER step 1 on purpose: who is filing and on
+    # whose authority is answered first — a caller with no representation at
+    # all hears `no_effective_representation`, not "sign with ERI". Nothing
+    # is pending yet either way; `_build_filing` only reads.
+    if payload.pkcs7 is None and payload.on_behalf != "self":
+        raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
     application.id = payload.application_id or uuid7()
     await _assert_complete(  # step 2
         db, application, items=items, rules_accepted=payload.rules_accepted
@@ -2167,7 +2093,12 @@ async def file(
         db,
         event_code=NOTIFY_APPLICATION_SUBMITTED,
         recipient_user_id=await _notification_recipient(db, application),
-        params={"application_number": number},
+        params={
+            "application_number": number,
+            # The inbox's chips (PR #95): a filing has no `from` — the row was
+            # born SUBMITTED — and says so rather than inventing a DRAFT.
+            **notifications_service.transition_params(from_status=None, to_status=SUBMITTED_STATUS),
+        },
         object_type="application",
         object_id=application.id,
     )
@@ -3487,108 +3418,56 @@ async def cancel(
 APPLICATION_CLONE = "application.clone"
 
 
-async def clone(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> Application:
-    """`POST /applications/{id}/clone` — a fresh DRAFT pre-filled from an
-    application the caller owns, in WHATEVER status it holds: a herder
-    renewing next season's grazing should not have to retype the plot, the
-    activity or the herd every filing.
+async def clone_template(
+    db: AsyncSession, application_id: uuid.UUID, *, actor: User
+) -> ApplicationFilingIn:
+    """`GET /applications/{id}/clone` — the filing a caller would send to
+    refile an application they own, in WHATEVER status it holds (stage 12,
+    plan 12 R6: a read that returns a template, since there is no draft to
+    create): a herder renewing next season's grazing should not have to
+    retype the plot, the activity or the herd every filing.
 
     **The point of a clone is what it does NOT copy.** Everything the source
     EARNED by being reviewed, priced, signed or decided stays behind — the
-    public `number`, `status` (always a fresh `DRAFT`), the frozen
-    `contour_version_id`, every timestamp, the SLA deadline, the assignment,
-    the documents, the checks, the calculation and the whole status history:
-    the clone's own timeline holds exactly the one `DRAFT` row this function
-    writes. Documents are excluded ON PURPOSE, not merely deferred: a
-    veterinary certificate has a validity period, and silently carrying last
-    year's into a new filing is exactly the kind of quiet error this system
-    exists to prevent — the applicant attaches a fresh one.
+    public `number`, the status, the frozen `contour_version_id`, every
+    timestamp, the SLA deadline, the assignment, the documents, the checks,
+    the calculation and the whole status history. Documents are excluded ON
+    PURPOSE, not merely deferred: a veterinary certificate has a validity
+    period, and silently carrying last year's into a new filing is exactly
+    the kind of quiet error this system exists to prevent — the applicant
+    attaches a fresh one.
 
     What copies is the request itself: who is filing and on whose authority
-    (`applicant_id`, `on_behalf`, `representation_id`), the plot and activity
-    (`contour_id`, `activity_type_id`), the declared period, area, quantity and
-    herd (`period_from`, `period_to`, `requested_area_ha`, `quantity`,
-    `items`) and the claimed `benefit_category_item_id`. The period comes
-    along with the rest of the request rather than being left for a mandatory
-    `PATCH`: `checks.REQUIRED_FOR_PRICING` refuses a submission missing it, and
-    a clone an applicant cannot submit without editing fields that did not
-    change (the plot, the herd) would save them nothing. `contour_version_id`
-    is deliberately NOT among them: the clone reprices against whichever
-    version is published at ITS OWN submission (ruling 22), never the one the
-    source was decided against.
+    (`applicant_id`, `on_behalf`), the plot and activity (`contour_id`,
+    `activity_type_id`), the declared period, quantity and herd
+    (`period_from`, `period_to`, `quantity`, `items`) and the claimed
+    `benefit_category_item_id` with its certificate number. The period comes
+    along with the rest of the request rather than being left blank: a
+    template an applicant cannot file without retyping fields that did not
+    change (the plot, the herd) would save them nothing.
 
-    `parent_application_id` is set to the SOURCE while `kind` stays `"new"`
-    (`KIND_NEW`): a clone is a brand-new filing that happens to remember where
-    it came from, not `extend` (`tz/12` #6) — that verb belongs to 3.11's
-    `POST /permits/{id}/extend`, on an already-ISSUED permit, and is out of
-    scope here.
-
-    The OWNER only, in ANY status — a stranger is told 404, the same answer
-    every other refusal in this module gives, never 403 (`_readable_
-    application`'s own reasoning: an application carries a citizen's name,
-    plot and herd from the moment it exists). Unlocked, deliberately unlike
-    `_own_application_for_update`: the source is only ever READ here, never
-    written, so there is nothing to serialise against a concurrent writer.
-
-    No event is published and no notification sent: nothing subscribes to a
-    clone and no template is seeded for one — inventing either here would be
-    exactly the mistake `events.NOTIFIED_EVENT_CODES`'s own note on
-    `application.cancelled` warns against.
+    Ownership only — 404 for a stranger, never 403 (the module's one answer
+    to "does this id exist"). No lock, no write, no audit: a read.
     """
     source = await repo.get_application(db, application_id)
     if source is None or source.applicant_id not in await _own_applicant_ids(db, actor):
         raise err("ERR-SYS-003", details={"application": str(application_id)})
-    application = Application(
+    items = await repo.list_items(db, source.id)
+    return ApplicationFilingIn(
+        on_behalf=source.on_behalf,  # type: ignore[arg-type]  # CHECK-backed literal
         applicant_id=source.applicant_id,
-        submitted_by_user_id=actor.id,
-        on_behalf=source.on_behalf,
-        representation_id=source.representation_id,
         activity_type_id=source.activity_type_id,
         contour_id=source.contour_id,
-        requested_area_ha=source.requested_area_ha,
         period_from=source.period_from,
         period_to=source.period_to,
         quantity=source.quantity,
+        items=[
+            ApplicationItemIn(livestock_type_id=item.livestock_type_id, head_count=item.head_count)
+            for item in items
+        ],
         benefit_category_item_id=source.benefit_category_item_id,
-        status=INITIAL_STATUS,
-        channel=CHANNEL_PORTAL,
-        kind=KIND_NEW,
-        parent_application_id=source.id,
+        benefit_certificate_no=source.benefit_certificate_no,
     )
-    db.add(application)
-    await db.flush()
-    for item in await repo.list_items(db, source.id):
-        db.add(
-            ApplicationItem(
-                application_id=application.id,
-                livestock_type_id=item.livestock_type_id,
-                head_count=item.head_count,
-            )
-        )
-    await repo.add_status_history(
-        db,
-        ApplicationStatusHistory(
-            application_id=application.id,
-            from_status=None,
-            to_status=INITIAL_STATUS,
-            changed_by=actor.id,
-        ),
-    )
-    # `created_at`/`updated_at`/`requested_area_ha`/`quantity` all round-trip
-    # through Postgres defaults or `NUMERIC`'s own scale (the same lesson
-    # `create_draft` and `patch_draft` both carry) — refreshed before this row
-    # is serialized into the 201 response.
-    await db.refresh(application)
-    await audit.log(
-        db,
-        action=APPLICATION_CLONE,
-        user_id=actor.id,
-        object_type="application",
-        object_id=application.id,
-        old_value={"parent_application_id": str(source.id)},
-        new_value=_snapshot(application, await repo.list_items(db, application.id)),
-    )
-    return application
 
 
 async def timeline(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
