@@ -48,17 +48,18 @@ import uuid
 from datetime import date
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, Query, Request, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files, settings_store
+from app.core import files, settings_store, xlsx
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import PAGING_MAX, Page
+from app.core.time import business_today
 from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.payments import backoffice_service, statement_service
+from app.modules.payments import backoffice_service, export, statement_service
 from app.modules.payments.backoffice_schemas import (
     AllocationOut,
     FiledManualConfirmationOut,
@@ -193,6 +194,25 @@ async def list_bank_statements(
     )
 
 
+@router.get("/bank-statements/export.xlsx")
+async def export_bank_statements_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[str | None, Query(pattern=_STATEMENT_STATUS_PATTERN)] = None,
+) -> Response:
+    """`GET /payments/bank-statements` as a spreadsheet (stage 13, ruling
+    #204): the same `payments.view` gate and the same `?status=` filter,
+    every matching import up to the configured cap. Declared BEFORE
+    `/bank-statements/{statement_id}` on purpose — `export.xlsx` is not a
+    UUID, and the two share the same path-segment count."""
+    items, total, cap = await export.statement_rows(db, lang=lang, status=status)
+    filename = f"bank-hisobotlari-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_statements(items, lang=lang), filename=filename, total=total, cap=cap
+    )
+
+
 @router.get("/bank-statements/{statement_id}", response_model=StatementOut)
 async def get_bank_statement(
     statement_id: uuid.UUID,
@@ -267,6 +287,23 @@ async def list_reconciliations(
         total=total,
         page=offset // limit + 1,
         page_size=limit,
+    )
+
+
+@router.get("/reconciliations/export.xlsx")
+async def export_reconciliations_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[str, Query(pattern=_STATUS_PATTERN)] = RECONCILIATION_STATUSES[0],
+) -> Response:
+    """`GET /payments/reconciliations` as a spreadsheet (stage 13, ruling
+    #204): the same `payments.view` gate, the same default (`open`) and
+    `?status=` filter, every matching row up to the configured cap."""
+    items, total, cap = await export.reconciliation_rows(db, actor=actor, lang=lang, status=status)
+    filename = f"nomuvofiqliklar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_reconciliations(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
@@ -351,6 +388,27 @@ async def list_manual_confirmations(
         page=offset // limit + 1,
         page_size=limit,
     )
+
+
+@router.get("/manual-confirmations/export.xlsx")
+async def export_manual_confirmations_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_any_permission(PAYMENTS_MANAGE, PAYMENTS_CONFIRM))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[
+        str, Query(pattern=_MANUAL_CONFIRMATION_STATUS_PATTERN)
+    ] = MANUAL_CONFIRMATION_STATUSES[0],
+) -> Response:
+    """`GET /payments/manual-confirmations` as a spreadsheet (stage 13,
+    ruling #204): the same maker-or-checker gate, the same default
+    (`pending_check`) and `?status=` filter, every matching row up to the
+    configured cap."""
+    items, total, cap = await export.manual_confirmation_rows(
+        db, actor=actor, lang=lang, status=status
+    )
+    filename = f"qolda-tasdiqlar-{business_today().isoformat()}.xlsx"
+    rendered = export.render_manual_confirmations(items, lang=lang)
+    return xlsx.xlsx_response(rendered, filename=filename, total=total, cap=cap)
 
 
 @router.post("/manual-confirmations", status_code=201, response_model=FiledManualConfirmationOut)
@@ -485,3 +543,25 @@ async def list_allocations(
         page=offset // limit + 1,
         page_size=limit,
     )
+
+
+@router.get("/allocations/export.xlsx")
+async def export_allocations_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(PAYMENTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    invoice_id: Annotated[uuid.UUID | None, Query()] = None,
+    period_from: Annotated[date | None, Query()] = None,
+    period_to: Annotated[date | None, Query()] = None,
+) -> Response:
+    """`GET /payments/allocations` as a spreadsheet (stage 13, ruling
+    #204): the same `payments.view` gate, the same `invoice_id`-or-period
+    selection (including the route's own `ERR-VAL-001` when neither or a
+    reversed period is given), every matching row up to the configured
+    cap."""
+    items, total, cap = await export.allocation_rows(
+        db, lang=lang, invoice_id=invoice_id, period_from=period_from, period_to=period_to
+    )
+    filename = f"tolovlar-taqsimoti-{business_today().isoformat()}.xlsx"
+    rendered = export.render_allocations(items, lang=lang)
+    return xlsx.xlsx_response(rendered, filename=filename, total=total, cap=cap)

@@ -18,13 +18,16 @@ may write here is a `role_permissions` row, not a change here)."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import require_any_permission, require_permission
 from app.modules.auth.models import User
+from app.modules.payments import export
 from app.modules.payments import recipients_service as service
 from app.modules.payments.permissions import PAYMENTS_RECIPIENTS_MANAGE, PAYMENTS_VIEW
 from app.modules.payments.schemas import (
@@ -46,6 +49,23 @@ async def list_recipients(
     actor: Annotated[User, Depends(_READ)],
 ) -> Page[PaymentRecipientOut]:
     return await service.list_all(db, params=params)
+
+
+@router.get("/export.xlsx")
+async def export_recipients_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(_READ)],
+    lang: xlsx.Lang = "uz_latn",
+) -> Response:
+    """`GET /payments/recipients` as a spreadsheet (stage 13, ruling
+    #204): the same read gate (`payments.view` or
+    `payments.recipients.manage`), the whole directory (active and
+    inactive alike, exactly like the list — ruling #157) up to the
+    configured cap."""
+    items, total, cap = await export.recipient_rows(db, lang=lang)
+    filename = f"qabul-qiluvchilar-{business_today().isoformat()}.xlsx"
+    rendered = export.render_recipients(items, lang=lang)
+    return xlsx.xlsx_response(rendered, filename=filename, total=total, cap=cap)
 
 
 @router.post("", response_model=PaymentRecipientOut, status_code=201)
