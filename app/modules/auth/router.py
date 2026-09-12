@@ -37,6 +37,10 @@ from app.modules.auth.schemas import (
     OtpVerifyIn,
     OtpVerifyOut,
     PasswordChangeIn,
+    PasswordForgotLookupIn,
+    PasswordForgotLookupOut,
+    PasswordForgotResetIn,
+    PasswordForgotSendIn,
     RepresentationOut,
     RoleOut,
     UserOut,
@@ -274,6 +278,54 @@ async def password_change(
 ) -> None:
     await service.change_password(
         db, user, old=body.old_password, new=body.new_password, current_session_id=session_row.id
+    )
+
+
+@router.post(
+    "/password/forgot/lookup",
+    response_model=PasswordForgotLookupOut,
+    dependencies=[Depends(rate_limit("password_forgot", "ratelimit_otp_per_minute"))],
+)
+async def password_forgot_lookup(
+    body: PasswordForgotLookupIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+) -> PasswordForgotLookupOut:
+    phone, email = await service.forgot_password_lookup(
+        db, login=body.login, ip=request.client.host if request.client else None
+    )
+    return PasswordForgotLookupOut(phone=phone, email=email)
+
+
+@router.post(
+    "/password/forgot/send",
+    status_code=204,
+    dependencies=[Depends(rate_limit("password_forgot", "ratelimit_otp_per_minute"))],
+)
+async def password_forgot_send(
+    body: PasswordForgotSendIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+) -> None:
+    await service.forgot_password_send(
+        db,
+        login=body.login,
+        channel=body.channel,
+        ip=request.client.host if request.client else None,
+    )
+
+
+@router.post(
+    "/password/forgot/reset",
+    status_code=204,
+    dependencies=[Depends(rate_limit("password_forgot", "ratelimit_otp_per_minute"))],
+)
+async def password_forgot_reset(
+    body: PasswordForgotResetIn, request: Request, db: Annotated[AsyncSession, Depends(get_db)]
+) -> None:
+    await service.forgot_password_reset(
+        db,
+        login=body.login,
+        channel=body.channel,
+        code=body.code,
+        new_password=body.new_password,
+        ip=request.client.host if request.client else None,
     )
 
 
