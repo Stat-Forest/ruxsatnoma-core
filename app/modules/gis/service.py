@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import settings_store
+from app.core import settings_store, xlsx
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import DomainError, err
 from app.core.models import MediaFile
@@ -23,7 +23,7 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
-from app.modules.gis import checks, repo
+from app.modules.gis import checks, kmz, repo
 from app.modules.gis.models import (
     CONTOUR_LAYER_CODE,
     Contour,
@@ -1666,6 +1666,34 @@ async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) 
         "over_allocated": over_allocated,
         "occupancy_source": source,
     }
+
+
+async def contour_kmz(
+    db: AsyncSession, contour_id: uuid.UUID, *, actor: User, lang: xlsx.Lang = "uz_latn"
+) -> tuple[bytes, str]:
+    """`GET /gis/contours/{id}/export.kmz` — the card's own geometry as a KMZ
+    file plus the filename to serve it under. Reads through `contour_card`
+    on purpose, so the same two rules decide what leaves the server: a
+    contour with no published version is a 404, and decision #178's `None`
+    geometry (no `geom`, or the leshoz's `gis_enabled` switch off) is a 404
+    too — `ERR-GIS-007`, named rather than reused, because "the contour exists
+    but its boundary was never drawn" is what the card's button has to hide
+    on, and a client that still asks deserves to be told which of the two it
+    hit. Never an empty or degenerate file: a KMZ with no polygon opens in
+    Google Earth as nothing at all, the hiding kind of defect."""
+    card = await contour_card(db, contour_id, actor=actor)
+    geometry = card["geometry"]
+    if geometry is None:
+        raise err("ERR-GIS-007")
+    org = await admin_repo.get_organization(db, card["organization_id"])
+    organization_name = xlsx.localized(org.name if org is not None else None, lang)
+    data = kmz.render_kmz(
+        number=card["number"],
+        organization_name=organization_name,
+        area_ha=str(card["area_ha"]),
+        geometry=geometry,
+    )
+    return data, f"kontur-{card['number']}.kmz"
 
 
 async def list_versions(

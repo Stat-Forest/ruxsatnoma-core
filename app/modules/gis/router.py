@@ -18,13 +18,13 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import xlsx
+from app.core import files, xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.gis import checks, export, service
+from app.modules.gis import checks, export, kmz, service
 from app.modules.gis.models import VERSION_STATUSES
 from app.modules.gis.permissions import CONTOURS_APPROVE, CONTOURS_MANAGE
 from app.modules.gis.schemas import (
@@ -126,6 +126,30 @@ async def list_contour_features(
         await service.list_contour_features(
             db, bbox=bbox, organization_id=organization_id, actor=user
         )
+    )
+
+
+@router.get("/contours/{contour_id}/export.kmz")
+async def export_contour_kmz(
+    contour_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+) -> Response:
+    """The card's published boundary as a KMZ file (Odilxon, 2026-09-13):
+    what the application and permit cards' «KMZ yuklab olish» button
+    downloads. Same reader as the card, so the same people see the same
+    polygon; 404 `ERR-GIS-007` when the contour has no geometry to give
+    (decision #178) — the button hides on that card, and a direct call is
+    told why rather than handed an empty file."""
+    data, filename = await service.contour_kmz(db, contour_id, actor=user, lang=lang)
+    return Response(
+        content=data,
+        media_type=kmz.MEDIA_TYPE,
+        headers={
+            "Content-Disposition": files.content_disposition("attachment", filename),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
