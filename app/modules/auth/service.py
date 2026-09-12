@@ -698,9 +698,13 @@ async def request_otp(
     )
 
 
-async def verify_otp(
+async def _burn_otp_code(
     db: AsyncSession, *, target: str, code: str, purpose: str, ip: str | None
-) -> str:
+) -> OtpCode:
+    """Check `code` against the latest pending OTP for `target`/`purpose` and
+    mark it used. Denied paths commit the attempt counter and the audit row
+    before raising (ruling 2). Shared by `verify_otp` (which then mints a
+    `{purpose}_token`) and the self-service password reset (which does not)."""
     row = await repo.latest_pending_otp(db, target=target, purpose=purpose)
     max_attempts = await settings_store.get_int(db, "otp_max_attempts")
     if row is None or row.attempts >= max_attempts:
@@ -726,8 +730,20 @@ async def verify_otp(
         )
         await db.commit()  # the attempt counter must survive the raise (ruling 2)
         raise err("ERR-AUTH-010")
-    now = datetime.now(UTC)
-    row.used_at = now
+    row.used_at = datetime.now(UTC)
+    await audit.log(
+        db,
+        action="otp.verify",
+        ip=ip,
+        extra={"target": _mask_target(target), "purpose": purpose},
+    )
+    return row
+
+
+async def verify_otp(
+    db: AsyncSession, *, target: str, code: str, purpose: str, ip: str | None
+) -> str:
+    row = await _burn_otp_code(db, target=target, code=code, purpose=purpose, ip=ip)
     token = new_token()
     await repo.add(
         db,
@@ -736,16 +752,102 @@ async def verify_otp(
             target=target,
             code_hash=hash_token(token),
             purpose=f"{purpose}_token",
-            expires_at=now + timedelta(minutes=OTP_TOKEN_TTL_MINUTES),
+            expires_at=datetime.now(UTC) + timedelta(minutes=OTP_TOKEN_TTL_MINUTES),
         ),
     )
-    await audit.log(
-        db,
-        action="otp.verify",
-        ip=ip,
-        extra={"target": _mask_target(target), "purpose": purpose},
-    )
     return token
+
+
+# ---- self-service password reset (decision #208, supersedes the admin-only
+# ---- half of #32) -----------------------------------------------------------
+
+PASSWORD_RESET_PURPOSE = "password_reset"
+
+
+def mask_phone_for_display(phone: str) -> str:
+    """`+998901234567` → `+998 ** *** ** 67`: the country code and the last two
+    digits, enough to recognise one's own number and nothing more."""
+    return f"{phone[:4]} ** *** ** {phone[-2:]}"
+
+
+def mask_email_for_display(email: str) -> str:
+    return _mask_target(email)
+
+
+def _self_reset_user(user: User | None) -> User | None:
+    """Only an active staff account with a password can reset it by itself;
+    applicants (no password, decision #32) and blocked accounts answer as if
+    the login did not exist."""
+    if user is None or user.status != "active" or user.password_hash is None:
+        return None
+    return user
+
+
+def _reset_contact(user: User, channel: str) -> str | None:
+    return user.phone if channel == "phone" else user.email
+
+
+async def forgot_password_lookup(
+    db: AsyncSession, *, login: str, ip: str | None
+) -> tuple[str | None, str | None]:
+    """Masked (phone, email) of the login's owner — `None` where the card has
+    no such contact. An unknown or ineligible login gets `(None, None)`, the
+    same answer as a card with nothing filled in, so the existence oracle this
+    route unavoidably is (decision #208) says as little as it can."""
+    user = _self_reset_user(await repo.get_user_by_login(db, login))
+    if user is None:
+        await audit.log(
+            db,
+            action="user.password_forgot",
+            result="denied",
+            basis="unknown login",
+            ip=ip,
+            extra={"login": login[:64]},
+        )
+        return None, None
+    await audit.log(db, action="user.password_forgot", user_id=user.id, ip=ip)
+    return (
+        mask_phone_for_display(user.phone) if user.phone else None,
+        mask_email_for_display(user.email) if user.email else None,
+    )
+
+
+async def forgot_password_send(
+    db: AsyncSession, *, login: str, channel: str, ip: str | None
+) -> None:
+    """Send a reset code to the login's own phone or e-mail. The target is
+    read from the card, never from the request, so a caller learns nothing
+    the lookup did not already say. Per-target hourly cap, hashing and outbox
+    delivery are `request_otp`'s."""
+    user = _self_reset_user(await repo.get_user_by_login(db, login))
+    target = _reset_contact(user, channel) if user is not None else None
+    if user is None or target is None:
+        raise err("ERR-AUTH-001")
+    await request_otp(db, target_type=channel, target=target, purpose=PASSWORD_RESET_PURPOSE, ip=ip)
+
+
+async def forgot_password_reset(
+    db: AsyncSession, *, login: str, channel: str, code: str, new_password: str, ip: str | None
+) -> None:
+    """Burn the code and set the new password. The policy is checked BEFORE
+    the code so a too-short password does not cost the user a fresh SMS.
+    Every session is revoked and the lockout cleared — the person who just
+    proved control of the contact is the owner, and a lockout left over from
+    someone else's guessing would keep them out of their reset account."""
+    user = _self_reset_user(await repo.get_user_by_login(db, login))
+    target = _reset_contact(user, channel) if user is not None else None
+    if user is None or target is None:
+        raise err("ERR-AUTH-001")
+    validate_password_policy(new_password)
+    await _burn_otp_code(db, target=target, code=code, purpose=PASSWORD_RESET_PURPOSE, ip=ip)
+    user.password_hash = await asyncio.to_thread(hash_password, new_password)
+    user.must_change_password = False
+    user.failed_login_count = 0
+    user.locked_until = None
+    await repo.revoke_user_sessions(db, user.id)
+    await audit.log(
+        db, action="user.password_reset_self", user_id=user.id, ip=ip, extra={"channel": channel}
+    )
 
 
 async def consume_otp_token(db: AsyncSession, *, token: str, purpose: str, target: str) -> None:

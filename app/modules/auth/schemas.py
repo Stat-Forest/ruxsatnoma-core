@@ -151,6 +151,33 @@ class PasswordChangeIn(BaseModel):
     new_password: str
 
 
+class PasswordForgotLookupIn(BaseModel):
+    login: str = Field(min_length=1, max_length=150)
+
+
+class PasswordForgotLookupOut(BaseModel):
+    """Masked contacts a self-service reset can go to; `None` = not filled in.
+
+    An unknown login answers `(None, None)` too — indistinguishable from a
+    staff member whose card has neither contact (decision #208).
+    """
+
+    phone: str | None
+    email: str | None
+
+
+class PasswordForgotSendIn(BaseModel):
+    login: str = Field(min_length=1, max_length=150)
+    channel: Literal["phone", "email"]
+
+
+class PasswordForgotResetIn(BaseModel):
+    login: str = Field(min_length=1, max_length=150)
+    channel: Literal["phone", "email"]
+    code: str = Field(min_length=1, max_length=16)
+    new_password: str
+
+
 def _validate_target_format(target: str, purpose: str) -> None:
     """Raise ValueError unless `target` matches the format `purpose` implies.
 
