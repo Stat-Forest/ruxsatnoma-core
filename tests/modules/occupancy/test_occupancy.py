@@ -268,3 +268,46 @@ async def test_one_query_however_many_permits_or_however_long_the_window(
 
     assert counter.value == 1, f"must cost one query, not {counter.value}"
     assert len(periods) == 5
+
+
+async def test_a_permit_awaiting_signatures_already_shows_full(
+    db, published_contour, leshoz, haymaking_activity_id, applicant_client
+):
+    """A permit is born `pending_signatures` and may sit there for weeks
+    (ruling #99); issuance already refuses a competitor over it. The calendar
+    must not paint those days green — green is the colour an applicant acts
+    on, and a slot that is reserved but unsigned is not free."""
+    await issue_permit(
+        db,
+        contour=published_contour,
+        org=leshoz,
+        activity_type_id=haymaking_activity_id,
+        period_from=date(2028, 2, 10),
+        period_to=date(2028, 2, 20),
+        sb_load=None,
+        status="pending_signatures",
+    )
+    await db.commit()
+
+    resp = await applicant_client.get(
+        occupancy_url(
+            published_contour.id, haymaking_activity_id, date(2028, 2, 1), date(2028, 2, 28)
+        )
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert [(p["period_from"], p["period_to"], p["result"]) for p in resp.json()["periods"]] == [
+        ("2028-02-01", "2028-02-09", "free"),
+        ("2028-02-10", "2028-02-20", "full"),
+        ("2028-02-21", "2028-02-28", "free"),
+    ]
+
+
+def test_the_calendar_counts_exactly_the_statuses_the_gates_count() -> None:
+    """`occupancy.repo` mirrors `permits.service.OCCUPYING_STATUSES` as a
+    literal (a reader takes the table, never the service); this is the pin
+    that keeps the calendar and the three gates answering the same question.
+    A test may import what `app/` may not (module boundary)."""
+    from app.modules.permits import service as permits_service
+
+    assert occupancy_repo.OCCUPYING_STATUSES == permits_service.OCCUPYING_STATUSES

@@ -32,17 +32,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.permits.models import Permit
 
-# Mirrors `permits.service.ACTIVE_STATUS` ("active") — repeated as a literal
-# rather than imported, because importing `permits.service` here would pull
-# in that module's whole write surface for one string; a reader takes the
-# TABLE, never the service (module boundary, `CLAUDE.md`).
-ACTIVE_STATUS = "active"
+# Mirrors `permits.service.OCCUPYING_STATUSES` — repeated as literals rather
+# than imported, because importing `permits.service` here would pull in that
+# module's whole write surface for two strings; a reader takes the TABLE,
+# never the service (module boundary, `CLAUDE.md`). A test pins the two
+# together. `pending_signatures` is counted on purpose: an issued, paid-for
+# permit awaiting its signatures reserves the slot, and a calendar painting
+# those days green would show an applicant a slot every gate refuses.
+OCCUPYING_STATUSES = ("pending_signatures", "active")
 
 
 @dataclass(frozen=True)
 class PermitPeriod:
-    """One ACTIVE permit's own dates and committed load — nothing that could
-    identify who holds it.
+    """One occupying permit's own dates and committed load — nothing that
+    could identify who holds it.
 
     TWO load columns, because the permit carries two: `sb_load` is grazing's
     conditional-head count, `quantity` is every other activity's committed
@@ -64,7 +67,7 @@ async def active_permit_periods(
     period_from: date,
     period_to: date,
 ) -> list[PermitPeriod]:
-    """Every ACTIVE permit's own period for this contour x activity,
+    """Every OCCUPYING permit's own period for this contour x activity,
     overlapping `[period_from, period_to]` — ONE query for the whole window,
     never one per day and never one per sub-period; `occupancy.service` builds
     every sub-period boundary from what this returns.
@@ -78,7 +81,7 @@ async def active_permit_periods(
         select(Permit.period_from, Permit.period_to, Permit.sb_load, Permit.quantity).where(
             Permit.contour_id == contour_id,
             Permit.activity_type_id == activity_type_id,
-            Permit.status == ACTIVE_STATUS,
+            Permit.status.in_(OCCUPYING_STATUSES),
             Permit.period_from <= period_to,
             Permit.period_to >= period_from,
         )
