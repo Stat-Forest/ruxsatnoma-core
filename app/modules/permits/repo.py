@@ -292,7 +292,7 @@ async def rating_for_permit(db: AsyncSession, permit_id: uuid.UUID) -> PermitRat
 
 
 async def occupied_area_by_contour(
-    db: AsyncSession, contour_ids: Sequence[uuid.UUID], *, status: str, as_of: date
+    db: AsyncSession, contour_ids: Sequence[uuid.UUID], *, statuses: Sequence[str], as_of: date
 ) -> dict[uuid.UUID, Decimal]:
     """How many hectares each of these contours has committed, in ONE statement.
 
@@ -305,9 +305,9 @@ async def occupied_area_by_contour(
     contract says a key it was not given back counts as zero, so there is no
     reason to pay for a LEFT JOIN against a list of ids.
 
-    `status` comes from the caller: `service.ACTIVE_STATUS` is the module's one
-    source of truth for that word and importing the service from here would be a
-    cycle.
+    `statuses` comes from the caller: `service.OCCUPYING_STATUSES` is the
+    module's one source of truth for which permits occupy a slot, and importing
+    the service from here would be a cycle.
 
     **`as_of` (ruling #176, stage 9): a permit whose OWN period has already
     ended no longer occupies its area**, even while its stored `status` still
@@ -322,7 +322,7 @@ async def occupied_area_by_contour(
     rows = await db.execute(
         select(Permit.contour_id, func.sum(Permit.area_ha))
         .where(
-            Permit.status == status,
+            Permit.status.in_(statuses),
             Permit.contour_id.in_(contour_ids),
             Permit.period_to >= as_of,
         )

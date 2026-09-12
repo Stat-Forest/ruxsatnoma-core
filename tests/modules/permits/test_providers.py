@@ -544,7 +544,7 @@ def test_all_four_providers_are_registered_exactly_once() -> None:
 async def test_a_suspension_frees_the_area_and_the_load(
     db, active_permit, head_client, suspend_reason_id, resume_reason_id, order_file_id
 ) -> None:
-    """Ruling 7: both providers count `active` and nothing else, so there is
+    """Ruling 7: `suspended` is not in `OCCUPYING_STATUSES`, so there is
     nothing to recompute — and this is the test that says so out loud."""
     from app.modules.permits import service
 
@@ -572,3 +572,103 @@ async def test_a_suspension_frees_the_area_and_the_load(
         await service.load_provider(db, contour, active_permit.period_from, active_permit.period_to)
         == load_before
     )
+
+
+# --- A permit awaiting signatures already occupies its slot -------------------
+#
+# `issue()` writes the permit row in `pending_signatures`, and the LAST gate
+# (`_assert_contour_still_has_room`) has counted that row since stage 9. The
+# four providers below feed every EARLIER gate — submission, pre-check, the
+# decision — and the calendar; if they count `active` only, a second applicant
+# is approved and PAYS while the first permit sits unsigned, and is refused
+# only at issuance. One word, one meaning, everywhere: a permit occupies its
+# contour × activity from the moment its row exists.
+
+
+@pytest.fixture
+async def pending_permit(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    grazing_activity_id: uuid.UUID,
+) -> Permit:
+    """Issued, paid for, not yet signed — `service.INITIAL_STATUS`, the state
+    every permit is born in and may sit in indefinitely (ruling #99)."""
+    return await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=grazing_activity_id,
+        status="pending_signatures",
+    )
+
+
+async def test_occupancy_counts_a_permit_still_awaiting_signatures(
+    db: AsyncSession, contour: Contour, pending_permit: Permit
+) -> None:
+    from app.modules.permits import service
+
+    result = await service.occupancy_provider(db, [contour.id])
+    assert result.get(contour.id) == pending_permit.area_ha
+
+
+async def test_load_counts_a_permit_still_awaiting_signatures(
+    db: AsyncSession, contour: Contour, pending_permit: Permit
+) -> None:
+    from app.modules.permits import service
+
+    assert await service.load_provider(
+        db, contour.id, date(2027, 6, 1), date(2027, 7, 1)
+    ) == Decimal("40.0000")
+
+
+async def test_capacity_load_provider_counts_a_permit_still_awaiting_signatures(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    apiary_activity_id: uuid.UUID,
+) -> None:
+    from app.modules.permits import service
+
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=apiary_activity_id,
+        status="pending_signatures",
+        sb_load=None,
+        quantity=Decimal("6.0000"),
+    )
+    assert await service.capacity_load_provider(
+        db, contour.id, apiary_activity_id, date(2027, 6, 1), date(2027, 7, 1)
+    ) == Decimal("6.0000")
+
+
+async def test_exclusivity_provider_counts_a_permit_still_awaiting_signatures(
+    db: AsyncSession,
+    contour: Contour,
+    version_id: uuid.UUID,
+    leshoz: Organization,
+    apiary_activity_id: uuid.UUID,
+) -> None:
+    from app.modules.permits import service
+
+    await make_permit_on_contour(
+        db,
+        contour=contour,
+        version_id=version_id,
+        org=leshoz,
+        activity_type_id=apiary_activity_id,
+        status="pending_signatures",
+        sb_load=None,
+        quantity=Decimal("6.0000"),
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 9, 30),
+    )
+    assert await service.exclusivity_provider(
+        db, contour.id, apiary_activity_id, date(2027, 6, 1), date(2027, 7, 1)
+    ) == date(2027, 9, 30)

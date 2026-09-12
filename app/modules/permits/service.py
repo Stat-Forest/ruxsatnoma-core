@@ -113,19 +113,29 @@ ACTIVE_STATUS = "active"
 # string, at the same module boundary.
 GRAZING_ACTIVITY_CODE = "grazing"
 
-# Ruling #176 (stage 9): the two ACTIVE-only seams below
-# (`capacity_load_provider`, `exclusivity_provider`, and the pre-existing
-# `load_provider`/`occupancy_provider`) answer what `norms` needs for pricing
-# and admissibility — submission, precheck, the decision re-check. Issuance's
-# OWN gate, `_assert_contour_still_has_room`, is stricter on purpose: a
-# permit already EXISTS the moment `issue()` creates its row, in
-# `INITIAL_STATUS`, days or weeks before the fourth signature could ever make
-# it `ACTIVE_STATUS` — so a check that only counted `ACTIVE_STATUS` would let
-# `repo.lock_contour_activity`'s lock serialise two concurrent issuances
-# without either ever seeing the other's freshly written row, defeating the
-# whole point of taking it. This is the LAST gate before a legal, numbered
-# document, so it counts a competing permit from the moment it exists.
-ISSUANCE_BLOCKING_STATUSES = (INITIAL_STATUS, ACTIVE_STATUS)
+# The statuses in which a permit OCCUPIES its contour × activity slot — ONE
+# meaning for every gate and every calendar (ruling #176, sharpened 2026-09-13).
+#
+# A permit EXISTS the moment `issue()` writes its row, in `INITIAL_STATUS`,
+# and may sit there for weeks before the fourth signature makes it
+# `ACTIVE_STATUS` (ruling #99: nothing times a citizen's signature out). Stage
+# 9 gave issuance's own gate, `_assert_contour_still_has_room`, exactly this
+# pair — a check counting `ACTIVE_STATUS` alone would let `repo.
+# lock_contour_activity`'s lock serialise two concurrent issuances without
+# either ever seeing the other's freshly written row — but left the four
+# provider seams below (`occupancy_provider`, `load_provider`,
+# `capacity_load_provider`, `exclusivity_provider`) counting `ACTIVE_STATUS`
+# only. Those seams feed every EARLIER gate: submission, the pre-check, the
+# decision. So a second applicant for a slot whose first permit was issued
+# but not yet signed was approved, invoiced and PAID, then refused at
+# issuance — the manual refund ruling #176's decision-time gate exists to
+# prevent. One tuple, read everywhere, closes that: `suspended` still
+# occupies nothing (3.11a ruling 11 — not in use, `resume` puts it back),
+# `expired`/`revoked` are over, and a permit awaiting signatures is a
+# reserved slot, never a free one. `occupancy.repo` mirrors this tuple as a
+# literal (a reader takes the table, never the service) and a test pins the
+# two together.
+OCCUPYING_STATUSES = (INITIAL_STATUS, ACTIVE_STATUS)
 
 # Ruling #102: the status an extension's OWN activation moves its PARENT permit
 # out of `active` into — see `_close_parent_permit_if_extension`, the only writer
@@ -644,10 +654,9 @@ async def _assert_contour_still_has_room(
     The SAME "requested <= capacity - committed" comparison (or, with no
     capacity at all, exclusivity) `norms.checks._limit_check` makes at
     submission and `applications.decision._assert_capacity_available` remakes
-    at approval — but against THIS module's own, STRICTER accounting,
-    `ISSUANCE_BLOCKING_STATUSES`, which counts a permit from the moment it
-    EXISTS rather than only once `add_signature` makes it `ACTIVE_STATUS`
-    (that constant's own comment has the full reasoning). `norms.service.
+    at approval, over the SAME accounting — `OCCUPYING_STATUSES`, a permit
+    counted from the moment it EXISTS (that constant's own comment has the
+    full reasoning); what this gate adds is the lock. `norms.service.
     effective_norm` is the one call this needs from `norms` — on that
     module's own public surface, never `norms.repo`/`norms.calculator`
     directly (module boundary).
@@ -675,7 +684,7 @@ async def _assert_contour_still_has_room(
             activity_type_id,
             period_from,
             period_to,
-            statuses=ISSUANCE_BLOCKING_STATUSES,
+            statuses=OCCUPYING_STATUSES,
         )
         if occupied_until is not None:
             raise err(
@@ -699,7 +708,7 @@ async def _assert_contour_still_has_room(
 
     if activity_code == GRAZING_ACTIVITY_CODE:
         committed = await repo.committed_sb_load(
-            db, contour_id, period_from, period_to, statuses=ISSUANCE_BLOCKING_STATUSES
+            db, contour_id, period_from, period_to, statuses=OCCUPYING_STATUSES
         )
     else:
         committed = await repo.committed_capacity_quantity(
@@ -708,7 +717,7 @@ async def _assert_contour_still_has_room(
             activity_type_id,
             period_from,
             period_to,
-            statuses=ISSUANCE_BLOCKING_STATUSES,
+            statuses=OCCUPYING_STATUSES,
         )
     # A plain `Decimal` subtraction, deliberately NOT `calculator.
     # remaining_sb`'s `rounding_heads` floor for grazing: that rounding lives
@@ -1308,8 +1317,8 @@ async def _close_parent_permit_if_extension(
     no `parent_application_id` (unreachable through `service.extend`, guarded
     here anyway rather than trusted): nothing to close. A parent that is not
     `active` — already `expired`, `suspended` or `revoked` — is left alone
-    too: both occupancy providers count `active` and nothing else (module
-    docstring), so a non-active parent already occupies no area and needs no
+    too: the occupancy providers count `OCCUPYING_STATUSES` and nothing else,
+    so a non-active parent already occupies no area and needs no
     second closing; forcing one would also risk an illegal `PERMIT_TRANSITIONS`
     edge (`suspended -> expired` is legal, but this function has no business
     overriding a human's own suspension of the parent).
@@ -1589,11 +1598,13 @@ async def add_signature(
 # Neither takes a permission or a zone rule, like every other in-process read
 # here: the caller is another SERVICE, and the gates live on the routes above it.
 #
-# `ACTIVE_STATUS` and nothing else. A `suspended` permit is not in use, so it
-# occupies no hectare and commits no head; `expired`/`revoked` are over and
-# `pending_signatures` has not begun (C11: a permit is in force only once all
-# four signatures are on it). That single word is the whole of ruling 11, and it
-# is passed down to the repo rather than repeated there.
+# `OCCUPYING_STATUSES`, passed down to the repo rather than repeated there. A
+# `suspended` permit is not in use, so it occupies no hectare and commits no
+# head; `expired`/`revoked` are over (3.11a ruling 11). `pending_signatures`
+# has not begun (C11: a permit is in force only once all four signatures are
+# on it) — but it has been ISSUED and paid for, and the slot it names is
+# reserved, not free; see the constant's own comment for the gap counting
+# `active` alone opened.
 
 
 async def occupancy_provider(
@@ -1629,7 +1640,7 @@ async def occupancy_provider(
     if not contour_ids:
         return {}
     return await repo.occupied_area_by_contour(
-        db, contour_ids, status=ACTIVE_STATUS, as_of=business_today()
+        db, contour_ids, statuses=OCCUPYING_STATUSES, as_of=business_today()
     )
 
 
@@ -1648,7 +1659,7 @@ async def load_provider(
     PERIOD-AWARE the same way `occupancy_provider` above now is too — the two
     seams no longer disagree (ruling #176, stage 9)."""
     return await repo.committed_sb_load(
-        db, contour_id, period_from, period_to, statuses=(ACTIVE_STATUS,)
+        db, contour_id, period_from, period_to, statuses=OCCUPYING_STATUSES
     )
 
 
@@ -1668,7 +1679,7 @@ async def capacity_load_provider(
     never be summed together (`repo.committed_capacity_quantity`'s own
     docstring)."""
     return await repo.committed_capacity_quantity(
-        db, contour_id, activity_type_id, period_from, period_to, statuses=(ACTIVE_STATUS,)
+        db, contour_id, activity_type_id, period_from, period_to, statuses=OCCUPYING_STATUSES
     )
 
 
@@ -1685,7 +1696,7 @@ async def exclusivity_provider(
     the question a contour with NO capacity resolves to: not "how much room is
     left" but "is it free at all, and if not, until when"."""
     return await repo.latest_occupied_until(
-        db, contour_id, activity_type_id, period_from, period_to, statuses=(ACTIVE_STATUS,)
+        db, contour_id, activity_type_id, period_from, period_to, statuses=OCCUPYING_STATUSES
     )
 
 
@@ -1994,7 +2005,7 @@ async def public_check(
 # - `occupancy_provider(db, contour_ids) -> Mapping[uuid, Decimal]` and
 #   `load_provider(db, contour_id, period_from, period_to) -> Decimal` (Task 6)
 #   — the two seams `gis` and `norms` registered in `app/event_subscriptions.py`.
-#   Callable directly as well; both count `active` permits and nothing else.
+#   Callable directly as well; both count `OCCUPYING_STATUSES` and nothing else.
 # - `missing_signatures(db, permit_id) -> list[str]` — which required purposes
 #   still lack a valid signature, in the configured display order. A pass-through
 #   to `signatures.service` on purpose (ruling 7).
