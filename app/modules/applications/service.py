@@ -17,7 +17,7 @@ names, unchanged since branch 1."""
 
 import json
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -165,39 +165,6 @@ DOC_TYPE_CLASSIFIER_CODE = "doc_types"
 # together.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
 
-
-# A registered verifier for one benefit-category CODE — `beekeepers.service.
-# match_certificate`'s own signature (`db`, then `certificate_no`/`pinfl`/
-# `stir` keyword-only), returning something carrying a `.status` this module
-# reads. `Callable[..., Awaitable[Any]]` rather than a `Protocol` spelling
-# out the keyword-only parameters and the exact return type: pyright checks
-# a `Protocol.__call__`'s return type INVARIANTLY through `Coroutine`'s
-# covariant slot, so a real registration (`beekeepers.service.MatchResult`,
-# a dataclass this module deliberately never imports — see below) fails
-# `reportArgumentType` even though it is a plain structural match at every
-# call site. `...` also sidesteps the keyword-only-vs-positional mismatch a
-# precisely-typed `Callable[[AsyncSession, str, str | None, str | None],
-# ...]` would have with a keyword-only signature.
-#
-# **Never imported here directly.** `applications` (level 3) could import a
-# level-2 module's service directly (it already does, for `norms`/`gis`),
-# but this seam is deliberately data-driven instead, the same idiom `norms.
-# CAPACITY_LOAD_PROVIDERS`/`.EXCLUSIVITY_PROVIDERS` already use: a category
-# with no registered verifier must cost this module nothing, not even an
-# import, and a test proves the EMPTY seam without `beekeepers` existing in
-# that test process at all.
-BenefitAutoVerifier = Callable[..., Awaitable[Any]]
-
-# Ruling #181/#182: a benefit-category CODE with no registered verifier stays
-# `pending` — the leshoz's own review queue, as today. Keyed by CODE, not
-# appended like `norms.LOAD_PROVIDERS`: at most one verifier owns a given
-# category, and a second registration under the same code would silently
-# shadow the first rather than summing two answers the way a load does.
-# Starts EMPTY; `app/event_subscriptions.py` is the one place that fills it
-# (`beekeeping_union_member -> beekeepers.service.match_certificate`), the
-# same idiom `_register_providers` already uses for `CAPACITY_LOAD_
-# PROVIDERS`/`EXCLUSIVITY_PROVIDERS`.
-BENEFIT_AUTO_VERIFIERS: dict[str, BenefitAutoVerifier] = {}
 
 # tz/05's transition table (plan 03.9a task 8, the brief's own copy). All
 # fourteen `APPLICATION_STATUSES` are keys; `ARCHIVED` is terminal. No status
@@ -1643,37 +1610,17 @@ async def _open_benefit_verification(db: AsyncSession, application: Application)
     at all; the branch reading it is DELETED, not merely skipped** — the
     number is universal, so there is nothing left for that property to gate.
 
-    **The seam, ruling #182.** A category with a registered
-    `BENEFIT_AUTO_VERIFIERS` entry (keyed by the classifier item's own
-    `code`) is checked automatically against whatever register that verifier
-    speaks for — today, `beekeeping_union_member` against the Beekeeping
-    Union's own register, wired from `app/event_subscriptions.py`, never
-    imported here directly (see `BenefitAutoVerifier`'s own docstring for
-    why). `matched` verifies the claim ON THE SPOT — `benefit_verified_by =
-    NULL` means "the register", ruling #182's own words, distinct from a
-    human verifier's real id. `unknown`/`not_yours` refuse the SUBMISSION
-    itself (422 `ERR-APP-003`): a number that is not provably the applicant's
-    own is not evidence, and letting the filing through `pending` would ask
-    the leshoz to re-decide what the register already answered. A category
-    with NO registered verifier — every #181 recreation category today —
-    stays `pending`, exactly as before: the leshoz's own review queue.
-
-    **Identity for the auto-verifier is read off the SAME `Applicant` row
-    `submit`'s other steps already use** (`auth_service.get_applicant`), not
-    branched on `on_behalf`: an `individual` applicant (`on_behalf="self"`)
-    carries `pinfl` and no `stir`, a `legal` one (`on_behalf="legal"`) the
-    reverse (`identity_by_kind`, `auth/models.py`), so passing both straight
-    through and letting the verifier's own "PINFL when given, else STIR" rule
-    pick is the SAME split ruling #182 asks for, with no second conditional
-    to drift from the CHECK that already enforces it.
-
-    Integration finding, stage 9 wave 2 — and the exact shape this project's
-    defects keep taking. T9 added the five columns and the verifier's whole
-    workplace, T6 made issuance refuse a `pending` claim, and both were green:
-    nothing ever SET `pending`. Every benefit claim would have sailed past the
-    office built to check it, with the certificate number never asked for, and
-    the only visible symptom would have been a verifier's empty list — which
-    reads exactly like a quiet week.
+    **No automatic verdict, ruling #206 (2026-09-13; supersedes the
+    register-at-filing half of #182).** Every claim that carries a number
+    opens `pending` — the leshoz's own review queue — whatever the category.
+    The Beekeeping Union's register (`beekeepers`) is still maintained by
+    the registrar and is what the leshoz consults for a `beekeeping_union_
+    member` claim, but the system no longer refuses a FILING over it: an
+    unknown or someone else's number is a question for the reviewer, not a
+    wall in front of the applicant. The seam that used to hold that check
+    (`BENEFIT_AUTO_VERIFIERS`, wired from `app/event_subscriptions.py`) is
+    DELETED, not left empty — an empty seam reads like a check that could be
+    on, and this project's defects hide rather than leak.
 
     Fail-closed on the unconfigurable case: a claim whose classifier item
     cannot be read is refused, not waved through as `not_required`. The
@@ -1690,33 +1637,13 @@ async def _open_benefit_verification(db: AsyncSession, application: Application)
     if not (application.benefit_certificate_no or "").strip():
         raise err("ERR-APP-003", details={"reason": "benefit_certificate_required"})
 
-    verifier = BENEFIT_AUTO_VERIFIERS.get(item.code)
-    if verifier is None:
-        # A RESUBMISSION must not silently keep a verdict made about the
-        # previous attempt: the applicant may have changed the number since
-        # it was rejected.
-        application.benefit_verification_status = "pending"
-        application.benefit_verified_by = None
-        application.benefit_verified_at = None
-        application.benefit_rejection_reason = None
-        return
-
-    applicant = await auth_service.get_applicant(db, application.applicant_id)
-    result = await verifier(
-        db,
-        certificate_no=(application.benefit_certificate_no or "").strip(),
-        pinfl=applicant.pinfl if applicant is not None else None,
-        stir=applicant.stir if applicant is not None else None,
-    )
-    if result.status == "matched":
-        application.benefit_verification_status = "verified"
-        application.benefit_verified_by = None
-        application.benefit_verified_at = datetime.now(UTC)
-        application.benefit_rejection_reason = None
-    elif result.status == "unknown":
-        raise err("ERR-APP-003", details={"reason": "benefit_certificate_unknown"})
-    else:  # "not_yours"
-        raise err("ERR-APP-003", details={"reason": "benefit_certificate_not_yours"})
+    # A RESUBMISSION must not silently keep a verdict made about the
+    # previous attempt: the applicant may have changed the number since it
+    # was rejected.
+    application.benefit_verification_status = "pending"
+    application.benefit_verified_by = None
+    application.benefit_verified_at = None
+    application.benefit_rejection_reason = None
 
 
 async def _published_version_or_refuse(db: AsyncSession, application: Application) -> Any:

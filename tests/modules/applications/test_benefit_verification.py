@@ -7,12 +7,13 @@ benefit type -> `/submit` -> `/start-review` -> `/verify`|`/reject` — never by
 stamping `benefit_verification_status` on the row directly (lesson: build a
 fixture's precondition through the real transition). `benefit_categories` is
 no longer empty (ruling #181, migration `0053`), so this file uses the REAL
-seven seeded categories — `beekeeping_union_member` for the wired seam,
-`conftest.py`'s own `benefit_category_item_id` (a fresh, unrelated code with
-no registered auto-verifier) for the pending/leshoz-review path.
+seven seeded categories. Ruling #206 (2026-09-13) removed the automatic
+register check at filing: every numbered claim, `beekeeping_union_member`
+included, opens `pending` for the leshoz — the last three tests pin that.
 """
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -29,7 +30,6 @@ from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User
 from app.modules.beekeepers import service as beekeepers_service
 from app.modules.beekeepers.schemas import BeekeeperCreateIn
-from tests.modules.applications.conftest import unique_pinfl
 from tests.modules.applications.test_submit import _submit, _submit_with_button, _upload
 
 API = "/api/v1"
@@ -393,25 +393,22 @@ async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_ve
 
 # --- ruling #182: the wired seam, real register, three outcomes ---------------
 #
-# The refusal tests below file with the BUTTON (`_submit_with_button`): an ERI
-# filing prices at `POST /applications/package` first, and a claim that is
-# not in the tariff's modifiers is refused there — before `file()`'s step 3b
-# could ever answer. The button path reaches step 3b directly.
+# The tests below file with the BUTTON (`_submit_with_button`) where they need
+# to reach step 3b directly: an ERI filing prices at `POST /applications/
+# package` first, and a claim not in the tariff's modifiers is refused there.
 
 
-async def test_the_wired_seam_empty_for_every_other_category(
+async def test_every_category_opens_pending_whatever_the_number(
     applicant_client,
     recreation_filing_ready_for_submission: dict[str, Any],
     preschool_children_item_id: uuid.UUID,
     preschool_children_priced: None,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
-    """`BENEFIT_AUTO_VERIFIERS` holds exactly one entry (`beekeeping_union_
-    member`); every other REAL #181 category — `preschool_children` here —
-    genuinely reaches SUBMITTED and falls through to the leshoz's own
-    `pending` queue, restated as this file's own negative control against
-    the wired seam specifically: a category that is not `beekeeping_union_
-    member` must never be auto-verified, whatever it prices to."""
+    """Ruling #206: a claim with a number reaches SUBMITTED and opens the
+    leshoz's own `pending` review — no register is consulted at filing for
+    ANY category, `preschool_children` here being the one that prices on a
+    seeded recreation tariff and therefore genuinely gets to SUBMITTED."""
     filing = await _claim_and_prove(
         applicant_client,
         recreation_filing_ready_for_submission,
@@ -424,17 +421,19 @@ async def test_the_wired_seam_empty_for_every_other_category(
     assert submitted.json()["benefit_verification_status"] == "pending"
 
 
-async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
+async def test_an_unregistered_beekeeper_number_is_not_refused_at_filing(
     db: AsyncSession,
     applicant_client,
     filing_ready_for_submission,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
-    """The REAL `beekeeping_union_member` category (migration `0053`) and the
-    REAL `beekeepers.service.match_certificate` (wired from `app/
-    event_subscriptions.py`, active in every test process — `register_event_
-    subscriptions()` runs autouse) against a certificate number nobody has
-    ever registered: `unknown`."""
+    """Ruling #206 supersedes #182's `benefit_certificate_unknown`: the REAL
+    `beekeeping_union_member` category with a number nobody has registered
+    passes step 3b. The filing still ends 422 downstream (no seeded apiary
+    tariff carries the modifier for a GRAZING filing, as every other "past
+    step 3b" test in this file) — the assertion is that the refusal is NOT
+    `ERR-APP-003`, i.e. the register no longer stands in the way; the
+    committed `pending` state is proven in-process below."""
     item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
     filing = await _claim_and_prove(
         applicant_client,
@@ -446,110 +445,21 @@ async def test_the_wired_seam_refuses_an_unregistered_certificate_number(
 
     result = await _submit_with_button(applicant_client, filing)
     assert result.status_code == 422, result.text
-    error = result.json()["error"]
-    assert error["code"] == "ERR-APP-003"
-    assert error["details"]["reason"] == "benefit_certificate_unknown"
+    assert result.json()["error"]["code"] != "ERR-APP-003"
 
 
-async def test_the_wired_seam_refuses_someone_elses_certificate_number(
-    db: AsyncSession,
-    applicant_client,
-    filing_ready_for_submission,
-    benefit_doc_type_item_id: uuid.UUID,
-    hodim_user: User,
-) -> None:
-    """A REAL, ACTIVE `beekeepers` row — seeded through `beekeepers.service.
-    create_beekeeper`, never a stub — under a PINFL that is NOT the
-    applicant's own: `not_yours`."""
-    item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
-    certificate_no = f"BEE-{uuid.uuid4().hex[:10]}"
-    await beekeepers_service.create_beekeeper(
-        db,
-        data=BeekeeperCreateIn(
-            certificate_no=certificate_no,
-            pinfl=unique_pinfl(),
-            passport_series="AB",
-            passport_number="1234567",
-            full_name="Someone Else",
-        ),
-        actor=hodim_user,
-    )
-    await db.commit()
-
-    filing = await _claim_and_prove(
-        applicant_client,
-        filing_ready_for_submission,
-        benefit_category_item_id=item_id,
-        benefit_doc_type_item_id=benefit_doc_type_item_id,
-        certificate_no=certificate_no,
-    )
-
-    result = await _submit_with_button(applicant_client, filing)
-    assert result.status_code == 422, result.text
-    error = result.json()["error"]
-    assert error["code"] == "ERR-APP-003"
-    assert error["details"]["reason"] == "benefit_certificate_not_yours"
-
-
-async def test_the_wired_seam_matched_passes_step_3b(
-    db: AsyncSession,
-    applicant_client,
-    filing_ready_for_submission,
-    benefit_doc_type_item_id: uuid.UUID,
-    hodim_user: User,
-) -> None:
-    """A REAL, ACTIVE `beekeepers` row under the APPLICANT's OWN PINFL: the
-    claim is `matched` and step 3b passes it through — the submission still
-    ends 422 downstream (no seeded apiary tariff carries a `beekeeping_
-    union_member` modifier for a GRAZING filing, the same reason every other
-    "past step 3b" test in this file ends 422), which is exactly why the
-    committed STATE of a matched claim is proven separately, in-process,
-    below (`test_the_wired_seam_matched_verifies_the_claim_on_the_spot`) —
-    the pricing failure rolls the whole transaction back before this route
-    ever gets to observe the row it set."""
-    item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
-    pinfl = (await applicant_client.get(f"{API}/auth/me")).json()["applicant"]["pinfl"]
-    certificate_no = f"BEE-{uuid.uuid4().hex[:10]}"
-    await beekeepers_service.create_beekeeper(
-        db,
-        data=BeekeeperCreateIn(
-            certificate_no=certificate_no,
-            pinfl=pinfl,
-            passport_series="AB",
-            passport_number="1234567",
-            full_name="The Applicant",
-        ),
-        actor=hodim_user,
-    )
-    await db.commit()
-
-    filing = await _claim_and_prove(
-        applicant_client,
-        filing_ready_for_submission,
-        benefit_category_item_id=item_id,
-        benefit_doc_type_item_id=benefit_doc_type_item_id,
-        certificate_no=certificate_no,
-    )
-
-    result = await _submit_with_button(applicant_client, filing)
-    assert result.status_code == 422, result.text
-    body = result.json()
-    assert body["error"]["code"] != "ERR-APP-003"
-
-
-async def test_the_wired_seam_matched_verifies_the_claim_on_the_spot(
+async def test_a_registered_beekeeper_number_still_opens_pending_not_verified(
     db: AsyncSession,
     applicant,
     submitted_application: str,
     hodim_user: User,
 ) -> None:
-    """In-process, so the committed COLUMNS can be asserted directly — the
-    HTTP test above cannot, because the same request's downstream pricing
-    failure rolls the whole transaction back. `service._open_benefit_
-    verification` is called exactly as `submit`'s own step 3b calls it, over
-    the REAL registered verifier (`register_event_subscriptions()` runs
-    autouse, so `BENEFIT_AUTO_VERIFIERS["beekeeping_union_member"]` already
-    IS `beekeepers.service.match_certificate` here, no stub)."""
+    """In-process, so the committed COLUMNS can be asserted directly. A REAL,
+    ACTIVE `beekeepers` row under the applicant's OWN PINFL — the exact
+    input #182 used to auto-verify on the spot — now opens `pending` like
+    any other claim: ruling #206 removed the automatic verdict in BOTH
+    directions, no refusal and no green, and a stale verdict from a previous
+    attempt is wiped."""
     assert applicant.pinfl is not None
     item_id = await _benefit_category_item_id(db, "beekeeping_union_member")
     certificate_no = f"BEE-{uuid.uuid4().hex[:10]}"
@@ -570,13 +480,15 @@ async def test_the_wired_seam_matched_verifies_the_claim_on_the_spot(
     assert application is not None
     application.benefit_category_item_id = item_id
     application.benefit_certificate_no = certificate_no
+    application.benefit_verification_status = "rejected"
+    application.benefit_verified_by = hodim_user.id
+    application.benefit_verified_at = datetime.now(UTC)
+    application.benefit_rejection_reason = "previous attempt"
     await db.flush()
 
     await service._open_benefit_verification(db, application)
 
-    assert application.benefit_verification_status == "verified"
-    assert application.benefit_verified_by is None, (
-        "ruling #182: NULL means the register, not a human"
-    )
-    assert application.benefit_verified_at is not None
+    assert application.benefit_verification_status == "pending"
+    assert application.benefit_verified_by is None
+    assert application.benefit_verified_at is None
     assert application.benefit_rejection_reason is None
