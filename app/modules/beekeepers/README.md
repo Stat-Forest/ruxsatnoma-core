@@ -41,11 +41,14 @@ stale match); the certificate number is trimmed and case-folded before
 comparison; identity is PINFL when given, else STIR (ruling #182 option а —
 the caller picks which one to pass by the application's `on_behalf`).
 
-`applications` (wave 2 of this stage) is expected to register this function
-under `beekeeping_union_member` in its own `BENEFIT_AUTO_VERIFIERS` dict,
-wired from `app/event_subscriptions.py` — never imported directly by a
-router, the same seam shape `gis.OCCUPANCY_PROVIDERS`/`norms.LOAD_PROVIDERS`
-already use.
+**Nobody calls this at filing any more — ruling #206 (2026-09-13).** Stage 10
+wired it into `applications.BENEFIT_AUTO_VERIFIERS` so that an unknown or
+someone else's number refused the submission (`benefit_certificate_unknown` /
+`_not_yours`) and a match verified the claim on the spot; #206 removed both
+directions — every numbered claim opens `pending` for the leshoz, and the
+seam is deleted rather than left empty. The function stays as the register's
+own query (its tests live in `tests/modules/beekeepers/`), ready for a
+reviewer-side lookup on the application card if one is ever asked for.
 
 ## Data (migration `0053`)
 

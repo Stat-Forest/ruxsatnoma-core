@@ -147,9 +147,9 @@ async def recreation_activity_id(db: AsyncSession) -> uuid.UUID:
 
 @pytest.fixture
 async def preschool_children_item_id(db: AsyncSession) -> uuid.UUID:
-    """A REAL #181 benefit category (migration `0053`) with NO registered
-    auto-verifier — `BENEFIT_AUTO_VERIFIERS` holds `beekeeping_union_member`
-    alone, so this one stays the leshoz's own `pending` review.
+    """A REAL #181 benefit category (migration `0053`) that prices on the
+    seeded recreation tariff, so a claim on it genuinely reaches SUBMITTED
+    and the leshoz's own `pending` review (ruling #206: every claim does).
 
     Deliberately NOT an invented code (`benefit_category_item_id` below):
     since #181, `_open_benefit_verification`'s certificate check is no
