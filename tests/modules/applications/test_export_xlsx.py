@@ -131,13 +131,27 @@ async def test_the_file_and_the_list_agree_for_a_republic_wide_reader(
     submitted_application: str, prosecutor_client
 ) -> None:
     """The prosecutor's zone is the whole republic: the file holds the same
-    ids the list does — neither wider (ruling #98) nor narrower."""
-    listed = await prosecutor_client.get("/api/v1/applications", params={"page_size": 100})
+    ids the list does — neither wider (ruling #98) nor narrower.
+
+    The list is read to its END, not as one page of 100: nothing rolls a test
+    back (`tests/conftest.py`), so this worker's database holds every
+    application the module's earlier tests filed, and once they pass a hundred
+    a single page is a strict subset of the file (CI, 2026-09-13)."""
+    listed_ids: set[str] = set()
+    page = 1
+    while True:
+        listed = await prosecutor_client.get(
+            "/api/v1/applications", params={"page": page, "page_size": 100}
+        )
+        assert listed.status_code == 200, listed.text
+        body = listed.json()
+        listed_ids |= {row["id"] for row in body["items"]}
+        if page * 100 >= body["total"]:
+            break
+        page += 1
     resp = await prosecutor_client.get(EXPORT)
-    assert resp.status_code == listed.status_code == 200
-    assert {row[-1] for row in _data_rows(resp.content)} == {
-        row["id"] for row in listed.json()["items"]
-    }
+    assert resp.status_code == 200
+    assert {row[-1] for row in _data_rows(resp.content)} == listed_ids
 
 
 async def test_an_unknown_language_is_refused(hodim_client) -> None:
