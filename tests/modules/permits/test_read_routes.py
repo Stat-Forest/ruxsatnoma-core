@@ -624,3 +624,22 @@ async def test_permit_card_and_list_agree_on_who_the_holder_is(
     assert total == 1
     assert [row.id for row in items] == [issued_permit.id]
     assert issued_permit.application_id == paid_application.id
+
+
+async def test_q_finds_a_permit_by_the_holders_name_and_by_its_printed_number(
+    zone_staff_client: httpx.AsyncClient, issued_permit: Permit
+):
+    """`q` is the one free-text filter the register has (the former `/search`
+    screen folded into it): a substring of the holder's name, case-insensitive,
+    or of the printed `"<series> № <000000>"` — and nothing for a stranger's
+    name."""
+    by_name = await zone_staff_client.get(f"{API}/permits", params={"q": "азизов"})
+    assert by_name.status_code == 200, by_name.text
+    assert [row["id"] for row in by_name.json()["items"]] == [str(issued_permit.id)]
+
+    printed = f"{issued_permit.series} № {issued_permit.number:06d}"
+    by_number = await zone_staff_client.get(f"{API}/permits", params={"q": printed})
+    assert [row["id"] for row in by_number.json()["items"]] == [str(issued_permit.id)]
+
+    nobody = await zone_staff_client.get(f"{API}/permits", params={"q": "Каримов"})
+    assert nobody.json()["total"] == 0

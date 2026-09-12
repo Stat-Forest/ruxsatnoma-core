@@ -1125,6 +1125,7 @@ async def list_applications(
     contour_id: uuid.UUID | None = None,
     applicant_id: uuid.UUID | None = None,
     number: str | None = None,
+    q: str | None = None,
     period_from: date | None = None,
     period_to: date | None = None,
 ) -> tuple[list[Application], int]:
@@ -1189,6 +1190,7 @@ async def list_applications(
         contour_id=contour_id,
         applicant_id=applicant_id,
         number=number,
+        q=q,
         period_from=period_from,
         period_to=period_to,
         offset=params.offset,

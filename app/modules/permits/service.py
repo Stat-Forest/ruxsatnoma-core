@@ -3001,6 +3001,7 @@ async def list_permits(
     organization_id: uuid.UUID | None = None,
     series: str | None = None,
     number: int | None = None,
+    q: str | None = None,
 ) -> tuple[list[Permit], int]:
     """`GET /permits` — one page of the permits `actor` may see, plus the total.
 
@@ -3059,6 +3060,7 @@ async def list_permits(
         organization_id=organization_id,
         series=series,
         number=number,
+        q=q,
         offset=params.offset,
         limit=params.page_size,
     )

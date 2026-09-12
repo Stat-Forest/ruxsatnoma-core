@@ -140,6 +140,7 @@ async def list_permits(
     organization_id: uuid.UUID | None = None,
     series: Annotated[str | None, Query(max_length=service.SERIES_MAX_LENGTH)] = None,
     number: Annotated[int | None, Query(ge=1, le=service.MAX_PERMIT_NUMBER)] = None,
+    q: Annotated[str | None, Query(max_length=200)] = None,
 ) -> Page[PermitOut]:
     """The permits this caller may see: their own, or — holding
     `permits.view_any` — their zone's.
@@ -165,6 +166,7 @@ async def list_permits(
         organization_id=organization_id,
         series=series,
         number=number,
+        q=q,
     )
     return Page[PermitOut](
         items=[PermitOut.model_validate(item) for item in items],
