@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store
 from app.core.errors import err
+from app.core.models import MediaFile
 from app.db import uuid7
 
 # `Organization` (region_id/district_id) is read-only here, for the zone JOIN
@@ -1040,3 +1041,35 @@ async def features_intersecting(
         )
     )
     return list(rows.all())
+
+
+async def contour_numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Stage 13 (ruling #204): numbers for a batch of contours in ONE query.
+    Not `contour_numbers` above — that one answers an organization's whole
+    set and has a different question."""
+    if not ids:
+        return {}
+    rows = await db.execute(select(Contour.id, Contour.number).where(Contour.id.in_(ids)))
+    return {row.id: row.number for row in rows}
+
+
+async def contour_identity_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, Any]:
+    """Stage 13 export: `kind`, `layer_id`, `parent_id`, `created_at` for a
+    batch of contours the caller ALREADY holds (the list route returned them,
+    so nothing here widens a scope). One query; `{}` for an empty set."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(
+            Contour.id, Contour.kind, Contour.layer_id, Contour.parent_id, Contour.created_at
+        ).where(Contour.id.in_(ids))
+    )
+    return {row.id: row for row in rows.all()}
+
+
+async def media_filenames(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Stage 13 export: the stored filename of each import batch's source file."""
+    if not ids:
+        return {}
+    rows = await db.execute(select(MediaFile.id, MediaFile.filename).where(MediaFile.id.in_(ids)))
+    return {row.id: row.filename for row in rows.all()}

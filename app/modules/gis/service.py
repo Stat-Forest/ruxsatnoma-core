@@ -1933,3 +1933,10 @@ async def public_features(
     return await repo.features_geojson(
         db, layer_code=code, bbox=parsed_bbox, valid_on=None, status="published", import_id=None
     )
+
+
+async def contour_numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Stage 13 (ruling #204): `contour_number` for a batch — identity only,
+    one query, `{}` for an empty set. The register exports print a contour
+    by its number and must not pay a query per row for it."""
+    return await repo.contour_numbers_by_ids(db, ids)

@@ -767,6 +767,45 @@ async def issued_permit(
 
 
 @pytest.fixture
+async def other_zone_paid_application(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    other_leshoz: Organization,
+    approval_doc: MediaFile,
+    grazing_activity_id: uuid.UUID,
+) -> Application:
+    """`paid_application`'s twin in a DIFFERENT leshoz — stage 13's export
+    tests need a permit a zone-scoped caller must NOT see, built the same way
+    every other fixture here is (never a permit inserted with a hand-picked
+    `organization_id`)."""
+    return await make_paid_application(
+        db,
+        layer=contours_layer,
+        org=other_leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=grazing_activity_id,
+    )
+
+
+@pytest.fixture
+async def other_zone_issued_permit(
+    db: AsyncSession,
+    other_zone_paid_application: Application,
+    other_zone_hodim_client: httpx.AsyncClient,
+) -> Permit:
+    """A permit in `other_leshoz`, issued through the real route by a
+    `permits.issue` holder zoned there — the export's zone-hiding test's
+    "row a scoped caller must not see" (stage 13)."""
+    result = await other_zone_hodim_client.post(
+        f"/api/v1/applications/{other_zone_paid_application.id}/permit"
+    )
+    assert result.status_code == 201, result.text
+    permit = await service.for_application(db, other_zone_paid_application.id)
+    assert permit is not None
+    return permit
+
+
+@pytest.fixture
 async def permit_pdf(db: AsyncSession, issued_permit: Permit) -> bytes:
     """The stored bytes every signature is taken over — read back from storage,
     never re-rendered (ruling 3: there is only ever one document)."""

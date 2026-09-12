@@ -179,3 +179,47 @@ async def test_the_head_still_reads_the_register_through_payments_confirm(
     response = await head_client.get(REFUNDS)
 
     assert response.status_code == 200, response.text
+
+
+async def test_the_owners_refund_export_blanks_what_their_screen_blanks(
+    owner_client: httpx.AsyncClient,
+    head_client: httpx.AsyncClient,
+    refund_application: Application,
+    paid_refund_invoice: Invoice,
+    rf01: uuid.UUID,
+) -> None:
+    """Stage 13 on top of stage 11: the citizen's file is their list on
+    paper — their own row, the accountant's hint blanked; the head's file of
+    the same row carries the hint. A file that showed the citizen a figure
+    their screen hides would be the leaking twin of this project's usual
+    hiding defect."""
+    import io
+
+    from openpyxl import load_workbook
+
+    refund_id = await _file(owner_client, refund_application.id, rf01)
+
+    def sheet_rows(content: bytes) -> dict[str, dict[str, object]]:
+        sheet = load_workbook(io.BytesIO(content)).active
+        assert sheet is not None
+        headers = [str(c.value) for c in sheet[1]]
+        return {
+            str(row[-1]): dict(zip(headers, (c for c in row), strict=True))
+            for row in sheet.iter_rows(min_row=2, values_only=True)
+        }
+
+    mine = await owner_client.get(f"{REFUNDS}/export.xlsx", params={"lang": "ru"})
+    assert mine.status_code == 200, mine.text
+    listed = {item["id"] for item in (await owner_client.get(REFUNDS)).json()["items"]}
+    rows = sheet_rows(mine.content)
+    assert set(rows) == listed and refund_id in rows
+    assert rows[refund_id]["Рекомендовано"] is None
+
+    theirs = await head_client.get(
+        f"{REFUNDS}/export.xlsx",
+        params={"lang": "ru", "application_id": str(refund_application.id)},
+    )
+    assert theirs.status_code == 200, theirs.text
+    staff_rows = sheet_rows(theirs.content)
+    assert refund_id in staff_rows
+    assert staff_rows[refund_id]["Рекомендовано"] is not None  # the hint, computed at filing

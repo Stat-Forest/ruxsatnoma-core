@@ -551,3 +551,19 @@ async def update_setting(db: AsyncSession, *, key: str, raw_value: Any, actor: U
         description=spec.description,
         overridden=True,
     )
+
+
+# --- Stage 13 (ruling #204): batch name readers for the register exports ------
+
+
+async def organization_names(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Names for a batch of organizations, one query; `{}` for an empty set."""
+    return await repo.organization_names(db, ids)
+
+
+async def activity_type_names(db: AsyncSession) -> dict[uuid.UUID, dict[str, Any]]:
+    """The whole catalogue (a handful of rows) keyed by id — one read beats a
+    filtered one, and every export prints the same few names."""
+    return {row.id: dict(row.name) for row in await repo.list_activity_types(db)}

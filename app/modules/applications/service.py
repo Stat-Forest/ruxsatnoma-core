@@ -3806,3 +3806,18 @@ async def open_work_provider_for_org(
     if not ids:
         return None
     return admin_open_work.OpenWork(kind="applications", count=len(ids), ids=list(ids))
+
+
+# --- Stage 13 (ruling #204): batch readers for other modules' exports ---------
+# A permit's or an invoice's export prints the application's number and
+# names its applicant; these answer a batch in one query each. Identity
+# only — no status, no scope: the caller already holds rows that name these
+# applications, so nothing here widens what it may see.
+
+
+async def numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str | None]:
+    return await repo.numbers_by_ids(db, ids)
+
+
+async def applicants_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, uuid.UUID]:
+    return await repo.applicants_by_ids(db, ids)

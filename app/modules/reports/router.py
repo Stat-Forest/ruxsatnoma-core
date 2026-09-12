@@ -8,12 +8,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import files
+from app.core import files, xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.auth.deps import require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.reports import service
+from app.modules.reports import export, service
 from app.modules.reports.models import REPORT_STATUSES
 from app.modules.reports.permissions import (
     REPORTS_ACCEPT,
@@ -73,6 +74,23 @@ async def list_forms(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/forms/export.xlsx")
+async def export_report_forms_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _user: Annotated[User, Depends(require_permission(REPORTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    status: Annotated[str | None, Query()] = None,
+) -> Response:
+    """`GET /reports/forms` as a spreadsheet (stage 13, ruling #204).
+    Declared before `/forms/{form_id}` on purpose — a UUID path parser
+    would otherwise answer this literal path with a worse error than a 404."""
+    items, total, cap = await export.form_rows(db, lang=lang, status=status)
+    filename = f"hisobot-shakllari-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_forms(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 
@@ -147,6 +165,32 @@ async def list_reports(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/export.xlsx")
+async def export_reports_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_permission(REPORTS_VIEW))],
+    lang: xlsx.Lang = "uz_latn",
+    organization_id: Annotated[uuid.UUID | None, Query()] = None,
+    status: Annotated[str | None, Query()] = None,
+    form_id: Annotated[uuid.UUID | None, Query()] = None,
+) -> Response:
+    """`GET /reports` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same zone (ruling R2: `service.list_reports`, the exact
+    function the list route calls), every matching row up to the configured
+    cap. Declared before `/{report_id}` on purpose — a UUID path parser
+    would otherwise answer this literal path with a worse error than a 404.
+    `GET /{report_id}/export.xlsx` (the per-report data export) is untouched."""
+    if status is not None and status not in REPORT_STATUSES:
+        status = None  # mirrors list_reports' own "an unknown status filters to nothing usable"
+    items, total, cap = await export.report_rows(
+        db, actor=user, lang=lang, organization_id=organization_id, status=status, form_id=form_id
+    )
+    filename = f"hisobotlar-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render_reports(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 

@@ -32,14 +32,16 @@ see of it, blanking the accountant's working fields for a non-staff reader."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.schemas import PAGING_MAX, Page
+from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
-from app.modules.payments import backoffice_service
+from app.modules.payments import backoffice_service, export
 from app.modules.payments import service as payments_service
 from app.modules.payments.backoffice_schemas import (
     RefundApproveIn,
@@ -179,6 +181,28 @@ async def approve_refund(
     out = RefundOut.model_validate(approved.refund)
     out.components = await backoffice_service.refund_components_out(db, approved.refund)
     return out
+
+
+@router.get("/refunds/export.xlsx")
+async def export_refunds_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    application_id: uuid.UUID | None = None,
+    status: Annotated[str | None, Query(pattern=_STATUS_PATTERN)] = None,
+) -> Response:
+    """`GET /refunds` as a spreadsheet (stage 13, ruling #204): the same
+    reader set as the list (staff see their zone, a citizen their own rows
+    with the accountant's fields blanked — stage 11, ruling R3), the same
+    `application_id`/`?status=` filters, every matching row up to the cap.
+    Declared BEFORE `/refunds/{refund_id}` on purpose — `export.xlsx` is
+    not a UUID, and the two share the same path-segment count."""
+    items, total, cap = await export.refund_rows(
+        db, actor=actor, lang=lang, application_id=application_id, status=status
+    )
+    filename = f"qaytarishlar-{business_today().isoformat()}.xlsx"
+    rendered = export.render_refunds(items, lang=lang)
+    return xlsx.xlsx_response(rendered, filename=filename, total=total, cap=cap)
 
 
 @router.get("/refunds/{refund_id}", response_model=RefundOut)

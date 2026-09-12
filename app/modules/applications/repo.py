@@ -761,3 +761,24 @@ async def set_benefit_verification(
     application.benefit_rejection_reason = rejection_reason
     await db.flush()
     await db.refresh(application)
+
+
+# --- Stage 13 (ruling #204): batch readers for other modules' exports ---------
+
+
+async def numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str | None]:
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Application.id, Application.number).where(Application.id.in_(ids))
+    )
+    return {row.id: row.number for row in rows}
+
+
+async def applicants_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, uuid.UUID]:
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Application.id, Application.applicant_id).where(Application.id.in_(ids))
+    )
+    return {row.id: row.applicant_id for row in rows}

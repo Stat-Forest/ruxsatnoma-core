@@ -32,11 +32,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import xlsx
 from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.applications import decision as service_decision
-from app.modules.applications import service
+from app.modules.applications import export, service
 from app.modules.applications.permissions import (
     APPLICATIONS_ASSIGN,
     APPLICATIONS_CREATE,
@@ -233,6 +235,46 @@ async def list_applications(
         total=total,
         page=params.page,
         page_size=params.page_size,
+    )
+
+
+@router.get("/applications/export.xlsx")
+async def export_applications_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    status: ApplicationStatus | None = None,
+    activity_type_id: uuid.UUID | None = None,
+    contour_id: uuid.UUID | None = None,
+    applicant_id: uuid.UUID | None = None,
+    number: Annotated[str | None, Query(max_length=NUMBER_MAX_LENGTH)] = None,
+    period_from: date | None = None,
+    period_to: date | None = None,
+) -> Response:
+    """`GET /applications` as a spreadsheet (stage 13, ruling #204): the same
+    filters, the same scope through the same service call, every matching
+    row up to `register_export_max_rows` — past it the file is cut and the
+    `X-Export-*` headers say so.
+
+    Declared BEFORE `/applications/{application_id}` on purpose: FastAPI
+    matches in declaration order, and after the card route this path would
+    be a 422 from the UUID parser rather than an export.
+    """
+    items, total, cap = await export.rows(
+        db,
+        actor=user,
+        lang=lang,
+        status=status,
+        activity_type_id=activity_type_id,
+        contour_id=contour_id,
+        applicant_id=applicant_id,
+        number=number,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    filename = f"{export.FILENAME_STEM}-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        export.render(items, lang=lang), filename=filename, total=total, cap=cap
     )
 
 

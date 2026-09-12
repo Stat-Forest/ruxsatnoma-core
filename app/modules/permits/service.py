@@ -3255,3 +3255,13 @@ async def list_rating_comments(
         limit=params.page_size,
     )
     return [dict(row._mapping) for row in rows], total
+
+
+async def permit_numbers_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Stage 13 (ruling #204): the display number (`_permit_number`, the one
+    formatter the document and every notification print) for a batch of
+    permits another module's export names — one query, `{}` for an empty
+    set. Identity only: the caller already holds rows that name these
+    permits, so nothing here widens what it may see."""
+    found = await repo.series_and_numbers_by_ids(db, ids)
+    return {pid: _permit_number(series, number) for pid, (series, number) in found.items()}

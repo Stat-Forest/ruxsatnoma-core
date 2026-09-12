@@ -874,6 +874,10 @@ async def rating_comments(
     total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
     rows = await db.execute(
         select(
+            # The rating's OWN id — for the stage-13 export's mandatory last
+            # column (ruling R4). It names nobody: `RatingCommentRow` has no
+            # `id` field, so the feed's JSON stays exactly as ruling #141 left it.
+            PermitRating.id,
             PermitRating.created_at,
             PermitRating.score,
             PermitRating.comment,
@@ -890,3 +894,16 @@ async def rating_comments(
         .limit(limit)
     )
     return rows.all(), total
+
+
+async def series_and_numbers_by_ids(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, tuple[str, int]]:
+    """Stage 13 export seam: `(series, number)` for a batch of permits in ONE
+    query; `{}` for an empty set. Identity only — no status, no scope."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Permit.id, Permit.series, Permit.number).where(Permit.id.in_(ids))
+    )
+    return {row.id: (row.series, row.number) for row in rows}
