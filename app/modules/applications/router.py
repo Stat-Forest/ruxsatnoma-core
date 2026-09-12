@@ -204,6 +204,7 @@ async def list_applications(
     contour_id: uuid.UUID | None = None,
     applicant_id: uuid.UUID | None = None,
     number: Annotated[str | None, Query(max_length=NUMBER_MAX_LENGTH)] = None,
+    q: Annotated[str | None, Query(max_length=200)] = None,
     period_from: date | None = None,
     period_to: date | None = None,
 ) -> Page[ApplicationOut]:
@@ -227,6 +228,7 @@ async def list_applications(
         contour_id=contour_id,
         applicant_id=applicant_id,
         number=number,
+        q=q,
         period_from=period_from,
         period_to=period_to,
     )

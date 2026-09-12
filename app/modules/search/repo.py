@@ -4,7 +4,7 @@ mandatory `scope` predicate the SERVICE built from `abac.zone_filter` — this
 file never decides who may see what, only how to query once that is decided
 (same split `permits.repo.list_permits` uses).
 
-No persisted full-text index (plan ruling 1): `_text_filter` below is a live
+No persisted full-text index (plan ruling 1): `core.textsearch.text_filter` is a live
 `ILIKE` (case-insensitive substring, `unaccent`-normalized on both sides) with
 a `similarity()` tiebreak for ordering — `pg_trgm`/`unaccent` are both
 extensions already installed by migration `0001`, so this costs no schema
@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import Row, String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.textsearch import text_filter
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
 from app.modules.auth.models import Applicant
@@ -27,21 +28,9 @@ from app.modules.permits.models import Permit
 from app.modules.search.models import ExportJob, SavedFilter
 
 
-def _text_filter(pattern: str, *columns: Any) -> Any:
-    """`ILIKE '%needle%'` OR'd across every given column, `unaccent`-wrapped
-    on both sides so a diacritic in either the query or the stored value does
-    not hide a match — the same compensation `design/02` names for the
-    tsvector approach this module does not take (plan ruling 1). A literal
-    `%`/`_`/`\\` typed by the caller is escaped first so it matches itself
-    rather than acting as an ILIKE wildcard."""
-    escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    needle = func.unaccent(f"%{escaped}%")
-    return or_(*(func.unaccent(col).ilike(needle) for col in columns))
-
-
 def _similarity_rank(q: str, *columns: Any) -> Any:
     """The BEST trigram similarity across the given columns, highest first —
-    a ranking hint only (`_text_filter` above is what actually admits or
+    a ranking hint only (`text_filter` is what actually admits or
     rejects a row), so a typo'd query still surfaces its closest matches on
     top of an otherwise ILIKE-ordered page."""
     scores = [func.similarity(col, q) for col in columns]
@@ -99,7 +88,7 @@ async def search_applications(
         if value is not None:
             conditions.append(column == value)
     if q:
-        conditions.append(_text_filter(q, Application.number, Applicant.name, Applicant.phone))
+        conditions.append(text_filter(q, Application.number, Applicant.name, Applicant.phone))
 
     base = (
         select(
@@ -172,7 +161,7 @@ async def search_permits(
         "number"
     )
     if q:
-        conditions.append(_text_filter(q, display_number, Applicant.name, Applicant.phone))
+        conditions.append(text_filter(q, display_number, Applicant.name, Applicant.phone))
 
     base = (
         select(

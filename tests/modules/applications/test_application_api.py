@@ -416,3 +416,26 @@ async def test_the_list_puts_the_most_recently_updated_application_first(
     assert listed.status_code == 200
     ids = [row["id"] for row in listed.json()["items"]]
     assert ids == [older.json()["id"], newer.json()["id"]]
+
+
+async def test_q_finds_an_application_by_its_number_and_by_the_applicants_name(
+    db, applicant_client, applicant, filing_ready_for_submission
+) -> None:
+    """`q` is the list's one free-text filter (the former `/search` screen
+    folded into it): a case-insensitive substring of the number or of the
+    applicant's name, and nothing for a name nobody carries."""
+    applicant.name = "Каримов Карим Каримович"
+    await db.commit()
+    mine = await _submit_with_button(applicant_client, filing_ready_for_submission)
+    assert mine.status_code == 201, mine.text
+    number = mine.json()["number"]
+
+    by_name = await applicant_client.get("/api/v1/applications", params={"q": "каримов"})
+    assert by_name.status_code == 200, by_name.text
+    assert [row["id"] for row in by_name.json()["items"]] == [mine.json()["id"]]
+
+    by_number = await applicant_client.get("/api/v1/applications", params={"q": number[-4:]})
+    assert [row["id"] for row in by_number.json()["items"]] == [mine.json()["id"]]
+
+    nobody = await applicant_client.get("/api/v1/applications", params={"q": "Азизов"})
+    assert nobody.json()["total"] == 0

@@ -28,6 +28,7 @@ from typing import Any
 from sqlalchemy import Row, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.textsearch import text_filter
 from app.modules.admin.models import ActivityType, Organization
 from app.modules.applications.assignment import Candidate
 from app.modules.applications.models import (
@@ -281,6 +282,7 @@ async def list_applications(
     contour_id: uuid.UUID | None,
     applicant_id: uuid.UUID | None,
     number: str | None,
+    q: str | None,
     period_from: date | None,
     period_to: date | None,
     offset: int,
@@ -307,6 +309,11 @@ async def list_applications(
     row stays invisible to a ZONED actor while a republic-wide one (whose
     `zone_filter` is `true()` and reads no organization column at all) still
     sees it.
+
+    `q` is the list's one free-text filter — a substring of the number or of
+    the applicant's name (`core.textsearch.text_filter`, the same predicate
+    `GET /search` used before that screen was folded into this list). It joins
+    `applicants` only when set, so the plain list keeps its two-table shape.
 
     `period_from`/`period_to` filter by OVERLAP, not by equality: "applications
     active in this window" is the question a reviewer's queue asks, and an
@@ -336,17 +343,21 @@ async def list_applications(
         conditions.append(Application.period_to >= period_from)
     if period_to is not None:
         conditions.append(Application.period_from <= period_to)
+    if q:
+        conditions.append(text_filter(q, Application.number, Applicant.name))
 
     join_target = _zone_join_target(contour_organization_col)
-    counted = (
-        select(Application.id)
-        .outerjoin(Organization, Organization.id == join_target)
-        .where(*conditions)
-    )
+
+    def _joined(stmt: Any) -> Any:
+        stmt = stmt.outerjoin(Organization, Organization.id == join_target)
+        if q:
+            stmt = stmt.join(Applicant, Applicant.id == Application.applicant_id)
+        return stmt
+
+    counted = _joined(select(Application.id)).where(*conditions)
     total = (await db.execute(select(func.count()).select_from(counted.subquery()))).scalar_one()
     rows = await db.execute(
-        select(Application)
-        .outerjoin(Organization, Organization.id == join_target)
+        _joined(select(Application))
         .where(*conditions)
         .order_by(Application.updated_at.desc(), Application.id.desc())
         .offset(offset)

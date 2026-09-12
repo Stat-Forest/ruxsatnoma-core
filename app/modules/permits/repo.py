@@ -10,12 +10,14 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import ColumnElement, Row, func, select, text
+from sqlalchemy import ColumnElement, Row, String, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.abac import Zone, zone_filter
+from app.core.textsearch import text_filter
 from app.db import Base
 from app.modules.admin.models import ActivityType, Organization
+from app.modules.auth.models import Applicant
 from app.modules.permits.models import (
     ForestTicket,
     Permit,
@@ -160,6 +162,7 @@ async def list_permits(
     organization_id: uuid.UUID | None,
     series: str | None,
     number: int | None,
+    q: str | None,
     offset: int,
     limit: int,
 ) -> tuple[list[Permit], int]:
@@ -186,6 +189,11 @@ async def list_permits(
     every permit issued after it. `updated_at` moves on every ORM write to the
     row (`service.set_status`, `_activate`, the expiry sweep) and not on a
     child-table write alone. Served by `ix_permits_updated_at_id`.
+
+    `q` is the free-text filter: a substring of the applicant's name or of the
+    printed number `"<series> № <000000>"` (`core.textsearch.text_filter`,
+    the predicate `GET /search` used before that screen was folded into this
+    list). It joins `applicants` only when set.
     """
     conditions: list[Any] = [scope]
     for column, value in (
@@ -198,15 +206,20 @@ async def list_permits(
     ):
         if value is not None:
             conditions.append(column == value)
-    joined = (
-        select(Permit.id)
-        .join(Organization, Organization.id == Permit.organization_id)
-        .where(*conditions)
-    )
+    if q:
+        printed = Permit.series + " № " + func.lpad(cast(Permit.number, String), 6, "0")
+        conditions.append(text_filter(q, printed, Applicant.name))
+
+    def _joined(stmt: Any) -> Any:
+        stmt = stmt.join(Organization, Organization.id == Permit.organization_id)
+        if q:
+            stmt = stmt.join(Applicant, Applicant.id == Permit.applicant_id)
+        return stmt
+
+    joined = _joined(select(Permit.id)).where(*conditions)
     total = (await db.execute(select(func.count()).select_from(joined.subquery()))).scalar_one()
     rows = await db.execute(
-        select(Permit)
-        .join(Organization, Organization.id == Permit.organization_id)
+        _joined(select(Permit))
         .where(*conditions)
         .order_by(Permit.updated_at.desc(), Permit.id.desc())
         .offset(offset)
