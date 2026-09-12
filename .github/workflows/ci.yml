@@ -62,7 +62,7 @@ jobs:
       - run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=ruxsatnoma -e MINIO_ROOT_PASSWORD=ruxsatnoma-secret \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
       # postgresql-client creates the test DB below. The three pango/harfbuzz packages are
       # WeasyPrint's own documented Debian/Ubuntu requirement (they carry gobject, pango,
       # pangoft2, harfbuzz and fontconfig, which it dlopens at import time): without them
