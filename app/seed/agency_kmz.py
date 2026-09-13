@@ -18,10 +18,12 @@ failing all three from `SHAPE_Area` (m² -> ha). Every raw field is kept in the
 GeoJSON properties (comma decimals turned into floats, `<Null>` into null) so a
 `--dry-run --out` file is a complete conversion, not only the two mapped keys.
 
-Rows with no number at all, and rows whose coordinates fall outside Uzbekistan
-(Qiziriq's land-type file carries 18 legend polygons in the Indian Ocean), are
-dropped here and counted in the report — the importer would otherwise fail the
-whole batch on the first of them.
+Rows with no number at all, rows whose coordinates fall outside Uzbekistan
+(Qiziriq's land-type file carries 18 legend polygons in the Indian Ocean), and
+rows whose polygon has no area (Zomin, Ellikqal'a, Sirdaryo and Bobotog each
+carry one collapsed three-point ring — `ck_contour_versions_area_positive`
+refuses it and the import is atomic, so one such row failed the whole leshoz)
+are dropped here and counted in the report.
 """
 
 from __future__ import annotations
@@ -55,6 +57,9 @@ AREA_HA_FIELDS = ("Umumiy yer maydoni", "F12", "umum_y_m")
 # Uzbekistan's bounding box with a margin; anything outside is a template polygon.
 LON_RANGE = (55.0, 74.0)
 LAT_RANGE = (36.0, 46.0)
+# Planar shoelace area in square degrees below which a ring is a collapsed line:
+# 1e-10 deg² is about 1 m² at this latitude.
+MIN_RING_AREA_DEG2 = 1e-10
 
 _ROW_RE = re.compile(r"<tr[^>]*>\s*<td>(.*?)</td>\s*<td>(.*?)</td>\s*</tr>", re.S)
 _NUMBER_RE = re.compile(r"^-?\d+(,\d+)?$")
@@ -119,6 +124,18 @@ def _in_uzbekistan(polys: list[list[list[list[float]]]]) -> bool:
     return True
 
 
+def _has_area(polys: list[list[list[list[float]]]]) -> bool:
+    """True when at least one outer ring encloses a real area (shoelace)."""
+    for rings in polys:
+        outer = rings[0]
+        twice = 0.0
+        for (x1, y1), (x2, y2) in zip(outer, outer[1:] + outer[:1], strict=True):
+            twice += x1 * y2 - x2 * y1
+        if abs(twice) / 2 >= MIN_RING_AREA_DEG2:
+            return True
+    return False
+
+
 def _first(attrs: dict[str, Any], names: tuple[str, ...]) -> Any:
     for name in names:
         if attrs.get(name) is not None:
@@ -135,7 +152,14 @@ def convert(kmz_path: Path) -> tuple[dict[str, Any], dict[str, int]]:
         root = ET.fromstring(zf.read(kml_name))  # nosec B314
 
     features: list[dict[str, Any]] = []
-    stats = {"placemarks": 0, "no_number": 0, "no_geometry": 0, "outside_uz": 0, "kept": 0}
+    stats = {
+        "placemarks": 0,
+        "no_number": 0,
+        "no_geometry": 0,
+        "outside_uz": 0,
+        "zero_area": 0,
+        "kept": 0,
+    }
     for pm in root.iter(f"{KML_NS}Placemark"):
         stats["placemarks"] += 1
         desc = pm.find(f"{KML_NS}description")
@@ -150,6 +174,9 @@ def convert(kmz_path: Path) -> tuple[dict[str, Any], dict[str, int]]:
             continue
         if not _in_uzbekistan(polys):
             stats["outside_uz"] += 1
+            continue
+        if not _has_area(polys):
+            stats["zero_area"] += 1
             continue
         area_ha = _first(attrs, AREA_HA_FIELDS)
         if area_ha is None and isinstance(attrs.get("SHAPE_Area"), (int, float)):
