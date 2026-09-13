@@ -138,6 +138,7 @@ async def rows_contours(
     lang: xlsx.Lang,
     organization_id: uuid.UUID | None,
     bbox: str | None,
+    region_id: uuid.UUID | None = None,
 ) -> tuple[list[ContourRow], int, int]:
     """(rows, total, cap). `service.list_contours` is exactly what
     `GET /gis/contours` calls — same zone scoping (`zone_filter`), same
@@ -151,6 +152,7 @@ async def rows_contours(
         db,
         organization_id=organization_id,
         bbox=bbox,
+        region_id=region_id,
         params=PageParams.model_construct(page=1, page_size=cap),
         actor=actor,
     )

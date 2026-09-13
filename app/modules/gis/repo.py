@@ -749,6 +749,7 @@ async def list_contours(
     zone: Any,
     offset: int,
     limit: int,
+    region_id: uuid.UUID | None = None,
 ) -> tuple[list[Any], int]:
     """One row (contour_id, number, organization_id, version_id, area_ha) per
     contour that HAS a published version, matching the given filters. `zone`
@@ -770,6 +771,11 @@ async def list_contours(
     conditions: list[Any] = [ContourVersion.status == "published", zone]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
+    # A region is a filter on the joined `organizations` row, the same column
+    # the zone check reads — a viloyat-wide list for the Viloyat → Xoʻjalik
+    # → Kontur cascade (2026-09-13), not a new axis of its own.
+    if region_id is not None:
+        conditions.append(Organization.region_id == region_id)
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
         conditions.append(
@@ -809,6 +815,7 @@ async def contour_features_geojson(
     bbox: tuple[float, float, float, float] | None,
     zone: Any,
     organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """Published contours as a GeoJSON FeatureCollection — the layer a map
     draws when NOTHING is picked yet, so an applicant can see the leshoz's
@@ -849,6 +856,8 @@ async def contour_features_geojson(
     ]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
+    if region_id is not None:
+        conditions.append(Organization.region_id == region_id)
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
         conditions.append(

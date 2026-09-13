@@ -59,6 +59,7 @@ async def list_contours(
     params: Annotated[PageParams, Depends()],
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
+    region_id: uuid.UUID | None = None,
 ) -> Page[ContourListItem]:
     """Reading published contours needs no permission at all (ruling 5): an
     applicant must be able to pick a plot the same way any authenticated user
@@ -69,7 +70,12 @@ async def list_contours(
     was unbounded, and an applicant picking a plot would have received every
     published contour in the country."""
     items, total = await service.list_contours(
-        db, organization_id=organization_id, bbox=bbox, params=params, actor=user
+        db,
+        organization_id=organization_id,
+        bbox=bbox,
+        region_id=region_id,
+        params=params,
+        actor=user,
     )
     return Page[ContourListItem](
         items=[ContourListItem.model_validate(item) for item in items],
@@ -86,6 +92,7 @@ async def export_contours_xlsx(
     lang: xlsx.Lang = "uz_latn",
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
+    region_id: uuid.UUID | None = None,
 ) -> Response:
     """`GET /gis/contours` as a spreadsheet (stage 13, ruling #204): the
     same filters, the same zone scoping, every matching row up to the
@@ -94,7 +101,7 @@ async def export_contours_xlsx(
     purpose — `export.xlsx` is not a UUID, and the 422 the UUID parser
     would answer is a worse error than a 404."""
     items, total, cap = await export.rows_contours(
-        db, actor=user, lang=lang, organization_id=organization_id, bbox=bbox
+        db, actor=user, lang=lang, organization_id=organization_id, bbox=bbox, region_id=region_id
     )
     filename = f"konturlar-{business_today().isoformat()}.xlsx"
     return xlsx.xlsx_response(
@@ -108,6 +115,7 @@ async def list_contour_features(
     user: Annotated[User, Depends(get_current_user)],
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
+    region_id: uuid.UUID | None = None,
 ) -> FeatureCollectionOut:
     """The published contour layer as GeoJSON — what a map draws before the
     applicant has picked anything. `GET /gis/contours` above answers the same
@@ -124,7 +132,7 @@ async def list_contour_features(
     """
     return FeatureCollectionOut.model_validate(
         await service.list_contour_features(
-            db, bbox=bbox, organization_id=organization_id, actor=user
+            db, bbox=bbox, organization_id=organization_id, region_id=region_id, actor=user
         )
     )
 

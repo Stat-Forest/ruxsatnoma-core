@@ -1536,6 +1536,7 @@ async def list_contours(
     *,
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
+    region_id: uuid.UUID | None = None,
     params: PageParams,
     actor: User,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -1571,6 +1572,7 @@ async def list_contours(
         db,
         organization_id=organization_id,
         bbox=parsed_bbox,
+        region_id=region_id,
         zone=zone,
         offset=params.offset,
         limit=params.page_size,
@@ -1599,6 +1601,7 @@ async def list_contour_features(
     *,
     bbox: str | None = None,
     organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
     actor: User,
 ) -> dict[str, Any]:
     """`GET /gis/contours/features` — the whole published contour layer as
@@ -1623,7 +1626,7 @@ async def list_contour_features(
         organization_col=Contour.organization_id,
     )
     return await repo.contour_features_geojson(
-        db, bbox=parsed_bbox, zone=zone, organization_id=organization_id
+        db, bbox=parsed_bbox, zone=zone, organization_id=organization_id, region_id=region_id
     )
 
 
