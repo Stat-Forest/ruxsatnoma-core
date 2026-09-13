@@ -116,6 +116,10 @@ _ORGANIZATION_ROWS = [
         "code": BURCHMULLA_CODE,
         "kind": "leshoz",
         "parent_code": "agency",
+        # Toshkent viloyati — without a region the leshoz is invisible to the
+        # Viloyat → Xoʻjalik → Kontur cascade (`?region_id=`), and the demo's
+        # one mapped leshoz would answer "no contours" under its own region.
+        "region_code": "tashkent-region",
         "name": {
             "uz_cyrl": "Бурчмулла ДЎХ",
             "uz_latn": "Burchmulla DOʻX",
