@@ -9,6 +9,7 @@ NOT the same wire shape and only the omitted form is what `PermitSignIn.
 pkcs7: str | None = None` is meant to accept from an honest client.
 """
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,14 @@ from app.modules.permits.models import Permit
 from app.modules.signatures import service as signatures_service
 from app.modules.signatures.models import Signature
 from tests.modules.permits.conftest import Signer, sign_permit, sign_permit_simple
+
+
+@pytest.fixture(autouse=True)
+async def _recipient_line(recipient_line_required: None) -> None:
+    """Ruling #210 took the recipient line out of the default requirement set;
+    every test here is about that line, so the whole module runs under the
+    pre-#210 four-line override (`permit_recipient` is still a known purpose an
+    operator may require)."""
 
 
 async def test_a_citizens_holder_signature_with_no_envelope_activates_the_permit(

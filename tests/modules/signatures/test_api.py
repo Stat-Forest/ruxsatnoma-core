@@ -342,17 +342,18 @@ async def test_signature_list_is_ordered_by_signed_at_then_id(client_a, user_a: 
             user=user_a,
         )
 
-    third = await _sign("permit_recipient", timedelta(seconds=20))
     first = await _sign("permit_head", timedelta(seconds=0))
     tie_a = await _sign("permit_chief_forester", timedelta(seconds=10))
     tie_b = await _sign("permit_accountant", timedelta(seconds=10))
+    # Three rows, not four: the three leshoz lines are the whole required set
+    # since ruling #210, and `sign()` refuses a purpose outside it.
     await db.commit()
 
     resp = await client_a.get(f"{API}/signatures?object_type=permit&object_id={obj_id}")
     assert resp.status_code == 200
     ids = [item["id"] for item in resp.json()["items"]]
     tie_pair = sorted((str(tie_a.id), str(tie_b.id)))
-    assert ids == [str(first.id), *tie_pair, str(third.id)]
+    assert ids == [str(first.id), *tie_pair]
 
 
 @pytest.mark.asyncio

@@ -117,7 +117,6 @@ async def test_a_paid_application_becomes_a_publicly_verifiable_permit(
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (holder_client, signers.RECIPIENT_PURPOSE),
     ):
         result = await sign_permit(signer, permit_id, purpose, pdf)
         assert result.status_code == 200, result.text
@@ -127,7 +126,7 @@ async def test_a_paid_application_becomes_a_publicly_verifiable_permit(
     body = card.json()
     assert body["status"] == "active"
     assert body["issued_at"] is not None
-    assert len(body["signatures"]) == 4
+    assert len(body["signatures"]) == 3  # ruling #210: three leshoz lines
     assert body["missing_signatures"] == []
     # (None -> pending_signatures) at issuance, (pending_signatures -> active)
     # at the fourth signature.
@@ -272,7 +271,6 @@ async def test_an_extensions_activation_closes_the_parent_permit_it_replaces(
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (other_applicant_client, signers.RECIPIENT_PURPOSE),
     ):
         result = await sign_permit(signer, extension_permit_id, purpose, pdf)
         assert result.status_code == 200, result.text
@@ -570,21 +568,21 @@ async def test_missing_signatures_answers_in_process_and_empties_as_they_land(
     order being stable)."""
     before = await service.missing_signatures(db, issued_permit.id)
     assert before == await signatures_service.required_purposes(db, service.OBJECT_TYPE)
-    assert signers.RECIPIENT_PURPOSE in before
+    # Ruling #210: the recipient line is not in the default set.
+    assert signers.RECIPIENT_PURPOSE not in before
 
     for signer, purpose in (
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
-        (accountant_client, "permit_accountant"),
     ):
         assert (await sign_permit(signer, issued_permit.id, purpose, permit_pdf)).status_code == 200
         remaining = await service.missing_signatures(db, issued_permit.id)
         assert purpose not in remaining
         assert remaining == [one for one in before if one in remaining]  # order preserved
 
-    assert await service.missing_signatures(db, issued_permit.id) == [signers.RECIPIENT_PURPOSE]
+    assert await service.missing_signatures(db, issued_permit.id) == ["permit_accountant"]
     assert (
-        await sign_permit(holder_client, issued_permit.id, signers.RECIPIENT_PURPOSE, permit_pdf)
+        await sign_permit(accountant_client, issued_permit.id, "permit_accountant", permit_pdf)
     ).status_code == 200
     assert await service.missing_signatures(db, issued_permit.id) == []
     # An object nobody has ever signed still answers the full requirement set,

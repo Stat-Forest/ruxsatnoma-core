@@ -13,7 +13,7 @@ from app.modules.notifications.models import Notification
 from app.workers import jobs
 from tests.modules.auth.test_sessions import make_user
 
-EVENT = "permit.issued"
+EVENT = "permit.active"  # keeps an active `sms` template after 0060 (ruling #211)
 
 
 async def test_reports_dead_rows_once_and_fails_their_notifications(db, engine):

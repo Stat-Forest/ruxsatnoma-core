@@ -23,7 +23,10 @@ a role name from spec prose is not a `roles.code` (lesson: there is no `rahbar`
 code; «Раҳбар», the approver of `tz/03`'s matrix, is `executor_head`).
 """
 
-# The purpose the HOLDER signs. It maps to no role on purpose: `applicant` is
+# The purpose the HOLDER signs — NOT required by default since ruling #210
+# (the citizen's only signature is the one over the application at filing);
+# it stays a known purpose an operator may put back into
+# `permit_required_signatures`. It maps to no role on purpose: `applicant` is
 # held by every citizen in the country, so holding it proves nothing about THIS
 # permit. The proof is owning — or effectively representing — the applicant of
 # the permit's own application, which only the service can check because only it

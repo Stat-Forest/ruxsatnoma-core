@@ -32,7 +32,8 @@ from app.modules.signatures.models import Signature
 from tests.modules.auth.test_sessions import make_user
 
 DOC = b"the-permit-bytes"
-PURPOSE = "permit_recipient"  # in the default `permit_required_signatures`
+# In the default `permit_required_signatures`; ruling #210 dropped the recipient line.
+PURPOSE = "permit_accountant"
 
 
 def _pinfl() -> str:

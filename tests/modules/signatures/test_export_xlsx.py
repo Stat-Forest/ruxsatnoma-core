@@ -172,7 +172,7 @@ async def test_signatures_export_truncates_at_the_cap_and_says_so(
         db,
         object_type="permit",
         object_id=a_signature.object_id,
-        purpose="permit_recipient",
+        purpose="permit_accountant",
         document=DOC,
         pkcs7=_pkcs7(DOC, user_a.pinfl),
         user=user_a,

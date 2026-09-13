@@ -96,28 +96,29 @@ def test_the_purpose_role_map_is_the_four_of_ruling_4_and_nothing_else():
 # --- the happy path ----------------------------------------------------------
 
 
-async def test_four_signatures_make_the_permit_active(
+async def test_three_signatures_make_the_permit_active(
     db: AsyncSession,
     issued_permit: Permit,
     permit_pdf: bytes,
     head_client: Signer,
     chief_forester_client: Signer,
     accountant_client: Signer,
-    holder_client: Signer,
 ):
-    """С11: ACTIVE only when all 3+1 are in. Not before, whatever the order —
-    signatures may be taken in any order (plan ruling 5); `missing_purposes`
-    returns a display order for a UI, never a gate."""
+    """С11: ACTIVE only when all three leshoz lines are in (ruling #210 dropped
+    the recipient's). Not before, whatever the order — signatures may be taken
+    in any order (plan ruling 5); `missing_purposes` returns a display order for
+    a UI, never a gate."""
     for signer, purpose in (
         (accountant_client, "permit_accountant"),
         (head_client, "permit_head"),
-        (chief_forester_client, "permit_chief_forester"),
     ):
         result = await _sign(signer, issued_permit.id, purpose, permit_pdf)
         assert result.status_code == 200, result.text
         assert result.json()["status"] == "pending_signatures"
 
-    final = await _sign(holder_client, issued_permit.id, "permit_recipient", permit_pdf)
+    final = await _sign(
+        chief_forester_client, issued_permit.id, "permit_chief_forester", permit_pdf
+    )
     assert final.status_code == 200, final.text
     assert final.json()["status"] == "active"
     assert final.json()["missing_signatures"] == []
@@ -133,7 +134,6 @@ async def test_each_signature_names_exactly_what_is_still_missing(
     assert result.json()["missing_signatures"] == [
         "permit_chief_forester",
         "permit_accountant",
-        "permit_recipient",
     ]
 
 
@@ -141,7 +141,6 @@ async def test_the_last_signature_moves_the_application_to_permit_issued(
     db: AsyncSession,
     issued_permit: Permit,
     permit_pdf: bytes,
-    holder_client: Signer,
     head_client: Signer,
     chief_forester_client: Signer,
     accountant_client: Signer,
@@ -155,7 +154,6 @@ async def test_the_last_signature_moves_the_application_to_permit_issued(
     for signer, purpose in (
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
-        (accountant_client, "permit_accountant"),
     ):
         await _sign(signer, issued_permit.id, purpose, permit_pdf)
 
@@ -163,7 +161,7 @@ async def test_the_last_signature_moves_the_application_to_permit_issued(
     assert application is not None
     assert (await _reread(db, application)).status == "PAID"
 
-    await _sign(holder_client, issued_permit.id, "permit_recipient", permit_pdf)
+    await _sign(accountant_client, issued_permit.id, "permit_accountant", permit_pdf)
 
     assert (await _reread(db, application)).status == "PERMIT_ISSUED"
 
@@ -172,7 +170,6 @@ async def test_activation_stamps_issued_at_and_leaves_a_timeline_and_a_notice(
     db: AsyncSession,
     issued_permit: Permit,
     permit_pdf: bytes,
-    holder_client: Signer,
     head_client: Signer,
     chief_forester_client: Signer,
     accountant_client: Signer,
@@ -184,7 +181,6 @@ async def test_activation_stamps_issued_at_and_leaves_a_timeline_and_a_notice(
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (holder_client, "permit_recipient"),
     ):
         assert (await _sign(signer, issued_permit.id, purpose, permit_pdf)).status_code == 200
 
@@ -244,7 +240,10 @@ async def test_a_head_from_another_leshoz_cannot_sign(
 
 
 async def test_a_stranger_cannot_sign_as_the_recipient(
-    other_applicant_client: Signer, issued_permit: Permit, permit_pdf: bytes
+    recipient_line_required: None,
+    other_applicant_client: Signer,
+    issued_permit: Permit,
+    permit_pdf: bytes,
 ):
     """The recipient purpose is proven by owning the APPLICATION, which
     `sign()`'s own PINFL check cannot see: a different citizen signing with
@@ -362,19 +361,17 @@ async def test_an_already_active_permit_takes_no_further_signature(
     db: AsyncSession,
     issued_permit: Permit,
     permit_pdf: bytes,
-    holder_client: Signer,
     head_client: Signer,
     chief_forester_client: Signer,
     accountant_client: Signer,
 ):
-    """`pending_signatures` and nothing else. Without the status check the four
+    """`pending_signatures` and nothing else. Without the status check the three
     slots are full, so `sign()` would answer ERR-SIGN-002 «already signed» —
     true of the purpose, and the wrong explanation for the permit."""
     for signer, purpose in (
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (holder_client, "permit_recipient"),
     ):
         await _sign(signer, issued_permit.id, purpose, permit_pdf)
 
@@ -474,6 +471,7 @@ async def test_a_refusal_does_not_move_the_application(
 
 
 async def test_the_holder_is_told_when_only_their_signature_is_missing(
+    recipient_line_required: None,
     db: AsyncSession,
     issued_permit: Permit,
     permit_pdf: bytes,
@@ -528,6 +526,7 @@ async def test_the_holder_is_told_when_only_their_signature_is_missing(
 
 
 async def test_a_holder_who_signs_first_is_never_reminded(
+    recipient_line_required: None,
     db: AsyncSession,
     issued_permit: Permit,
     permit_pdf: bytes,
@@ -591,6 +590,7 @@ async def test_the_recipients_reminder_addresses_them_and_fits_one_sms(db: Async
 
 
 async def test_two_signatories_landing_at_once_cannot_leave_the_permit_stuck(
+    recipient_line_required: None,
     db: AsyncSession,
     engine: AsyncEngine,
     issued_permit: Permit,
