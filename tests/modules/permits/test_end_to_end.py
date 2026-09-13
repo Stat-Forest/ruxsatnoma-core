@@ -51,7 +51,7 @@ from app.modules.gis.models import GisLayer
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
 from app.modules.notifications.models import NotificationTemplate
-from app.modules.notifications.service import DEFAULT_CHANNELS
+from app.modules.notifications.service import DEFAULT_CHANNELS, SMS_EVENT_CODES
 from app.modules.permits import events, jobs, service, signers
 from app.modules.permits.models import PERMIT_STATUSES, Permit, PermitStatusHistory
 from app.modules.signatures import service as signatures_service
@@ -708,6 +708,9 @@ async def test_every_event_this_module_notifies_on_has_a_template(db: AsyncSessi
     missing = []
     for event_code in events.NOTIFIED_EVENT_CODES:
         for channel in DEFAULT_CHANNELS:
+            # Ruling #211: `sms` is seeded for `SMS_EVENT_CODES` alone.
+            if channel == "sms" and event_code not in SMS_EVENT_CODES:
+                continue
             row = await db.scalar(
                 select(NotificationTemplate).where(
                     NotificationTemplate.event_code == event_code,

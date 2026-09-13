@@ -573,7 +573,8 @@ async def test_the_recipients_reminder_addresses_them_and_fits_one_sms(db: Async
     from app.modules.notifications import service as notifications_service
 
     number = "А № 000001"
-    for channel in ("inapp", "sms"):
+    # Ruling #211 archived the `sms` text; the in-app one still carries the demand.
+    for channel in ("inapp",):
         template = await notifications_repo.get_active_template(
             db, event_code=events.PERMIT_SIGNED, channel=channel
         )

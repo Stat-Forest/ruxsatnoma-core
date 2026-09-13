@@ -18,7 +18,7 @@ from app.modules.notifications import service
 from tests.modules.auth.test_sessions import make_user
 from tests.modules.notifications.test_models import make_template
 
-EVENT = "permit.issued"
+EVENT = "permit.active"  # keeps an active `sms` template after 0060 (ruling #211)
 
 
 @pytest.fixture(autouse=True)

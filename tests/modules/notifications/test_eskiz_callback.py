@@ -15,7 +15,7 @@ from tests.conftest import make_client
 from tests.modules.auth.test_sessions import make_user
 
 SECRET = "test-callback-secret"
-EVENT = "permit.issued"
+EVENT = "permit.active"  # keeps an active `sms` template after 0060 (ruling #211)
 
 
 async def _sms_notification(db) -> Notification:

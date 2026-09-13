@@ -156,6 +156,16 @@ async def archive_template(
 
 DEFAULT_CHANNELS = ("inapp", "sms")
 
+# Ruling #211: the only events that carry an ACTIVE `sms` template after
+# migration 0060 — SMS goes to the applicant, for these three, and nowhere
+# else (the OTP is not a template). Every other event is in-app only:
+# `notify()` still asks for `sms` by default and skips it for want of a
+# template (ruling 10). The per-module "every event has a template" guards
+# read this to know which events must have an `sms` row and which must not.
+SMS_EVENT_CODES: frozenset[str] = frozenset(
+    {"invoice.issued", "application.rejected", "permit.active"}
+)
+
 
 # json.dumps handles exactly these without a custom encoder; the engine configures
 # no `json_serializer`, so anything else reaches the JSONB bind and raises.

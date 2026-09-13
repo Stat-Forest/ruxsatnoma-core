@@ -330,11 +330,14 @@ async def test_every_event_this_module_notifies_on_has_a_template(db) -> None:
     string in-app and sends NOTHING by SMS or e-mail — silently, with a
     `notification.template_missing` ERROR log line, forever."""
     from app.modules.notifications.models import NotificationTemplate
-    from app.modules.notifications.service import DEFAULT_CHANNELS
+    from app.modules.notifications.service import DEFAULT_CHANNELS, SMS_EVENT_CODES
 
     missing = []
     for event_code in events.NOTIFIED_EVENT_CODES:
         for channel in DEFAULT_CHANNELS:
+            # Ruling #211: `sms` is seeded for `SMS_EVENT_CODES` alone.
+            if channel == "sms" and event_code not in SMS_EVENT_CODES:
+                continue
             row = await db.scalar(
                 select(NotificationTemplate).where(
                     NotificationTemplate.event_code == event_code,
