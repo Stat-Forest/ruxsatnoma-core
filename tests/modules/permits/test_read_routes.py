@@ -75,7 +75,6 @@ async def test_the_card_carries_the_signatures_and_the_timeline(
         "permit_head",
         "permit_chief_forester",
         "permit_accountant",
-        "permit_recipient",
     }
     assert all(row["verification_status"] == "valid" for row in body["signatures"])
     # The envelope itself is never on the card: it is large, and 3.8's own
@@ -130,7 +129,6 @@ async def test_document_date_is_the_frozen_document_date_not_the_activation_day(
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (holder_client, "permit_recipient"),
     ):
         signed = await sign_permit(signer, permit.id, purpose, pdf)
         assert signed.status_code == 200, signed.text

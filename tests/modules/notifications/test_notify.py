@@ -14,7 +14,7 @@ from app.modules.notifications.models import Notification
 from tests.modules.auth.test_sessions import make_user
 from tests.modules.notifications.test_models import make_template
 
-EVENT = "permit.issued"  # seeded with inapp + sms templates by migration 0009
+EVENT = "permit.active"  # keeps inapp + sms templates after 0060 (ruling #211)
 
 
 @pytest.fixture(autouse=True)

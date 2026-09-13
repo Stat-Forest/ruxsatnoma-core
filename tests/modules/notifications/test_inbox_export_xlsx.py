@@ -13,7 +13,7 @@ from tests.modules.admin.test_organizations_admin import auth_client
 from tests.modules.auth.test_sessions import make_session, make_user
 
 API = "/api/v1"
-EVENT = "permit.issued"
+EVENT = "permit.active"  # keeps an active `sms` template after 0060 (ruling #211)
 
 
 def _sheet(content: bytes):

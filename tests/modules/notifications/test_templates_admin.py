@@ -188,6 +188,6 @@ async def test_seeded_templates_are_listed(db):
     await db.commit()
     async with make_client(create_app(), lifespan=True) as client:
         auth_client(client, token, csrf)
-        r = await client.get(f"{API}?event_code=permit.issued")
+        r = await client.get(f"{API}?event_code=permit.active")
     assert r.status_code == 200
     assert {item["channel"] for item in r.json()["items"]} == {"inapp", "sms"}

@@ -25,11 +25,11 @@ DOC = b"the-permit-bytes"
 # `test_the_default_permit_requirement_is_the_three_plus_one`'s own order —
 # asserted again below so this test fails loudly, not silently, if the two
 # ever drift apart.
-THE_FOUR_PURPOSES = [
+# Ruling #210: the recipient line is no longer required — three leshoz lines.
+THE_THREE_PURPOSES = [
     "permit_head",
     "permit_chief_forester",
     "permit_accountant",
-    "permit_recipient",
 ]
 
 
@@ -83,8 +83,8 @@ async def _staff_member(db: AsyncSession, *, applicant: Applicant) -> User:
     return user
 
 
-async def test_c11_the_permits_3_plus_1(db: AsyncSession, one_organisation: Applicant):
-    assert await service.required_purposes(db, "permit") == THE_FOUR_PURPOSES
+async def test_c11_the_permits_three_lines(db: AsyncSession, one_organisation: Applicant):
+    assert await service.required_purposes(db, "permit") == THE_THREE_PURPOSES
     obj = uuid.uuid4()
     assert one_organisation.stir is not None  # narrows Applicant.stir's nullable column type
     stir = one_organisation.stir
@@ -97,7 +97,7 @@ async def test_c11_the_permits_3_plus_1(db: AsyncSession, one_organisation: Appl
 
     # Nothing is bound in advance (brief): each signer's certificate is
     # created here, on first use, by `sign()` itself via `bind_certificate`.
-    for index, purpose in enumerate(THE_FOUR_PURPOSES):
+    for index, purpose in enumerate(THE_THREE_PURPOSES):
         signer = await _staff_member(db, applicant=one_organisation)
         row = await service.sign(
             db,
@@ -110,7 +110,7 @@ async def test_c11_the_permits_3_plus_1(db: AsyncSession, one_organisation: Appl
         )
         assert row.verification_status == "valid"
 
-        is_last = index == len(THE_FOUR_PURPOSES) - 1
+        is_last = index == len(THE_THREE_PURPOSES) - 1
         assert await service.is_complete(db, object_type="permit", object_id=obj) is is_last
 
     # 3.11 calls exactly this before flipping a permit to ACTIVE — silent

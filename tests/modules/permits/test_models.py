@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.config import get_settings
 from app.db import make_session_factory
 from app.modules.notifications import repo as notifications_repo
-from app.modules.notifications.service import DEFAULT_CHANNELS
+from app.modules.notifications.service import DEFAULT_CHANNELS, SMS_EVENT_CODES
 from app.modules.permits import repo
 from app.modules.permits.events import NOTIFIED_EVENT_CODES
 from app.modules.permits.models import (
@@ -233,7 +233,9 @@ async def test_every_event_code_this_module_notifies_on_has_an_active_template(d
         (code, channel)
         for code in NOTIFIED_EVENT_CODES
         for channel in DEFAULT_CHANNELS
-        if await notifications_repo.get_active_template(db, event_code=code, channel=channel)
+        # Ruling #211: `sms` is seeded for `SMS_EVENT_CODES` alone.
+        if not (channel == "sms" and code not in SMS_EVENT_CODES)
+        and await notifications_repo.get_active_template(db, event_code=code, channel=channel)
         is None
     ]
     assert missing == []

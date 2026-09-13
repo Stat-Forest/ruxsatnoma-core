@@ -49,7 +49,7 @@ from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.norms.calculator import RULE_CODE_VERSION
 from app.modules.norms.models import Calculation
 from app.modules.notifications.models import Notification
-from app.modules.permits import decisions, grounds, repo, service, signers
+from app.modules.permits import decisions, grounds, repo, service
 from app.modules.permits.models import Permit, PermitTemplate
 from app.modules.permits.permissions import PERMITS_ISSUE
 from tests.conftest import make_client
@@ -882,6 +882,16 @@ async def legal_permit_pdf(db: AsyncSession, legal_issued_permit: Permit) -> byt
 
 
 @pytest.fixture
+async def recipient_line_required(override_required_signatures):
+    """The pre-#210 four-line set, for the tests that exercise the recipient
+    line itself (`permit_recipient` is still a known purpose an operator may
+    require; by default it is not — ruling #210)."""
+    await override_required_signatures(
+        "permit_head,permit_chief_forester,permit_accountant,permit_recipient"
+    )
+
+
+@pytest.fixture
 async def override_required_signatures(db: AsyncSession):
     """Rewrite `permit_required_signatures` for one test, then take it back.
 
@@ -971,7 +981,8 @@ async def active_permit(
     accountant_client: Signer,
     holder_client: Signer,
 ) -> Permit:
-    """A permit in force, through the four real signatures.
+    """A permit in force, through the three real signatures (ruling #210: the
+    recipient line is not required by default).
 
     `active` is never assigned here by hand: `service._activate` is the ONE
     writer of that status and it runs only once `missing_purposes` comes back
@@ -983,7 +994,6 @@ async def active_permit(
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (holder_client, signers.RECIPIENT_PURPOSE),
     ):
         result = await sign_permit(signer, issued_permit.id, purpose, permit_pdf)
         assert result.status_code == 200, result.text

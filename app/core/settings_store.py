@@ -207,7 +207,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "permit_required_signatures",
             str,
-            "permit_head,permit_chief_forester,permit_accountant,permit_recipient",
+            # Ruling #210: the recipient does not sign the permit — the ERI
+            # signature over the application at filing is the citizen's only
+            # one. `permit_recipient` stays a known purpose (`permits.signers`)
+            # an operator may add back here; by default it is never awaited.
+            "permit_head,permit_chief_forester,permit_accountant",
             "Purposes that must all be signed before a permit may become ACTIVE (C11)",
         ),
         # `signatures._REQUIREMENT_SETTINGS["permit_decision"]` — the same data

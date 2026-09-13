@@ -53,12 +53,11 @@ async def _override(db, value: str) -> None:
 DOC = b"permit"
 
 
-async def test_the_default_permit_requirement_is_the_three_plus_one(db):
+async def test_the_default_permit_requirement_is_the_three_leshoz_lines(db):
     assert await service.required_purposes(db, "permit") == [
         "permit_head",
         "permit_chief_forester",
         "permit_accountant",
-        "permit_recipient",
     ]
 
 
@@ -97,7 +96,6 @@ async def test_an_incomplete_set_names_exactly_what_is_missing(db, a_user):
     assert await service.missing_purposes(db, object_type="permit", object_id=obj) == [
         "permit_chief_forester",
         "permit_accountant",
-        "permit_recipient",
     ]
     with pytest.raises(DomainError) as exc:
         await service.require_complete(db, object_type="permit", object_id=obj)
@@ -106,7 +104,6 @@ async def test_an_incomplete_set_names_exactly_what_is_missing(db, a_user):
     assert exc.value.details["missing"] == [
         "permit_chief_forester",
         "permit_accountant",
-        "permit_recipient",
     ]
 
 
@@ -146,7 +143,7 @@ async def test_an_empty_override_is_rejected_and_falls_back_to_the_default(db):
     `system_setting_invalid` and falls back to the code DEFAULT rather than
     letting `""` through -- `permit_required_signatures` can never actually
     be switched off via an empty override the way one might expect; the
-    real 3+1 requirement stays in force. The only way `required_purposes`
+    real three-line requirement (ruling #210) stays in force. The only way `required_purposes`
     returns `[]` is an object_type with NO entry in `_REQUIREMENT_SETTINGS`
     at all (`"application"`, above) -- never an override of this key."""
     await _override(db, "")
@@ -154,7 +151,6 @@ async def test_an_empty_override_is_rejected_and_falls_back_to_the_default(db):
         "permit_head",
         "permit_chief_forester",
         "permit_accountant",
-        "permit_recipient",
     ]
 
 

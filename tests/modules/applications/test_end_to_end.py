@@ -31,7 +31,7 @@ from app.core.errors import DomainError
 from app.modules.applications import events as app_events
 from app.modules.applications import service
 from app.modules.notifications.models import NotificationTemplate
-from app.modules.notifications.service import DEFAULT_CHANNELS
+from app.modules.notifications.service import DEFAULT_CHANNELS, SMS_EVENT_CODES
 
 
 async def test_one_application_walks_the_whole_path(
@@ -352,6 +352,9 @@ async def test_every_event_this_module_notifies_on_has_a_template(db: AsyncSessi
     missing = []
     for event_code in app_events.NOTIFIED_EVENT_CODES:
         for channel in DEFAULT_CHANNELS:
+            # Ruling #211: `sms` is seeded for `SMS_EVENT_CODES` alone.
+            if channel == "sms" and event_code not in SMS_EVENT_CODES:
+                continue
             row = await db.scalar(
                 select(NotificationTemplate).where(
                     NotificationTemplate.event_code == event_code,

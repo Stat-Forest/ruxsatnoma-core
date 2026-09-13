@@ -235,12 +235,11 @@ async def test_the_journey_from_approval_to_the_public_qr_page(
     # подписано**» is what PERMIT_ISSUED means.
     assert (await _reread(db, application)).status == "PAID"
 
-    # --- hop 5: the 3+1 ERI signatures ---------------------------------------
+    # --- hop 5: the three ERI signatures (ruling #210: no recipient line) ----
     for signer, purpose in (
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (journey_holder, signers.RECIPIENT_PURPOSE),
     ):
         result = await sign_permit(signer, permit_id, purpose, pdf)
         assert result.status_code == 200, (purpose, result.text)
@@ -385,12 +384,11 @@ async def test_the_manual_confirmation_door_reaches_every_downstream_module_too(
 
     assert (await _reread(db, application)).status == "PAID"
 
-    # --- hop 5: the 3+1 ERI signatures ---------------------------------------
+    # --- hop 5: the three ERI signatures (ruling #210: no recipient line) ----
     for signer, purpose in (
         (head_client, "permit_head"),
         (chief_forester_client, "permit_chief_forester"),
         (accountant_client, "permit_accountant"),
-        (journey_holder, signers.RECIPIENT_PURPOSE),
     ):
         result = await sign_permit(signer, permit_id, purpose, pdf)
         assert result.status_code == 200, (purpose, result.text)
@@ -710,19 +708,14 @@ async def test_two_real_permits_on_one_contour_are_what_over_allocated_means(
         permit_id = uuid.UUID(issued.json()["id"])
         pdf = (await accountant_client.client.get(f"{API}/permits/{permit_id}/pdf")).content
 
-        applicant_row = await db.get(Applicant, application.applicant_id)
-        assert applicant_row is not None and applicant_row.owner_user_id is not None
-        holder_user = await db.get(User, applicant_row.owner_user_id)
-        assert holder_user is not None
-        async for holder in _signer_for(db, role_code="applicant", user=holder_user):
-            for signer, purpose in (
-                (head_client, "permit_head"),
-                (chief_forester_client, "permit_chief_forester"),
-                (accountant_client, "permit_accountant"),
-                (holder, signers.RECIPIENT_PURPOSE),
-            ):
-                result = await sign_permit(signer, permit_id, purpose, pdf)
-                assert result.status_code == 200, (purpose, result.text)
+        # Ruling #210: the holder signs nothing on the permit.
+        for signer, purpose in (
+            (head_client, "permit_head"),
+            (chief_forester_client, "permit_chief_forester"),
+            (accountant_client, "permit_accountant"),
+        ):
+            result = await sign_permit(signer, permit_id, purpose, pdf)
+            assert result.status_code == 200, (purpose, result.text)
 
     # Two independently unremarkable applications — 30 + 30 ga on a 50 ga
     # contour. Neither the applications module, the payments module nor the
@@ -1048,7 +1041,9 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                 pdf = pdf_response.content
                 assert len(pdf) > 0
 
-                # --- the 3+1 signatures: the holder uses the button (ruling #183) -
+                # --- the three leshoz signatures; the citizen signs nothing on
+                # the permit (ruling #210) — their button of ruling #183 is now
+                # refused as a purpose nobody requires.
                 for signer, purpose in (
                     (head_client, "permit_head"),
                     (chief_forester_client, "permit_chief_forester"),
@@ -1056,27 +1051,25 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                 ):
                     result = await sign_permit(signer, permit_id, purpose, pdf)
                     assert result.status_code == 200, (purpose, result.text)
-                holder_result = await sign_permit_simple(
-                    citizen, permit_id, signers.RECIPIENT_PURPOSE
-                )
-                assert holder_result.status_code == 200, holder_result.text
 
                 permit = await permits_service.get(db, permit_id)
                 assert permit is not None
                 assert (await _reread(db, permit)).status == "active"
                 assert (await _reread(db, application)).status == "PERMIT_ISSUED"
 
-                holder_signature = (
-                    await db.scalars(
+                holder_result = await sign_permit_simple(
+                    citizen, permit_id, signers.RECIPIENT_PURPOSE
+                )
+                assert holder_result.status_code == 409, holder_result.text
+                assert (
+                    await db.scalar(
                         select(Signature).where(
                             Signature.object_type == "permit",
                             Signature.object_id == permit_id,
                             Signature.purpose == signers.RECIPIENT_PURPOSE,
                         )
                     )
-                ).one()
-                assert holder_signature.kind == "simple"
-                assert holder_signature.certificate_id is None
+                ) is None
     finally:
         tariff.benefit_modifiers = original_modifiers
         await db.commit()
