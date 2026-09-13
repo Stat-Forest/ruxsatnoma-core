@@ -563,7 +563,28 @@ async def organization_names(
     return await repo.organization_names(db, ids)
 
 
+async def organization_places(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]]:
+    """`(name, region, district)` names for a batch of organizations, one
+    query; `{}` for an empty set."""
+    return await repo.organization_places(db, ids)
+
+
+async def classifier_item_names(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Names for a batch of classifier items, one query; `{}` for an empty set."""
+    return await repo.classifier_item_names(db, ids)
+
+
 async def activity_type_names(db: AsyncSession) -> dict[uuid.UUID, dict[str, Any]]:
     """The whole catalogue (a handful of rows) keyed by id — one read beats a
     filtered one, and every export prints the same few names."""
     return {row.id: dict(row.name) for row in await repo.list_activity_types(db)}
+
+
+async def activity_type_units(db: AsyncSession) -> dict[uuid.UUID, str]:
+    """`quantity_unit` per activity type, the whole catalogue keyed by id —
+    what an application's bare `quantity` is counted in (head, hive, ton…)."""
+    return {row.id: row.quantity_unit for row in await repo.list_activity_types(db)}

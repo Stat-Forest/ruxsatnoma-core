@@ -1,7 +1,8 @@
 """All SQL/ORM queries for `reports` — including the cross-module reader join
 (design/01 rule 5: reports gets read-only access to any table). `permits`,
 `invoices`, `allocations` and `applicants` are imported here, for SELECT
-only, and nowhere else in this module — the boundary rule is enforced by
+only, and nowhere else in this module (since 2026-09-14 also `calculations`
+and `application_conclusions`, for the applications register) — the boundary rule is enforced by
 convention (this file is the one place it happens), the same shape
 `norms/repo.py::application_facts` uses for ITS one read-only cross-module
 window. `inspection_result` is the one exception: it comes from
@@ -10,7 +11,7 @@ rather than a table read, because "which acts count" (signed only) is
 `inspections`' own business rule — see `report_rows`'s docstring."""
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -18,8 +19,10 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
+from app.modules.applications.models import ApplicationConclusion, ApplicationItem
 from app.modules.auth.models import Applicant
 from app.modules.inspections import service as inspections_service
+from app.modules.norms.models import Calculation
 from app.modules.payments.models import Allocation, Invoice
 from app.modules.permits.models import Permit
 from app.modules.reports.models import Report, ReportForm
@@ -316,3 +319,103 @@ async def report_rows(
             }
         )
     return rows
+
+
+# --- the applications register (`applications_register.py`) ------------------
+#
+# Four batch readers, one query each, keyed by application id — the columns
+# the register prints that `applications` (level 3) may not read for itself
+# (`permits`, `invoices` are level 4; `calculations` and
+# `application_conclusions` are its own and `norms`' tables, read here
+# rather than through one service call per row for a 10 000-row file).
+# `DISTINCT ON` picks the newest row per application where several exist,
+# with the same `created_at DESC, id DESC` order `norms.repo` uses for "the
+# newest calculation" — the id tie-break matters because uuid7 is
+# time-ordered and two rows CAN share a `created_at`.
+
+
+async def permit_facts_by_application(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, tuple[date, date, datetime | None]]:
+    """`(period_from, period_to, issued_at)` of the permit an application
+    produced — `permits.application_id` is UNIQUE, so at most one. `issued_at`
+    is null until the permit is ACTIVE (every signature in), which is the
+    only moment the register may call it issued (`tz/05`)."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Permit.application_id, Permit.period_from, Permit.period_to, Permit.issued_at).where(
+            Permit.application_id.in_(ids)
+        )
+    )
+    return {row[0]: (row[1], row[2], row[3]) for row in rows}
+
+
+async def paid_amount_by_application(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, Decimal]:
+    """The sum of the application's PAID invoices — money that arrived, never
+    a pending claim; absent from the dict when nothing was paid."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Invoice.application_id, func.sum(Invoice.amount))
+        .where(Invoice.application_id.in_(ids), Invoice.status == "paid")
+        .group_by(Invoice.application_id)
+    )
+    return {row[0]: row[1] for row in rows}
+
+
+async def calculated_amount_by_application(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, Decimal]:
+    """The newest calculation's amount per application — the same row
+    `applications.service.current_calculation` answers with."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Calculation.application_id, Calculation.amount)
+        .distinct(Calculation.application_id)
+        .where(Calculation.application_id.in_(ids))
+        .order_by(Calculation.application_id, Calculation.created_at.desc(), Calculation.id.desc())
+    )
+    return {row[0]: row[1] for row in rows}
+
+
+async def executor_conclusion_by_application(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """The newest EXECUTOR conclusion's text per application (3.9b, `kind`
+    `executor` — the specialist who studied the filing; the GIS specialist's
+    is a separate kind and not what the customer asked to see)."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(ApplicationConclusion.application_id, ApplicationConclusion.text)
+        .distinct(ApplicationConclusion.application_id)
+        .where(
+            ApplicationConclusion.application_id.in_(ids),
+            ApplicationConclusion.kind == "executor",
+        )
+        .order_by(
+            ApplicationConclusion.application_id,
+            ApplicationConclusion.created_at.desc(),
+            ApplicationConclusion.id.desc(),
+        )
+    )
+    return {row[0]: row[1] for row in rows}
+
+
+async def head_count_by_application(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """The herd an application declares — the sum of its `application_items`
+    — for the register's «quantity» column: grazing keeps its count in the
+    items by livestock kind and leaves `applications.quantity` NULL (that
+    column is every OTHER activity's declared amount)."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(ApplicationItem.application_id, func.sum(ApplicationItem.head_count))
+        .where(ApplicationItem.application_id.in_(ids))
+        .group_by(ApplicationItem.application_id)
+    )
+    return {row[0]: int(row[1]) for row in rows}
