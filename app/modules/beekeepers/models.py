@@ -21,7 +21,7 @@ not a new precedent for this one table.
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import CheckConstraint, ForeignKey, Index, func, text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -49,6 +49,11 @@ class Beekeeper(Base):
     stir: Mapped[str | None]
     full_name: Mapped[str]
     farm_name: Mapped[str | None]
+    # Ruling #217: the certificate's own term («Действует до 31.12.2025» on
+    # the first real one). NULL = no term known, never "expired". Expiry
+    # does not touch `status` — removal is the Union's act, expiry is the
+    # paper's — `service.match_certificate` reads it as `expired`.
+    valid_to: Mapped[date | None]
     status: Mapped[str] = mapped_column(default="active")
     removed_reason: Mapped[str | None]
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))

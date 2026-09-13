@@ -121,7 +121,9 @@ async def test_export_renders_labels_not_codes(db):
             if r[-1] == beekeeper_id
         )
         assert row[0] == certificate_no  # the human number first
-        assert row[4] == "Faol"  # the status LABEL, not "active"
+        assert (
+            row[5] == "Faol"
+        )  # the status LABEL, not "active" (ruling #217 put the term before it)
 
 
 async def test_export_truncates_at_the_cap_and_says_so(db, monkeypatch):

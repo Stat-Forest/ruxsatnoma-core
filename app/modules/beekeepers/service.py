@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.core.schemas import Page, PageParams
+from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
@@ -41,16 +42,19 @@ _AUDITED_FIELDS = (
     "stir",
     "full_name",
     "farm_name",
+    "valid_to",
     "status",
     "removed_reason",
 )
 
 
 def _snapshot(row: Beekeeper) -> dict[str, Any]:
-    # Every audited field is a plain string or None — no Decimal/date/UUID to
-    # coerce at this JSON boundary (lessons.md), unlike most other modules'
-    # own `_snapshot` helpers.
-    return {field: getattr(row, field) for field in _AUDITED_FIELDS}
+    # Every audited field is a plain string or None except `valid_to`
+    # (ruling #217), a `date` this JSON boundary must spell out itself
+    # (lessons.md).
+    snapshot = {field: getattr(row, field) for field in _AUDITED_FIELDS}
+    snapshot["valid_to"] = row.valid_to.isoformat() if row.valid_to is not None else None
+    return snapshot
 
 
 async def _beekeeper_or_404(db: AsyncSession, beekeeper_id: uuid.UUID) -> Beekeeper:
@@ -94,6 +98,7 @@ async def create_beekeeper(db: AsyncSession, *, data: BeekeeperCreateIn, actor: 
         stir=data.stir,
         full_name=data.full_name,
         farm_name=data.farm_name,
+        valid_to=data.valid_to,
         status="active",
         created_by=actor.id,
         updated_by=actor.id,
@@ -129,6 +134,7 @@ _PATCHABLE_FIELDS = (
     "stir",
     "full_name",
     "farm_name",
+    "valid_to",
 )
 
 
@@ -273,9 +279,12 @@ class MatchResult:
         had never been registered, never as a stale match).
       * `not_yours` — an ACTIVE row exists under this certificate number, but
         the given identity does not own it.
+      * `expired` — the identity owns it, but the certificate's own term
+        (`valid_to`, ruling #217) ended before the business day. A row with
+        no term never expires: the register does not invent a date.
     """
 
-    status: Literal["matched", "unknown", "not_yours"]
+    status: Literal["matched", "unknown", "not_yours", "expired"]
     beekeeper_id: uuid.UUID | None
 
 
@@ -301,4 +310,6 @@ async def match_certificate(
         owns = False
     if not owns:
         return MatchResult(status="not_yours", beekeeper_id=None)
+    if row.valid_to is not None and row.valid_to < business_today():
+        return MatchResult(status="expired", beekeeper_id=row.id)
     return MatchResult(status="matched", beekeeper_id=row.id)

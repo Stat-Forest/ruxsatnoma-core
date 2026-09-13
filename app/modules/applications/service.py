@@ -32,7 +32,7 @@ from app.core.errors import err
 from app.core.events import Event, publish
 from app.core.models import MediaFile
 from app.core.numbers import next_public_number
-from app.core.schemas import PageParams
+from app.core.schemas import Page, PageParams
 from app.core.time import business_today
 from app.db import uuid7
 from app.modules.admin import open_work as admin_open_work
@@ -66,6 +66,7 @@ from app.modules.applications.schemas import (
     ApplicationFilingIn,
     ApplicationItemIn,
     ApplicationPatch,
+    BenefitClaimMonitorOut,
 )
 from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
@@ -1113,6 +1114,48 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
             else sla.is_overdue(application.status, deadline, datetime.now(UTC))
         ),
     }
+
+
+BEEKEEPING_BENEFIT_CODE = "beekeeping_union_member"
+
+
+async def list_beekeeping_claims(
+    db: AsyncSession, *, params: PageParams, status: str | None = None
+) -> Page[BenefitClaimMonitorOut]:
+    """`GET /applications/beekeeping` (ruling #217): the Union's registrar
+    monitors, country-wide, every application that claims
+    `beekeeping_union_member` — filed, under review, rejected, or with its
+    permit issued (`PERMIT_ISSUED` and beyond). The permission gate is the
+    router's (`beekeepers.manage`); no zone applies, and no other benefit
+    code is ever selected here, so the one screen cannot widen into the
+    caseload of anyone's leshoz."""
+    rows, total = await repo.list_benefit_claims(
+        db,
+        classifier_code=BENEFIT_CLASSIFIER_CODE,
+        benefit_code=BEEKEEPING_BENEFIT_CODE,
+        status=status,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+    items = [
+        BenefitClaimMonitorOut(
+            id=application.id,
+            number=application.number,
+            status=application.status,
+            applicant_name=applicant_name,
+            organization_name=organization_name,
+            benefit_certificate_no=application.benefit_certificate_no,
+            benefit_verification_status=application.benefit_verification_status,
+            period_from=application.period_from,
+            period_to=application.period_to,
+            submitted_at=application.submitted_at,
+            decided_at=application.decided_at,
+        )
+        for application, applicant_name, organization_name in rows
+    ]
+    return Page[BenefitClaimMonitorOut](
+        items=items, total=total, page=params.page, page_size=params.page_size
+    )
 
 
 async def list_applications(

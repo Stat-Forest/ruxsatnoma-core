@@ -29,7 +29,7 @@ from sqlalchemy import Row, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.textsearch import text_filter
-from app.modules.admin.models import ActivityType, Organization
+from app.modules.admin.models import ActivityType, Classifier, ClassifierItem, Organization
 from app.modules.applications.assignment import Candidate
 from app.modules.applications.models import (
     Application,
@@ -364,6 +364,51 @@ async def list_applications(
         .limit(limit)
     )
     return list(rows.scalars().all()), total
+
+
+async def list_benefit_claims(
+    db: AsyncSession,
+    *,
+    classifier_code: str,
+    benefit_code: str,
+    status: str | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[Row[Any]], int]:
+    """Ruling #217's monitoring read: every application whose benefit claim
+    names `benefit_code` (an item of the `classifier_code` classifier —
+    membership through BOTH tables, since `classifier_items.code` is unique
+    only within its classifier), with the applicant's name and the leshoz
+    it sits with. No zone: the caller is a central role that sees these
+    claims country-wide and nothing else — the narrow predicate ruling #182
+    retired, back for the one screen that needs it. Rows are
+    `(Application, applicant_name, organization_name)`; the outer join on
+    `organizations` keeps an application not yet assigned anywhere."""
+    conditions: list[Any] = [
+        Classifier.code == classifier_code,
+        ClassifierItem.code == benefit_code,
+    ]
+    if status is not None:
+        conditions.append(Application.status == status)
+
+    def _joined(stmt: Any) -> Any:
+        return (
+            stmt.join(ClassifierItem, ClassifierItem.id == Application.benefit_category_item_id)
+            .join(Classifier, Classifier.id == ClassifierItem.classifier_id)
+            .join(Applicant, Applicant.id == Application.applicant_id)
+            .outerjoin(Organization, Organization.id == Application.assigned_org_id)
+        )
+
+    counted = _joined(select(Application.id)).where(*conditions)
+    total = (await db.execute(select(func.count()).select_from(counted.subquery()))).scalar_one()
+    rows = await db.execute(
+        _joined(select(Application, Applicant.name, Organization.name))
+        .where(*conditions)
+        .order_by(Application.updated_at.desc(), Application.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.all()), total
 
 
 async def list_application_ids_by_applicants(
