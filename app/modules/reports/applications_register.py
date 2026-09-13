@@ -3,7 +3,8 @@ the columns the Agency's PM asked for (Odilxon, 2026-09-13): region,
 district, leshoz, contour, the applicant and their phone, the activity, the
 benefit, quantity and area, the filing date, the permit's issue date and
 term, the calculated and the paid amount, the status — as the customer's
-six groups AND as our exact one — and the executor's conclusion.
+six groups AND as our exact one — and the inspector's conclusion from the
+site visit (the newest SIGNED field act on the filing, C6).
 
 It lives in `reports`, not `applications`, because half of those columns
 come from `permits` and `payments` (level 4) and `applications` (level 3)
@@ -32,6 +33,7 @@ from app.modules.applications.models import Application
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.gis import service as gis_service
+from app.modules.inspections import service as inspections_service
 from app.modules.reports import repo
 
 STATUS_LABELS: dict[str, dict[str, str]] = {
@@ -92,6 +94,13 @@ UNIT_LABELS: dict[str, dict[str, str]] = {
     "m3": {"uz_latn": "m³", "ru": "м³"},
     "unit": {"uz_latn": "dona", "ru": "штука"},
 }
+# `inspection_acts.result` → the adminka's word (`inspector.actForm.result.*`);
+# printed as the conclusion when the act carries no notes of its own.
+RESULT_LABELS: dict[str, dict[str, str]] = {
+    "compliant": {"uz_latn": "Mos", "ru": "Соответствует"},
+    "warning": {"uz_latn": "Eslatma", "ru": "Замечание"},
+    "violation": {"uz_latn": "Buzilish", "ru": "Нарушение"},
+}
 TITLE = {"uz_latn": "Arizalar", "ru": "Заявки"}
 FILENAME_STEM = "arizalar"
 
@@ -145,6 +154,19 @@ class Row:
         self.calculated = calculated
         self.paid = paid
         self.conclusion = conclusion
+
+
+def _conclusion(acts: Sequence[Any], lang: xlsx.Lang) -> str | None:
+    """The inspector's word on the filing: the NEWEST signed act's notes, or
+    its result as a word when the inspector wrote none; `None` — an empty
+    cell — while nobody has been out. The list is chronological
+    (`acts_for_applications`), so the newest is the last."""
+    if not acts:
+        return None
+    act = acts[-1]
+    if act.notes:
+        return act.notes
+    return _label(RESULT_LABELS, act.result, lang) if act.result else None
 
 
 def _attr(name: str) -> Callable[[Row], xlsx.CellValue]:
@@ -302,7 +324,7 @@ async def rows(
     permits = await repo.permit_facts_by_application(db, ids)
     calculated = await repo.calculated_amount_by_application(db, ids)
     paid = await repo.paid_amount_by_application(db, ids)
-    conclusions = await repo.executor_conclusion_by_application(db, ids)
+    acts = await inspections_service.acts_for_applications(db, list(ids))
 
     out: list[Row] = []
     for n, app in enumerate(apps, start=1):
@@ -343,7 +365,7 @@ async def rows(
                 permit=permits.get(app.id),
                 calculated=calculated.get(app.id),
                 paid=paid.get(app.id),
-                conclusion=conclusions.get(app.id),
+                conclusion=_conclusion(acts.get(app.id, []), lang),
             )
         )
     return out, total, cap

@@ -2,7 +2,7 @@
 (design/01 rule 5: reports gets read-only access to any table). `permits`,
 `invoices`, `allocations` and `applicants` are imported here, for SELECT
 only, and nowhere else in this module (since 2026-09-14 also `calculations`
-and `application_conclusions`, for the applications register) — the boundary rule is enforced by
+and `application_items`, for the applications register) — the boundary rule is enforced by
 convention (this file is the one place it happens), the same shape
 `norms/repo.py::application_facts` uses for ITS one read-only cross-module
 window. `inspection_result` is the one exception: it comes from
@@ -19,7 +19,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
-from app.modules.applications.models import ApplicationConclusion, ApplicationItem
+from app.modules.applications.models import ApplicationItem
 from app.modules.auth.models import Applicant
 from app.modules.inspections import service as inspections_service
 from app.modules.norms.models import Calculation
@@ -323,15 +323,17 @@ async def report_rows(
 
 # --- the applications register (`applications_register.py`) ------------------
 #
-# Four batch readers, one query each, keyed by application id — the columns
-# the register prints that `applications` (level 3) may not read for itself
-# (`permits`, `invoices` are level 4; `calculations` and
-# `application_conclusions` are its own and `norms`' tables, read here
-# rather than through one service call per row for a 10 000-row file).
-# `DISTINCT ON` picks the newest row per application where several exist,
-# with the same `created_at DESC, id DESC` order `norms.repo` uses for "the
-# newest calculation" — the id tie-break matters because uuid7 is
-# time-ordered and two rows CAN share a `created_at`.
+# Batch readers, one query each, keyed by application id — the columns the
+# register prints that `applications` (level 3) may not read for itself
+# (`permits`, `invoices` are level 4; `calculations` is `norms`' and
+# `application_items` its own, read here rather than through one service
+# call per row for a 10 000-row file). The inspector's conclusion is NOT
+# here: which acts count is `inspections`' rule, so the register asks
+# `inspections.service.acts_for_applications`, as `report_rows` does for
+# permits. `DISTINCT ON` picks the newest calculation where several exist,
+# with the same `created_at DESC, id DESC` order `norms.repo` uses — the id
+# tie-break matters because uuid7 is time-ordered and two rows CAN share a
+# `created_at`.
 
 
 async def permit_facts_by_application(
@@ -378,30 +380,6 @@ async def calculated_amount_by_application(
         .distinct(Calculation.application_id)
         .where(Calculation.application_id.in_(ids))
         .order_by(Calculation.application_id, Calculation.created_at.desc(), Calculation.id.desc())
-    )
-    return {row[0]: row[1] for row in rows}
-
-
-async def executor_conclusion_by_application(
-    db: AsyncSession, ids: set[uuid.UUID]
-) -> dict[uuid.UUID, str]:
-    """The newest EXECUTOR conclusion's text per application (3.9b, `kind`
-    `executor` — the specialist who studied the filing; the GIS specialist's
-    is a separate kind and not what the customer asked to see)."""
-    if not ids:
-        return {}
-    rows = await db.execute(
-        select(ApplicationConclusion.application_id, ApplicationConclusion.text)
-        .distinct(ApplicationConclusion.application_id)
-        .where(
-            ApplicationConclusion.application_id.in_(ids),
-            ApplicationConclusion.kind == "executor",
-        )
-        .order_by(
-            ApplicationConclusion.application_id,
-            ApplicationConclusion.created_at.desc(),
-            ApplicationConclusion.id.desc(),
-        )
     )
     return {row[0]: row[1] for row in rows}
 

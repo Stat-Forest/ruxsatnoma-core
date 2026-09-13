@@ -739,6 +739,25 @@ async def acts_for_permits(
     return by_permit
 
 
+async def acts_for_applications(
+    db: AsyncSession, application_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, list[InspectionAct]]:
+    """Every SIGNED act for each of `application_ids` — the inspector's site
+    visit on a filing (C6) — each application's own list chronological; the
+    read behind the applications register's «conclusion» column (decision
+    #215, `reports.applications_register`). The same rule and the same
+    reasoning as `acts_for_permits` above: which acts COUNT is this
+    module's business, so a reader asks here rather than filtering
+    `inspection_acts` itself."""
+    acts = await repo.acts_for_applications(db, application_ids=application_ids)
+    by_application: dict[uuid.UUID, list[InspectionAct]] = {}
+    for act in acts:
+        if act.application_id is None:
+            continue
+        by_application.setdefault(act.application_id, []).append(act)
+    return by_application
+
+
 async def update_act(
     db: AsyncSession,
     act_id: uuid.UUID,

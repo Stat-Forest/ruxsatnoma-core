@@ -2,7 +2,7 @@
 the same scope, the same filters, readable cells, the id last (stage 13,
 ruling #204), with the columns the Agency's PM asked for on 2026-09-13:
 region, district, phone, benefit, the permit's issue date and term, the
-calculated and the paid amount, the executor's conclusion, and the status
+calculated and the paid amount, the inspector's field conclusion, and the status
 both as the customer's six groups and as our exact one.
 
 The route is served by `reports.applications_register` — a level-5 reader,
@@ -19,11 +19,12 @@ narrows it).
 
 import io
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from openpyxl import load_workbook
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store, xlsx
@@ -31,7 +32,11 @@ from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import APPLICATION_STATUSES
 from app.modules.auth.models import Applicant
+from app.modules.inspections import service as inspections_service
+from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.reports import applications_register as register
+from tests.modules.applications.conftest import unique_pinfl
+from tests.modules.auth.test_sessions import make_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -162,7 +167,7 @@ async def test_the_export_renders_names_labels_and_places_not_codes(
     assert row["Ruxsatnoma muddati: dan"] is None
     assert row["Hisoblangan summa"] is not None  # the filing priced itself
     assert row["Toʻlangan summa"] is None  # nothing paid
-    assert row["Xulosa"] is None  # nobody has written one
+    assert row["Xulosa"] is None  # no inspector has been out yet
     assert row["ID"] == submitted_application
 
     in_russian = await hodim_client.get(
@@ -176,31 +181,77 @@ async def test_the_export_renders_names_labels_and_places_not_codes(
 
 
 async def test_the_export_carries_the_review_columns(
-    db: AsyncSession, application_in_review: str, hodim_client, executor_head_client
+    db: AsyncSession,
+    application_in_review: str,
+    leshoz: Organization,
+    hodim_client,
+    executor_head_client,
 ) -> None:
-    """After the executor's conclusion and the head's approval the row shows
-    the conclusion's text, the calculated amount and the customer's
+    """After the inspector's site visit and the head's approval the row shows
+    the field act's conclusion, the calculated amount and the customer's
     «reviewed» group — while the paid amount stays empty, because nothing
-    has been paid (an invoice is not a payment)."""
+    has been paid (an invoice is not a payment).
+
+    The conclusion is the SIGNED act's notes: a draft act is not yet the
+    inspector's word (`inspections.service.acts_for_applications`), so the
+    draft written first here must not show, and the signed one must."""
     from tests.modules.applications.test_decision import _decide
 
-    written = await hodim_client.post(
-        f"/api/v1/applications/{application_in_review}/conclusion",
-        json={"text": "Комплект полный", "kind": "executor", "recommendation": "approve"},
+    app_id = uuid.UUID(application_in_review)
+    inspector = await make_user(
+        db, role_code="inspector", organization_id=leshoz.id, pinfl=unique_pinfl()
     )
-    assert written.status_code == 201, written.text
+    assert inspector.pinfl is not None
+    # Migration `0026`'s own seeded checklist, the same one the inspections
+    # fixtures read (`default_checklist_id` there is a fixture, not callable).
+    checklist_id = (
+        await db.execute(text("SELECT id FROM checklists WHERE code = 'field_inspection_default'"))
+    ).scalar_one()
+
+    async def act(notes: str):
+        return await inspections_service.create_act(
+            db,
+            task_id=None,
+            permit_id=None,
+            application_id=app_id,
+            occurred_at=datetime.now(UTC),
+            gps=None,
+            gps_accuracy_m=None,
+            checklist_id=checklist_id,
+            answers={"activity_matches": True, "within_contour": True},
+            facts={},
+            notes=notes,
+            result="compliant",
+            created_offline_at=None,
+            actor=inspector,
+        )
+
+    signed = await act("Контур свободен, выпас возможен")
+    await inspections_service.sign_act(
+        db,
+        signed.id,
+        pkcs7=encode_mock_signature(
+            document=inspections_service._act_package_bytes(signed),  # noqa: SLF001
+            serial=f"SN-{inspector.pinfl}",
+            issuer="ISS-1",
+            pinfl=inspector.pinfl,
+        ),
+        violation_type_item_id=None,
+        actor=inspector,
+    )
+    await act("Черновик, не подписан")  # a later DRAFT — must not overtake the signed one
+    await db.commit()
+
     decided = await _decide(executor_head_client, application_in_review, "approve")
     assert decided.status_code == 200, decided.text
 
-    calculation = await applications_service.current_calculation(
-        db, uuid.UUID(application_in_review)
-    )
+    calculation = await applications_service.current_calculation(db, app_id)
     assert calculation is not None
 
     resp = await hodim_client.get(EXPORT, params={"lang": "uz_latn"})
     assert resp.status_code == 200, resp.text
     row = _by_header(resp.content, application_in_review)
-    assert row["Xulosa"] == "Комплект полный"
+    assert row["Xulosa"] == "Контур свободен, выпас возможен"
     assert row["Hisoblangan summa"] == calculation.amount
     assert row["Toʻlangan summa"] is None
     assert row["Holati"] == "Hisob-faktura yuborilgan"  # INVOICED, by the bus
