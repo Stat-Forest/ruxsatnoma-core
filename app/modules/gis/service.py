@@ -1602,6 +1602,7 @@ async def list_contour_features(
     bbox: str | None = None,
     organization_id: uuid.UUID | None = None,
     region_id: uuid.UUID | None = None,
+    tolerance: float | None = None,
     actor: User,
 ) -> dict[str, Any]:
     """`GET /gis/contours/features` — the whole published contour layer as
@@ -1626,7 +1627,12 @@ async def list_contour_features(
         organization_col=Contour.organization_id,
     )
     return await repo.contour_features_geojson(
-        db, bbox=parsed_bbox, zone=zone, organization_id=organization_id, region_id=region_id
+        db,
+        bbox=parsed_bbox,
+        zone=zone,
+        organization_id=organization_id,
+        region_id=region_id,
+        tolerance=tolerance,
     )
 
 

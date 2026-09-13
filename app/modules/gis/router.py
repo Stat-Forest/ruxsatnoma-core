@@ -117,6 +117,7 @@ async def list_contour_features(
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
     region_id: uuid.UUID | None = None,
+    tolerance: Annotated[float | None, Query(gt=0, le=0.05)] = None,
 ) -> FeatureCollectionOut:
     """The published contour layer as GeoJSON — what a map draws before the
     applicant has picked anything. `GET /gis/contours` above answers the same
@@ -130,10 +131,19 @@ async def list_contour_features(
 
     Send a `?bbox=` — without one this is every published contour the caller
     may see, and `truncated` in the response says when that hit the cap.
+
+    `?tolerance=` (degrees, at most 0.05 ≈ 5 km) asks for an overview:
+    simplified geometries under a ten-times-higher cap, for a map zoomed
+    out to a region — see `repo.contour_features_geojson`.
     """
     return FeatureCollectionOut.model_validate(
         await service.list_contour_features(
-            db, bbox=bbox, organization_id=organization_id, region_id=region_id, actor=user
+            db,
+            bbox=bbox,
+            organization_id=organization_id,
+            region_id=region_id,
+            tolerance=tolerance,
+            actor=user,
         )
     )
 

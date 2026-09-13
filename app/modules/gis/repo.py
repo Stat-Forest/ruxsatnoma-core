@@ -739,6 +739,11 @@ async def import_version_statuses(db: AsyncSession, import_id: uuid.UUID) -> lis
 # mistake a clipped collection for the whole layer; the fix is to pass a bbox,
 # and the flag is what tells them to.
 FEATURE_COLLECTION_LIMIT = 2000
+# The cap of an OVERVIEW collection (`tolerance` given): a simplified parcel
+# is a handful of vertices, so ten times the features weigh about the same as
+# a detailed collection — what lets a whole region draw at once (2026-09-13)
+# until vector tiles (3.6b) make the question moot.
+OVERVIEW_FEATURE_LIMIT = 20000
 
 
 async def list_contours(
@@ -857,10 +862,18 @@ async def contour_features_geojson(
     zone: Any,
     organization_id: uuid.UUID | None = None,
     region_id: uuid.UUID | None = None,
+    tolerance: float | None = None,
 ) -> dict[str, Any]:
     """Published contours as a GeoJSON FeatureCollection — the layer a map
     draws when NOTHING is picked yet, so an applicant can see the leshoz's
     parcels at once instead of finding them one at a time in the list.
+
+    `tolerance` (degrees) asks for an OVERVIEW: every geometry is
+    `ST_SimplifyPreserveTopology`-ed to it and written with five decimals
+    (about a metre), and the cap is `OVERVIEW_FEATURE_LIMIT` instead of
+    `FEATURE_COLLECTION_LIMIT`. A zoomed-out map draws parcels a few pixels
+    across, so their vertices are weight without information — this is what
+    lets a whole region show at once. Never for anything but drawing.
 
     Deliberately a sibling of `list_contours` rather than a flag on it: that
     one is PAGED (`?page=&page_size=`, max 100) because it feeds a list, and
@@ -907,6 +920,16 @@ async def contour_features_geojson(
                 func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
             )
         )
+    if tolerance:
+        # `ST_Multi`: simplification hands a one-part MULTIPOLYGON back as a
+        # POLYGON, and a map style keyed on the type would drop it.
+        geometry_sql = func.ST_AsGeoJSON(
+            func.ST_Multi(func.ST_SimplifyPreserveTopology(ContourVersion.geom, tolerance)), 5
+        )
+        limit = OVERVIEW_FEATURE_LIMIT
+    else:
+        geometry_sql = func.ST_AsGeoJSON(ContourVersion.geom)
+        limit = FEATURE_COLLECTION_LIMIT
     rows = (
         await db.execute(
             select(
@@ -914,7 +937,7 @@ async def contour_features_geojson(
                 Contour.number,
                 Contour.organization_id,
                 ContourVersion.area_ha,
-                func.ST_AsGeoJSON(ContourVersion.geom).label("geometry"),
+                geometry_sql.label("geometry"),
             )
             .join(ContourVersion, ContourVersion.contour_id == Contour.id)
             .join(Organization, Organization.id == Contour.organization_id)
@@ -922,11 +945,11 @@ async def contour_features_geojson(
             .order_by(Contour.number)
             # One past the cap, so "there are more" is read off this query
             # rather than a second COUNT over the same predicate.
-            .limit(FEATURE_COLLECTION_LIMIT + 1)
+            .limit(limit + 1)
         )
     ).all()
-    truncated = len(rows) > FEATURE_COLLECTION_LIMIT
-    rows = rows[:FEATURE_COLLECTION_LIMIT]
+    truncated = len(rows) > limit
+    rows = rows[:limit]
     return {
         "type": "FeatureCollection",
         "truncated": truncated,
