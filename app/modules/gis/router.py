@@ -35,6 +35,7 @@ from app.modules.gis.schemas import (
     ContourListItem,
     ContourOut,
     ContourPatch,
+    ExtentOut,
     FeatureCollectionOut,
     SplitIn,
     SplitOut,
@@ -133,6 +134,24 @@ async def list_contour_features(
     return FeatureCollectionOut.model_validate(
         await service.list_contour_features(
             db, bbox=bbox, organization_id=organization_id, region_id=region_id, actor=user
+        )
+    )
+
+
+@router.get("/contours/extent", response_model=ExtentOut)
+async def contours_extent(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+) -> ExtentOut:
+    """The bounding box of the published contours the caller may see under
+    the same filters `/contours/features` takes — what the map fits itself
+    to when a region or a leshoz is picked. **Above `/contours/{contour_id}`
+    for the same reason `/contours/features` is**: `extent` is not a UUID."""
+    return ExtentOut(
+        bbox=await service.contours_extent(
+            db, actor=user, organization_id=organization_id, region_id=region_id
         )
     )
 

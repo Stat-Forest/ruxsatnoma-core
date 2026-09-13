@@ -809,6 +809,47 @@ async def list_contours(
     return list(result.all()), total
 
 
+async def contours_extent(
+    db: AsyncSession,
+    *,
+    zone: Any,
+    organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+) -> tuple[float, float, float, float] | None:
+    """`[west, south, east, north]` of every published contour the caller may
+    see under the given filters, or `None` when there is none — what a map
+    fits itself to when a region or a leshoz is picked (2026-09-13). The same
+    joins, the same zone and the same two filters as `contour_features_geojson`,
+    but ONE aggregate (`ST_Extent`) instead of the geometries themselves, so
+    a whole region's thousands of parcels cost one row."""
+    conditions: list[Any] = [
+        ContourVersion.status == "published",
+        ContourVersion.geom.is_not(None),
+        zone,
+    ]
+    if organization_id is not None:
+        conditions.append(Contour.organization_id == organization_id)
+    if region_id is not None:
+        conditions.append(Organization.region_id == region_id)
+    row = (
+        await db.execute(
+            select(
+                func.ST_XMin(func.ST_Extent(ContourVersion.geom)),
+                func.ST_YMin(func.ST_Extent(ContourVersion.geom)),
+                func.ST_XMax(func.ST_Extent(ContourVersion.geom)),
+                func.ST_YMax(func.ST_Extent(ContourVersion.geom)),
+            )
+            .select_from(Contour)
+            .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+            .join(Organization, Organization.id == Contour.organization_id)
+            .where(*conditions)
+        )
+    ).one()
+    if row[0] is None:
+        return None
+    return (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+
+
 async def contour_features_geojson(
     db: AsyncSession,
     *,

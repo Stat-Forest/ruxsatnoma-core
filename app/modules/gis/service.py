@@ -1630,6 +1630,29 @@ async def list_contour_features(
     )
 
 
+async def contours_extent(
+    db: AsyncSession,
+    *,
+    actor: User,
+    organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+) -> tuple[float, float, float, float] | None:
+    """`GET /gis/contours/extent` — the bounding box of what
+    `list_contour_features` would draw under the same filters, so the map
+    can fly to a region or a leshoz the moment it is picked instead of
+    staying wherever it was. Same zone, built the same way, for the same
+    reason as the two reads above."""
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Contour.organization_id,
+    )
+    return await repo.contours_extent(
+        db, zone=zone, organization_id=organization_id, region_id=region_id
+    )
+
+
 async def contour_card(db: AsyncSession, contour_id: uuid.UUID, *, actor: User) -> dict[str, Any]:
     """`GET /gis/contours/{id}` — the published version's geometry plus the
     same occupancy placeholder `list_contours` carries (ruling 14). Requires a

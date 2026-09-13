@@ -362,3 +362,36 @@ async def test_region_id_narrows_the_list_and_the_features_to_that_region(
         f"/api/v1/gis/contours?region_id={region_a.id}&organization_id={other.id}"
     )
     assert crossed.json()["total"] == 0
+
+
+async def test_extent_is_the_bbox_of_the_filtered_published_contours(
+    db, applicant_client, leshoz, contours_layer, approval_doc
+):
+    """`GET /gis/contours/extent` — what the map flies to when a region or a
+    leshoz is picked. The same filters and zone as `/contours/features`,
+    answered as one `[west, south, east, north]`; `null` when nothing
+    matches, so a map stays put rather than fitting to nothing."""
+    from shapely import wkt as shapely_wkt
+
+    contour = await make_contour(db, contours_layer, leshoz)
+    box = random_box_wkt()
+    await make_version(
+        db,
+        contour.id,
+        box,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    await db.commit()
+    west, south, east, north = shapely_wkt.loads(box).bounds
+
+    resp = await applicant_client.get(f"/api/v1/gis/contours/extent?organization_id={leshoz.id}")
+    assert resp.status_code == 200, resp.text
+    bbox = resp.json()["bbox"]
+    assert bbox is not None
+    assert [round(v, 6) for v in bbox] == [round(v, 6) for v in (west, south, east, north)]
+
+    empty = await applicant_client.get(f"/api/v1/gis/contours/extent?organization_id={uuid7()}")
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["bbox"] is None
