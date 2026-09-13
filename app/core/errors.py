@@ -32,6 +32,12 @@ ERRORS: dict[str, tuple[int, str]] = {
     # collapses to nothing. Never `ERR-GIS-005`: this is a defect in the
     # SUBMITTED GEOMETRY itself, not a conflict with the parent's STATE.
     "ERR-GIS-006": (422, "Части не образуют точное разделение родительского контура"),
+    # `gis.service.contour_kmz` (2026-09-13): the contour exists and is
+    # published, but has no boundary to export — decision #178's `None`
+    # geometry (a version filed by requisites alone, or the leshoz's
+    # `gis_enabled` switch off). Distinct from `ERR-SYS-003` so a client can
+    # tell "no such contour" from "this one was never drawn".
+    "ERR-GIS-007": (404, "У контура нет геометрии"),
     "ERR-NORM-001": (422, "На контуре нет утверждённой нормы"),
     "ERR-NORM-002": (422, "Превышен остаток лимита"),
     "ERR-NORM-003": (422, "Период не соответствует сезону или ротации"),
