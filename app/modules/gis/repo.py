@@ -739,6 +739,11 @@ async def import_version_statuses(db: AsyncSession, import_id: uuid.UUID) -> lis
 # mistake a clipped collection for the whole layer; the fix is to pass a bbox,
 # and the flag is what tells them to.
 FEATURE_COLLECTION_LIMIT = 2000
+# The cap of an OVERVIEW collection (`tolerance` given): a simplified parcel
+# is a handful of vertices, so ten times the features weigh about the same as
+# a detailed collection — what lets a whole region draw at once (2026-09-13)
+# until vector tiles (3.6b) make the question moot.
+OVERVIEW_FEATURE_LIMIT = 20000
 
 
 async def list_contours(
@@ -749,6 +754,7 @@ async def list_contours(
     zone: Any,
     offset: int,
     limit: int,
+    region_id: uuid.UUID | None = None,
 ) -> tuple[list[Any], int]:
     """One row (contour_id, number, organization_id, version_id, area_ha) per
     contour that HAS a published version, matching the given filters. `zone`
@@ -770,6 +776,11 @@ async def list_contours(
     conditions: list[Any] = [ContourVersion.status == "published", zone]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
+    # A region is a filter on the joined `organizations` row, the same column
+    # the zone check reads — a viloyat-wide list for the Viloyat → Xoʻjalik
+    # → Kontur cascade (2026-09-13), not a new axis of its own.
+    if region_id is not None:
+        conditions.append(Organization.region_id == region_id)
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
         conditions.append(
@@ -803,16 +814,66 @@ async def list_contours(
     return list(result.all()), total
 
 
+async def contours_extent(
+    db: AsyncSession,
+    *,
+    zone: Any,
+    organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+) -> tuple[float, float, float, float] | None:
+    """`[west, south, east, north]` of every published contour the caller may
+    see under the given filters, or `None` when there is none — what a map
+    fits itself to when a region or a leshoz is picked (2026-09-13). The same
+    joins, the same zone and the same two filters as `contour_features_geojson`,
+    but ONE aggregate (`ST_Extent`) instead of the geometries themselves, so
+    a whole region's thousands of parcels cost one row."""
+    conditions: list[Any] = [
+        ContourVersion.status == "published",
+        ContourVersion.geom.is_not(None),
+        zone,
+    ]
+    if organization_id is not None:
+        conditions.append(Contour.organization_id == organization_id)
+    if region_id is not None:
+        conditions.append(Organization.region_id == region_id)
+    row = (
+        await db.execute(
+            select(
+                func.ST_XMin(func.ST_Extent(ContourVersion.geom)),
+                func.ST_YMin(func.ST_Extent(ContourVersion.geom)),
+                func.ST_XMax(func.ST_Extent(ContourVersion.geom)),
+                func.ST_YMax(func.ST_Extent(ContourVersion.geom)),
+            )
+            .select_from(Contour)
+            .join(ContourVersion, ContourVersion.contour_id == Contour.id)
+            .join(Organization, Organization.id == Contour.organization_id)
+            .where(*conditions)
+        )
+    ).one()
+    if row[0] is None:
+        return None
+    return (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+
+
 async def contour_features_geojson(
     db: AsyncSession,
     *,
     bbox: tuple[float, float, float, float] | None,
     zone: Any,
     organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+    tolerance: float | None = None,
 ) -> dict[str, Any]:
     """Published contours as a GeoJSON FeatureCollection — the layer a map
     draws when NOTHING is picked yet, so an applicant can see the leshoz's
     parcels at once instead of finding them one at a time in the list.
+
+    `tolerance` (degrees) asks for an OVERVIEW: every geometry is
+    `ST_SimplifyPreserveTopology`-ed to it and written with five decimals
+    (about a metre), and the cap is `OVERVIEW_FEATURE_LIMIT` instead of
+    `FEATURE_COLLECTION_LIMIT`. A zoomed-out map draws parcels a few pixels
+    across, so their vertices are weight without information — this is what
+    lets a whole region show at once. Never for anything but drawing.
 
     Deliberately a sibling of `list_contours` rather than a flag on it: that
     one is PAGED (`?page=&page_size=`, max 100) because it feeds a list, and
@@ -849,6 +910,8 @@ async def contour_features_geojson(
     ]
     if organization_id is not None:
         conditions.append(Contour.organization_id == organization_id)
+    if region_id is not None:
+        conditions.append(Organization.region_id == region_id)
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
         conditions.append(
@@ -857,6 +920,16 @@ async def contour_features_geojson(
                 func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326),
             )
         )
+    if tolerance:
+        # `ST_Multi`: simplification hands a one-part MULTIPOLYGON back as a
+        # POLYGON, and a map style keyed on the type would drop it.
+        geometry_sql = func.ST_AsGeoJSON(
+            func.ST_Multi(func.ST_SimplifyPreserveTopology(ContourVersion.geom, tolerance)), 5
+        )
+        limit = OVERVIEW_FEATURE_LIMIT
+    else:
+        geometry_sql = func.ST_AsGeoJSON(ContourVersion.geom)
+        limit = FEATURE_COLLECTION_LIMIT
     rows = (
         await db.execute(
             select(
@@ -864,7 +937,7 @@ async def contour_features_geojson(
                 Contour.number,
                 Contour.organization_id,
                 ContourVersion.area_ha,
-                func.ST_AsGeoJSON(ContourVersion.geom).label("geometry"),
+                geometry_sql.label("geometry"),
             )
             .join(ContourVersion, ContourVersion.contour_id == Contour.id)
             .join(Organization, Organization.id == Contour.organization_id)
@@ -872,11 +945,11 @@ async def contour_features_geojson(
             .order_by(Contour.number)
             # One past the cap, so "there are more" is read off this query
             # rather than a second COUNT over the same predicate.
-            .limit(FEATURE_COLLECTION_LIMIT + 1)
+            .limit(limit + 1)
         )
     ).all()
-    truncated = len(rows) > FEATURE_COLLECTION_LIMIT
-    rows = rows[:FEATURE_COLLECTION_LIMIT]
+    truncated = len(rows) > limit
+    rows = rows[:limit]
     return {
         "type": "FeatureCollection",
         "truncated": truncated,

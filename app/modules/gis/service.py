@@ -1536,6 +1536,7 @@ async def list_contours(
     *,
     organization_id: uuid.UUID | None = None,
     bbox: str | None = None,
+    region_id: uuid.UUID | None = None,
     params: PageParams,
     actor: User,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -1571,6 +1572,7 @@ async def list_contours(
         db,
         organization_id=organization_id,
         bbox=parsed_bbox,
+        region_id=region_id,
         zone=zone,
         offset=params.offset,
         limit=params.page_size,
@@ -1599,6 +1601,8 @@ async def list_contour_features(
     *,
     bbox: str | None = None,
     organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+    tolerance: float | None = None,
     actor: User,
 ) -> dict[str, Any]:
     """`GET /gis/contours/features` — the whole published contour layer as
@@ -1623,7 +1627,35 @@ async def list_contour_features(
         organization_col=Contour.organization_id,
     )
     return await repo.contour_features_geojson(
-        db, bbox=parsed_bbox, zone=zone, organization_id=organization_id
+        db,
+        bbox=parsed_bbox,
+        zone=zone,
+        organization_id=organization_id,
+        region_id=region_id,
+        tolerance=tolerance,
+    )
+
+
+async def contours_extent(
+    db: AsyncSession,
+    *,
+    actor: User,
+    organization_id: uuid.UUID | None = None,
+    region_id: uuid.UUID | None = None,
+) -> tuple[float, float, float, float] | None:
+    """`GET /gis/contours/extent` — the bounding box of what
+    `list_contour_features` would draw under the same filters, so the map
+    can fly to a region or a leshoz the moment it is picked instead of
+    staying wherever it was. Same zone, built the same way, for the same
+    reason as the two reads above."""
+    zone = zone_filter(
+        zone_of(actor),
+        region_col=Organization.region_id,
+        district_col=Organization.district_id,
+        organization_col=Contour.organization_id,
+    )
+    return await repo.contours_extent(
+        db, zone=zone, organization_id=organization_id, region_id=region_id
     )
 
 

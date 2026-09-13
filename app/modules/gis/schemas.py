@@ -430,6 +430,14 @@ class ContourCardOut(BaseModel):
         return _trim_decimal(value)
 
 
+class ExtentOut(BaseModel):
+    """`GET /gis/contours/extent`. `bbox` is `[west, south, east, north]` in
+    WGS84 — MapLibre's own `fitBounds` order — or `None` when no published
+    contour matches, which a map treats as "stay where you are"."""
+
+    bbox: tuple[float, float, float, float] | None
+
+
 class FeatureCollectionOut(BaseModel):
     """`GET /gis/layers/{code}/features` — built entirely in SQL
     (`gis.repo.features_geojson`); this schema only shapes what the service

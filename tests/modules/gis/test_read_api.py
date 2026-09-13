@@ -2,8 +2,10 @@
 actually read. S_available is a declared placeholder until permits land (ruling 14)."""
 
 import pytest
-from sqlalchemy import func
+from sqlalchemy import func, select
 
+from app.db import uuid7
+from app.modules.admin.models import Organization, Region
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
 
 
@@ -299,3 +301,97 @@ async def test_an_applicant_may_not_ask_for_drafts(applicant_client, published_f
 async def test_an_unknown_status_is_422(gis_client):
     resp = await gis_client.get("/api/v1/gis/layers/fire_bans/features?status=nonsense")
     assert resp.status_code == 422
+
+
+async def test_region_id_narrows_the_list_and_the_features_to_that_region(
+    db, applicant_client, leshoz, contours_layer, approval_doc
+):
+    """`?region_id=` is the first step of the Viloyat → Xoʻjalik → Kontur
+    cascade (2026-09-13): a filter on the joined `organizations.region_id`,
+    the column the zone check already reads. Two fresh leshozes in two
+    regions, one published contour each; the region of the first answers
+    exactly its own contour on both read routes and the export shares the
+    same path through `service.list_contours`."""
+    # Two regions NO other test zones an actor to (fergana/andijan/
+    # karakalpakstan are taken): the rows below stay in the shared,
+    # persistent test DB, and a region-scoped export test elsewhere asserts
+    # its own region has nothing to show.
+    regions = select(Region).where(Region.code.in_(("jizzakh", "navoiy"))).order_by(Region.code)
+    region_a, region_b = (await db.execute(regions)).scalars().all()
+    leshoz.region_id = region_a.id
+    other = Organization(
+        id=uuid7(),
+        code=f"R{leshoz.code[1:]}",
+        name={"uz_latn": "Boshqa viloyat OʻX"},
+        kind="leshoz",
+        parent_id=leshoz.parent_id,
+        region_id=region_b.id,
+    )
+    db.add(other)
+    await db.flush()
+    mine = await make_contour(db, contours_layer, leshoz)
+    theirs = await make_contour(db, contours_layer, other)
+    for contour in (mine, theirs):
+        await make_version(
+            db,
+            contour.id,
+            random_box_wkt(),
+            status="published",
+            approval_doc_id=approval_doc.id,
+            published_at=func.now(),
+        )
+    await db.commit()
+
+    listing = await applicant_client.get(
+        f"/api/v1/gis/contours?region_id={region_a.id}&page_size=100"
+    )
+    assert listing.status_code == 200, listing.text
+    ids = {item["id"] for item in listing.json()["items"]}
+    assert str(mine.id) in ids
+    assert str(theirs.id) not in ids
+
+    features = await applicant_client.get(f"/api/v1/gis/contours/features?region_id={region_a.id}")
+    assert features.status_code == 200, features.text
+    feature_ids = {f["id"] for f in features.json()["features"]}
+    assert str(mine.id) in feature_ids
+    assert str(theirs.id) not in feature_ids
+
+    # Combined with an organization of ANOTHER region the two filters
+    # intersect to nothing — the region never widens an organization filter.
+    crossed = await applicant_client.get(
+        f"/api/v1/gis/contours?region_id={region_a.id}&organization_id={other.id}"
+    )
+    assert crossed.json()["total"] == 0
+
+
+async def test_extent_is_the_bbox_of_the_filtered_published_contours(
+    db, applicant_client, leshoz, contours_layer, approval_doc
+):
+    """`GET /gis/contours/extent` — what the map flies to when a region or a
+    leshoz is picked. The same filters and zone as `/contours/features`,
+    answered as one `[west, south, east, north]`; `null` when nothing
+    matches, so a map stays put rather than fitting to nothing."""
+    from shapely import wkt as shapely_wkt
+
+    contour = await make_contour(db, contours_layer, leshoz)
+    box = random_box_wkt()
+    await make_version(
+        db,
+        contour.id,
+        box,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    await db.commit()
+    west, south, east, north = shapely_wkt.loads(box).bounds
+
+    resp = await applicant_client.get(f"/api/v1/gis/contours/extent?organization_id={leshoz.id}")
+    assert resp.status_code == 200, resp.text
+    bbox = resp.json()["bbox"]
+    assert bbox is not None
+    assert [round(v, 6) for v in bbox] == [round(v, 6) for v in (west, south, east, north)]
+
+    empty = await applicant_client.get(f"/api/v1/gis/contours/extent?organization_id={uuid7()}")
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["bbox"] is None

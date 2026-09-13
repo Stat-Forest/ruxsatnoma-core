@@ -183,3 +183,51 @@ async def test_an_unknown_organization_filter_answers_an_empty_collection(applic
     assert resp.status_code == 200, resp.text
     assert resp.json()["features"] == []
     assert resp.json()["truncated"] is False
+
+
+async def test_tolerance_answers_a_simplified_overview_of_the_same_contours(
+    db, applicant_client, leshoz, contours_layer, approval_doc
+):
+    """`?tolerance=` is for a map zoomed out to a region: the same contours,
+    each geometry simplified to the tolerance and written with five decimals,
+    so thousands of parcels weigh what hundreds of detailed ones do. A
+    polygon with a jagged edge loses the jag; a tolerance out of range is a
+    422, not a silently detailed answer."""
+    lon, lat = random_anchor()
+    # A rectangle with sixteen tiny notches along its northern edge — every
+    # one of them is under a metre and vanishes at a tolerance of 0.0005°.
+    step = 0.01 / 16
+    notched = [(lon + i * step, lat + 0.01 + (0.000004 if i % 2 else 0)) for i in range(17)]
+    ring = [(lon, lat), (lon + 0.01, lat)] + [(x, y) for x, y in reversed(notched)] + [(lon, lat)]
+    wkt = "MULTIPOLYGON(((" + ",".join(f"{x} {y}" for x, y in ring) + ")))"
+    contour = await make_contour(db, contours_layer, leshoz)
+    await make_version(
+        db,
+        contour.id,
+        wkt,
+        status="published",
+        approval_doc_id=approval_doc.id,
+        published_at=func.now(),
+    )
+    await db.commit()
+
+    detailed = await applicant_client.get(
+        f"/api/v1/gis/contours/features?organization_id={leshoz.id}"
+    )
+    overview = await applicant_client.get(
+        f"/api/v1/gis/contours/features?organization_id={leshoz.id}&tolerance=0.0005"
+    )
+    assert overview.status_code == 200, overview.text
+    detailed_geom = _features_by_id(detailed.json())[str(contour.id)]["geometry"]
+    overview_geom = _features_by_id(overview.json())[str(contour.id)]["geometry"]
+    assert overview_geom["type"] == detailed_geom["type"] == "MultiPolygon"
+    detailed_ring = detailed_geom["coordinates"][0][0]
+    overview_ring = overview_geom["coordinates"][0][0]
+    assert len(detailed_ring) == len(ring)
+    assert len(overview_ring) == 5, overview_ring
+    assert all(len(str(v).split(".")[-1]) <= 5 for point in overview_ring for v in point)
+
+    too_coarse = await applicant_client.get(
+        f"/api/v1/gis/contours/features?organization_id={leshoz.id}&tolerance=1"
+    )
+    assert too_coarse.status_code == 422
