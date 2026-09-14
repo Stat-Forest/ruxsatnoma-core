@@ -24,7 +24,7 @@ from app.modules.auth.models import Applicant
 from app.modules.inspections import service as inspections_service
 from app.modules.norms.models import Calculation
 from app.modules.payments.models import Allocation, Invoice
-from app.modules.permits.models import Permit
+from app.modules.permits.models import Permit, display_number
 from app.modules.reports.models import Report, ReportForm
 
 # --- report_forms ------------------------------------------------------------
@@ -286,7 +286,7 @@ async def report_rows(
         )
         rows.append(
             {
-                "permit_series_number": f"{r.series} № {r.number:06d}",
+                "permit_series_number": display_number(r.series, r.number),
                 "legal_name": r.name if r.kind == "legal" else None,
                 "legal_stir": r.stir,
                 "individual_name": r.name if r.kind == "individual" else None,

@@ -258,7 +258,7 @@ async def test_zone_scoped_actor_does_not_see_another_orgs_permit(
 #
 # Stage 7.3 finding F21: `search_permits` built its display number as
 # `"<series>-<number>"`, so a permit whose document, whose card and whose public
-# check page all read `А № 000003` was found by typing `А-3` and by nothing
+# check page all read `А №000003` was found by typing `А-3` and by nothing
 # else. A prosecutor or an inspector types what is on the paper.
 
 
@@ -283,7 +283,7 @@ async def test_a_permit_is_found_by_the_number_printed_on_it(
     )
     await db.commit()
 
-    printed = f"{permit.series} № {permit.number:06d}"
+    printed = f"{permit.series} №{permit.number:06d}"
     padded = f"{permit.number:06d}"
 
     async for client in _client_for(db, SEARCH_USE, organization_id=leshoz.id):
@@ -326,4 +326,4 @@ async def test_the_search_result_shows_the_printed_number_not_an_internal_form(
             params={"kind": "permits", "q": f"{permit.number:06d}", "page_size": 100},
         )
         row = next(r for r in resp.json()["items"] if r["id"] == str(permit.id))
-        assert row["number"] == f"{permit.series} № {permit.number:06d}"
+        assert row["number"] == f"{permit.series} №{permit.number:06d}"

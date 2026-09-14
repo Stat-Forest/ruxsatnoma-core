@@ -25,11 +25,14 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    ColumnElement,
     ForeignKey,
     Index,
     Integer,
     Numeric,
+    String,
     UniqueConstraint,
+    cast,
     func,
     text,
 )
@@ -360,3 +363,24 @@ class PermitRating(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     __table_args__ = (CheckConstraint("score BETWEEN 1 AND 5", name="score_valid"),)
+
+
+# The permit's number as a person reads it — «А №000004»: the series, a space, №
+# glued to six digits (Oybek, 2026-09-14: no space after №; `design/03` and the
+# blank's «серия __ № 000000» header are the six digits). ONE spelling: the
+# document, every notification, the exports and the search index print
+# `display_number`, and a list filtered or displayed in SQL uses its twin below
+# — a result list spelling the same identifier a second way is how a person
+# decides they found a different permit (stage 7.3, finding F21).
+NUMBER_SEPARATOR = " №"
+
+
+def display_number(series: str, number: int) -> str:
+    return f"{series}{NUMBER_SEPARATOR}{number:06d}"
+
+
+def display_number_sql() -> ColumnElement[str]:
+    """`display_number` as a SQL expression over `Permit` — for a `q` filter or a
+    result column. Asserted equal to the Python form on a real row in
+    `tests/modules/permits/test_display_number.py`."""
+    return Permit.series + NUMBER_SEPARATOR + func.lpad(cast(Permit.number, String), 6, "0")

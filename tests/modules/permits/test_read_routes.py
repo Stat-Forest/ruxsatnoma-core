@@ -635,7 +635,7 @@ async def test_q_finds_a_permit_by_the_holders_name_and_by_its_printed_number(
     assert by_name.status_code == 200, by_name.text
     assert [row["id"] for row in by_name.json()["items"]] == [str(issued_permit.id)]
 
-    printed = f"{issued_permit.series} № {issued_permit.number:06d}"
+    printed = f"{issued_permit.series} №{issued_permit.number:06d}"
     by_number = await zone_staff_client.get(f"{API}/permits", params={"q": printed})
     assert [row["id"] for row in by_number.json()["items"]] == [str(issued_permit.id)]
 
