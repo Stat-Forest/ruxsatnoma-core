@@ -114,6 +114,13 @@ BLOCKING = frozenset(_ERROR_BY_CHECK_TYPE)
 # table and therefore cannot be missing.
 REQUIRED_FOR_PRICING = ("activity_type_id", "contour_id", "period_from", "period_to")
 
+# Decision #215 R6. Keyed by `activity_types.code`; the permit blank of each
+# activity prints these lines, so a filing without them would print «None».
+BLANK_FIELDS_BY_ACTIVITY: dict[str, tuple[str, ...]] = {
+    "deadwood": ("deadwood_product", "removal_deadline"),
+    "recreation": ("recreation_purpose", "event_at"),
+}
+
 
 def _jsonable(value: Any) -> Any:
     """A check's `details` as a JSONB column and a `DomainError` response can
@@ -257,6 +264,11 @@ async def missing_for_pricing(
             missing.append("items")
     elif application.quantity is None:
         missing.append("quantity")
+    # Decision #215 R6: the blank's own lines, for the activity whose blank prints
+    # them and no other. A haymaking filing is not asked for a removal deadline.
+    for name in BLANK_FIELDS_BY_ACTIVITY.get(activity.code, ()):
+        if getattr(application, name) is None:
+            missing.append(name)
     return missing
 
 

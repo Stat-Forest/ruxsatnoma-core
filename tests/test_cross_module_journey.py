@@ -983,6 +983,12 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                         "period_from": "2027-09-01",
                         "period_to": "2027-09-30",
                         "quantity": "2",
+                        # Decision #215 R6 (stage 15): recreation's own blank
+                        # lines, required by `checks.missing_for_pricing` since
+                        # `BLANK_FIELDS_BY_ACTIVITY` — without them this filing
+                        # 400s before reaching what this journey means to test.
+                        "recreation_purpose": "recreational",
+                        "event_at": "2027-09-01T09:00:00+05:00",
                         "benefit_category_item_id": str(benefit_category_item_id),
                         "benefit_certificate_no": "VET-0001",
                         "documents": [

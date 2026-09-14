@@ -520,6 +520,10 @@ def _snapshot(application: Application, items: list[ApplicationItem]) -> dict[st
             "period_to",
             "quantity",
             "benefit_category_item_id",
+            "deadwood_product",
+            "removal_deadline",
+            "recreation_purpose",
+            "event_at",
         )
     }
     snapshot["items"] = [
@@ -1820,6 +1824,10 @@ async def _build_filing(
         quantity=payload.quantity,
         benefit_category_item_id=payload.benefit_category_item_id,
         benefit_certificate_no=payload.benefit_certificate_no,
+        deadwood_product=payload.deadwood_product,
+        removal_deadline=payload.removal_deadline,
+        recreation_purpose=payload.recreation_purpose,
+        event_at=payload.event_at,
     )
     items = [
         ApplicationItem(livestock_type_id=item.livestock_type_id, head_count=item.head_count)
@@ -3452,11 +3460,14 @@ async def clone_template(
     What copies is the request itself: who is filing and on whose authority
     (`applicant_id`, `on_behalf`), the plot and activity (`contour_id`,
     `activity_type_id`), the declared period, quantity and herd
-    (`period_from`, `period_to`, `quantity`, `items`) and the claimed
-    `benefit_category_item_id` with its certificate number. The period comes
-    along with the rest of the request rather than being left blank: a
-    template an applicant cannot file without retyping fields that did not
-    change (the plot, the herd) would save them nothing.
+    (`period_from`, `period_to`, `quantity`, `items`), the claimed
+    `benefit_category_item_id` with its certificate number, and (decision
+    #215 R6, stage 15) the deadwood/recreation blank lines
+    (`deadwood_product`, `removal_deadline`, `recreation_purpose`,
+    `event_at`) — a choice the applicant made, not something the source
+    earned. The period comes along with the rest of the request rather than
+    being left blank: a template an applicant cannot file without retyping
+    fields that did not change (the plot, the herd) would save them nothing.
 
     Ownership only — 404 for a stranger, never 403 (the module's one answer
     to "does this id exist"). No lock, no write, no audit: a read.
@@ -3479,6 +3490,10 @@ async def clone_template(
         ],
         benefit_category_item_id=source.benefit_category_item_id,
         benefit_certificate_no=source.benefit_certificate_no,
+        deadwood_product=source.deadwood_product,  # type: ignore[arg-type]  # CHECK-backed literal
+        removal_deadline=source.removal_deadline,
+        recreation_purpose=source.recreation_purpose,  # type: ignore[arg-type]  # CHECK-backed literal
+        event_at=source.event_at,
     )
 
 
