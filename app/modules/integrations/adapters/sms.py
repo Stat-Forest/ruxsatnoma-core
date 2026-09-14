@@ -13,26 +13,34 @@ from app.config import Settings, get_settings
 logger = structlog.get_logger(__name__)
 
 
+# Eskiz validates `user_sms_id` as a number of at most twelve digits — measured
+# live on 2026-09-14: `999999999999` accepted, `1000000000000`, a uuid and a
+# uuid's hex refused with `400 user_sms_id is invalid`.
+MAX_REFERENCE_DIGITS = 12
+
+
 class SmsSender(Protocol):
     async def send(
-        self, *, phone: str, text: str, reference: str, delivery_report: bool = True
+        self, *, phone: str, text: str, reference: str | None = None, delivery_report: bool = True
     ) -> str | None:
-        """Deliver one SMS. `reference` is our own correlation id (the notification
-        uuid), echoed back by the provider's delivery report. Returns the provider's
-        message id when it supplies one. Raises on failure — the outbox retries.
+        """Deliver one SMS. `reference` is our own correlation id — the
+        notification's numeric `provider_reference`, as decimal digits — echoed
+        back by the provider's delivery report. Returns the provider's message id
+        when it supplies one. Raises on failure — the outbox retries.
 
-        `delivery_report=False` opts out of the provider callback for sends that
-        have no `notifications` row to correlate a report against — OTP today. A
-        report we cannot correlate is a dead letter, not information."""
+        `reference=None` with `delivery_report=False` is a send that has no
+        `notifications` row to correlate a report against — OTP today. A report
+        we cannot correlate is a dead letter, not information, so such a send
+        carries neither an id for the provider to echo nor a callback."""
         ...
 
 
 class MockSmsSender:
     def __init__(self) -> None:
-        self.sent: list[tuple[str, str, str]] = []
+        self.sent: list[tuple[str, str, str | None]] = []
 
     async def send(
-        self, *, phone: str, text: str, reference: str, delivery_report: bool = True
+        self, *, phone: str, text: str, reference: str | None = None, delivery_report: bool = True
     ) -> str | None:
         self.sent.append((phone, text, reference))
         # Masked exactly like the Eskiz sender: this class is the copy-paste source
@@ -112,15 +120,22 @@ class EskizSmsSender:
         return self._token if fresh and self._token else await self._login(client)
 
     async def send(
-        self, *, phone: str, text: str, reference: str, delivery_report: bool = True
+        self, *, phone: str, text: str, reference: str | None = None, delivery_report: bool = True
     ) -> str | None:
+        if reference is not None and not (
+            reference.isdigit() and len(reference) <= MAX_REFERENCE_DIGITS
+        ):
+            # Our own code shaped the id wrongly — a defect, not a provider
+            # failure: never an `EskizError` the outbox would retry to death.
+            raise ValueError(f"sms reference must be 1-{MAX_REFERENCE_DIGITS} digits")
         digits = "".join(ch for ch in phone if ch.isdigit())
         payload = {
             "mobile_phone": digits,
             "message": text,
             "from": self._settings.eskiz_sender,
-            "user_sms_id": reference,
         }
+        if reference is not None:
+            payload["user_sms_id"] = reference
         # Eskiz posts a report for every message that carries a callback_url. An OTP
         # send has no `notifications` row behind its reference, so its report would
         # dead-letter every single time — one inbound_dead_letters row (holding the

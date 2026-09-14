@@ -1,7 +1,6 @@
 """OTP delivery seam (SMS/email). Real SMS is Eskiz, real email is SMTP (3.5 Task
 6). The mock logs the code and keeps it in memory so dev and tests can read it."""
 
-import uuid
 from functools import lru_cache
 from typing import Protocol
 
@@ -41,14 +40,15 @@ class RealOtpSender:
     async def send(self, *, target_type: str, target: str, code: str) -> None:
         text = OTP_TEXT.format(code=code)
         if target_type == "phone":
-            # No delivery report: the reference below is a throwaway id that matches
-            # no `notifications` row, so every report Eskiz posted for it would be
-            # dead-lettered (with the phone number in the stored payload). OTP
-            # success is the user entering the code, never a provider callback.
+            # No reference and no delivery report: an OTP has no `notifications`
+            # row, so every report Eskiz posted for it would be dead-lettered (with
+            # the phone number in the stored payload), and any id we invented for
+            # it would name nothing. OTP success is the user entering the code,
+            # never a provider callback.
             await get_sms_sender().send(
                 phone=target,
                 text=text,
-                reference=str(uuid.uuid4()),
+                reference=None,
                 delivery_report=False,
             )
         else:

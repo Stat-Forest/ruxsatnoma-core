@@ -84,6 +84,12 @@ async def get_notification(db: AsyncSession, notification_id: uuid.UUID) -> Noti
     return await db.get(Notification, notification_id)
 
 
+async def get_by_provider_reference(db: AsyncSession, reference: int) -> Notification | None:
+    return (
+        await db.execute(select(Notification).where(Notification.provider_reference == reference))
+    ).scalar_one_or_none()
+
+
 async def get_by_provider_message_id(
     db: AsyncSession, provider_message_id: str
 ) -> Notification | None:

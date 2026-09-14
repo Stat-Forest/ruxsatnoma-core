@@ -373,22 +373,18 @@ Tooling and environment.
   `zone_filter` "on whose rows": `GET /admin/users/{id}/permissions` had the first and not
   the second, so a regional admin read another region's user (3.3b, `aa1d551`). `sys_admin`
   skips `require_permission` (decision #41), but `GET /auth/me` reported an empty
-  `permissions[]` for one — fully privileged in fact, powerless on screen (3.3a). And
-  `permits._readable_permit` admitted only the holder or `permits.view_any`, while
-  `add_signature` independently admitted the three required official signers — so the head,
-  chief forester and accountant could SIGN a permit they could not OPEN, and no permit was
-  signable through the UI at all (3.11a, found by an end-to-end run, not by any suite).
+  `permissions[]` for one (3.3a). `permits._readable_permit` admitted only the holder or
+  `permits.view_any` while `add_signature` admitted the three official signers — so they
+  could SIGN a permit they could not OPEN, and none was signable through the UI (3.11a).
 - **How to apply:** Adding a path near a guarded one, copy its scoping, not just its
-  permission code, and add a cross-zone/cross-org denial test. When a read and a write guard
-  the same object, the read derives its rule from the write's own sources — the permits fix
-  intersects `required_purposes()` with `signers.required_role()` and reuses the write path's
-  organization equality.
+  permission code, and add a cross-zone/cross-org denial test. A read guarding the same
+  object as a write derives its rule from the write's own sources — the permits fix
+  intersects `required_purposes()` with `signers.required_role()`.
 - **Across a module-level boundary, the source moves down, never copies:** `norms` (level
-  2) needed applications' "was this actor the one who forwarded it" fact for ruling #107's
-  calculation read, and could not import it from `applications` (level 3). Fix: the
-  constant and its predicate moved to the lowest module both already call downward
-  (`audit`, level 0: `APPLICATION_FORWARD`/`logged_by`), not copied as a second literal or
-  bolted onto ruling 20's unrelated table grant (F7, `docs/plans/07.4-findings.md`).
+  2) needed applications' "was this actor the forwarder" fact (ruling #107) and could not
+  import `applications` (level 3): the constant and its predicate moved to the lowest module
+  both already call (`audit`: `APPLICATION_FORWARD`/`logged_by`), not copied as a second
+  literal (F7, `docs/plans/07.4-findings.md`).
 
 ## A role's identity and its grants have ONE source — the seeding migration, never a name or a docstring standing in for it
 
@@ -887,6 +883,12 @@ Tooling and environment.
   direct-ORM `pytest.raises` for a CHECK). Add a direct in-process call to each NEW surface
   function inside the SAME test, reusing its committed fixtures. A negative control that stays
   green means the guard is redundant or the call is unreached — never that it works.
+- **The mirror for a provider client:** a suite over `httpx.MockTransport` asserts OUR reading
+  of the contract, so it cannot go red on the provider's. 3.5's Eskiz client sent the
+  notification uuid as `user_sms_id`, its test asserted exactly that, and the first live
+  message (2026-09-14) answered `400 user_sms_id is invalid` — digits, at most twelve. One
+  live call per request shape, on the cheapest account and text, BEFORE `*_mode=real` is
+  offered; the measured limit becomes a constant (`sms.MAX_REFERENCE_DIGITS`) and a test.
 
 ## A test that reads the machine — its clock, its fonts, its runtime — is a scheduled failure
 
