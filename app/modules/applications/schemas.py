@@ -315,6 +315,30 @@ class ApplicationConclusionOut(BaseModel):
     created_at: datetime
 
 
+class BenefitClaimMonitorOut(BaseModel):
+    """One row of `GET /applications/beekeeping` (ruling #217): what the
+    Beekeeping Union's registrar may see of an application claiming its
+    members' benefit — the claim, its fate, who filed it and where it sits.
+    Deliberately NOT `ApplicationOut`: the registrar holds no application
+    read code, and the card's forty columns are not theirs to read."""
+
+    id: uuid.UUID
+    number: str | None
+    status: ApplicationStatus
+    applicant_name: str
+    # The leshoz's localized name AS STORED (`{"uz_latn": …, "ru": …}`), not
+    # re-validated as `LocalizedName` on the way out: a monitoring list must
+    # never answer 500 over one organization's name shape — the screen picks
+    # the language and falls back itself.
+    organization_name: dict[str, str] | None
+    benefit_certificate_no: str | None
+    benefit_verification_status: BenefitVerificationStatus
+    period_from: date | None
+    period_to: date | None
+    submitted_at: datetime | None
+    decided_at: datetime | None
+
+
 class ApplicationOut(BaseModel):
     """The application's own columns — the response to create and patch, and one
     row of `GET /applications`.

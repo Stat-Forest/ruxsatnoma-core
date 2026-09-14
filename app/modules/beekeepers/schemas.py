@@ -14,7 +14,7 @@ already enforces.
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -42,6 +42,7 @@ class BeekeeperOut(BaseModel):
     stir: str | None
     full_name: str
     farm_name: str | None
+    valid_to: date | None
     status: str
     removed_reason: str | None
     created_by: uuid.UUID
@@ -60,6 +61,9 @@ class BeekeeperCreateIn(BaseModel):
     stir: Stir | None = None
     full_name: NonBlankStr
     farm_name: str | None = None
+    # Ruling #217: the certificate's term, optional — a registrar copying a
+    # certificate without one leaves it blank rather than inventing a date.
+    valid_to: date | None = None
 
 
 class BeekeeperPatchIn(BaseModel):
@@ -77,6 +81,7 @@ class BeekeeperPatchIn(BaseModel):
     stir: Stir | None = None
     full_name: NonBlankStr | None = None
     farm_name: str | None = None
+    valid_to: date | None = None
 
 
 class BeekeeperRemoveIn(BaseModel):

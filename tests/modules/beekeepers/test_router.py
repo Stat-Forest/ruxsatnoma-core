@@ -321,3 +321,54 @@ async def test_an_explicit_null_on_a_required_field_is_a_422_not_a_500(db):
     assert r.status_code == 422, r.text
     assert r.json()["error"]["code"] == "ERR-VAL-001"
     assert r.json()["error"]["details"]["fields"] == ["full_name", "pinfl"]
+
+
+async def test_the_term_is_stored_patched_and_audited(db):
+    """Ruling #217: `valid_to` on create and patch, echoed on the wire and
+    spelled out (ISO) in the audit snapshot — a `date` at the JSON boundary."""
+    user, token, csrf = await registrar_client(db, BEEKEEPERS_MANAGE)
+    app = create_app()
+    certificate_no = f"T-{uuid.uuid4().hex[:8]}"
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        r_create = await client.post(
+            f"{API}/beekeepers",
+            json={
+                "certificate_no": certificate_no,
+                "pinfl": unique_pinfl(),
+                "passport_series": "AB",
+                "passport_number": "1234567",
+                "full_name": "Term Holder",
+                "valid_to": "2025-12-31",
+            },
+        )
+        assert r_create.status_code == 201, r_create.text
+        assert r_create.json()["valid_to"] == "2025-12-31"
+        beekeeper_id = r_create.json()["id"]
+
+        r_patch = await client.patch(
+            f"{API}/beekeepers/{beekeeper_id}", json={"valid_to": "2026-12-31"}
+        )
+        assert r_patch.status_code == 200, r_patch.text
+        assert r_patch.json()["valid_to"] == "2026-12-31"
+
+        r_clear = await client.patch(f"{API}/beekeepers/{beekeeper_id}", json={"valid_to": None})
+        assert r_clear.status_code == 200, r_clear.text
+        assert r_clear.json()["valid_to"] is None
+
+    rows = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.object_id == uuid.UUID(beekeeper_id))
+                .order_by(AuditLog.occurred_at, AuditLog.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    actions = [row.action for row in rows]
+    assert actions[:2] == ["beekeeper.create", "beekeeper.update"]
+    assert rows[0].new_value["valid_to"] == "2025-12-31"
+    assert rows[1].old_value["valid_to"] == "2025-12-31"
+    assert rows[1].new_value["valid_to"] == "2026-12-31"

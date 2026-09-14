@@ -44,6 +44,12 @@ def columns(lang: xlsx.Lang) -> list[xlsx.Column[BeekeeperOut]]:
             b("farm_name"),
             30,
         ),
+        xlsx.Column(
+            "valid_to",
+            {"uz_latn": "Amal qilish muddati", "ru": "Действует до"},
+            b("valid_to"),
+            14,
+        ),
         # No passport series/number and no STIR: the screen shows neither, and
         # identity documents in a bulk file are a step the screen never takes
         # (ruling R4 adds USEFUL hidden fields, not more personal data). The

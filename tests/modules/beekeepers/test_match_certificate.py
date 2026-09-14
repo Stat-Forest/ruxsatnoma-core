@@ -5,7 +5,9 @@ layer of indirection through the HTTP API (`test_router.py` already walks
 that layer for the CRUD routes)."""
 
 import uuid
+from datetime import date
 
+from app.core.time import business_today
 from app.modules.beekeepers import repo
 from app.modules.beekeepers.models import Beekeeper
 from app.modules.beekeepers.service import MatchResult, match_certificate
@@ -129,3 +131,33 @@ async def test_not_yours_when_neither_pinfl_nor_stir_is_given(db):
     result = await match_certificate(db, certificate_no=certificate_no, pinfl=None, stir=None)
 
     assert result == MatchResult(status="not_yours", beekeeper_id=None)
+
+
+async def test_expired_when_the_term_has_passed(db):
+    """Ruling #217: the certificate carries a term («Действует до
+    31.12.2025»). Past it the identity still owns the number — so `expired`
+    names the row, never `unknown` (which would send the member to check a
+    number that is real) and never `not_yours`."""
+    certificate_no = f"AUZ-{uuid.uuid4().hex[:10]}"
+    pinfl = unique_pinfl()
+    row = await make_beekeeper(db, certificate_no=certificate_no, pinfl=pinfl)
+    row.valid_to = date(2025, 12, 31)
+    await db.commit()
+
+    result = await match_certificate(db, certificate_no=certificate_no, pinfl=pinfl, stir=None)
+
+    assert result == MatchResult(status="expired", beekeeper_id=row.id)
+
+
+async def test_a_term_ending_today_still_matches(db):
+    """`valid_to` is inclusive — «до 31.12» includes the 31st — and a row
+    with no term never expires."""
+    certificate_no = f"AUZ-{uuid.uuid4().hex[:10]}"
+    pinfl = unique_pinfl()
+    row = await make_beekeeper(db, certificate_no=certificate_no, pinfl=pinfl)
+    row.valid_to = business_today()
+    await db.commit()
+
+    result = await match_certificate(db, certificate_no=certificate_no, pinfl=pinfl, stir=None)
+
+    assert result == MatchResult(status="matched", beekeeper_id=row.id)

@@ -60,6 +60,10 @@ EXPORT_BACKLOG = {
     # calendar) stay here until somebody asks for them
     "/api/v1/calculations",
     "/api/v1/activity-seasons",
+    # Ruling #217 — the Union's monitoring of its members' applications: a
+    # register by #207's own criterion, opened as a 10-minute slice without
+    # its sibling; the export follows when the Union asks for a file
+    "/api/v1/applications/beekeeping",
 }
 
 # No export by design: the public site's lists (anonymous callers, no

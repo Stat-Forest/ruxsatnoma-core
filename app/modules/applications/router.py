@@ -69,6 +69,7 @@ from app.modules.applications.schemas import (
     ApplicationStatus,
     ApplicationSubmitIn,
     ApplicationTimelineOut,
+    BenefitClaimMonitorOut,
     FilingPackageOut,
     PrecheckCalculationOut,
     PrecheckCheckOut,
@@ -81,6 +82,7 @@ from app.modules.auth.deps import (
     require_permission,
 )
 from app.modules.auth.models import User
+from app.modules.beekeepers.permissions import BEEKEEPERS_MANAGE
 
 router = APIRouter(tags=["applications"])
 
@@ -232,6 +234,22 @@ async def list_applications(
         page=params.page,
         page_size=params.page_size,
     )
+
+
+@router.get("/applications/beekeeping", response_model=Page[BenefitClaimMonitorOut])
+async def list_beekeeping_claims(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    params: Annotated[PageParams, Depends()],
+    _: Annotated[User, Depends(require_permission(BEEKEEPERS_MANAGE))],
+    status: ApplicationStatus | None = None,
+) -> Page[BenefitClaimMonitorOut]:
+    """Ruling #217: the Beekeeping Union's registrar monitors, country-wide,
+    every application claiming `beekeeping_union_member` — and nothing else.
+    Gated on `beekeepers.manage`, the register's own code, not on any
+    application read code: a leshoz reviewer has their own list, and this
+    one carries a deliberately narrow shape. Declared before
+    `/applications/{application_id}` so the literal path wins."""
+    return await service.list_beekeeping_claims(db, params=params, status=status)
 
 
 @router.get("/applications/{application_id}")
