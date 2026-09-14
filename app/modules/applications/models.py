@@ -97,6 +97,11 @@ CHECK_SOURCES = ("auto", "external_api", "manual_fallback")
 ASSIGNMENT_REASONS = ("auto", "absence", "manual")
 CONCLUSION_KINDS = ("executor", "gis")
 CONCLUSION_RECOMMENDATIONS = ("approve", "reject")
+# Stage 15 (decision #215 R6): the two blank-field codes. Mirrored as literals in
+# migration 0061 (a migration is frozen history and does not import the app) and
+# will grow `schemas.DeadwoodProduct`/`.RecreationPurpose` `Literal`s in a later task.
+DEADWOOD_PRODUCTS = ("firewood", "branches", "both")
+RECREATION_PURPOSES = ("cultural_educational", "upbringing", "health", "recreational", "aesthetic")
 
 
 class Application(Base):
@@ -175,6 +180,17 @@ class Application(Base):
     )
     benefit_verified_at: Mapped[datetime | None]
     benefit_rejection_reason: Mapped[str | None]
+    # Stage 15 (decision #215 R6): the lines of the deadwood and recreation blanks
+    # the wizard did not collect until then. Nullable — a draft is autosaved field
+    # by field (3.9a ruling 7) — and required at pre-check and submission for their
+    # OWN activity only (`checks.missing_for_pricing`). The two code columns are
+    # CHECK-backed in migration 0061; the literals are `schemas.DeadwoodProduct`
+    # and `schemas.RecreationPurpose`. Deliberately NOT part of `_package_bytes`:
+    # the signed package is the priced subject, and these price nothing.
+    deadwood_product: Mapped[str | None]
+    removal_deadline: Mapped[date | None]
+    recreation_purpose: Mapped[str | None]
+    event_at: Mapped[datetime | None]
     decision_basis: Mapped[str | None]
     submitted_at: Mapped[datetime | None]
     decided_at: Mapped[datetime | None]
@@ -195,6 +211,16 @@ class Application(Base):
         CheckConstraint(
             f"benefit_verification_status IN {BENEFIT_VERIFICATION_STATUSES}",
             name="benefit_verification_status_valid",
+        ),
+        # Migration 0061 creates these two; declared here as well so the
+        # autogenerate-diff guard stays empty (same reasoning as the indexes below).
+        CheckConstraint(
+            f"deadwood_product IS NULL OR deadwood_product IN {DEADWOOD_PRODUCTS}",
+            name="deadwood_product_valid",
+        ),
+        CheckConstraint(
+            f"recreation_purpose IS NULL OR recreation_purpose IN {RECREATION_PURPOSES}",
+            name="recreation_purpose_valid",
         ),
         # Every row carrying an active benefit claim — a small fraction of the
         # table. Ruling #179 built this for the (now-retired, ruling #182) central

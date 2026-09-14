@@ -137,20 +137,28 @@ async def grazing_activity_id(db: AsyncSession) -> uuid.UUID:
 
 @pytest.fixture
 async def haymaking_activity_id(db: AsyncSession) -> uuid.UUID:
-    """A second activity type, for the `permit_templates` uniqueness tests: migration
-    0019 already seeds an ACTIVE grazing template, so a test that built its own v1
-    there would collide with the seed rather than with the row it created."""
+    """A second activity type, used all over the suite as "some OTHER activity".
+    Not template-free since migration 0061 (R1 gives every open activity, this one
+    included, a seeded ACTIVE row) — `science_activity_id` below is the fixture for
+    a genuinely empty `permit_templates` slot."""
     rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'haymaking'"))
     return rows.scalar_one()
 
 
 @pytest.fixture
 async def apiary_activity_id(db: AsyncSession) -> uuid.UUID:
-    """A THIRD activity type, for the stored-layout arm of the template lookup.
-    Deliberately not `haymaking`: `test_models.py` inserts its own ACTIVE haymaking
-    template and needs the slot empty, while the fixture below has to COMMIT its
-    template for the app's own session to see it."""
+    """A THIRD activity type, for the stored-layout arm of the template lookup."""
     rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'apiary'"))
+    return rows.scalar_one()
+
+
+@pytest.fixture
+async def science_activity_id(db: AsyncSession) -> uuid.UUID:
+    """For the `permit_templates` uniqueness tests: migration 0061 (decision #215
+    R1) seeds an ACTIVE row for every OPEN activity, so a test building its own v1
+    needs the one activity that never gets one — `science`, archived by the same
+    migration (#214) and with no blank to seed a layout for."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'science'"))
     return rows.scalar_one()
 
 

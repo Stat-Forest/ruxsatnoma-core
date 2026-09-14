@@ -448,3 +448,15 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(ConclusionKind)) == set(CONCLUSION_KINDS)
     assert set(get_args(ConclusionRecommendation)) == set(CONCLUSION_RECOMMENDATIONS)
     assert set(get_args(BenefitVerificationStatus)) == set(BENEFIT_VERIFICATION_STATUSES)
+
+
+def test_the_blank_fields_of_stage_15_are_columns_with_check_backed_codes() -> None:
+    """Decision #215 R6: the four lines the deadwood and recreation blanks print
+    live on `applications`, nullable (a draft is autosaved field by field), and
+    the two code columns are CHECK-backed so a typo cannot reach a printed permit."""
+    columns = Application.__table__.columns
+    assert columns["deadwood_product"].nullable
+    assert columns["removal_deadline"].nullable
+    assert columns["recreation_purpose"].nullable
+    assert columns["event_at"].nullable
+    assert columns["event_at"].type.timezone is True  # pyright: ignore[reportAttributeAccessIssue]
