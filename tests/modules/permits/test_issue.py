@@ -181,8 +181,11 @@ async def test_a_template_with_no_layout_file_renders_the_bundled_layout(
     assert template is not None
     assert template.layout_file_id is None
 
+    # Stage 15 Task 4 chooses the blank per activity.
     expected = render.render_permit(
-        permit.snapshot, render.default_layout(), service.qr_url(permit.qr_token)
+        permit.snapshot,
+        render.bundled_layout(service.GRAZING_ACTIVITY_CODE),
+        service.qr_url(permit.qr_token),
     )
     assert await service.pdf_bytes(db, permit.id) == expected
 
@@ -785,7 +788,9 @@ async def test_every_snapshot_key_is_printed_by_the_bundled_layout(
     permit = await service.for_application(db, paid_application.id)
     assert permit is not None
 
-    printed = {m.group(1).strip() for m in render._PLACEHOLDER.finditer(render.default_layout())}
+    # Stage 15 Task 4 chooses the blank per activity.
+    layout = render.bundled_layout(service.GRAZING_ACTIVITY_CODE)
+    printed = {m.group(1).strip() for m in render._PLACEHOLDER.finditer(layout)}
     printed.discard(render.QR_FIELD)  # the renderer fills it, not the snapshot
 
     assert printed == set(permit.snapshot) - {"calculation_id"}

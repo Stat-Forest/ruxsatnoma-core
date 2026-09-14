@@ -477,7 +477,8 @@ async def _layout_html(db: AsyncSession, template: PermitTemplate) -> str:
     administrator's own uploaded layout and wins from then on.
     """
     if template.layout_file_id is None:
-        return render.default_layout()
+        # Stage 15 Task 4 chooses the blank per activity.
+        return render.bundled_layout(GRAZING_ACTIVITY_CODE)
     file = await db.get(MediaFile, template.layout_file_id)
     if file is None or file.status != "active":
         raise err(
