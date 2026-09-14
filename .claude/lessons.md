@@ -338,28 +338,26 @@ Tooling and environment.
 
 # JSON boundaries
 
-## Nothing in this app configures a JSON encoder — coerce before every JSON boundary
+## A `Decimal`/`date` is converted at the boundary it crosses — coerced for JSON, formatted for a reader, never left to `str()`
 
-- **Rule:** Any value that is not a JSON primitive (`Decimal`, `date`, `UUID`, an
-  `UploadFile`) is coerced at the single point where it crosses into JSON — a JSONB bind, an
-  `err(..., details=...)` payload, a persisted request body. Never assume something
-  downstream will encode it.
-- **Why:** Three boundaries, three 500s, one absent encoder:
-  - **JSONB bind** — the engine sets no `json_serializer`, so a `Decimal` `{amount}` or a
-    `date` `{due_date}` in `notifications.params` raises `TypeError: Object of type Decimal
-    is not JSON serializable` at flush, INSIDE the caller's business transaction.
-  - **`DomainError` details** — `app.main`'s handler renders with stock `JSONResponse`,
-    unlike a `response_model` route; `ERR-GIS-003`'s raw `Decimal`/`UUID` raised inside the
-    exception handler itself, turning a blocked publish's clean 422 into a 500 (3.6a t5).
-  - **A parsed form body** — a multipart file part is an `UploadFile`, not a string, so the
-    Eskiz callback's dead-letter payload 500'd on a one-line curl against the anonymous
-    route that exists precisely to survive garbage.
-- **How to apply:** `gis.checks.jsonable` is the template; form dicts get
-  `{k: v if isinstance(v, str) else f"<{type(v).__name__}>" for k, v in form.items()}`.
-  A coercer whose callers need IDENTICAL conversions belongs in ONE function — the gis pair
-  had already diverged (the schemas copy had no `UUID` branch) when review caught it, and
-  `norms.calculator` has since grown a third copy. Only deliberately-different copies are
-  exempt: `_json_safe` for audit snapshots behaves differently per consumer on purpose.
+- **Rule:** A non-primitive (`Decimal`, `date`, `UUID`, an `UploadFile`) is converted at the
+  ONE point where it crosses a boundary: coerced where it enters JSON (a JSONB bind, an
+  `err(..., details=)` payload, a persisted body) and display-formatted where a person reads
+  it (SMS, cabinet, PDF). `str()` is right for neither — it 500s on one side and prints
+  `594000000.00` / `2026-09-20` on the other.
+- **Why:** No `json_serializer` on the engine and a stock `JSONResponse` in `app.main`'s
+  handler: a `Decimal` `{amount}` in `notifications.params` raised at flush INSIDE the
+  caller's transaction; `ERR-GIS-003`'s raw `Decimal`/`UUID` turned a 422 into a 500 (3.6a
+  t5); an `UploadFile` form part 500'd the Eskiz dead-letter route. On the reader's side the
+  dev stand's real SMS read "To'lov: 594000000.00 so'm, muddat 2026-09-20" from 3.10 until
+  2026-09-14 — `render()` did `str()`, and its test asserted that very string, so it was green.
+- **How to apply:** JSON: `gis.checks.jsonable` is the template, form dicts get
+  `f"<{type(v).__name__}>"`. Readers: `notifications.service.display` — thousands grouped by
+  a plain space (an NBSP leaves GSM 03.38), `dd.mm.yyyy`, Tashkent for instants; the permit
+  PDF still prints ISO and is the next caller. Store the machine form and render the human
+  one — `already_notified(params_match=)` keys on `date.isoformat()`. Callers needing
+  IDENTICAL conversions share ONE function (the gis pair had diverged, `norms.calculator`
+  grew a third copy); `_json_safe` for audit snapshots differs on purpose.
 
 ---
 

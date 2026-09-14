@@ -235,7 +235,11 @@ async def test_non_primitive_params_do_not_break_the_callers_transaction(db):
         },
     )
     inapp = next(r for r in rows if r.channel == "inapp")
-    assert inapp.params["amount"] == "1234.56"  # stored as text, exactly as rendered
+    # Stored in the MACHINE form — `already_notified(params_match=...)` keys on
+    # `date.isoformat()` — while the text the citizen reads is human-formatted.
+    assert inapp.params["amount"] == "1234.56"
     assert inapp.params["due_date"] == "2026-09-30"
     assert inapp.params["application_number"] == "A-1"  # a str is left alone
-    assert "1234.56" in inapp.rendered_text
+    assert "1 234,56" in inapp.rendered_text
+    assert "30.09.2026" in inapp.rendered_text
+    assert "1234.56" not in inapp.rendered_text
