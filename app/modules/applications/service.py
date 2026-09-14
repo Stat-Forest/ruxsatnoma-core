@@ -744,6 +744,30 @@ async def status_reached_at(
     return None
 
 
+async def submitted_history_ids(db: AsyncSession, application_id: uuid.UUID) -> list[uuid.UUID]:
+    """Every SUBMITTED row's own `id`, oldest first — exactly what a submission
+    signature is bound to (`SUBMISSION_OBJECT_TYPE`, ruling 25: `submit` mints
+    `id = submission_id` for that very row and signs against it, never against
+    the application itself, so `("application", application_id)` is not a
+    submission signature's key at any point in this codebase).
+
+    The additive accessor `permits.service.public_check` needs for decision
+    #215 R5 (the anonymous QR page lists the citizen's own submission
+    signature) and could not have any other way — the same reason
+    `status_reached_at` above exists: `permits` may not reach
+    `application_status_history` directly (module boundary, `CLAUDE.md`).
+    `timeline()` is the wrong shape to reuse here — it authorizes an
+    owner-or-staff actor and returns the signature rows already joined to
+    their entry, while an anonymous page only needs the bare ids to look its
+    own object type up with.
+
+    Usually one row; 3.9b's return-and-resubmit can leave several, each
+    signed on its own attempt.
+    """
+    history = await repo.list_status_history(db, application_id)
+    return [entry.id for entry in history if entry.to_status == SUBMITTED_STATUS]
+
+
 async def _readable_application(
     db: AsyncSession, application_id: uuid.UUID, *, actor: User
 ) -> Application:

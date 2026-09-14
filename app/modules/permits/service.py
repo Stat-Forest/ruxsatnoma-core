@@ -1922,6 +1922,84 @@ PUBLIC_STATUS_LABELS: dict[str, str] = {
     status: label[PUBLIC_STATUS_KEY_LANGUAGE] for status, label in PUBLIC_STATUS_LABELS_I18N.items()
 }
 
+# Decision #215 R5 — the labels of the signature lines the QR page lists. The
+# purposes are `permits.signers.PURPOSE_ROLES`' keys plus the application's own
+# submission purpose; a purpose absent here is reported with its code as the label
+# in every language rather than dropped (the hiding direction, closed on purpose).
+SIGNATURE_LINE_LABELS: dict[str, dict[str, str]] = {
+    "application_submit": {
+        "uz_latn": "Ariza beruvchi (ariza imzosi)",
+        "uz_cyrl": "Ариза берувчи (ариза имзоси)",
+        "ru": "Заявитель (подпись заявления)",
+    },
+    "permit_head": {
+        "uz_latn": "Xoʻjalik rahbari",
+        "uz_cyrl": "Хўжалик раҳбари",
+        "ru": "Директор лесхоза",
+    },
+    "permit_chief_forester": {
+        "uz_latn": "Bosh oʻrmonchi",
+        "uz_cyrl": "Бош ўрмончи",
+        "ru": "Главный лесничий",
+    },
+    "permit_accountant": {
+        "uz_latn": "Bosh hisobchi",
+        "uz_cyrl": "Бош ҳисобчи",
+        "ru": "Главный бухгалтер",
+    },
+    "permit_recipient": {
+        "uz_latn": "Foydalanuvchi",
+        "uz_cyrl": "Фойдаланувчи",
+        "ru": "Пользователь",
+    },
+}
+
+
+def _signature_line(row: Any) -> dict[str, Any]:
+    label = SIGNATURE_LINE_LABELS.get(row.purpose) or {
+        "uz_latn": row.purpose,
+        "uz_cyrl": row.purpose,
+        "ru": row.purpose,
+    }
+    return {
+        "line": row.purpose,
+        "line_label": label,
+        "signed_on": row.signed_at.astimezone(TASHKENT).date(),
+        "kind": row.kind,
+    }
+
+
+async def _public_signature_lines(db: AsyncSession, permit: Permit) -> list[dict[str, Any]]:
+    """Valid rows only, the application's submission signature(s) first, then
+    the permit's, in the order they were signed.
+
+    **The submission signature is NOT keyed to `("application", application_id)`**
+    — that pair, under `"application_decision"`, names a REVIEW DECISION
+    (`applications.service.timeline`'s own docstring). A citizen's submission
+    signs `("application_submission", <the SUBMITTED history row's id>)`
+    instead (ruling 25), and this module may not read
+    `application_status_history` to find that id itself (module boundary) —
+    `applications_service.submitted_history_ids` is the accessor built for
+    exactly this read, the same way `status_reached_at` already serves the
+    snapshot. `get_for_object` orders each group by `signed_at` already, and
+    every submission attempt precedes every permit signature in real use, so
+    concatenating oldest-submission-first keeps the whole list time-ordered.
+    """
+    over_application: list[Any] = []
+    for submission_id in await applications_service.submitted_history_ids(
+        db, permit.application_id
+    ):
+        over_application += await signatures_service.get_for_object(
+            db, object_type=applications_service.SUBMISSION_OBJECT_TYPE, object_id=submission_id
+        )
+    over_permit = await signatures_service.get_for_object(
+        db, object_type=OBJECT_TYPE, object_id=permit.id
+    )
+    rows = [r for r in over_application if r.purpose == applications_service.SUBMISSION_PURPOSE]
+    rows += list(over_permit)
+    return [_signature_line(r) for r in rows if r.verification_status == "valid"]
+
+
 # The two statuses that are NOT public, each for its own reason — spelled out
 # rather than left to fall through the map above, so that adding a seventh
 # permit status forces a decision instead of silently answering "no such
@@ -2136,6 +2214,7 @@ async def public_check(
         "signatures_valid": await signatures_service.carried_signatures_valid(
             db, object_type=OBJECT_TYPE, object_id=permit.id
         ),
+        "signatures": await _public_signature_lines(db, permit),
         # `mask_name` answers `NOT_STATED` on an empty name itself, so there is no
         # `or` here: a mask applied to the em dash would print «—.***».
         "holder": mask_name(_from_snapshot(permit.snapshot, "holder_name")),

@@ -392,6 +392,18 @@ class PublicCheckMiss(BaseModel):
     found: Literal[False] = False
 
 
+class PublicSignatureLine(BaseModel):
+    """One signature LINE of the document as the QR page reports it (decision
+    #215 R5): which line, its label in every language, the calendar date it was
+    signed (Tashkent) and the kind (`eri` / `simple`, #183). No signer name, no
+    user id, no certificate — this page is anonymous and names lines, not people."""
+
+    line: str
+    line_label: LocalizedName
+    signed_on: date
+    kind: str
+
+
 class PublicCheckCard(BaseModel):
     """`GET /public/permits/check` — what a citizen or an inspector sees.
 
@@ -400,7 +412,9 @@ class PublicCheckCard(BaseModel):
     and the list is closed: `qr_token` is the key to this very page and
     `holder_pinfl` is requisite 10's identity half, so neither may appear here at
     any width. `signatures_valid` is the STORED verification verdict of the 3+1
-    signatures; nothing on this path calls E-IMZO.
+    signatures; nothing on this path calls E-IMZO. `signatures` names the LINES
+    those signatures fill (decision #215 R5) — never a signer's name, user id or
+    certificate, which the identity-half rule above already forbids here.
     """
 
     found: Literal[True] = True
@@ -416,6 +430,10 @@ class PublicCheckCard(BaseModel):
     organization: str
     activity_type: str
     signatures_valid: bool
+    # Decision #215 R5 — every VALID signature line over this permit (and the
+    # citizen's own, over the application), oldest first. `service.SIGNATURE_LINE_LABELS`
+    # is the single source of truth for `line_label`; see `PublicSignatureLine`.
+    signatures: list[PublicSignatureLine]
     holder: str
     # The permit's map contour, as a GeoJSON geometry — `None` unless BOTH
     # `public_permit_contour_enabled` is on (ruling R2: personal geodata,
