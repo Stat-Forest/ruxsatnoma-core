@@ -411,10 +411,15 @@ class ApplicationOut(BaseModel):
     benefit_rejection_reason: str | None
     # Decision #215 R6: the deadwood and recreation blanks' own lines
     # (`BlankLinesMixin` on the input side). Read-only here, exactly like
-    # every other column — editable only through `ApplicationPatch`.
-    deadwood_product: str | None
+    # every other column — editable only through `ApplicationPatch`. Typed
+    # with the Literal, not `str`, matching every other CHECK-backed enum
+    # column on this class (`status`, `on_behalf`, `channel`, `kind`,
+    # `benefit_verification_status`): the OpenAPI schema (and the generated
+    # frontend client) then carries the enum too, and a corrupted DB value
+    # raises at `model_validate` instead of passing through silently.
+    deadwood_product: DeadwoodProduct | None
     removal_deadline: date | None
-    recreation_purpose: str | None
+    recreation_purpose: RecreationPurpose | None
     event_at: datetime | None
     rejection_reason_item_id: uuid.UUID | None
     assigned_org_id: uuid.UUID | None
