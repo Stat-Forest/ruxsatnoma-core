@@ -468,3 +468,40 @@ async def organization_names(
         select(Organization.id, Organization.name).where(Organization.id.in_(ids))
     )
     return {row.id: dict(row.name) for row in rows}
+
+
+async def organization_places(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]]:
+    """`(name, region name, district name)` for a batch of organizations in
+    ONE query — the two places as `LocalizedName` dicts, `None` where the
+    organization sits in no region or district (the agency itself, an
+    unfilled leshoz). The applications register prints them beside the
+    leshoz, and reading them here keeps `regions`/`districts` behind
+    `admin` (CLAUDE.md "Reference data")."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Organization.id, Organization.name, Region.name, District.name)
+        .outerjoin(Region, Region.id == Organization.region_id)
+        .outerjoin(District, District.id == Organization.district_id)
+        .where(Organization.id.in_(ids))
+    )
+    return {
+        row[0]: (dict(row[1]), dict(row[2]) if row[2] else None, dict(row[3]) if row[3] else None)
+        for row in rows
+    }
+
+
+async def classifier_item_names(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """`LocalizedName` dicts for a batch of classifier items in ONE query
+    (a benefit category, a rejection reason — whatever a register row
+    names by item id)."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(ClassifierItem.id, ClassifierItem.name).where(ClassifierItem.id.in_(ids))
+    )
+    return {row.id: dict(row.name) for row in rows}

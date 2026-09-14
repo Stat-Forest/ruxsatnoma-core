@@ -159,6 +159,23 @@ async def acts_for_permits(
     return result.scalars().all()
 
 
+async def acts_for_applications(
+    db: AsyncSession, *, application_ids: Sequence[uuid.UUID]
+) -> Sequence[InspectionAct]:
+    """Every SIGNED act against any of `application_ids` — the site visit of
+    C6, before a permit exists — for `service.acts_for_applications` (the
+    applications register's «conclusion» column, decision #216); the same
+    shape as `acts_for_permits` above, keyed on the application."""
+    if not application_ids:
+        return []
+    result = await db.execute(
+        select(InspectionAct)
+        .where(InspectionAct.application_id.in_(application_ids), InspectionAct.status == "signed")
+        .order_by(InspectionAct.application_id, InspectionAct.occurred_at, InspectionAct.id)
+    )
+    return result.scalars().all()
+
+
 async def list_act_files(db: AsyncSession, act_id: uuid.UUID) -> Sequence[InspectionActFile]:
     result = await db.execute(select(InspectionActFile).where(InspectionActFile.act_id == act_id))
     return result.scalars().all()

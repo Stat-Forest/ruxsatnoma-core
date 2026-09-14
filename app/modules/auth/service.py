@@ -1558,5 +1558,11 @@ async def applicant_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UU
     return await repo.applicant_names(db, ids)
 
 
+async def applicant_contacts(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, tuple[str, str | None]]:
+    return await repo.applicant_contacts(db, ids)
+
+
 async def user_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
     return await repo.user_full_names(db, ids)

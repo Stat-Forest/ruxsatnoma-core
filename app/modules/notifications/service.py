@@ -4,7 +4,8 @@ upper modules call inside their own transaction (plan 03.5 ruling 4)."""
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 import structlog
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import settings_store
 from app.core.errors import err
+from app.core.time import TASHKENT
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.integrations import service as integrations_service
@@ -39,6 +41,29 @@ SMS_LANGUAGE = "uz_latn"
 _PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 
 
+def display(value: Any) -> str:
+    """A placeholder's value as a PERSON reads it in an SMS or the cabinet.
+
+    `str()` gives the machine forms — `1250000.00`, `2026-09-15` — and that is
+    exactly what the dev stand sent a citizen ("To'lov: 594000000.00 so'm,
+    muddat 2026-09-20") until this existed. Money is grouped by thousands with a
+    plain ASCII space (an NBSP would push the whole SMS out of GSM 03.38 and
+    bill it as Cyrillic — decision #139) and drops an empty tiyin part; a
+    calendar date reads `dd.mm.yyyy`; an instant is the Tashkent wall clock,
+    never the UTC one a `timestamptz` comes back in. Anything else stays `str()`.
+    The STORED `params` are not formatted here — see `_jsonable`.
+    """
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return f"{int(value):,}".replace(",", " ")
+        return f"{value.quantize(Decimal('0.01')):,}".replace(",", " ").replace(".", ",")
+    if isinstance(value, datetime):  # before `date`: datetime is a date
+        return value.astimezone(TASHKENT).strftime("%d.%m.%Y %H:%M")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    return str(value)
+
+
 def render(body: dict[str, Any], params: Mapping[str, Any], language: str) -> str:
     text = body.get(language) or body.get(FALLBACK_LANGUAGE) or ""
 
@@ -47,7 +72,7 @@ def render(body: dict[str, Any], params: Mapping[str, Any], language: str) -> st
         if name not in params:
             logger.warning("notification.placeholder_missing", placeholder=name)
             return match.group(0)
-        return str(params[name])
+        return display(params[name])
 
     return _PLACEHOLDER.sub(_substitute, text)
 
@@ -182,10 +207,14 @@ def _jsonable(params: Mapping[str, Any]) -> dict[str, Any]:
     transaction. That is the one thing ruling 10 forbids: a content-shaped problem
     must never break the business action (invoice issuance would 500).
 
-    Non-primitives become their `str()` — the same form `render()` already
-    substitutes into the text, so display is unchanged; only the stored copy is.
-    Containers are stringified too rather than walked: a guaranteed-serializable
-    value matters more here than a faithful round-trip of a shape no caller uses.
+    Non-primitives become their `str()` — the MACHINE form (`2026-09-30`,
+    `1234.56`), deliberately not `display()`'s: `already_notified(params_match=)`
+    keys the once-only SLA reminder on the stored `deadline` against
+    `date.isoformat()`, so a human-formatted copy here would make every reminder
+    look unsent and re-send it daily. The text a person reads is rendered from
+    the caller's TYPED params, not from this copy. Containers are stringified
+    too rather than walked: a guaranteed-serializable value matters more here
+    than a faithful round-trip of a shape no caller uses.
     """
     return {
         key: value if isinstance(value, _JSON_PRIMITIVES) else str(value)
@@ -277,7 +306,8 @@ async def notify(
     cabinet even when other channels are off). Transport channels are enqueued on
     the 3.4 outbox and delivered by its worker — nothing is sent from a request.
     """
-    values = _jsonable(params or {})
+    typed = dict(params or {})  # what `render()` formats for a reader
+    values = _jsonable(typed)  # what the row stores — machine-readable
     requested = tuple(channels) if channels is not None else DEFAULT_CHANNELS
     requested = tuple(dict.fromkeys(requested))  # de-dupe, order preserved: never double-send
     unknown = sorted(set(requested) - set(CHANNELS))
@@ -317,12 +347,12 @@ async def notify(
             # `notifications.language` is what the stored text is written in.
             language=language,
             subject=(
-                render(template.subject, values, language)
+                render(template.subject, typed, language)
                 if template is not None and template.subject
                 else None
             ),
             rendered_text=(
-                render(template.body, values, language)
+                render(template.body, typed, language)
                 if template is not None
                 else _fallback_body(event_code, values)
             ),

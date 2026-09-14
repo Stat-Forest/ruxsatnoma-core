@@ -3,6 +3,7 @@
 """
 
 import uuid
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -12,9 +13,10 @@ from app.core import files, xlsx
 from app.core.deps import get_db
 from app.core.schemas import Page, PageParams
 from app.core.time import business_today
-from app.modules.auth.deps import require_any_permission, require_permission
+from app.modules.applications.schemas import NUMBER_MAX_LENGTH, ApplicationStatus
+from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
-from app.modules.reports import export, service
+from app.modules.reports import applications_register, export, service
 from app.modules.reports.models import REPORT_STATUSES
 from app.modules.reports.permissions import (
     REPORTS_ACCEPT,
@@ -34,6 +36,51 @@ from app.modules.reports.schemas import (
 )
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+# The applications register's export, served from here because its columns
+# join `permits`, `payments` and `norms` — tables `applications` (level 3)
+# may not read and a reader (level 5, design/01 rule 5) may. The path stays
+# `/applications/export.xlsx` (the adminka's button and the sibling rule of
+# `tests/test_export_routes.py` both key on it), so this router is mounted
+# in `main.py` BEFORE `applications_router`: Starlette matches in
+# registration order, and after `/applications/{application_id}` this path
+# would be a 422 from the UUID parser rather than an export.
+register_router = APIRouter(tags=["reports"])
+
+
+@register_router.get("/applications/export.xlsx")
+async def export_applications_xlsx(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+    lang: xlsx.Lang = "uz_latn",
+    status: ApplicationStatus | None = None,
+    activity_type_id: uuid.UUID | None = None,
+    contour_id: uuid.UUID | None = None,
+    applicant_id: uuid.UUID | None = None,
+    number: Annotated[str | None, Query(max_length=NUMBER_MAX_LENGTH)] = None,
+    period_from: date | None = None,
+    period_to: date | None = None,
+) -> Response:
+    """`GET /applications` as a spreadsheet (stage 13, ruling #204; the
+    columns of 2026-09-14): the same filters, the same scope through the
+    same service call, every matching row up to `register_export_max_rows`
+    — past it the file is cut and the `X-Export-*` headers say so."""
+    items, total, cap = await applications_register.rows(
+        db,
+        actor=user,
+        lang=lang,
+        status=status,
+        activity_type_id=activity_type_id,
+        contour_id=contour_id,
+        applicant_id=applicant_id,
+        number=number,
+        period_from=period_from,
+        period_to=period_to,
+    )
+    filename = f"{applications_register.FILENAME_STEM}-{business_today().isoformat()}.xlsx"
+    return xlsx.xlsx_response(
+        applications_register.render(items, lang=lang), filename=filename, total=total, cap=cap
+    )
 
 
 # --- report_forms ------------------------------------------------------

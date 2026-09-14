@@ -496,6 +496,20 @@ async def applicant_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UU
     return {row.id: row.name for row in rows}
 
 
+async def applicant_contacts(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, tuple[str, str | None]]:
+    """`(name, phone)` for a batch of applicants in ONE query — the phone is
+    the applicant's own (`applicants.phone`), the one the leshoz rings, not
+    the login user's; `{}` for an empty set without touching the database."""
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(Applicant.id, Applicant.name, Applicant.phone).where(Applicant.id.in_(ids))
+    )
+    return {row.id: (row.name, row.phone) for row in rows}
+
+
 async def user_full_names(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
     """Full names for a batch of users in ONE query (the responsible or
     assigned staff member a register row names)."""
