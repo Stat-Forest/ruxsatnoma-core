@@ -73,6 +73,7 @@ from app.modules.permits.public_router import router as permits_public_router
 from app.modules.permits.router import router as permits_router
 from app.modules.public.admin_router import router as public_admin_router
 from app.modules.public.router import router as public_router
+from app.modules.reports.router import register_router as applications_register_router
 from app.modules.reports.router import router as reports_router
 from app.modules.search.router import router as search_router
 from app.modules.signatures.router import router as signatures_router
@@ -353,6 +354,10 @@ def create_app() -> FastAPI:
     # literal). Nothing left here collides today; the order stays so the next
     # literal path added to this router cannot regress the same way.
     app.include_router(benefit_verification_router, prefix="/api/v1")
+    # `GET /applications/export.xlsx` is `reports`' (its columns join tables
+    # `applications` may not read) and must ALSO precede the card route —
+    # the same registration-order reason as the line above.
+    app.include_router(applications_register_router, prefix="/api/v1")
     app.include_router(applications_router, prefix="/api/v1")
     app.include_router(payments_router, prefix="/api/v1")
     app.include_router(payments_backoffice_router, prefix="/api/v1")

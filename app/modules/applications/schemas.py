@@ -35,6 +35,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer
 # built from, and `test_models.py::test_the_schema_literals_match_the_tuples_
 # the_checks_are_built_from` closes the gap (lesson: an enum-ish column has ONE
 # source of truth — the tuple).
+# `applications.number` is `RX-<yyyy>-<seq>` (plan ruling 5а). Bounded because
+# it is bound into SQL as text from a query string anybody can type; the value
+# itself is matched exactly, never as a pattern. Shared by the list route and
+# its `reports`-served export, which take the same filters.
+NUMBER_MAX_LENGTH = 64
+
 ApplicationStatus = Literal[
     "SUBMITTED",
     "IN_REVIEW",

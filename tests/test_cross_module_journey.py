@@ -45,17 +45,21 @@ and fails on the second run of the suite.
 """
 
 import hashlib
+import io
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import httpx
 import pytest
+from openpyxl import load_workbook
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
 from app.core.models import MediaFile
+from app.core.time import TASHKENT
 from app.modules.admin.models import Organization
 from app.modules.applications import service as applications_service
 from app.modules.applications.events import APPLICATION_APPROVED
@@ -270,6 +274,38 @@ async def test_the_journey_from_approval_to_the_public_qr_page(
         "the invoice and the permit's frozen snapshot name different calculations, "
         "so a paid invoice cannot be reconciled with the document it paid for"
     )
+
+    # --- hop 7: the register export sees the whole journey on one line ------
+    # `reports.applications_register` is the FOURTH independent reader of the
+    # price (after the invoice, the permit and the executor's notification),
+    # and the only place the permit's issue date, its term, the money billed
+    # and the money received sit beside the application they belong to. The
+    # head can list the leshoz's applications (`applications.decide`); the
+    # issuing hodim holds `permits.issue` alone and would see an empty scope.
+    exported = await head_client.client.get(
+        f"{API}/applications/export.xlsx", params={"lang": "uz_latn"}
+    )
+    assert exported.status_code == 200, exported.text
+    sheet = load_workbook(io.BytesIO(exported.content)).active
+    assert sheet is not None
+    headers = [str(c.value) for c in sheet[1]]
+    lines: list[dict[str, Any]] = [
+        dict(zip(headers, r, strict=True)) for r in sheet.iter_rows(min_row=2, values_only=True)
+    ]
+    (line,) = [row for row in lines if row["ID"] == str(app_id)]
+    assert line["Ariza holati"] == "Ruxsatnoma berilgan"
+    assert line["Holati"] == "Ruxsatnoma berilgan"
+    assert line["Hisoblangan summa"] == billed_amount
+    assert line["Toʻlangan summa"] == billed_amount
+    # openpyxl reads a date cell back as a midnight datetime.
+    assert line["Ruxsatnoma muddati: dan"].date() == permit.period_from
+    assert line["Ruxsatnoma muddati: gacha"].date() == permit.period_to
+    assert permit.issued_at is not None
+    # Written naive, in Tashkent — a spreadsheet is display (`core/xlsx.py`);
+    # Excel keeps milliseconds, so compare to the second.
+    assert line["Ruxsatnoma berilgan sana"].replace(microsecond=0) == permit.issued_at.astimezone(
+        TASHKENT
+    ).replace(tzinfo=None, microsecond=0)
 
 
 async def test_the_manual_confirmation_door_reaches_every_downstream_module_too(
