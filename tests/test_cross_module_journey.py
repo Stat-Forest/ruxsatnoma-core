@@ -1063,6 +1063,29 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                 assert (await _reread(db, permit)).status == "active"
                 assert (await _reread(db, application)).status == "PERMIT_ISSUED"
 
+                # Decision #215 R7, the branch only a VERIFIED benefit reaches:
+                # the recreation blank's paid line names the benefit the leshoz
+                # granted, in the document's language, before a paid amount of
+                # nothing — dated by the PAID row `_settle_free` wrote, as
+                # Tashkent reads it.
+                benefit_name = await db.scalar(
+                    text("SELECT name->>'uz_latn' FROM classifier_items WHERE id = :id").bindparams(
+                        id=benefit_category_item_id
+                    )
+                )
+                paid_row = (
+                    await db.execute(
+                        select(ApplicationStatusHistory).where(
+                            ApplicationStatusHistory.application_id == application.id,
+                            ApplicationStatusHistory.to_status == "PAID",
+                        )
+                    )
+                ).scalar_one()
+                paid_date = paid_row.occurred_at.astimezone(TASHKENT).date().isoformat()
+                assert (await _reread(db, permit)).snapshot["payment_basis"] == (
+                    f"Imtiyoz: {benefit_name}. Toʻlangan: 0.00 soʻm, {paid_date}"
+                )
+
                 holder_result = await sign_permit_simple(
                     citizen, permit_id, signers.RECIPIENT_PURPOSE
                 )

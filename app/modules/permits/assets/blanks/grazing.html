@@ -60,17 +60,17 @@
     <div class="caption">(vakolatli organning nomi / наименование уполномоченного органа)</div>
   </div>
 
-  <div class="title">O‘rmon fondi yaylov hududlarida chorva mollarini boqish uchun</div>
+  <div class="title">Oʻrmon fondi yaylov hududlarida chorva mollarini boqish uchun</div>
   <h1>RUXSATNOMA</h1>
   <h1 class="ru">РАЗРЕШЕНИЕ</h1>
   <div class="title ru">для выпаса скота на пастбищных угодьях лесного фонда</div>
   <div class="date">{{ issued_at }}</div>
 
   <table class="fields">
-    <tr><th>O‘rmon xo‘jaligi <span class="ru">Лесное хозяйство</span></th><td>{{ leshoz_name }}</td></tr>
-    <!-- Requisites 5-7 (bo‘lim / aylanma / bo‘lak) have no data source (tz/12 #10, #19) —
+    <tr><th>Oʻrmon xoʻjaligi <span class="ru">Лесное хозяйство</span></th><td>{{ leshoz_name }}</td></tr>
+    <!-- Requisites 5-7 (boʻlim / aylanma / boʻlak) have no data source (tz/12 #10, #19) —
          the blank's line is printed with the contour, which is what the leshoz actually holds. -->
-    <tr><th>Aylanma / bo‘lagi, ajratilgan maydon <span class="ru">Обход / квартал, выделенная площадь</span></th><td>kontur {{ contour_number }}, {{ area_ha }} ga</td></tr>
+    <tr><th>Aylanma / boʻlagi, ajratilgan maydon <span class="ru">Обход / квартал, выделенная площадь</span></th><td>kontur {{ contour_number }}, {{ area_ha }} ga</td></tr>
     <tr><th>Foydalanuvchi (F.I.Sh., JShShIR / STIR) <span class="ru">Пользователь</span></th><td>{{ holder_name }}, {{ holder_pinfl }}</td></tr>
     <tr><th>Foydalanuvchining manzili <span class="ru">Адрес пользователя</span></th><td>{{ holder_address }}</td></tr>
     <tr><th>Jami chorva mollari soni <span class="ru">Общее количество скота</span></th><td>{{ heads_total }}</td></tr>
@@ -89,13 +89,13 @@
     <tr><td class="species">Otlar <span class="ru">Лошади</span></td><td>{{ heads_horse_adult }}</td><td>{{ heads_horse_young }}</td><td>—</td><td>—</td></tr>
     <tr><td class="species">Tuyalar <span class="ru">Верблюды</span></td><td>{{ heads_camel_adult }}</td><td>{{ heads_camel_young }}</td><td>—</td><td>—</td></tr>
     <tr><td class="species">Eshaklar <span class="ru">Ослы</span></td><td>{{ heads_donkey_adult }}</td><td>{{ heads_donkey_young }}</td><td>—</td><td>—</td></tr>
-    <tr><td class="species">Qo‘y va echkilar <span class="ru">Овцы и козы</span></td><td>—</td><td>—</td><td>{{ heads_sheep_goat_6m }}</td><td>{{ heads_lamb_kid_under_6m }}</td></tr>
+    <tr><td class="species">Qoʻy va echkilar <span class="ru">Овцы и козы</span></td><td>—</td><td>—</td><td>{{ heads_sheep_goat_6m }}</td><td>{{ heads_lamb_kid_under_6m }}</td></tr>
   </table>
 
   <table class="fields" style="margin-top: 2mm">
     <tr><th>Foydalanish muddati <span class="ru">Срок пользования</span></th><td>{{ period_from }} dan {{ period_to }} gacha</td></tr>
-    <tr><th>Ruxsatnoma summasi <span class="ru">Сумма разрешения</span></th><td>{{ amount }} so‘m</td></tr>
-    <tr><th>To‘lov <span class="ru">Оплата</span></th><td>{{ payment_basis }}</td></tr>
+    <tr><th>Ruxsatnoma summasi <span class="ru">Сумма разрешения</span></th><td>{{ amount }} soʻm</td></tr>
+    <tr><th>Toʻlov <span class="ru">Оплата</span></th><td>{{ payment_basis }}</td></tr>
   </table>
 
   <!-- R4: two labelled lines, the holder's NAME on the second, no staff name, one QR. -->
@@ -104,7 +104,7 @@
       <td>
         <table class="lines">
           <tr>
-            <td class="who">Xo‘jalik rahbari<br><span class="caption">Директор лесхоза</span></td>
+            <td class="who">Xoʻjalik rahbari<br><span class="caption">Директор лесхоза</span></td>
             <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
           </tr>
           <tr>

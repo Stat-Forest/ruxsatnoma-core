@@ -1086,7 +1086,14 @@ async def agency_org(db: AsyncSession) -> Organization:
         agency = Organization(
             id=uuid7(),
             code=f"A{uuid.uuid4().hex[:8]}",
-            name={"uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"},
+            # `uz_latn` is the required key (decision #90) and the permit's own
+            # language (#215 R2) — the same name `tests/modules/gis/conftest.py`
+            # gives the row, so whichever module creates it first, it is valid.
+            name={
+                "uz_latn": "Test agentligi",
+                "uz_cyrl": "Тест агентлиги",
+                "ru": "Тестовое агентство",
+            },
             kind="agency",
         )
         db.add(agency)

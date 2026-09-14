@@ -38,14 +38,14 @@ SNAPSHOT = {
 BLANK_SNAPSHOT = {
     **SNAPSHOT,
     "authority_name": (
-        "O‘zbekiston Respublikasi Ekologiya va iqlim o‘zgarishi milliy qo‘mitasi huzuridagi "
-        "O‘rmon va yashil hududlarni ko‘paytirish, cho‘llanishga qarshi kurashish agentligi"
+        "Oʻzbekiston Respublikasi Ekologiya va iqlim oʻzgarishi milliy qoʻmitasi huzuridagi "
+        "Oʻrmon va yashil hududlarni koʻpaytirish, choʻllanishga qarshi kurashish agentligi"
     ),
-    "leshoz_name": "Burchmulla o‘rmon xo‘jaligi",
+    "leshoz_name": "Burchmulla oʻrmon xoʻjaligi",
     "activity_name": "Chorva mollarini boqish",
     "holder_name": "Azizov Aziz Azizovich",
-    "holder_address": "Toshkent viloyati, Bo‘stonliq tumani, Burchmulla qishlog‘i",
-    "payment_status": "To‘langan",
+    "holder_address": "Toshkent viloyati, Boʻstonliq tumani, Burchmulla qishlogʻi",
+    "payment_status": "Toʻlangan",
     "heads_total": "9",
     "heads_cattle_adult": "5",
     "heads_cattle_young": "—",
@@ -58,7 +58,7 @@ BLANK_SNAPSHOT = {
     "heads_sheep_goat_6m": "2",
     "heads_lamb_kid_under_6m": "—",
     "quantity": "—",
-    "payment_basis": "To‘langan: 2060000.00 so‘m, 2027-04-01",
+    "payment_basis": "Toʻlangan: 2060000.00 soʻm, 2027-04-01",
     "deadwood_product": "—",
     "removal_deadline": "—",
     "recreation_purpose": "—",
@@ -70,26 +70,26 @@ BLANK_SNAPSHOT = {
 WORST_CASE_SNAPSHOT = {
     **BLANK_SNAPSHOT,
     "leshoz_name": (
-        "Toshkent viloyati Bo‘stonliq tumani «Burchmulla» davlat o‘rmon xo‘jaligi bo‘limi"
+        "Toshkent viloyati Boʻstonliq tumani «Burchmulla» davlat oʻrmon xoʻjaligi boʻlimi"
     ),
     "holder_name": (
         "Abdurahmonova Gulnoza Abdurahmon qizi "
-        "(yuridik shaxs vakili: «Yashil vodiy» fermer xo‘jaligi)"
+        "(yuridik shaxs vakili: «Yashil vodiy» fermer xoʻjaligi)"
     ),
     "holder_address": (
-        "Toshkent viloyati, Bo‘stonliq tumani, Burchmulla qishlog‘i, Chinor mahallasi, "
-        "Tog‘ ko‘chasi, 128-uy, 4-xonadon"
+        "Toshkent viloyati, Boʻstonliq tumani, Burchmulla qishlogʻi, Chinor mahallasi, "
+        "Togʻ koʻchasi, 128-uy, 4-xonadon"
     ),
     "activity_name": (
-        "Davlat o‘rmon fondi uchastkalaridan madaniy-ma’rifiy, tarbiyaviy, "
-        "sog‘lomlashtirish, rekreatsion va estetik maqsadlarda foydalanish"
+        "Davlat oʻrmon fondi uchastkalaridan madaniy-maʼrifiy, tarbiyaviy, "
+        "sogʻlomlashtirish, rekreatsion va estetik maqsadlarda foydalanish"
     ),
     "payment_basis": (
-        "Imtiyoz: Nogironligi bo‘lgan shaxslar (I va II guruh). "
-        "To‘langan: 12345678.00 so‘m, 2027-04-01"
+        "Imtiyoz: Nogironligi boʻlgan shaxslar (I va II guruh). "
+        "Toʻlangan: 12345678.00 soʻm, 2027-04-01"
     ),
-    "deadwood_product": "o‘tin va shox-shabba",
-    "recreation_purpose": "madaniy-ma’rifiy",
+    "deadwood_product": "oʻtin va shox-shabba",
+    "recreation_purpose": "madaniy-maʼrifiy",
     "removal_deadline": "2027-06-15",
     "event_at": "2027-05-01 15:00",
     "heads_cattle_adult": "1200",
@@ -417,11 +417,14 @@ def test_an_unknown_activity_has_no_bundled_blank() -> None:
 
 
 def test_the_bundled_faces_draw_the_latin_apostrophes_of_the_blanks() -> None:
-    """The blanks write o‘ (U+2018) and oʻ (U+02BB), and every localized value
-    arrives in uz_latn (R2): both must be in the bundled cmap, or issuance refuses
-    the holder's own leshoz name as unrenderable."""
+    """The blanks and `service`'s stage-15 constants write oʻ (U+02BB) and ʼ
+    (U+02BC) — the codebase's one apostrophe convention, migrations 0031/0032's
+    — and every localized value arrives in uz_latn (R2): both must be in the
+    bundled cmap, or issuance refuses the holder's own leshoz name as
+    unrenderable. The typographic quotes (U+2018/U+2019) an operator may type
+    into a name are pinned beside them for the same reason."""
     covered = render._renderable_codepoints()
-    assert {0x2018, 0x02BB, 0x2019, 0x0110, 0x0111} <= covered
+    assert {0x02BB, 0x02BC, 0x2018, 0x2019, 0x0110, 0x0111} <= covered
 
 
 def test_a_layout_cannot_make_the_server_fetch_a_url_or_read_a_file() -> None:

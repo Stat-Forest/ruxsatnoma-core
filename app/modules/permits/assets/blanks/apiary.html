@@ -56,28 +56,28 @@
     <div class="caption">(vakolatli organning nomi / наименование уполномоченного органа)</div>
   </div>
 
-  <div class="title">O‘rmon fondi uchastkalarida asalari uyalari va qutilarini joylashtirish uchun</div>
+  <div class="title">Oʻrmon fondi uchastkalarida asalari uyalari va qutilarini joylashtirish uchun</div>
   <h1>RUXSATNOMA</h1>
   <h1 class="ru">РАЗРЕШЕНИЕ</h1>
   <div class="title ru">для размещения пчелиных ульев и пасек на участках лесного фонда</div>
   <div class="date">{{ issued_at }}</div>
 
   <table class="fields">
-    <tr><th>O‘rmon xo‘jaligi <span class="ru">Лесное хозяйство</span></th><td>{{ leshoz_name }}</td></tr>
-    <!-- Requisites 5-7 (bo‘lim / aylanma / bo‘lak) have no data source (tz/12 #10, #19) —
+    <tr><th>Oʻrmon xoʻjaligi <span class="ru">Лесное хозяйство</span></th><td>{{ leshoz_name }}</td></tr>
+    <!-- Requisites 5-7 (boʻlim / aylanma / boʻlak) have no data source (tz/12 #10, #19) —
          the blank's line is printed with the contour, which is what the leshoz actually holds. -->
-    <tr><th>Aylanma / bo‘lagi <span class="ru">Обход / квартал</span></th><td>kontur {{ contour_number }}</td></tr>
+    <tr><th>Aylanma / boʻlagi <span class="ru">Обход / квартал</span></th><td>kontur {{ contour_number }}</td></tr>
     <tr><th>Foydalanuvchi (F.I.Sh., JShShIR / STIR) <span class="ru">Пользователь</span></th><td>{{ holder_name }}, {{ holder_pinfl }}</td></tr>
     <tr><th>Foydalanuvchining manzili <span class="ru">Адрес пользователя</span></th><td>{{ holder_address }}</td></tr>
     <tr><th>Ajratilgan maydon (ga) <span class="ru">Выделенная площадь (га)</span></th><td>{{ area_ha }}</td></tr>
     <tr><th>Asalari oilalari soni <span class="ru">Количество пчелиных семей</span></th><td>{{ quantity }}</td></tr>
     <tr><th>Joylashtirish nuqtasi <span class="ru">Место размещения</span></th><td>{{ leshoz_name }}, kontur {{ contour_number }}</td></tr>
-    <tr><th>To‘lov summasi va hujjati <span class="ru">Сумма и документ об оплате</span></th><td>{{ payment_basis }}</td></tr>
+    <tr><th>Toʻlov summasi va hujjati <span class="ru">Сумма и документ об оплате</span></th><td>{{ payment_basis }}</td></tr>
     <!-- #214 point 2: the four non-grazing blanks label the term as the forest ticket's. -->
-    <tr><th>O‘rmon chiptasining amal qilish muddati <span class="ru">Срок действия лесного билета</span></th><td>{{ period_from }} dan {{ period_to }} gacha</td></tr>
-    <tr><th>Ruxsatnoma summasi <span class="ru">Сумма разрешения</span></th><td>{{ amount }} so‘m</td></tr>
+    <tr><th>Oʻrmon chiptasining amal qilish muddati <span class="ru">Срок действия лесного билета</span></th><td>{{ period_from }} dan {{ period_to }} gacha</td></tr>
+    <tr><th>Ruxsatnoma summasi <span class="ru">Сумма разрешения</span></th><td>{{ amount }} soʻm</td></tr>
     <!-- The snapshot carries no application number, and the paid application IS the ground. -->
-    <tr><th>Asos <span class="ru">Основание</span></th><td>{{ activity_name }} uchun ariza, to‘langan {{ payment_date }}</td></tr>
+    <tr><th>Asos <span class="ru">Основание</span></th><td>{{ activity_name }} uchun ariza, toʻlangan {{ payment_date }}</td></tr>
   </table>
 
   <!-- R4: two labelled lines, the holder's NAME on the second, no staff name, one QR. -->
@@ -86,7 +86,7 @@
       <td>
         <table class="lines">
           <tr>
-            <td class="who">Xo‘jalik rahbari<br><span class="caption">Директор лесхоза</span></td>
+            <td class="who">Xoʻjalik rahbari<br><span class="caption">Директор лесхоза</span></td>
             <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
           </tr>
           <tr>

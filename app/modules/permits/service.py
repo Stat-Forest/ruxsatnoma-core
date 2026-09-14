@@ -188,7 +188,7 @@ APPLICATION_PERMIT_ISSUED = "PERMIT_ISSUED"
 # boundary, `CLAUDE.md`) — so `applications.service.status_reached_at` exposes it,
 # added with this ruling for this one caller, and `issue()` freezes what it
 # returns into the snapshot. See `_snapshot`'s own docstring.
-PAYMENT_STATUS_PAID = "To‘langan"
+PAYMENT_STATUS_PAID = "Toʻlangan"
 
 # The document's language (decision #215 R2). The blanks are Latin, and #90 makes
 # `uz_latn` the one key every LocalizedName is guaranteed to carry — `_localized`
@@ -206,14 +206,14 @@ PUBLIC_STATUS_KEY_LANGUAGE = "uz_cyrl"
 # document's language. Mirror `applications.schemas.DeadwoodProduct` /
 # `RecreationPurpose`; a code missing here is refused at issuance by name.
 DEADWOOD_PRODUCT_LABELS = {
-    "firewood": "o‘tin",
+    "firewood": "oʻtin",
     "branches": "shox-shabba",
-    "both": "o‘tin va shox-shabba",
+    "both": "oʻtin va shox-shabba",
 }
 RECREATION_PURPOSE_LABELS = {
-    "cultural_educational": "madaniy-ma’rifiy",
+    "cultural_educational": "madaniy-maʼrifiy",
     "upbringing": "tarbiyaviy",
-    "health": "sog‘lomlashtirish",
+    "health": "sogʻlomlashtirish",
     "recreational": "rekreatsion",
     "aesthetic": "estetik",
 }
@@ -710,7 +710,7 @@ async def _snapshot(
     # `pending` and `rejected`, so a `benefit_verified=False` here with an item
     # set is `not_required`, which prints nothing about a benefit.
     paid_line = (
-        f"{PAYMENT_STATUS_PAID}: {_money(amount)} so‘m, "
+        f"{PAYMENT_STATUS_PAID}: {_money(amount)} soʻm, "
         f"{paid_at.astimezone(TASHKENT).date().isoformat()}"
     )
     if benefit_item_id is not None and benefit_verified:

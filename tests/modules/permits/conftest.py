@@ -42,7 +42,7 @@ from app.core.time import business_today
 from app.main import create_app
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
-from app.modules.applications.models import Application
+from app.modules.applications.models import Application, ApplicationStatusHistory
 from app.modules.auth.models import Applicant, Representation, User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
@@ -106,6 +106,29 @@ GRAZING_HERD: tuple[tuple[str, int], ...] = (
     ("sheep_goat_6m", 2),
     ("lamb_kid_under_6m", 5),
 )
+
+
+# When every fixture application was PAID — the `application_status_history`
+# row's own `occurred_at`, which is what ruling #118 prints as the permit's
+# payment date (`applications.service.status_reached_at`); the `updated_at`
+# floor `issue()` keeps is never reached here, exactly as in production. Fixed,
+# aware, and 20:30 UTC on purpose: that is 01:30 on the NEXT day in Tashkent,
+# so a permit printing the UTC date would fail rather than pass by luck.
+PAID_AT = datetime(2027, 4, 20, 20, 30, tzinfo=UTC)
+
+
+def paid_history_row(application_id: uuid.UUID) -> ApplicationStatusHistory:
+    """The PAID transition as `applications.service.set_status` records it
+    (`from_status`, `to_status`, no actor — the payment subscriber's own
+    shape), at `PAID_AT`. `changed_by` is null the way a provider confirmation
+    leaves it."""
+    return ApplicationStatusHistory(
+        application_id=application_id,
+        from_status="INVOICED",
+        to_status="PAID",
+        changed_by=None,
+        occurred_at=PAID_AT,
+    )
 
 
 def calculation_input_snapshot(items: tuple[tuple[str, int], ...]) -> dict[str, object]:
@@ -196,6 +219,10 @@ async def make_paid_application(
     a random, isolated spot (a fixed committed geometry accumulates across runs
     on the shared test DB — lesson).
 
+    A `PAID` row also gets its `application_status_history` entry at `PAID_AT`:
+    ruling #118 prints the payment date off that row, and a fixture without one
+    would have every test assert the `updated_at` floor instead of the source.
+
     It also gets a `Calculation`, because issuance reads the priced amount out of
     `applications.service.current_calculation` and refuses without one (`tz/13`
     field 18 is not optional on a permit) — and, since ruling T3-f, the HERD too:
@@ -260,6 +287,9 @@ async def make_paid_application(
     )
     db.add(row)
     await db.flush()
+    if status == "PAID":
+        db.add(paid_history_row(row.id))
+        await db.flush()
 
     if not with_calculation:
         return row
@@ -359,6 +389,8 @@ async def make_legal_paid_application(
         assigned_org_id=org.id,
     )
     db.add(row)
+    await db.flush()
+    db.add(paid_history_row(row.id))
     await db.flush()
 
     db.add(

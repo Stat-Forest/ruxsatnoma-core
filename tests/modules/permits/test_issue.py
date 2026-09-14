@@ -29,14 +29,14 @@ from app.core.time import TASHKENT
 from app.event_subscriptions import PAYMENT_CONFIRMED
 from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
-from app.modules.applications.models import Application, ApplicationItem
+from app.modules.applications.models import Application, ApplicationItem, ApplicationStatusHistory
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Applicant, User
 from app.modules.norms.models import Calculation
 from app.modules.notifications.models import Notification
 from app.modules.permits import events, render, repo, service
 from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
-from tests.modules.permits.conftest import STORED_LAYOUT, make_paid_application
+from tests.modules.permits.conftest import PAID_AT, STORED_LAYOUT, make_paid_application
 
 API = "/api/v1"
 
@@ -242,22 +242,45 @@ def _pdf_text(content: bytes) -> str:
     return "".join(text_content.split())
 
 
+async def paid_row(db: AsyncSession, application_id: uuid.UUID) -> ApplicationStatusHistory:
+    """The PAID transition's own history row — ruling #118's source for the
+    printed payment date, read straight off the table rather than through the
+    accessor under test."""
+    return (
+        await db.execute(
+            select(ApplicationStatusHistory).where(
+                ApplicationStatusHistory.application_id == application_id,
+                ApplicationStatusHistory.to_status == "PAID",
+            )
+        )
+    ).scalar_one()
+
+
 async def test_the_snapshot_carries_the_payment_date_and_it_is_visible_in_the_pdf(
     db: AsyncSession, hodim_client, paid_application: Application
 ):
     """Ruling #118: requisite 19 prints BOTH halves of «Статус оплаты и дата».
-    `service._snapshot`'s own docstring explains where the date comes from
-    (`applications.updated_at`, read off the SAME `PAID` row `issue()` already
-    holds) and why that stays inside this module's boundary."""
-    application = await applications_service.get(db, paid_application.id)
-    assert application is not None
-    expected = application.updated_at.astimezone(TASHKENT).date().isoformat()
+    The date is the PAID row's own `occurred_at` in `application_status_history`
+    (`applications.service.status_reached_at` — `service._snapshot`'s docstring
+    says why that stays inside this module's boundary), as a Tashkent calendar
+    date: the fixture pays at 20:30 UTC, which is already the next day there,
+    so the UTC date would be a wrong answer here rather than an equal one."""
+    paid = await paid_row(db, paid_application.id)
+    assert paid.occurred_at == PAID_AT
+    expected = paid.occurred_at.astimezone(TASHKENT).date().isoformat()
+    assert expected != paid.occurred_at.date().isoformat(), "the boundary case, on purpose"
+    calculation = await applications_service.current_calculation(db, paid_application.id)
+    assert calculation is not None
 
     result = await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
     assert result.status_code == 201, result.text
     permit = await service.for_application(db, paid_application.id)
     assert permit is not None
     assert permit.snapshot["payment_date"] == expected
+    # Decision #215 R7: the blanks print the same date inside the paid line.
+    assert permit.snapshot["payment_basis"] == (
+        f"{service.PAYMENT_STATUS_PAID}: {calculation.amount:f} soʻm, {expected}"
+    )
     # The status half stays exactly what it always was (ruling T3-b's half that
     # this ruling does NOT touch).
     assert permit.snapshot["payment_status"] == service.PAYMENT_STATUS_PAID
@@ -820,11 +843,20 @@ async def test_a_deadwood_permit_is_issued_on_its_own_blank(
 ) -> None:
     """Before 0061 this refused with `no_active_template` for every activity but
     grazing — the finding `app/seed/demo.py` recorded."""
+    paid = await paid_row(db, deadwood_paid_application.id)
+    calculation = await applications_service.current_calculation(db, deadwood_paid_application.id)
+    assert calculation is not None
+
     permit = await service.issue(db, deadwood_paid_application.id, actor=assigned_executor)
-    assert permit.snapshot["deadwood_product"] == "o‘tin"
+    assert permit.snapshot["deadwood_product"] == "oʻtin"
     assert permit.snapshot["removal_deadline"] == "2027-06-15"
     assert permit.snapshot["quantity"] == "3.0000"
-    assert permit.snapshot["payment_basis"].startswith("To‘langan: ")
+    # The whole paid line (R7): status, the priced amount, the PAID row's own
+    # date in Tashkent — and no benefit prefix, because none was claimed.
+    assert permit.snapshot["payment_basis"] == (
+        f"Toʻlangan: {calculation.amount:f} soʻm, "
+        f"{paid.occurred_at.astimezone(TASHKENT).date().isoformat()}"
+    )
     pdf = await service.pdf_bytes(db, permit.id)
     assert pdf.startswith(b"%PDF")
 
@@ -833,7 +865,7 @@ async def test_a_recreation_permit_prints_its_purpose_and_event_in_tashkent_time
     db: AsyncSession, recreation_paid_application: Application, assigned_executor: User
 ) -> None:
     permit = await service.issue(db, recreation_paid_application.id, actor=assigned_executor)
-    assert permit.snapshot["recreation_purpose"] == "sog‘lomlashtirish"
+    assert permit.snapshot["recreation_purpose"] == "sogʻlomlashtirish"
     assert permit.snapshot["event_at"] == "2027-05-01 15:00"  # 10:00 UTC
 
 
@@ -848,3 +880,21 @@ async def test_a_deadwood_application_without_its_blank_lines_is_refused_by_name
     with pytest.raises(DomainError) as excinfo:
         await service.issue(db, deadwood_paid_application.id, actor=assigned_executor)
     assert excinfo.value.details == {"reason": "missing_requisite", "field": "removal_deadline"}
+
+
+def test_the_stage_15_twins_agree_across_the_module_boundary() -> None:
+    """Four constants exist twice because `permits` may not import them from
+    where they were born (module boundary: `applications` is reached through
+    its service, `norms.calculator` not at all). Each pair agrees by hand;
+    this is what makes the agreement checked rather than remembered. A test
+    may import both sides — the service may not."""
+    from typing import get_args
+
+    from app.modules.applications import checks, schemas
+
+    assert service.BLANK_REQUISITES_BY_ACTIVITY == checks.BLANK_FIELDS_BY_ACTIVITY
+    assert set(service.DEADWOOD_PRODUCT_LABELS) == set(get_args(schemas.DeadwoodProduct))
+    assert set(service.RECREATION_PURPOSE_LABELS) == set(get_args(schemas.RecreationPurpose))
+    assert set(service.GRAZING_CELLS) == {
+        code for _, codes in service.LIVESTOCK_ROWS for code in codes
+    }

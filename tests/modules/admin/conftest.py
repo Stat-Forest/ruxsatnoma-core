@@ -43,7 +43,13 @@ async def agency(db) -> Organization:
     org = Organization(
         kind="agency",
         code="agency",
-        name={"uz_cyrl": "Ўрмон хўжалиги агентлиги", "en": "Forestry Agency"},
+        # `uz_latn` is the required key (decision #90) and the permit's own
+        # language (#215 R2): an agency named without it refuses every issuance.
+        name={
+            "uz_latn": "Oʻrmon xoʻjaligi agentligi",
+            "uz_cyrl": "Ўрмон хўжалиги агентлиги",
+            "en": "Forestry Agency",
+        },
     )
     db.add(org)
     await db.commit()
