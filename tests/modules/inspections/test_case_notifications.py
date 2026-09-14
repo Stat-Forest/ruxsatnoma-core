@@ -83,7 +83,9 @@ async def test_requesting_an_explanation_notifies_with_its_deadline(
     assert case is not None
     rows = await _notifications_for(db, applicant_user.id)
     assert [r.event_code for r in rows] == [events.CASE_OPENED, events.CASE_EXPLANATION_REQUESTED]
-    assert str(case.explanation_due_at) in rows[-1].rendered_text
+    assert case.explanation_due_at is not None
+    # The citizen reads the deadline as a calendar date, not the ISO machine form.
+    assert case.explanation_due_at.strftime("%d.%m.%Y") in rows[-1].rendered_text
 
 
 @pytest.mark.parametrize("decision", ["warning", "suspend", "revoke", "transfer"])
