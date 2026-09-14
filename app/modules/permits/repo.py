@@ -10,7 +10,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import ColumnElement, Row, String, cast, func, select, text
+from sqlalchemy import ColumnElement, Row, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.abac import Zone, zone_filter
@@ -25,6 +25,7 @@ from app.modules.permits.models import (
     PermitRating,
     PermitStatusHistory,
     PermitTemplate,
+    display_number_sql,
 )
 
 
@@ -191,7 +192,7 @@ async def list_permits(
     child-table write alone. Served by `ix_permits_updated_at_id`.
 
     `q` is the free-text filter: a substring of the applicant's name or of the
-    printed number `"<series> № <000000>"` (`core.textsearch.text_filter`,
+    printed number (`models.display_number_sql`, `core.textsearch.text_filter`,
     the predicate `GET /search` used before that screen was folded into this
     list). It joins `applicants` only when set.
     """
@@ -207,8 +208,7 @@ async def list_permits(
         if value is not None:
             conditions.append(column == value)
     if q:
-        printed = Permit.series + " № " + func.lpad(cast(Permit.number, String), 6, "0")
-        conditions.append(text_filter(q, printed, Applicant.name))
+        conditions.append(text_filter(q, display_number_sql(), Applicant.name))
 
     def _joined(stmt: Any) -> Any:
         stmt = stmt.join(Organization, Organization.id == Permit.organization_id)

@@ -86,3 +86,26 @@ async def test_outbox_alerted_at_exists_and_starts_null(db):
     db.add(row)
     await db.flush()
     assert row.alerted_at is None
+
+
+async def test_provider_reference_is_assigned_by_the_database_and_unique(db):
+    """`provider_reference` is what Eskiz gets as `user_sms_id` and echoes on the
+    delivery report: a number the provider accepts (digits, at most twelve), handed
+    out by the database, never by the caller — two rows never share one."""
+    user = await make_user(db)
+    rows = [
+        Notification(
+            recipient_user_id=user.id,
+            channel="inapp",
+            event_code="test.event",
+            params={},
+            language="uz_latn",
+            rendered_text="Matn",
+        )
+        for _ in range(2)
+    ]
+    db.add_all(rows)
+    await db.flush()
+    first, second = (row.provider_reference for row in rows)
+    assert isinstance(first, int) and isinstance(second, int)
+    assert 0 < first < second < 10**12

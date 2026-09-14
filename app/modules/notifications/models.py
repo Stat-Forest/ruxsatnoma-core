@@ -6,7 +6,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, UniqueConstraint, func, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Identity,
+    Index,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -71,6 +80,12 @@ class Notification(Base):
         ForeignKey("outbox_messages.id", ondelete="SET NULL")
     )
     provider_message_id: Mapped[str | None]
+    # What the provider gets as its correlation id and echoes on the delivery
+    # report. Eskiz accepts a NUMBER of at most twelve digits and nothing else
+    # (a uuid is `400 user_sms_id is invalid` — measured 2026-09-14), so the
+    # database hands one out per row; `eager_defaults` makes it readable right
+    # after the flush without a lazy load an async session cannot do.
+    provider_reference: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
     error: Mapped[str | None]
     object_type: Mapped[str | None]
     object_id: Mapped[uuid.UUID | None]
@@ -80,10 +95,12 @@ class Notification(Base):
     delivered_at: Mapped[datetime | None]
     read_at: Mapped[datetime | None]
 
+    __mapper_args__ = {"eager_defaults": True}
     __table_args__ = (
         CheckConstraint("channel IN ('inapp', 'sms', 'email')", name="channel_valid"),
         CheckConstraint("status IN ('queued', 'sent', 'delivered', 'failed')", name="status_valid"),
         Index("ix_notifications_inbox", "recipient_user_id", "created_at"),
+        Index("uq_notifications_provider_reference", "provider_reference", unique=True),
         Index(
             "ix_notifications_provider_message_id",
             "provider_message_id",

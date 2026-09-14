@@ -18,7 +18,7 @@ from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.email import get_email_sender
-from app.modules.integrations.adapters.sms import get_sms_sender
+from app.modules.integrations.adapters.sms import MAX_REFERENCE_DIGITS, get_sms_sender
 from app.modules.integrations.senders import register_sender
 from app.modules.notifications import repo
 from app.modules.notifications.models import CHANNELS, Notification, NotificationTemplate
@@ -493,7 +493,7 @@ async def _deliver(db: AsyncSession, payload: dict[str, Any]) -> None:
     if row.channel == "sms":
         assert contact.phone is not None  # _recipient_reachable guarantees it
         provider_id = await get_sms_sender().send(
-            phone=contact.phone, text=row.rendered_text, reference=str(row.id)
+            phone=contact.phone, text=row.rendered_text, reference=str(row.provider_reference)
         )
     else:
         assert contact.email is not None
@@ -527,11 +527,11 @@ async def apply_delivery_report(db: AsyncSession, data: Mapping[str, Any]) -> st
     provider_id = str(data.get("message_id") or data.get("id") or "").strip()
     status = str(data.get("status") or "").strip().upper()
     row: Notification | None = None
-    if reference:
-        try:
-            row = await repo.get_notification(db, uuid.UUID(reference))
-        except ValueError:
-            row = None
+    # `user_sms_id` echoes the row's numeric `provider_reference` (the only shape
+    # Eskiz accepts); anything else — the uuid the 3.5 client used to send — names
+    # no row and falls through to the provider id, then to the dead letter.
+    if reference.isdigit() and len(reference) <= MAX_REFERENCE_DIGITS:
+        row = await repo.get_by_provider_reference(db, int(reference))
     if row is None and provider_id:
         row = await repo.get_by_provider_message_id(db, provider_id)
     result = "ok"

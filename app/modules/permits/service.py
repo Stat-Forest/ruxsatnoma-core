@@ -62,6 +62,7 @@ from app.modules.permits.models import (
     PermitStatusHistory,
     PermitTemplate,
     QrCheckLog,
+    display_number,
 )
 from app.modules.permits.permissions import PERMITS_VIEW_ANY
 from app.modules.permits.schemas import DecisionIn, DuplicateIn, ForestTicketIn
@@ -1129,9 +1130,10 @@ OBJECT_TYPE = "permit"
 
 def _permit_number(series: str, number: int) -> str:
     """The permit's number as every notification and the document itself print
-    it. One formatter, three callers — a legal document's identifier must not be
-    spelled two ways because two call sites each carried their own f-string."""
-    return f"{series} № {number:06d}"
+    it — `models.display_number`, kept under this name for its callers here. One
+    formatter: a legal document's identifier must not be spelled two ways because
+    two call sites each carried their own f-string."""
+    return display_number(series, number)
 
 
 async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:

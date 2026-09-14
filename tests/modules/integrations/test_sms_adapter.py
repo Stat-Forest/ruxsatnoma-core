@@ -38,8 +38,8 @@ async def test_logs_in_once_and_reuses_the_token(db):
         return httpx.Response(200, json={"id": "9001", "status": "waiting"})
 
     sender = _sender(handler)
-    assert await sender.send(phone="998901234567", text="hi", reference="ref-1") == "9001"
-    assert await sender.send(phone="998901234567", text="hi", reference="ref-2") == "9001"
+    assert await sender.send(phone="998901234567", text="hi", reference="1") == "9001"
+    assert await sender.send(phone="998901234567", text="hi", reference="2") == "9001"
     assert calls.count("/api/auth/login") == 1
 
 
@@ -52,11 +52,13 @@ async def test_sends_the_documented_fields(db):
         captured.update(dict(httpx.QueryParams(request.content.decode())))
         return httpx.Response(200, json={"id": "42"})
 
-    await _sender(handler).send(phone="+998 90 123-45-67", text="Матн", reference="ref-9")
+    await _sender(handler).send(phone="+998 90 123-45-67", text="Матн", reference="900123")
     assert captured["mobile_phone"] == "998901234567"  # digits only, no '+' (design/04 §4)
     assert captured["message"] == "Матн"
     assert captured["from"] == "4546"
-    assert captured["user_sms_id"] == "ref-9"
+    # Eskiz validates `user_sms_id` as a number of at most twelve digits — a uuid
+    # answers `400 user_sms_id is invalid` (measured live, 2026-09-14).
+    assert captured["user_sms_id"] == "900123"
     assert captured["callback_url"] == "https://ruxsatnoma.example/api/v1/webhooks/eskiz/cbsecret"
 
 
@@ -73,7 +75,7 @@ async def test_a_401_triggers_one_relogin_and_a_retry(db):
             return httpx.Response(401, json={"message": "expired"})
         return httpx.Response(200, json={"id": "77"})
 
-    assert await _sender(handler).send(phone="998901234567", text="hi", reference="r") == "77"
+    assert await _sender(handler).send(phone="998901234567", text="hi", reference="7") == "77"
     assert seen.count("/api/auth/login") == 2
 
 
@@ -84,7 +86,7 @@ async def test_a_persistent_401_raises_rather_than_looping(db):
         return httpx.Response(401, json={"message": "nope"})
 
     with pytest.raises(EskizError):
-        await _sender(handler).send(phone="998901234567", text="hi", reference="r")
+        await _sender(handler).send(phone="998901234567", text="hi", reference="7")
 
 
 async def test_a_failed_login_raises_without_the_password(db):
@@ -92,7 +94,7 @@ async def test_a_failed_login_raises_without_the_password(db):
         return httpx.Response(403, json={"message": "bad credentials"})
 
     with pytest.raises(EskizError) as excinfo:
-        await _sender(handler).send(phone="998901234567", text="hi", reference="r")
+        await _sender(handler).send(phone="998901234567", text="hi", reference="7")
     assert "s3cret" not in str(excinfo.value)
 
 
@@ -106,7 +108,7 @@ async def test_an_error_never_leaks_the_message_text_or_the_phone(db):
         return httpx.Response(400, json={"message": "invalid"})
 
     with pytest.raises(EskizError) as excinfo:
-        await _sender(handler).send(phone="998901234567", text="code 123456", reference="r")
+        await _sender(handler).send(phone="998901234567", text="code 123456", reference="7")
     rendered = f"{excinfo.value!r} {excinfo.value}"
     assert "123456" not in rendered
     assert "998901234567" not in rendered
@@ -124,7 +126,7 @@ async def test_a_transport_timeout_becomes_an_eskiz_error(db):
         raise httpx.ConnectTimeout("timed out")
 
     with pytest.raises(EskizError):
-        await _sender(handler).send(phone="998901234567", text="hi", reference="r")
+        await _sender(handler).send(phone="998901234567", text="hi", reference="7")
 
 
 async def test_a_transport_timeout_during_send_becomes_an_eskiz_error(db):
@@ -137,7 +139,7 @@ async def test_a_transport_timeout_during_send_becomes_an_eskiz_error(db):
         raise httpx.ConnectTimeout("timed out")
 
     with pytest.raises(EskizError):
-        await _sender(handler).send(phone="998901234567", text="hi", reference="r")
+        await _sender(handler).send(phone="998901234567", text="hi", reference="7")
 
 
 async def test_real_mode_returns_the_eskiz_sender(monkeypatch):
@@ -187,7 +189,45 @@ async def test_an_otp_send_asks_for_no_delivery_report(db, monkeypatch):
 
     # ...while a notification send still asks for one: without it nothing would
     # ever move a notification from 'sent' to 'delivered'.
-    await sender.send(phone="998901234567", text="hi", reference="ref-1")
+    await sender.send(phone="998901234567", text="hi", reference="8")
     assert captured[-1]["callback_url"] == (
         "https://ruxsatnoma.example/api/v1/webhooks/eskiz/cbsecret"
     )
+
+
+async def test_a_reference_that_is_not_a_short_number_is_refused_before_any_request(db):
+    """Eskiz's `user_sms_id` is digits only and at most twelve of them (live probe,
+    2026-09-14: 999999999999 accepted, 1000000000000 and any uuid refused). A
+    reference our own code shaped wrongly is a defect, not a provider failure —
+    it must fail here, loudly, never as an `EskizError` the outbox retries."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(200, json={"data": {"token": "tok"}, "id": "1"})
+
+    sender = _sender(handler)
+    for bad in ("ref-9", "0198d2a2-5d2e-7b1c-9f3e-2b4c6d8e0f1a", "1000000000000", "", "-5"):
+        with pytest.raises(ValueError):
+            await sender.send(phone="998901234567", text="hi", reference=bad)
+    assert requests == []
+    assert await sender.send(phone="998901234567", text="hi", reference="999999999999") == "1"
+
+
+async def test_a_send_without_a_reference_carries_no_user_sms_id(db):
+    """An OTP has no `notifications` row to correlate a report against, so it sends
+    no `user_sms_id` at all — a throwaway one would be either refused (a uuid) or
+    a lie (a number that names nothing)."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, json={"data": {"token": "tok"}})
+        captured.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={"id": "1"})
+
+    await _sender(handler).send(
+        phone="998901234567", text="code 1", reference=None, delivery_report=False
+    )
+    assert "user_sms_id" not in captured
+    assert "callback_url" not in captured

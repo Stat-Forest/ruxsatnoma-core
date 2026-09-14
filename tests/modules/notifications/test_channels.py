@@ -68,8 +68,11 @@ async def test_delivery_marks_the_notification_sent_and_records_the_provider_id(
     phone, text, reference = sender.sent[-1]
     assert phone == "998901234567"
     assert "P-7" in text
-    assert reference == str(sms.id)
-    assert sms.provider_message_id == f"mock-{sms.id}"
+    # The correlation id the provider echoes back is the row's numeric
+    # `provider_reference`, never its uuid (Eskiz refuses anything but ≤12 digits).
+    assert reference == str(sms.provider_reference)
+    assert reference is not None and reference.isdigit() and len(reference) <= 12
+    assert sms.provider_message_id == f"mock-{sms.provider_reference}"
 
 
 async def test_a_failing_sender_leaves_the_row_pending_for_retry(db, monkeypatch):

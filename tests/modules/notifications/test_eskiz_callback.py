@@ -56,7 +56,7 @@ async def _post(
 async def test_delivered_report_marks_the_notification_delivered(db, monkeypatch):
     sms = await _sms_notification(db)
     await db.commit()
-    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "DELIVRD"})
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "DELIVRD"})
     assert r.status_code == 200
     assert r.json()["result"] == "ok"
     await db.refresh(sms)
@@ -76,7 +76,7 @@ async def test_correlation_falls_back_to_the_provider_id(db, monkeypatch):
 async def test_a_failure_report_marks_the_notification_failed(db, monkeypatch):
     sms = await _sms_notification(db)
     await db.commit()
-    await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "REJECTD"})
+    await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "REJECTD"})
     await db.refresh(sms)
     assert sms.status == "failed"
     assert sms.error == "REJECTD"
@@ -85,7 +85,7 @@ async def test_a_failure_report_marks_the_notification_failed(db, monkeypatch):
 async def test_an_intermediate_status_leaves_the_row_alone(db, monkeypatch):
     sms = await _sms_notification(db)
     await db.commit()
-    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "STORED"})
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "STORED"})
     assert r.json()["result"] == "ignored"
     await db.refresh(sms)
     assert sms.status == "sent"
@@ -94,22 +94,20 @@ async def test_an_intermediate_status_leaves_the_row_alone(db, monkeypatch):
 async def test_a_repeated_delivered_report_is_a_no_op(db, monkeypatch):
     sms = await _sms_notification(db)
     await db.commit()
-    await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "DELIVRD"})
-    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "REJECTD"})
+    await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "DELIVRD"})
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "REJECTD"})
     assert r.json()["result"] == "ignored"  # terminal statuses are never overwritten
     await db.refresh(sms)
     assert sms.status == "delivered"
 
 
 async def test_a_wrong_secret_is_a_404(db, monkeypatch):
-    r = await _post(
-        monkeypatch, {"user_sms_id": str(uuid.uuid4()), "status": "DELIVRD"}, secret="nope"
-    )
+    r = await _post(monkeypatch, {"user_sms_id": "1", "status": "DELIVRD"}, secret="nope")
     assert r.status_code == 404
 
 
 async def test_an_unknown_reference_becomes_a_dead_letter(db, monkeypatch):
-    unknown = str(uuid.uuid4())
+    unknown = "999999999999"  # the largest reference Eskiz accepts; names no row here
     r = await _post(monkeypatch, {"user_sms_id": unknown, "status": "DELIVRD"})
     assert r.status_code == 200
     assert r.json()["result"] == "dead_letter"
@@ -124,14 +122,16 @@ async def test_an_unknown_reference_becomes_a_dead_letter(db, monkeypatch):
 async def test_a_form_encoded_report_is_accepted(db, monkeypatch):
     sms = await _sms_notification(db)
     await db.commit()
-    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "DELIVRD"}, form=True)
+    r = await _post(
+        monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "DELIVRD"}, form=True
+    )
     assert r.json()["result"] == "ok"
 
 
 async def test_a_body_without_a_status_becomes_a_dead_letter(db, monkeypatch):
     sms = await _sms_notification(db)
     await db.commit()
-    r = await _post(monkeypatch, {"user_sms_id": str(sms.id)})
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference)})
     assert r.json()["result"] == "dead_letter"
 
 
@@ -155,7 +155,7 @@ async def test_a_lowercase_status_is_normalized(db, monkeypatch):
     # one that would fail if apply_delivery_report's `.upper()` were ever deleted.
     sms = await _sms_notification(db)
     await db.commit()
-    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "delivrd"})
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.provider_reference), "status": "delivrd"})
     assert r.json()["result"] == "ok"
     await db.refresh(sms)
     assert sms.status == "delivered"
@@ -168,3 +168,14 @@ async def test_a_non_ascii_secret_is_a_404_not_a_500(db, monkeypatch):
     r = await _post(monkeypatch, {"status": "DELIVRD"}, secret="Ω")
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "ERR-SYS-003"
+
+
+async def test_a_report_naming_a_uuid_is_a_dead_letter_not_a_crash(db, monkeypatch):
+    """The 3.5 client sent the notification uuid as `user_sms_id`; Eskiz never
+    accepted one (`400 user_sms_id is invalid`), so a report carrying a uuid is
+    a body we cannot interpret — recorded, answered 200, never a 500."""
+    sms = await _sms_notification(db)
+    await db.commit()
+    r = await _post(monkeypatch, {"user_sms_id": str(sms.id), "status": "DELIVRD"})
+    assert r.status_code == 200
+    assert r.json()["result"] == "dead_letter"
