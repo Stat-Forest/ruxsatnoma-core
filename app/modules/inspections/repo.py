@@ -164,7 +164,7 @@ async def acts_for_applications(
 ) -> Sequence[InspectionAct]:
     """Every SIGNED act against any of `application_ids` — the site visit of
     C6, before a permit exists — for `service.acts_for_applications` (the
-    applications register's «conclusion» column, decision #215); the same
+    applications register's «conclusion» column, decision #216); the same
     shape as `acts_for_permits` above, keyed on the application."""
     if not application_ids:
         return []

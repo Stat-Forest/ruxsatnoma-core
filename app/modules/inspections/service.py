@@ -745,7 +745,7 @@ async def acts_for_applications(
     """Every SIGNED act for each of `application_ids` — the inspector's site
     visit on a filing (C6) — each application's own list chronological; the
     read behind the applications register's «conclusion» column (decision
-    #215, `reports.applications_register`). The same rule and the same
+    #216, `reports.applications_register`). The same rule and the same
     reasoning as `acts_for_permits` above: which acts COUNT is this
     module's business, so a reader asks here rather than filtering
     `inspection_acts` itself."""
