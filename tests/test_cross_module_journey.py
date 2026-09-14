@@ -843,11 +843,8 @@ async def test_the_free_path_from_filing_to_an_active_permit(
     test_a_tariff_published_between_package_and_submit_is_also_package_changed`
     already uses for the identical class of row.
     """
-    from datetime import date
-
     from sqlalchemy import text
 
-    from app.core import storage
     from app.modules.applications.models import ApplicationStatusHistory
     from app.modules.integrations.adapters.eimzo import encode_mock_signature
     from app.modules.norms.models import Tariff
@@ -896,37 +893,14 @@ async def test_the_free_path_from_filing_to_an_active_permit(
     tariff.benefit_modifiers = {BENEFIT_CODE: "0"}
     await db.commit()
 
-    # Migration 0019 seeds an active template for `grazing` alone — every
-    # other activity has none until an administrator uploads one
-    # (`permits/models.py::PermitTemplate`'s own docstring), and the layout
-    # BUNDLED with the module (`layout_file_id=NULL`) is grazing's own —
-    # `{{sb_load}}` among its placeholders, which a recreation application
-    # never fills (`ERR-VAL-001 unfilled_placeholders`). A STORED layout of
-    # this test's own, the same shape `permits/conftest.py::apiary_template`
-    # uses, sidesteps every activity-specific placeholder.
-    RECREATION_LAYOUT_FILE_ID = uuid.UUID("01a06200-0000-7000-8000-000000000002")
-    RECREATION_LAYOUT_KEY = "t/permits-recreation-layout-b2.html"
-    layout_bytes = (
-        "<html><body><h1>{{ series }} № {{ number }}</h1>"
-        '<p>Recreation — {{ holder_name }}</p><img src="{{ qr }}"></body></html>'
-    ).encode()
-    await storage.ensure_bucket()
-    await storage.put_object(RECREATION_LAYOUT_KEY, layout_bytes, "text/html")
-    layout_file = await db.get(MediaFile, RECREATION_LAYOUT_FILE_ID)
-    if layout_file is None:
-        layout_file = MediaFile(
-            id=RECREATION_LAYOUT_FILE_ID,
-            storage_key=RECREATION_LAYOUT_KEY,
-            filename="recreation_layout.html",
-            content_type="text/html",
-            size_bytes=len(layout_bytes),
-            sha256=hashlib.sha256(layout_bytes).hexdigest(),
-        )
-        db.add(layout_file)
-        await db.flush()
-
-    # Get-or-create: a previous run's row is reused rather than colliding
-    # with `uq_permit_templates_active`.
+    # The recreation permit is issued on the blank BUNDLED for its activity —
+    # migration 0061 seeds every open activity's template with `layout_file_id`
+    # NULL (decision #215 R1), and the snapshot has covered that blank's lines
+    # since stage 15 Task 4. A stored layout of this test's own once stood in
+    # for the missing template; it is gone, because `tests/modules/permits/
+    # test_models.py` asserts the recreation row NULL and a committed repoint
+    # here would flip that assertion on any shared or persistent test DB.
+    # Self-healing, for a database such an earlier run left behind.
     recreation_template = (
         await db.execute(
             select(PermitTemplate).where(
@@ -934,18 +908,8 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                 PermitTemplate.status == "active",
             )
         )
-    ).scalar_one_or_none()
-    if recreation_template is None:
-        recreation_template = PermitTemplate(
-            activity_type_id=recreation_activity_id,
-            version=1,
-            name={"uz_cyrl": "Тест бланки", "en": "Test recreation layout"},
-            layout_file_id=layout_file.id,
-            status="active",
-            valid_from=date(2020, 1, 1),
-        )
-        db.add(recreation_template)
-    recreation_template.layout_file_id = layout_file.id
+    ).scalar_one()
+    recreation_template.layout_file_id = None
     await db.commit()
 
     applicant_user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())

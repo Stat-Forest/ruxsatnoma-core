@@ -23,6 +23,7 @@ from pypdf import PdfReader
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.core.events import Event, publish
 from app.core.time import TASHKENT
 from app.event_subscriptions import PAYMENT_CONFIRMED
@@ -168,11 +169,12 @@ async def test_the_snapshot_survives_the_applicant_ROW_being_renamed(
 async def test_a_template_with_no_layout_file_renders_the_bundled_layout(
     db: AsyncSession, hodim_client, paid_application: Application
 ):
-    """Migration 0019 seeds the grazing template with a NULL `layout_file_id`,
-    which means "the layout bundled in `app/modules/permits/assets/`" (task 1,
-    decision 2). Byte-compared against a fresh render from that very file, so this
-    proves WHICH layout was used and that the PDF was made from the stored
-    snapshot — not merely that some PDF came out."""
+    """Migration 0061 seeds every open activity's template with a NULL
+    `layout_file_id`, which means "the blank bundled with the module for THIS
+    row's activity" (decision #215 R1) — grazing's here. Byte-compared against a
+    fresh render from that very file, so this proves WHICH layout was used and
+    that the PDF was made from the stored snapshot — not merely that some PDF
+    came out."""
     await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
     permit = await service.for_application(db, paid_application.id)
     assert permit is not None
@@ -181,7 +183,6 @@ async def test_a_template_with_no_layout_file_renders_the_bundled_layout(
     assert template is not None
     assert template.layout_file_id is None
 
-    # Stage 15 Task 4 chooses the blank per activity.
     expected = render.render_permit(
         permit.snapshot,
         render.bundled_layout(service.GRAZING_ACTIVITY_CODE),
@@ -597,8 +598,8 @@ async def test_the_authority_and_the_leshoz_are_two_different_requisites(
     permit = await service.for_application(db, paid_application.id)
     assert permit is not None
 
-    assert permit.snapshot["authority_name"] == agency.name["uz_cyrl"]
-    assert permit.snapshot["leshoz_name"] == leshoz.name["uz_cyrl"]
+    assert permit.snapshot["authority_name"] == agency.name[service.DOCUMENT_LANGUAGE]
+    assert permit.snapshot["leshoz_name"] == leshoz.name[service.DOCUMENT_LANGUAGE]
     assert permit.snapshot["authority_name"] != permit.snapshot["leshoz_name"]
 
 
@@ -656,7 +657,7 @@ async def test_the_holders_address_falls_back_to_what_the_registry_does_hold(
     # hook makes this row permanent (the shared-test-DB lesson).
     district = District(
         code=f"d-{uuid.uuid4().hex[:8]}",
-        name={"uz_cyrl": "Синов тумани", "ru": "Тестовый район"},
+        name={"uz_latn": "Sinov tumani", "uz_cyrl": "Синов тумани", "ru": "Тестовый район"},
         region_id=region.id,
     )
     db.add(district)
@@ -672,7 +673,7 @@ async def test_the_holders_address_falls_back_to_what_the_registry_does_hold(
     assert permit is not None
 
     assert permit.snapshot["holder_address"] == (
-        f"{region.name['uz_cyrl']}, {district.name['uz_cyrl']}"
+        f"{region.name[service.DOCUMENT_LANGUAGE]}, {district.name[service.DOCUMENT_LANGUAGE]}"
     )
 
 
@@ -700,11 +701,14 @@ async def test_the_printed_head_counts_come_from_the_frozen_calculation(
     permit = await service.for_application(db, paid_application.id)
     assert permit is not None
 
-    # One row per tz/13 requisite, each naming its species from the classifier.
-    assert permit.snapshot["heads_large_adult"] == "Қорамол (катта) — 5"
-    assert permit.snapshot["heads_large_young"] == "От (2 ёшгача) — 2"
-    assert permit.snapshot["heads_small_adult"] == "Қўй ва эчки (6 ойдан катта) — 2"
-    assert permit.snapshot["heads_small_young"] == "Қўзи ва улоқ (6 ойгача) — 5"
+    # One row per tz/13 requisite, each naming its species from the classifier —
+    # in the document's language (decision #215 R2), the `uz_latn` migration 0032
+    # derived from 0005's Cyrillic seed. Unprinted since stage 15 (the grazing
+    # blank has a cell per species) but still frozen: `reports` reads these four.
+    assert permit.snapshot["heads_large_adult"] == "Qoramol (katta) — 5"
+    assert permit.snapshot["heads_large_young"] == "Ot (2 yoshgacha) — 2"
+    assert permit.snapshot["heads_small_adult"] == "Qoʻy va echki (6 oydan katta) — 2"
+    assert permit.snapshot["heads_small_young"] == "Qoʻzi va uloq (6 oygacha) — 5"
     assert "999" not in "".join(
         str(permit.snapshot[key]) for key in permit.snapshot if key.startswith("heads_")
     ), "the live application_items row must not reach the document"
@@ -725,9 +729,11 @@ async def test_an_activity_that_commits_no_livestock_prints_no_head_counts(
     assert permit is not None
 
     heads = {key: permit.snapshot[key] for key in permit.snapshot if key.startswith("heads_")}
-    assert set(heads) == {name for name, _ in service.LIVESTOCK_ROWS}, (
-        "form 1-ilova has exactly these four head-count rows, by name"
-    )
+    assert set(heads) == (
+        {name for name, _ in service.LIVESTOCK_ROWS}
+        | {f"heads_{code}" for code in service.GRAZING_CELLS}
+        | {"heads_total"}
+    ), "form 1-ilova's four rows, the grazing blank's cells and its total — by name"
     assert set(heads.values()) == {service.NOT_STATED}
     # `"0" not in …` was implied by the line above and could never fail on its own.
     # The claim worth guarding is about NOT_STATED ITSELF: it is what all four rows
@@ -773,24 +779,72 @@ async def test_a_livestock_code_the_form_has_no_row_for_is_refused(
     assert await counter(db) == before
 
 
-async def test_every_snapshot_key_is_printed_by_the_bundled_layout(
-    db: AsyncSession, hodim_client, paid_application: Application
-):
-    """A key nobody prints is dead weight in an immutable record, and a placeholder
-    with no key is `ERR-VAL-001` at the first real issuance. The bundled layout and
-    `service._snapshot` therefore have to be kept in step BOTH ways — mechanically,
-    because `tz/13` is a 25-row table and drift here is invisible until a permit is
-    refused or a requisite quietly stops being printed.
+async def test_the_snapshot_covers_exactly_the_placeholders_the_blanks_use(
+    db: AsyncSession, paid_application: Application, assigned_executor: User
+) -> None:
+    """Decision #215: `render.BLANK_FIELDS` is the contract from the blanks' side;
+    this pins it from the snapshot's side. `calculation_id` and the four legacy
+    `heads_*` rows ride along unprinted (reports read them)."""
+    permit = await service.issue(db, paid_application.id, actor=assigned_executor)
+    unprinted = {
+        "calculation_id",
+        "heads_large_adult",
+        "heads_large_young",
+        "heads_small_adult",
+        "heads_small_young",
+        "sb_load",
+        "payment_status",
+    }
+    assert set(permit.snapshot) - unprinted == render.BLANK_FIELDS
+    assert all(value is not None for value in permit.snapshot.values())
 
-    `calculation_id` is the one documented exception: it is the link back to the
-    invoice that was actually paid (ruling 19), deliberately not on the form."""
-    await hodim_client.post(f"{API}/applications/{paid_application.id}/permit")
-    permit = await service.for_application(db, paid_application.id)
-    assert permit is not None
 
-    # Stage 15 Task 4 chooses the blank per activity.
-    layout = render.bundled_layout(service.GRAZING_ACTIVITY_CODE)
-    printed = {m.group(1).strip() for m in render._PLACEHOLDER.finditer(layout)}
-    printed.discard(render.QR_FIELD)  # the renderer fills it, not the snapshot
+async def test_a_grazing_permit_prints_each_species_in_its_own_cell(
+    db: AsyncSession, paid_application: Application, assigned_executor: User
+) -> None:
+    permit = await service.issue(db, paid_application.id, actor=assigned_executor)
+    # `GRAZING_HERD` in conftest (5 cattle, 2 young horses, 2 sheep/goats, 5
+    # lambs/kids): the matching cells, the merged sheep/goat row (R3), «—» for a
+    # species this permit does not commit, and the total over all four.
+    assert permit.snapshot["heads_cattle_adult"] == "5"
+    assert permit.snapshot["heads_horse_young"] == "2"
+    assert permit.snapshot["heads_sheep_goat_6m"] == "2"
+    assert permit.snapshot["heads_lamb_kid_under_6m"] == "5"
+    assert permit.snapshot["heads_camel_adult"] == "—"
+    assert permit.snapshot["heads_total"] == "14"
+    assert permit.snapshot["deadwood_product"] == "—"
 
-    assert printed == set(permit.snapshot) - {"calculation_id"}
+
+async def test_a_deadwood_permit_is_issued_on_its_own_blank(
+    db: AsyncSession, deadwood_paid_application: Application, assigned_executor: User
+) -> None:
+    """Before 0061 this refused with `no_active_template` for every activity but
+    grazing — the finding `app/seed/demo.py` recorded."""
+    permit = await service.issue(db, deadwood_paid_application.id, actor=assigned_executor)
+    assert permit.snapshot["deadwood_product"] == "o‘tin"
+    assert permit.snapshot["removal_deadline"] == "2027-06-15"
+    assert permit.snapshot["quantity"] == "3.0000"
+    assert permit.snapshot["payment_basis"].startswith("To‘langan: ")
+    pdf = await service.pdf_bytes(db, permit.id)
+    assert pdf.startswith(b"%PDF")
+
+
+async def test_a_recreation_permit_prints_its_purpose_and_event_in_tashkent_time(
+    db: AsyncSession, recreation_paid_application: Application, assigned_executor: User
+) -> None:
+    permit = await service.issue(db, recreation_paid_application.id, actor=assigned_executor)
+    assert permit.snapshot["recreation_purpose"] == "sog‘lomlashtirish"
+    assert permit.snapshot["event_at"] == "2027-05-01 15:00"  # 10:00 UTC
+
+
+async def test_a_deadwood_application_without_its_blank_lines_is_refused_by_name(
+    db: AsyncSession, deadwood_paid_application: Application, assigned_executor: User
+) -> None:
+    """Belt and braces under R6: the wizard requires them, and issuance still
+    names the missing requisite rather than printing «None» — the renderer's own
+    rule, applied at the source it can attribute."""
+    deadwood_paid_application.removal_deadline = None
+    await db.commit()
+    with pytest.raises(DomainError) as excinfo:
+        await service.issue(db, deadwood_paid_application.id, actor=assigned_executor)
+    assert excinfo.value.details == {"reason": "missing_requisite", "field": "removal_deadline"}

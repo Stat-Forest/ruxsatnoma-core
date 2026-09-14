@@ -188,12 +188,54 @@ APPLICATION_PERMIT_ISSUED = "PERMIT_ISSUED"
 # boundary, `CLAUDE.md`) — so `applications.service.status_reached_at` exposes it,
 # added with this ruling for this one caller, and `issue()` freezes what it
 # returns into the snapshot. See `_snapshot`'s own docstring.
-PAYMENT_STATUS_PAID = "Тўланган"
+PAYMENT_STATUS_PAID = "To‘langan"
 
-# The document's language. `tz/13`'s note: «на государственном языке» — the permit
-# is issued in Uzbek Cyrillic, whatever language the holder reads the cabinet in.
-# `organizations.name`/`activity_types.name` are JSONB with this key.
-DOCUMENT_LANGUAGE = "uz_cyrl"
+# The document's language (decision #215 R2). The blanks are Latin, and #90 makes
+# `uz_latn` the one key every LocalizedName is guaranteed to carry — `_localized`
+# on `uz_cyrl` refused an issuance whenever a name was filled per #90 without it.
+# `tz/13`'s «на государственном языке» is satisfied either way: the holder reads
+# the cabinet in whatever language they choose; the document is Uzbek.
+DOCUMENT_LANGUAGE = "uz_latn"
+
+# NOT the document's language: the four words `PublicStatus` pins and the
+# landing's `STATUS_BADGE` keys on — an API vocabulary the front end already
+# depends on, kept where it was when the document moved to Latin (R2).
+PUBLIC_STATUS_KEY_LANGUAGE = "uz_cyrl"
+
+# Decision #215 R6/R9 — the blank's own labels for the two choice fields, in the
+# document's language. Mirror `applications.schemas.DeadwoodProduct` /
+# `RecreationPurpose`; a code missing here is refused at issuance by name.
+DEADWOOD_PRODUCT_LABELS = {
+    "firewood": "o‘tin",
+    "branches": "shox-shabba",
+    "both": "o‘tin va shox-shabba",
+}
+RECREATION_PURPOSE_LABELS = {
+    "cultural_educational": "madaniy-ma’rifiy",
+    "upbringing": "tarbiyaviy",
+    "health": "sog‘lomlashtirish",
+    "recreational": "rekreatsion",
+    "aesthetic": "estetik",
+}
+
+# Decision #215 R6 — the lines each activity's blank prints from the application
+# row itself, and which issuance therefore requires by name. The twin of
+# `applications.checks.BLANK_FIELDS_BY_ACTIVITY`, which the wizard enforces at
+# filing; written a second time here rather than imported, because `permits`
+# reads `applications` through its service alone (module boundary) and a
+# `checks` constant is not on that surface. An activity absent here prints
+# `NOT_STATED` in those cells (see `_snapshot`).
+BLANK_REQUISITES_BY_ACTIVITY: dict[str, tuple[str, ...]] = {
+    "deadwood": ("deadwood_product", "removal_deadline"),
+    "recreation": ("recreation_purpose", "event_at"),
+}
+
+# The grazing blank's cells (R3): one snapshot key per livestock code, «—» when
+# the permit commits none of that species — never «0» (see NOT_STATED).
+GRAZING_CELLS = (
+    "cattle_adult", "cattle_young", "horse_adult", "horse_young", "camel_adult",
+    "camel_young", "donkey_adult", "donkey_young", "sheep_goat_6m", "lamb_kid_under_6m",
+)  # fmt: skip
 
 # What a field prints when the form has nothing to state there — an em dash, the form
 # convention. It is a chosen VALUE, not a missing one, and it is never a blank.
@@ -313,9 +355,11 @@ def _required[T](value: T | None, *, field: str) -> T:
 
 
 def _localized(name: Any, *, field: str) -> str:
-    """A JSONB `{uz_cyrl: ..., ru: ...}` reference name, in the document's own
-    language. No fallback to `ru`: a Russian leshoz name on an Uzbek-language
-    permit is a defect that should be fixed in the classifier, not papered over."""
+    """A JSONB `{uz_latn: ..., uz_cyrl: ..., ru: ...}` reference name, in the
+    document's own language. No fallback to `ru` or to `uz_cyrl`: a name in the
+    wrong alphabet on a Latin permit is a defect that should be fixed in the
+    classifier, not papered over — and #90 guarantees `uz_latn` on every name
+    written since, so a refusal here points at a pre-#90 row."""
     if not isinstance(name, dict):
         raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": field})
     return str(_required(name.get(DOCUMENT_LANGUAGE), field=field))
@@ -358,9 +402,12 @@ def _frozen_herd(input_snapshot: Any) -> dict[str, int]:
     return herd
 
 
-async def _livestock_rows(db: AsyncSession, input_snapshot: Any) -> dict[str, str]:
+async def _livestock_rows(db: AsyncSession, herd: Mapping[str, int]) -> dict[str, str]:
     """`tz/13` requisites 12-15, ready to print: one string per row of form 1-ilova,
-    naming each species from the classifier and its head count.
+    naming each species from the classifier and its head count. `herd` is
+    `_frozen_herd`'s reading of the calculation, taken ONCE by `_snapshot` and
+    shared with `_grazing_cells` — the rows and the cells are two views of one
+    herd and may not be read twice.
 
     Species order follows `LIVESTOCK_ROWS`, never the order the applicant happened to
     enter them in — two permits for the same herd must render the same bytes, which is
@@ -370,8 +417,10 @@ async def _livestock_rows(db: AsyncSession, input_snapshot: Any) -> dict[str, st
     and an eleventh species can be added without anyone touching this module; dropping
     it here would understate the herd on a legal permit while the fee — computed from
     the very same list — still charged for it.
+
+    Unprinted since stage 15 — the grazing blank prints a cell per species
+    (`_grazing_cells`) — but still frozen: `reports` reads these four keys.
     """
-    herd = _frozen_herd(input_snapshot)
     known = {code for _, codes in LIVESTOCK_ROWS for code in codes}
     for code in herd:
         if code not in known:
@@ -392,6 +441,30 @@ async def _livestock_rows(db: AsyncSession, input_snapshot: Any) -> dict[str, st
                 printed.append(f"{name} — {herd[code]}")
         rows[field] = ", ".join(printed) if printed else NOT_STATED
     return rows
+
+
+def _grazing_cells(herd: Mapping[str, int]) -> dict[str, str]:
+    """The grazing blank's cells (decision #215 R3): `heads_<code>` per species,
+    out of the same frozen herd as requisites 12-15, and `heads_total` over all
+    of it. A species the permit commits none of prints `NOT_STATED`, never «0»
+    — an apiary permit reading «Tuya — 0» would be a statement about camels that
+    nobody made — and with no herd at all the total says the same."""
+    cells = {
+        f"heads_{code}": str(herd[code]) if herd.get(code) else NOT_STATED for code in GRAZING_CELLS
+    }
+    cells["heads_total"] = str(sum(herd.values())) if herd else NOT_STATED
+    return cells
+
+
+def _labelled(code: str | None, labels: Mapping[str, str], *, field: str) -> str:
+    """A choice field's printed label, «—» when the activity has none, and a
+    refusal by name for a code the labels do not know — a CHECK constraint keeps
+    the column honest, this keeps the two lists honest with each other."""
+    if code is None:
+        return NOT_STATED
+    if code not in labels:
+        raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": field})
+    return labels[code]
 
 
 def _reference_name(name: Any) -> str | None:
@@ -467,18 +540,19 @@ def qr_url(token: str) -> str:
     return f"{get_settings().public_base_url.rstrip('/')}{QR_CHECK_PATH}?qr={token}"
 
 
-async def _layout_html(db: AsyncSession, template: PermitTemplate) -> str:
+async def _layout_html(db: AsyncSession, template: PermitTemplate, *, activity_code: str) -> str:
     """The layout this template means.
 
-    `layout_file_id` NULL means "the layout bundled with the module"
-    (`app/modules/permits/assets/default_layout.html`, task 1 decision 2): a
-    migration cannot put bytes in MinIO, and a row pointing at a storage key that
-    does not exist would be worse than an honest null. A non-null value is an
-    administrator's own uploaded layout and wins from then on.
+    `layout_file_id` NULL means the bundled blank of this row's activity
+    (decision #215 R1 — `render.bundled_layout`, one file per code in
+    `app/modules/permits/assets/blanks/`): a migration cannot put bytes in
+    MinIO, and a row pointing at a storage key that does not exist would be
+    worse than an honest null. A non-null value is an administrator's own
+    uploaded layout and wins from then on. `activity_code` is the template's
+    own activity, resolved by the caller, which already holds the row.
     """
     if template.layout_file_id is None:
-        # Stage 15 Task 4 chooses the blank per activity.
-        return render.bundled_layout(GRAZING_ACTIVITY_CODE)
+        return render.bundled_layout(activity_code)
     file = await db.get(MediaFile, template.layout_file_id)
     if file is None or file.status != "active":
         raise err(
@@ -506,9 +580,17 @@ async def _snapshot(
     calculation_id: uuid.UUID,
     calculation_input: Any,
     paid_at: datetime,
+    quantity: Decimal | None,
+    benefit_item_id: uuid.UUID | None,
+    benefit_verified: bool,
+    deadwood_product: str | None,
+    removal_deadline: date | None,
+    recreation_purpose: str | None,
+    event_at: datetime | None,
 ) -> dict[str, Any]:
-    """Form 1-ilova's requisites (`tz/13` § 1-илова, ruling 14), gathered once and
-    never read from their sources again.
+    """Form 1-ilova's requisites (`tz/13` § 1-илова, ruling 14) and, since stage
+    15, every line the five bundled blanks print (decision #215), gathered once
+    and never read from their sources again.
 
     Everything is already a string: the snapshot is what the renderer receives, so
     the PDF and the stored record cannot disagree, and JSONB has no `Decimal` or
@@ -561,6 +643,20 @@ async def _snapshot(
     missing requisite is named at its SOURCE rather than reaching the renderer as
     an unfilled placeholder it cannot attribute.
 
+    **One shape for every activity (decision #215).** `render.BLANK_FIELDS` is
+    the union of what the five blanks print; the snapshot covers it exactly,
+    whichever blank this permit lands on, and prints `NOT_STATED` in a line
+    another activity's blank owns — never a missing key, which the renderer
+    would refuse as an unfilled placeholder. The lines the application row
+    itself carries (`BLANK_REQUISITES_BY_ACTIVITY`) are required by name for
+    the activity whose blank prints them, the way `issue` resolves every other
+    column through `_required`; `quantity` prints for every activity but
+    grazing, whose figure is the herd (`_grazing_cells`, R3); `payment_basis`
+    (R7) is the paid line, prefixed with the verified benefit's name when one
+    was granted. The four legacy `heads_*` rows of form 1-ilova, `sb_load` and
+    `payment_status` stay frozen unprinted — `reports` reads the first four,
+    and an immutable record does not shrink.
+
     **`paid_at` is the `application_status_history` PAID row's own
     `occurred_at`** — the exact source `tz/12` #17 named, read through
     `applications_service.status_reached_at`, an accessor added with this
@@ -582,6 +678,20 @@ async def _snapshot(
     activity = await admin_repo.get_activity_type(db, activity_type_id)
     if activity is None:
         raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": "activity_type"})
+    # Decision #215 R6: the lines THIS activity's blank prints off the
+    # application row, refused by name when empty — the wizard already requires
+    # them at filing (`applications.checks.BLANK_FIELDS_BY_ACTIVITY`), and this
+    # is the renderer's "never print None" rule applied at the source it can
+    # attribute. Checked before anything below is gathered, like `issue`'s own
+    # `_required` calls.
+    blank_lines = {
+        "deadwood_product": deadwood_product,
+        "removal_deadline": removal_deadline,
+        "recreation_purpose": recreation_purpose,
+        "event_at": event_at,
+    }
+    for name in BLANK_REQUISITES_BY_ACTIVITY.get(activity.code, ()):
+        _required(blank_lines[name], field=name)
     contour_number = await gis_service.contour_number(db, contour_id)
     # Requisite 1. The single root of the organization tree — `root_is_agency`
     # makes `parent_id IS NULL` and `kind = 'agency'` the same row, so an agency
@@ -589,7 +699,27 @@ async def _snapshot(
     agency = await admin_repo.get_agency(db)
     if agency is None:
         raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": "authority"})
-    heads = await _livestock_rows(db, calculation_input)
+    # The herd, read out of the frozen calculation ONCE (ruling T3-f) and
+    # shared by the four form rows and the grazing blank's cells.
+    herd = _frozen_herd(calculation_input)
+    heads = await _livestock_rows(db, herd)
+
+    # Requisite 19 as the blanks print it (decision #215 R7): the paid line —
+    # status, amount, Tashkent calendar date — prefixed with the benefit the
+    # verifier GRANTED, never one merely claimed: `issue` has already refused
+    # `pending` and `rejected`, so a `benefit_verified=False` here with an item
+    # set is `not_required`, which prints nothing about a benefit.
+    paid_line = (
+        f"{PAYMENT_STATUS_PAID}: {_money(amount)} so‘m, "
+        f"{paid_at.astimezone(TASHKENT).date().isoformat()}"
+    )
+    if benefit_item_id is not None and benefit_verified:
+        item = await admin_repo.get_classifier_item(db, benefit_item_id)
+        if item is None:
+            raise err("ERR-VAL-001", details={"reason": "missing_requisite", "field": "benefit"})
+        payment_basis = f"Imtiyoz: {_localized(item.name, field='benefit')}. {paid_line}"
+    else:
+        payment_basis = paid_line
 
     return {
         # 1-2: the authorising body, the series and the number
@@ -634,6 +764,24 @@ async def _snapshot(
         "payment_date": paid_at.astimezone(TASHKENT).date().isoformat(),
         # Not printed: the link back to the calculation this amount came from.
         "calculation_id": str(calculation_id),
+        # The blank's own lines (decision #215). «—» where this activity's blank
+        # does not print the key, never a blank: every snapshot has ONE shape.
+        "quantity": _money(quantity) if quantity is not None else NOT_STATED,
+        "payment_basis": payment_basis,
+        "deadwood_product": _labelled(
+            deadwood_product, DEADWOOD_PRODUCT_LABELS, field="deadwood_product"
+        ),
+        "removal_deadline": removal_deadline.isoformat() if removal_deadline else NOT_STATED,
+        "recreation_purpose": _labelled(
+            recreation_purpose, RECREATION_PURPOSE_LABELS, field="recreation_purpose"
+        ),
+        # The event's moment in Tashkent time, like every date on the form —
+        # `event_at` is UTC storage (`timestamptz`), never printed as-is.
+        "event_at": (
+            event_at.astimezone(TASHKENT).strftime("%Y-%m-%d %H:%M") if event_at else NOT_STATED
+        ),
+        # The grazing blank's cells (R3), out of the same frozen herd as 12-15.
+        **_grazing_cells(herd),
     }
 
 
@@ -918,7 +1066,7 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
                 "activity_type_id": str(activity_type_id),
             },
         )
-    layout_html = await _layout_html(db, template)
+    layout_html = await _layout_html(db, template, activity_code=activity.code)
 
     # 4. The number. One UPDATE ... RETURNING under the row lock (ruling 9).
     series = get_settings().permit_series
@@ -928,6 +1076,18 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         # classically a Latin `A` where the seeded key is Cyrillic `А`. Refuse:
         # carrying on would write a permit with no number at all.
         raise err("ERR-SYS-001", details={"reason": "unknown_permit_series", "series": series})
+
+    # Ruling #118 — the PAID transition's own timestamp, through the accessor
+    # `applications` exposes for it; `updated_at` is the floor, never reached
+    # for an application this function accepts. Read back from the row when it
+    # is: the column is server-stamped (`onupdate=func.now()`) and expired
+    # after every flush, so an in-session caller that touched the application
+    # would otherwise lazy-load it here and die of `MissingGreenlet` (lesson: a
+    # row in memory is not what Postgres stored).
+    paid_at = await applications_service.status_reached_at(db, application.id, status="PAID")
+    if paid_at is None:
+        await db.refresh(application, attribute_names=["updated_at"])
+        paid_at = application.updated_at
 
     snapshot = await _snapshot(
         db,
@@ -944,13 +1104,17 @@ async def issue(db: AsyncSession, application_id: uuid.UUID, *, actor: User) -> 
         sb_load=calculation.used_sb,
         calculation_id=calculation.id,
         calculation_input=calculation.input_snapshot,
-        # Ruling #118 — the PAID transition's own timestamp, through the
-        # accessor `applications` exposes for it; `updated_at` is the floor,
-        # never reached for an application this function accepts.
-        paid_at=(
-            await applications_service.status_reached_at(db, application.id, status="PAID")
-            or application.updated_at
-        ),
+        paid_at=paid_at,
+        # Stage 15 (decision #215): the blanks' own lines, off the application
+        # row. `quantity` for every activity but grazing, whose figure is the
+        # herd — the same split the `Permit.quantity` column below makes.
+        quantity=None if activity.code == GRAZING_ACTIVITY_CODE else application.quantity,
+        benefit_item_id=application.benefit_category_item_id,
+        benefit_verified=application.benefit_verification_status == "verified",
+        deadwood_product=application.deadwood_product,
+        removal_deadline=application.removal_deadline,
+        recreation_purpose=application.recreation_purpose,
+        event_at=application.event_at,
     )
 
     # 5. The QR token is a SECRET, not an identifier (ruling 8): never derived
@@ -1728,10 +1892,12 @@ async def missing_signatures(db: AsyncSession, permit_id: uuid.UUID) -> list[str
 # complete now, because it is what 3.11b lands on rather than something it has to
 # invent alongside its transitions.
 # С12's four words, in every language the interfaces offer. The Cyrillic column
-# is the one the spec quotes and the one `PublicStatus` pins; the other two exist
-# because this page is the ONE surface a citizen reaches with no account, and
-# stage 7.3 (finding F6) watched a scanned QR render «амалда» in the middle of an
-# otherwise Latin page.
+# is the one the spec quotes and the one `PublicStatus` pins
+# (`PUBLIC_STATUS_KEY_LANGUAGE` — an API vocabulary, decoupled from the
+# document's own language when that moved to Latin under #215 R2); the other
+# two exist because this page is the ONE surface a citizen reaches with no
+# account, and stage 7.3 (finding F6) watched a scanned QR render «амалда» in
+# the middle of an otherwise Latin page.
 #
 # Only the STATUS is localized here, and that is the whole of the ruling. The
 # organization and the activity on the same card come from the permit's
@@ -1753,7 +1919,7 @@ PUBLIC_STATUS_LABELS_I18N: dict[str, dict[str, str]] = {
 # pass every test while a citizen read one on the page and an inspector the other
 # (lesson: an enum-ish value has ONE source of truth).
 PUBLIC_STATUS_LABELS: dict[str, str] = {
-    status: label[DOCUMENT_LANGUAGE] for status, label in PUBLIC_STATUS_LABELS_I18N.items()
+    status: label[PUBLIC_STATUS_KEY_LANGUAGE] for status, label in PUBLIC_STATUS_LABELS_I18N.items()
 }
 
 # The two statuses that are NOT public, each for its own reason — spelled out

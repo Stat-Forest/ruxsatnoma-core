@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import httpx
@@ -153,6 +153,22 @@ async def apiary_activity_id(db: AsyncSession) -> uuid.UUID:
 
 
 @pytest.fixture
+async def deadwood_activity_id(db: AsyncSession) -> uuid.UUID:
+    """Deadwood — one of the two activities whose blank prints lines of its own
+    (`deadwood_product`, `removal_deadline`; decision #215 R6)."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'deadwood'"))
+    return rows.scalar_one()
+
+
+@pytest.fixture
+async def recreation_activity_id(db: AsyncSession) -> uuid.UUID:
+    """Recreation — the other activity with blank lines of its own
+    (`recreation_purpose`, `event_at`; decision #215 R6)."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'recreation'"))
+    return rows.scalar_one()
+
+
+@pytest.fixture
 async def science_activity_id(db: AsyncSession) -> uuid.UUID:
     """For the `permit_templates` uniqueness tests: migration 0061 (decision #215
     R1) seeds an ACTIVE row for every OPEN activity, so a test building its own v1
@@ -173,6 +189,7 @@ async def make_paid_application(
     used_sb: Decimal | None = Decimal("40.0000"),
     with_calculation: bool = True,
     items: tuple[tuple[str, int], ...] = GRAZING_HERD,
+    quantity: Decimal | None = None,
 ) -> Application:
     """An application in `PAID` — the only status this module issues a permit
     from (ruling 10) — with its own applicant, contour and published version, at
@@ -191,7 +208,12 @@ async def make_paid_application(
     `with_calculation=False` is how a test reaches the "no calculation" refusal:
     `calculations` is append-only at the database level (migration 0011's trigger),
     so a row cannot be deleted afterwards — the application has to be built
-    without one."""
+    without one.
+
+    `quantity` is the non-grazing activities' declared amount (ruling #176 —
+    `applications.quantity`, in the activity's own `quantity_unit`), which the
+    permit both stores and, since stage 15, prints; `None` for grazing, whose
+    figure is the herd."""
     user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
     # `tz/13` requisite 10, and since Task 5 the half of it the public QR card
     # shows masked. `make_user`'s default is "Test User", which no masking rule
@@ -231,6 +253,7 @@ async def make_paid_application(
         requested_area_ha=Decimal("12.5000"),
         period_from=date(2027, 5, 1),
         period_to=date(2027, 9, 30),
+        quantity=quantity,
         status=status,
         channel="portal",
         assigned_org_id=org.id,
@@ -457,6 +480,65 @@ async def apiary_paid_application(
         used_sb=None,
         items=(),
     )
+
+
+@pytest.fixture
+async def deadwood_paid_application(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    deadwood_activity_id: uuid.UUID,
+) -> Application:
+    """A paid deadwood application, issued on the BUNDLED deadwood blank
+    (migration 0061 seeds its template with `layout_file_id` NULL, decision
+    #215 R1). `quantity` in the activity's own unit (m3), and the two lines that
+    blank alone prints (R6) set on the row the way the wizard would."""
+    row = await make_paid_application(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=deadwood_activity_id,
+        used_sb=None,
+        items=(),
+        quantity=Decimal("3"),
+    )
+    row.deadwood_product = "firewood"
+    row.removal_deadline = date(2027, 6, 15)
+    await db.flush()
+    # What Postgres stored, not what was assigned (lesson): `quantity` is
+    # NUMERIC(12, 4), so the row reads `3.0000` — the figure the permit prints.
+    await db.refresh(row)
+    return row
+
+
+@pytest.fixture
+async def recreation_paid_application(
+    db: AsyncSession,
+    contours_layer: GisLayer,
+    leshoz: Organization,
+    approval_doc: MediaFile,
+    recreation_activity_id: uuid.UUID,
+) -> Application:
+    """The recreation twin of `deadwood_paid_application`: `quantity` in
+    person-days, and the purpose plus the event's moment (stored UTC, printed
+    in Tashkent time) that the recreation blank prints (decision #215 R6)."""
+    row = await make_paid_application(
+        db,
+        layer=contours_layer,
+        org=leshoz,
+        approval_doc=approval_doc,
+        activity_type_id=recreation_activity_id,
+        used_sb=None,
+        items=(),
+        quantity=Decimal("2"),
+    )
+    row.recreation_purpose = "health"
+    row.event_at = datetime(2027, 5, 1, 10, 0, tzinfo=UTC)
+    await db.flush()
+    await db.refresh(row)
+    return row
 
 
 @pytest.fixture
