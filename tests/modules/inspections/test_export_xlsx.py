@@ -1,33 +1,34 @@
 """Stage 13: `/inspections/{tasks,acts,cases}/export.xlsx` are their lists on
 paper — same scope, same filters, readable cells, the id last."""
 
-import io
+import uuid
 
 import pytest
-from openpyxl import load_workbook
 
 from app.modules.applications.models import Application
 from app.modules.inspections import repo as inspections_repo
 from app.modules.inspections import service as inspections_service
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
+from tests.conftest import assert_export_cut, export_cap, xlsx_rows
 
 pytestmark = pytest.mark.asyncio
 
 API = "/api/v1/inspections"
+TASKS = f"{API}/tasks/export.xlsx"
+ACTS = f"{API}/acts/export.xlsx"
+CASES = f"{API}/cases/export.xlsx"
 
 
-def _sheet(content: bytes):
-    sheet = load_workbook(io.BytesIO(content)).active
-    assert sheet is not None
-    return sheet
+def _ids(rows) -> set[str]:
+    """The last column of every data row, as strings — a cell is typed as a
+    broad union openpyxl itself does not guarantee hashable, so every id is
+    coerced through `str()` before it enters a set (every id column ever
+    holds one already, via `xlsx.id_column`)."""
+    return {str(row[-1]) for row in rows}
 
 
-def _ids(sheet) -> set[str]:
-    """The last column of every data row, as strings — `iter_rows(values_only
-    =True)` types a cell as a broad union openpyxl itself does not guarantee
-    hashable, so every id is coerced through `str()` before it enters a set
-    (every id column ever holds one already, via `xlsx.id_column`)."""
-    return {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+def _row(rows, id_: str):
+    return next(r for r in rows if str(r[-1]) == id_)
 
 
 async def _create_task(client, application: Application, inspector) -> str:
@@ -65,10 +66,8 @@ async def _open_case(db, inspector_client, inspector, application, checklist_id,
     """A signed `violation` act opens a case automatically (`service.sign_act`)
     — never assigned by hand (lesson: build a fixture's precondition through
     the real transition)."""
-    import uuid as uuid_mod
-
     act_id = await _create_act(inspector_client, application, checklist_id, result="violation")
-    act = await inspections_repo.get_act(db, uuid_mod.UUID(act_id))
+    act = await inspections_repo.get_act(db, uuid.UUID(act_id))
     assert act is not None
     pkcs7 = encode_mock_signature(
         document=inspections_service._act_package_bytes(act),
@@ -88,7 +87,7 @@ async def _open_case(db, inspector_client, inspector, application, checklist_id,
 # --- Tasks -----------------------------------------------------------------
 
 
-async def test_tasks_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_tasks_export_mirrors_the_list(
     executor_head_client, application: Application, inspector
 ) -> None:
     task_id = await _create_task(executor_head_client, application, inspector)
@@ -97,164 +96,84 @@ async def test_tasks_export_holds_exactly_the_rows_the_list_shows(
     listed_ids = {row["id"] for row in listed["items"]}
     assert task_id in listed_ids
 
-    resp = await executor_head_client.get(f"{API}/tasks/export.xlsx", params={"lang": "ru"})
+    resp = await executor_head_client.get(TASKS, params={"lang": "ru"})
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
     assert resp.headers["x-export-truncated"] == "false"
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[-1] == "ID"
-    exported_ids = _ids(sheet)
-    assert exported_ids == listed_ids
-    assert task_id in exported_ids
+    assert _ids(rows) == listed_ids
 
-
-async def test_tasks_export_applies_the_same_status_filter_as_the_list(
-    executor_head_client, application: Application, inspector
-) -> None:
-    await _create_task(executor_head_client, application, inspector)  # status: assigned
-
-    resp = await executor_head_client.get(
-        f"{API}/tasks/export.xlsx", params={"status": "cancelled", "lang": "uz_latn"}
-    )
-    assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_tasks_export_renders_labels_not_codes(
-    executor_head_client, application: Application, inspector
-) -> None:
-    await _create_task(executor_head_client, application, inspector)
-
-    resp = await executor_head_client.get(f"{API}/tasks/export.xlsx", params={"lang": "uz_latn"})
-    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    _, rows = xlsx_rows((await executor_head_client.get(TASKS, params={"lang": "uz_latn"})).content)
+    row = _row(rows, task_id)
     assert row[0] == "Ruxsatnomani tekshirish"  # kind label, not "permit_inspection"
     assert row[1] == "Tayinlangan"  # status label, not "assigned"
 
-
-async def test_tasks_export_truncates_at_the_cap_and_says_so(
-    executor_head_client, application: Application, inspector, monkeypatch
-) -> None:
-    await _create_task(executor_head_client, application, inspector)
-    from app.core import settings_store
-
-    real_get_int = settings_store.get_int
-
-    async def one(db, key):
-        # `auth.deps.get_current_session` reads `session_idle_minutes`
-        # through this same function on every request — the patch must
-        # fall through to the real one for every key but ours.
-        if key == "register_export_max_rows":
-            return 1
-        return await real_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", one)
-    resp = await executor_head_client.get(f"{API}/tasks/export.xlsx")
+    resp = await executor_head_client.get(TASKS, params={"status": "cancelled", "lang": "uz_latn"})
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert xlsx_rows(resp.content)[1] == []
+
+    with export_cap(1):
+        assert_export_cut(await executor_head_client.get(TASKS), cap=1)
 
 
 async def test_tasks_export_is_empty_not_403_for_a_caller_with_no_scope(
     other_inspector_client,
 ) -> None:
-    resp = await other_inspector_client.get(f"{API}/tasks/export.xlsx")
+    resp = await other_inspector_client.get(TASKS)
     assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_tasks_export_rejects_an_unknown_language(executor_head_client) -> None:
-    resp = await executor_head_client.get(f"{API}/tasks/export.xlsx", params={"lang": "en"})
-    assert resp.status_code == 422
+    assert xlsx_rows(resp.content)[1] == []
 
 
 # --- Acts --------------------------------------------------------------
 
 
-async def test_acts_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_acts_export_mirrors_the_list(
     inspector_client, application: Application, default_checklist_id
 ) -> None:
     act_id = await _create_act(inspector_client, application, default_checklist_id)
+    warning_id = await _create_act(
+        inspector_client, application, default_checklist_id, result="warning"
+    )
 
     listed = (await inspector_client.get(f"{API}/acts", params={"page_size": 100})).json()
     listed_ids = {row["id"] for row in listed["items"]}
     assert act_id in listed_ids
 
-    resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "ru"})
+    resp = await inspector_client.get(ACTS, params={"lang": "ru"})
     assert resp.status_code == 200
     assert resp.headers["x-export-truncated"] == "false"
-    sheet = _sheet(resp.content)
-    assert [c.value for c in sheet[1]][-1] == "ID"
-    exported_ids = _ids(sheet)
-    assert exported_ids == listed_ids
-    assert act_id in exported_ids
+    headers, rows = xlsx_rows(resp.content)
+    assert headers[-1] == "ID"
+    assert _ids(rows) == listed_ids
 
-
-async def test_acts_export_applies_the_same_result_filter_as_the_list(
-    inspector_client, application: Application, default_checklist_id
-) -> None:
-    await _create_act(inspector_client, application, default_checklist_id, result="compliant")
-
-    resp = await inspector_client.get(
-        f"{API}/acts/export.xlsx", params={"result": "violation", "lang": "uz_latn"}
-    )
-    assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_acts_export_renders_labels_not_codes(
-    inspector_client, application: Application, default_checklist_id
-) -> None:
-    await _create_act(inspector_client, application, default_checklist_id, result="warning")
-
-    resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "uz_latn"})
-    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    _, rows = xlsx_rows((await inspector_client.get(ACTS, params={"lang": "uz_latn"})).content)
+    row = _row(rows, warning_id)
     assert row[1] == "Qoralama"  # status label ("draft"), not the raw code
     assert row[2] == "Eslatma"  # result label ("warning"), not the raw code
 
-
-async def test_acts_export_truncates_at_the_cap_and_says_so(
-    inspector_client, application: Application, default_checklist_id, monkeypatch
-) -> None:
-    await _create_act(inspector_client, application, default_checklist_id)
-    from app.core import settings_store
-
-    real_get_int = settings_store.get_int
-
-    async def one(db, key):
-        # `auth.deps.get_current_session` reads `session_idle_minutes`
-        # through this same function on every request — the patch must
-        # fall through to the real one for every key but ours.
-        if key == "register_export_max_rows":
-            return 1
-        return await real_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", one)
-    resp = await inspector_client.get(f"{API}/acts/export.xlsx")
+    resp = await inspector_client.get(ACTS, params={"result": "violation", "lang": "uz_latn"})
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert xlsx_rows(resp.content)[1] == []
+
+    with export_cap(1):  # two acts of this inspector's, one fits
+        resp = await inspector_client.get(ACTS)
+        assert int(resp.headers["x-export-total"]) >= 2
+        assert_export_cut(resp, cap=1)
 
 
 async def test_acts_export_is_empty_not_403_for_a_caller_with_no_scope(
     other_inspector_client,
 ) -> None:
-    resp = await other_inspector_client.get(f"{API}/acts/export.xlsx")
+    resp = await other_inspector_client.get(ACTS)
     assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_acts_export_rejects_an_unknown_language(inspector_client) -> None:
-    resp = await inspector_client.get(f"{API}/acts/export.xlsx", params={"lang": "en"})
-    assert resp.status_code == 422
+    assert xlsx_rows(resp.content)[1] == []
 
 
 # --- Cases -----------------------------------------------------------------
 
 
-async def test_cases_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_cases_export_mirrors_the_list(
     db,
     executor_head_client,
     inspector_client,
@@ -271,93 +190,30 @@ async def test_cases_export_holds_exactly_the_rows_the_list_shows(
     listed_ids = {row["id"] for row in listed["items"]}
     assert case_id in listed_ids
 
-    resp = await executor_head_client.get(f"{API}/cases/export.xlsx", params={"lang": "ru"})
+    resp = await executor_head_client.get(CASES, params={"lang": "ru"})
     assert resp.status_code == 200
     assert resp.headers["x-export-truncated"] == "false"
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Номер дела" and headers[-1] == "ID"
-    exported_ids = _ids(sheet)
-    assert exported_ids == listed_ids
-    assert case_id in exported_ids
+    assert _ids(rows) == listed_ids
 
-
-async def test_cases_export_applies_the_same_status_filter_as_the_list(
-    db,
-    executor_head_client,
-    inspector_client,
-    inspector,
-    application: Application,
-    default_checklist_id,
-    vt_01,
-) -> None:
-    await _open_case(db, inspector_client, inspector, application, default_checklist_id, vt_01)
-
-    resp = await executor_head_client.get(
-        f"{API}/cases/export.xlsx", params={"status": "closed", "lang": "uz_latn"}
-    )
-    assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_cases_export_renders_labels_not_codes(
-    db,
-    executor_head_client,
-    inspector_client,
-    inspector,
-    application: Application,
-    default_checklist_id,
-    vt_01,
-) -> None:
-    await _open_case(db, inspector_client, inspector, application, default_checklist_id, vt_01)
-
-    resp = await executor_head_client.get(f"{API}/cases/export.xlsx", params={"lang": "uz_latn"})
-    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    _, rows = xlsx_rows((await executor_head_client.get(CASES, params={"lang": "uz_latn"})).content)
+    row = _row(rows, case_id)
     assert row[1] == "Ochilgan"  # status label ("opened"), not the raw code
-    number = row[0]
     # the human case number comes first (service.NUMBER_PREFIX)
-    assert isinstance(number, str) and number.startswith("VC-")
+    assert isinstance(row[0], str) and row[0].startswith("VC-")
 
-
-async def test_cases_export_truncates_at_the_cap_and_says_so(
-    db,
-    executor_head_client,
-    inspector_client,
-    inspector,
-    application: Application,
-    default_checklist_id,
-    vt_01,
-    monkeypatch,
-) -> None:
-    await _open_case(db, inspector_client, inspector, application, default_checklist_id, vt_01)
-    from app.core import settings_store
-
-    real_get_int = settings_store.get_int
-
-    async def one(db, key):
-        # `auth.deps.get_current_session` reads `session_idle_minutes`
-        # through this same function on every request — the patch must
-        # fall through to the real one for every key but ours.
-        if key == "register_export_max_rows":
-            return 1
-        return await real_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", one)
-    resp = await executor_head_client.get(f"{API}/cases/export.xlsx")
+    resp = await executor_head_client.get(CASES, params={"status": "closed", "lang": "uz_latn"})
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert xlsx_rows(resp.content)[1] == []
+
+    with export_cap(1):
+        assert_export_cut(await executor_head_client.get(CASES), cap=1)
 
 
 async def test_cases_export_is_empty_not_403_for_a_caller_with_no_scope(
     other_inspector_client,
 ) -> None:
-    resp = await other_inspector_client.get(f"{API}/cases/export.xlsx")
+    resp = await other_inspector_client.get(CASES)
     assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_cases_export_rejects_an_unknown_language(executor_head_client) -> None:
-    resp = await executor_head_client.get(f"{API}/cases/export.xlsx", params={"lang": "en"})
-    assert resp.status_code == 422
+    assert xlsx_rows(resp.content)[1] == []

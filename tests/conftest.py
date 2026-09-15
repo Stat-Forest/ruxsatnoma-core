@@ -1,7 +1,9 @@
 import asyncio
+import io
 import os
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any
 
 import asyncpg
 import httpx
@@ -270,3 +272,57 @@ async def make_client(
                 yield client
         else:
             yield client
+
+
+# --- Register export (`GET …/export.xlsx`, stage 13) helpers -----------------
+#
+# Every export test file used to carry its own copy of these two, and six
+# tests per endpoint on top (2026-09-15: 250 tests for one shared renderer).
+# The file-level shape is now ONE "mirrors the list" test per endpoint that
+# reads the sheet through `xlsx_rows` and exercises the cap through
+# `export_cap`; the shared `lang` refusal is a static check in
+# `tests/test_export_routes.py`.
+
+
+def xlsx_rows(content: bytes) -> tuple[list[Any], list[tuple[Any, ...]]]:
+    """`(headers, rows)` of the workbook's active sheet — the header row's
+    values and every data row as a tuple, in sheet order."""
+    from openpyxl import load_workbook
+
+    sheet = load_workbook(io.BytesIO(content)).active
+    assert sheet is not None  # a fresh Workbook always has one active sheet
+    headers = [cell.value for cell in sheet[1]]
+    return headers, list(sheet.iter_rows(min_row=2, values_only=True))
+
+
+@contextmanager
+def export_cap(rows: int) -> Iterator[None]:
+    """Lower `register_export_max_rows` to `rows` for the block, at the one
+    place every export reads it. Only that key is overridden — the same
+    `settings_store.get_int` serves `session_idle_minutes` to every
+    authenticated request, and must keep answering the real value."""
+    from app.core import settings_store
+
+    original = settings_store.get_int
+
+    async def capped(db: AsyncSession, key: str) -> int:
+        if key == "register_export_max_rows":
+            return rows
+        return await original(db, key)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings_store, "get_int", capped)
+        yield
+
+
+def assert_export_cut(resp: httpx.Response, *, cap: int) -> None:
+    """The three headers of `xlsx.xlsx_response` agree with each other and
+    with the sheet: `X-Export-Total` is the register's size, `X-Export-Rows`
+    what was written, `X-Export-Truncated` whether the two differ. Call it
+    on a response made inside `export_cap(cap)`."""
+    assert resp.status_code == 200, resp.text
+    total = int(resp.headers["x-export-total"])
+    assert resp.headers["x-export-rows"] == str(min(total, cap))
+    assert resp.headers["x-export-truncated"] == ("true" if total > cap else "false")
+    _, rows = xlsx_rows(resp.content)
+    assert len(rows) == min(total, cap)

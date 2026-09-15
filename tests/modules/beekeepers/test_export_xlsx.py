@@ -6,22 +6,15 @@ assert on something fresh, never an assumed-small or empty neighbourhood).
 Compared on TOTAL count plus this test's own fresh row's presence, never on
 full id-set equality against one capped list page."""
 
-import io
 import uuid
-
-from openpyxl import load_workbook
 
 from app.main import create_app
 from app.modules.auth.models import UserPermission
 from app.modules.beekeepers.permissions import BEEKEEPERS_MANAGE
-from tests.conftest import make_client
+from tests.conftest import assert_export_cut, export_cap, make_client, xlsx_rows
 from tests.modules.auth.test_sessions import make_session, make_user
 
-
-def _sheet(content: bytes):
-    sheet = load_workbook(io.BytesIO(content)).active
-    assert sheet is not None
-    return sheet
+EXPORT = "/api/v1/beekeepers/export.xlsx"
 
 
 def _unique_pinfl() -> str:
@@ -62,7 +55,10 @@ async def _create_beekeeper(client, *, certificate_no: str, full_name: str) -> s
     return resp.json()["id"]
 
 
-async def test_export_holds_exactly_the_rows_the_list_shows(db):
+async def test_the_export_mirrors_the_list(db):
+    """The list's total and its `q` filter, labels rather than codes, no
+    passport and no STIR in the file (the screen shows neither; a bulk file
+    must not widen what it shows), and the cap — two fresh rows."""
     ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
     async with ctx as client:
         _auth(client, token, csrf)
@@ -70,115 +66,44 @@ async def test_export_holds_exactly_the_rows_the_list_shows(db):
         beekeeper_id = await _create_beekeeper(
             client, certificate_no=certificate_no, full_name="Export Test Beekeeper"
         )
+        await _create_beekeeper(
+            client, certificate_no=f"CAP-{uuid.uuid4().hex[:8].upper()}", full_name="Cap"
+        )
 
         listed_total = (await client.get("/api/v1/beekeepers", params={"page_size": 1})).json()[
             "total"
         ]
 
-        resp = await client.get("/api/v1/beekeepers/export.xlsx", params={"lang": "ru"})
+        resp = await client.get(EXPORT, params={"lang": "ru"})
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
         assert int(resp.headers["x-export-total"]) == listed_total
-        sheet = _sheet(resp.content)
-        headers = [c.value for c in sheet[1]]
+        headers, rows = xlsx_rows(resp.content)
         assert headers[0] == "Номер сертификата" and headers[-1] == "ID"
-        exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
-        assert beekeeper_id in exported_ids
+        assert beekeeper_id in {str(row[-1]) for row in rows}
+        assert "Серия паспорта" not in headers and "Номер паспорта" not in headers
+        assert "СТИР" not in headers
+        assert "ПИНФЛ" in headers  # a screen column, it stays
 
-
-async def test_export_applies_the_same_filter_as_the_list(db):
-    ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
-    async with ctx as client:
-        _auth(client, token, csrf)
-        certificate_no = f"QRY-{uuid.uuid4().hex[:8].upper()}"
-        beekeeper_id = await _create_beekeeper(
-            client, certificate_no=certificate_no, full_name="Filter Test Beekeeper"
-        )
-
-        resp = await client.get("/api/v1/beekeepers/export.xlsx", params={"q": certificate_no})
+        # The list's `q` filter, and the cells of the row it keeps.
+        resp = await client.get(EXPORT, params={"q": certificate_no, "lang": "uz_latn"})
         assert resp.status_code == 200
-        exported_ids = {
-            str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-        }
-        assert exported_ids == {beekeeper_id}
-
-
-async def test_export_renders_labels_not_codes(db):
-    ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
-    async with ctx as client:
-        _auth(client, token, csrf)
-        certificate_no = f"LBL-{uuid.uuid4().hex[:8].upper()}"
-        beekeeper_id = await _create_beekeeper(
-            client, certificate_no=certificate_no, full_name="Label Test Beekeeper"
-        )
-
-        resp = await client.get(
-            "/api/v1/beekeepers/export.xlsx", params={"q": certificate_no, "lang": "uz_latn"}
-        )
-        row = next(
-            r
-            for r in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-            if r[-1] == beekeeper_id
-        )
+        _, rows = xlsx_rows(resp.content)
+        assert {str(row[-1]) for row in rows} == {beekeeper_id}
+        (row,) = rows
         assert row[0] == certificate_no  # the human number first
         assert (
             row[5] == "Faol"
         )  # the status LABEL, not "active" (ruling #217 put the term before it)
 
-
-async def test_export_truncates_at_the_cap_and_says_so(db, monkeypatch):
-    ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
-    async with ctx as client:
-        _auth(client, token, csrf)
-        for i in range(2):
-            await _create_beekeeper(
-                client, certificate_no=f"CAP-{uuid.uuid4().hex[:8].upper()}", full_name=f"Cap {i}"
-            )
-
-        from app.core import settings_store
-
-        real_get_int = settings_store.get_int
-
-        async def capped(db_, key):
-            if key == "register_export_max_rows":
-                return 1
-            return await real_get_int(db_, key)
-
-        monkeypatch.setattr(settings_store, "get_int", capped)
-
-        resp = await client.get("/api/v1/beekeepers/export.xlsx")
-        assert resp.status_code == 200
-        total = int(resp.headers["x-export-total"])
-        assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-        assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
-        assert resp.headers["x-export-rows"] == str(min(total, 1))
+        with export_cap(1):
+            assert_export_cut(await client.get(EXPORT), cap=1)
 
 
 async def test_export_requires_the_permission(db):
     ctx, token, csrf = await _registrar_client(db)  # no grants
     async with ctx as client:
         _auth(client, token, csrf)
-        resp = await client.get("/api/v1/beekeepers/export.xlsx")
+        resp = await client.get(EXPORT)
         assert resp.status_code == 403
         assert resp.json()["error"]["code"] == "ERR-ACL-001"
-
-
-async def test_export_rejects_an_unknown_language(db):
-    ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
-    async with ctx as client:
-        _auth(client, token, csrf)
-        resp = await client.get("/api/v1/beekeepers/export.xlsx", params={"lang": "en"})
-        assert resp.status_code == 422
-
-
-async def test_the_file_carries_no_passport_and_no_stir(db):
-    """The screen shows neither; a bulk file must not widen what it shows."""
-    ctx, token, csrf = await _registrar_client(db, BEEKEEPERS_MANAGE)
-    async with ctx as client:
-        _auth(client, token, csrf)
-        resp = await client.get("/api/v1/beekeepers/export.xlsx", params={"lang": "ru"})
-        assert resp.status_code == 200, resp.text
-        headers = [c.value for c in _sheet(resp.content)[1]]
-        assert "Серия паспорта" not in headers and "Номер паспорта" not in headers
-        assert "СТИР" not in headers
-        assert "ПИНФЛ" in headers  # a screen column, it stays
