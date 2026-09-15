@@ -49,6 +49,35 @@ Debugging one file is still fastest serial and on the existing database:
 `uv run pytest tests/modules/permits/test_issue.py`. `PYTEST_XDIST_WORKER` is
 unset there, so no rewriting happens at all.
 
+**One machine, one `make test` at a time.** Every run is four workers on the
+one PostgreSQL in Docker, and the suite is bound by its round-trips, not by
+CPU: two suites at once do not share the machine, they halve each other
+(measured 2026-09-15 — a 70 s module run took 160 s beside another session's
+suite, load average 15). While working, run the module's own tests; run
+`make check` once, before the commit, and not while another session's
+`make test` is visible in `ps`.
+
+### Test economy
+
+Every test costs its fixtures — a user, a session, an app, an organization, a
+contour — and that setup is ~45% of the suite's time. Two rules keep the count
+honest:
+
+- **A shared mechanism is tested once, where it lives.** A refusal made by one
+  type (`xlsx.Lang` → 422), one helper (`xlsx_response`'s cap headers) or one
+  dependency (`require_permission`) is not re-proven on every route that uses
+  it; a static check over the OpenAPI schema
+  (`tests/test_export_routes.py`) or one direct test of the helper is the
+  guard. The stage-13 tracks stamped a six-test template onto 27 export routes
+  — 250 tests, 36 of them asserting the same FastAPI 422 — cut to one
+  "mirrors the list" test per route on 2026-09-15.
+- **One test per endpoint proves the WIRING, on one set of rows.** The same
+  ids as the list, the list's own filter, a label in a cell and the cap all
+  read the fixture built once; splitting them into four tests quadruples the
+  setup and proves nothing more. `tests/conftest.py` holds the shared pieces
+  (`xlsx_rows`, `export_cap`, `assert_export_cut`) — do not copy them into a
+  module.
+
 ## Hard rules
 
 - **English everywhere** in code, comments, docstrings, commit messages (decision №35). Existing Russian comments from the stage-2 skeleton stay until touched. No AI attribution in commits.

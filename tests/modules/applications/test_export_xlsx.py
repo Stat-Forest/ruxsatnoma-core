@@ -17,17 +17,15 @@ the direction this project's defects actually take, one that silently
 narrows it).
 """
 
-import io
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from openpyxl import load_workbook
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import settings_store, xlsx
+from app.core import xlsx
 from app.modules.admin.models import District, Organization, Region
 from app.modules.applications import service as applications_service
 from app.modules.applications.models import APPLICATION_STATUSES
@@ -35,6 +33,7 @@ from app.modules.auth.models import Applicant
 from app.modules.inspections import service as inspections_service
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.reports import applications_register as register
+from tests.conftest import assert_export_cut, export_cap, xlsx_rows
 from tests.modules.applications.conftest import unique_pinfl
 from tests.modules.auth.test_sessions import make_user
 
@@ -43,27 +42,24 @@ pytestmark = pytest.mark.asyncio
 EXPORT = "/api/v1/applications/export.xlsx"
 
 
-def _sheet(content: bytes):
-    sheet = load_workbook(io.BytesIO(content)).active
-    assert sheet is not None
-    return sheet
-
-
 def _data_rows(content: bytes) -> list[tuple]:
-    return list(_sheet(content).iter_rows(min_row=2, values_only=True))
+    return xlsx_rows(content)[1]
 
 
 def _by_header(content: bytes, application_id: str) -> dict[str, Any]:
-    headers = [str(c.value) for c in _sheet(content)[1]]
-    for row in _data_rows(content):
+    headers, rows = xlsx_rows(content)
+    for row in rows:
         if row[-1] == application_id:
-            return dict(zip(headers, row, strict=True))
+            return dict(zip([str(h) for h in headers], row, strict=True))
     raise AssertionError(f"{application_id} is not in the file")
 
 
-async def test_the_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_export_mirrors_the_list(
     submitted_application: str, published_contour, hodim_client, other_zone_hodim_client
 ) -> None:
+    """The same rows as the list for the same caller, the list's filters
+    (and its status literal), the zone hiding a row in both places, the cap,
+    and the route itself not shadowed by the card route."""
     listed = await hodim_client.get("/api/v1/applications", params={"page_size": 100})
     listed_ids = {row["id"] for row in listed.json()["items"]}
     # A NON-EMPTY scope, or nothing below proves anything.
@@ -76,10 +72,8 @@ async def test_the_export_holds_exactly_the_rows_the_list_shows(
     assert resp.headers["x-export-total"] == str(len(listed_ids))
     assert resp.headers["content-disposition"].startswith('attachment; filename="arizalar-')
 
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "№" and headers[-1] == "ID"
-    rows = _data_rows(resp.content)
     assert {row[-1] for row in rows} == listed_ids
     # The serial number counts the rows of THIS file, 1..n, whatever the ids.
     assert [row[0] for row in rows] == list(range(1, len(rows) + 1))
@@ -93,22 +87,28 @@ async def test_the_export_holds_exactly_the_rows_the_list_shows(
     assert _data_rows(theirs.content) == []
     assert theirs.headers["x-export-total"] == "0"
 
-
-async def test_the_export_applies_the_same_filters_as_the_list(
-    submitted_application: str, published_contour, hodim_client
-) -> None:
+    # The list's own filters, and its status literal.
     narrowed = await hodim_client.get(
         EXPORT, params={"contour_id": str(published_contour.id), "lang": "uz_latn"}
     )
     assert narrowed.status_code == 200
     assert [row[-1] for row in _data_rows(narrowed.content)] == [submitted_application]
-
     none = await hodim_client.get(EXPORT, params={"status": "REJECTED"})
     assert none.status_code == 200
     assert _data_rows(none.content) == []
-
     typo = await hodim_client.get(EXPORT, params={"status": "SUBMITED"})
     assert typo.status_code == 422  # the same literal the list validates
+
+    with export_cap(1):
+        resp = await hodim_client.get(EXPORT)
+        assert resp.headers["x-export-total"] == str(len(listed_ids))
+        assert_export_cut(resp, cap=1)
+
+    # `export.xlsx` is not a UUID: mounted after `/{application_id}` it would
+    # be a 422 from the id parser rather than this route — and since the route
+    # now lives in another module's router, the ORDER `main.py` mounts the two
+    # routers in is what keeps it so.
+    assert (await hodim_client.get(f"/api/v1/applications/{uuid.uuid4()}")).status_code == 404
 
 
 async def test_the_export_renders_names_labels_and_places_not_codes(
@@ -270,30 +270,6 @@ async def test_every_status_falls_into_exactly_one_customer_group() -> None:
         assert set(register.STATUS_LABELS[status]) == set(xlsx.LANGS), status
 
 
-async def test_the_export_truncates_at_the_cap_and_says_so(
-    submitted_application: str, hodim_client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    real_get_int = settings_store.get_int
-
-    async def one(db, key: str) -> int:
-        if key == "register_export_max_rows":
-            return 1
-        return await real_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", one)
-
-    listed = await hodim_client.get("/api/v1/applications", params={"page_size": 100})
-    total = listed.json()["total"]
-    assert total >= 1
-
-    resp = await hodim_client.get(EXPORT)
-    assert resp.status_code == 200
-    assert resp.headers["x-export-total"] == str(total)
-    assert resp.headers["x-export-rows"] == "1"
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(_data_rows(resp.content)) == 1
-
-
 async def test_the_file_and_the_list_agree_for_a_republic_wide_reader(
     submitted_application: str, prosecutor_client
 ) -> None:
@@ -319,17 +295,3 @@ async def test_the_file_and_the_list_agree_for_a_republic_wide_reader(
     resp = await prosecutor_client.get(EXPORT)
     assert resp.status_code == 200
     assert {row[-1] for row in _data_rows(resp.content)} == listed_ids
-
-
-async def test_an_unknown_language_is_refused(hodim_client) -> None:
-    assert (await hodim_client.get(EXPORT, params={"lang": "en"})).status_code == 422
-
-
-async def test_the_export_route_is_not_shadowed_by_the_card_route(hodim_client) -> None:
-    """`export.xlsx` is not a UUID: mounted after `/{application_id}` it would
-    be a 422 from the id parser rather than this route — and since the route
-    now lives in another module's router, the ORDER `main.py` mounts the two
-    routers in is what keeps it so."""
-    resp = await hodim_client.get(EXPORT)
-    assert resp.status_code == 200, resp.text
-    assert (await hodim_client.get(f"/api/v1/applications/{uuid.uuid4()}")).status_code == 404

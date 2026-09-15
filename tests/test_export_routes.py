@@ -134,3 +134,30 @@ def test_a_served_export_is_not_still_in_the_backlog():
     assert not stale, f"served now — move from EXPORT_BACKLOG to EXPORTED: {sorted(stale)}"
     gone = (EXPORT_BACKLOG | EXPORTED) - _paged_get_paths(paths)
     assert not gone, f"named here but no longer a paged route: {sorted(gone)}"
+
+
+def test_every_export_takes_its_language_from_the_one_shared_type():
+    """`lang` on every `export.xlsx` route is `app.core.xlsx.Lang` — the one
+    `Literal` FastAPI turns into a 422 for anything else — never a bare `str`
+    a track typed by hand. One static check over the OpenAPI schema replaces
+    the thirty-six runtime "rejects an unknown language" tests the stage-13
+    tracks stamped onto every endpoint (2026-09-15): the refusal is FastAPI's,
+    made once by the type, and a route that forgets the type is what this
+    test names."""
+    from app.core.xlsx import LANGS
+
+    spec = create_app().openapi()
+    wrong: dict[str, object] = {}
+    for (
+        register
+    ) in EXPORTED:  # a register's sibling; `/reports/{id}/export.xlsx` is a report's data
+        path = register + EXPORT_SUFFIX
+        params = {
+            p["name"]: p
+            for p in spec["paths"][path]["get"].get("parameters", [])
+            if p["in"] == "query"
+        }
+        schema = params.get("lang", {}).get("schema")
+        if schema is None or schema.get("enum") != list(LANGS) or schema.get("default") != LANGS[0]:
+            wrong[path] = schema
+    assert not wrong, f"export routes whose `lang` is not `xlsx.Lang` (default uz_latn): {wrong}"

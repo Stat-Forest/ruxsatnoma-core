@@ -1,8 +1,9 @@
 """Stage 13 (ruling #204): the payments module's register exports are their
 screen on paper — same scope, same filters, readable cells, the id last.
 
-`/invoices/export.xlsx` (Task C.1) below; the other payments lists (Task
-C.2) land in this same file, one commit each."""
+One "mirrors the list" test per register — the same rows as the list under
+the same filter, labels rather than codes, the list's other filter, the cap —
+plus the register's own answer to a caller with no scope."""
 
 import csv
 import hashlib
@@ -14,7 +15,6 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from openpyxl import load_workbook
 from sqlalchemy import select
 
 from app.core.models import MediaFile
@@ -22,7 +22,7 @@ from app.main import create_app
 from app.modules.admin.models import ClassifierItem
 from app.modules.payments import statement_service
 from app.modules.payments.models import Invoice
-from tests.conftest import make_client
+from tests.conftest import assert_export_cut, export_cap, make_client, xlsx_rows
 from tests.modules.admin.test_organizations_admin import auth_client
 from tests.modules.auth.test_sessions import make_session, make_user
 from tests.modules.gis.conftest import _commit_pending_before_requests
@@ -30,10 +30,12 @@ from tests.modules.gis.conftest import _commit_pending_before_requests
 pytestmark = pytest.mark.asyncio
 
 
-def _sheet(content: bytes):
-    sheet = load_workbook(io.BytesIO(content)).active
-    assert sheet is not None  # a fresh Workbook always has one active sheet
-    return sheet
+def _ids(content: bytes) -> set[str]:
+    return {str(row[-1]) for row in xlsx_rows(content)[1]}
+
+
+def _row(content: bytes, id_: str):
+    return next(r for r in xlsx_rows(content)[1] if str(r[-1]) == id_)
 
 
 # --- Bank-statement upload helpers, local to this file (mirrors
@@ -196,74 +198,46 @@ async def filed_refund(payments_view_client, pending_invoice, refund_basis) -> d
 
 # --- /invoices/export.xlsx (Task C.1) ---------------------------------------
 
+INVOICES = "/api/v1/invoices/export.xlsx"
+STATEMENTS = "/api/v1/payments/bank-statements/export.xlsx"
+RECONCILIATIONS = "/api/v1/payments/reconciliations/export.xlsx"
+MANUAL_CONFIRMATIONS = "/api/v1/payments/manual-confirmations/export.xlsx"
+ALLOCATIONS = "/api/v1/payments/allocations/export.xlsx"
+REFUNDS = "/api/v1/refunds/export.xlsx"
+RECIPIENTS = "/api/v1/payments/recipients/export.xlsx"
 
-async def test_invoices_export_holds_exactly_the_rows_the_list_shows(payments_view_client, invoice):
+
+async def test_the_invoices_export_mirrors_the_list(payments_view_client, invoice):
     # Scoped by `application_id` — the same filter the screen's own "search
     # by application" box sends — so the comparison is deterministic
     # regardless of what earlier tests left in this shared, persistent test
     # database (lesson: "The test DB is shared, persistent, and never empty").
-    listed = (
-        await payments_view_client.get(
-            "/api/v1/invoices", params={"application_id": str(invoice.application_id)}
-        )
-    ).json()
+    by_application = {"application_id": str(invoice.application_id)}
+    listed = (await payments_view_client.get("/api/v1/invoices", params=by_application)).json()
     listed_ids = {row["id"] for row in listed["items"]}
     assert listed_ids  # non-empty: this invoice is visible to a payments.view holder
 
-    resp = await payments_view_client.get(
-        "/api/v1/invoices/export.xlsx",
-        params={"application_id": str(invoice.application_id), "lang": "ru"},
-    )
+    resp = await payments_view_client.get(INVOICES, params={**by_application, "lang": "ru"})
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
     assert resp.headers["x-export-truncated"] == "false"
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Номер счёта" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
-    assert exported_ids == listed_ids
+    assert {str(row[-1]) for row in rows} == listed_ids
 
-
-async def test_invoices_export_applies_the_same_filters_as_the_list(payments_view_client, invoice):
-    resp = await payments_view_client.get(
-        "/api/v1/invoices/export.xlsx",
-        params={"application_id": str(invoice.application_id), "status": "paid", "lang": "uz_latn"},
-    )
-    assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_invoices_export_renders_labels_not_codes(payments_view_client, invoice):
-    resp = await payments_view_client.get(
-        "/api/v1/invoices/export.xlsx",
-        params={"application_id": str(invoice.application_id), "lang": "uz_latn"},
-    )
-    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    resp = await payments_view_client.get(INVOICES, params={**by_application, "lang": "uz_latn"})
+    row = _row(resp.content, str(invoice.id))
     assert row[0] == invoice.number  # the human number first
     assert row[1] == "Toʻlov kutilmoqda"  # the status label, not "pending"
 
-
-async def test_invoices_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, invoice, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        # `get_current_session` (every authenticated request) also reads
-        # `session_idle_minutes` through this same function — only the
-        # export's own cap key is overridden here.
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get("/api/v1/invoices/export.xlsx")
+    resp = await payments_view_client.get(
+        INVOICES, params={**by_application, "status": "paid", "lang": "uz_latn"}
+    )
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert xlsx_rows(resp.content)[1] == []
+
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(INVOICES), cap=1)
 
 
 async def test_invoices_export_matches_the_list_status_for_a_caller_with_no_scope(owner_client):
@@ -273,26 +247,17 @@ async def test_invoices_export_matches_the_list_status_for_a_caller_with_no_scop
     # own list, 200) — the export must answer the SAME status and, on a
     # 200, the same id set (brief shape 5).
     listed_resp = await owner_client.get("/api/v1/invoices")
-    export_resp = await owner_client.get("/api/v1/invoices/export.xlsx")
+    export_resp = await owner_client.get(INVOICES)
     assert export_resp.status_code == listed_resp.status_code
     if listed_resp.status_code == 200:
         listed_ids = {row["id"] for row in listed_resp.json()["items"]}
-        exported_ids = {
-            str(row[-1])
-            for row in _sheet(export_resp.content).iter_rows(min_row=2, values_only=True)
-        }
-        assert exported_ids == listed_ids
-
-
-async def test_invoices_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get("/api/v1/invoices/export.xlsx", params={"lang": "en"})
-    assert resp.status_code == 422
+        assert _ids(export_resp.content) == listed_ids
 
 
 # --- /payments/bank-statements/export.xlsx (Task C.2) -----------------------
 
 
-async def test_statements_export_holds_exactly_the_rows_the_list_shows(payments_view_client, db):
+async def test_the_statements_export_mirrors_the_list(payments_view_client, db):
     statement_id = await _upload_statement(payments_view_client)
     await _drain(db)
 
@@ -302,86 +267,40 @@ async def test_statements_export_holds_exactly_the_rows_the_list_shows(payments_
     listed_ids = {row["id"] for row in listed["items"]}
     assert statement_id in listed_ids
 
-    resp = await payments_view_client.get(
-        "/api/v1/payments/bank-statements/export.xlsx", params={"lang": "ru"}
-    )
+    resp = await payments_view_client.get(STATEMENTS, params={"lang": "ru"})
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Дата выписки" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    exported_ids = {str(row[-1]) for row in rows}
     assert statement_id in exported_ids
     assert exported_ids == listed_ids
 
-
-async def test_statements_export_applies_the_same_filters_as_the_list(payments_view_client, db):
-    statement_id = await _upload_statement(payments_view_client)
-    await _drain(db)
-
     resp = await payments_view_client.get(
-        "/api/v1/payments/bank-statements/export.xlsx", params={"status": "failed"}
+        STATEMENTS, params={"status": "parsed", "lang": "uz_latn"}
     )
+    assert _row(resp.content, statement_id)[1] == "Qayta ishlandi"  # the label, not "parsed"
+
+    resp = await payments_view_client.get(STATEMENTS, params={"status": "failed"})
     assert resp.status_code == 200
-    exported_ids = {
-        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    assert statement_id not in exported_ids  # a "parsed" statement is not "failed"
+    assert statement_id not in _ids(resp.content)  # a "parsed" statement is not "failed"
 
-
-async def test_statements_export_renders_labels_not_codes(payments_view_client, db):
-    statement_id = await _upload_statement(payments_view_client)
-    await _drain(db)
-
-    resp = await payments_view_client.get(
-        "/api/v1/payments/bank-statements/export.xlsx",
-        params={"status": "parsed", "lang": "uz_latn"},
-    )
-    row_by_id = {
-        str(row[-1]): row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    assert row_by_id[statement_id][1] == "Qayta ishlandi"  # the label, not "parsed"
-
-
-async def test_statements_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get("/api/v1/payments/bank-statements/export.xlsx")
-    assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(STATEMENTS), cap=1)
 
 
 async def test_statements_export_matches_the_list_status_for_a_caller_with_no_scope(
     applicant_client,
 ):
     listed_resp = await applicant_client.get("/api/v1/payments/bank-statements")
-    export_resp = await applicant_client.get("/api/v1/payments/bank-statements/export.xlsx")
+    export_resp = await applicant_client.get(STATEMENTS)
     assert export_resp.status_code == listed_resp.status_code
-
-
-async def test_statements_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/bank-statements/export.xlsx", params={"lang": "en"}
-    )
-    assert resp.status_code == 422
 
 
 # --- /payments/reconciliations/export.xlsx (Task C.2) -----------------------
 
 
-async def test_reconciliations_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_reconciliations_export_mirrors_the_list(
     payments_view_client, open_reconciliation
 ):
     listed = (
@@ -394,424 +313,203 @@ async def test_reconciliations_export_holds_exactly_the_rows_the_list_shows(
     )
     listed_ids = {item["id"] for item in listed["items"]}
 
-    resp = await payments_view_client.get(
-        "/api/v1/payments/reconciliations/export.xlsx", params={"status": "open", "lang": "ru"}
-    )
+    resp = await payments_view_client.get(RECONCILIATIONS, params={"status": "open", "lang": "ru"})
     assert resp.status_code == 200
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Счёт" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    exported_ids = {str(row[-1]) for row in rows}
     assert mine["id"] in exported_ids
     assert exported_ids == listed_ids
 
-
-async def test_reconciliations_export_applies_the_same_filters_as_the_list(
-    payments_view_client, open_reconciliation
-):
     resp = await payments_view_client.get(
-        "/api/v1/payments/reconciliations/export.xlsx", params={"status": "resolved"}
+        RECONCILIATIONS, params={"status": "open", "lang": "uz_latn"}
     )
-    assert resp.status_code == 200
-    exported_numbers = {
-        str(row[0]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    assert open_reconciliation.number not in exported_numbers
-
-
-async def test_reconciliations_export_renders_labels_not_codes(
-    payments_view_client, open_reconciliation
-):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/reconciliations/export.xlsx",
-        params={"status": "open", "lang": "uz_latn"},
-    )
-    rows_by_invoice_number = {
-        row[0]: row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    row = rows_by_invoice_number[open_reconciliation.number]
+    row = _row(resp.content, mine["id"])
+    assert row[0] == open_reconciliation.number
     assert row[1] == "Nomuvofiqlik"  # the result label, not "discrepancy"
     assert row[2] == "Ochiq"  # the status label, not "open"
 
-
-async def test_reconciliations_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, open_reconciliation, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get("/api/v1/payments/reconciliations/export.xlsx")
+    resp = await payments_view_client.get(RECONCILIATIONS, params={"status": "resolved"})
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert mine["id"] not in _ids(resp.content)
+
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(RECONCILIATIONS), cap=1)
 
 
 async def test_reconciliations_export_matches_the_list_status_for_a_caller_with_no_scope(
     applicant_client,
 ):
     listed_resp = await applicant_client.get("/api/v1/payments/reconciliations")
-    export_resp = await applicant_client.get("/api/v1/payments/reconciliations/export.xlsx")
+    export_resp = await applicant_client.get(RECONCILIATIONS)
     assert export_resp.status_code == listed_resp.status_code
-
-
-async def test_reconciliations_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/reconciliations/export.xlsx", params={"lang": "en"}
-    )
-    assert resp.status_code == 422
 
 
 # --- /payments/manual-confirmations/export.xlsx (Task C.2) ------------------
 
 
-async def test_manual_confirmations_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_manual_confirmations_export_mirrors_the_list(
     payments_view_client, filed_manual_confirmation
 ):
+    pending = {"status": "pending_check"}
     listed = (
         await payments_view_client.get(
-            "/api/v1/payments/manual-confirmations",
-            params={"status": "pending_check", "limit": 200},
+            "/api/v1/payments/manual-confirmations", params={**pending, "limit": 200}
         )
     ).json()
     listed_ids = {item["id"] for item in listed["items"]}
     assert filed_manual_confirmation["id"] in listed_ids
 
-    resp = await payments_view_client.get(
-        "/api/v1/payments/manual-confirmations/export.xlsx",
-        params={"status": "pending_check", "lang": "ru"},
-    )
+    resp = await payments_view_client.get(MANUAL_CONFIRMATIONS, params={**pending, "lang": "ru"})
     assert resp.status_code == 200
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Счёт" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
+    exported_ids = {str(row[-1]) for row in rows}
     assert filed_manual_confirmation["id"] in exported_ids
     assert exported_ids == listed_ids
 
-
-async def test_manual_confirmations_export_applies_the_same_filters_as_the_list(
-    payments_view_client, filed_manual_confirmation
-):
     resp = await payments_view_client.get(
-        "/api/v1/payments/manual-confirmations/export.xlsx", params={"status": "confirmed"}
+        MANUAL_CONFIRMATIONS, params={**pending, "lang": "uz_latn"}
     )
-    assert resp.status_code == 200
-    exported_ids = {
-        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    assert filed_manual_confirmation["id"] not in exported_ids  # still "pending_check"
-
-
-async def test_manual_confirmations_export_renders_labels_not_codes(
-    payments_view_client, filed_manual_confirmation
-):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/manual-confirmations/export.xlsx",
-        params={"status": "pending_check", "lang": "uz_latn"},
-    )
-    rows_by_id = {
-        str(row[-1]): row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    row = rows_by_id[filed_manual_confirmation["id"]]
+    row = _row(resp.content, filed_manual_confirmation["id"])
     assert row[1] == "Tekshiruv kutilmoqda"  # the status label, not "pending_check"
 
-
-async def test_manual_confirmations_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, filed_manual_confirmation, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get("/api/v1/payments/manual-confirmations/export.xlsx")
+    resp = await payments_view_client.get(MANUAL_CONFIRMATIONS, params={"status": "confirmed"})
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert filed_manual_confirmation["id"] not in _ids(resp.content)  # still "pending_check"
+
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(MANUAL_CONFIRMATIONS), cap=1)
 
 
 async def test_manual_confirmations_export_matches_the_list_status_for_a_caller_with_no_scope(
     applicant_client,
 ):
     listed_resp = await applicant_client.get("/api/v1/payments/manual-confirmations")
-    export_resp = await applicant_client.get("/api/v1/payments/manual-confirmations/export.xlsx")
+    export_resp = await applicant_client.get(MANUAL_CONFIRMATIONS)
     assert export_resp.status_code == listed_resp.status_code
-
-
-async def test_manual_confirmations_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/manual-confirmations/export.xlsx", params={"lang": "en"}
-    )
-    assert resp.status_code == 422
 
 
 # --- /payments/allocations/export.xlsx (Task C.2) ---------------------------
 
 
-async def test_allocations_export_holds_exactly_the_rows_the_list_shows(
+async def test_the_allocations_export_mirrors_the_list(
     payments_view_client, paid_invoice_with_allocations
 ):
-    invoice_id = str(paid_invoice_with_allocations.id)
+    by_invoice = {"invoice_id": str(paid_invoice_with_allocations.id)}
     listed = (
         await payments_view_client.get(
-            "/api/v1/payments/allocations", params={"invoice_id": invoice_id, "limit": 200}
+            "/api/v1/payments/allocations", params={**by_invoice, "limit": 200}
         )
     ).json()
     listed_ids = {row["id"] for row in listed["items"]}
     assert listed_ids  # at least the leshoz's own remainder row
 
-    resp = await payments_view_client.get(
-        "/api/v1/payments/allocations/export.xlsx",
-        params={"invoice_id": invoice_id, "lang": "ru"},
-    )
+    resp = await payments_view_client.get(ALLOCATIONS, params={**by_invoice, "lang": "ru"})
     assert resp.status_code == 200
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Счёт" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
-    assert exported_ids == listed_ids
+    assert {str(row[-1]) for row in rows} == listed_ids
 
-
-async def test_allocations_export_applies_the_same_filters_as_the_list(
-    payments_view_client, paid_invoice_with_allocations
-):
-    # An invoice id with no allocations written against it narrows the
-    # export to zero rows exactly as it narrows the list — `list_allocations`
-    # only ever filters `Allocation.invoice_id`, no existence check.
-    resp = await payments_view_client.get(
-        "/api/v1/payments/allocations/export.xlsx", params={"invoice_id": str(uuid.uuid4())}
-    )
-    assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
-
-
-async def test_allocations_export_renders_labels_not_codes(
-    payments_view_client, paid_invoice_with_allocations
-):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/allocations/export.xlsx",
-        params={"invoice_id": str(paid_invoice_with_allocations.id), "lang": "uz_latn"},
-    )
-    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
+    resp = await payments_view_client.get(ALLOCATIONS, params={**by_invoice, "lang": "uz_latn"})
+    (row, *_) = xlsx_rows(resp.content)[1]
     assert row[0] == paid_invoice_with_allocations.number  # the human number first
     assert row[1] == "Toʻlov"  # the entry-type label, not "payment"
 
-
-async def test_allocations_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, paid_invoice_with_allocations, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get(
-        "/api/v1/payments/allocations/export.xlsx",
-        params={"invoice_id": str(paid_invoice_with_allocations.id)},
-    )
+    # An invoice id with no allocations written against it narrows the
+    # export to zero rows exactly as it narrows the list — `list_allocations`
+    # only ever filters `Allocation.invoice_id`, no existence check.
+    resp = await payments_view_client.get(ALLOCATIONS, params={"invoice_id": str(uuid.uuid4())})
     assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert xlsx_rows(resp.content)[1] == []
+
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(ALLOCATIONS, params=by_invoice), cap=1)
 
 
 async def test_allocations_export_matches_the_list_status_for_a_caller_with_no_scope(
     applicant_client, paid_invoice_with_allocations
 ):
-    invoice_id = str(paid_invoice_with_allocations.id)
-    listed_resp = await applicant_client.get(
-        "/api/v1/payments/allocations", params={"invoice_id": invoice_id}
-    )
-    export_resp = await applicant_client.get(
-        "/api/v1/payments/allocations/export.xlsx", params={"invoice_id": invoice_id}
-    )
+    by_invoice = {"invoice_id": str(paid_invoice_with_allocations.id)}
+    listed_resp = await applicant_client.get("/api/v1/payments/allocations", params=by_invoice)
+    export_resp = await applicant_client.get(ALLOCATIONS, params=by_invoice)
     assert export_resp.status_code == listed_resp.status_code
-
-
-async def test_allocations_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/allocations/export.xlsx", params={"lang": "en"}
-    )
-    assert resp.status_code == 422
 
 
 # --- /refunds/export.xlsx (Task C.2) -----------------------------------------
 
 
-async def test_refunds_export_holds_exactly_the_rows_the_list_shows(
-    payments_view_client, filed_refund
-):
-    application_id = filed_refund["application_id"]
-    listed = (
-        await payments_view_client.get("/api/v1/refunds", params={"application_id": application_id})
-    ).json()
+async def test_the_refunds_export_mirrors_the_list(payments_view_client, filed_refund):
+    by_application = {"application_id": filed_refund["application_id"]}
+    listed = (await payments_view_client.get("/api/v1/refunds", params=by_application)).json()
     listed_ids = {item["id"] for item in listed["items"]}
     assert filed_refund["id"] in listed_ids
 
-    resp = await payments_view_client.get(
-        "/api/v1/refunds/export.xlsx", params={"application_id": application_id, "lang": "ru"}
-    )
+    resp = await payments_view_client.get(REFUNDS, params={**by_application, "lang": "ru"})
     assert resp.status_code == 200
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Заявка" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
-    assert exported_ids == listed_ids
+    assert {str(row[-1]) for row in rows} == listed_ids
 
+    resp = await payments_view_client.get(REFUNDS, params={**by_application, "lang": "uz_latn"})
+    assert _row(resp.content, filed_refund["id"])[2] == "Soʻralgan"  # the status label
 
-async def test_refunds_export_applies_the_same_filters_as_the_list(
-    payments_view_client, filed_refund
-):
-    resp = await payments_view_client.get(
-        "/api/v1/refunds/export.xlsx",
-        params={"application_id": filed_refund["application_id"], "status": "returned"},
-    )
+    resp = await payments_view_client.get(REFUNDS, params={**by_application, "status": "returned"})
     assert resp.status_code == 200
-    assert list(_sheet(resp.content).iter_rows(min_row=2, values_only=True)) == []
+    assert xlsx_rows(resp.content)[1] == []
 
-
-async def test_refunds_export_renders_labels_not_codes(payments_view_client, filed_refund):
-    resp = await payments_view_client.get(
-        "/api/v1/refunds/export.xlsx",
-        params={"application_id": filed_refund["application_id"], "lang": "uz_latn"},
-    )
-    row = next(_sheet(resp.content).iter_rows(min_row=2, values_only=True))
-    assert row[2] == "Soʻralgan"  # the status label, not "requested"
-
-
-async def test_refunds_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, filed_refund, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get("/api/v1/refunds/export.xlsx")
-    assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(REFUNDS), cap=1)
 
 
 async def test_refunds_export_matches_the_list_status_for_a_caller_with_no_scope(
     applicant_client,
 ):
     listed_resp = await applicant_client.get("/api/v1/refunds")
-    export_resp = await applicant_client.get("/api/v1/refunds/export.xlsx")
+    export_resp = await applicant_client.get(REFUNDS)
     assert export_resp.status_code == listed_resp.status_code
-
-
-async def test_refunds_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get("/api/v1/refunds/export.xlsx", params={"lang": "en"})
-    assert resp.status_code == 422
 
 
 # --- /payments/recipients/export.xlsx (Task C.2) -----------------------------
 
 
-async def test_recipients_export_holds_exactly_the_rows_the_list_shows(
-    payments_view_client, budget_50
-):
+async def test_the_recipients_export_mirrors_the_list(payments_view_client, budget_50):
     listed = (
         await payments_view_client.get("/api/v1/payments/recipients", params={"page_size": 100})
     ).json()
     listed_ids = {item["id"] for item in listed["items"]}
     assert str(budget_50.id) in listed_ids
 
-    resp = await payments_view_client.get(
-        "/api/v1/payments/recipients/export.xlsx", params={"lang": "ru"}
-    )
+    resp = await payments_view_client.get(RECIPIENTS, params={"lang": "ru"})
     assert resp.status_code == 200
-    sheet = _sheet(resp.content)
-    headers = [c.value for c in sheet[1]]
+    headers, rows = xlsx_rows(resp.content)
     assert headers[0] == "Название" and headers[-1] == "ID"
-    exported_ids = {str(row[-1]) for row in sheet.iter_rows(min_row=2, values_only=True)}
-    assert str(budget_50.id) in exported_ids
-    assert exported_ids == listed_ids
+    assert {str(row[-1]) for row in rows} == listed_ids
+
+    resp = await payments_view_client.get(RECIPIENTS, params={"lang": "uz_latn"})
+    row = _row(resp.content, str(budget_50.id))
+    assert row[0] == "Davlat byudjeti"  # the name first
+    assert row[1] == "Foiz"  # the kind label, not "percent"
+    assert row[5] == "Faol"  # the status label, not True
+
+    with export_cap(1):
+        assert_export_cut(await payments_view_client.get(RECIPIENTS), cap=1)
 
 
 async def test_recipients_export_includes_inactive_rows_like_the_list(
     payments_view_client, budget_50_inactive
 ):
     # `payment_recipients` has no filter parameter at all (ruling #157: an
-    # inactive row is never hidden) — this stands in for shape 2, proving
-    # the export does not silently narrow beyond what the list shows.
-    resp = await payments_view_client.get("/api/v1/payments/recipients/export.xlsx")
+    # inactive row is never hidden) — this stands in for the filter shape,
+    # proving the export does not silently narrow beyond what the list shows.
+    resp = await payments_view_client.get(RECIPIENTS, params={"lang": "uz_latn"})
     assert resp.status_code == 200
-    exported_ids = {
-        str(row[-1]) for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    assert str(budget_50_inactive.id) in exported_ids
-
-
-async def test_recipients_export_renders_labels_not_codes(payments_view_client, budget_50):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/recipients/export.xlsx", params={"lang": "uz_latn"}
-    )
-    rows_by_id = {
-        str(row[-1]): row for row in _sheet(resp.content).iter_rows(min_row=2, values_only=True)
-    }
-    row = rows_by_id[str(budget_50.id)]
-    assert row[0] == "Davlat byudjeti"  # the name first
-    assert row[1] == "Foiz"  # the kind label, not "percent"
-    assert row[5] == "Faol"  # the status label, not True
-
-
-async def test_recipients_export_truncates_at_the_cap_and_says_so(
-    payments_view_client, budget_50, monkeypatch
-):
-    from app.core import settings_store
-
-    original_get_int = settings_store.get_int
-
-    async def capped(db, key):
-        if key == "register_export_max_rows":
-            return 1
-        return await original_get_int(db, key)
-
-    monkeypatch.setattr(settings_store, "get_int", capped)
-    resp = await payments_view_client.get("/api/v1/payments/recipients/export.xlsx")
-    assert resp.status_code == 200
-    total = int(resp.headers["x-export-total"])
-    assert resp.headers["x-export-truncated"] == ("true" if total > 1 else "false")
-    assert len(list(_sheet(resp.content).iter_rows(min_row=2, values_only=True))) <= 1
+    assert _row(resp.content, str(budget_50_inactive.id))[5] == "Faol emas"
 
 
 async def test_recipients_export_matches_the_list_status_for_a_caller_with_no_scope(
     applicant_client,
 ):
     listed_resp = await applicant_client.get("/api/v1/payments/recipients")
-    export_resp = await applicant_client.get("/api/v1/payments/recipients/export.xlsx")
+    export_resp = await applicant_client.get(RECIPIENTS)
     assert export_resp.status_code == listed_resp.status_code
-
-
-async def test_recipients_export_rejects_an_unknown_language(payments_view_client):
-    resp = await payments_view_client.get(
-        "/api/v1/payments/recipients/export.xlsx", params={"lang": "en"}
-    )
-    assert resp.status_code == 422
