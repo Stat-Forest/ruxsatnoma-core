@@ -20,6 +20,20 @@ Stage 15 (decisions #213, #214, #215). Three things, one revision:
    index over `status = 'active'`, and a test database may already hold an
    active apiary row left by `tests/modules/permits/conftest.py::apiary_template`.
 
+   The insert is idempotent (`ON CONFLICT (id) DO UPDATE`): a downgrade that kept
+   one of these rows (below) leaves its fixed id in place, and a re-upgrade must
+   reactivate that same row rather than collide with it on the primary key.
+
+`downgrade()`'s own rule for the five rows this revision seeds: a `permits` row
+may already reference one by the time downgrade runs (a permit does not stop
+existing because the revision that seeded its layout is reversed — the same
+"keep it" reasoning `tz/05` invariant 7 applies to every other frozen permit
+field). So each of the five is ARCHIVED, never deleted, when `permits.template_id`
+still points at it; only a row nothing references is deleted, as before.
+`fk_permits_template_id_permit_templates` is what would otherwise abort the
+whole downgrade — found the hard way, by `pytest -n4 --fresh-db`'s full-suite
+order issuing a non-grazing permit before `test_downgrade_upgrade_roundtrip` ran.
+
 Revision ID: 0061
 Revises: 0063
 Create Date: 2026-09-14 12:00:00.000000
@@ -141,24 +155,44 @@ def upgrade() -> None:
                 "COALESCE(MAX(version), 0) + 1, "
                 "jsonb_build_object('uz_latn', :latn, 'uz_cyrl', :cyrl, 'ru', :ru), "
                 "NULL, 'active', DATE '2026-09-14' "
-                "FROM permit_templates WHERE activity_type_id = CAST(:activity AS uuid)"
+                "FROM permit_templates WHERE activity_type_id = CAST(:activity AS uuid) "
+                # A re-upgrade after a downgrade that ARCHIVED (not deleted) this
+                # same fixed id must reactivate it, not collide with it on the PK —
+                # `version` stays whatever the row already carries, never the
+                # `COALESCE(MAX(version), 0) + 1` the SELECT computed for a fresh
+                # insert (that count now includes this very row).
+                "ON CONFLICT (id) DO UPDATE SET status = 'active', name = EXCLUDED.name"
             ).bindparams(id=template_id, activity=activity_id, latn=latn, cyrl=cyrl, ru=ru)
         )
 
 
 def downgrade() -> None:
-    # The blanks: delete the five rows this revision inserted and put 0019's
-    # grazing version 1 back in force. Other activities had no active row before
-    # this revision (any archived row is a test fixture's own), so nothing to
-    # restore there. `permits.template_id` may reference a deleted row only for
-    # a permit issued while this revision was applied — the FK refuses the
-    # downgrade then, which is the honest answer.
+    # The blanks: for each of the five rows this revision inserted, ARCHIVE it
+    # (never delete) if a `permits` row still references it — a permit keeps
+    # pointing at the layout it was issued with, the same "frozen at issuance"
+    # reasoning every other permit field already gets — and DELETE it otherwise,
+    # as before. Then put 0019's grazing version 1 back in force; other
+    # activities had no active row before this revision (any archived row left
+    # over is a test fixture's own), so nothing to restore there.
+    bind = op.get_bind()
     for _code, template_id, *_ in TEMPLATES:
-        op.execute(
-            sa.text("DELETE FROM permit_templates WHERE id = CAST(:id AS uuid)").bindparams(
-                id=template_id
+        in_use = bind.execute(
+            sa.text(
+                "SELECT 1 FROM permits WHERE template_id = CAST(:id AS uuid) LIMIT 1"
+            ).bindparams(id=template_id)
+        ).first()
+        if in_use is not None:
+            op.execute(
+                sa.text(
+                    "UPDATE permit_templates SET status = 'archived' WHERE id = CAST(:id AS uuid)"
+                ).bindparams(id=template_id)
             )
-        )
+        else:
+            op.execute(
+                sa.text("DELETE FROM permit_templates WHERE id = CAST(:id AS uuid)").bindparams(
+                    id=template_id
+                )
+            )
     op.execute(
         sa.text(
             "UPDATE permit_templates SET status = 'active' "
