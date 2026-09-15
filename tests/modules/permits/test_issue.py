@@ -850,7 +850,9 @@ async def test_a_deadwood_permit_is_issued_on_its_own_blank(
     permit = await service.issue(db, deadwood_paid_application.id, actor=assigned_executor)
     assert permit.snapshot["deadwood_product"] == "oʻtin"
     assert permit.snapshot["removal_deadline"] == "2027-06-15"
-    assert permit.snapshot["quantity"] == "3.0000"
+    # A count prints as a count (`_count`): the NUMERIC(12, 4) scale stays in the
+    # column, never on the form — «3», not «3.0000».
+    assert permit.snapshot["quantity"] == "3"
     # The whole paid line (R7): status, the priced amount, the PAID row's own
     # date in Tashkent — and no benefit prefix, because none was claimed.
     assert permit.snapshot["payment_basis"] == (
@@ -859,6 +861,17 @@ async def test_a_deadwood_permit_is_issued_on_its_own_blank(
     )
     pdf = await service.pdf_bytes(db, permit.id)
     assert pdf.startswith(b"%PDF")
+
+
+def test_a_count_prints_as_a_count_and_never_in_scientific_notation() -> None:
+    """`Decimal("40.0000").normalize()` is `Decimal("4E+1")` — `str()` of it would put
+    «4E+1» on a legal form; `format(…, "f")` is what keeps `_count` honest."""
+    assert service._count(Decimal("3.0000")) == "3"
+    assert service._count(Decimal("2.5000")) == "2.5"
+    assert service._count(Decimal("40.0000")) == "40"
+    assert service._count(Decimal("1000000.0000")) == "1000000"
+    assert service._count(Decimal("12345678.5000")) == "12345678.5"
+    assert service._count(None) is None
 
 
 async def test_a_recreation_permit_prints_its_purpose_and_event_in_tashkent_time(

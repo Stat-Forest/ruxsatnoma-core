@@ -84,10 +84,15 @@ WORST_CASE_SNAPSHOT = {
         "Davlat oʻrmon fondi uchastkalaridan madaniy-maʼrifiy, tarbiyaviy, "
         "sogʻlomlashtirish, rekreatsion va estetik maqsadlarda foydalanish"
     ),
+    # The longest benefit name migration 0053 seeds (VMQ 278 ¶12, 88 characters) —
+    # not an invented one: the 43-character stand-in this held before let the
+    # recreation blank spill to two pages under the real title (final review, I2).
     "payment_basis": (
-        "Imtiyoz: Nogironligi boʻlgan shaxslar (I va II guruh). "
-        "Toʻlangan: 12345678.00 soʻm, 2027-04-01"
+        "Imtiyoz: 1941-1945-yillar urushi ishtirokchilari, nogironlari va ularga "
+        "tenglashtirilgan shaxslar. Toʻlangan: 12345678.00 soʻm, 2027-04-01"
     ),
+    # NUMERIC(12, 4) holds eight integer digits; `_count` keeps the fraction.
+    "quantity": "12345678.5",
     "deadwood_product": "oʻtin va shox-shabba",
     "recreation_purpose": "madaniy-maʼrifiy",
     "removal_deadline": "2027-06-15",
@@ -356,7 +361,11 @@ _PAGE_OBJECT = re.compile(rb"/Type\s*/Page\b(?!s)")
 
 
 def _page_count(pdf: bytes) -> int:
-    """PDF/A-1b forbids object streams, so every page object is in the clear."""
+    """PDF/A-1b forbids object streams, so every page object is in the clear.
+
+    A deliberately independent copy of `render._PAGE_OBJECT`, the way `_faces_in`
+    is of `_BASE_FONT_NAME`: the one-page tests below must not share the regex
+    with the guard they exist to check."""
     return len(_PAGE_OBJECT.findall(pdf))
 
 
@@ -372,6 +381,27 @@ def test_every_blank_is_exactly_one_page(code: str, snapshot: dict[str, str]) ->
         "https://dev.ruxsatnoma-urmon.uz/check?qr=" + "x" * 43,
     )
     assert _page_count(pdf) == 1, f"{code} spilled to {_page_count(pdf)} pages"
+
+
+@pytest.mark.parametrize("code", render.BLANK_CODES)
+def test_a_blank_that_spills_past_one_page_is_refused_at_issuance(code: str) -> None:
+    """Final review R1. The registry caps no name or address, so WORST_CASE_SNAPSHOT
+    is a floor and not a ceiling: the real 88-character benefit title of VMQ 278
+    put the recreation blank's signature block and QR alone on a second page while
+    the test above, fed an invented 43-character one, stayed green. A two-page
+    permit is the hiding direction — the leshoz prints page one and the QR is on
+    a sheet nobody printed — so `render_permit` counts pages and refuses, by
+    reason, rather than returning a longer document."""
+    with pytest.raises(DomainError) as raised:
+        render.render_permit(
+            {**WORST_CASE_SNAPSHOT, "holder_address": "Chinor mahallasi, " * 170},
+            render.bundled_layout(code),
+            "https://example.uz/x",
+        )
+    assert raised.value.code == "ERR-VAL-001", code
+    assert raised.value.details is not None
+    assert raised.value.details["reason"] == "blank_overflow", code
+    assert raised.value.details["pages"] >= 2, code
 
 
 @pytest.mark.parametrize("code", render.BLANK_CODES)

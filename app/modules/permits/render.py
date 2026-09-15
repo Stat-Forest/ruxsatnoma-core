@@ -26,6 +26,11 @@ embedded, and the container image's font set is not ours to depend on) and the Q
 enforces that from the other side: a layout may reference the bundled assets and `data:`
 URIs and nothing else, so an admin-authored layout cannot make the server fetch a URL or
 read a file.
+
+And one the owner set rather than the format: **one page.** The registry caps no name or
+address, so the blanks are tested against a worst case AND the finished document is
+counted at issuance (`_assert_one_page`) — a permit whose QR landed on a second sheet is
+refused, never printed.
 """
 
 import base64
@@ -162,6 +167,11 @@ _FONT_FILES = ("DejaVuSerif.ttf", "DejaVuSerif-Bold.ttf")
 _BASE_FONT_KEY = re.compile(rb"/BaseFont\b")
 _BASE_FONT_NAME = re.compile(rb"/BaseFont\s*/([^\s/<>\[\]{}()%]+)")
 _SUBSET_TAG = re.compile(rb"^[A-Z]{6}\+")
+
+# `/Type /Page` and not `/Type /Pages` (the tree node). PDF/A-1b forbids object
+# streams, so every page object is in the clear; `test_render._page_count` reads
+# the same shape independently.
+_PAGE_OBJECT = re.compile(rb"/Type\s*/Page\b(?!s)")
 
 
 def _font_css() -> str:
@@ -348,6 +358,24 @@ def _assert_only_bundled_faces(pdf: bytes) -> None:
         )
 
 
+def _assert_one_page(pdf: bytes) -> None:
+    """The one-page rule (Oybek, 2026-09-14), enforced where a permit is actually made.
+
+    `test_every_blank_is_exactly_one_page` renders the five blanks under a fixed
+    WORST_CASE_SNAPSHOT — but the registry caps no name, address or benefit title,
+    so no fixed worst case is exhaustive: the first real one past it was VMQ 278's
+    88-character benefit name, which put the signature block and the QR alone on a
+    second page of the recreation blank while every test stayed green. A two-page
+    permit is the hiding direction: nothing alarms, the leshoz prints page one, and
+    the holder signs a document whose QR is on a sheet nobody printed. So the count
+    is checked at issuance, and a spill is refused there — the fix is the CSS, never
+    a dropped row, and never a silently longer document.
+    """
+    pages = len(_PAGE_OBJECT.findall(pdf))
+    if pages != 1:
+        raise err("ERR-VAL-001", details={"reason": "blank_overflow", "pages": pages})
+
+
 def fill(layout_html: str, values: Mapping[str, Any]) -> str:
     """Substitute every `{{ field }}` with its HTML-escaped value.
 
@@ -414,4 +442,5 @@ def render_permit(snapshot: Mapping[str, Any], layout_html: str, qr_url: str) ->
     pdf = document.write_pdf(pdf_variant=PDF_VARIANT)
     assert pdf is not None
     _assert_only_bundled_faces(pdf)
+    _assert_one_page(pdf)
     return pdf

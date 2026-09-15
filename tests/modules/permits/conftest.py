@@ -540,7 +540,7 @@ async def deadwood_paid_application(
     row.removal_deadline = date(2027, 6, 15)
     await db.flush()
     # What Postgres stored, not what was assigned (lesson): `quantity` is
-    # NUMERIC(12, 4), so the row reads `3.0000` — the figure the permit prints.
+    # NUMERIC(12, 4), so the row reads `3.0000` — which `_count` prints as «3».
     await db.refresh(row)
     return row
 

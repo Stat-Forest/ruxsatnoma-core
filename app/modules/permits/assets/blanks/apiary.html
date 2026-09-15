@@ -18,9 +18,10 @@
   <title>Ruxsatnoma {{ series }} №{{ number }}</title>
   <style>
     /* ONE A4 page under the longest values the registry holds (test_every_blank_is_exactly_one_page):
-       a change here is checked against WORST_CASE_SNAPSHOT, never by dropping a row. */
-    @page { size: A4; margin: 11mm 14mm 9mm 16mm; }
-    body { font-size: 10pt; line-height: 1.25; color: #000; }
+       a change here is checked against WORST_CASE_SNAPSHOT, never by dropping a row — and a spill
+       past that case is refused at issuance (render._assert_one_page), never printed. */
+    @page { size: A4; margin: 9mm 12mm 8mm 14mm; }
+    body { font-size: 9.5pt; line-height: 1.2; color: #000; }
     .emblem { text-align: center; margin-bottom: 1.5mm; }
     .emblem img { width: 19mm; height: 19mm; }
     .series { text-align: right; font-size: 9pt; }
@@ -64,7 +65,9 @@
 
   <table class="fields">
     <tr><th>Oʻrmon xoʻjaligi <span class="ru">Лесное хозяйство</span></th><td>{{ leshoz_name }}</td></tr>
-    <!-- Requisites 5-7 (boʻlim / aylanma / boʻlak) have no data source (tz/12 #10, #19) —
+    <!-- tz/13 requisite 5, decision #127: printed as a blank line («—») until the Agency delivers the level below the leshoz (tz/12 #10, #19). -->
+    <tr><th>Oʻrmon boʻlimi <span class="ru">Лесничество</span></th><td>—</td></tr>
+    <!-- Requisites 6-7 (aylanma / boʻlak) have no data source either (tz/12 #10, #19) —
          the blank's line is printed with the contour, which is what the leshoz actually holds. -->
     <tr><th>Aylanma / boʻlagi <span class="ru">Обход / квартал</span></th><td>kontur {{ contour_number }}</td></tr>
     <tr><th>Foydalanuvchi (F.I.Sh., JShShIR / STIR) <span class="ru">Пользователь</span></th><td>{{ holder_name }}, {{ holder_pinfl }}</td></tr>

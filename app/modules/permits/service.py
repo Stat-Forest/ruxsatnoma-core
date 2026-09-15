@@ -371,6 +371,13 @@ def _money(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
 
 
+def _count(value: Decimal | None) -> str | None:
+    """A declared amount as the form prints it: «3», «2.5», «40» — never «3.0000».
+    `normalize()` strips the NUMERIC(12, 4) scale; `format(…, "f")` keeps it out of
+    scientific notation the way `_money` does (`Decimal("40").normalize()` is `4E+1`)."""
+    return None if value is None else format(value.normalize(), "f")
+
+
 def _frozen_herd(input_snapshot: Any) -> dict[str, int]:
     """The head counts the permit is PRICED for, out of the calculation's own
     `input_snapshot` (ruling T3-f) — `{livestock_code: heads}`, summed per code.
@@ -766,7 +773,7 @@ async def _snapshot(
         "calculation_id": str(calculation_id),
         # The blank's own lines (decision #215). «—» where this activity's blank
         # does not print the key, never a blank: every snapshot has ONE shape.
-        "quantity": _money(quantity) if quantity is not None else NOT_STATED,
+        "quantity": _count(quantity) if quantity is not None else NOT_STATED,
         "payment_basis": payment_basis,
         "deadwood_product": _labelled(
             deadwood_product, DEADWOOD_PRODUCT_LABELS, field="deadwood_product"

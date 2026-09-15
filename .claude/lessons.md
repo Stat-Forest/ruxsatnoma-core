@@ -575,9 +575,7 @@ Tooling and environment.
   wrote a SECOND lawful zero (`no_tariff_by_law`): every `science` application sat `INVOICED`
   forever, and a fixed receiver made `split_payment(0, …)` refuse approval (dev, 2026-09-10).
   Before an `else` over a value another module computes, grep that module for every writer.
-- **Or the seeded ROW is the claim (stage 15):** `permit_templates` had one active row, for
-  `grazing` alone — every other open activity's issuance was unreachable while every module's own
-  suite stayed green — closed by `test_every_open_activity_has_one_active_bundled_template`.
+- **Or the seeded ROW is the claim (stage 15):** a catalogue row seeded for ONE enum member (`permit_templates`, `grazing`) is a feature that works for one member, every suite green; the guard is a test that walks the enum.
 
 ## A guard that corrects a row's own column must be read back from that column, not from the raw answer it was given
 

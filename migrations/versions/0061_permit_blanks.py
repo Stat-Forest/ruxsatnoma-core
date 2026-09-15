@@ -74,7 +74,7 @@ TEMPLATES = (
     (
         "haymaking",
         "0198f150-0015-7000-8000-000000000002",
-        "Ruxsatnoma — pichan o‘rish (rasmiy blank)",
+        "Ruxsatnoma — pichan oʻrish (rasmiy blank)",
         "Рухсатнома — пичан ўриш (расмий бланк)",
         "Разрешение — сенокошение (официальный бланк)",
     ),
@@ -88,7 +88,7 @@ TEMPLATES = (
     (
         "deadwood",
         "0198f150-0015-7000-8000-000000000004",
-        "Ruxsatnoma — o‘tin va shox-shabba yig‘ish (rasmiy blank)",
+        "Ruxsatnoma — oʻtin va shox-shabba yigʻish (rasmiy blank)",
         "Рухсатнома — ўтин ва шох-шабба йиғиш (расмий бланк)",
         "Разрешение — сбор дров и ветвей (официальный бланк)",
     ),
