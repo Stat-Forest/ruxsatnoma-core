@@ -759,12 +759,25 @@ async def benefit_category_item_id(engine) -> AsyncIterator[uuid.UUID]:
 
 
 @pytest.fixture
-async def science_activity_id(db: AsyncSession) -> uuid.UUID:
+async def science_activity_id(db: AsyncSession) -> AsyncIterator[uuid.UUID]:
     """`science` — «Илмий тадқиқот», the one activity VMQ 278 leaves un-rated
     (`tariff_exempt:science`, published by migration 0013). Seeded by 0005,
-    never created here: `activity_types` is a fixed catalogue."""
+    never created here: `activity_types` is a fixed catalogue. ARCHIVED by
+    migration 0061 (#214: no blank, off the menu) — re-activated here for the
+    tests that exercise the tariff-exempt path, which is still real code, and
+    archived again after. Committed both ways: the app runs on its own
+    session."""
     rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'science'"))
-    return rows.scalar_one()
+    activity_id = rows.scalar_one()
+    await db.execute(text("UPDATE activity_types SET status = 'active' WHERE code = 'science'"))
+    await db.commit()
+    try:
+        yield activity_id
+    finally:
+        await db.execute(
+            text("UPDATE activity_types SET status = 'archived' WHERE code = 'science'")
+        )
+        await db.commit()
 
 
 @pytest.fixture

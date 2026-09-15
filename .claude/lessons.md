@@ -565,10 +565,9 @@ Tooling and environment.
 
 - **Rule:** A hard-coded fact about ANOTHER module's state ("not merged yet", "no such table")
   needs a check that fails once the fact goes stale — never a comment trusted to be re-read.
-- **Why:** `dashboard/service.py` hard-codes `OMITTED_TILES` saying `inspections` "is not
-  merged into `dev` yet" — true when written; `inspections` has since merged with 21 routes and
-  a real `violation_cases` table the dashboard still refuses to count. Its tests pass because
-  they assert `omitted` is reported HONESTLY — nothing asserts the REASON still holds.
+- **Why:** `dashboard/service.py` hard-codes `OMITTED_TILES` saying `inspections` "is not merged
+  into `dev` yet" — true when written, false since `inspections` merged with 21 routes. Tests pass
+  because they assert `omitted` is reported HONESTLY, not that the REASON still holds.
 - **How to apply:** Hard-coding an omission tied to another module's absence, add a test that
   fails once that module ships, or tie it to a tracked ticket.
 - **The claim can be wrong the day it is written (ruling #202):** #185 hard-coded "a zero with
@@ -576,6 +575,9 @@ Tooling and environment.
   wrote a SECOND lawful zero (`no_tariff_by_law`): every `science` application sat `INVOICED`
   forever, and a fixed receiver made `split_payment(0, …)` refuse approval (dev, 2026-09-10).
   Before an `else` over a value another module computes, grep that module for every writer.
+- **Or the seeded ROW is the claim (stage 15):** `permit_templates` had one active row, for
+  `grazing` alone — every other open activity's issuance was unreachable while every module's own
+  suite stayed green — closed by `test_every_open_activity_has_one_active_bundled_template`.
 
 ## A guard that corrects a row's own column must be read back from that column, not from the raw answer it was given
 

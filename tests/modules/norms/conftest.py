@@ -226,12 +226,24 @@ async def science_activity_id(db: AsyncSession) -> AsyncIterator[uuid.UUID]:
     fixture deletes every tariff row for this activity_type_id at teardown,
     regardless of who created it — nothing else in the product is ever supposed
     to write one, and the delete is scoped to this one FK, never a blanket
-    `DELETE FROM tariffs`."""
+    `DELETE FROM tariffs`. ARCHIVED by migration 0061 (#214: no blank, off the
+    menu) — re-activated here for the tests that exercise the tariff-exempt
+    path, which is still real code, and archived again after. Committed both
+    ways: the app runs on its own session."""
     rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'science'"))
     activity_id = rows.scalar_one()
-    yield activity_id
-    await db.execute(text("DELETE FROM tariffs WHERE activity_type_id = :id"), {"id": activity_id})
+    await db.execute(text("UPDATE activity_types SET status = 'active' WHERE code = 'science'"))
     await db.commit()
+    try:
+        yield activity_id
+    finally:
+        await db.execute(
+            text("DELETE FROM tariffs WHERE activity_type_id = :id"), {"id": activity_id}
+        )
+        await db.execute(
+            text("UPDATE activity_types SET status = 'archived' WHERE code = 'science'")
+        )
+        await db.commit()
 
 
 # --- clients ---------------------------------------------------------------

@@ -27,7 +27,8 @@ from tests.modules.auth.test_sessions import make_user
 
 API = "/api/v1"
 
-SEEDED_ACTIVITY_CODES = {"grazing", "haymaking", "apiary", "recreation", "deadwood", "science"}
+# `science` is excluded: archived by migration 0061 (#214), off every open-activity list.
+OPEN_ACTIVITY_CODES = {"grazing", "haymaking", "apiary", "recreation", "deadwood"}
 
 
 @pytest.fixture
@@ -65,7 +66,7 @@ async def test_route_is_reachable_anonymously_and_covers_the_catalogue(db) -> No
     assert response.status_code == 200
     body = response.json()
     codes = {row["activity_type_code"] for row in body}
-    assert SEEDED_ACTIVITY_CODES <= codes
+    assert OPEN_ACTIVITY_CODES <= codes
 
 
 async def test_an_activity_without_an_agency_row_is_none_not_open_all_year(db, agency) -> None:
