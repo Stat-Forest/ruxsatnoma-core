@@ -98,8 +98,7 @@ async def test_public_refs_carry_the_presentation_fields(client: httpx.AsyncClie
     assert grazing["processing_days"] == 15
     assert grazing["description"]["uz_latn"].strip()
     assert grazing["description"]["ru"].strip()
-    science = next(row for row in body if row["code"] == "science")
-    assert science["description"] is None
+    assert all(row["code"] != "science" for row in body)  # archived by 0061 (#214)
 
 
 async def test_patch_edits_presentation_and_writes_an_audit_row(

@@ -413,7 +413,8 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     value added on one side and forgotten on the other would be a 422 that
     should have been a 200, or an `IntegrityError` 500 that should have been a
     422. `permits/test_models.py` carries the identical guard. Task 5 (3.9b)
-    adds `ConclusionKind`/`ConclusionRecommendation` beside the original four."""
+    adds `ConclusionKind`/`ConclusionRecommendation` beside the original four;
+    stage 15 task 2 adds `DeadwoodProduct`/`RecreationPurpose`."""
     from typing import get_args
 
     from app.modules.applications.models import (
@@ -422,8 +423,10 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         CHANNELS,
         CONCLUSION_KINDS,
         CONCLUSION_RECOMMENDATIONS,
+        DEADWOOD_PRODUCTS,
         HISTORY_STATUSES,
         ON_BEHALF_VALUES,
+        RECREATION_PURPOSES,
     )
     from app.modules.applications.schemas import (
         ApplicationKind,
@@ -432,8 +435,10 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         Channel,
         ConclusionKind,
         ConclusionRecommendation,
+        DeadwoodProduct,
         HistoryStatus,
         OnBehalf,
+        RecreationPurpose,
     )
 
     assert set(get_args(ApplicationStatus)) == set(APPLICATION_STATUSES)
@@ -448,3 +453,17 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(ConclusionKind)) == set(CONCLUSION_KINDS)
     assert set(get_args(ConclusionRecommendation)) == set(CONCLUSION_RECOMMENDATIONS)
     assert set(get_args(BenefitVerificationStatus)) == set(BENEFIT_VERIFICATION_STATUSES)
+    assert set(get_args(DeadwoodProduct)) == set(DEADWOOD_PRODUCTS)
+    assert set(get_args(RecreationPurpose)) == set(RECREATION_PURPOSES)
+
+
+def test_the_blank_fields_of_stage_15_are_columns_with_check_backed_codes() -> None:
+    """Decision #215 R6: the four lines the deadwood and recreation blanks print
+    live on `applications`, nullable (a draft is autosaved field by field), and
+    the two code columns are CHECK-backed so a typo cannot reach a printed permit."""
+    columns = Application.__table__.columns
+    assert columns["deadwood_product"].nullable
+    assert columns["removal_deadline"].nullable
+    assert columns["recreation_purpose"].nullable
+    assert columns["event_at"].nullable
+    assert columns["event_at"].type.timezone is True  # pyright: ignore[reportAttributeAccessIssue]

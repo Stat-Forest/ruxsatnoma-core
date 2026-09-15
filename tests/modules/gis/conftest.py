@@ -81,6 +81,38 @@ async def contours_layer(db: AsyncSession) -> GisLayer:
     return layer
 
 
+# The single agency's name, in every language a document or a page reads it in.
+# `uz_latn` is not optional: it is the permit's language (decision #215 R2), and
+# `permits.service._localized` refuses an issuance whose authority has no name in
+# it — a fixture agency without one would fail every issuance test for a reason
+# that has nothing to do with the test.
+AGENCY_NAME = {"uz_latn": "Test agentligi", "uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"}
+
+
+async def _agency(db: AsyncSession) -> Organization:
+    """The singleton agency — reused when another test module has already
+    committed one to the shared, persistent test DB (lesson), created otherwise.
+
+    Self-healing, the same shape `permits/conftest.py::apiary_template` uses: a
+    row another module's fixture created carries only the languages THAT module
+    needed, and one left behind before #215 has no `uz_latn` at all. Filling the
+    missing keys here, rather than asserting, is what keeps the agency's name
+    valid for the permit no matter which fixture happened to create it first."""
+    agency = (
+        await db.execute(select(Organization).where(Organization.kind == "agency"))
+    ).scalar_one_or_none()
+    if agency is None:
+        agency = Organization(
+            id=uuid7(), code=f"A{uuid.uuid4().hex[:8]}", name=dict(AGENCY_NAME), kind="agency"
+        )
+        db.add(agency)
+        await db.flush()
+    elif not all(agency.name.get(key) for key in AGENCY_NAME):
+        agency.name = {**AGENCY_NAME, **{k: v for k, v in agency.name.items() if v}}
+        await db.flush()
+    return agency
+
+
 @pytest.fixture
 async def leshoz(db: AsyncSession) -> Organization:
     """An organization of our own, so tests never collide on the shared test DB.
@@ -90,23 +122,14 @@ async def leshoz(db: AsyncSession) -> Organization:
     singleton another test module may already have committed to the shared,
     persistent test DB — so this reuses one if it exists rather than assuming
     a fresh database (lesson: "the test database is shared, persistent").
+    Named in `uz_latn` too, because the permit prints the leshoz in the
+    document's language (decision #215 R2) — see `AGENCY_NAME`.
     """
-    agency = (
-        await db.execute(select(Organization).where(Organization.kind == "agency"))
-    ).scalar_one_or_none()
-    if agency is None:
-        agency = Organization(
-            id=uuid7(),
-            code=f"A{uuid.uuid4().hex[:8]}",
-            name={"uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"},
-            kind="agency",
-        )
-        db.add(agency)
-        await db.flush()
+    agency = await _agency(db)
     org = Organization(
         id=uuid7(),
         code=f"T{uuid.uuid4().hex[:8]}",
-        name={"uz_cyrl": "Тест ЎХ", "ru": "Тестовый лесхоз"},
+        name={"uz_latn": "Test OʻX", "uz_cyrl": "Тест ЎХ", "ru": "Тестовый лесхоз"},
         kind="leshoz",
         parent_id=agency.id,
     )
@@ -123,22 +146,11 @@ async def other_leshoz(db: AsyncSession) -> Organization:
     needs a second, different organization to attempt the create against; not
     a fixture `leshoz` itself can produce twice (pytest fixtures are cached per
     test, so requesting the same one twice gives the same instance, not two)."""
-    agency = (
-        await db.execute(select(Organization).where(Organization.kind == "agency"))
-    ).scalar_one_or_none()
-    if agency is None:
-        agency = Organization(
-            id=uuid7(),
-            code=f"A{uuid.uuid4().hex[:8]}",
-            name={"uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"},
-            kind="agency",
-        )
-        db.add(agency)
-        await db.flush()
+    agency = await _agency(db)
     org = Organization(
         id=uuid7(),
         code=f"T{uuid.uuid4().hex[:8]}",
-        name={"uz_cyrl": "Тест ЎХ 2", "ru": "Тестовый лесхоз 2"},
+        name={"uz_latn": "Test OʻX 2", "uz_cyrl": "Тест ЎХ 2", "ru": "Тестовый лесхоз 2"},
         kind="leshoz",
         parent_id=agency.id,
     )

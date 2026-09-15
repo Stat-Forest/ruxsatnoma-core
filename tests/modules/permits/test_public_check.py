@@ -25,6 +25,7 @@ process, so `id > marker` is exact and owes nothing to the database's clock.
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any, get_args
 
 import httpx
@@ -36,6 +37,8 @@ from app.core import ratelimit
 from app.core.logging import _SilentPathFilter, configure_logging
 from app.db import uuid7
 from app.main import create_app
+from app.modules.applications import service as applications_service
+from app.modules.applications.models import ApplicationStatusHistory
 from app.modules.auth.models import Applicant
 from app.modules.permits import service
 from app.modules.permits.models import (
@@ -64,6 +67,8 @@ CARD_FIELDS = {
     "organization",
     "activity_type",
     "signatures_valid",
+    # Task 5 (decision #215 R5): the signature LINES this card names.
+    "signatures",
     "holder",
     # Task 5: always present, `None` unless `public_permit_contour_enabled`
     # is on (ruling R2, default OFF) — this suite never flips it, so every
@@ -492,6 +497,107 @@ async def test_a_failed_signing_attempt_is_evidence_and_not_a_broken_document(
 
     body = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()
     assert body["signatures_valid"] is True
+
+
+# --- decision #215 R5: the signature lines -------------------------------------
+
+
+async def test_the_card_names_every_valid_signature_line_and_no_person(
+    client: httpx.AsyncClient, active_permit: Permit
+) -> None:
+    """Decision #215 R5 (#213: «the signatures are in the QR»). Lines and dates,
+    never a name, a user id or a certificate — the route is anonymous.
+
+    `active_permit` (conftest ~1097) goes through the three leshoz signatures and
+    no application signature (the fixture chain inserts the `Application` row
+    directly, never through the real `submit()`, so there is no SUBMITTED
+    history row for a submission signature to bind to — see the next test), so
+    the list starts at `permit_head`."""
+    result = await client.get(CHECK, params={"qr": active_permit.qr_token})
+    body = result.json()
+    lines = body["signatures"]
+    assert [row["line"] for row in lines] == [
+        "permit_head",
+        "permit_chief_forester",
+        "permit_accountant",
+    ]
+    assert lines[0]["line_label"]["ru"] == "Директор лесхоза"
+    assert lines[0]["kind"] == "eri"
+    assert set(lines[0]) == {"line", "line_label", "signed_on", "kind"}
+
+
+async def test_the_citizens_signature_is_the_first_line_and_an_invalid_row_is_not_listed(
+    db: AsyncSession, client: httpx.AsyncClient, active_permit: Permit
+) -> None:
+    """No permits test drives a SIGNED application to an active permit (the
+    fixtures insert the `Application` row directly), so the application line is
+    pinned by building the one real thing a submission signature is keyed
+    to itself: a SUBMITTED `ApplicationStatusHistory` row with a known `id`,
+    exactly as `applications.service.file`/`.submit` mint one (ruling 25), and
+    a signature over THAT id under `SUBMISSION_OBJECT_TYPE`
+    (`"application_submission"`) — **not** `("application", application_id)`,
+    which names a review DECISION, never a citizen's filing
+    (`applications.service.timeline`'s own docstring spells out the two keys).
+
+    `uq_signatures_valid_purpose` is unique over VALID rows only
+    (`applications/service.py:1402`), so the invalid twin inserts beside the
+    valid one and rides along as evidence that is not listed."""
+    signed_at = datetime(2027, 3, 31, 20, 30, tzinfo=UTC)  # 2027-04-01 01:30 in Tashkent
+    submission_id = uuid7()
+    db.add(
+        ApplicationStatusHistory(
+            id=submission_id,
+            application_id=active_permit.application_id,
+            from_status=None,
+            to_status="SUBMITTED",
+            changed_by=None,
+            occurred_at=signed_at,
+        )
+    )
+    db.add(
+        Signature(
+            object_type=applications_service.SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=applications_service.SUBMISSION_PURPOSE,
+            signer_user_id=None,
+            certificate_id=None,
+            doc_hash="0" * 64,
+            signature_value="simple",
+            signed_at=signed_at,
+            verification={"kind": "simple"},
+            verification_status="valid",
+            kind="simple",
+        )
+    )
+    db.add(
+        Signature(
+            object_type=applications_service.SUBMISSION_OBJECT_TYPE,
+            object_id=submission_id,
+            purpose=applications_service.SUBMISSION_PURPOSE,
+            signer_user_id=None,
+            certificate_id=None,
+            doc_hash="0" * 64,
+            signature_value="a refused envelope",
+            signed_at=signed_at,
+            verification={"reason": "signature_invalid"},
+            verification_status="invalid",
+            kind="simple",
+        )
+    )
+    await db.commit()
+
+    lines = (await client.get(CHECK, params={"qr": active_permit.qr_token})).json()["signatures"]
+    assert lines[0] == {
+        "line": "application_submit",
+        "line_label": {
+            "uz_latn": "Ariza beruvchi (ariza imzosi)",
+            "uz_cyrl": "Ариза берувчи (ариза имзоси)",
+            "ru": "Заявитель (подпись заявления)",
+        },
+        "signed_on": "2027-04-01",  # Tashkent, not UTC
+        "kind": "simple",
+    }
+    assert [row["line"] for row in lines].count("application_submit") == 1
 
 
 # --- review round 1: the route is the system's first open door ----------------

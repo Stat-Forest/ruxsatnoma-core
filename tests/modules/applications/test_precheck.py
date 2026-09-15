@@ -14,6 +14,8 @@ from sqlalchemy import func, select
 
 from app.modules.norms.models import Calculation
 
+API = "/api/v1"
+
 
 async def test_an_over_limit_herd_is_reported_not_refused(
     applicant_client, filing_ready_for_submission, published_grazing_norm, sheep_type_id
@@ -383,3 +385,117 @@ async def test_missing_for_pricing_reads_items_from_memory_when_handed_them(
     assert payload.items[0].count == 40
     collected = await checks.evaluate(db, application, items=herd)
     assert {c for c, _, _ in collected} >= {"norm_limit", "gis_within_fund"}
+
+
+async def test_a_deadwood_draft_is_told_which_blank_lines_it_still_lacks(
+    db, applicant_client, applicant, published_contour, deadwood_activity_id
+) -> None:
+    """Decision #215 R6: `missing_for_pricing` is the one definition of "ready to
+    file", so the pre-check names the two deadwood lines the way it names
+    `quantity` — the citizen learns it here, never from `ERR-APP-001` at submit.
+
+    **Built directly as a RETURNED row, not through `POST /applications`
+    then `PATCH`** (the task-2 brief's own sketch): since stage 12 `POST
+    /applications` files a COMPLETE application in one shot and refuses an
+    incomplete one with `ERR-APP-001` — `missing_for_pricing` is exactly the
+    gate this test is about, so an application missing `deadwood_product`/
+    `removal_deadline` can never be FILED in the first place. The only
+    persisted, still-editable row missing them is the one a leshoz `/return`
+    actually produces; this is the same direct-row idiom
+    `test_capacity_decision.py`'s `make_permit_on_contour` uses to stand in
+    for a real transition this test is not about."""
+    from datetime import date
+    from decimal import Decimal
+
+    from app.modules.applications.models import Application
+
+    application = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        status="RETURNED",
+        channel="portal",
+        kind="new",
+        activity_type_id=deadwood_activity_id,
+        contour_id=published_contour.id,
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 5, 31),
+        quantity=Decimal("3"),
+    )
+    db.add(application)
+    await db.flush()
+    application_id = str(application.id)
+
+    result = await applicant_client.post(f"{API}/applications/{application_id}/precheck")
+    assert result.status_code == 200, result.text
+    # Not every `skipped` row carries `details["missing"]` — `gis_within_fund`
+    # can skip for `reason: "layer_empty"` with no such key — so this reads
+    # the key defensively, the way `by_type[...]["details"]["missing"]` reads
+    # ONE named row elsewhere in this file.
+    skipped = [row for row in result.json()["checks"] if row["result"] == "skipped"]
+    missing = {name for row in skipped for name in row["details"].get("missing", [])}
+    assert {"deadwood_product", "removal_deadline"} <= missing
+    assert "recreation_purpose" not in missing
+
+    filled = await applicant_client.patch(
+        f"{API}/applications/{application_id}",
+        json={"deadwood_product": "firewood", "removal_deadline": "2027-06-15"},
+    )
+    assert filled.status_code == 200, filled.text
+    body = filled.json()
+    assert body["deadwood_product"] == "firewood"
+    assert body["removal_deadline"] == "2027-06-15"
+
+
+async def test_a_recreation_draft_needs_its_purpose_and_event_time(
+    db, applicant_client, applicant, published_contour, recreation_activity_id
+) -> None:
+    """Same reasoning as the deadwood test above for why this is a directly
+    built RETURNED row rather than `POST /applications` + `PATCH`."""
+    from datetime import date
+    from decimal import Decimal
+
+    from app.modules.applications.models import Application
+
+    application = Application(
+        applicant_id=applicant.id,
+        submitted_by_user_id=applicant.owner_user_id,
+        on_behalf="self",
+        status="RETURNED",
+        channel="portal",
+        kind="new",
+        activity_type_id=recreation_activity_id,
+        contour_id=published_contour.id,
+        period_from=date(2027, 5, 1),
+        period_to=date(2027, 5, 2),
+        quantity=Decimal("40"),
+    )
+    db.add(application)
+    await db.flush()
+    application_id = str(application.id)
+
+    result = await applicant_client.post(f"{API}/applications/{application_id}/precheck")
+    assert result.status_code == 200, result.text
+    skipped = [row for row in result.json()["checks"] if row["result"] == "skipped"]
+    missing = {name for row in skipped for name in row["details"].get("missing", [])}
+    assert {"recreation_purpose", "event_at"} <= missing
+
+    bad = await applicant_client.patch(
+        f"{API}/applications/{application_id}", json={"recreation_purpose": "picnic"}
+    )
+    assert bad.status_code == 422  # a Literal, not a free string
+
+    # The wizard's <input type="datetime-local"> sends a naive value; it is read as
+    # Tashkent time and stored aware — a 500 here is the asyncpg naive/aware clash.
+    naive = await applicant_client.patch(
+        f"{API}/applications/{application_id}",
+        json={"recreation_purpose": "health", "event_at": "2027-05-01T10:00"},
+    )
+    assert naive.status_code == 200, naive.text
+    # `ApplicationOut` carries no Tashkent-display serializer for `event_at` —
+    # every other datetime column here answers in UTC too (the JSON-boundary
+    # lesson: the machine form crosses JSON, Tashkent is a DISPLAY concern for
+    # a human reader). 10:00 Tashkent (UTC+5) is 05:00 UTC — asserting THAT,
+    # rather than "any 200", is what proves the validator read the naive value
+    # as Tashkent wall-clock time and not as UTC or some other zone.
+    assert naive.json()["event_at"] == "2027-05-01T05:00:00Z"

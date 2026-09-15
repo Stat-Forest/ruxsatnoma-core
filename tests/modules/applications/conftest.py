@@ -214,7 +214,13 @@ def recreation_filing_ready_for_submission(
 ) -> dict[str, Any]:
     """A FILING ready to submit on the RECREATION activity — `_ready_filing`'s
     own template does not fit here: recreation prices by `quantity`, never
-    `items` (grazing's own herd list)."""
+    `items` (grazing's own herd list).
+
+    `recreation_purpose`/`event_at` (decision #215 R6, stage 15): recreation's
+    own blank lines, required by `checks.missing_for_pricing` since
+    `BLANK_FIELDS_BY_ACTIVITY` — without them this filing is no longer
+    "ready to submit" and every caller of this fixture would 400 at
+    `POST /applications/package` instead of reaching what it means to test."""
     return {
         "on_behalf": "self",
         "contour_id": str(published_contour.id),
@@ -222,6 +228,8 @@ def recreation_filing_ready_for_submission(
         "period_from": "2027-09-01",
         "period_to": "2027-09-30",
         "quantity": "2",
+        "recreation_purpose": "recreational",
+        "event_at": "2027-09-01T09:00:00+05:00",
     }
 
 
@@ -751,11 +759,33 @@ async def benefit_category_item_id(engine) -> AsyncIterator[uuid.UUID]:
 
 
 @pytest.fixture
-async def science_activity_id(db: AsyncSession) -> uuid.UUID:
+async def science_activity_id(db: AsyncSession) -> AsyncIterator[uuid.UUID]:
     """`science` — «Илмий тадқиқот», the one activity VMQ 278 leaves un-rated
     (`tariff_exempt:science`, published by migration 0013). Seeded by 0005,
-    never created here: `activity_types` is a fixed catalogue."""
+    never created here: `activity_types` is a fixed catalogue. ARCHIVED by
+    migration 0061 (#214: no blank, off the menu) — re-activated here for the
+    tests that exercise the tariff-exempt path, which is still real code, and
+    archived again after. Committed both ways: the app runs on its own
+    session."""
     rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'science'"))
+    activity_id = rows.scalar_one()
+    await db.execute(text("UPDATE activity_types SET status = 'active' WHERE code = 'science'"))
+    await db.commit()
+    try:
+        yield activity_id
+    finally:
+        await db.execute(
+            text("UPDATE activity_types SET status = 'archived' WHERE code = 'science'")
+        )
+        await db.commit()
+
+
+@pytest.fixture
+async def deadwood_activity_id(db: AsyncSession) -> uuid.UUID:
+    """`deadwood` — the activity whose blank prints `deadwood_product` and
+    `removal_deadline` (decision #215 R6). Seeded by 0005, never created here:
+    `activity_types` is a fixed catalogue."""
+    rows = await db.execute(text("SELECT id FROM activity_types WHERE code = 'deadwood'"))
     return rows.scalar_one()
 
 
@@ -1069,7 +1099,14 @@ async def agency_org(db: AsyncSession) -> Organization:
         agency = Organization(
             id=uuid7(),
             code=f"A{uuid.uuid4().hex[:8]}",
-            name={"uz_cyrl": "Тест агентлиги", "ru": "Тестовое агентство"},
+            # `uz_latn` is the required key (decision #90) and the permit's own
+            # language (#215 R2) — the same name `tests/modules/gis/conftest.py`
+            # gives the row, so whichever module creates it first, it is valid.
+            name={
+                "uz_latn": "Test agentligi",
+                "uz_cyrl": "Тест агентлиги",
+                "ru": "Тестовое агентство",
+            },
             kind="agency",
         )
         db.add(agency)

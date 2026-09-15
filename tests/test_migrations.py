@@ -580,6 +580,229 @@ async def test_0053_role_rename_keeps_a_users_assignment(engine):
             )
 
 
+async def test_0061_downgrade_survives_an_issued_non_grazing_permit(engine):
+    """Cross-task finding: `0061`'s downgrade used to unconditionally `DELETE`
+    the five rows it seeded. `pytest -n4 --fresh-db`'s full-suite run issues
+    real permits on the non-grazing bundled blanks (`test_issue.py` and others)
+    before `test_downgrade_upgrade_roundtrip` runs last on that worker, so the
+    DELETE hit `fk_permits_template_id_permit_templates` and aborted the whole
+    downgrade mid-transaction — which then failed every migration test after it
+    on that worker, collaterally.
+
+    The fix: a template row referenced by a `permits` row is ARCHIVED, not
+    deleted, on downgrade — the same "frozen at issuance" reasoning every other
+    permit field already gets. This test builds one permit on the seeded
+    deadwood template (`0198f150-...004`), downgrades to `0062` (one step back)
+    and proves the row SURVIVES (archived, permit unaffected), then upgrades
+    back to head and proves the upsert reactivates that exact row rather than
+    colliding with it on its own fixed id — no second active row for deadwood."""
+    url = get_settings().database_url_test
+    cfg = _alembic_config(url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    template_id = uuid.UUID("0198f150-0015-7000-8000-000000000004")  # deadwood, seeded by 0061
+    deadwood_activity_id = uuid.UUID("0198f100-0001-7000-8000-000000000005")
+
+    agency_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    contour_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    applicant_id = uuid.uuid4()
+    application_id = uuid.uuid4()
+    permit_id = uuid.uuid4()
+    pinfl = str(applicant_id.int % 10**14).zfill(14)
+
+    async with engine.begin() as conn:
+        # Only what the FK chain and this table's own NOT NULL columns demand —
+        # 0046/0053's own principle. `organizations`/`contours`/`contour_versions`
+        # are the one addition those two tests never needed: a permit carries
+        # its OWN contour/organization, not the application's.
+        role_id = (await conn.execute(text("SELECT id FROM roles LIMIT 1"))).scalar_one()
+        layer_id = (
+            await conn.execute(text("SELECT id FROM gis_layers WHERE code = 'contours'"))
+        ).scalar_one()
+
+        # The agency is a singleton (`uq_organizations_single_agency`) another
+        # test module may already have committed to this shared, persistent
+        # database — reuse it if so, create it otherwise (the same get-or-create
+        # `tests/modules/gis/conftest.py::_agency` uses).
+        existing_agency = (
+            await conn.execute(text("SELECT id FROM organizations WHERE kind = 'agency' LIMIT 1"))
+        ).scalar_one_or_none()
+        created_agency = existing_agency is None
+        if created_agency:
+            await conn.execute(
+                text(
+                    "INSERT INTO organizations (id, kind, code, name, status) "
+                    "VALUES (CAST(:id AS uuid), 'agency', :code, "
+                    "'{\"uz_latn\": \"Test Agency\"}'::jsonb, 'active')"
+                ),
+                {"id": agency_id, "code": f"TESTAG{agency_id.hex[:8]}"},
+            )
+        else:
+            agency_id = existing_agency
+
+        await conn.execute(
+            text(
+                "INSERT INTO organizations (id, parent_id, kind, code, name, status) "
+                "VALUES (CAST(:id AS uuid), CAST(:parent_id AS uuid), 'leshoz', :code, "
+                "'{\"uz_latn\": \"Test Leshoz\"}'::jsonb, 'active')"
+            ),
+            {"id": org_id, "parent_id": agency_id, "code": f"TESTLH{org_id.hex[:8]}"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO contours (id, layer_id, organization_id, kind, number, status) "
+                "VALUES (CAST(:id AS uuid), CAST(:layer_id AS uuid), CAST(:org_id AS uuid), "
+                "'contour', :number, 'active')"
+            ),
+            {
+                "id": contour_id,
+                "layer_id": layer_id,
+                "org_id": org_id,
+                "number": f"T{contour_id.hex[:8]}",
+            },
+        )
+        # `geom` stays NULL (decision #178: a leshoz with no delivered GIS
+        # layer) — `declared_area_ha` is what `geom_or_declared_area` then
+        # requires instead, and this test's downgrade is about `permit_templates`,
+        # not geometry.
+        await conn.execute(
+            text(
+                "INSERT INTO contour_versions "
+                "(id, contour_id, version_no, area_ha, declared_area_ha, source, status) "
+                "VALUES (CAST(:id AS uuid), CAST(:contour_id AS uuid), 1, 12.5, 12.5, "
+                "'survey', 'draft')"
+            ),
+            {"id": version_id, "contour_id": contour_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO users "
+                "(id, full_name, role_id, status, must_change_password, failed_login_count) "
+                "VALUES (CAST(:id AS uuid), 'Migration test user', "
+                "CAST(:role_id AS uuid), 'active', false, 0)"
+            ),
+            {"id": user_id, "role_id": role_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO applicants (id, kind, pinfl, name, owner_user_id) "
+                "VALUES (CAST(:id AS uuid), 'individual', :pinfl, "
+                "'Migration test applicant', CAST(:user_id AS uuid))"
+            ),
+            {"id": applicant_id, "pinfl": pinfl, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO applications "
+                "(id, applicant_id, submitted_by_user_id, on_behalf, channel, status, kind) "
+                "VALUES (CAST(:id AS uuid), CAST(:applicant_id AS uuid), "
+                "CAST(:user_id AS uuid), 'self', 'portal', 'APPROVED', 'new')"
+            ),
+            {"id": application_id, "applicant_id": applicant_id, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO permits "
+                "(id, series, number, application_id, applicant_id, activity_type_id, "
+                "organization_id, contour_id, contour_version_id, area_ha, period_from, "
+                "period_to, amount, status, qr_token, template_id, snapshot) "
+                "VALUES (CAST(:id AS uuid), 'Z', :number, CAST(:application_id AS uuid), "
+                "CAST(:applicant_id AS uuid), CAST(:activity_id AS uuid), CAST(:org_id AS uuid), "
+                "CAST(:contour_id AS uuid), CAST(:version_id AS uuid), 12.5000, "
+                "'2027-05-01', '2027-09-30', 500000.00, 'active', :qr_token, "
+                "CAST(:template_id AS uuid), '{}'::jsonb)"
+            ),
+            {
+                "id": permit_id,
+                "number": permit_id.int % 900000 + 100000,
+                "application_id": application_id,
+                "applicant_id": applicant_id,
+                "activity_id": deadwood_activity_id,
+                "org_id": org_id,
+                "contour_id": contour_id,
+                "version_id": version_id,
+                "qr_token": f"test-0061-{permit_id.hex[:16]}",
+                "template_id": template_id,
+            },
+        )
+
+    try:
+        # THE PROOF: this must not raise — before the fix, the unconditional
+        # DELETE hit fk_permits_template_id_permit_templates right here.
+        await asyncio.to_thread(command.downgrade, cfg, "0062")
+
+        async with engine.connect() as conn:
+            template_status = (
+                await conn.execute(
+                    text("SELECT status FROM permit_templates WHERE id = CAST(:id AS uuid)"),
+                    {"id": template_id},
+                )
+            ).scalar_one()
+            assert template_status == "archived"
+
+            permit_template = (
+                await conn.execute(
+                    text("SELECT template_id FROM permits WHERE id = CAST(:id AS uuid)"),
+                    {"id": permit_id},
+                )
+            ).scalar_one()
+            assert permit_template == template_id, "the permit must keep pointing at its own layout"
+    finally:
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+
+        async with engine.connect() as conn:
+            active_rows = (
+                await conn.execute(
+                    text(
+                        "SELECT id, status FROM permit_templates "
+                        "WHERE activity_type_id = CAST(:activity_id AS uuid) AND status = 'active'"
+                    ),
+                    {"activity_id": deadwood_activity_id},
+                )
+            ).all()
+            assert [row.id for row in active_rows] == [template_id], (
+                "the re-upgrade must reactivate the SAME row, not insert a second one"
+            )
+
+        # This test's own rows would otherwise sit in the shared per-worker
+        # database forever, the same reasoning `test_0046_...`'s own cleanup
+        # documents. Deleted in FK order; the agency is left alone unless this
+        # run is the one that created it.
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM permits WHERE id = CAST(:id AS uuid)"), {"id": permit_id}
+            )
+            await conn.execute(
+                text("DELETE FROM applications WHERE id = CAST(:id AS uuid)"),
+                {"id": application_id},
+            )
+            await conn.execute(
+                text("DELETE FROM applicants WHERE id = CAST(:id AS uuid)"),
+                {"id": applicant_id},
+            )
+            await conn.execute(
+                text("DELETE FROM users WHERE id = CAST(:id AS uuid)"), {"id": user_id}
+            )
+            await conn.execute(
+                text("DELETE FROM contour_versions WHERE id = CAST(:id AS uuid)"),
+                {"id": version_id},
+            )
+            await conn.execute(
+                text("DELETE FROM contours WHERE id = CAST(:id AS uuid)"), {"id": contour_id}
+            )
+            await conn.execute(
+                text("DELETE FROM organizations WHERE id = CAST(:id AS uuid)"), {"id": org_id}
+            )
+            if created_agency:
+                await conn.execute(
+                    text("DELETE FROM organizations WHERE id = CAST(:id AS uuid)"),
+                    {"id": agency_id},
+                )
+
+
 async def test_downgrade_upgrade_roundtrip(engine):
     """upgrade head → downgrade base → upgrade head (plan 03.4 ruling 16).
 
@@ -598,4 +821,4 @@ async def test_downgrade_upgrade_roundtrip(engine):
     # every other test (conftest's migrator is session-scoped and autouse, so a
     # branch point kills the whole suite rather than one case). Move this in the
     # SAME commit as the migration that moves the head.
-    assert version == "0063"
+    assert version == "0061"

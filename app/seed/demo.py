@@ -29,7 +29,8 @@ already provide:
     touching `DEMO_YIELD_C_PER_HA`. Without it grazing cannot be SUBMITTED at
     all (`ERR-NORM-001`), and — discovered only by driving the full chain —
     `permit_templates` has an active row for `grazing` alone, so no permit
-    can ever be issued for any other activity either.
+    can ever be issued for any other activity either. Closed by migration
+    0061 (stage 15): every open activity has a bundled blank.
 
 Everything else the wizard needs (activity types, livestock types, VMQ 278
 tariffs) is already seeded by migrations 0005/0012 — this script only checks
@@ -665,8 +666,9 @@ async def _ensure_grazing_norm(db: AsyncSession, *, organization_id: uuid.UUID, 
     verifying this very round of fixes — `permit_templates` has an ACTIVE
     row for `grazing` and NO OTHER activity, so permit issuance, the four ERI
     signatures and a permit ever reaching ACTIVE are unreachable through any
-    activity but grazing. Leaving this unseeded would make the entire back
-    half of the demo (steps 5-7) unverifiable and undemonstrable, not merely
+    activity but grazing. Closed by migration 0061 (stage 15): every open
+    activity has a bundled blank. Leaving this unseeded would make the entire
+    back half of the demo (steps 5-7) unverifiable and undemonstrable, not merely
     provisional-but-working like `coef_sb`. That structural finding is why
     this function writes a value the docstring above says is not derivable —
     a judgement call, not a ruling, made because the alternative failed

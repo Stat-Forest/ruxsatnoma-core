@@ -2,6 +2,9 @@ import functools
 import re
 import zlib
 
+import pytest
+
+from app.core.errors import DomainError
 from app.modules.permits import render
 
 SNAPSHOT = {
@@ -26,6 +29,85 @@ SNAPSHOT = {
     "amount": "2060000.00",
     "payment_status": "Тўланган",
     "payment_date": "2027-04-01",
+}
+
+# Decision #215: what `permits.service._snapshot` freezes after stage 15 — every
+# blank's placeholders, in the document's language (uz_latn, R2). Kept as one
+# dict for all five blanks on purpose: the snapshot is one shape for every
+# activity, and a blank simply does not name the keys that are not its own.
+BLANK_SNAPSHOT = {
+    **SNAPSHOT,
+    "authority_name": (
+        "Oʻzbekiston Respublikasi Ekologiya va iqlim oʻzgarishi milliy qoʻmitasi huzuridagi "
+        "Oʻrmon va yashil hududlarni koʻpaytirish, choʻllanishga qarshi kurashish agentligi"
+    ),
+    "leshoz_name": "Burchmulla oʻrmon xoʻjaligi",
+    "activity_name": "Chorva mollarini boqish",
+    "holder_name": "Azizov Aziz Azizovich",
+    "holder_address": "Toshkent viloyati, Boʻstonliq tumani, Burchmulla qishlogʻi",
+    "payment_status": "Toʻlangan",
+    "heads_total": "9",
+    "heads_cattle_adult": "5",
+    "heads_cattle_young": "—",
+    "heads_horse_adult": "—",
+    "heads_horse_young": "2",
+    "heads_camel_adult": "—",
+    "heads_camel_young": "—",
+    "heads_donkey_adult": "—",
+    "heads_donkey_young": "—",
+    "heads_sheep_goat_6m": "2",
+    "heads_lamb_kid_under_6m": "—",
+    "quantity": "—",
+    "payment_basis": "Toʻlangan: 2060000.00 soʻm, 2027-04-01",
+    "deadwood_product": "—",
+    "removal_deadline": "—",
+    "recreation_purpose": "—",
+    "event_at": "—",
+}
+
+# The longest values the registry can hold — a blank that fits the demo values and
+# spills on Burchmulla's full name is a defect found by the first real citizen.
+WORST_CASE_SNAPSHOT = {
+    **BLANK_SNAPSHOT,
+    "leshoz_name": (
+        "Toshkent viloyati Boʻstonliq tumani «Burchmulla» davlat oʻrmon xoʻjaligi boʻlimi"
+    ),
+    "holder_name": (
+        "Abdurahmonova Gulnoza Abdurahmon qizi "
+        "(yuridik shaxs vakili: «Yashil vodiy» fermer xoʻjaligi)"
+    ),
+    "holder_address": (
+        "Toshkent viloyati, Boʻstonliq tumani, Burchmulla qishlogʻi, Chinor mahallasi, "
+        "Togʻ koʻchasi, 128-uy, 4-xonadon"
+    ),
+    "activity_name": (
+        "Davlat oʻrmon fondi uchastkalaridan madaniy-maʼrifiy, tarbiyaviy, "
+        "sogʻlomlashtirish, rekreatsion va estetik maqsadlarda foydalanish"
+    ),
+    # The longest benefit name migration 0053 seeds (VMQ 278 ¶12, 88 characters) —
+    # not an invented one: the 43-character stand-in this held before let the
+    # recreation blank spill to two pages under the real title (final review, I2).
+    "payment_basis": (
+        "Imtiyoz: 1941-1945-yillar urushi ishtirokchilari, nogironlari va ularga "
+        "tenglashtirilgan shaxslar. Toʻlangan: 12345678.00 soʻm, 2027-04-01"
+    ),
+    # NUMERIC(12, 4) holds eight integer digits; `_count` keeps the fraction.
+    "quantity": "12345678.5",
+    "deadwood_product": "oʻtin va shox-shabba",
+    "recreation_purpose": "madaniy-maʼrifiy",
+    "removal_deadline": "2027-06-15",
+    "event_at": "2027-05-01 15:00",
+    "heads_cattle_adult": "1200",
+    "heads_cattle_young": "1200",
+    "heads_horse_adult": "1200",
+    "heads_horse_young": "1200",
+    "heads_camel_adult": "1200",
+    "heads_camel_young": "1200",
+    "heads_donkey_adult": "1200",
+    "heads_donkey_young": "1200",
+    "heads_sheep_goat_6m": "12000",
+    "heads_lamb_kid_under_6m": "12000",
+    "heads_total": "33600",
 }
 LAYOUT = '<html><body><h1>{{ series }} № {{ number }}</h1><img src="{{ qr }}"></body></html>'
 
@@ -59,10 +141,6 @@ def test_the_qr_is_embedded_not_linked() -> None:
 def test_a_placeholder_with_no_value_is_refused_not_left_blank() -> None:
     """A permit is a legal document: an unfilled field is a defect, not a
     cosmetic gap, and it must fail at issuance rather than reach a citizen."""
-    import pytest
-
-    from app.core.errors import DomainError
-
     with pytest.raises(DomainError) as raised:
         render.render_permit({"series": "А"}, LAYOUT, "https://example.uz/x")
     assert raised.value.code == "ERR-VAL-001"
@@ -232,8 +310,6 @@ def _substituting_scripts_or_skip() -> tuple[str, ...]:
     detected at runtime rather than for a platform name, and switches itself back on the
     day a runner has fonts.
     """
-    import pytest
-
     scripts = _scripts_with_a_host_face()
     if not scripts:
         pytest.skip(
@@ -281,25 +357,110 @@ def test_no_system_font_is_substituted_for_the_uzbek_letters() -> None:
     assert not missing, f"the embedded subset carries no glyph for {missing}"
 
 
-def test_the_layout_bundled_with_the_module_renders_from_the_issuers_snapshot() -> None:
-    """The seeded grazing `permit_templates` row has a NULL `layout_file_id`, which
-    means this file (task 1, decision 2). A placeholder in it that the snapshot does
-    not carry would surface as ERR-VAL-001 at the first real issuance, not here."""
-    pdf = render.render_permit(
-        SNAPSHOT, render.default_layout(), "https://example.uz/public/permits/check?qr=x"
-    )
+_PAGE_OBJECT = re.compile(rb"/Type\s*/Page\b(?!s)")
 
+
+def _page_count(pdf: bytes) -> int:
+    """PDF/A-1b forbids object streams, so every page object is in the clear.
+
+    A deliberately independent copy of `render._PAGE_OBJECT`, the way `_faces_in`
+    is of `_BASE_FONT_NAME`: the one-page tests below must not share the regex
+    with the guard they exist to check."""
+    return len(_PAGE_OBJECT.findall(pdf))
+
+
+@pytest.mark.parametrize("code", render.BLANK_CODES)
+@pytest.mark.parametrize("snapshot", [BLANK_SNAPSHOT, WORST_CASE_SNAPSHOT], ids=["normal", "worst"])
+def test_every_blank_is_exactly_one_page(code: str, snapshot: dict[str, str]) -> None:
+    """Oybek, 2026-09-14: «в одной странице, формат не должен сломаться». A blank
+    that spills under the longest values the registry can hold is fixed in its
+    CSS, never by dropping a line."""
+    pdf = render.render_permit(
+        snapshot,
+        render.bundled_layout(code),
+        "https://dev.ruxsatnoma-urmon.uz/check?qr=" + "x" * 43,
+    )
+    assert _page_count(pdf) == 1, f"{code} spilled to {_page_count(pdf)} pages"
+
+
+@pytest.mark.parametrize("code", render.BLANK_CODES)
+def test_a_blank_that_spills_past_one_page_is_refused_at_issuance(code: str) -> None:
+    """Final review R1. The registry caps no name or address, so WORST_CASE_SNAPSHOT
+    is a floor and not a ceiling: the real 88-character benefit title of VMQ 278
+    put the recreation blank's signature block and QR alone on a second page while
+    the test above, fed an invented 43-character one, stayed green. A two-page
+    permit is the hiding direction — the leshoz prints page one and the QR is on
+    a sheet nobody printed — so `render_permit` counts pages and refuses, by
+    reason, rather than returning a longer document."""
+    with pytest.raises(DomainError) as raised:
+        render.render_permit(
+            {**WORST_CASE_SNAPSHOT, "holder_address": "Chinor mahallasi, " * 170},
+            render.bundled_layout(code),
+            "https://example.uz/x",
+        )
+    assert raised.value.code == "ERR-VAL-001", code
+    assert raised.value.details is not None
+    assert raised.value.details["reason"] == "blank_overflow", code
+    assert raised.value.details["pages"] >= 2, code
+
+
+@pytest.mark.parametrize("code", render.BLANK_CODES)
+def test_every_bundled_blank_renders_from_the_stage_15_snapshot(code: str) -> None:
+    """Decision #215 R1: one bundled blank per open activity, each filled from
+    the ONE snapshot shape `_snapshot` freezes. A placeholder a blank names and
+    the snapshot does not carry would surface as ERR-VAL-001 at the first real
+    issuance of that activity, not here — so every blank is rendered here."""
+    pdf = render.render_permit(
+        BLANK_SNAPSHOT, render.bundled_layout(code), "https://example.uz/check?qr=x"
+    )
     assert pdf.startswith(b"%PDF")
     assert b"pdfaid" in pdf
+    # R8: the emblem is a vector, drawn by WeasyPrint's own SVG path — no raster
+    # /Image XObject sneaks in for it. The QR is the one image on the page.
+    assert pdf.count(b"/Subtype /Image") == 1
+
+
+def test_a_blank_names_only_placeholders_the_snapshot_defines() -> None:
+    """The set the five blanks use, pinned — Task 4's service test asserts the
+    real snapshot covers exactly this set, so a new placeholder cannot be added
+    to a blank without the snapshot growing in the same change."""
+    used = {
+        name.strip()
+        for code in render.BLANK_CODES
+        for name in render._PLACEHOLDER.findall(render.bundled_layout(code))
+    }
+    assert used - {render.QR_FIELD} == render.BLANK_FIELDS
+
+
+def test_the_emblem_is_bundled_and_has_no_text_to_draw() -> None:
+    """R8: PDF/A needs the emblem offline, and `_assert_only_bundled_faces` would
+    refuse a document whose SVG asked Pango for a font."""
+    svg = (render.ASSETS_DIR / "emblem.svg").read_text(encoding="utf-8")
+    assert "<text" not in svg and "<image" not in svg
+    assert (render.ASSETS_DIR / "LICENSE-emblem.txt").exists()
+
+
+def test_an_unknown_activity_has_no_bundled_blank() -> None:
+    with pytest.raises(DomainError) as excinfo:
+        render.bundled_layout("science")
+    assert excinfo.value.details == {"reason": "no_bundled_layout", "activity_code": "science"}
+
+
+def test_the_bundled_faces_draw_the_latin_apostrophes_of_the_blanks() -> None:
+    """The blanks and `service`'s stage-15 constants write oʻ (U+02BB) and ʼ
+    (U+02BC) — the codebase's one apostrophe convention, migrations 0031/0032's
+    — and every localized value arrives in uz_latn (R2): both must be in the
+    bundled cmap, or issuance refuses the holder's own leshoz name as
+    unrenderable. The typographic quotes (U+2018/U+2019) an operator may type
+    into a name are pinned beside them for the same reason."""
+    covered = render._renderable_codepoints()
+    assert {0x02BB, 0x02BC, 0x2018, 0x2019, 0x0110, 0x0111} <= covered
 
 
 def test_a_layout_cannot_make_the_server_fetch_a_url_or_read_a_file() -> None:
     """The layout is an admin-editable row. Without `_AssetFetcher` a stored `<img>`
     would be a server-side request from inside the issuing transaction, and a
     `file://` one a local read — the SSRF twin of the template-engine hole above."""
-    import pytest
-
-    from app.core.errors import DomainError
 
     fetcher = render._AssetFetcher()
     for url in ("http://127.0.0.1:9000/probe.png", "https://example.uz/x.png"):
@@ -334,9 +495,6 @@ def test_a_character_the_bundled_font_cannot_draw_is_refused_at_issuance() -> No
     Hiragino Mincho into the PDF on the developer's Mac, and would have produced tofu —
     and different bytes, so a different `doc_hash` — in the container. The refusal names
     the character, so the fix is obvious to whoever entered it."""
-    import pytest
-
-    from app.core.errors import DomainError
 
     with pytest.raises(DomainError) as raised:
         render.render_permit(
@@ -372,9 +530,6 @@ def test_no_host_face_reaches_the_document_even_from_the_layout_itself() -> None
     `_substituting_scripts_or_skip`) rather than for a platform name. The scanner's own
     logic is pinned from crafted bytes below, on every machine, either way.
     """
-    import pytest
-
-    from app.core.errors import DomainError
 
     for script in _substituting_scripts_or_skip():
         with pytest.raises(DomainError) as raised:
@@ -421,7 +576,9 @@ def test_the_pdf_dates_come_from_the_snapshot_and_never_from_the_clock() -> None
     import datetime
 
     pdf = render.render_permit(
-        {**SNAPSHOT, "issued_at": "1999-12-31"}, render.default_layout(), "https://example.uz/x"
+        {**BLANK_SNAPSHOT, "issued_at": "1999-12-31"},
+        render.bundled_layout("grazing"),
+        "https://example.uz/x",
     )
 
     assert b"D:19991231" in pdf, "the issue date is not pinned into the document"
@@ -444,9 +601,6 @@ def test_the_scanner_refuses_a_foreign_face_in_every_shape_and_fails_closed_on_t
     foreign `/BaseFont` can take is asserted here, from bytes, where the machine's font
     set cannot change the answer.
     """
-    import pytest
-
-    from app.core.errors import DomainError
 
     for label, blob, expected in (
         ("a plain name", b"/BaseFont /Times-New-Roman", "Times-New-Roman"),

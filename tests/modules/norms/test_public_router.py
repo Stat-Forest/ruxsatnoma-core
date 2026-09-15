@@ -208,7 +208,7 @@ async def test_public_activity_types_answers_anonymously_with_id_code_name(
     response = await client.get(ACTIVITY_TYPES)
     assert response.status_code == 200
     items = response.json()
-    assert len(items) >= 6  # the seeded catalog, migration 0005
+    assert len(items) >= 5  # the seeded catalog, migration 0005 — `science` archived by 0061 (#214)
     grazing = next(item for item in items if item["code"] == "grazing")
     # migration 0038 (ruling #138) added description/processing_days — the shop-window
     # copy — to this anonymous surface; quantity_unit/status are still never here.

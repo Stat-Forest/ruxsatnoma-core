@@ -26,7 +26,9 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+
+from app.core.time import TASHKENT
 
 # Spelled out rather than `Literal[*APPLICATION_STATUSES]`: pyright rejects a
 # starred variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal`
@@ -87,6 +89,15 @@ ConclusionRecommendation = Literal["approve", "reject"]
 # tuples_the_checks_are_built_from` is the guard that keeps the two in sync.
 BenefitVerificationStatus = Literal["not_required", "pending", "verified", "rejected"]
 
+# Decision #215 R6 — the two blank lines that are a CHOICE. The document prints a
+# label for each (`permits.service.DEADWOOD_PRODUCT_LABELS` / `RECREATION_PURPOSE_
+# LABELS`); the wizard shows its own dictionary's. Mirrored by migration 0061's
+# CHECK constraints — change both or neither.
+DeadwoodProduct = Literal["firewood", "branches", "both"]
+RecreationPurpose = Literal[
+    "cultural_educational", "upbringing", "health", "recreational", "aesthetic"
+]
+
 # `POST /applications/{id}/checks` (task 7, 3.9b) — deliberate SUBSETS of
 # `models.CHECK_TYPES`/`CHECK_RESULTS`/`CHECK_SOURCES`, not their mirror, so
 # NOT added to `test_the_schema_literals_match_the_tuples_the_checks_are_
@@ -143,7 +154,31 @@ class ApplicationItemIn(BaseModel):
     head_count: Annotated[int, Field(gt=0, le=MAX_HEAD_COUNT)]
 
 
-class ApplicationPatch(BaseModel):
+class BlankLinesMixin(BaseModel):
+    """The deadwood and recreation blank lines (decision #215 R6), shared by
+    `ApplicationPatch` and `ApplicationFilingIn` rather than pasted twice.
+
+    `<input type="datetime-local">` sends `YYYY-MM-DDTHH:MM` with no zone, and
+    asyncpg refuses a naive datetime on a `timestamptz` column outright.
+    Tashkent is the only zone this system serves (`core.time.TASHKENT`), so a
+    naive value is read as Tashkent wall-clock time; an aware one is kept as
+    sent.
+    """
+
+    deadwood_product: DeadwoodProduct | None = None
+    removal_deadline: date | None = None
+    recreation_purpose: RecreationPurpose | None = None
+    event_at: datetime | None = None
+
+    @field_validator("event_at")
+    @classmethod
+    def _event_at_in_tashkent(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=TASHKENT)
+        return value
+
+
+class ApplicationPatch(BlankLinesMixin):
     """`PATCH /applications/{id}` — any SUBSET of the draft's own fields
     (design/03's list, plan task 3). A field left out is untouched; a field sent
     as `null` is cleared, which is what makes a half-filled draft correctable.
@@ -374,6 +409,18 @@ class ApplicationOut(BaseModel):
     benefit_verified_by: uuid.UUID | None
     benefit_verified_at: datetime | None
     benefit_rejection_reason: str | None
+    # Decision #215 R6: the deadwood and recreation blanks' own lines
+    # (`BlankLinesMixin` on the input side). Read-only here, exactly like
+    # every other column — editable only through `ApplicationPatch`. Typed
+    # with the Literal, not `str`, matching every other CHECK-backed enum
+    # column on this class (`status`, `on_behalf`, `channel`, `kind`,
+    # `benefit_verification_status`): the OpenAPI schema (and the generated
+    # frontend client) then carries the enum too, and a corrupted DB value
+    # raises at `model_validate` instead of passing through silently.
+    deadwood_product: DeadwoodProduct | None
+    removal_deadline: date | None
+    recreation_purpose: RecreationPurpose | None
+    event_at: datetime | None
     rejection_reason_item_id: uuid.UUID | None
     assigned_org_id: uuid.UUID | None
     assigned_user_id: uuid.UUID | None
@@ -575,7 +622,7 @@ class ApplicationSubmitIn(BaseModel):
 # `ERR-APP-001`.
 
 
-class ApplicationFilingIn(BaseModel):
+class ApplicationFilingIn(BlankLinesMixin):
     """The content of a filing — who, what, where, when, how much, the benefit
     claim and the documents. The body of `POST /applications/precheck` and
     `POST /applications/package`, and the base of `ApplicationFileIn`.
@@ -586,7 +633,14 @@ class ApplicationFilingIn(BaseModel):
     (`applicant_is_not_the_caller`), never silently ignored.
 
     `documents` carry file ids already uploaded through `POST /files` (plan
-    12, R9); each must be the caller's own active upload."""
+    12, R9); each must be the caller's own active upload.
+
+    `deadwood_product`/`removal_deadline`/`recreation_purpose`/`event_at`
+    (decision #215 R6, `BlankLinesMixin`) are the deadwood and recreation
+    blanks' own lines — free to be null while typing, required at pre-check
+    and submission for that activity alone (`checks.missing_for_pricing`).
+    Not in the signed package: the package prices the request, and these
+    price nothing."""
 
     model_config = ConfigDict(extra="forbid")
 

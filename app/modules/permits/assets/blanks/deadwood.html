@@ -1,0 +1,106 @@
+<!--
+  The bundled blank for DEADWOOD — Odilxon's «Рухсатнома турлари асл дизайнда» (docs:
+  tz/forms/2026-09-13-ruxsatnoma-turlari.md), decision #213/#215.
+
+  Rules for whoever edits this file or uploads a replacement:
+  1. Every placeholder (brace syntax) must be a key `permits/service.py::_snapshot` freezes, with a
+     non-null value — render.fill refuses the whole document otherwise, and render.BLANK_FIELDS
+     is the pinned set. A comment is not an exemption: the substitution runs over the file.
+  2. No external resource. Only files under assets/ (emblem.svg) and data: URIs render;
+     _AssetFetcher refuses everything else, and PDF/A requires the document to be offline.
+  3. Signer NAMES are never printed (R4): the document is rendered before anyone signs and
+     never re-rendered. The QR page names the lines and their dates.
+  The bundled DejaVu Serif face is applied by render._font_css(), not from here.
+-->
+<html lang="uz-Latn">
+<head>
+  <meta charset="utf-8">
+  <title>Ruxsatnoma {{ series }} №{{ number }}</title>
+  <style>
+    /* ONE A4 page under the longest values the registry holds (test_every_blank_is_exactly_one_page):
+       a change here is checked against WORST_CASE_SNAPSHOT, never by dropping a row — and a spill
+       past that case is refused at issuance (render._assert_one_page), never printed. */
+    @page { size: A4; margin: 9mm 12mm 8mm 14mm; }
+    body { font-size: 9.5pt; line-height: 1.2; color: #000; }
+    .emblem { text-align: center; margin-bottom: 1.5mm; }
+    .emblem img { width: 19mm; height: 19mm; }
+    .series { text-align: right; font-size: 9pt; }
+    .authority { text-align: center; font-size: 9pt; margin: 0.5mm 0 0; }
+    .authority .caption { font-size: 7.5pt; color: #333; }
+    .title { text-align: center; margin: 3mm 0 0.5mm; font-size: 10pt; }
+    h1 { text-align: center; font-size: 15pt; letter-spacing: 2pt; margin: 0.5mm 0; }
+    .ru { color: #222; }
+    .date { text-align: center; margin: 1mm 0 2.5mm; }
+    table.fields { width: 100%; border-collapse: collapse; }
+    table.fields th, table.fields td { border: 0.5pt solid #000; padding: 1mm 1.8mm; vertical-align: top; text-align: left; }
+    table.fields th { width: 40%; font-weight: normal; }
+    table.fields th .ru { display: block; font-size: 8.5pt; }
+    table.fields td { font-weight: bold; font-size: 9.5pt; }
+    /* No rowspan here: WeasyPrint paginates a rowspan cell's rows apart even with room
+       to spare, which put the holder's line alone on a second page. */
+    table.signatures { width: 100%; margin-top: 3mm; border-collapse: collapse; font-size: 9.5pt; page-break-inside: avoid; }
+    table.signatures td { vertical-align: top; padding: 0; }
+    table.lines { width: 100%; border-collapse: collapse; }
+    table.lines td { vertical-align: top; padding: 0.8mm 2mm; }
+    table.lines td.who { width: 36%; }
+    table.lines td.line { border-bottom: 0.6pt solid #000; }
+    .signatures .caption { font-size: 7.5pt; color: #333; }
+    td.qr { width: 30mm; text-align: center; }
+    td.qr img { width: 28mm; height: 28mm; }
+  </style>
+</head>
+<body>
+  <div class="emblem"><img src="emblem.svg" alt=""></div>
+  <div class="series">seriya {{ series }} №{{ number }}</div>
+  <div class="authority">
+    {{ authority_name }}
+    <div class="caption">(vakolatli organning nomi / наименование уполномоченного органа)</div>
+  </div>
+
+  <div class="title">Oʻrmon fondi uchastkalarida daraxt va butalarni kesmagan holda oʻtin hamda shox-shabbalarni yigʻish uchun</div>
+  <h1>RUXSATNOMA</h1>
+  <h1 class="ru">РАЗРЕШЕНИЕ</h1>
+  <div class="title ru">для сбора дров и ветвей без рубки деревьев и кустарников на участках лесного фонда</div>
+  <div class="date">{{ issued_at }}</div>
+
+  <table class="fields">
+    <tr><th>Oʻrmon xoʻjaligi <span class="ru">Лесное хозяйство</span></th><td>{{ leshoz_name }}</td></tr>
+    <!-- tz/13 requisite 5, decision #127: printed as a blank line («—») until the Agency delivers the level below the leshoz (tz/12 #10, #19). -->
+    <tr><th>Oʻrmon boʻlimi <span class="ru">Лесничество</span></th><td>—</td></tr>
+    <!-- Requisites 6-7 (aylanma / boʻlak) have no data source either (tz/12 #10, #19) —
+         the blank's line is printed with the contour, which is what the leshoz actually holds. -->
+    <tr><th>Aylanma / boʻlagi <span class="ru">Обход / квартал</span></th><td>kontur {{ contour_number }}</td></tr>
+    <tr><th>Foydalanuvchi (F.I.Sh., JShShIR / STIR) <span class="ru">Пользователь</span></th><td>{{ holder_name }}, {{ holder_pinfl }}</td></tr>
+    <tr><th>Foydalanuvchining manzili <span class="ru">Адрес пользователя</span></th><td>{{ holder_address }}</td></tr>
+    <tr><th>Mahsulot turi <span class="ru">Вид продукции</span></th><td>{{ deadwood_product }}</td></tr>
+    <tr><th>Ruxsat etilgan hajm (m³) <span class="ru">Разрешенный объем (м³)</span></th><td>{{ quantity }}</td></tr>
+    <tr><th>Yigʻish joyi <span class="ru">Место сбора</span></th><td>{{ leshoz_name }}, kontur {{ contour_number }}</td></tr>
+    <tr><th>Olib chiqish muddati <span class="ru">Срок вывоза</span></th><td>{{ removal_deadline }}</td></tr>
+    <tr><th>Toʻlov summasi va hujjati <span class="ru">Сумма и документ об оплате</span></th><td>{{ payment_basis }}</td></tr>
+    <!-- #214 point 2: the four non-grazing blanks label the term as the forest ticket's. -->
+    <tr><th>Oʻrmon chiptasining amal qilish muddati <span class="ru">Срок действия лесного билета</span></th><td>{{ period_from }} dan {{ period_to }} gacha</td></tr>
+    <tr><th>Ruxsatnoma summasi <span class="ru">Сумма разрешения</span></th><td>{{ amount }} soʻm</td></tr>
+    <!-- The snapshot carries no application number, and the paid application IS the ground. -->
+    <tr><th>Asos <span class="ru">Основание</span></th><td>{{ activity_name }} uchun ariza, toʻlangan {{ payment_date }}</td></tr>
+  </table>
+
+  <!-- R4: two labelled lines, the holder's NAME on the second, no staff name, one QR. -->
+  <table class="signatures">
+    <tr>
+      <td>
+        <table class="lines">
+          <tr>
+            <td class="who">Xoʻjalik rahbari<br><span class="caption">Директор лесхоза</span></td>
+            <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
+          </tr>
+          <tr>
+            <td class="who">Foydalanuvchi<br><span class="caption">Пользователь</span></td>
+            <td class="line">{{ holder_name }}</td>
+          </tr>
+        </table>
+      </td>
+      <td class="qr"><img src="{{ qr }}" alt="QR"><div class="caption">Hujjat haqiqiyligini tekshirish uchun QR-kodni skanerlang</div></td>
+    </tr>
+  </table>
+</body>
+</html>

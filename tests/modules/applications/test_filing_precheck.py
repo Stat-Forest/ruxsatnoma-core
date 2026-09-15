@@ -9,6 +9,8 @@ from sqlalchemy import func, select
 
 from app.modules.applications.models import Application, ApplicationCheck
 
+API = "/api/v1"
+
 
 def _grazing_filing(contour_id, activity_type_id, livestock_type_id, **overrides):
     body = {
@@ -130,3 +132,25 @@ async def test_the_static_routes_are_not_shadowed_by_the_uuid_routes(applicant_c
     assert result.status_code == 422, result.text
     assert result.json()["error"]["code"] == "ERR-VAL-001"
     assert "on_behalf" in result.text
+
+
+async def test_a_transient_deadwood_filing_is_told_its_blank_lines_too(
+    applicant_client, published_contour, deadwood_activity_id
+) -> None:
+    """The stage-12 path builds an `Application` that has no row; the same
+    `missing_for_pricing` must name the same fields (one definition, R6)."""
+    result = await applicant_client.post(
+        f"{API}/applications/precheck",
+        json={
+            "on_behalf": "self",
+            "activity_type_id": str(deadwood_activity_id),
+            "contour_id": str(published_contour.id),
+            "period_from": "2027-05-01",
+            "period_to": "2027-05-31",
+            "quantity": "3",
+        },
+    )
+    assert result.status_code == 200, result.text
+    skipped = [row for row in result.json()["checks"] if row["result"] == "skipped"]
+    missing = {name for row in skipped for name in row["details"].get("missing", [])}
+    assert {"deadwood_product", "removal_deadline"} <= missing

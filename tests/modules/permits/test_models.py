@@ -8,10 +8,11 @@ from typing import get_args
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.config import get_settings
 from app.db import make_session_factory
+from app.modules.admin.models import ActivityType
 from app.modules.notifications import repo as notifications_repo
 from app.modules.notifications.service import DEFAULT_CHANNELS, SMS_EVENT_CODES
 from app.modules.permits import repo
@@ -142,30 +143,34 @@ async def _template(db, activity_type_id, *, version: int, status="active") -> P
     return row
 
 
-async def test_only_one_template_version_is_active_per_activity_type(db, haymaking_activity_id):
+async def test_only_one_template_version_is_active_per_activity_type(db, science_activity_id):
     """Review round 1: `uq(activity_type_id, version)` alone lets two ACTIVE rows
     exist, so Task 3's "the active template for this activity" lookup would return
     whichever row the plan order handed back and freeze the wrong `template_id` into
     the permit permanently. Every sibling versioned catalogue (notification_templates
-    0009, contour_versions) pins this with the same partial unique index."""
-    await _template(db, haymaking_activity_id, version=1)
+    0009, contour_versions) pins this with the same partial unique index.
+
+    `science_activity_id`, not `haymaking_activity_id`: migration 0061 (decision
+    #215 R1) now seeds haymaking its own active v1, and this test needs a slot
+    still empty."""
+    await _template(db, science_activity_id, version=1)
     with pytest.raises(IntegrityError, match="uq_permit_templates_active"):
-        await _template(db, haymaking_activity_id, version=2)
+        await _template(db, science_activity_id, version=2)
 
 
 async def test_archiving_the_active_template_frees_the_slot_for_the_next_version(
-    db, haymaking_activity_id
+    db, science_activity_id
 ):
     """The supersede the docstring promises, in the ONE order that works: archive,
     `flush()`, then insert. Without the flush both statements are still pending when
     the partial index is checked and the insert raises on a conflict the flush would
     have resolved (lesson). Archived rows sit outside the index, so the superseded
     version stays readable — an issued permit's `template_id` still resolves."""
-    first = await _template(db, haymaking_activity_id, version=1)
+    first = await _template(db, science_activity_id, version=1)
 
     first.status = "archived"
     await db.flush()
-    second = await _template(db, haymaking_activity_id, version=2)
+    second = await _template(db, science_activity_id, version=2)
 
     # Read back from the DATABASE, not off the two objects this test just set the
     # status on itself — `expire_on_commit=False` means those attributes are whatever
@@ -174,9 +179,7 @@ async def test_archiving_the_active_template_frees_the_slot_for_the_next_version
         row.version: row.status
         for row in (
             await db.execute(
-                select(PermitTemplate).where(
-                    PermitTemplate.activity_type_id == haymaking_activity_id
-                )
+                select(PermitTemplate).where(PermitTemplate.activity_type_id == science_activity_id)
             )
         ).scalars()
     }
@@ -309,3 +312,31 @@ async def test_the_lock_does_not_hold_up_a_different_contour_or_activity(engine:
         await first.rollback()
         await second.rollback()
         await third.rollback()
+
+
+async def test_every_open_activity_has_one_active_bundled_template(db: AsyncSession) -> None:
+    """Migration 0061 (decision #215 R1). Before it only grazing had an active
+    row and `issue()` refused every other activity with `no_active_template` —
+    the finding `app/seed/demo.py` recorded and nobody closed."""
+    rows = (
+        await db.execute(
+            select(ActivityType.code, PermitTemplate.layout_file_id)
+            .join(PermitTemplate, PermitTemplate.activity_type_id == ActivityType.id)
+            .where(PermitTemplate.status == "active")
+        )
+    ).all()
+    by_code = {code: layout for code, layout in rows}
+    assert set(by_code) >= {"grazing", "haymaking", "deadwood", "recreation", "apiary"}
+    for code in ("grazing", "haymaking", "deadwood", "recreation"):
+        assert by_code[code] is None, code  # NULL = the bundled blank of this activity
+    # `apiary` is not asserted NULL: `conftest.apiary_template` repoints the one
+    # active apiary row at a stored file and commits, and the test DB persists.
+
+
+async def test_science_is_archived_by_migration_0061(db: AsyncSession) -> None:
+    """Decision #214: no blank, no menu entry. The row stays — a permit issued
+    for it earlier must still resolve its activity."""
+    status = (
+        await db.execute(select(ActivityType.status).where(ActivityType.code == "science"))
+    ).scalar_one()
+    assert status == "archived"
