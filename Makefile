@@ -1,6 +1,6 @@
 # Single entry point for the local gate. `make check` mirrors CI
 # (.github/workflows/ci.yml) exactly, so the two can never drift apart.
-.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test lint fmt type security check heads lessons-check
+.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test test-all lint fmt type security check heads lessons-check
 
 help:               ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -63,7 +63,22 @@ lint:               ## Lint + format check, no changes (CI's `lint` job)
 type:               ## Type-check (CI's `lint` job)
 	uv run pyright
 
-test:               ## Full test suite (needs `make up`; CI's `test` job)
+# `make test` alone is the full suite; `make test M=payments` (or M="permits gis")
+# is that module's package only -- the shape to use WHILE WORKING, because the
+# full suite costs 4-7 min of one shared PostgreSQL and two sessions running it
+# at once halve each other (CLAUDE.md "One machine, one make test at a time").
+# The full suite still runs on every push in CI and in `make check`, which
+# depends on `test-all` and never narrows.
+ifdef M
+TEST_PATHS = $(addprefix tests/modules/,$(M))
+else
+TEST_PATHS =
+endif
+
+test:               ## Test suite; one module with M=<name> -- make test M=payments
+	uv run pytest -q -n 4 --fresh-db $(TEST_PATHS)
+
+test-all:           ## Full test suite (needs `make up`; CI's `test` job)
 	# -n 4: the suite is I/O-bound on PostgreSQL and MinIO, so four workers cut
 	# it from ~14 min to ~3 (measured 2026-09-06). Each worker migrates a test
 	# DB of its own -- tests/conftest.py derives its name from DATABASE_URL_TEST.
@@ -78,4 +93,4 @@ security:           ## Security scan (bandit), same args as CI and pre-commit
 	# pyproject.toml. Version pinned so local and CI report the same findings.
 	uvx bandit@1.9.4 -ll --skip B101 -r app
 
-check: heads lessons-check lint type security test  ## The full local gate — exactly what CI runs
+check: heads lessons-check lint type security test-all  ## The full local gate — exactly what CI runs
