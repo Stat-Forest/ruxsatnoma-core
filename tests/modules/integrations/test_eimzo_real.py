@@ -8,6 +8,7 @@ file writes no response body of its own.
 """
 
 import base64
+import contextlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -197,6 +198,51 @@ async def test_health_omits_x_real_ip_when_there_is_no_signer_address() -> None:
     adapter = _adapter(handler)
     await adapter.health()
     assert captured["has_header"] is False
+
+
+async def test_issue_challenge_uses_get_not_post() -> None:
+    """Measured against the live e-imzo-server v2.1.1, 2026-09-23: of the five
+    routes this adapter calls, `/frontend/challenge` is the ONE served on GET
+    only. The plan inferred POST from the shape of its neighbours, and the
+    failure it caused hid itself completely — the server answers `405` with
+    NO headers at all (no `content-length`, no `connection: close`), so httpx
+    waits for a body that never arrives and dies on the 20-second read
+    timeout. Every ERI login ended in `ERR-INT-001` "provider unavailable"
+    after a 20-second hang, which reads as the provider being down rather
+    than as our own wrong verb, and would have sent somebody to debug the
+    VPN, the key, or NIC."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        return httpx.Response(200, json={"challenge": "abc123", "status": 1})
+
+    adapter = _adapter(handler)
+    await adapter.issue_challenge(ip=None)
+    assert captured["method"] == "GET"
+
+
+async def test_the_other_provider_calls_stay_post() -> None:
+    """The counterpart of the test above: the remaining four routes DO take
+    POST (measured the same day, all four answering in milliseconds), so a
+    future fix for the challenge must not be widened into "GET everywhere"."""
+    for call, path in (
+        (lambda a: a.verify_signed_challenge("x", ip=None), "/backend/auth"),
+        (lambda a: a.verify_attached("x", ip=None), "/backend/pkcs7/verify/attached"),
+        (lambda a: a.verify_detached(b"doc", "x", ip=None), "/backend/pkcs7/verify/detached"),
+        (lambda a: a.attach_timestamp("x", ip=None), "/frontend/timestamp/pkcs7"),
+    ):
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request, captured: dict[str, Any] = captured) -> httpx.Response:
+            captured["method"] = request.method
+            captured["path"] = request.url.path
+            return httpx.Response(200, json=VENDOR_ATTACHED_SAMPLE)
+
+        with contextlib.suppress(EimzoError):
+            await call(_adapter(handler))
+        assert captured["path"] == path
+        assert captured["method"] == "POST", f"{path} must stay POST"
 
 
 async def test_issue_challenge_sends_the_signers_own_address() -> None:

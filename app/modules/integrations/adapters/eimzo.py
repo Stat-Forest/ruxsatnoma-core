@@ -466,7 +466,7 @@ class RealEimzo:
         return await self._send("GET", path, content=None, ip=None)
 
     async def issue_challenge(self, ip: str | None) -> str:
-        """`POST /frontend/challenge` (design/04 §2.2 step 2): the challenge
+        """`GET /frontend/challenge` (design/04 §2.2 step 2): the challenge
         belongs to e-imzo-server here, with its own 120-second TTL — unlike
         the mock's opaque token, this one must be handed to the browser's
         `create_pkcs7` call and back to `/backend/auth` before it expires.
@@ -474,8 +474,22 @@ class RealEimzo:
         (ruling 11) and threads through the CITIZEN's own address so it
         reaches `X-Real-IP` here, same as every other provider-reaching
         call — there is no session yet at this point, so `ip` comes straight
-        from the request, not from an authenticated actor."""
-        payload = await self._post("/frontend/challenge", "", ip=ip)
+        from the request, not from an authenticated actor.
+
+        **GET, not POST — measured against the live server, 2026-09-23.** This
+        is the ONE route of the five we call that e-imzo-server v2.1.1 serves
+        on GET only; `/backend/auth`, both `/backend/pkcs7/verify/*` and
+        `/frontend/timestamp/pkcs7` all take POST, and the plan's `POST` here
+        was inferred from their shape rather than measured. The failure it
+        caused is worse than a clean refusal: the server answers `405` with NO
+        headers at all — no `content-length`, no `connection: close` — so the
+        client sits waiting for a body that never comes and dies on the read
+        timeout (20 s). Every ERI login therefore ended in `ERR-INT-001`
+        "provider unavailable" after a 20-second hang, which reads as a
+        provider outage, not as our own wrong verb. Use `_send` directly:
+        `_get` drops `ip`, and `X-Real-IP` must still carry the signer's own
+        address."""
+        payload = await self._send("GET", "/frontend/challenge", content=None, ip=ip)
         challenge = payload.get("challenge")
         status = _body_status(payload)
         if status != 1 or not isinstance(challenge, str):
