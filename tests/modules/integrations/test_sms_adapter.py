@@ -4,6 +4,7 @@ not leak the message text, which for OTP is the code itself (3.4 carry-over)."""
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from app.config import Settings
 from app.modules.integrations.adapters.sms import EskizError, EskizSmsSender
@@ -231,3 +232,184 @@ async def test_a_send_without_a_reference_carries_no_user_sms_id(db):
     )
     assert "user_sms_id" not in captured
     assert "callback_url" not in captured
+
+
+# --- What the provider actually says when it refuses (2026-09-23) -----------
+#
+# A live OTP failed and `outbox_messages.last_error` read, in full,
+# `EskizError('eskiz send failed: HTTP 400')` — the body was parsed on the
+# success path only, so the one sentence explaining the refusal was discarded and
+# recovering it took a throwaway script against the live provider. This is that
+# body's `message`, verbatim.
+MODERATION_MESSAGE = (
+    "Этот смс текст еще не прошёл модерацию. Сначала добавьте его через API - "
+    "Шаблоны - Отправить шаблон или через кабинет my.eskiz.uz - СМС - Мои тексты."
+)
+CALLBACK_URL = "https://ruxsatnoma.example/api/v1/webhooks/eskiz/cbsecret"
+
+
+def _logged_in(then: httpx.Response):
+    """A handler that answers the login and then `then` for the send."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, json={"data": {"token": "tok"}})
+        return then
+
+    return handler
+
+
+async def test_a_refusal_carries_the_providers_own_reason(db):
+    """The whole point of the fix: an administrator reading `last_error` must see
+    WHY, not just that something was a 400. The equality also pins what is left
+    OUT — `status` ("error", which the HTTP status already says) and `id`."""
+    body = {
+        "id": "b606e81b-aaaa-bbbb-cccc-dddddddddddd",
+        "message": MODERATION_MESSAGE,
+        "status": "error",
+    }
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(_logged_in(httpx.Response(400, json=body))).send(
+            phone="998901234567", text="Salom", reference="7"
+        )
+    assert str(excinfo.value) == f"eskiz send failed: HTTP 400: {MODERATION_MESSAGE}"
+
+
+async def test_a_body_that_echoes_the_request_leaks_neither_phone_nor_text(db):
+    """Assume a provider that hands our whole request back in its error body —
+    the guarantee has to be mechanical, not a reading of Eskiz's current shape.
+    `last_error` is admin-visible AND logged, and for an OTP the text IS the
+    code (lessons: *a sender's own diagnostics must never carry what it was
+    sending*)."""
+    text = "Tasdiqlash kodi: 481902"
+    phone = "+998 90 123-45-67"
+    body = {
+        "message": (
+            f"invalid request: message='{text}' to 998901234567 ({phone}), callback {CALLBACK_URL}"
+        ),
+        # An echo of the whole request: dropped by the allow-list before any
+        # value-based filter has to catch it.
+        "data": {"mobile_phone": "998901234567", "message": text, "callback_url": CALLBACK_URL},
+        "status": "error",
+    }
+    with capture_logs() as logs:
+        with pytest.raises(EskizError) as excinfo:
+            await _sender(_logged_in(httpx.Response(400, json=body))).send(
+                phone=phone, text=text, reference="7"
+            )
+    rendered = f"{excinfo.value!r} {excinfo.value} {logs}"
+    for leaked in (text, "481902", "998901234567", phone, "cbsecret", CALLBACK_URL):
+        assert leaked not in rendered, leaked
+    # ...and the diagnosis survives: the status, plus a visible marker that
+    # something was taken out rather than a silently shortened sentence.
+    assert "HTTP 400" in str(excinfo.value)
+    assert "invalid request" in str(excinfo.value)
+    assert "[redacted]" in str(excinfo.value)
+
+
+async def test_an_otp_code_quoted_on_its_own_is_caught_by_its_shape(db):
+    """The exact-value filter cannot catch a provider that quotes only PART of
+    what we sent. The digit scrub is what stands there — and for an OTP the part
+    worth hiding is exactly a run of digits."""
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(
+            _logged_in(httpx.Response(400, json={"message": "code 481902 was rejected"}))
+        ).send(phone="998901234567", text="Tasdiqlash kodi: 481902", reference="7")
+    assert "481902" not in str(excinfo.value)
+    assert "was rejected" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"content": b"<html><body>502 Bad Gateway</body></html>"}, id="html"),
+        pytest.param({"content": b""}, id="empty"),
+        pytest.param({"content": b"not json at all"}, id="text"),
+        pytest.param({"content": b"\xff\xfe\x00 binary"}, id="binary"),
+        pytest.param({"json": ["a", "list"]}, id="json-array"),
+        pytest.param({"json": "a bare string"}, id="json-string"),
+        pytest.param({"json": {"unexpected": "shape"}}, id="json-object-without-a-reason"),
+    ],
+)
+async def test_a_body_that_is_not_a_usable_json_object_still_names_the_status(db, kwargs):
+    """A provider may answer with anything, and a proxy in front of it certainly
+    will. Parsing must never turn a delivery failure into a decode error — the
+    outbox would retry either way, but `last_error` would then describe OUR
+    parser instead of THEIR refusal."""
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(_logged_in(httpx.Response(400, **kwargs))).send(
+            phone="998901234567", text="hi", reference="7"
+        )
+    assert str(excinfo.value) == "eskiz send failed: HTTP 400"
+
+
+async def test_a_giant_reason_is_capped(db):
+    """An HTML error page or a JSON dump must not push the useful part out of
+    `outbox_messages.last_error` (1000 chars) or out of the 200 the admin XLSX
+    export prints."""
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(_logged_in(httpx.Response(400, json={"message": "verbose " * 500}))).send(
+            phone="998901234567", text="hi", reference="7"
+        )
+    assert "verbose" in str(excinfo.value)
+    assert len(repr(excinfo.value)) <= 260
+
+
+async def test_a_failed_send_is_logged_like_a_successful_one(db):
+    """The success path has logged `sms.eskiz_send` with a masked phone since
+    3.5; the failure had no line at all, so a send that never arrived left
+    nothing in the process log to correlate."""
+    with capture_logs() as logs:
+        with pytest.raises(EskizError):
+            await _sender(
+                _logged_in(httpx.Response(400, json={"message": MODERATION_MESSAGE}))
+            ).send(phone="+998 90 123-45-67", text="Salom", reference="900123")
+    failed = [entry for entry in logs if entry["event"] == "sms.eskiz_send_failed"]
+    assert len(failed) == 1
+    assert failed[0]["phone"] == "***4567"  # same mask as sms.eskiz_send
+    assert failed[0]["status"] == 400
+    assert failed[0]["reference"] == "900123"
+    assert failed[0]["reason"] == MODERATION_MESSAGE
+    assert not [entry for entry in logs if entry["event"] == "sms.eskiz_send"]
+
+
+async def test_a_failed_login_carries_the_reason_but_not_the_credentials(db):
+    """`_login` discarded the body the same way `send` did. The credentials are
+    put INSIDE `message` here on purpose: the allow-list alone would not save
+    them, so this exercises the redaction rather than the field filter."""
+    body = {"message": "Аккаунт заблокирован: robot@example.com / s3cret"}
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(lambda request: httpx.Response(403, json=body)).send(
+            phone="998901234567", text="hi", reference="7"
+        )
+    assert "eskiz login failed: HTTP 403" in str(excinfo.value)
+    assert "Аккаунт заблокирован" in str(excinfo.value)
+    assert "robot@example.com" not in str(excinfo.value)
+    assert "s3cret" not in str(excinfo.value)
+
+
+async def test_a_login_answering_something_other_than_json_raises_an_eskiz_error(db):
+    """A 200 carrying a maintenance page used to raise `JSONDecodeError` straight
+    out of `_login` — a delivery failure reported as a bug in our parser."""
+    maintenance = httpx.Response(200, content=b"<html>maintenance</html>")
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(lambda request: maintenance).send(
+            phone="998901234567", text="hi", reference="7"
+        )
+    assert "eskiz login returned no token: HTTP 200" in str(excinfo.value)
+
+
+async def test_a_transport_failure_names_what_httpx_said(db):
+    """`type(exc).__name__` alone loses the errno; an asyncio-flavour timeout
+    loses everything (lessons: log `repr(e)`, not `f"{e}"`). The text goes
+    through the same scrub as a provider body."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, json={"data": {"token": "tok"}})
+        raise httpx.ConnectError("[Errno 61] Connection refused")
+
+    with pytest.raises(EskizError) as excinfo:
+        await _sender(handler).send(phone="998901234567", text="hi", reference="7")
+    assert "eskiz send transport error: ConnectError" in str(excinfo.value)
+    assert "Connection refused" in str(excinfo.value)

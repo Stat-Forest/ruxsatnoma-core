@@ -742,20 +742,20 @@ Tooling and environment.
 
 ## A sender's own diagnostics must never carry what it was sending
 
-- **Rule:** A sender may report the TRANSPORT failure (status code, provider error code) in a
-  raised exception — never the payload's contents. And it may request a delivery-report
-  callback only for a send that has a stored row to correlate it against — pass an explicit
-  "no callback" flag otherwise.
-- **Why:** two shapes into the same admin-visible sinks. `outbox_messages.last_error` is
-  admin-visible via `/admin/integrations/*` AND logged, so a sender formatting the payload
-  into its exception would leak live OTP codes to anyone holding the admin outbox permission.
-  And `EskizSmsSender` put `callback_url` in every payload while `RealOtpSender` passed a
-  throwaway uuid as the reference, so at `sms_mode=real` EVERY OTP would produce an
-  `inbound_dead_letters` row holding the recipient's phone number, forever — no purge job
-  covers dead letters, and the DLQ's triage purpose would drown (3.5 final review).
-- **How to apply:** Every new sender raises with transport metadata only, plus a test
-  asserting the code is NOT in `str(exc)`. Wiring a provider callback, ask what the DLQ does
-  with a report matching nothing — and remove the cause rather than filtering it.
+- **Rule:** A sender's exception must name WHY the provider refused — its own message, read
+  from the error body defensively — while being UNABLE to carry the payload: an allow-list of
+  body fields, redaction of the values just sent, a digit scrub, a length cap. And it may ask
+  for a delivery report only for a send with a stored row to correlate it against.
+- **Why:** both halves cost an incident. `outbox_messages.last_error` is admin-visible via
+  `/admin/integrations/*` AND logged, so formatting the payload into the exception would leak
+  live OTP codes — but `HTTP {status}` ALONE left a real OTP failure (2026-09-23) unreadable:
+  the body said the text had not passed Eskiz moderation, and learning that took a throwaway
+  script against the live provider. In 3.5 the mirror: `EskizSmsSender` put `callback_url` in
+  every payload while `RealOtpSender` passed a throwaway uuid as the reference, so at
+  `sms_mode=real` every OTP would leave an `inbound_dead_letters` row with the phone, forever.
+- **How to apply:** `sms.py::_failure_reason` is the reference — copy its filters and the test
+  that echoes the whole request back. Wiring a provider callback, ask what the DLQ does with a
+  report matching nothing, and remove the cause rather than filtering it.
 
 ## `str.format` on admin-authored text is an attribute-access hole
 
