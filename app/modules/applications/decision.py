@@ -47,21 +47,29 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import settings_store
 from app.core.errors import err
 from app.core.events import Event, publish
 from app.modules.admin import repo as admin_repo
 from app.modules.admin import service as admin_service
 from app.modules.admin.models import ClassifierItem
-from app.modules.applications import checks, repo
+from app.modules.applications import checks, printouts, repo
 from app.modules.applications import service as flow
 from app.modules.applications.events import APPLICATION_APPROVED, APPLICATION_REJECTED
-from app.modules.applications.models import Application, ApplicationStatusHistory
+from app.modules.applications.models import (
+    REJECTABLE_REASON_KINDS,
+    Application,
+    ApplicationRejectionGround,
+    ApplicationStatusHistory,
+)
+from app.modules.applications.schemas import RejectionGroundIn
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.norms import service as norms_service
 from app.modules.notifications import service as notifications_service
 from app.modules.signatures import service as signatures_service
+from app.modules.signatures.models import Signature
 
 # Ruling 17, beside `service.APPLICATION_SUBMIT`/`.APPLICATION_START_REVIEW`: a
 # flow verb audits under its OWN name, so the journal can say whether an
@@ -372,7 +380,7 @@ async def _sign_decision(
     pkcs7: str,
     actor: User,
     ip: str | None = None,
-) -> None:
+) -> Signature:
     """The head's ERI over the decision (ruling 25: one decision object per
     application, however many times it was submitted).
 
@@ -400,7 +408,7 @@ async def _sign_decision(
     is why every refusal runs ahead of it and nothing is written before it.
     """
     document = await flow.package(db, application.id, actor=actor)
-    await signatures_service.sign(
+    return await signatures_service.sign(
         db,
         object_type=flow.DECISION_OBJECT_TYPE,
         object_id=application.id,
@@ -431,6 +439,32 @@ async def _reason_item(db: AsyncSession, reason_item_id: uuid.UUID) -> Classifie
     ):
         raise err("ERR-VAL-001", details={"reason": "unknown_rejection_reason"})
     return item
+
+
+async def _rejection_ground_item(db: AsyncSession, reason_item_id: uuid.UUID) -> ClassifierItem:
+    """A rejection ground's code: an ACTIVE `rejection_reasons` item (membership,
+    `_reason_item`) whose kind is a refusal (ruling R4) — a return-only code
+    such as RJ-01 is 422 `reason_not_rejectable`."""
+    item = await _reason_item(db, reason_item_id)
+    if item.props.get("kind") not in REJECTABLE_REASON_KINDS:
+        raise err("ERR-VAL-001", details={"reason": "reason_not_rejectable"})
+    return item
+
+
+async def rejection_defaults(
+    db: AsyncSession, application_id: uuid.UUID, *, actor: User
+) -> dict[str, str]:
+    """`GET /applications/{id}/rejection-defaults` — the notice's language and
+    the two default texts in it, read through the card's own access rule."""
+    application = await flow._readable_application(db, application_id, actor=actor)
+    language = await printouts.recipient_language(
+        db, await flow._notification_recipient(db, application)
+    )
+    return {
+        "language": language,
+        "reapply_text": await settings_store.get_str(db, f"rejection_reapply_text_{language}"),
+        "appeal_text": await settings_store.get_str(db, f"rejection_appeal_text_{language}"),
+    }
 
 
 async def _notify_decision(
@@ -628,36 +662,35 @@ async def reject(
     application_id: uuid.UUID,
     *,
     pkcs7: str,
-    reason_item_id: uuid.UUID,
-    legal_basis: str | None,
+    grounds: list[RejectionGroundIn],
+    reapply_text: str,
+    appeal_text: str,
     actor: User,
     ip: str | None = None,
 ) -> Application:
-    """`POST /applications/{id}/reject` — IN_REVIEW -> REJECTED, with grounds.
+    """`POST /applications/{id}/reject` — IN_REVIEW -> REJECTED, with 1…10
+    detailed grounds (stage 16, ruling R3).
 
-    **`tz/04` С8: a refusal by the state carries an RJ-* reason AND a legal
-    basis.** `reason_item_id` is required by `ApplicationRejectIn` rather than
-    validated here, so a body missing it is 422 `ERR-VAL-001` before this
-    function — and therefore before `sign()` — is ever reached. The one thing
-    the schema cannot check is that the id names an ACTIVE
-    `rejection_reasons` item, and that runs here, still ahead of the signature.
+    **Every ground names an ACTIVE `rejection_reasons` item whose `kind` is a
+    refusal** (`_rejection_ground_item`) — a return-only code such as RJ-01 is
+    422 `reason_not_rejectable`, still ahead of `sign()`. `grounds` is
+    required and bounded to 1..10 by `ApplicationRejectIn` itself, so an empty
+    or oversized list never reaches this function at all.
 
-    **`legal_basis` is OPTIONAL at the wire (ruling #182).** When the
-    application's own benefit claim was `rejected` by the leshoz's own
-    verify/reject pair, that verdict IS the grounds — `legal_basis` defaults
-    to the claim's own `benefit_rejection_reason` rather than making the head
-    retype what a colleague already wrote down. Every OTHER case keeps the
-    ORIGINAL rule: a missing `legal_basis` is refused HERE, still ahead of
-    `sign()`, with the SAME `ERR-VAL-001` code the wire-level 422 used to
-    carry — the mandatory-grounds rule is unchanged for a claim that is not
-    `rejected`, only its enforcement point moved for the one case ruling #182
-    added.
+    **Ruling R8 retires ruling #182's server-side default.** The old
+    `legal_basis` fallback off a rejected benefit claim is gone: the reject
+    form now prefills the first ground's `fact` with that reason instead, and
+    the head edits it like any other ground — the server always requires the
+    full set.
 
-    The grounds land in three places, each answering a different question: the
+    The grounds land in four places, each answering a different question: the
     `application_status_history` row (what the timeline shows), the
     `applications` row itself (`rejection_reason_item_id` / `decision_basis` —
-    what the card and every later reader see without walking the history), and
-    the audit journal.
+    the FIRST ground's reason and legal reference, what the card and every
+    later reader see without walking the history), the append-only
+    `application_rejection_grounds` table (the full set, in order), and the
+    frozen rejection notice `printouts.record_rejection_notice` writes in this
+    same transaction.
 
     No role limit applies. Decision #29 caps what a head may GRANT — an
     escalation exists because approving beyond one's ceiling commits the state
@@ -667,21 +700,14 @@ async def reject(
     application = await _decidable(
         db, application_id, to_status=REJECTED_STATUS, actor=actor, action=APPLICATION_REJECT
     )
-    if legal_basis is None:
-        if (
-            application.benefit_verification_status == "rejected"
-            and application.benefit_rejection_reason
-        ):
-            legal_basis = application.benefit_rejection_reason
-        else:
-            raise err("ERR-VAL-001", details={"reason": "legal_basis_required"})
-    item = await _reason_item(db, reason_item_id)
-
-    await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)
+    items = [await _rejection_ground_item(db, g.reason_item_id) for g in grounds]
+    signature = await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)
+    first = grounds[0]
+    legal_basis = f"{first.legal_document}, {first.legal_clause}"
     # Set BEFORE the transition, so ONE update carries the whole decision — see
     # `approve`'s note on `updated_at` for why a column written after
     # `_apply_transition`'s `db.refresh` turns a successful rejection into a 500.
-    application.rejection_reason_item_id = reason_item_id
+    application.rejection_reason_item_id = first.reason_item_id
     application.decision_basis = legal_basis
     application.decided_at = datetime.now(UTC)
     entry = await flow._apply_transition(
@@ -690,8 +716,36 @@ async def reject(
         to_status=REJECTED_STATUS,
         action=APPLICATION_REJECT,
         actor=actor,
-        reason_item_id=reason_item_id,
+        reason_item_id=first.reason_item_id,
         legal_basis=legal_basis,
+    )
+    rows = [
+        ApplicationRejectionGround(
+            application_id=application.id,
+            position=position,
+            reason_item_id=g.reason_item_id,
+            fact=g.fact,
+            legal_document=g.legal_document,
+            legal_clause=g.legal_clause,
+            evidence=g.evidence,
+            remedy=g.remedy,
+            created_by=actor.id,
+        )
+        for position, g in enumerate(grounds, 1)
+    ]
+    await repo.add_rejection_grounds(db, rows)
+    recipient = await flow._notification_recipient(db, application)
+    await printouts.record_rejection_notice(
+        db,
+        application,
+        grounds=rows,
+        reason_items=items,
+        reapply_text=reapply_text,
+        appeal_text=appeal_text,
+        signature=signature,
+        signer=actor,
+        recipient_user_id=recipient,
+        organization_id=await flow._effective_organization(db, application),
     )
 
     language = await _recipient_language(db, application)
@@ -704,11 +758,12 @@ async def reject(
             **notifications_service.transition_params(
                 from_status=entry.from_status, to_status=entry.to_status
             ),
-            # The reason as the citizen reads it. `classifier_items.name` is
-            # multilingual and `uz_latn` is the one key `LocalizedName` guarantees
-            # (decision #90), so it is the fallback — never `item.code`, which
-            # would render as «Причина: RJ-03».
-            "reason": item.name.get(language) or item.name[FALLBACK_LANGUAGE],
+            # The reason as the citizen reads it — the FIRST ground's own
+            # localized name. `classifier_items.name` is multilingual and
+            # `uz_latn` is the one key `LocalizedName` guarantees (decision
+            # #90), so it is the fallback — never `item.code`, which would
+            # render as «Причина: R01».
+            "reason": items[0].name.get(language) or items[0].name[FALLBACK_LANGUAGE],
         },
     )
     await publish(db, Event(name=APPLICATION_REJECTED, payload={"application_id": application.id}))

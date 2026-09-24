@@ -295,6 +295,15 @@ async def applicant_client(db: AsyncSession, applicant: Applicant):
 
 
 @pytest.fixture
+async def applicant_user(db: AsyncSession, applicant: Applicant) -> User:
+    """The account behind `applicant_client` — the same person, so a test can
+    change its language before the event it records (stage 16, ruling R5)."""
+    user = await db.get(User, applicant.owner_user_id)
+    assert user is not None
+    return user
+
+
+@pytest.fixture
 async def other_applicant_client(db: AsyncSession):
     """A SECOND, unrelated applicant — the stranger every ownership test needs.
     Its own user and its own `applicants` row, so nothing it does can be
@@ -1386,6 +1395,15 @@ async def rj_03_reject_reason(db: AsyncSession) -> ClassifierItem:
     this fixture's original code before migration 0064 (stage 16, ruling R4)
     archived it; kept under its old name so its callers need no edit."""
     return await _rejection_reasons_item(db, "R01")
+
+
+@pytest.fixture
+async def r05_reason(db: AsyncSession) -> ClassifierItem:
+    """R05, a second `kind="reject"` code — stage 16's own second ground, used
+    to prove `test_rejection_stores_every_ground_in_order_and_the_first_as_
+    the_legacy_reason` stores two DIFFERENT reasons rather than the same one
+    twice."""
+    return await _rejection_reasons_item(db, "R05")
 
 
 @pytest.fixture

@@ -40,6 +40,53 @@ class SettingSpec:
     allow_blank: bool = False
 
 
+# Stage 16 (ruling R3): the default «Qayta murojaat» / «Shikoyat qilish» texts a
+# rejection notice prefills, per document language. The head may edit them per
+# notice; the Agency edits the defaults here, in the settings screen.
+REJECTION_REAPPLY_DEFAULTS = {
+    "uz_latn": (
+        "Kamchiliklar bartaraf etilgandan soʻng axborot tizimi orqali qayta ariza berishingiz "
+        "mumkin."
+    ),
+    "uz_cyrl": (
+        "Камчиликлар бартараф этилгандан сўнг ахборот тизими орқали қайта ариза беришингиз мумкин."
+    ),
+    "ru": (
+        "После устранения недостатков вы можете повторно подать заявление через информационную "
+        "систему."
+    ),
+    "kaa": (
+        "Kemshilikler saplastırılǵannan soń informaciyalıq sistema arqalı qayta arza beriwińiz "
+        "múmkin."
+    ),
+    "en": (
+        "Once the shortcomings are remedied, you may apply again through the information system."
+    ),
+}
+REJECTION_APPEAL_DEFAULTS = {
+    "uz_latn": (
+        "Ushbu qarorga rozi boʻlmasangiz, u ustidan yuqori turuvchi organga yoki sudga "
+        "belgilangan tartibda shikoyat qilishingiz mumkin."
+    ),
+    "uz_cyrl": (
+        "Ушбу қарорга рози бўлмасангиз, у устидан юқори турувчи органга ёки судга белгиланган "
+        "тартибда шикоят қилишингиз мумкин."
+    ),
+    "ru": (
+        "Если вы не согласны с решением, вы вправе обжаловать его в вышестоящий орган или в суд "
+        "в установленном порядке."
+    ),
+    "kaa": (
+        "Usı sheshimge razı bolmasańız, onıń ústinen joqarı turıwshı organǵa yamasa sudqa "
+        "belgilengen tártipte shaǵım etiwińiz múmkin."
+    ),
+    "en": (
+        "If you disagree with this decision, you may appeal it to a higher authority or to a "
+        "court in the established manner."
+    ),
+}
+
+
 SETTING_SPECS: dict[str, SettingSpec] = {
     spec.key: spec
     for spec in (
@@ -404,6 +451,26 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             bool,
             False,
             "Publish the permit contour on the anonymous check page (#174)",
+        ),
+        # Stage 16 (ruling R3): one pair of defaults per document language —
+        # the rejection notice prefills them, the head may edit per notice.
+        *(
+            SettingSpec(
+                f"rejection_reapply_text_{lang}",
+                str,
+                text,
+                f"Rejection notice: default «re-apply» text ({lang})",
+            )
+            for lang, text in REJECTION_REAPPLY_DEFAULTS.items()
+        ),
+        *(
+            SettingSpec(
+                f"rejection_appeal_text_{lang}",
+                str,
+                text,
+                f"Rejection notice: default «appeal» text ({lang})",
+            )
+            for lang, text in REJECTION_APPEAL_DEFAULTS.items()
         ),
     )
 }

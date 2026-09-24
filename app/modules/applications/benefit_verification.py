@@ -155,9 +155,9 @@ async def reject_claim(
     rejected`, with the reason ruling #179 makes MANDATORY (`schemas.
     BenefitClaimRejectIn.reason`, `min_length=1` — checked at the wire AND
     here, the same belt `ApplicationRejectIn`'s own grounds wear). Written
-    into `benefit_rejection_reason`, which `decision.reject` reads as the
-    APPLICATION's own grounds when the head gives none of their own
-    (ruling #182)."""
+    into `benefit_rejection_reason`, which the reject FORM (not the server —
+    stage 16, ruling R8 retired ruling #182's server-side default) prefills
+    into the head's first ground as a starting point."""
     return await _transition(
         db,
         application_id,

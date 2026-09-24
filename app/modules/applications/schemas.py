@@ -26,7 +26,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_serializer,
+    field_validator,
+)
 
 from app.core.time import TASHKENT
 
@@ -906,39 +913,52 @@ class ApplicationApproveIn(BaseModel):
     pkcs7: str
 
 
+# Stage 16 (ruling R3): a rejection now carries 1..10 detailed grounds instead
+# of the old single RJ-* reason plus free-text legal basis.
+REJECTION_GROUNDS_MAX = 10
+
+_Text2000 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+_Text300 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)]
+_Text100 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+
+
+class RejectionGroundIn(BaseModel):
+    """One ground of a rejection (stage 16, ruling R3) — every field required:
+    the blank refuses a bare generic reason, so an empty or whitespace-only
+    field is 422 `ERR-VAL-001` before a signature is spent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason_item_id: uuid.UUID
+    fact: _Text2000
+    legal_document: _Text300
+    legal_clause: _Text100
+    evidence: _Text2000
+    remedy: _Text2000
+
+
 class ApplicationRejectIn(BaseModel):
-    """`POST /applications/{id}/reject` — the ERI plus the grounds `tz/04` С8
-    requires of a refusal BY the state: an RJ-* reason from the
-    `rejection_reasons` classifier AND a legal basis.
-
-    **`reason_item_id` is REQUIRED here rather than validated in the
-    service**, which is what makes a missing one a 422 `ERR-VAL-001` before
-    the request body is ever handed to a function that could reach `sign()` —
-    a signature must never be spent on a request that cannot succeed.
-
-    **`legal_basis` is OPTIONAL** (ruling #182): when the application's own
-    benefit claim was `rejected` by the leshoz's own verify/reject pair, that
-    verdict IS the grounds for rejecting the application too, and the head
-    need not retype it — `decision.reject` fills `legal_basis` from the
-    claim's own `benefit_rejection_reason` when the caller leaves it out.
-    Every OTHER case keeps the ORIGINAL rule intact: a missing `legal_basis`
-    is refused (`ERR-VAL-001`, `reason="legal_basis_required"`) before
-    `sign()` is ever reached, exactly as when it was required at the wire.
-    `min_length=1` closes the half a plain `str` would leave open when one
-    IS given: an empty legal basis is a missing one.
-
-    This is the opposite of `ApplicationCancelIn` beside it, whose reason is
-    optional because a citizen withdrawing their own application owes nobody an
-    explanation.
-    """
+    """`POST /applications/{id}/reject` — the ERI plus 1…10 grounds and the two
+    texts the notice prints. Ruling R8 (stage 16) retires ruling #182's
+    server-side default: the form prefills, the server requires."""
 
     model_config = ConfigDict(extra="forbid")
 
     pkcs7: str
-    reason_item_id: uuid.UUID
-    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)] | None = (
-        None
-    )
+    grounds: Annotated[
+        list[RejectionGroundIn], Field(min_length=1, max_length=REJECTION_GROUNDS_MAX)
+    ]
+    reapply_text: _Text2000
+    appeal_text: _Text2000
+
+
+class RejectionDefaultsOut(BaseModel):
+    """`GET /applications/{id}/rejection-defaults` — the language the notice
+    will be printed in and the two default texts in that language."""
+
+    language: str
+    reapply_text: str
+    appeal_text: str
 
 
 class ApplicationReturnIn(BaseModel):

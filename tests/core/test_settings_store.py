@@ -130,3 +130,23 @@ async def test_a_blank_address_round_trips_through_get_and_set(db):
     await db.flush()
     settings_store.invalidate(key)
     assert await settings_store.get_str(db, key) == ""
+
+
+async def test_rejection_defaults_are_registered_for_every_locale(db) -> None:
+    """Stage 16 (ruling R3): every `LOCALES` value has both a re-apply and an
+    appeal default, and each round-trips through `get_str`."""
+    from app.core.schemas import LOCALES
+
+    for lang in LOCALES:
+        reapply_key = f"rejection_reapply_text_{lang}"
+        appeal_key = f"rejection_appeal_text_{lang}"
+        assert reapply_key in settings_store.SETTING_SPECS
+        assert appeal_key in settings_store.SETTING_SPECS
+        assert (
+            await settings_store.get_str(db, reapply_key)
+            == (settings_store.REJECTION_REAPPLY_DEFAULTS[lang])
+        )
+        assert (
+            await settings_store.get_str(db, appeal_key)
+            == (settings_store.REJECTION_APPEAL_DEFAULTS[lang])
+        )
