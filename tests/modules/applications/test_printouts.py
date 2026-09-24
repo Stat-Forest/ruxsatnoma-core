@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.schemas import LOCALES
 from app.modules.applications import printout_labels as labels
+from app.modules.applications import printouts
 from app.modules.applications.models import ApplicationPrintout
 from tests.modules.applications.test_decision import _decide, _reject_body
 
@@ -240,3 +241,84 @@ async def test_a_resubmission_freezes_a_second_letter(
     assert rows[1].snapshot["period"].count("31.08.2027") == 1, "the new letter carries the edit"
     latest = await repo.latest_printouts(db, uuid.UUID(application_in_review))
     assert [p.id for p in latest] == [rows[1].id]
+
+
+# --- Task B5: rendering the two layouts, in every language -------------------
+
+LETTER_SNAPSHOT = {
+    "number": "RX-2026-000001",
+    "date": "24.09.2026",
+    "addressee": "Bo'stonliq o'rmon xo'jaligi rahbariga",
+    "applicant_name": "Aliyev Vali",
+    "applicant_address": "Toshkent viloyati, Boʻstonliq tumani",
+    "contact": "+998901234567",
+    "activity_name": "Chorva mollarini boqish",
+    "territory": "Toshkent / Boʻstonliq / Burchmulla",
+    "plot": "Kontur № 10517қ, maydon 12.5 ga",
+    "coordinates": "41.600000, 70.100000",
+    "period": "01.10.2026 dan 31.12.2026 gacha",
+    "quantity": "Qoramol: 10",
+    "purpose": "Chorva mollarini boqish",
+    "attachments": "—",
+    "signed_at": "24.09.2026 10:00",
+    "signature": "OneID orqali tasdiqlangan, ID x",
+    "package_sha256": "a" * 64,
+    "created": "2026-09-24T10:00:00+05:00",
+}
+NOTICE_SNAPSHOT = {
+    "number": "RD-2026-000001",
+    "decided_at": "24.09.2026",
+    "application_number": "RX-2026-000001",
+    "addressee": "Алиев Валига",
+    "addressee_address": "Тошкент вилояти, Бўстонлиқ тумани",
+    "addressee_contact": "Шахсий кабинет",
+    "reviewer": "Бурчмулла ўрмон хўжалиги / Каримов Анвар",
+    "body": "Сизнинг 20.09.2026 куни берилган RX-2026-000001-сон аризангиз кўриб чиқилди.",
+    "grounds": [
+        {
+            "index": str(i),
+            "code": "R05",
+            "name": "Ҳудуд ёки координатада устма-уст тушиш аниқланди",
+            "fact": (
+                "Uchastka RX-2026-000124 ruxsatnomasi bilan 2,3 ga kesishadi; Toǵay ń ı á ó ú ǵ"
+            ),
+            "legal": "VMQ 689 (19.08.2019), 12-band",
+            "evidence": "GIS tekshiruvi 20.09.2026 — «ustma-ust tushish»",
+            "remedy": "Boshqa kontur tanlang yoki muddatni oʻzgartiring",
+        }
+        for i in (1, 2, 3)
+    ],
+    "reapply_text": "Kamchiliklar bartaraf etilgandan soʻng qayta ariza berishingiz mumkin.",
+    "appeal_text": "Если вы не согласны с решением, вы вправе обжаловать его в суд.",
+    "moderator": "Rahbar, Каримов Анвар",
+    "signature": "ERI, sertifikat № 7A1B2C",
+    "signed_at": "24.09.2026 10:00",
+    "created": "2026-09-24T10:00:00+05:00",
+}
+
+
+@pytest.mark.parametrize("language", ["uz_latn", "uz_cyrl", "ru", "kaa", "en"])
+def test_both_documents_render_in_every_language(language: str) -> None:
+    letter = printouts.render_pdf("letter", language, LETTER_SNAPSHOT)
+    notice = printouts.render_pdf("rejection_notice", language, NOTICE_SNAPSHOT)
+    assert letter.startswith(b"%PDF-") and notice.startswith(b"%PDF-")
+    assert printouts.render_pdf("letter", language, LETTER_SNAPSHOT) == letter
+
+
+def test_every_layout_placeholder_has_a_value() -> None:
+    """The contract between layouts, labels and snapshots, pinned: `fill`
+    refuses a gap, so rendering the fixed snapshots above in every language
+    (the test before this) already proves it — this one names the layout
+    keys so a new placeholder without a label fails HERE with its name."""
+    import re
+
+    for name, keys in (
+        ("letter", set(LETTER_SNAPSHOT) | set(labels.LETTER_LABELS["uz_latn"]) | {"qr"}),
+        ("notice", set(NOTICE_SNAPSHOT) | set(labels.NOTICE_LABELS["uz_latn"])),
+        (
+            "notice_ground",
+            set(NOTICE_SNAPSHOT["grounds"][0]) | set(labels.NOTICE_LABELS["uz_latn"]),
+        ),
+    ):
+        used = {m.strip() for m in re.findall(r"\{\{([^{}]*)\}\}", printouts._layout(name))}
+        assert used <= keys, (name, used - keys)

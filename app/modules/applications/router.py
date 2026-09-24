@@ -32,11 +32,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import files
 from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
 from app.modules.applications import decision as service_decision
 from app.modules.applications import service
+from app.modules.applications.models import PRINTOUT_LETTER, PRINTOUT_REJECTION_NOTICE
 from app.modules.applications.permissions import (
     APPLICATIONS_ASSIGN,
     APPLICATIONS_CREATE,
@@ -970,4 +972,46 @@ async def confirm_application_check(
     """
     return ApplicationCheckOut.model_validate(
         await service.confirm_check(db, application_id, check_id, actor=actor)
+    )
+
+
+# --- Task B5 (stage 16): the two printouts ------------------------------------
+#
+# Distinct static suffixes (`.pdf`, `-notice.pdf`), so declaration order next
+# to `GET /applications/{application_id}` above does not matter (that route
+# takes no further path segment at all).
+
+
+@router.get("/applications/{application_id}/letter.pdf")
+async def download_application_letter(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> Response:
+    """«Ariza xati» — the newest submission's letter (stage 16, R2/R6/R7)."""
+    filename, data = await service.printout_pdf(db, application_id, PRINTOUT_LETTER, actor=user)
+    return _pdf_response(filename, data)
+
+
+@router.get("/applications/{application_id}/rejection-notice.pdf")
+async def download_rejection_notice(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> Response:
+    """«Rad etish xati» — the rejection notice (stage 16, R2/R3/R6)."""
+    filename, data = await service.printout_pdf(
+        db, application_id, PRINTOUT_REJECTION_NOTICE, actor=user
+    )
+    return _pdf_response(filename, data)
+
+
+def _pdf_response(filename: str, data: bytes) -> Response:
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": files.content_disposition("attachment", filename),
+            "X-Content-Type-Options": "nosniff",
+        },
     )

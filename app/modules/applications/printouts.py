@@ -13,10 +13,13 @@ Imports no `service`/`decision` — both import this module. Whatever needs
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import pdf
 from app.core.numbers import next_public_number
 from app.core.schemas import LOCALES
 from app.core.time import TASHKENT, business_today
@@ -41,6 +44,35 @@ from app.modules.signatures.models import Signature
 
 FALLBACK_LANGUAGE = "uz_latn"
 NOTICE_NUMBER_PREFIX = "RD"
+
+LAYOUTS_DIR = Path(__file__).parent / "assets" / "printouts"
+
+
+@lru_cache(maxsize=3)
+def _layout(name: str) -> str:
+    return (LAYOUTS_DIR / f"{name}.html").read_text(encoding="utf-8")
+
+
+def render_pdf(kind: str, language: str, snapshot: dict[str, Any]) -> bytes:
+    """One printout to PDF/A bytes, from its frozen snapshot alone. Blocking —
+    call through `asyncio.to_thread`. `created` pins the metadata, so a
+    re-render of the same snapshot is byte-identical (ruling R6)."""
+    created = snapshot.get("created")
+    if kind == PRINTOUT_LETTER:
+        values = {**snapshot, **labels.LETTER_LABELS[language]}
+        values[pdf.QR_FIELD] = pdf.qr_png_data_uri(
+            f"{snapshot['number']} sha256:{snapshot['package_sha256']}"
+        )
+        return pdf.render_document(_layout("letter"), values, created=created)
+    notice_labels = labels.NOTICE_LABELS[language]
+    ground_layout = _layout("notice_ground")
+    grounds_html = "".join(
+        pdf.fill(ground_layout, {**g, **notice_labels}) for g in snapshot["grounds"]
+    )
+    values = {k: v for k, v in snapshot.items() if k != "grounds"} | notice_labels
+    return pdf.render_document(
+        _layout("notice"), values, fragments={"grounds": grounds_html}, created=created
+    )
 
 
 def _name(value: dict[str, Any] | None, language: str) -> str:

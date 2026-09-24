@@ -414,7 +414,8 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     should have been a 200, or an `IntegrityError` 500 that should have been a
     422. `permits/test_models.py` carries the identical guard. Task 5 (3.9b)
     adds `ConclusionKind`/`ConclusionRecommendation` beside the original four;
-    stage 15 task 2 adds `DeadwoodProduct`/`RecreationPurpose`."""
+    stage 15 task 2 adds `DeadwoodProduct`/`RecreationPurpose`; stage 16 task
+    B5 adds `PrintoutKind`."""
     from typing import get_args
 
     from app.modules.applications.models import (
@@ -426,6 +427,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         DEADWOOD_PRODUCTS,
         HISTORY_STATUSES,
         ON_BEHALF_VALUES,
+        PRINTOUT_KINDS,
         RECREATION_PURPOSES,
     )
     from app.modules.applications.schemas import (
@@ -438,6 +440,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         DeadwoodProduct,
         HistoryStatus,
         OnBehalf,
+        PrintoutKind,
         RecreationPurpose,
     )
 
@@ -455,6 +458,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(BenefitVerificationStatus)) == set(BENEFIT_VERIFICATION_STATUSES)
     assert set(get_args(DeadwoodProduct)) == set(DEADWOOD_PRODUCTS)
     assert set(get_args(RecreationPurpose)) == set(RECREATION_PURPOSES)
+    assert set(get_args(PrintoutKind)) == set(PRINTOUT_KINDS)
 
 
 def test_the_blank_fields_of_stage_15_are_columns_with_check_backed_codes() -> None:

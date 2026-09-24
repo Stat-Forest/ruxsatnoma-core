@@ -15,6 +15,8 @@ the "Task 8 public surface" comment below for the contract this file promises
 levels 4+ (payments 3.10, permits 3.11) — three functions and four event
 names, unchanged since branch 1."""
 
+import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Mapping
@@ -27,6 +29,7 @@ from sqlalchemy import Row, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import files, storage
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.events import Event, publish
@@ -43,12 +46,14 @@ from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
     APPLICATION_KINDS,
+    PRINTOUT_LETTER,
     Application,
     ApplicationAssignment,
     ApplicationCheck,
     ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
+    ApplicationPrintout,
     ApplicationStatusHistory,
     InfoRequest,
 )
@@ -1141,7 +1146,48 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
             if deadline is None
             else sla.is_overdue(application.status, deadline, datetime.now(UTC))
         ),
+        "printouts": await repo.latest_printouts(db, application.id),
     }
+
+
+async def printout_pdf(
+    db: AsyncSession, application_id: uuid.UUID, kind: str, *, actor: User
+) -> tuple[str, bytes]:
+    """`GET /applications/{id}/letter.pdf` / `rejection-notice.pdf` (stage 16).
+
+    The card's own read rule (`_readable_application`: owner, or staff in
+    zone; a stranger 404). The newest printout of `kind`, row-locked: its first
+    download renders and stores the PDF once (R6), every later one returns the
+    stored bytes. 404 `ERR-SYS-003` when there is none — an application filed
+    before stage 16, or a notice for one never rejected."""
+    application = await _readable_application(db, application_id, actor=actor)
+    row = await repo.latest_printout_for_update(db, application.id, kind)
+    if row is None:
+        raise err("ERR-SYS-003", details={"printout": kind})
+    if row.file_id is not None:
+        file = await db.get(MediaFile, row.file_id)
+        if file is None:
+            raise err("ERR-SYS-003", details={"printout": kind})
+        data = await storage.get_object(file.storage_key)
+    else:
+        data = await asyncio.to_thread(printouts.render_pdf, row.kind, row.language, row.snapshot)
+        stored = await files.save_upload(
+            db,
+            data=data,
+            filename=_printout_filename(row),
+            content_type="application/pdf",
+            actor=actor,
+        )
+        row.file_id = stored.id
+        row.sha256 = hashlib.sha256(data).hexdigest()
+        await db.flush()
+    return _printout_filename(row), data
+
+
+def _printout_filename(row: ApplicationPrintout) -> str:
+    if row.kind == PRINTOUT_LETTER:
+        return f"ariza-xati-{row.snapshot['number']}.pdf"
+    return f"rad-etish-xati-{row.number}.pdf"
 
 
 BEEKEEPING_BENEFIT_CODE = "beekeeping_union_member"

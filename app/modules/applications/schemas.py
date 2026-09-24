@@ -105,6 +105,11 @@ RecreationPurpose = Literal[
     "cultural_educational", "upbringing", "health", "recreational", "aesthetic"
 ]
 
+# Stage 16 (`models.PRINTOUT_KINDS`) — the two printed documents the card offers
+# for download (ruling R2). The same starred-variable-in-`Literal` restriction
+# applies, so it too is spelled out and pinned by the models/schemas guard test.
+PrintoutKind = Literal["letter", "rejection_notice"]
+
 # `POST /applications/{id}/checks` (task 7, 3.9b) — deliberate SUBSETS of
 # `models.CHECK_TYPES`/`CHECK_RESULTS`/`CHECK_SOURCES`, not their mirror, so
 # NOT added to `test_the_schema_literals_match_the_tuples_the_checks_are_
@@ -357,6 +362,17 @@ class ApplicationConclusionOut(BaseModel):
     created_at: datetime
 
 
+class ApplicationPrintoutOut(BaseModel):
+    """A printed document the card can offer for download (stage 16, R2)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    kind: PrintoutKind
+    number: str | None
+    language: str
+    created_at: datetime
+
+
 class BenefitClaimMonitorOut(BaseModel):
     """One row of `GET /applications/beekeeping` (ruling #217): what the
     Beekeeping Union's registrar may see of an application claiming its
@@ -466,6 +482,9 @@ class ApplicationCardOut(ApplicationOut):
     # Task 5 (3.9b), tz/04 С8: every conclusion on record — "the rahbar sees
     # both conclusions" — never just the newest per `kind` (ruling 10).
     conclusions: list[ApplicationConclusionOut]
+    # Stage 16, ruling R2: the newest printout of each kind — what the card's
+    # download buttons read to decide whether to show at all.
+    printouts: list[ApplicationPrintoutOut]
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> ApplicationCardOut:
@@ -489,6 +508,7 @@ class ApplicationCardOut(ApplicationOut):
                     None if calculation is None else ApplicationCalculationOut.build(calculation)
                 ),
                 "sla_overdue": card["sla_overdue"],
+                "printouts": card["printouts"],
             }
         )
 
