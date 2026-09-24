@@ -150,6 +150,31 @@ async def test_the_response_files_become_application_documents(
     assert any(d["file_id"] == str(vet_certificate_file.id) for d in card["documents"])
 
 
+async def test_the_same_file_twice_in_a_reply_is_attached_once(
+    applicant_client, hodim_client, application_in_review, vet_certificate_file
+) -> None:
+    """QA run 01, suspected P1: `respond_info`'s loop over `file_ids` had no
+    de-duplication, so the same `media_files` row posted twice became TWO
+    `application_documents` rows (and two audit entries) — reproduced here
+    through the real PENDING_INFO transition (`request-info` then
+    `respond-info`), not by hand-setting the status (lesson: build a
+    fixture's precondition through the real transition)."""
+    await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/request-info",
+        json={"message": "справку"},
+    )
+    file_id = str(vet_certificate_file.id)
+    response = await applicant_client.post(
+        f"/api/v1/applications/{application_in_review}/respond-info",
+        json={"text": "Javob", "file_ids": [file_id, file_id]},
+    )
+    assert response.status_code == 200, response.text
+
+    card = (await hodim_client.get(f"/api/v1/applications/{application_in_review}")).json()
+    documents = [d for d in card["documents"] if d["file_id"] == file_id]
+    assert len(documents) == 1
+
+
 async def test_the_timeline_lists_the_pause_open_and_then_closed(
     hodim_client, applicant_client, application_in_review
 ) -> None:

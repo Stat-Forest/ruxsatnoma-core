@@ -3369,6 +3369,12 @@ async def respond_info(
     info_request.responded_at = now
     info_request.response_text = text
 
+    # De-duplicated, order kept: a client that posts the same `file_id` twice
+    # (a double-tap, a retried upload) must attach it once, not one
+    # `application_documents` row (and one audit entry) per repetition
+    # (QA run 01, suspected P1 — reproduced in
+    # `test_the_same_file_twice_in_a_reply_is_attached_once`).
+    file_ids = list(dict.fromkeys(file_ids))
     if file_ids:
         doc_type = await _info_response_doc_type(db)
         if doc_type is None:
