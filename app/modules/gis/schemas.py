@@ -25,24 +25,32 @@ ACCURACY_M_MAX = Decimal("999999.99")  # NUMERIC(8, 2)
 GEOMETRY_MAX_COORDINATES = 60_000
 
 
-def _count_numbers(node: Any) -> int:
-    if isinstance(node, bool):
-        return 0
-    if isinstance(node, (int, float)):
-        return 1
-    if isinstance(node, list):
-        return sum(_count_numbers(item) for item in node)
-    return 0
+def _count_numbers(root: Any) -> int:
+    """Every number anywhere in `root` (dicts and lists, at any depth),
+    excluding bools (`isinstance(True, int)` is `True` in Python). An
+    ITERATIVE walk with an explicit stack, not recursion (I3, final review):
+    the previous version only ever looked at the TOP level's `geometries`
+    list and each part's OWN `coordinates` key, so a GeometryCollection
+    nested inside another one — which has no `coordinates` key of its own,
+    only `geometries` — counted as zero numbers no matter how large the
+    polygon inside it was."""
+    total = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, bool):
+            continue
+        if isinstance(node, (int, float)):
+            total += 1
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return total
 
 
 def _cap_geometry(geom: dict[str, Any]) -> dict[str, Any]:
-    parts = geom.get("geometries")
-    nodes = (
-        [part.get("coordinates") for part in parts if isinstance(part, dict)]
-        if isinstance(parts, list)
-        else [geom.get("coordinates")]
-    )
-    total = sum(_count_numbers(node) for node in nodes)
+    total = _count_numbers(geom)
     if total > GEOMETRY_MAX_COORDINATES:
         raise ValueError(
             f"geometry has {total} coordinates, the limit is {GEOMETRY_MAX_COORDINATES}"
