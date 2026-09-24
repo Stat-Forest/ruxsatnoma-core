@@ -2,10 +2,10 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.modules.applications.models import ApplicationPrintout
-from tests.modules.applications.test_decision import _decide, _reject_body
+from tests.modules.applications.test_decision import _decide, _ground, _reject_body
 
 
 async def test_the_applicant_downloads_their_letter(
@@ -82,3 +82,63 @@ async def test_the_card_lists_its_printouts(
     )
     card = (await applicant_client.get(f"/api/v1/applications/{application_in_review}")).json()
     assert [p["kind"] for p in card["printouts"]] == ["letter", "rejection_notice"]
+
+
+async def test_an_unrenderable_fact_refuses_the_download_without_touching_the_row(
+    db, applicant_client, executor_head_client, application_in_review, rejection_reason_item
+) -> None:
+    """The reject ITSELF must succeed — the snapshot only freezes the text
+    (`printouts.record_rejection_notice`); `pdf.render_document`'s own
+    `_assert_renderable` is what refuses an emoji the bundled DejaVu Serif
+    face cannot draw, and it only ever runs at DOWNLOAD (R6, lazy render)."""
+    rejected = await _decide(
+        executor_head_client,
+        application_in_review,
+        "reject",
+        **_reject_body(rejection_reason_item, _ground(rejection_reason_item, fact="Ali 🙂")),
+    )
+    assert rejected.status_code == 200, rejected.text
+    result = await applicant_client.get(
+        f"/api/v1/applications/{application_in_review}/rejection-notice.pdf"
+    )
+    assert result.status_code == 422, result.text
+    body = result.json()
+    assert body["error"]["code"] == "ERR-VAL-001"
+    assert body["error"]["details"]["reason"] == "unrenderable_characters"
+    row = (
+        await db.execute(
+            select(ApplicationPrintout).where(
+                ApplicationPrintout.application_id == uuid.UUID(application_in_review),
+                ApplicationPrintout.kind == "rejection_notice",
+            )
+        )
+    ).scalar_one()
+    await db.refresh(row)
+    assert row.file_id is None and row.sha256 is None
+
+
+async def test_an_archived_stored_file_refuses_the_download(
+    db, applicant_client, submitted_application
+) -> None:
+    """The same existence-plus-active guard every other file read in this
+    codebase applies (`core/files.py::get_readable`, `applications/service.py`'s
+    own `_own_document_file`/`_assert_check_doc_active`, `permits/service.py`'s
+    `pdf_bytes`) — a stored `file_id` pointing at an archived `media_files` row
+    is refused exactly like a missing one, never served from storage anyway."""
+    first = await applicant_client.get(f"/api/v1/applications/{submitted_application}/letter.pdf")
+    assert first.status_code == 200, first.text
+    row = (
+        await db.execute(
+            select(ApplicationPrintout).where(
+                ApplicationPrintout.application_id == uuid.UUID(submitted_application)
+            )
+        )
+    ).scalar_one()
+    await db.refresh(row)
+    assert row.file_id is not None
+    await db.execute(
+        text("UPDATE media_files SET status = 'archived' WHERE id = :id"), {"id": row.file_id}
+    )
+    await db.commit()
+    second = await applicant_client.get(f"/api/v1/applications/{submitted_application}/letter.pdf")
+    assert second.status_code == 404

@@ -1159,14 +1159,17 @@ async def printout_pdf(
     zone; a stranger 404). The newest printout of `kind`, row-locked: its first
     download renders and stores the PDF once (R6), every later one returns the
     stored bytes. 404 `ERR-SYS-003` when there is none — an application filed
-    before stage 16, or a notice for one never rejected."""
+    before stage 16, or a notice for one never rejected — and the same code
+    for a stored `file_id` whose `media_files` row is gone or archived (the
+    existence-plus-active guard every other file read in this codebase
+    applies, `core/files.py::get_readable` among them)."""
     application = await _readable_application(db, application_id, actor=actor)
     row = await repo.latest_printout_for_update(db, application.id, kind)
     if row is None:
         raise err("ERR-SYS-003", details={"printout": kind})
     if row.file_id is not None:
         file = await db.get(MediaFile, row.file_id)
-        if file is None:
+        if file is None or file.status != "active":
             raise err("ERR-SYS-003", details={"printout": kind})
         data = await storage.get_object(file.storage_key)
     else:
