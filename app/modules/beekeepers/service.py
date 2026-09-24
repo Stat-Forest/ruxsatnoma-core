@@ -1,6 +1,6 @@
 """beekeepers service: the Union's register, and the seam `applications`
-(wave 2 of this stage) calls on every filing that claims the
-`beekeeping_union_member` benefit.
+calls on every pre-check, package and filing that claims the
+`beekeeping_union_member` benefit (ruling #219).
 
 Level 2 (design/01): a self-contained "tool" beside `signatures`/`gis`/
 `norms`/`notifications` — it reaches `auth` (level 1) for the OneID-profile
@@ -268,7 +268,7 @@ async def lookup_by_pinfl(db: AsyncSession, *, pinfl: str, actor: User) -> Beeke
 
 @dataclass(frozen=True)
 class MatchResult:
-    """The seam `applications` (wave 2) calls — a pure function of THIS
+    """The seam `applications` calls (ruling #219) — a pure function of THIS
     register, nothing about an application. `status`:
 
       * `matched` — an ACTIVE row exists under this certificate number and

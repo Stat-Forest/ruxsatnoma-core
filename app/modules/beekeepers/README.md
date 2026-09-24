@@ -3,8 +3,8 @@
 Stage 10, rulings #181/#182 (`docs/decisions.md`). The Beekeeping Union's own
 register of certificate holders, kept by `beekeeping_registrar` (renamed from
 `benefit_verifier` by migration `0053`, same role id) — and the seam
-`applications` calls to auto-verify the `beekeeping_union_member` benefit
-claim without a human in the loop.
+`applications` calls to check the `beekeeping_union_member` benefit claim
+against it without a human in the loop (ruling #219).
 
 Level 2 (design/01): a self-contained "tool", the same shelf as `signatures`/
 `gis`/`norms`/`notifications`. It reaches `auth` (level 1) for one read —
@@ -34,21 +34,27 @@ async def match_certificate(
 ```
 
 `MatchResult` is a frozen dataclass: `status: Literal["matched", "unknown",
-"not_yours"]`, `beekeeper_id: uuid.UUID | None`. Pure function of this
-register only — no application knowledge, no exceptions for business
+"not_yours", "expired"]`, `beekeeper_id: uuid.UUID | None`. Pure function of
+this register only — no application knowledge, no exceptions for business
 outcomes. `active` rows only (a `removed` row reads as `unknown`, never as a
 stale match); the certificate number is trimmed and case-folded before
 comparison; identity is PINFL when given, else STIR (ruling #182 option а —
-the caller picks which one to pass by the application's `on_behalf`).
+the caller passes the applicant's own identity, so a legal entity is matched by
+its STIR); `expired` is a row the identity owns whose `valid_to` (ruling #217)
+is before the business day.
 
-**Nobody calls this at filing any more — ruling #206 (2026-09-13).** Stage 10
-wired it into `applications.BENEFIT_AUTO_VERIFIERS` so that an unknown or
-someone else's number refused the submission (`benefit_certificate_unknown` /
-`_not_yours`) and a match verified the claim on the spot; #206 removed both
-directions — every numbered claim opens `pending` for the leshoz, and the
-seam is deleted rather than left empty. The function stays as the register's
-own query (its tests live in `tests/modules/beekeepers/`), ready for a
-reviewer-side lookup on the application card if one is ever asked for.
+**Called on every step that can reach a signature — ruling #219
+(2026-09-24).** `applications.service._check_benefit_claim` asks it at the
+pre-check (the wizard's "Next" on step 4), at the package and at filing:
+`unknown`/`not_yours`/`expired` refuse 422 `ERR-APP-003`
+(`benefit_certificate_unknown`/`_not_yours`/`_expired`), `matched` verifies the
+claim on the spot (`benefit_verified_by` NULL — "the register, not a human").
+#219 supersedes #206 (2026-09-13), which had switched the check off and sent
+every claim to the leshoz; `applications` imports this service directly
+(level 3 -> level 2), the seam `BENEFIT_AUTO_VERIFIERS` that stage 10 used is
+not coming back. The one step that does NOT ask is `GET /applications/{id}/
+package`: the head signs the decision over those bytes, and a register change
+after filing must not stop a decision.
 
 ## Data (migration `0053`)
 
