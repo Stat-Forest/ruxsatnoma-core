@@ -36,8 +36,10 @@ from app.core.schemas import LIST_MAX_ITEMS, TextStr
 
 # `Numeric(18, 2)` is every money column's own precision in this module
 # (`manual_payment_confirmations.amount`, `refund_components.amount`,
-# `refunds.final_amount` alike) — R4's own derivation: `10**(p - s) - 10**-s`.
-MAX_MONEY = Decimal("9999999999999999.99")
+# `refunds.final_amount` alike) — the same derivation `schemas.MAX_MONEY`
+# uses, and the same value; imported rather than redefined (final review) so
+# the two can never drift apart.
+from app.modules.payments.schemas import MAX_MONEY
 
 
 class StatementAccepted(BaseModel):
