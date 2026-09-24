@@ -18,6 +18,8 @@ from pydantic import (
     field_validator,
 )
 
+from app.core.schemas import CodeStr
+
 
 def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
     """Ruling 20's multiplier, bounded (I7, final review). The values reach
@@ -360,6 +362,17 @@ class PublishOut(BaseModel):
     warnings: list[PublishWarning] = []
 
 
+# `calculations.items`/`quantity` reach `asyncpg` untyped from PostGIS's view —
+# a body integer needs its own ceiling (stage 17 ruling R4) or it reaches
+# asyncpg as a `DataError: value out of int64 range`, a 500 for a body anybody
+# can post. Moved here from `applications/schemas.py` (stage 17 task 3): a
+# livestock head count is this module's own concept, and `applications`
+# imports it rather than keeping a second copy that could drift.
+MAX_HEAD_COUNT = 1_000_000
+# Ten livestock types are seeded; a valid request names each at most once.
+MAX_LIVESTOCK_ITEMS = 20
+
+
 class LivestockItemIn(BaseModel):
     """One grazing line: how many head of one livestock type. Validity of the
     code itself (a real `livestock_types` entry with a known VMQ 278 group and
@@ -367,8 +380,8 @@ class LivestockItemIn(BaseModel):
     unknown code surfaces as `ERR-NORM-004` naming the missing parameter,
     exactly like every other missing rule number (ruling 6)."""
 
-    livestock_code: str
-    count: Annotated[int, Field(gt=0)]
+    livestock_code: CodeStr
+    count: Annotated[int, Field(gt=0, le=MAX_HEAD_COUNT)]
 
 
 class CalculationIn(BaseModel):
@@ -420,7 +433,7 @@ class CalculationIn(BaseModel):
     period_from: date
     period_to: date
     quantity: Annotated[Decimal, Field(ge=0)] | None = None
-    items: list[LivestockItemIn] = Field(default_factory=list)
+    items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
     benefit_code: str | None = None
 
 
@@ -475,7 +488,7 @@ class PublicEstimateIn(BaseModel):
     period_from: date
     period_to: date
     quantity: Annotated[Decimal, Field(ge=0)] | None = None
-    items: list[LivestockItemIn] = Field(default_factory=list)
+    items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
 
 
 # The five admissibility checks `checks.run_checks` runs (`checks.BLOCKING`) all

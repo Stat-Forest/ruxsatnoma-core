@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import create_app
+from app.modules.norms.schemas import MAX_LIVESTOCK_ITEMS
 from tests.conftest import make_client
 from tests.modules.gis.conftest import _commit_pending_before_requests
 
@@ -100,6 +101,81 @@ async def test_a_grazing_estimate_reports_the_missing_coefficient_rather_than_gu
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "ERR-NORM-004"
     assert response.json()["error"]["details"]["code"].startswith("coef_sb:")
+
+
+async def test_an_estimate_with_a_repeated_livestock_code_is_refused(
+    client: httpx.AsyncClient, grazing_activity_id: uuid.UUID
+) -> None:
+    """Same reason code `applications._assert_references` already uses for a
+    repeated species (QA run 01, a1-02 / a6-code-01) — one adminka message
+    covers both."""
+    response = await client.post(
+        ESTIMATE,
+        json={
+            "activity_type_id": str(grazing_activity_id),
+            "period_from": "2026-05-01",
+            "period_to": "2026-09-30",
+            "items": [
+                {"livestock_code": "cattle_adult", "count": 10},
+                {"livestock_code": "cattle_adult", "count": 5},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["details"]["reason"] == "duplicate_livestock_type"
+
+
+async def test_an_estimate_with_more_items_than_the_cap_is_refused_before_any_work(
+    client: httpx.AsyncClient, grazing_activity_id: uuid.UUID
+) -> None:
+    """`MAX_LIVESTOCK_ITEMS` items is the whole seeded catalog (ten types) —
+    one over that is refused by the schema's own `max_length`, before the
+    request ever reaches a lookup or the calculator."""
+    response = await client.post(
+        ESTIMATE,
+        json={
+            "activity_type_id": str(grazing_activity_id),
+            "period_from": "2026-05-01",
+            "period_to": "2026-09-30",
+            "items": [
+                {"livestock_code": f"x{i}", "count": 1} for i in range(MAX_LIVESTOCK_ITEMS + 1)
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+async def test_the_calculator_runs_in_a_worker_thread(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, haymaking_activity_id: uuid.UUID
+) -> None:
+    """The QA run's own P1 (a6-code-01): a 50 000-item estimate took ~10s ON
+    THE EVENT LOOP. `service.py` calls `calculator.calculate` as a module
+    attribute (`from app.modules.norms import calculator`), so patching the
+    attribute intercepts the real call site."""
+    import threading
+
+    from app.modules.norms import calculator
+    from app.modules.norms.calculator import CalcRequest, CalcResult, ParamSnapshot
+
+    seen: list[bool] = []
+    real = calculator.calculate
+
+    def spy(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
+        seen.append(threading.current_thread() is threading.main_thread())
+        return real(request, snapshot)
+
+    monkeypatch.setattr(calculator, "calculate", spy)
+    response = await client.post(
+        ESTIMATE,
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "period_from": "2026-06-01",
+            "period_to": "2026-09-30",
+            "quantity": "4",
+        },
+    )
+    assert response.status_code == 200
+    assert seen == [False]
 
 
 async def test_an_estimate_writes_nothing(

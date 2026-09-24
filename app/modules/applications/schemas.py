@@ -38,6 +38,7 @@ from pydantic import (
 from app.core.pdf import strip_invisible
 from app.core.time import TASHKENT
 from app.modules.norms import service as norms_service
+from app.modules.norms.schemas import MAX_HEAD_COUNT
 
 # Spelled out rather than `Literal[*APPLICATION_STATUSES]`: pyright rejects a
 # starred variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal`
@@ -125,12 +126,13 @@ ExternalCheckType = Literal["vet", "cadastre"]
 CheckResult = Literal["pass", "fail", "warning"]
 
 # `application_items.head_count` is a plain integer column, so the only ceiling
-# it has is the one written here. Bounded for the same reason every integer
-# query parameter is (`core.schemas.PAGING_MAX`): an unbounded integer reaches
-# asyncpg as `DataError: value out of int64 range` — a 500 for a body anybody
-# can post. A million head on one contour is already absurd by three orders of
-# magnitude; the real limit is the norm's, checked by `norms.checks`.
-MAX_HEAD_COUNT = 1_000_000
+# it has is `MAX_HEAD_COUNT`, imported above from `norms.schemas` — the same
+# constant `LivestockItemIn.count` (norms' own per-group head count) is bound
+# by, moved down a level rather than copied (stage 17 task 3): an unbounded
+# integer reaches asyncpg as `DataError: value out of int64 range` — a 500 for
+# a body anybody can post. A million head on one contour is already absurd by
+# three orders of magnitude; the real limit is the norm's, checked by
+# `norms.checks`.
 # `applications.quantity` is `NUMERIC(12, 4)` — 8 integer digits. `max_digits`
 # and `decimal_places` below are that column, restated where a 422 is still
 # possible; without them an over-precise value reaches Postgres as a

@@ -10,8 +10,9 @@ latest_calculation(), LOAD_PROVIDERS — see the dedicated section near the end
 of this module for what a caller at those levels may and may not do with
 them."""
 
+import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -40,6 +41,7 @@ from app.modules.norms.schemas import (
     ActivitySeasonIn,
     ActivitySeasonPatch,
     CalculationIn,
+    LivestockItemIn,
     NormIn,
     NormPatch,
     PublicEstimateIn,
@@ -1026,6 +1028,14 @@ def resolve_effective_windows(
 # it (or refuses to).
 
 
+def _refuse_repeated_livestock(items: Sequence[LivestockItemIn]) -> None:
+    codes = [item.livestock_code for item in items]
+    if len(set(codes)) != len(codes):
+        # Same reason code as applications._assert_references, so one adminka
+        # message covers both (QA run 01, a1-02 / a6-code-01).
+        raise err("ERR-VAL-001", details={"reason": "duplicate_livestock_type"})
+
+
 async def _resolve_activity_code(db: AsyncSession, activity_type_id: uuid.UUID) -> str:
     """Same existence guard `create_norm`/`create_versioned` already apply to
     this FK, plus the CODE `CalcRequest.activity_code` needs — resolved
@@ -1055,6 +1065,7 @@ async def _build_request_and_snapshot(
     caller-declared figure, same principle as `contour_versions.area_ha`
     itself) — `Decimal('0')` when the contour has none, since it plays no
     part in `Amount` either way (calculator.py's own docstring)."""
+    _refuse_repeated_livestock(payload.items)
     activity_code = await _resolve_activity_code(db, payload.activity_type_id)
     if await gis_service.contour_organization(db, payload.contour_id) is None:
         raise err("ERR-SYS-003")
@@ -1101,7 +1112,8 @@ async def _compute(
     per-endpoint guard is not a root fix' lesson warns about — this module IS
     that one shared entry point, so the guard stays where it already lives."""
     request, snapshot = await _build_request_and_snapshot(db, payload)
-    result = calculator.calculate(request, snapshot)
+    # pure CPU; never on the event loop (QA run 01 a6-code-01; precedent: permits render)
+    result = await asyncio.to_thread(calculator.calculate, request, snapshot)
     check_results = await checks.run_checks(
         db,
         request=request,
@@ -1177,6 +1189,7 @@ async def estimate_public(db: AsyncSession, *, payload: PublicEstimateIn) -> dic
     `checks.run_checks` enforces) because that guard is never reached any other
     way here — `run_checks` itself is not called (see the block comment
     above)."""
+    _refuse_repeated_livestock(payload.items)
     activity_code = await _resolve_activity_code(db, payload.activity_type_id)
     if payload.period_to < payload.period_from:
         raise err("ERR-VAL-001", details={"reason": "period_reversed"})
@@ -1201,7 +1214,8 @@ async def estimate_public(db: AsyncSession, *, payload: PublicEstimateIn) -> dic
     snapshot = await norm_params.load_snapshot(
         db, request=request, contour_id=None, activity_type_id=payload.activity_type_id
     )
-    result = calculator.calculate(request, snapshot)
+    # pure CPU; never on the event loop (QA run 01 a6-code-01; precedent: permits render)
+    result = await asyncio.to_thread(calculator.calculate, request, snapshot)
     return {
         "activity_type_id": payload.activity_type_id,
         "period_from": payload.period_from,
