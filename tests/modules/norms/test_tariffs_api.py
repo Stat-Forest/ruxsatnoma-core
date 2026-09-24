@@ -338,6 +338,45 @@ async def test_a_maker_cannot_archive_a_published_tariff(
     assert blocked.json()["error"]["code"] == "ERR-ACL-001"
 
 
+async def test_a_reversed_period_is_a_422_on_create_and_on_patch(
+    tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
+) -> None:
+    """QA run 01, a3-central-02 (P1): `effective_to` before `effective_from`
+    reached `flush()` unguarded in `create_versioned`/`update_versioned` and
+    surfaced as an uncaught `IntegrityError` -> `ERR-SYS-001`/500, the same
+    defect class `create_norm`/`update_norm` already guard against."""
+    response = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "coefficient": "1.0",
+            "quantity_unit": "ha",
+            "effective_from": "2026-10-10",
+            "effective_to": "2026-10-01",
+            "basis": "t",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == "effective_to_before_from"
+
+    created = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "coefficient": "1.0",
+            "quantity_unit": "ha",
+            "effective_from": "2036-01-01",
+            "basis": "t",
+        },
+    )
+    assert created.status_code == 201, created.text
+    patched = await tariffs_maker_client.patch(
+        f"/api/v1/tariffs/{created.json()['id']}", json={"effective_to": "2000-01-01"}
+    )
+    assert patched.status_code == 422, patched.text
+    assert patched.json()["error"]["details"]["reason"] == "effective_to_before_from"
+
+
 async def test_the_create_response_shows_the_stored_precision_not_the_caller_s(
     tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
 ) -> None:

@@ -158,6 +158,12 @@ async def create_versioned(db: AsyncSession, kind: _Versioned, payload: Any, *, 
         if not any(activity.id == activity_type_id for activity in known):
             raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
     await _assert_benefit_codes(db, payload)
+    if payload.effective_to is not None and payload.effective_to < payload.effective_from:
+        # Caught here, not by the `period_valid` CHECK (mirrors
+        # create_norm's own reasoning, QA run 01 a3-central-02): an
+        # IntegrityError has no handler in main.py and answers
+        # ERR-SYS-001/500 instead of a domain 422.
+        raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
     row = kind.model(**payload.model_dump(), status="draft", created_by=actor.id)
     db.add(row)
     await db.flush()
@@ -192,8 +198,13 @@ async def update_versioned(
     # A PATCH can set `benefit_modifiers` too, so the same guard applies here —
     # validating only on create would leave the hole open one HTTP verb over.
     await _assert_benefit_codes(db, patch)
+    fields = patch.model_dump(exclude_unset=True)
+    effective_from = fields.get("effective_from", row.effective_from)
+    effective_to = fields.get("effective_to", row.effective_to)
+    if effective_to is not None and effective_to < effective_from:
+        raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
     before = _snapshot(row)
-    for field, value in patch.model_dump(exclude_unset=True).items():
+    for field, value in fields.items():
         setattr(row, field, value)
     await db.flush()
     # `updated_at` is `onupdate=func.now()`: an UPDATE leaves it expired (unlike
