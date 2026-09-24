@@ -111,6 +111,31 @@ async def test_the_export_mirrors_the_list(
     assert (await hodim_client.get(f"/api/v1/applications/{uuid.uuid4()}")).status_code == 404
 
 
+async def test_the_export_narrows_by_the_day_the_application_was_filed(
+    db: AsyncSession, submitted_application: str, hodim_client
+) -> None:
+    """`created_from`/`created_to` reach the file as they reach the list — the
+    applicant's "Excel" button sends the list's own query, date window
+    included, and a file that ignored it would quietly hold more rows than the
+    screen it was taken from."""
+    await db.execute(
+        text("UPDATE applications SET created_at = :at WHERE id = :id"),
+        # 30.09 23:50 in Tashkent — still the 30th there, already the 30th in UTC.
+        {"at": datetime(2026, 9, 30, 18, 50, tzinfo=UTC), "id": uuid.UUID(submitted_application)},
+    )
+    await db.commit()
+
+    that_day = await hodim_client.get(
+        EXPORT, params={"created_from": "2026-09-30", "created_to": "2026-09-30"}
+    )
+    assert that_day.status_code == 200, that_day.text
+    assert submitted_application in {row[-1] for row in _data_rows(that_day.content)}
+
+    the_next = await hodim_client.get(EXPORT, params={"created_from": "2026-10-01"})
+    assert the_next.status_code == 200, the_next.text
+    assert submitted_application not in {row[-1] for row in _data_rows(the_next.content)}
+
+
 async def test_the_export_renders_names_labels_and_places_not_codes(
     db: AsyncSession,
     submitted_application: str,

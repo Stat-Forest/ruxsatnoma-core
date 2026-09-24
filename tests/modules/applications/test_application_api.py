@@ -9,7 +9,7 @@ re-exported gis fixtures) live there rather than in any one file.
 """
 
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -439,3 +439,40 @@ async def test_q_finds_an_application_by_its_number_and_by_the_applicants_name(
 
     nobody = await applicant_client.get("/api/v1/applications", params={"q": "Азизов"})
     assert nobody.json()["total"] == 0
+
+
+async def test_created_from_and_to_select_by_the_tashkent_calendar_day_it_was_filed(
+    db, applicant_client, filing_ready_for_submission, another_ready_filing
+) -> None:
+    """`created_from`/`created_to` are Asia/Tashkent calendar days, both ends
+    inclusive — the applicant's "which ones did I file between these dates".
+
+    The two rows straddle Tashkent midnight but share one UTC date, so a
+    window built from naive UTC midnights would put both on 30 September and
+    answer every assertion below wrongly."""
+    late = await _submit_with_button(applicant_client, filing_ready_for_submission)
+    after_midnight = await _submit_with_button(applicant_client, another_ready_filing)
+    assert late.status_code == 201 and after_midnight.status_code == 201, (
+        late.text,
+        after_midnight.text,
+    )
+    for response, instant in (
+        (late, datetime(2026, 9, 30, 18, 50, tzinfo=UTC)),  # 30.09 23:50 Tashkent
+        (after_midnight, datetime(2026, 9, 30, 19, 10, tzinfo=UTC)),  # 01.10 00:10 Tashkent
+    ):
+        await db.execute(
+            update(Application)
+            .where(Application.id == uuid.UUID(response.json()["id"]))
+            .values(created_at=instant)
+        )
+    await db.commit()
+
+    async def ids(**params: str) -> list[str]:
+        listed = await applicant_client.get("/api/v1/applications", params=params)
+        assert listed.status_code == 200, listed.text
+        return [row["id"] for row in listed.json()["items"]]
+
+    assert await ids(created_to="2026-09-30") == [late.json()["id"]]
+    assert await ids(created_from="2026-10-01") == [after_midnight.json()["id"]]
+    assert await ids(created_from="2026-09-30", created_to="2026-09-30") == [late.json()["id"]]
+    assert await ids(created_from="2026-10-02") == []
