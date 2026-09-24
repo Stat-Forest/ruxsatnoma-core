@@ -5,9 +5,11 @@ there is no reason for the wire shape to diverge from the stored one."""
 
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
+
+from app.core.schemas import BlobStr
 
 
 class CertificateBindIn(BaseModel):
@@ -17,7 +19,7 @@ class CertificateBindIn(BaseModel):
     which signs bytes the caller supplies (ruling 6), this route has no
     document of its own (ruling 4's explicit-bind path)."""
 
-    pkcs7: Annotated[str, Field(min_length=1)]
+    pkcs7: BlobStr
 
 
 class CertificateOut(BaseModel):

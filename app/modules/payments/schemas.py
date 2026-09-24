@@ -14,11 +14,16 @@ for)."""
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import SORT_ORDER_MAX, CodeStr, LocalizedName, NoteStr
+
+# `Numeric(18, 2)` is every money column's own precision in this module
+# (`payment_recipients.fixed_amount` included) — the same derivation R4
+# spells out: `10**(p - s) - 10**-s`.
+MAX_MONEY = Decimal("9999999999999999.99")
 
 
 class InvoiceRecipientOut(BaseModel):
@@ -137,12 +142,14 @@ class PaymentRecipientIn(BaseModel):
     creation, the point where a row stops counting."""
 
     name: LocalizedName
-    payme_account_id: str | None = None
+    payme_account_id: CodeStr | None = None
     kind: RecipientKind
     percent: Decimal | None = Field(default=None, gt=0, le=100, decimal_places=2)
-    fixed_amount: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
-    sort_order: int = 0
-    note: str | None = None
+    fixed_amount: Decimal | None = Field(
+        default=None, gt=0, le=MAX_MONEY, max_digits=18, decimal_places=2
+    )
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
+    note: NoteStr | None = None
 
     @model_validator(mode="after")
     def _one_rule_only(self) -> Self:
@@ -163,11 +170,13 @@ class PaymentRecipientPatch(BaseModel):
     above enforces at creation."""
 
     name: LocalizedName | None = None
-    payme_account_id: str | None = None
+    payme_account_id: CodeStr | None = None
     percent: Decimal | None = Field(default=None, gt=0, le=100, decimal_places=2)
-    fixed_amount: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
-    sort_order: int | None = None
-    note: str | None = None
+    fixed_amount: Decimal | None = Field(
+        default=None, gt=0, le=MAX_MONEY, max_digits=18, decimal_places=2
+    )
+    sort_order: Annotated[int, Field(ge=0, le=SORT_ORDER_MAX)] | None = None
+    note: NoteStr | None = None
     active: bool | None = None
 
 

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.core.ratelimit import rate_limit
+from app.core.schemas import BlobStr
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.integrations import service
@@ -23,7 +24,7 @@ router = APIRouter(prefix="/eimzo", tags=["integrations"])
 
 
 class EimzoTimestampIn(BaseModel):
-    pkcs7: str
+    pkcs7: BlobStr
 
 
 class EimzoTimestampOut(BaseModel):
