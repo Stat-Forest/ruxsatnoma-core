@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 
 from app.core.schemas import LIST_MAX_ITEMS, CodeStr, JsonObject
 
@@ -23,14 +23,42 @@ ExportStatus = Literal["done", "failed"]
 _Name = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
 _Query = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
 
-# `SavedFilterIn.shared`/`.shared.*`/`.shared.*[]` (stage 17 C1): the stored
-# shape is `{"role_codes": [...], "user_ids": [...]}` (`search.repo`'s own
-# docstring) — role codes and stringified user UUIDs both fit `CodeStr`'s
-# bound. `maxProperties` is declared through `json_schema_extra` because a
-# plain `dict[str, list[CodeStr]]` carries no bound of its own for
-# `test_request_bounds.py` to see.
+# `SavedFilterIn.shared`/`.shared.*`/`.shared.*[]` (stage 17 C1, enforced I1
+# final review): the stored shape is `{"role_codes": [...], "user_ids":
+# [...]}` (`search.repo`'s own docstring) — role codes and stringified user
+# UUIDs both fit `CodeStr`'s bound, and those two are the ONLY keys
+# `service.py` ever reads (`_visible_to`). `Field(max_length=2)` on the dict
+# both emits AND enforces `maxProperties` (pydantic), unlike the
+# `json_schema_extra` this replaces, which only ever documented it.
+#
+# The key type stays plain `str` rather than `Literal["role_codes",
+# "user_ids"]` — tried, and it broke `search.service.update_saved_filter`'s
+# `row.shared = patch.shared`: `SavedFilter.shared` is a
+# `Mapped[dict[str, Any] | None]` JSONB column, and pyright's standard-mode
+# generics are invariant on a dict's KEY type, so `dict[Literal[...], V]` is
+# not assignable to `dict[str, Any]` even though every Literal member is a
+# `str`. `_reject_unknown_keys` below enforces the same restriction as a
+# value-level check instead, and `propertyNames` is declared explicitly
+# alongside `max_length` so the walker still sees a bounded typed dict.
 _SharedGroup = Annotated[list[CodeStr], Field(max_length=LIST_MAX_ITEMS)]
-SharedMap = Annotated[dict[str, _SharedGroup], Field(json_schema_extra={"maxProperties": 10})]
+_SHARED_KEYS = ("role_codes", "user_ids")
+
+
+def _reject_unknown_shared_keys(value: dict[str, list[str]]) -> dict[str, list[str]]:
+    unknown = set(value) - set(_SHARED_KEYS)
+    if unknown:
+        raise ValueError(f"unknown shared keys: {sorted(unknown)}")
+    return value
+
+
+SharedMap = Annotated[
+    dict[str, _SharedGroup],
+    Field(
+        max_length=len(_SHARED_KEYS),
+        json_schema_extra={"propertyNames": {"enum": list(_SHARED_KEYS)}},
+    ),
+    AfterValidator(_reject_unknown_shared_keys),
+]
 
 
 class SearchResultOut(BaseModel):

@@ -8,7 +8,6 @@ from fastapi import Query
 from pydantic import (
     AfterValidator,
     BaseModel,
-    ConfigDict,
     Field,
     RootModel,
     StringConstraints,
@@ -91,8 +90,26 @@ JsonValue = Annotated[
 
 LocalizedText = Annotated[str, StringConstraints(max_length=LONG_TEXT_MAX_LENGTH)]
 
+# `Field(max_length=...)` on the dict itself (I1, final review): pydantic
+# emits AND enforces `maxProperties` from this, unlike the `json_schema_extra`
+# this replaces, which only ever emitted it. `propertyNames` is declared the
+# same explicit way, NOT via a `Literal` key type: `LocalizedName.root` is
+# assigned straight into a dozen `Mapped[dict[str, Any]]` JSONB columns
+# (`ActivityType.name`, `Role.name`/`.description`, `FaqItem.question`, …),
+# and a `dict[Literal[...], V]` is not assignable to `dict[str, Any]` under
+# pyright's standard-mode invariant generics — tried, and it broke 17 call
+# sites across 7 modules for a distinction pydantic's `RootModel` can only
+# express at the type-checker level, not at the JSON-schema level anyway.
+# The `_check` validator below already enforces the SAME set (`LOCALES`) at
+# runtime, so `propertyNames` here documents exactly what that validator
+# checks, together give the walker everything a `Literal` key type would.
+_LocalizedNameRoot = Annotated[
+    dict[str, LocalizedText],
+    Field(max_length=len(LOCALES), json_schema_extra={"propertyNames": {"enum": list(LOCALES)}}),
+]
 
-class LocalizedName(RootModel[dict[str, LocalizedText]]):
+
+class LocalizedName(RootModel[_LocalizedNameRoot]):
     """`{"uz_latn": "Nomi", "ru": "Название"}` — validated, not free-form jsonb.
 
     Decision #90: this used to require `uz_cyrl` and not `uz_latn` at all, which
@@ -109,8 +126,6 @@ class LocalizedName(RootModel[dict[str, LocalizedText]]):
     Each value is capped at `LONG_TEXT_MAX_LENGTH` (stage 17 C1): this same type
     carries help answers and notification bodies, not just short names.
     """
-
-    model_config = ConfigDict(json_schema_extra={"maxProperties": len(LOCALES)})
 
     @model_validator(mode="after")
     def _check(self) -> Self:

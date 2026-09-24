@@ -65,17 +65,19 @@ def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
     return value
 
 
-# `TariffIn.benefit_modifiers`/`.benefit_modifiers.*` (stage 17 C1): keys are
-# benefit codes (VMQ 278's own short list), values are the `"0".."1"` string
-# `_benefit_modifiers` above parses — 20 chars comfortably covers any decimal
-# representation `Decimal` produces, and `maxProperties` caps the map at more
-# entries than VMQ 278 could ever seed. `maxProperties` has to sit on the
-# `dict[...]` annotation ITSELF, not on the `... | None` union around it —
-# `Field(json_schema_extra=...)` on the union lands on the `anyOf` wrapper,
-# a level `test_request_bounds.py`'s walker never inspects (it visits each
-# `anyOf` member on its own).
+# `TariffIn.benefit_modifiers`/`.benefit_modifiers.*` (stage 17 C1, key type
+# fixed I1 final review): keys are benefit codes (VMQ 278's own short list,
+# `CodeStr`'s bound comfortably covers any of them), values are the
+# `"0".."1"` string `_benefit_modifiers` above parses — 20 chars comfortably
+# covers any decimal representation `Decimal` produces.
+# `Field(max_length=50)` has to sit on the `dict[...]` annotation ITSELF, not
+# on the `... | None` union around it — on the union it would land on the
+# `anyOf` wrapper, a level `test_request_bounds.py`'s walker never inspects
+# (it visits each `anyOf` member on its own) — and, on the dict itself, it is
+# both emitted into the schema AND enforced at runtime, unlike the
+# `json_schema_extra` this replaces, which only ever documented it.
 _ModifierValue = Annotated[str, StringConstraints(max_length=20)]
-_ModifiersMap = Annotated[dict[str, _ModifierValue], Field(json_schema_extra={"maxProperties": 50})]
+_ModifiersMap = Annotated[dict[CodeStr, _ModifierValue], Field(max_length=50)]
 BenefitModifiers = Annotated[_ModifiersMap | None, AfterValidator(_benefit_modifiers)]
 
 # The DB CHECKs these mirror live in migrations 0011 (`livestock_group_valid`)
