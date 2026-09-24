@@ -803,6 +803,197 @@ async def test_0061_downgrade_survives_an_issued_non_grazing_permit(engine):
                 )
 
 
+async def test_0064_downgrade_survives_a_rejected_application_with_grounds_and_a_stored_notice(
+    engine,
+):
+    """Stage 16 fix wave F6: `0064`'s downgrade drops
+    `application_rejection_grounds`/`application_printouts` outright, then
+    nulls `application_status_history.reason_item_id` and `applications.
+    rejection_reason_item_id` — disabling the history table's own append-only
+    trigger for that one UPDATE (lesson: an append-only referrer blocks even
+    the nulling UPDATE) — before deleting the eight R01..R08 classifier rows
+    those columns may point at. Untested on real data before this fix wave.
+
+    Built by the minimal SQL `test_0061_downgrade_survives_an_issued_non_
+    grazing_permit`'s own precedent uses (`test_0046_...`/`test_0045_...`
+    before it): a REJECTED application whose `rejection_reason_item_id`
+    names R01, a matching `application_status_history` row, one
+    `application_rejection_grounds` row, and a `rejection_notice` printout
+    whose PDF was ALREADY stored (`file_id`/`sha256` set — the lazy-render
+    path having already run once). `downgrade` to `0061` and `upgrade` back
+    to head must both succeed."""
+    url = get_settings().database_url_test
+    cfg = _alembic_config(url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    r01_id = uuid.UUID("0198f160-0016-7000-8000-000000000001")  # R01, seeded by 0064
+
+    agency_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    applicant_id = uuid.uuid4()
+    application_id = uuid.uuid4()
+    history_id = uuid.uuid4()
+    ground_id = uuid.uuid4()
+    file_id = uuid.uuid4()
+    printout_id = uuid.uuid4()
+    pinfl = str(applicant_id.int % 10**14).zfill(14)
+
+    async with engine.begin() as conn:
+        role_id = (await conn.execute(text("SELECT id FROM roles LIMIT 1"))).scalar_one()
+
+        # The agency is a singleton another test module may already have
+        # committed to the shared, persistent test database — reuse it if
+        # so, create it otherwise (`test_0061_...`'s own get-or-create).
+        existing_agency = (
+            await conn.execute(text("SELECT id FROM organizations WHERE kind = 'agency' LIMIT 1"))
+        ).scalar_one_or_none()
+        created_agency = existing_agency is None
+        if created_agency:
+            await conn.execute(
+                text(
+                    "INSERT INTO organizations (id, kind, code, name, status) "
+                    "VALUES (CAST(:id AS uuid), 'agency', :code, "
+                    "'{\"uz_latn\": \"Test Agency\"}'::jsonb, 'active')"
+                ),
+                {"id": agency_id, "code": f"TESTAG{agency_id.hex[:8]}"},
+            )
+        else:
+            agency_id = existing_agency
+
+        await conn.execute(
+            text(
+                "INSERT INTO organizations (id, parent_id, kind, code, name, status) "
+                "VALUES (CAST(:id AS uuid), CAST(:parent_id AS uuid), 'leshoz', :code, "
+                "'{\"uz_latn\": \"Test Leshoz\"}'::jsonb, 'active')"
+            ),
+            {"id": org_id, "parent_id": agency_id, "code": f"TESTLH{org_id.hex[:8]}"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO users "
+                "(id, full_name, role_id, status, must_change_password, failed_login_count) "
+                "VALUES (CAST(:id AS uuid), 'Migration test user', "
+                "CAST(:role_id AS uuid), 'active', false, 0)"
+            ),
+            {"id": user_id, "role_id": role_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO applicants (id, kind, pinfl, name, owner_user_id) "
+                "VALUES (CAST(:id AS uuid), 'individual', :pinfl, "
+                "'Migration test applicant', CAST(:user_id AS uuid))"
+            ),
+            {"id": applicant_id, "pinfl": pinfl, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO applications "
+                "(id, applicant_id, submitted_by_user_id, on_behalf, channel, status, kind, "
+                " rejection_reason_item_id, decision_basis) "
+                "VALUES (CAST(:id AS uuid), CAST(:applicant_id AS uuid), CAST(:user_id AS uuid), "
+                "'self', 'portal', 'REJECTED', 'new', CAST(:reason_id AS uuid), 'test basis')"
+            ),
+            {
+                "id": application_id,
+                "applicant_id": applicant_id,
+                "user_id": user_id,
+                "reason_id": r01_id,
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO application_status_history "
+                "(id, application_id, from_status, to_status, changed_by, reason_item_id) "
+                "VALUES (CAST(:id AS uuid), CAST(:app_id AS uuid), 'IN_REVIEW', 'REJECTED', "
+                "CAST(:user_id AS uuid), CAST(:reason_id AS uuid))"
+            ),
+            {"id": history_id, "app_id": application_id, "user_id": user_id, "reason_id": r01_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO application_rejection_grounds "
+                "(id, application_id, position, reason_item_id, fact, legal_document, "
+                " legal_clause, evidence, remedy, created_by) "
+                "VALUES (CAST(:id AS uuid), CAST(:app_id AS uuid), 1, CAST(:reason_id AS uuid), "
+                "'fact', 'doc', 'clause', 'evidence', 'remedy', CAST(:user_id AS uuid))"
+            ),
+            {"id": ground_id, "app_id": application_id, "reason_id": r01_id, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO media_files "
+                "(id, storage_key, filename, content_type, size_bytes, sha256, uploaded_by, "
+                " status) "
+                "VALUES (CAST(:id AS uuid), :key, 'notice.pdf', 'application/pdf', 123, "
+                "'deadbeef', CAST(:user_id AS uuid), 'active')"
+            ),
+            {"id": file_id, "key": f"test-0064/{file_id.hex}", "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO application_printouts "
+                "(id, application_id, kind, number, language, snapshot, file_id, sha256) "
+                "VALUES (CAST(:id AS uuid), CAST(:app_id AS uuid), 'rejection_notice', :number, "
+                "'uz_latn', '{}'::jsonb, CAST(:file_id AS uuid), 'deadbeef')"
+            ),
+            {
+                "id": printout_id,
+                "app_id": application_id,
+                "number": f"RD-2026-{printout_id.int % 900000 + 100000}",
+                "file_id": file_id,
+            },
+        )
+
+    try:
+        # THE PROOF: neither direction may raise.
+        await asyncio.to_thread(command.downgrade, cfg, "0065")
+    finally:
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+
+        # This test's own rows would otherwise sit in the shared per-worker
+        # database forever (`test_0061_...`'s own cleanup documents why).
+        # `application_rejection_grounds`/`application_printouts` need no
+        # cleanup of their own — the downgrade→upgrade cycle DROPPED and
+        # RE-CREATED both tables, so our rows in them are already gone.
+        # `application_status_history`'s row survives that cycle (only its
+        # FK was nulled) and is append-only, so its own trigger has to be
+        # disabled for this one DELETE too, the same way 0064's downgrade
+        # disables it for the nulling UPDATE.
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE application_status_history DISABLE TRIGGER USER"))
+            await conn.execute(
+                text(
+                    "DELETE FROM application_status_history WHERE application_id = "
+                    "CAST(:id AS uuid)"
+                ),
+                {"id": application_id},
+            )
+            await conn.execute(text("ALTER TABLE application_status_history ENABLE TRIGGER USER"))
+            await conn.execute(
+                text("DELETE FROM applications WHERE id = CAST(:id AS uuid)"),
+                {"id": application_id},
+            )
+            await conn.execute(
+                text("DELETE FROM media_files WHERE id = CAST(:id AS uuid)"), {"id": file_id}
+            )
+            await conn.execute(
+                text("DELETE FROM applicants WHERE id = CAST(:id AS uuid)"),
+                {"id": applicant_id},
+            )
+            await conn.execute(
+                text("DELETE FROM users WHERE id = CAST(:id AS uuid)"), {"id": user_id}
+            )
+            await conn.execute(
+                text("DELETE FROM organizations WHERE id = CAST(:id AS uuid)"), {"id": org_id}
+            )
+            if created_agency:
+                await conn.execute(
+                    text("DELETE FROM organizations WHERE id = CAST(:id AS uuid)"),
+                    {"id": agency_id},
+                )
+
+
 async def test_downgrade_upgrade_roundtrip(engine):
     """upgrade head → downgrade base → upgrade head (plan 03.4 ruling 16).
 
@@ -821,4 +1012,4 @@ async def test_downgrade_upgrade_roundtrip(engine):
     # every other test (conftest's migrator is session-scoped and autouse, so a
     # branch point kills the whole suite rather than one case). Move this in the
     # SAME commit as the migration that moves the head.
-    assert version == "0065"
+    assert version == "0064"

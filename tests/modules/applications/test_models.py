@@ -414,7 +414,8 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     should have been a 200, or an `IntegrityError` 500 that should have been a
     422. `permits/test_models.py` carries the identical guard. Task 5 (3.9b)
     adds `ConclusionKind`/`ConclusionRecommendation` beside the original four;
-    stage 15 task 2 adds `DeadwoodProduct`/`RecreationPurpose`."""
+    stage 15 task 2 adds `DeadwoodProduct`/`RecreationPurpose`; stage 16 task
+    B5 adds `PrintoutKind`."""
     from typing import get_args
 
     from app.modules.applications.models import (
@@ -426,6 +427,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         DEADWOOD_PRODUCTS,
         HISTORY_STATUSES,
         ON_BEHALF_VALUES,
+        PRINTOUT_KINDS,
         RECREATION_PURPOSES,
     )
     from app.modules.applications.schemas import (
@@ -438,6 +440,7 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
         DeadwoodProduct,
         HistoryStatus,
         OnBehalf,
+        PrintoutKind,
         RecreationPurpose,
     )
 
@@ -455,6 +458,30 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(BenefitVerificationStatus)) == set(BENEFIT_VERIFICATION_STATUSES)
     assert set(get_args(DeadwoodProduct)) == set(DEADWOOD_PRODUCTS)
     assert set(get_args(RecreationPurpose)) == set(RECREATION_PURPOSES)
+    assert set(get_args(PrintoutKind)) == set(PRINTOUT_KINDS)
+
+
+def test_the_printout_language_check_is_built_from_core_locales() -> None:
+    """F7 (stage 16 fix wave): `ApplicationPrintout`'s `language` CHECK is
+    built directly from `app.core.schemas.LOCALES` (models.py imports it),
+    not a copied literal — migration 0064 keeps its own frozen literal on
+    purpose (a migration is history and does not import the app), so this is
+    the guard that the model-side CHECK and `LOCALES` cannot drift from each
+    other independently of it."""
+    from typing import cast
+
+    from sqlalchemy import CheckConstraint, Table
+
+    from app.core.schemas import LOCALES
+    from app.modules.applications.models import ApplicationPrintout
+
+    table = cast(Table, ApplicationPrintout.__table__)
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert checks["ck_application_printouts_language_valid"] == f"language IN {LOCALES}"
 
 
 def test_the_blank_fields_of_stage_15_are_columns_with_check_backed_codes() -> None:

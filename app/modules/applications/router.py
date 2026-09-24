@@ -32,11 +32,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import files
 from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
 from app.core.schemas import Page, PageParams
 from app.modules.applications import decision as service_decision
 from app.modules.applications import service
+from app.modules.applications.models import PRINTOUT_LETTER, PRINTOUT_REJECTION_NOTICE
 from app.modules.applications.permissions import (
     APPLICATIONS_ASSIGN,
     APPLICATIONS_CREATE,
@@ -74,6 +76,7 @@ from app.modules.applications.schemas import (
     PrecheckCalculationOut,
     PrecheckCheckOut,
     PrecheckOut,
+    RejectionDefaultsOut,
 )
 from app.modules.auth.deps import (
     get_current_user,
@@ -644,11 +647,13 @@ async def return_application(
     422 `ERR-VAL-001`: `unknown_rejection_reason` for a `reason_item_id`
     outside the `rejection_reasons` classifier; `reason_not_returnable` for
     one that IS in it but types a refusal or a withdrawal rather than a return
-    (RJ-03 is a REFUSAL — returning under it would misdescribe the decision);
-    `fields_to_fix_required` for an empty object; `unknown_field` for a key
-    naming no real column of the application. 404 `ERR-SYS-003` for an id that
-    does not exist and for an application outside the caller's zone. 409
-    `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
+    (R01 is a REFUSAL — returning under it would misdescribe the decision;
+    RJ-03, this docstring's own example before migration 0064, is now
+    archived and answers `unknown_rejection_reason` instead of ever reaching
+    this check); `fields_to_fix_required` for an empty object; `unknown_field`
+    for a key naming no real column of the application. 404 `ERR-SYS-003` for
+    an id that does not exist and for an application outside the caller's
+    zone. 409 `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
     """
     return ApplicationOut.model_validate(
         await service.return_to_applicant(
@@ -878,20 +883,21 @@ async def reject_application(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(APPLICATIONS_DECIDE))],
 ) -> ApplicationDecisionOut:
-    """IN_REVIEW -> REJECTED, with the grounds `tz/04` С8 requires.
+    """IN_REVIEW -> REJECTED, with 1…10 detailed grounds (stage 16, ruling R3).
 
-    `reason_item_id` is a REQUIRED field of the body, so a refusal naming no
-    reason at all is 422 `ERR-VAL-001` from pydantic — before the handler, and
-    therefore before a signature could be spent on a request that cannot
-    succeed. A `reason_item_id` outside the `rejection_reasons` classifier, or
-    archived, is the service's own 422 `ERR-VAL-001` (`unknown_rejection_
-    reason`), still ahead of the ERI.
+    `grounds` is a REQUIRED, 1..10-item field of the body, and every ground's
+    six fields are required non-blank text — a refusal naming nothing at all,
+    or a blank field within a ground, is 422 `ERR-VAL-001` from pydantic
+    before the handler, and therefore before a signature could be spent on a
+    request that cannot succeed. A ground's `reason_item_id` outside the
+    `rejection_reasons` classifier, archived, or naming a return-only code
+    (RJ-01/02/15) is the service's own 422 `ERR-VAL-001`
+    (`unknown_rejection_reason` / `reason_not_rejectable`), still ahead of the
+    ERI.
 
-    `legal_basis` is OPTIONAL at the wire (ruling #182): omitted while the
-    application's own benefit claim is `rejected`, the leshoz's own reason
-    for THAT becomes the grounds for this; omitted otherwise, still 422
-    `ERR-VAL-001` (`legal_basis_required`) — the mandatory-grounds rule
-    intact, just enforced one layer in.
+    Ruling R8 retires ruling #182's server-side default: the form prefills
+    `reapply_text`/`appeal_text` and the first ground's `fact` from a rejected
+    benefit claim, but the server always requires the full set.
 
     No role limit: decision #29 caps what a head may GRANT. 404 and 409 exactly
     as on `/approve` above.
@@ -901,12 +907,26 @@ async def reject_application(
             db,
             application_id,
             pkcs7=payload.pkcs7,
-            reason_item_id=payload.reason_item_id,
-            legal_basis=payload.legal_basis,
+            grounds=payload.grounds,
+            reapply_text=payload.reapply_text,
+            appeal_text=payload.appeal_text,
             actor=actor,
             ip=request.client.host if request.client else None,
         ),
         forwarded_to_organization=None,
+    )
+
+
+@router.get("/applications/{application_id}/rejection-defaults")
+async def get_rejection_defaults(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    actor: Annotated[User, Depends(require_permission(APPLICATIONS_DECIDE))],
+) -> RejectionDefaultsOut:
+    """The notice's language and its two default texts — what the reject form
+    prefills (stage 16, ruling R3). `applications.decide`, like the reject route."""
+    return RejectionDefaultsOut(
+        **await service_decision.rejection_defaults(db, application_id, actor=actor)
     )
 
 
@@ -960,4 +980,46 @@ async def confirm_application_check(
     """
     return ApplicationCheckOut.model_validate(
         await service.confirm_check(db, application_id, check_id, actor=actor)
+    )
+
+
+# --- Task B5 (stage 16): the two printouts ------------------------------------
+#
+# Distinct static suffixes (`.pdf`, `-notice.pdf`), so declaration order next
+# to `GET /applications/{application_id}` above does not matter (that route
+# takes no further path segment at all).
+
+
+@router.get("/applications/{application_id}/letter.pdf")
+async def download_application_letter(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> Response:
+    """«Ariza xati» — the newest submission's letter (stage 16, R2/R6/R7)."""
+    filename, data = await service.printout_pdf(db, application_id, PRINTOUT_LETTER, actor=user)
+    return _pdf_response(filename, data)
+
+
+@router.get("/applications/{application_id}/rejection-notice.pdf")
+async def download_rejection_notice(
+    application_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> Response:
+    """«Rad etish xati» — the rejection notice (stage 16, R2/R3/R6)."""
+    filename, data = await service.printout_pdf(
+        db, application_id, PRINTOUT_REJECTION_NOTICE, actor=user
+    )
+    return _pdf_response(filename, data)
+
+
+def _pdf_response(filename: str, data: bytes) -> Response:
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": files.content_disposition("attachment", filename),
+            "X-Content-Type-Options": "nosniff",
+        },
     )

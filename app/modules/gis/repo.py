@@ -475,6 +475,23 @@ async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
     return rows.scalar_one_or_none()
 
 
+async def version_point(db: AsyncSession, version_id: uuid.UUID) -> tuple[float, float] | None:
+    """`(lat, lon)` of a point guaranteed to lie on the version's own surface
+    (`ST_PointOnSurface`, not the centroid, which can fall outside a concave
+    plot). None for a version without geometry (#178) or no such version."""
+    row = (
+        await db.execute(
+            text(
+                "SELECT ST_Y(p), ST_X(p) FROM ("
+                " SELECT ST_PointOnSurface(geom) AS p FROM contour_versions"
+                " WHERE id = :id AND geom IS NOT NULL) s"
+            ),
+            {"id": version_id},
+        )
+    ).first()
+    return (float(row[0]), float(row[1])) if row is not None else None
+
+
 # --- Task 6: layer_features (restriction, protection, fire-ban and every
 # other non-contour layer object) --------------------------------------------
 #

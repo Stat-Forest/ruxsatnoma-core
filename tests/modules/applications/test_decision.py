@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import events
 from app.modules.applications import decision
 from app.modules.applications import events as app_events
+from app.modules.applications.models import Application, ApplicationRejectionGround
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 
 
@@ -48,6 +49,27 @@ async def _decide(client, app_id, route, **body):
             **body,
         },
     )
+
+
+def _ground(item, **overrides):
+    return {
+        "reason_item_id": str(item.id),
+        "fact": "Uchastka boshqa ruxsatnoma bilan 2,3 ga kesishadi",
+        "legal_document": "VMQ 689",
+        "legal_clause": "12-band",
+        "evidence": "GIS tekshiruvi 20.09.2026",
+        "remedy": "Boshqa kontur tanlang",
+        **overrides,
+    }
+
+
+def _reject_body(item, *grounds, **overrides):
+    return {
+        "grounds": list(grounds) or [_ground(item)],
+        "reapply_text": "Qayta ariza bering",
+        "appeal_text": "Sudga shikoyat qiling",
+        **overrides,
+    }
 
 
 async def test_approval_publishes_the_event_3_10_subscribes_to(
@@ -124,13 +146,21 @@ async def test_forwarding_with_no_parent_organization_is_a_loud_error(
 
 
 async def test_rejection_without_grounds_is_refused_before_the_signature(
-    executor_head_client, application_in_review
+    executor_head_client, application_in_review, rejection_reason_item
 ) -> None:
-    """tz/04 С8: a refusal carries a legal basis and an RJ-* reason. Checked
-    first, so a signature is never spent on a request that cannot succeed."""
-    result = await _decide(executor_head_client, application_in_review, "reject")
-    assert result.status_code == 422
-    assert result.json()["error"]["code"] == "ERR-VAL-001"
+    for body in (
+        {},
+        _reject_body(rejection_reason_item, grounds=[]),
+        _reject_body(rejection_reason_item, _ground(rejection_reason_item, fact="   ")),
+        _reject_body(rejection_reason_item, appeal_text=""),
+    ):
+        result = await _decide(executor_head_client, application_in_review, "reject", **body)
+        assert result.status_code == 422, body
+        assert result.json()["error"]["code"] == "ERR-VAL-001"
+    timeline = (
+        await executor_head_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    assert timeline["signatures"] == [], "no signature may be spent on a refused body"
 
 
 async def test_rejection_records_the_reason_and_publishes_its_event(
@@ -147,8 +177,7 @@ async def test_rejection_records_the_reason_and_publishes_its_event(
         executor_head_client,
         application_in_review,
         "reject",
-        reason_item_id=str(rejection_reason_item.id),
-        legal_basis="VMQ 278 п.14",
+        **_reject_body(rejection_reason_item),
     )
     assert result.status_code == 200, result.text
     assert result.json()["status"] == "REJECTED"
@@ -179,8 +208,7 @@ async def test_the_rejection_notification_names_both_ends_of_the_transition(
         executor_head_client,
         application_in_review,
         "reject",
-        reason_item_id=str(rejection_reason_item.id),
-        legal_basis="VMQ 278 п.14",
+        **_reject_body(rejection_reason_item),
     )
     assert result.status_code == 200, result.text
     params = await inapp_params(
@@ -194,6 +222,94 @@ async def test_a_head_outside_the_zone_cannot_decide(
 ) -> None:
     result = await _decide(other_zone_executor_head_client, application_in_review, "approve")
     assert result.status_code in (403, 404)
+
+
+# --- Stage 16 (rulings R3/R4/R8): 1..10 detailed grounds ---------------------
+
+
+async def test_rejection_stores_every_ground_in_order_and_the_first_as_the_legacy_reason(
+    db, executor_head_client, application_in_review, rejection_reason_item, r05_reason
+) -> None:
+    body = _reject_body(
+        rejection_reason_item,
+        _ground(rejection_reason_item, fact="Birinchi"),
+        _ground(r05_reason, fact="Ikkinchi", legal_document="VMQ 506", legal_clause="3-band"),
+    )
+    result = await _decide(executor_head_client, application_in_review, "reject", **body)
+    assert result.status_code == 200, result.text
+    rows = (
+        (
+            await db.execute(
+                select(ApplicationRejectionGround)
+                .where(
+                    ApplicationRejectionGround.application_id == uuid.UUID(application_in_review)
+                )
+                .order_by(ApplicationRejectionGround.position)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(r.position, r.fact) for r in rows] == [(1, "Birinchi"), (2, "Ikkinchi")]
+    application = await db.get(
+        Application, uuid.UUID(application_in_review), populate_existing=True
+    )
+    assert application.rejection_reason_item_id == rejection_reason_item.id
+    assert application.decision_basis == "VMQ 689, 12-band"
+
+
+async def test_a_return_code_is_not_a_rejection_ground(
+    executor_head_client, application_in_review, rj_01_return_reason
+) -> None:
+    result = await _decide(
+        executor_head_client, application_in_review, "reject", **_reject_body(rj_01_return_reason)
+    )
+    assert result.status_code == 422
+    assert result.json()["error"]["details"]["reason"] == "reason_not_rejectable"
+
+
+async def test_an_archived_rj_code_is_refused(
+    db, executor_head_client, application_in_review
+) -> None:
+    rj_03 = await _rejection_reasons_item_any_status(db, "RJ-03")
+    result = await _decide(
+        executor_head_client, application_in_review, "reject", **_reject_body(rj_03)
+    )
+    assert result.status_code == 422
+    assert result.json()["error"]["details"]["reason"] == "unknown_rejection_reason"
+
+
+async def test_a_rejected_benefit_claim_no_longer_supplies_the_grounds(
+    executor_head_client, application_in_review_with_rejected_claim
+) -> None:
+    """Ruling R8: #182's server default is gone — full grounds are required."""
+    result = await _decide(
+        executor_head_client,
+        application_in_review_with_rejected_claim,
+        "reject",
+        grounds=[],
+        reapply_text="x",
+        appeal_text="y",
+    )
+    assert result.status_code == 422
+
+
+async def _rejection_reasons_item_any_status(db: AsyncSession, code: str):
+    """`_rejection_reasons_item`'s conftest sibling, without the `status ==
+    'active'` filter — the one thing an archived-code test needs and no other
+    caller does, so it stays local rather than widening the shared helper."""
+    from app.modules.admin.models import Classifier, ClassifierItem
+
+    classifier_id = (
+        await db.execute(select(Classifier.id).where(Classifier.code == "rejection_reasons"))
+    ).scalar_one()
+    return (
+        await db.execute(
+            select(ClassifierItem).where(
+                ClassifierItem.classifier_id == classifier_id, ClassifierItem.code == code
+            )
+        )
+    ).scalar_one()
 
 
 # --- the half the six above cannot see (decision #29, both axes) -------------
@@ -466,12 +582,13 @@ async def test_a_reason_from_another_classifier_is_refused(
     """An existence check is not a validity check (lesson). `classifier_items`
     holds every classifier's values in ONE table, so an id-only check would let
     a benefit category stand as the legal ground for refusing a citizen."""
+    from types import SimpleNamespace
+
     result = await _decide(
         executor_head_client,
         application_in_review,
         "reject",
-        reason_item_id=str(benefit_category_item_id),
-        legal_basis="VMQ 278 п.14",
+        **_reject_body(SimpleNamespace(id=benefit_category_item_id)),
     )
     assert result.status_code == 422
     error = result.json()["error"]
@@ -570,8 +687,7 @@ async def test_a_rejection_audits_under_its_own_action(
         executor_head_client,
         application_in_review,
         "reject",
-        reason_item_id=str(rejection_reason_item.id),
-        legal_basis="VMQ 278 п.14",
+        **_reject_body(rejection_reason_item),
     )
     assert result.status_code == 200, result.text
     assert "application.reject" in await _audit_actions(db, application_in_review)
@@ -875,6 +991,22 @@ async def application_in_review_with_pending_benefit_claim(
     )
 
 
+@pytest.fixture
+async def application_in_review_with_rejected_claim(
+    hodim_client, application_in_review_with_pending_benefit_claim: str
+) -> str:
+    """The setup the two now-deleted ruling-#182 tests built inline: a claim
+    the leshoz has already REJECTED, kept here for stage 16's own test that
+    ruling R8 no longer lets that verdict stand in for the grounds."""
+    app_id = application_in_review_with_pending_benefit_claim
+    rejected = await hodim_client.post(
+        f"/api/v1/applications/benefit-verifications/{app_id}/reject",
+        json={"reason": "no matching registry entry"},
+    )
+    assert rejected.status_code == 200, rejected.text
+    return app_id
+
+
 async def test_approve_refuses_a_pending_benefit_claim(
     executor_head_client, application_in_review_with_pending_benefit_claim
 ) -> None:
@@ -917,52 +1049,3 @@ async def test_approve_passes_once_the_leshoz_verifies_the_claim(
     result = await _decide(executor_head_client, app_id, "approve")
     assert result.status_code == 200, result.text
     assert result.json()["status"] == "INVOICED"
-
-
-async def test_reject_uses_the_verifiers_own_reason_as_the_grounds_when_none_is_given(
-    db: AsyncSession,
-    hodim_client,
-    executor_head_client,
-    application_in_review_with_pending_benefit_claim,
-    rejection_reason_item,
-) -> None:
-    """Ruling #182: a `rejected` claim IS the grounds for rejecting the
-    APPLICATION too — the head need not retype what a colleague already
-    wrote down. `legal_basis` is deliberately absent from `_decide`'s own
-    kwargs here."""
-    from app.modules.applications.models import Application
-
-    reason = "no matching registry entry"
-    app_id = application_in_review_with_pending_benefit_claim
-    rejected_claim = await hodim_client.post(
-        f"/api/v1/applications/benefit-verifications/{app_id}/reject", json={"reason": reason}
-    )
-    assert rejected_claim.status_code == 200, rejected_claim.text
-
-    result = await _decide(
-        executor_head_client, app_id, "reject", reason_item_id=str(rejection_reason_item.id)
-    )
-    assert result.status_code == 200, result.text
-    assert result.json()["status"] == "REJECTED"
-
-    row = await db.get(Application, uuid.UUID(app_id))
-    assert row is not None
-    await db.refresh(row)
-    assert row.decision_basis == reason
-
-
-async def test_reject_without_legal_basis_is_still_refused_when_the_claim_is_not_rejected(
-    executor_head_client, application_in_review_with_pending_benefit_claim, rejection_reason_item
-) -> None:
-    """The mandatory-grounds rule stays intact: a `pending` (not `rejected`)
-    claim gives `reject` nothing of its own to default `legal_basis` from."""
-    result = await _decide(
-        executor_head_client,
-        application_in_review_with_pending_benefit_claim,
-        "reject",
-        reason_item_id=str(rejection_reason_item.id),
-    )
-    assert result.status_code == 422, result.text
-    error = result.json()["error"]
-    assert error["code"] == "ERR-VAL-001"
-    assert error["details"]["reason"] == "legal_basis_required"

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page {
+    size: A4; margin: 18mm 18mm 20mm 20mm;
+    @bottom-center { content: string(docnum) " · " counter(page) "/" counter(pages); font-size: 8pt; color: #555; }
+  }
+  body { font-size: 10.5pt; line-height: 1.35; color: #000; }
+  h1 { font-size: 13pt; text-align: center; margin: 0 0 10mm; }
+  h2 { font-size: 12pt; text-align: center; margin: 6mm 0 3mm; }
+  .addressee { margin-left: 50%; margin-bottom: 8mm; }
+  table { width: 100%; border-collapse: collapse; margin: 2mm 0; }
+  tr { page-break-inside: avoid; break-inside: avoid; }
+  td { border: 0.4pt solid #444; padding: 1.6mm 2mm; vertical-align: top; }
+  td.k { width: 34%; font-weight: bold; }
+  p { margin: 2mm 0; text-align: justify; }
+  .confirm { margin-top: 8mm; font-size: 9pt; }
+  .qr { width: 26mm; height: 26mm; float: right; margin-left: 4mm; }
+  .hash { font-size: 7.5pt; word-break: break-all; }
+  .docnum { string-set: docnum content(); }
+</style>
+</head>
+<body>
+  <h1>{{ t_title }}</h1>
+  <div class="addressee">{{ addressee }}</div>
+  <table>
+    <tr><td class="k">{{ t_number }}</td><td class="docnum">{{ number }}</td></tr>
+    <tr><td class="k">{{ t_date }}</td><td>{{ date }}</td></tr>
+    <tr><td class="k">{{ t_applicant }}</td><td>{{ applicant_name }}</td></tr>
+    <tr><td class="k">{{ t_address }}</td><td>{{ applicant_address }}</td></tr>
+    <tr><td class="k">{{ t_contact }}</td><td>{{ contact }}</td></tr>
+  </table>
+  <h2>{{ t_heading }}</h2>
+  <p>{{ t_request_1 }}{{ applicant_name }}{{ t_request_2 }}</p>
+  <table>
+    <tr><td class="k">{{ t_activity }}</td><td>{{ activity_name }}</td></tr>
+    <tr><td class="k">{{ t_territory }}</td><td>{{ territory }}</td></tr>
+    <tr><td class="k">{{ t_plot }}</td><td>{{ plot }}</td></tr>
+    <tr><td class="k">{{ t_coordinates }}</td><td>{{ coordinates }}</td></tr>
+    <tr><td class="k">{{ t_period }}</td><td>{{ period }}</td></tr>
+    <tr><td class="k">{{ t_quantity }}</td><td>{{ quantity }}</td></tr>
+    <tr><td class="k">{{ t_purpose }}</td><td>{{ purpose }}</td></tr>
+  </table>
+  <p>{{ t_undertaking }}</p>
+  <p><b>{{ t_attachments }}:</b> {{ attachments }}</p>
+  <div class="confirm">
+    <img class="qr" src="{{ qr }}" alt="">
+    <p><b>{{ t_confirmation }}:</b> {{ signed_at }} • {{ signature }}</p>
+    <p class="hash">SHA-256: {{ package_sha256 }}</p>
+  </div>
+</body>
+</html>

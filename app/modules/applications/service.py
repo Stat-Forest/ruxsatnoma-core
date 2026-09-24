@@ -15,6 +15,8 @@ the "Task 8 public surface" comment below for the contract this file promises
 levels 4+ (payments 3.10, permits 3.11) — three functions and four event
 names, unchanged since branch 1."""
 
+import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Mapping
@@ -27,6 +29,7 @@ from sqlalchemy import Row, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import files, storage
 from app.core.abac import Zone, zone_filter, zone_of
 from app.core.errors import err
 from app.core.events import Event, publish
@@ -38,17 +41,19 @@ from app.db import uuid7
 from app.modules.admin import open_work as admin_open_work
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import ClassifierItem, Organization
-from app.modules.applications import checks, repo, sla
+from app.modules.applications import checks, printouts, repo, sla
 from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
     APPLICATION_KINDS,
+    PRINTOUT_LETTER,
     Application,
     ApplicationAssignment,
     ApplicationCheck,
     ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
+    ApplicationPrintout,
     ApplicationStatusHistory,
     InfoRequest,
 )
@@ -1154,7 +1159,51 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
             if deadline is None
             else sla.is_overdue(application.status, deadline, datetime.now(UTC))
         ),
+        "printouts": await repo.latest_printouts(db, application.id),
     }
+
+
+async def printout_pdf(
+    db: AsyncSession, application_id: uuid.UUID, kind: str, *, actor: User
+) -> tuple[str, bytes]:
+    """`GET /applications/{id}/letter.pdf` / `rejection-notice.pdf` (stage 16).
+
+    The card's own read rule (`_readable_application`: owner, or staff in
+    zone; a stranger 404). The newest printout of `kind`, row-locked: its first
+    download renders and stores the PDF once (R6), every later one returns the
+    stored bytes. 404 `ERR-SYS-003` when there is none — an application filed
+    before stage 16, or a notice for one never rejected — and the same code
+    for a stored `file_id` whose `media_files` row is gone or archived (the
+    existence-plus-active guard every other file read in this codebase
+    applies, `core/files.py::get_readable` among them)."""
+    application = await _readable_application(db, application_id, actor=actor)
+    row = await repo.latest_printout_for_update(db, application.id, kind)
+    if row is None:
+        raise err("ERR-SYS-003", details={"printout": kind})
+    if row.file_id is not None:
+        file = await db.get(MediaFile, row.file_id)
+        if file is None or file.status != "active":
+            raise err("ERR-SYS-003", details={"printout": kind})
+        data = await storage.get_object(file.storage_key)
+    else:
+        data = await asyncio.to_thread(printouts.render_pdf, row.kind, row.language, row.snapshot)
+        stored = await files.save_upload(
+            db,
+            data=data,
+            filename=_printout_filename(row),
+            content_type="application/pdf",
+            actor=actor,
+        )
+        row.file_id = stored.id
+        row.sha256 = hashlib.sha256(data).hexdigest()
+        await db.flush()
+    return _printout_filename(row), data
+
+
+def _printout_filename(row: ApplicationPrintout) -> str:
+    if row.kind == PRINTOUT_LETTER:
+        return f"ariza-xati-{row.snapshot['number']}.pdf"
+    return f"rad-etish-xati-{row.number}.pdf"
 
 
 BEEKEEPING_BENEFIT_CODE = "beekeeping_union_member"
@@ -2107,7 +2156,7 @@ async def file(
     # ours is pending, which is the whole point of the order above.
     document = _package_bytes(application, priced, contour_version_id=version.id)
     if payload.pkcs7 is not None:
-        await signatures_service.sign(
+        signature = await signatures_service.sign(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2119,7 +2168,7 @@ async def file(
             ip=ip,
         )
     else:
-        await signatures_service.sign_simple(
+        signature = await signatures_service.sign_simple(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2231,6 +2280,17 @@ async def file(
     await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
     await _auto_assign_on_submission(db, application)
     await db.refresh(application)
+    # Stage 16 (R6/R7): the letter of THIS submission, frozen last — after the
+    # assignment, so nothing below it can still change what it records.
+    await printouts.record_letter(
+        db,
+        application,
+        submission_id=submission_id,
+        signature=signature,
+        items=items,
+        documents=filing.documents,
+        recipient_user_id=await _notification_recipient(db, application),
+    )
     return application
 
 
@@ -2405,7 +2465,7 @@ async def submit(
     # kept evidence-then-raise like every refusal that got this far.
     document = _package_bytes(application, priced, contour_version_id=version.id)
     if pkcs7 is not None:
-        await signatures_service.sign(
+        signature = await signatures_service.sign(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2417,7 +2477,7 @@ async def submit(
             ip=ip,
         )
     elif application.on_behalf == "self":
-        await signatures_service.sign_simple(
+        signature = await signatures_service.sign_simple(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2595,6 +2655,17 @@ async def submit(
     # Postgres stored"). Refresh unconditionally rather than branching on
     # whether it actually wrote anything.
     await db.refresh(application)
+    # Stage 16 (R6/R7): the letter of THIS submission, frozen last — after the
+    # assignment, so nothing below it can still change what it records.
+    await printouts.record_letter(
+        db,
+        application,
+        submission_id=submission_id,
+        signature=signature,
+        items=await repo.list_items(db, application.id),
+        documents=await repo.list_documents(db, application.id),
+        recipient_user_id=await _notification_recipient(db, application),
+    )
     return application
 
 
@@ -3031,11 +3102,14 @@ NOTIFY_APPLICATION_RETURNED = "application.returned"
 # The SAME `rejection_reasons` classifier `decision._reason_item` reads
 # (tz/10 §8.2) — repeated here rather than imported because `decision.py`
 # imports `service.py`, never the reverse. Ruling 3's KIND check below is this
-# function's own; `decision.reject` checks no kind at all.
+# function's own; `decision.reject` has its own KIND check too (stage 16,
+# `REJECTABLE_REASON_KINDS` — every ground's `reason_item_id` must be
+# `kind` `reject`/`both`, R01..R08 today).
 RETURN_REASON_CLASSIFIER_CODE = "rejection_reasons"
-# `classifier_items.props["kind"]` values a RETURN may cite (0005_admin_seeds;
-# 0025 recast RJ-15 from "reject" to "both"). RJ-03 ("plot outside the forest
-# fund") types "reject" and is refused with `reason_not_returnable` —
+# `classifier_items.props["kind"]` values a RETURN may cite (0005_admin_seeds).
+# Migration 0064 (stage 16, ruling R4) archived RJ-03..RJ-12 and made RJ-15
+# return-only ("both" -> "return"); R01 ("information incomplete or
+# inconsistent") types "reject" and is refused with `reason_not_returnable` —
 # returning under it would misdescribe the decision and hand the applicant
 # something they cannot fix.
 RETURNABLE_REASON_KINDS = frozenset({"return", "both"})

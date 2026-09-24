@@ -278,3 +278,11 @@ async def test_a_contour_with_real_geometry_still_shows_its_map(
     )
     ids_on_map = {f["properties"]["contour_id"] for f in features.json()["features"]}
     assert str(published_contour.contour_id) in ids_on_map
+
+
+async def test_version_point_is_none_without_geometry(db, published_contour_without_geometry):
+    """Stage 16: a leshoz with no delivered layer still gets a letter — its
+    coordinates line prints `NOT_STATED`, never a 500 over a NULL `geom`."""
+    from app.modules.gis import service
+
+    assert await service.version_point(db, published_contour_without_geometry.id) is None
