@@ -1199,6 +1199,8 @@ async def list_applications(
     q: str | None = None,
     period_from: date | None = None,
     period_to: date | None = None,
+    created_from: date | None = None,
+    created_to: date | None = None,
 ) -> tuple[list[Application], int]:
     """`GET /applications` — one page of the applications `actor` may see, plus
     the total.
@@ -1264,6 +1266,8 @@ async def list_applications(
         q=q,
         period_from=period_from,
         period_to=period_to,
+        created_from=created_from,
+        created_to=created_to,
         offset=params.offset,
         limit=params.page_size,
     )

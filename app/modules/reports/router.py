@@ -60,6 +60,8 @@ async def export_applications_xlsx(
     number: Annotated[str | None, Query(max_length=NUMBER_MAX_LENGTH)] = None,
     period_from: date | None = None,
     period_to: date | None = None,
+    created_from: date | None = None,
+    created_to: date | None = None,
 ) -> Response:
     """`GET /applications` as a spreadsheet (stage 13, ruling #204; the
     columns of 2026-09-14): the same filters, the same scope through the
@@ -76,6 +78,8 @@ async def export_applications_xlsx(
         number=number,
         period_from=period_from,
         period_to=period_to,
+        created_from=created_from,
+        created_to=created_to,
     )
     filename = f"{applications_register.FILENAME_STEM}-{business_today().isoformat()}.xlsx"
     return xlsx.xlsx_response(

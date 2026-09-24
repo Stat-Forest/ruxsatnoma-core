@@ -303,6 +303,8 @@ async def rows(
     number: str | None,
     period_from: date | None,
     period_to: date | None,
+    created_from: date | None,
+    created_to: date | None,
 ) -> tuple[list[Row], int, int]:
     """`(rows, total, cap)`. `PageParams.model_construct` bypasses the model's
     own `page_size <= 100` — the export is the one caller legitimately above
@@ -319,6 +321,8 @@ async def rows(
         number=number,
         period_from=period_from,
         period_to=period_to,
+        created_from=created_from,
+        created_to=created_to,
     )
     ids = {a.id for a in apps}
     contacts = await auth_service.applicant_contacts(db, {a.applicant_id for a in apps})

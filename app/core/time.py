@@ -6,7 +6,7 @@ classifier validity windows (admin.service.archive_classifier_item,
 admin.repo.list_classifier_items) and, later, seasons/rotations/permit validity.
 """
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 TASHKENT = ZoneInfo("Asia/Tashkent")
@@ -15,6 +15,18 @@ TASHKENT = ZoneInfo("Asia/Tashkent")
 def business_today() -> date:
     """Today's calendar date in Asia/Tashkent, independent of the server's own zone."""
     return datetime.now(TASHKENT).date()
+
+
+def tashkent_day_start(day: date) -> datetime:
+    """The UTC instant an Asia/Tashkent calendar day begins.
+
+    For filtering a `timestamptz` column by a day a person picked: a window
+    `[from, to]` is `>= tashkent_day_start(from)` and
+    `< tashkent_day_start(to + 1 day)`. Naive `datetime.combine(day, time.min)`
+    is compared in the SESSION's zone (UTC here), which moves every boundary by
+    five hours: an application filed at 00:10 on the 1st in Tashkent (19:10 UTC
+    on the 30th) would then count as filed on the 30th."""
+    return datetime.combine(day, time.min, tzinfo=TASHKENT).astimezone(UTC)
 
 
 def in_quiet_hours(start_hour: int, end_hour: int, *, now: datetime | None = None) -> bool:
