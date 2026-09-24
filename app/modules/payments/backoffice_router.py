@@ -55,7 +55,7 @@ from app.core import files, settings_store, xlsx
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
-from app.core.schemas import PAGING_MAX, Page
+from app.core.schemas import PAGING_MAX, TEXT_MAX_LENGTH, Page
 from app.core.time import business_today
 from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
@@ -131,7 +131,7 @@ async def create_bank_statement(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(PAYMENTS_MANAGE))],
     ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
-    column_map: Annotated[str, Form()] = "{}",
+    column_map: Annotated[str, Form(max_length=TEXT_MAX_LENGTH)] = "{}",
 ) -> StatementAccepted:
     """202, not 201: the file is stored and the work is QUEUED. The parse and
     the matching happen in `app/workers/jobs.py::process_bank_statements`.

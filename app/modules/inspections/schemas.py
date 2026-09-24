@@ -9,7 +9,14 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import BlobStr, CodeStr, JsonObject, LocalizedName, NoteStr, TextStr
+
+# --- Request bounds (stage 17, QA run 01, task 8) -----------------------------
+# `inspection_acts`/`violation_cases`' numeric columns are fixed-scale
+# NUMERIC — `le=` mirrors that scale exactly (R4).
+GPS_ACCURACY_M_MAX = Decimal("99999999.99")  # inspection_acts.gps_accuracy_m NUMERIC(10, 2)
+DAMAGE_AMOUNT_MAX = Decimal("9999999999999999.99")  # violation_cases.damage_amount NUMERIC(18, 2)
+CHECKLIST_ITEMS_MAX = 200  # R3
 
 
 def _trim_decimal(value: Decimal | None) -> str | None:
@@ -35,7 +42,7 @@ class GpsPoint(BaseModel):
 
 
 class ChecklistQuestion(BaseModel):
-    code: str
+    code: CodeStr
     question: LocalizedName
     type: Literal["bool", "number", "text"]
     required: bool = False
@@ -46,10 +53,10 @@ class ChecklistIn(BaseModel):
     supersedes it (archive + insert, service-side) — never an in-place edit of
     a past act's own checklist."""
 
-    code: str
+    code: CodeStr
     name: LocalizedName
     activity_type_id: uuid.UUID | None = None
-    items: Annotated[list[ChecklistQuestion], Field(min_length=1)]
+    items: Annotated[list[ChecklistQuestion], Field(min_length=1, max_length=CHECKLIST_ITEMS_MAX)]
 
 
 class ChecklistOut(BaseModel):
@@ -108,11 +115,11 @@ class ActCreateIn(BaseModel):
     application_id: uuid.UUID | None = None
     occurred_at: datetime
     gps: GpsPoint | None = None
-    gps_accuracy_m: Decimal | None = None
+    gps_accuracy_m: Decimal | None = Field(default=None, le=GPS_ACCURACY_M_MAX)
     checklist_id: uuid.UUID
-    answers: dict[str, Any] = Field(default_factory=dict)
-    facts: dict[str, Any] = Field(default_factory=dict)
-    notes: str | None = None
+    answers: JsonObject = Field(default_factory=dict)
+    facts: JsonObject = Field(default_factory=dict)
+    notes: NoteStr | None = None
     result: Literal["compliant", "warning", "violation"] | None = None
     created_offline_at: datetime | None = None
 
@@ -128,10 +135,10 @@ class ActUpdateIn(BaseModel):
 
     occurred_at: datetime | None = None
     gps: GpsPoint | None = None
-    gps_accuracy_m: Decimal | None = None
-    answers: dict[str, Any] | None = None
-    facts: dict[str, Any] | None = None
-    notes: str | None = None
+    gps_accuracy_m: Decimal | None = Field(default=None, le=GPS_ACCURACY_M_MAX)
+    answers: JsonObject | None = None
+    facts: JsonObject | None = None
+    notes: NoteStr | None = None
     result: Literal["compliant", "warning", "violation"] | None = None
 
 
@@ -145,7 +152,7 @@ class ActFileIn(BaseModel):
     kind: Literal["photo", "video"]
     taken_at: datetime | None = None
     gps: GpsPoint | None = None
-    device: dict[str, Any] | None = None
+    device: JsonObject | None = None
 
 
 class ActSignIn(BaseModel):
@@ -156,7 +163,7 @@ class ActSignIn(BaseModel):
     act names which of VT-01…06 applies, so the inspector classifies it here,
     at the moment of finalizing."""
 
-    pkcs7: str = Field(min_length=1)
+    pkcs7: BlobStr
     violation_type_item_id: uuid.UUID | None = None
 
 
@@ -297,20 +304,20 @@ class CaseCardOut(CaseOut):
 
 
 class ExplanationIn(BaseModel):
-    text: str = Field(min_length=1)
+    text: TextStr
     file_id: uuid.UUID | None = None
 
 
 class DecisionIn(BaseModel):
     decision: Literal["warning", "suspend", "revoke", "transfer"]
-    damage_amount: Decimal | None = None
-    damage_calc: dict[str, Any] | None = None
-    note: str | None = None
+    damage_amount: Decimal | None = Field(default=None, le=DAMAGE_AMOUNT_MAX)
+    damage_calc: JsonObject | None = None
+    note: NoteStr | None = None
 
 
 class AppealIn(BaseModel):
-    text: str = Field(min_length=1)
+    text: TextStr
 
 
 class AppealResolveIn(BaseModel):
-    result: str = Field(min_length=1)
+    result: TextStr

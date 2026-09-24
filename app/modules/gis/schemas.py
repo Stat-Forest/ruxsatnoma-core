@@ -5,12 +5,56 @@ variant in pydantic would duplicate a parser we already have in the database."""
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Self
+from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, Field, field_serializer, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_serializer, model_validator
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import CodeStr, JsonObject, LocalizedName
 from app.modules.gis import checks
+
+# --- Request bounds (stage 17, QA run 01, task 8) -----------------------------
+# `contour_versions`' area/accuracy columns are fixed-scale NUMERIC — `le=`
+# mirrors that scale exactly (R4), so a value the column could never hold is
+# a 422 here instead of an asyncpg 500.
+DECLARED_AREA_HA_MAX = Decimal("99999999.9999")  # NUMERIC(12, 4)
+ACCURACY_M_MAX = Decimal("999999.99")  # NUMERIC(8, 2)
+
+# 20 000 vertices in 3D, 30 000 in 2D (a coordinate pair/triple is counted as
+# one number per ordinate). The largest real Burchmulla contour has 67
+# vertices, the whole leshoz 2 923 — this is headroom, not a realistic size.
+GEOMETRY_MAX_COORDINATES = 60_000
+
+
+def _count_numbers(node: Any) -> int:
+    if isinstance(node, bool):
+        return 0
+    if isinstance(node, (int, float)):
+        return 1
+    if isinstance(node, list):
+        return sum(_count_numbers(item) for item in node)
+    return 0
+
+
+def _cap_geometry(geom: dict[str, Any]) -> dict[str, Any]:
+    parts = geom.get("geometries")
+    nodes = (
+        [part.get("coordinates") for part in parts if isinstance(part, dict)]
+        if isinstance(parts, list)
+        else [geom.get("coordinates")]
+    )
+    total = sum(_count_numbers(node) for node in nodes)
+    if total > GEOMETRY_MAX_COORDINATES:
+        raise ValueError(
+            f"geometry has {total} coordinates, the limit is {GEOMETRY_MAX_COORDINATES}"
+        )
+    return geom
+
+
+GeoJsonGeometry = Annotated[
+    dict[str, Any],
+    AfterValidator(_cap_geometry),
+    Field(json_schema_extra={"x-max-coordinates": GEOMETRY_MAX_COORDINATES}),
+]
 
 
 class LayerOut(BaseModel):
@@ -28,7 +72,7 @@ class LayerList(BaseModel):
 
 
 class LayerPatch(BaseModel):
-    style: dict[str, Any] | None = None
+    style: JsonObject | None = None
     is_public: bool | None = None
     status: str | None = Field(default=None, pattern="^(active|archived)$")
 
@@ -39,7 +83,7 @@ class ContourIn(BaseModel):
 
     layer_id: uuid.UUID
     organization_id: uuid.UUID
-    number: str
+    number: CodeStr
     kind: str = Field(pattern="^(contour|subcontour)$")
     parent_id: uuid.UUID | None = None
 
@@ -106,10 +150,10 @@ class VersionIn(BaseModel):
     reason rather than the service's generic one.
     """
 
-    geom: dict[str, Any] | None = None
+    geom: GeoJsonGeometry | None = None
     source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
-    declared_area_ha: Decimal | None = None
-    accuracy_m: Decimal | None = None
+    declared_area_ha: Decimal | None = Field(default=None, le=DECLARED_AREA_HA_MAX)
+    accuracy_m: Decimal | None = Field(default=None, le=ACCURACY_M_MAX)
     survey_date: date | None = None
     effective_from: date | None = None
 
@@ -163,8 +207,8 @@ class VersionPatch(BaseModel):
     """Draft-only metadata edits (service 409s otherwise). Geometry is never
     patched in place — a changed shape is a new version, by design."""
 
-    declared_area_ha: Decimal | None = None
-    accuracy_m: Decimal | None = None
+    declared_area_ha: Decimal | None = Field(default=None, le=DECLARED_AREA_HA_MAX)
+    accuracy_m: Decimal | None = Field(default=None, le=ACCURACY_M_MAX)
     survey_date: date | None = None
     effective_from: date | None = None
 
@@ -179,9 +223,9 @@ class SplitPieceIn(BaseModel):
     never re-typed by the caller the way a plain `POST /gis/contours` would
     require."""
 
-    number: str
-    geom: dict[str, Any]
-    declared_area_ha: Decimal | None = None
+    number: CodeStr
+    geom: GeoJsonGeometry
+    declared_area_ha: Decimal | None = Field(default=None, le=DECLARED_AREA_HA_MAX)
 
 
 class SplitIn(BaseModel):
@@ -194,7 +238,7 @@ class SplitIn(BaseModel):
     piece_a: SplitPieceIn
     piece_b: SplitPieceIn
     source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
-    accuracy_m: Decimal | None = None
+    accuracy_m: Decimal | None = Field(default=None, le=ACCURACY_M_MAX)
     survey_date: date | None = None
     effective_from: date | None = None
 
@@ -276,10 +320,10 @@ class FeatureIn(BaseModel):
     through this schema at all.
     """
 
-    geom: dict[str, Any]
+    geom: GeoJsonGeometry
     organization_id: uuid.UUID | None = None
     name: LocalizedName | None = None
-    props: dict[str, Any] = Field(default_factory=dict)
+    props: JsonObject = Field(default_factory=dict)
     valid_from: date | None = None
     valid_to: date | None = None
 
@@ -310,7 +354,7 @@ class FeaturePatch(BaseModel):
     as the same `ERR-VAL-001`, reason=validity_period_invalid)."""
 
     name: LocalizedName | None = None
-    props: dict[str, Any] | None = None
+    props: JsonObject | None = None
     valid_from: date | None = None
     valid_to: date | None = None
 
