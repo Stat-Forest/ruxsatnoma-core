@@ -947,7 +947,7 @@ async def test_0064_downgrade_survives_a_rejected_application_with_grounds_and_a
 
     try:
         # THE PROOF: neither direction may raise.
-        await asyncio.to_thread(command.downgrade, cfg, "0061")
+        await asyncio.to_thread(command.downgrade, cfg, "0065")
     finally:
         await asyncio.to_thread(command.upgrade, cfg, "head")
 

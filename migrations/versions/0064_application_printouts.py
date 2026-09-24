@@ -24,7 +24,7 @@ revision:
    are untouched.
 
 Revision ID: 0064
-Revises: 0061
+Revises: 0065
 Create Date: 2026-09-24 18:27:54.139608
 
 """
@@ -37,7 +37,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "0064"
-down_revision: str | Sequence[str] | None = "0061"
+down_revision: str | Sequence[str] | None = "0065"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
