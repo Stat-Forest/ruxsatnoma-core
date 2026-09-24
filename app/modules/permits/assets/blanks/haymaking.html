@@ -1,6 +1,8 @@
 <!--
   The bundled blank for HAYMAKING — Odilxon's «Рухсатнома турлари асл дизайнда» (docs:
-  tz/forms/2026-09-13-ruxsatnoma-turlari.md), decision #213/#215.
+  tz/forms/2026-09-13-ruxsatnoma-turlari.md), decision #213/#215; revised on 2026-09-24 to the
+  official form Oybek sent that day (tz/forms/2026-09-24-ruxsatnoma-blankasi.docx): the
+  Regulation's annex line on top, and the issuer's line as the form words it.
 
   Rules for whoever edits this file or uploads a replacement:
   1. Every placeholder (brace syntax) must be a key `permits/service.py::_snapshot` freezes, with a
@@ -22,6 +24,7 @@
        past that case is refused at issuance (render._assert_one_page), never printed. */
     @page { size: A4; margin: 9mm 12mm 8mm 14mm; }
     body { font-size: 9.5pt; line-height: 1.2; color: #000; }
+    .annex { text-align: center; font-size: 8pt; margin: 0 6mm 0.5mm; }
     .emblem { text-align: center; margin-bottom: 1.5mm; }
     .emblem img { width: 19mm; height: 19mm; }
     .series { text-align: right; font-size: 9pt; }
@@ -50,6 +53,9 @@
   </style>
 </head>
 <body>
+  <!-- Verbatim from the official form, in its own Cyrillic (#214 point 2: a blank's wording is
+       printed as the form has it). The form ends the line at «низомга» with no annex number. -->
+  <div class="annex">Ўсимлик дунёси объектларидан фойдаланиш ва ўсимлик дунёси объектларидан фойдаланиш соҳасида рухсат бериш тартиб-таомилларидан ўтиш тартиби тўғрисидаги низомга</div>
   <div class="emblem"><img src="emblem.svg" alt=""></div>
   <div class="series">seriya {{ series }} №{{ number }}</div>
   <div class="authority">
@@ -82,13 +88,15 @@
     <tr><th>Asos <span class="ru">Основание</span></th><td>{{ activity_name }} uchun ariza, toʻlangan {{ payment_date }}</td></tr>
   </table>
 
-  <!-- R4: two labelled lines, the holder's NAME on the second, no staff name, one QR. -->
+  <!-- R4: two labelled lines, the holder's NAME on the second, no staff name, one QR. The
+       issuer's line is worded as the official form words it («Vakolatli organ rahbari»); the
+       signature on it is still the leshoz head's ERI (#210), which the QR page names. -->
   <table class="signatures">
     <tr>
       <td>
         <table class="lines">
           <tr>
-            <td class="who">Xoʻjalik rahbari<br><span class="caption">Директор лесхоза</span></td>
+            <td class="who">Vakolatli organ rahbari<br><span class="caption">Руководитель уполномоченного органа</span></td>
             <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
           </tr>
           <tr>
