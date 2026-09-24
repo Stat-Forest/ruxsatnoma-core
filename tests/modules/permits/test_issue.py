@@ -726,12 +726,17 @@ async def test_the_printed_head_counts_come_from_the_frozen_calculation(
 
     # One row per tz/13 requisite, each naming its species from the classifier —
     # in the document's language (decision #215 R2), the `uz_latn` migration 0032
-    # derived from 0005's Cyrillic seed. Unprinted since stage 15 (the grazing
-    # blank has a cell per species) but still frozen: `reports` reads these four.
+    # derived from 0005's Cyrillic seed, as 0065 worded the young (VMQ 278: suckling
+    # young are not counted). Unprinted since stage 15 (the grazing blank has a cell
+    # per species) but still frozen: `reports` reads these four.
     assert permit.snapshot["heads_large_adult"] == "Qoramol (katta) — 5"
-    assert permit.snapshot["heads_large_young"] == "Ot (2 yoshgacha) — 2"
+    assert permit.snapshot["heads_large_young"] == (
+        "Ot (2 yoshgacha, ona suti bilan oziqlanadigan toylardan tashqari) — 2"
+    )
     assert permit.snapshot["heads_small_adult"] == "Qoʻy va echki (6 oydan katta) — 2"
-    assert permit.snapshot["heads_small_young"] == "Qoʻzi va uloq (6 oygacha) — 5"
+    assert permit.snapshot["heads_small_young"] == (
+        "Qoʻzi va uloq (6 oygacha, ona suti bilan oziqlanadiganlaridan tashqari) — 5"
+    )
     assert "999" not in "".join(
         str(permit.snapshot[key]) for key in permit.snapshot if key.startswith("heads_")
     ), "the live application_items row must not reach the document"
