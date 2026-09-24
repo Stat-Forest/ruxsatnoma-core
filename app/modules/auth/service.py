@@ -694,7 +694,7 @@ async def request_otp(
     await integrations_service.enqueue(
         db,
         destination="sms_otp",
-        payload={"target_type": target_type, "target": target, "code": code},
+        payload={"target_type": target_type, "target": target, "code": code, "purpose": purpose},
     )
 
 
