@@ -1127,6 +1127,15 @@ async def preview(db: AsyncSession, *, payload: CalculationIn, actor: User) -> d
     )
 
 
+def explain(breakdown: list[dict[str, Any]], input_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """`calculator.explain` on this module's public surface: how a price —
+    a stored `calculations` row, or `preview`'s answer, which carry the same
+    `breakdown` and `input_snapshot` — came about, line by line. Only this
+    module knows the shape `calculate` writes, so the reading of it lives
+    here too, never in a caller."""
+    return calculator.explain(breakdown, input_snapshot)
+
+
 # --- The public surface (decision #63): anonymous, deliberately approximate --
 #
 # A citizen on the public `landing` site has no session at all and no parcel —

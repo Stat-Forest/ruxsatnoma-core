@@ -4,6 +4,7 @@ nowhere but in the request body (plan 12, R2/R3)."""
 import base64
 import json
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import func, select
 
@@ -43,6 +44,10 @@ async def test_a_complete_filing_is_prechecked_and_priced_and_nothing_is_written
     assert result.status_code == 200, result.text
     body = result.json()
     assert body["calculation"] is not None and body["calculation"]["amount"]
+    # The price is explained before the citizen signs over it, not only after.
+    (line,) = body["calculation"]["lines"]
+    assert line["quantity"] == "40" and body["calculation"]["bhm"]
+    assert Decimal(line["amount"]) == Decimal(body["calculation"]["amount"])
     assert {row["check_type"] for row in body["checks"]} >= {"norm_limit", "gis_within_fund"}
     assert all(set(row) == {"check_type", "result", "details"} for row in body["checks"])
     assert await db.scalar(select(func.count()).select_from(Application)) == apps_before

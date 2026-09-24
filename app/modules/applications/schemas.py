@@ -29,6 +29,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from app.core.time import TASHKENT
+from app.modules.norms import service as norms_service
 
 # Spelled out rather than `Literal[*APPLICATION_STATUSES]`: pyright rejects a
 # starred variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal`
@@ -281,6 +282,35 @@ class ApplicationCheckOut(BaseModel):
     confirmed_at: datetime | None
 
 
+class CalculationLineOut(BaseModel):
+    """One line of how a price came about — `norms.service.explain`'s reading
+    of the calculator's own `breakdown`, so a citizen sees «10 head × 0.45 БҲМ
+    × 440 000 = 1 980 000» rather than a bare total.
+
+    `livestock_code` names the line of a grazing herd, `activity_code` every
+    other activity's single line. `quantity` is the head count or the declared
+    quantity in `quantity_unit`; `coefficient` is the tariff in БҲМ as
+    published, BEFORE a benefit, and `benefit_modifier` multiplies it when
+    `benefit_code` is set. `exempt` marks a line the law charges nothing for
+    (`science`), which carries no quantity and no coefficient. `amount` is
+    rounded to the tiyin for reading; the lines may miss the rounded total by
+    a fraction of a sum."""
+
+    livestock_code: str | None = None
+    activity_code: str | None = None
+    quantity: Decimal | None = None
+    quantity_unit: str | None = None
+    coefficient: Decimal | None = None
+    benefit_code: str | None = None
+    benefit_modifier: Decimal | None = None
+    amount: Decimal
+    exempt: bool = False
+
+    @field_serializer("quantity", "coefficient", "benefit_modifier", "amount")
+    def _serialize_decimal(self, value: Decimal | None) -> str | None:
+        return _trim_decimal(value)
+
+
 class ApplicationCalculationOut(BaseModel):
     """The application's CURRENT price — `applications.service.
     current_calculation`, which is the newest `calculations` row and exactly
@@ -288,7 +318,9 @@ class ApplicationCalculationOut(BaseModel):
 
     A reduced view of that row on purpose: `input_snapshot` and `breakdown` are
     the calculator's own JSON, sometimes kilobytes, and `GET /calculations/{id}`
-    (norms' own route) answers the full row for whoever needs it.
+    (norms' own route) answers the full row for whoever needs it. What the card
+    does carry of them is `bhm` and `lines` — the price explained, which a
+    citizen reads instead of the total alone.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -299,9 +331,11 @@ class ApplicationCalculationOut(BaseModel):
     used_sb: Decimal | None
     max_sb: int | None
     remaining_sb: Decimal | None
+    bhm: Decimal | None
+    lines: list[CalculationLineOut]
     created_at: datetime
 
-    @field_serializer("amount", "used_sb", "remaining_sb")
+    @field_serializer("amount", "used_sb", "remaining_sb", "bhm")
     def _serialize_decimal(self, value: Decimal | None) -> str | None:
         return _trim_decimal(value)
 
@@ -318,6 +352,7 @@ class ApplicationCalculationOut(BaseModel):
         version and a parameter's matters, while on an application card there is
         one version and nothing to tell it apart from. The mapping lives here,
         in one place, so neither response has to know about the other."""
+        explained = norms_service.explain(calculation.breakdown, calculation.input_snapshot)
         return cls.model_validate(
             {
                 "id": calculation.id,
@@ -326,6 +361,8 @@ class ApplicationCalculationOut(BaseModel):
                 "used_sb": calculation.used_sb,
                 "max_sb": calculation.max_sb,
                 "remaining_sb": calculation.remaining_sb,
+                "bhm": explained["bhm"],
+                "lines": explained["lines"],
                 "created_at": calculation.created_at,
             }
         )
@@ -528,9 +565,15 @@ class PrecheckCalculationOut(BaseModel):
     remaining_sb: str | None = None
     rule_version: str
     breakdown: list[Any] = []
+    bhm: str | None = None
+    lines: list[CalculationLineOut] = []
 
     @classmethod
     def build(cls, priced: dict[str, Any]) -> PrecheckCalculationOut:
+        """`bhm`/`lines` are the card's own explanation of the price, read the
+        same way from the same two keys a stored row carries — the citizen sees
+        how the figure came about BEFORE signing over it, not only after."""
+        explained = norms_service.explain(priced["breakdown"], priced["input_snapshot"])
         return cls.model_validate(
             {
                 "amount": priced["amount"],
@@ -539,6 +582,8 @@ class PrecheckCalculationOut(BaseModel):
                 "remaining_sb": priced["remaining_sb"],
                 "rule_version": priced["rule_code_version"],
                 "breakdown": priced["breakdown"],
+                "bhm": _trim_decimal(explained["bhm"]),
+                "lines": explained["lines"],
             }
         )
 
