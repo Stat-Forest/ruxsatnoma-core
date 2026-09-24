@@ -1,10 +1,11 @@
 """`GET /applications/export.xlsx` — the applications register on paper, in
 the columns the Agency's PM asked for (Odilxon, 2026-09-13): region,
 district, leshoz, contour, the applicant and their phone, the activity, the
-benefit, quantity and area, the filing date, the permit's issue date and
-term, the calculated and the paid amount, the status — as the customer's
-six groups AND as our exact one — and the inspector's conclusion from the
-site visit (the newest SIGNED field act on the filing, C6).
+benefit, quantity and area (a grazing herd also kind by kind), the filing
+date, the permit's issue date and term, the calculated and the paid amount,
+the status — as the customer's six groups AND as our exact one — and the
+inspector's conclusion from the site visit (the newest SIGNED field act on
+the filing, C6).
 
 It lives in `reports`, not `applications`, because half of those columns
 come from `permits` and `payments` (level 4) and `applications` (level 3)
@@ -129,6 +130,7 @@ class Row:
         activity_type: str,
         quantity: Decimal | int | None,
         unit: str,
+        herd: str | None,
         benefit: str | None,
         permit: tuple[date, date, datetime | None] | None,
         calculated: Decimal | None,
@@ -147,6 +149,7 @@ class Row:
         self.activity_type = activity_type
         self.quantity = quantity
         self.unit = unit
+        self.herd = herd
         self.benefit = benefit
         self.permit_from = permit[0] if permit else None
         self.permit_to = permit[1] if permit else None
@@ -167,6 +170,15 @@ def _conclusion(acts: Sequence[Any], lang: xlsx.Lang) -> str | None:
     if act.notes:
         return act.notes
     return _label(RESULT_LABELS, act.result, lang) if act.result else None
+
+
+def _herd(herd: Sequence[tuple[dict[str, Any], int]] | None, lang: xlsx.Lang) -> str | None:
+    """«Qoramol (katta): 2, Qoʻy va echki (6 oydan katta): 40» — what the
+    single number in «quantity» is made of; `None`, an empty cell, for an
+    activity that declares no herd."""
+    if not herd:
+        return None
+    return ", ".join(f"{xlsx.localized(name, lang)}: {heads}" for name, heads in herd)
 
 
 def _attr(name: str) -> Callable[[Row], xlsx.CellValue]:
@@ -205,6 +217,7 @@ def columns(lang: xlsx.Lang) -> list[xlsx.Column[Row]]:
             "quantity", {"uz_latn": "Miqdor", "ru": "Количество"}, lambda r: r.quantity, 12
         ),
         xlsx.Column("unit", {"uz_latn": "Birlik", "ru": "Ед. изм."}, lambda r: r.unit, 12),
+        xlsx.Column("herd", {"uz_latn": "Chorva", "ru": "Скот"}, lambda r: r.herd, 40),
         xlsx.Column(
             "requested_area_ha",
             {"uz_latn": "Maydon, ga", "ru": "Площадь, га"},
@@ -320,7 +333,7 @@ async def rows(
     contours = await gis_service.contour_numbers_by_ids(
         db, {a.contour_id for a in apps if a.contour_id is not None}
     )
-    heads = await repo.head_count_by_application(db, ids)
+    herds = await repo.herd_by_application(db, ids)
     permits = await repo.permit_facts_by_application(db, ids)
     calculated = await repo.calculated_amount_by_application(db, ids)
     paid = await repo.paid_amount_by_application(db, ids)
@@ -351,12 +364,17 @@ async def rows(
                 ),
                 # Grazing counts its herd in the items and leaves `quantity`
                 # NULL; every other activity declares `quantity` itself.
-                quantity=app.quantity if app.quantity is not None else heads.get(app.id),
+                quantity=(
+                    app.quantity
+                    if app.quantity is not None or app.id not in herds
+                    else sum(heads for _, heads in herds[app.id])
+                ),
                 unit=(
                     _label(UNIT_LABELS, units[app.activity_type_id], lang)
                     if app.activity_type_id is not None and app.activity_type_id in units
                     else ""
                 ),
+                herd=_herd(herds.get(app.id), lang),
                 benefit=(
                     xlsx.localized(benefits.get(app.benefit_category_item_id), lang)
                     if app.benefit_category_item_id is not None
