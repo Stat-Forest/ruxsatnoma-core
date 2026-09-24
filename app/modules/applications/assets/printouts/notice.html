@@ -3,7 +3,10 @@
 <head>
 <meta charset="utf-8">
 <style>
-  @page { size: A4; margin: 18mm 18mm 20mm 20mm; }
+  @page {
+    size: A4; margin: 18mm 18mm 20mm 20mm;
+    @bottom-center { content: string(docnum) " · " counter(page) "/" counter(pages); font-size: 8pt; color: #555; }
+  }
   body { font-size: 10.5pt; line-height: 1.35; color: #000; }
   h1 { font-size: 13pt; text-align: center; margin: 0 0 10mm; }
   h2 { font-size: 12pt; text-align: center; margin: 6mm 0 3mm; }
@@ -16,13 +19,14 @@
   .qr { width: 26mm; height: 26mm; float: right; margin-left: 4mm; }
   .hash { font-size: 7.5pt; word-break: break-all; }
   table.ground { page-break-inside: avoid; margin-top: 3mm; }
+  .docnum { string-set: docnum content(); }
 </style>
 </head>
 <body>
   <h1>{{ t_title }}</h1>
   <div class="addressee">{{ addressee }}<br>{{ addressee_address }}<br>{{ addressee_contact }}</div>
   <table>
-    <tr><td class="k">{{ t_notice_number }}</td><td>{{ number }}</td></tr>
+    <tr><td class="k">{{ t_notice_number }}</td><td class="docnum">{{ number }}</td></tr>
     <tr><td class="k">{{ t_decision_date }}</td><td>{{ decided_at }}</td></tr>
     <tr><td class="k">{{ t_application_number }}</td><td>{{ application_number }}</td></tr>
     <tr><td class="k">{{ t_reviewer }}</td><td>{{ reviewer }}</td></tr>
