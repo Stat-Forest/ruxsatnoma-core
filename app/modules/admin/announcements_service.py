@@ -7,15 +7,15 @@ attached to an announcement the caller can currently see becomes readable throug
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, storage
 from app.core.errors import err
 from app.core.models import MediaFile
-from app.core.schemas import LocalizedName, Page, PageParams
+from app.core.schemas import LIST_MAX_ITEMS, CodeStr, LocalizedName, Page, PageParams
 from app.modules.admin import repo
 from app.modules.admin.models import Announcement
 from app.modules.audit import service as audit
@@ -27,8 +27,8 @@ class AudienceIn(BaseModel):
     """Targeting rule for `Announcement.audience` jsonb; `region_ids` are stored as
     strings (design/02: jsonb keys/elements are text, not native uuid)."""
 
-    role_codes: list[str] | None = None
-    region_ids: list[uuid.UUID] | None = None
+    role_codes: Annotated[list[CodeStr], Field(max_length=LIST_MAX_ITEMS)] | None = None
+    region_ids: Annotated[list[uuid.UUID], Field(max_length=LIST_MAX_ITEMS)] | None = None
 
 
 class FileRef(BaseModel):
@@ -71,7 +71,7 @@ class AnnouncementCreateIn(BaseModel):
     public_on_landing: bool = False
     publish_from: datetime | None = None
     publish_to: datetime | None = None
-    file_ids: list[uuid.UUID] | None = None
+    file_ids: Annotated[list[uuid.UUID], Field(max_length=LIST_MAX_ITEMS)] | None = None
 
 
 class AnnouncementPatchIn(BaseModel):
@@ -85,7 +85,7 @@ class AnnouncementPatchIn(BaseModel):
     public_on_landing: bool | None = None
     publish_from: datetime | None = None
     publish_to: datetime | None = None
-    file_ids: list[uuid.UUID] | None = None
+    file_ids: Annotated[list[uuid.UUID], Field(max_length=LIST_MAX_ITEMS)] | None = None
 
 
 class AnnouncementLandingOut(BaseModel):
