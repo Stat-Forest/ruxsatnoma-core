@@ -156,13 +156,12 @@ BENEFIT_CLASSIFIER_CODE = "benefit_categories"
 # membership, not merely that the id names some classifier item — otherwise a
 # rejection reason could be attached as a document type.
 DOC_TYPE_CLASSIFIER_CODE = "doc_types"
-# The `doc_types` item a benefit certificate's scan is filed under when the
-# citizen attaches one. **Optional since ruling #189** (2026-09-10): the claim
-# is the certificate NUMBER (ruling #181), checked against a register or by the
-# leshoz (`_open_benefit_verification`); the file is supporting material the
-# verifier may want to see, never a gate. Migration `0024` seeds the code —
-# it is ours, not the Agency's — so the adminka can name it; nothing on the
-# submission path looks it up any more. `tests/modules/applications/
+# The ONE `doc_types` item a benefit claim is proven with. **Mandatory again
+# since decision #220** (2026-09-24, superseding #189): every benefit needs its
+# certificate number AND a scan of this type (`_check_benefit_claim`).
+# Migration `0024` seeds the code — it is ours, not the Agency's — and while no
+# ACTIVE item carries it (somebody archived it) every benefit claim is REFUSED
+# rather than accepted on an unchecked attachment. `tests/modules/applications/
 # test_documents.py` holds the literal in the migration and this constant
 # together.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
@@ -1691,17 +1690,42 @@ async def _assert_complete(
         raise err("ERR-APP-001", details={"missing": missing})
 
 
-async def _check_benefit_claim(db: AsyncSession, application: Application) -> bool:
+async def _benefit_doc_type(db: AsyncSession) -> Any:
+    """The ACTIVE `doc_types` item whose code is `BENEFIT_DOC_TYPE_CODE`, or
+    `None` when there is none. Read through `admin.repo` (reference data is
+    reached through its owner); `list_classifier_items` already applies
+    "valid today AND active", the only sense in which a doc type proves
+    anything on a submission."""
+    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
+    if classifier is None:
+        return None
+    items = await admin_repo.list_classifier_items(db, classifier.id)
+    return next((item for item in items if item.code == BENEFIT_DOC_TYPE_CODE), None)
+
+
+async def _check_benefit_claim(
+    db: AsyncSession,
+    application: Application,
+    *,
+    documents: list[ApplicationDocument] | None = None,
+) -> bool:
     """The benefit claim's own gate, shared by every step that can reach a
     signature — the pre-checks, the package and the filing — so the wizard's
     "Next" and the filing can never disagree about a claim (lesson: one
     precondition, one function). Reads the application, writes nothing.
 
-    Ruling #181: EVERY benefit category needs a certificate number. Refused
-    for every category with none; `requires_certificate` is not read at all.
-    Fail-closed on the unconfigurable case: a claim whose classifier item
-    cannot be read is refused, not waved through. The scan is NOT required —
-    ruling #189: the number is the claim, the file is optional support.
+    `documents`: a transient filing's own attachments (stage 12 — they are
+    not in the session yet); `None` reads the stored rows of a RETURNED
+    application, the same idiom as `checks.missing_for_pricing`'s `items`.
+
+    Decision #220 (supersedes #189): EVERY benefit needs its certificate
+    number (#181) AND a scan of the `benefit_proof` type — refused 422
+    `ERR-APP-003` `benefit_certificate_required` /
+    `benefit_claim_needs_a_document`, in that order. A document of another
+    type does not prove a claim. **FAIL-CLOSED**: a benefit REDUCES the fee,
+    so a claim whose category cannot be read, or while `benefit_proof` is not
+    configured (`benefit_doc_type_not_configured`), is refused, never waved
+    through.
 
     **Ruling #219 (2026-09-24; supersedes #206, restores the register half of
     #182).** A `beekeeping_union_member` claim is checked against the
@@ -1728,6 +1752,25 @@ async def _check_benefit_claim(db: AsyncSession, application: Application) -> bo
     certificate_no = (application.benefit_certificate_no or "").strip()
     if not certificate_no:
         raise err("ERR-APP-003", details={"reason": "benefit_certificate_required"})
+    doc_type = await _benefit_doc_type(db)
+    if doc_type is None:
+        raise err(
+            "ERR-APP-003",
+            details={
+                "reason": "benefit_doc_type_not_configured",
+                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
+            },
+        )
+    if documents is None:
+        documents = await repo.list_documents(db, application.id)
+    if not any(document.doc_type_item_id == doc_type.id for document in documents):
+        raise err(
+            "ERR-APP-003",
+            details={
+                "reason": "benefit_claim_needs_a_document",
+                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
+            },
+        )
     if item.code != BEEKEEPING_BENEFIT_CODE:
         return False
 
@@ -1743,7 +1786,12 @@ async def _check_benefit_claim(db: AsyncSession, application: Application) -> bo
     return True
 
 
-async def _open_benefit_verification(db: AsyncSession, application: Application) -> None:
+async def _open_benefit_verification(
+    db: AsyncSession,
+    application: Application,
+    *,
+    documents: list[ApplicationDocument] | None = None,
+) -> None:
     """Step 3b: `_check_benefit_claim`, then the verdict it leaves on the row.
 
     A claim the Union's register confirmed is `verified` on the spot, with
@@ -1758,7 +1806,7 @@ async def _open_benefit_verification(db: AsyncSession, application: Application)
     if application.benefit_category_item_id is None:
         application.benefit_verification_status = "not_required"
         return
-    confirmed_by_register = await _check_benefit_claim(db, application)
+    confirmed_by_register = await _check_benefit_claim(db, application, documents=documents)
     application.benefit_verified_by = None
     application.benefit_rejection_reason = None
     if confirmed_by_register:
@@ -1923,7 +1971,7 @@ async def precheck_filing(
     # Ruling #219: the wizard runs this on leaving step 4, and the Union's
     # register answers HERE — a refused claim is a broken input (an HTTP
     # error the wizard shows at the certificate field), never a check row.
-    await _check_benefit_claim(db, application)
+    await _check_benefit_claim(db, application, documents=filing.documents)
     priced: dict[str, Any] | None = None
     if not await checks.missing_for_pricing(db, application, items=items):
         priced = await norms_service.preview(
@@ -1970,7 +2018,7 @@ async def package_filing(
     await _assert_complete(db, application, items=items)
     # Ruling #219: before the bytes exist, so a claim the register refuses
     # never reaches the E-IMZO dialog. `file()` checks again (step 3b).
-    await _check_benefit_claim(db, application)
+    await _check_benefit_claim(db, application, documents=filing.documents)
     version = await _published_version_or_refuse(db, application)
     application.id = application_id or uuid7()
     _, priced = await _price(db, application, actor=actor, items=items)
@@ -2023,7 +2071,7 @@ async def file(
         db, application, items=items, rules_accepted=payload.rules_accepted
     )
     application.rules_accepted_at = datetime.now(UTC)  # ruling #184, the server's clock
-    await _open_benefit_verification(db, application)  # step 3b
+    await _open_benefit_verification(db, application, documents=filing.documents)  # step 3b
     version = await _published_version_or_refuse(db, application)  # step 4 (ruling 22)
     application.contour_version_id = version.id
     application.requested_area_ha = version.area_ha

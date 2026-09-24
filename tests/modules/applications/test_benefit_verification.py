@@ -30,6 +30,7 @@ from app.modules.applications.benefit_verification import (
     BENEFIT_CLAIM_REJECT,
     BENEFIT_CLAIM_VERIFY,
 )
+from app.modules.applications.models import ApplicationDocument
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Applicant, User
 from app.modules.beekeepers import service as beekeepers_service
@@ -380,7 +381,7 @@ async def test_a_claim_with_its_number_on_an_unflagged_category_opens_pending_ve
 ) -> None:
     """The number alone is enough to pass step 3b on a category with no
     registered auto-verifier — it still ends 422 downstream, for the reason
-    `test_submit.py::test_a_benefit_claim_is_accepted_without_a_document`
+    `test_submit.py::test_a_benefit_claim_needs_a_scan_of_the_benefit_type_and_no_other`
     documents (no seeded tariff carries a modifier for a code a test
     invented); what this pins is WHICH gate answers first."""
     filing = await _claim_and_prove(
@@ -494,13 +495,21 @@ async def _register_beekeeper(
 
 
 async def _beekeeping_claim(
-    db: AsyncSession, filing: dict[str, Any], certificate_no: str
+    db: AsyncSession,
+    client,
+    filing: dict[str, Any],
+    certificate_no: str,
+    proof_type_id: uuid.UUID,
 ) -> dict[str, Any]:
-    return {
-        **filing,
-        "benefit_category_item_id": str(await _benefit_category_item_id(db, BEEKEEPING)),
-        "benefit_certificate_no": certificate_no,
-    }
+    """The Union member's claim with its number and its scan (decision #220:
+    both mandatory), so the register is the gate that answers."""
+    return await _claim_and_prove(
+        client,
+        filing,
+        benefit_category_item_id=await _benefit_category_item_id(db, BEEKEEPING),
+        benefit_doc_type_item_id=proof_type_id,
+        certificate_no=certificate_no,
+    )
 
 
 def _assert_register_refusal(result, reason: str) -> None:
@@ -511,10 +520,17 @@ def _assert_register_refusal(result, reason: str) -> None:
 
 
 async def test_the_precheck_refuses_a_number_the_register_does_not_know(
-    db: AsyncSession, applicant_client, filing_ready_for_submission
+    db: AsyncSession,
+    applicant_client,
+    filing_ready_for_submission,
+    benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
     filing = await _beekeeping_claim(
-        db, filing_ready_for_submission, f"BEE-{uuid.uuid4().hex[:10]}"
+        db,
+        applicant_client,
+        filing_ready_for_submission,
+        f"BEE-{uuid.uuid4().hex[:10]}",
+        benefit_doc_type_item_id,
     )
 
     result = await applicant_client.post(f"{API}/applications/precheck", json=filing)
@@ -523,10 +539,16 @@ async def test_the_precheck_refuses_a_number_the_register_does_not_know(
 
 
 async def test_the_precheck_refuses_someone_elses_number(
-    db: AsyncSession, applicant_client, filing_ready_for_submission, hodim_user: User
+    benefit_doc_type_item_id: uuid.UUID,
+    db: AsyncSession,
+    applicant_client,
+    filing_ready_for_submission,
+    hodim_user: User,
 ) -> None:
     certificate_no = await _register_beekeeper(db, hodim_user, pinfl=unique_pinfl())
-    filing = await _beekeeping_claim(db, filing_ready_for_submission, certificate_no)
+    filing = await _beekeeping_claim(
+        db, applicant_client, filing_ready_for_submission, certificate_no, benefit_doc_type_item_id
+    )
 
     result = await applicant_client.post(f"{API}/applications/precheck", json=filing)
 
@@ -534,6 +556,7 @@ async def test_the_precheck_refuses_someone_elses_number(
 
 
 async def test_the_precheck_refuses_an_expired_certificate(
+    benefit_doc_type_item_id: uuid.UUID,
     db: AsyncSession,
     applicant: Applicant,
     applicant_client,
@@ -547,7 +570,9 @@ async def test_the_precheck_refuses_an_expired_certificate(
     certificate_no = await _register_beekeeper(
         db, hodim_user, pinfl=applicant.pinfl, valid_to=date(2020, 12, 31)
     )
-    filing = await _beekeeping_claim(db, filing_ready_for_submission, certificate_no)
+    filing = await _beekeeping_claim(
+        db, applicant_client, filing_ready_for_submission, certificate_no, benefit_doc_type_item_id
+    )
 
     result = await applicant_client.post(f"{API}/applications/precheck", json=filing)
 
@@ -555,6 +580,7 @@ async def test_the_precheck_refuses_an_expired_certificate(
 
 
 async def test_the_precheck_passes_the_applicants_own_number_and_prices_it(
+    benefit_doc_type_item_id: uuid.UUID,
     db: AsyncSession,
     applicant: Applicant,
     applicant_client,
@@ -564,7 +590,9 @@ async def test_the_precheck_passes_the_applicants_own_number_and_prices_it(
 ) -> None:
     assert applicant.pinfl is not None
     certificate_no = await _register_beekeeper(db, hodim_user, pinfl=applicant.pinfl)
-    filing = await _beekeeping_claim(db, apiary_filing, certificate_no)
+    filing = await _beekeeping_claim(
+        db, applicant_client, apiary_filing, certificate_no, benefit_doc_type_item_id
+    )
 
     result = await applicant_client.post(f"{API}/applications/precheck", json=filing)
 
@@ -579,6 +607,7 @@ async def test_a_legal_entitys_claim_is_matched_by_its_stir_not_the_representati
     apiary_filing: dict[str, Any],
     beekeeping_priced: None,
     hodim_user: User,
+    benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
     """A farm files through its representative: the register row names the
     ENTITY's STIR, and a stranger's PINFL beside it — the claim is the
@@ -589,8 +618,10 @@ async def test_a_legal_entitys_claim_is_matched_by_its_stir_not_the_representati
     )
     filing = await _beekeeping_claim(
         db,
+        representative_client,
         {**apiary_filing, "on_behalf": "legal", "applicant_id": str(legal_applicant.id)},
         certificate_no,
+        benefit_doc_type_item_id,
     )
 
     result = await representative_client.post(f"{API}/applications/precheck", json=filing)
@@ -599,12 +630,19 @@ async def test_a_legal_entitys_claim_is_matched_by_its_stir_not_the_representati
 
 
 async def test_the_package_refuses_a_number_the_register_does_not_know(
-    db: AsyncSession, applicant_client, filing_ready_for_submission
+    db: AsyncSession,
+    applicant_client,
+    filing_ready_for_submission,
+    benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
     """The ERI path fetches the package BEFORE the signature: a claim the
     register refuses must never reach the E-IMZO dialog at all."""
     filing = await _beekeeping_claim(
-        db, filing_ready_for_submission, f"BEE-{uuid.uuid4().hex[:10]}"
+        db,
+        applicant_client,
+        filing_ready_for_submission,
+        f"BEE-{uuid.uuid4().hex[:10]}",
+        benefit_doc_type_item_id,
     )
 
     result = await applicant_client.post(f"{API}/applications/package", json=filing)
@@ -613,12 +651,19 @@ async def test_the_package_refuses_a_number_the_register_does_not_know(
 
 
 async def test_filing_refuses_a_number_the_register_does_not_know(
-    db: AsyncSession, applicant_client, filing_ready_for_submission
+    db: AsyncSession,
+    applicant_client,
+    filing_ready_for_submission,
+    benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
     """The filing re-checks on its own: the register may have changed since
     the pre-check, and a client may skip the pre-check altogether."""
     filing = await _beekeeping_claim(
-        db, filing_ready_for_submission, f"BEE-{uuid.uuid4().hex[:10]}"
+        db,
+        applicant_client,
+        filing_ready_for_submission,
+        f"BEE-{uuid.uuid4().hex[:10]}",
+        benefit_doc_type_item_id,
     )
 
     result = await _submit_with_button(applicant_client, filing)
@@ -627,6 +672,7 @@ async def test_filing_refuses_a_number_the_register_does_not_know(
 
 
 async def test_a_matching_number_is_verified_by_the_register_at_filing(
+    benefit_doc_type_item_id: uuid.UUID,
     db: AsyncSession,
     applicant: Applicant,
     applicant_client,
@@ -639,7 +685,9 @@ async def test_a_matching_number_is_verified_by_the_register_at_filing(
     not a human" — so the leshoz has nothing left to decide about it."""
     assert applicant.pinfl is not None
     certificate_no = await _register_beekeeper(db, hodim_user, pinfl=applicant.pinfl)
-    filing = await _beekeeping_claim(db, apiary_filing, certificate_no)
+    filing = await _beekeeping_claim(
+        db, applicant_client, apiary_filing, certificate_no, benefit_doc_type_item_id
+    )
 
     submitted = await _submit_with_button(applicant_client, filing)
 
@@ -655,6 +703,7 @@ async def test_a_register_match_replaces_a_previous_attempts_verdict(
     applicant: Applicant,
     submitted_application: str,
     hodim_user: User,
+    benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
     """In-process, over the step `submit` (a RETURNED row's resubmission) and
     `file` both call: a match verifies on the spot and wipes whatever a
@@ -671,7 +720,11 @@ async def test_a_register_match_replaces_a_previous_attempts_verdict(
     application.benefit_rejection_reason = "previous attempt"
     await db.flush()
 
-    await service._open_benefit_verification(db, application)
+    # The scan as a filing hands it over (decision #220: mandatory) — only
+    # its type is read, so a transient row is the whole of it.
+    scan = ApplicationDocument(doc_type_item_id=benefit_doc_type_item_id)
+
+    await service._open_benefit_verification(db, application, documents=[scan])
 
     assert application.benefit_verification_status == "verified"
     assert application.benefit_verified_by is None, "ruling #182: NULL means the register"
