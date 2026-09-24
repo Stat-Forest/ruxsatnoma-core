@@ -98,6 +98,25 @@ def _decimal(value: Decimal | None) -> str:
     return f"{value.normalize():f}"
 
 
+def _sanitized(value: Any) -> Any:
+    """Every string leaf of a snapshot goes through `pdf.renderable_text`
+    (stage 16 fix wave F1.4) — recursively, so each ground dict inside
+    `snapshot["grounds"]` is covered too. Data that was never entered in the
+    request whose signature this snapshot records — an applicant's stored
+    name or address, a region's or organization's localized name — must
+    never make the WHOLE document unrenderable (ruling R6: a document must
+    always render). Non-string values (there are none in practice — every
+    snapshot field is already a formatted string — but `None`/numbers stay
+    safe) pass through untouched."""
+    if isinstance(value, str):
+        return pdf.renderable_text(value)
+    if isinstance(value, dict):
+        return {key: _sanitized(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitized(item) for item in value]
+    return value
+
+
 def _iso(value: datetime) -> str:
     """The PDF's own clock (`pdf.render_document(created=…)`): WeasyPrint turns a
     W3C/ISO string into `/CreationDate`, so this is ISO, never the printed
@@ -125,18 +144,24 @@ async def _certificate_serial(db: AsyncSession, signature: Signature) -> str | N
     return certificate.serial_number
 
 
-async def _applicant_address(db: AsyncSession, applicant: Any) -> str:
+async def _applicant_address(db: AsyncSession, applicant: Any, language: str) -> str:
     """Region, district, street — the permit's own composition
-    (`permits.service._holder_address`), `—` when the registry holds nothing."""
+    (`permits.service._holder_address`), `—` when the registry holds nothing.
+
+    `language` is the DOCUMENT's language (stage 16 fix wave F2), not always
+    `FALLBACK_LANGUAGE`: a uz_cyrl letter printing a uz_latn region/district
+    name mid-Cyrillic-sentence was the bug — `_name` itself already falls
+    back to `uz_latn` per-name when a given region/district has no
+    translation in the requested language (decision #90)."""
     parts: list[str] = []
     if applicant.region_id is not None:
         region = await admin_repo.get_region(db, applicant.region_id)
         if region is not None:
-            parts.append(_name(region.name, FALLBACK_LANGUAGE))
+            parts.append(_name(region.name, language))
     if applicant.district_id is not None:
         district = await admin_repo.get_district(db, applicant.district_id)
         if district is not None:
-            parts.append(_name(district.name, FALLBACK_LANGUAGE))
+            parts.append(_name(district.name, language))
     if applicant.address:
         parts.append(applicant.address)
     filled = [p for p in parts if p and p != labels.NOT_STATED]
@@ -165,6 +190,14 @@ async def record_rejection_notice(
         await admin_repo.get_organization(db, organization_id) if organization_id else None
     )
     role = await auth_service.role_of(db, signer)
+    # F3 (stage 16 fix wave): the blank's «Модератор» line wants the signer's
+    # POSITION («Ваколатли шахс», «Ўрмон хўжалиги раҳбари», …) when
+    # `users.position` names one — the localized ROLE name is a fallback for
+    # the (common, today) case where nobody has filled it in, not the primary
+    # source.
+    moderator_title = (signer.position or "").strip() or _name(
+        role.name if role else None, language
+    )
     number = await next_public_number(db, NOTICE_NUMBER_PREFIX, business_today())
     decided_at = application.decided_at
     email = applicant.email if applicant is not None else None
@@ -176,7 +209,9 @@ async def record_rejection_notice(
             name=applicant.name if applicant is not None else labels.NOT_STATED
         ),
         "addressee_address": (
-            await _applicant_address(db, applicant) if applicant is not None else labels.NOT_STATED
+            await _applicant_address(db, applicant, language)
+            if applicant is not None
+            else labels.NOT_STATED
         ),
         "addressee_contact": email or labels.PERSONAL_CABINET[language],
         "reviewer": (
@@ -204,7 +239,7 @@ async def record_rejection_notice(
         ],
         "reapply_text": reapply_text,
         "appeal_text": appeal_text,
-        "moderator": f"{_name(role.name if role else None, language)}, {signer.full_name}",
+        "moderator": f"{moderator_title}, {signer.full_name}",
         "signature": _signature_line(signature, language, await _certificate_serial(db, signature)),
         "signed_at": _datetime(signature.signed_at),
         "created": _iso(signature.signed_at),
@@ -214,7 +249,7 @@ async def record_rejection_notice(
         kind=PRINTOUT_REJECTION_NOTICE,
         number=number,
         language=language,
-        snapshot=snapshot,
+        snapshot=_sanitized(snapshot),
     )
     await repo.add_printout(db, row)
     return row
@@ -261,6 +296,21 @@ async def _quantity_line(
         return labels.NOT_STATED
     unit = labels.UNIT_LABELS[language].get(activity.quantity_unit, activity.quantity_unit)
     return f"{_decimal(application.quantity)} {unit}"
+
+
+def _territory_line(region: Any, district: Any, organization: Any, language: str) -> str:
+    """Region / district / leshoz, built from the NON-EMPTY parts only (stage
+    16 fix wave F5) — a leshoz with no district (Burchmulla) used to print
+    "Тошкент вилояти / — / Бурчмулла ДЎХ", `_name`'s own `—` sitting mid-line
+    as if the middle level genuinely existed and was merely unrecorded. `—`
+    here means the WHOLE line is unknown, never one field of three."""
+    parts = [
+        _name(region.name if region else None, language),
+        _name(district.name if district else None, language),
+        _name(organization.name if organization else None, language),
+    ]
+    filled = [part for part in parts if part and part != labels.NOT_STATED]
+    return " / ".join(filled) if filled else labels.NOT_STATED
 
 
 def _purpose_line(application: Application, activity_name: str, language: str) -> str:
@@ -359,18 +409,12 @@ async def record_letter(
         ),
         "addressee": await _addressee(db, organization_id, language),
         "applicant_name": name,
-        "applicant_address": await _applicant_address(db, applicant)
+        "applicant_address": await _applicant_address(db, applicant, language)
         if applicant
         else labels.NOT_STATED,
         "contact": contact,
         "activity_name": activity_name,
-        "territory": " / ".join(
-            (
-                _name(region.name if region else None, language),
-                _name(district.name if district else None, language),
-                _name(organization.name if organization else None, language),
-            )
-        ),
+        "territory": _territory_line(region, district, organization, language),
         "plot": labels.PLOT_FORMAT[language].format(
             contour=contour or labels.NOT_STATED, area=_decimal(application.requested_area_ha)
         ),
@@ -391,7 +435,7 @@ async def record_letter(
         kind=PRINTOUT_LETTER,
         submission_id=submission_id,
         language=language,
-        snapshot=snapshot,
+        snapshot=_sanitized(snapshot),
     )
     await repo.add_printout(db, row)
     return row

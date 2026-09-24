@@ -20,6 +20,7 @@ import io
 import os
 import re
 import sys
+import unicodedata
 import zlib
 from collections.abc import Mapping
 from functools import lru_cache
@@ -126,10 +127,16 @@ def _renderable_codepoints() -> frozenset[int]:
     return frozenset(covered)
 
 
-def _assert_renderable(values: Mapping[str, Any]) -> None:
+def assert_renderable(values: Mapping[str, Any]) -> None:
     """Refuse a value carrying a character the bundled face cannot draw —
     Pango would fall back to a host face per glyph, changing the bytes by
-    machine (`permits/render.py::_assert_renderable`, finding I2)."""
+    machine (`permits/render.py::_assert_renderable`, finding I2).
+
+    Public (stage 16 fix wave F1): a caller that can still refuse BEFORE
+    committing anything — `decision.reject`, before it spends the head's ERI —
+    calls this directly over what the citizen typed, so an unrenderable
+    character in a REQUEST field is a loud 422 at the moment it is entered,
+    never a signed, frozen document nobody can ever download."""
     renderable = _renderable_codepoints()
     offenders: dict[str, list[str]] = {}
     for name, value in values.items():
@@ -142,9 +149,46 @@ def _assert_renderable(values: Mapping[str, Any]) -> None:
         raise err("ERR-VAL-001", details={"reason": "unrenderable_characters", "fields": offenders})
 
 
+def strip_invisible(text: str) -> str:
+    """Remove every character of Unicode category `Cf` (format) — a BOM
+    (U+FEFF), a zero-width space/joiner/non-joiner (U+200B..U+200F, U+2060), a
+    soft hyphen (U+00AD) — pasted from Word or a chat app into a text field.
+
+    These are invisible to a human reading the field but are ordinary
+    codepoints to `min_length=1`, so a field that is only formatting
+    characters would otherwise read as non-blank (stage 16 fix wave F1.1/1.2)."""
+    return "".join(c for c in text if unicodedata.category(c) != "Cf")
+
+
+@lru_cache(maxsize=1)
+def _replacement_char() -> str:
+    """U+FFFD if the bundled face can draw it, else `?` — decided ONCE from
+    the face's own cmap, so every substitution `renderable_text` makes across
+    every document uses the same glyph rather than one decided ad hoc per
+    call."""
+    return "�" if 0xFFFD in _renderable_codepoints() else "?"
+
+
+def renderable_text(text: str) -> str:
+    """`strip_invisible`, then every remaining non-space character the
+    bundled face cannot draw is REPLACED, never dropped silently.
+
+    For data that was never typed into the request this document's signature
+    covers — an applicant's stored name or address, an organization's name —
+    `assert_renderable` cannot run before the fact (there is no request to
+    refuse), and R6 requires that a document always renders. This is the
+    other half of that ruling: a snapshot built from such data goes through
+    this function field by field, so an uncovered character never makes the
+    WHOLE document unrenderable (stage 16 fix wave F1.4)."""
+    cleaned = strip_invisible(text)
+    renderable = _renderable_codepoints()
+    replacement = _replacement_char()
+    return "".join(c if c.isspace() or ord(c) in renderable else replacement for c in cleaned)
+
+
 def _assert_only_bundled_faces(pdf: bytes) -> None:
     """No face but ours may reach the finished document (the backstop for the
-    layout's own static text, which `_assert_renderable` never sees)."""
+    layout's own static text, which `assert_renderable` never sees)."""
     family = _FONT_FAMILY.replace(" ", "-").encode()
     haystacks = [pdf]
     for stream in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", pdf, re.S):
@@ -214,7 +258,7 @@ def render_document(
     `asyncio.to_thread`. `created` is the document's only clock (metadata
     created/modified), so the bytes are a function of the inputs alone."""
     fragments = fragments or {}
-    _assert_renderable({**values, **fragments})
+    assert_renderable({**values, **fragments})
     html = fill(layout_html, values, fragments=fragments)
     font_config = FontConfiguration()
     fetcher = _AssetFetcher()

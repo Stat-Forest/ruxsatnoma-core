@@ -15,6 +15,7 @@ from app.core.schemas import LOCALES
 from app.modules.applications import printout_labels as labels
 from app.modules.applications import printouts
 from app.modules.applications.models import ApplicationPrintout
+from app.modules.auth.models import User
 from tests.modules.applications.test_decision import _decide, _reject_body
 
 
@@ -92,6 +93,17 @@ async def test_rejection_grounds_are_append_only(
 # --- Stage 16 (rulings R5-R7): the rejection notice's frozen snapshot --------
 
 
+async def _notice(db: AsyncSession, application_id: str) -> ApplicationPrintout:
+    return (
+        await db.execute(
+            select(ApplicationPrintout).where(
+                ApplicationPrintout.application_id == uuid.UUID(application_id),
+                ApplicationPrintout.kind == "rejection_notice",
+            )
+        )
+    ).scalar_one()
+
+
 def test_every_wording_table_covers_all_five_languages() -> None:
     for name in dir(labels):
         table = getattr(labels, name)
@@ -111,16 +123,9 @@ async def test_a_rejection_freezes_its_notice_in_the_recipients_language(
         executor_head_client, application_in_review, "reject", **_reject_body(rejection_reason_item)
     )
     assert result.status_code == 200, result.text
-    row = (
-        await db.execute(
-            select(ApplicationPrintout).where(
-                ApplicationPrintout.application_id == uuid.UUID(application_in_review),
-                ApplicationPrintout.kind == "rejection_notice",
-            )
-        )
-    ).scalar_one()
+    row = await _notice(db, application_in_review)
     assert row.language == "ru"
-    assert re.fullmatch(r"RD-\d{4}-\d{6}", row.number)
+    assert row.number is not None and re.fullmatch(r"RD-\d{4}-\d{6}", row.number)
     snap = row.snapshot
     assert snap["grounds"][0]["code"] == "R01"
     assert snap["grounds"][0]["name"] == "Сведения неполны или противоречивы"
@@ -150,6 +155,105 @@ async def test_rejection_defaults_need_the_decide_permission(
         f"/api/v1/applications/{application_in_review}/rejection-defaults"
     )
     assert result.status_code == 403
+
+
+# --- Stage 16 fix wave F2/F3/F5: address language, moderator, territory -----
+
+
+async def test_the_addressee_address_follows_the_notices_own_language(
+    db,
+    applicant,
+    applicant_user,
+    executor_head_client,
+    application_in_review,
+    rejection_reason_item,
+) -> None:
+    """F2: `printouts._applicant_address` used to read region/district names
+    with a hardcoded `FALLBACK_LANGUAGE` ("uz_latn") no matter the document's
+    own language — a uz_cyrl notice printed a Latin-script region name
+    mid-Cyrillic sentence. It now takes `language` and reads with it; every
+    region carries BOTH scripts (migration 0032's uz_latn backfill), so a
+    uz_cyrl document must show the uz_cyrl name, not the transliteration."""
+    region_id = (await db.execute(text("SELECT id FROM regions LIMIT 1"))).scalar_one()
+    region_name = (
+        await db.execute(text("SELECT name FROM regions WHERE id = :id"), {"id": region_id})
+    ).scalar_one()
+    applicant.region_id = region_id
+    applicant_user.language = "uz_cyrl"
+    await db.commit()
+
+    result = await _decide(
+        executor_head_client, application_in_review, "reject", **_reject_body(rejection_reason_item)
+    )
+    assert result.status_code == 200, result.text
+    row = await _notice(db, application_in_review)
+    assert row.language == "uz_cyrl"
+    address = row.snapshot["addressee_address"]
+    assert region_name["uz_cyrl"] in address
+    assert region_name["uz_latn"] not in address
+
+
+async def test_moderator_prints_the_signers_position_when_set(
+    db, executor_head_client, application_in_review, rejection_reason_item
+) -> None:
+    """F3: the blank's «Модератор» line wants the signer's POSITION
+    (`users.position`, nullable) — `record_rejection_notice` used to always
+    print the localized ROLE name instead."""
+    from tests.modules.applications.conftest import EXECUTOR_HEAD_PINFL
+
+    signer = (await db.execute(select(User).where(User.pinfl == EXECUTOR_HEAD_PINFL))).scalar_one()
+    signer.position = "Bosh oʻrmonchi"
+    await db.commit()
+
+    result = await _decide(
+        executor_head_client, application_in_review, "reject", **_reject_body(rejection_reason_item)
+    )
+    assert result.status_code == 200, result.text
+    row = await _notice(db, application_in_review)
+    assert row.snapshot["moderator"].startswith("Bosh oʻrmonchi,")
+
+
+async def test_moderator_falls_back_to_the_localized_role_name_with_no_position(
+    db, executor_head_client, application_in_review, rejection_reason_item
+) -> None:
+    """The other branch of F3: a blank `users.position` (the common case
+    today) keeps printing the localized role name, exactly as before this
+    fix."""
+    from tests.modules.applications.conftest import EXECUTOR_HEAD_PINFL
+
+    signer = (await db.execute(select(User).where(User.pinfl == EXECUTOR_HEAD_PINFL))).scalar_one()
+    signer.position = None
+    await db.commit()
+
+    result = await _decide(
+        executor_head_client, application_in_review, "reject", **_reject_body(rejection_reason_item)
+    )
+    assert result.status_code == 200, result.text
+    row = await _notice(db, application_in_review)
+    assert not row.snapshot["moderator"].startswith("Bosh oʻrmonchi,")
+    assert row.snapshot["moderator"].endswith(signer.full_name)
+
+
+async def test_the_letter_names_only_the_known_territory_parts(
+    db, leshoz, applicant_client, filing_ready_for_submission
+) -> None:
+    """F5: a leshoz with a region but no district (Burchmulla, decision #45's
+    own sample) used to print "Тошкент вилояти / — / Бурчмулла ДЎХ" — built
+    from the NON-EMPTY parts only now; `—` means the WHOLE line is unknown,
+    never one field of three."""
+    from tests.modules.applications.test_submit import _submit_with_button
+
+    region_id = (await db.execute(text("SELECT id FROM regions LIMIT 1"))).scalar_one()
+    leshoz.region_id = region_id
+    leshoz.district_id = None
+    await db.commit()
+
+    result = await _submit_with_button(applicant_client, filing_ready_for_submission)
+    assert result.status_code == 201, result.text
+    row = await _letter(db, result.json()["id"])
+    territory = row.snapshot["territory"]
+    assert "—" not in territory
+    assert territory.count(" / ") == 1
 
 
 # --- Task B4 (rulings R6/R7/R11): the application letter's frozen snapshot ---
@@ -182,6 +286,32 @@ async def test_filing_freezes_a_letter(db, submitted_application: str) -> None:
     assert snap["coordinates"] != ""
     assert snap["package_sha256"] and len(snap["package_sha256"]) == 64
     assert all(isinstance(v, str) for v in snap.values()), "a letter snapshot holds strings only"
+
+
+async def test_an_uncovered_character_in_the_applicants_own_address_never_blocks_the_letter(
+    db, applicant, applicant_client, filing_ready_for_submission
+) -> None:
+    """Stage 16 fix wave F1.4: `printouts.record_letter` runs every snapshot
+    string through `pdf.renderable_text` — data nobody typed into THIS
+    request (the applicant's own STORED address) must never make a signed,
+    frozen letter unrenderable. Filing must never be blocked, and a document
+    must always render (ruling R6)."""
+    from tests.modules.applications.test_submit import _submit_with_button
+
+    applicant.address = "Toshkent, 1-uy 🙂"
+    await db.commit()
+    result = await _submit_with_button(applicant_client, filing_ready_for_submission)
+    assert result.status_code == 201, result.text
+    application_id = result.json()["id"]
+
+    download = await applicant_client.get(f"/api/v1/applications/{application_id}/letter.pdf")
+    assert download.status_code == 200, download.text
+    assert download.content.startswith(b"%PDF-")
+
+    row = await _letter(db, application_id)
+    address = row.snapshot["applicant_address"]
+    assert "🙂" not in address
+    assert "Toshkent, 1-uy" in address
 
 
 async def test_the_letter_is_in_the_applicants_language(

@@ -77,3 +77,54 @@ def test_render_document_refuses_an_external_resource() -> None:
 def test_qr_is_an_embedded_png_data_uri() -> None:
     uri = pdf.qr_png_data_uri("RX-2026-000001 sha256:abc")
     assert re.match(r"^data:image/png;base64,[A-Za-z0-9+/=]+$", uri)
+
+
+# --- Stage 16 fix wave F1: public `assert_renderable`, `strip_invisible`, ----
+# `renderable_text` -------------------------------------------------------
+
+
+def test_assert_renderable_is_the_public_name() -> None:
+    """F1.1: the check `decision.reject` must call before it spends the head's
+    ERI is now public — a rename, not a new function; `render_document` still
+    calls it (the tests above already prove that indirectly)."""
+    with pytest.raises(DomainError) as raised:
+        pdf.assert_renderable({"fact": "Ali 🙂"})
+    assert raised.value.details is not None
+    assert raised.value.details["reason"] == "unrenderable_characters"
+    assert "fact" in raised.value.details["fields"]
+
+
+def test_strip_invisible_removes_every_format_character() -> None:
+    """U+FEFF (BOM), U+200B (zero-width space), U+200F (RTL mark), U+2060
+    (word joiner) and U+00AD (soft hyphen) are all Unicode category `Cf` —
+    invisible to whoever typed them, ordinary codepoints to `min_length=1`."""
+    dirty = "﻿Bir​inchi‏ holat⁠ so­ʻz"
+    assert pdf.strip_invisible(dirty) == "Birinchi holat soʻz"
+
+
+def test_strip_invisible_leaves_ordinary_text_untouched() -> None:
+    assert pdf.strip_invisible(ALL_SCRIPTS) == ALL_SCRIPTS
+
+
+def test_renderable_text_strips_invisible_characters_too() -> None:
+    assert pdf.renderable_text("﻿Ali") == "Ali"
+
+
+def test_renderable_text_replaces_rather_than_drops_an_uncovered_character() -> None:
+    """The other half of ruling R6: data that was never typed into a request
+    this document's signature covers must never make the WHOLE document
+    unrenderable — an uncovered character is REPLACED, not removed, so its
+    position and the surrounding text survive."""
+    result = pdf.renderable_text("Ali 🙂 Vali")
+    assert "🙂" not in result
+    assert result.startswith("Ali ") and result.endswith(" Vali")
+    assert len(result) == len("Ali 🙂 Vali")
+
+
+def test_renderable_text_decides_the_replacement_character_once_from_the_cmap() -> None:
+    """Every substitution across a document uses the SAME glyph — proven by
+    calling it twice and getting the same character back both times."""
+    first = pdf.renderable_text("🙂")
+    second = pdf.renderable_text("🙂")
+    assert first == second
+    assert first in ("�", "?")

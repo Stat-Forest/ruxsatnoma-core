@@ -4,7 +4,11 @@ import uuid
 
 from sqlalchemy import select, text
 
-from app.modules.applications.models import ApplicationPrintout
+from app.modules.applications.models import (
+    Application,
+    ApplicationPrintout,
+    ApplicationRejectionGround,
+)
 from tests.modules.applications.test_decision import _decide, _ground, _reject_body
 
 
@@ -84,37 +88,86 @@ async def test_the_card_lists_its_printouts(
     assert [p["kind"] for p in card["printouts"]] == ["letter", "rejection_notice"]
 
 
-async def test_an_unrenderable_fact_refuses_the_download_without_touching_the_row(
-    db, applicant_client, executor_head_client, application_in_review, rejection_reason_item
+async def test_an_unrenderable_fact_refuses_the_rejection_before_the_signature(
+    db, executor_head_client, application_in_review, rejection_reason_item
 ) -> None:
-    """The reject ITSELF must succeed — the snapshot only freezes the text
-    (`printouts.record_rejection_notice`); `pdf.render_document`'s own
-    `_assert_renderable` is what refuses an emoji the bundled DejaVu Serif
-    face cannot draw, and it only ever runs at DOWNLOAD (R6, lazy render)."""
-    rejected = await _decide(
+    """Stage 16 fix wave F1 — INVERTED from this test's own prior behaviour
+    ("reject 200, download 422"): `decision.reject` now calls
+    `pdf.assert_renderable` over every ground's text BEFORE `_sign_decision`
+    spends the head's ERI, so an emoji the bundled DejaVu Serif face cannot
+    draw is refused at REJECT time. Snapshots are immutable once recorded, so
+    the old behaviour signed and froze a rejection notice that could never be
+    rendered — permanently."""
+    result = await _decide(
         executor_head_client,
         application_in_review,
         "reject",
         **_reject_body(rejection_reason_item, _ground(rejection_reason_item, fact="Ali 🙂")),
     )
-    assert rejected.status_code == 200, rejected.text
-    result = await applicant_client.get(
-        f"/api/v1/applications/{application_in_review}/rejection-notice.pdf"
-    )
     assert result.status_code == 422, result.text
     body = result.json()
     assert body["error"]["code"] == "ERR-VAL-001"
     assert body["error"]["details"]["reason"] == "unrenderable_characters"
-    row = (
+    assert "grounds.0.fact" in body["error"]["details"]["fields"]
+
+    timeline = (
+        await executor_head_client.get(f"/api/v1/applications/{application_in_review}/timeline")
+    ).json()
+    assert timeline["signatures"] == [], "no signature may be spent on an unrenderable ground"
+
+    application = await db.get(
+        Application, uuid.UUID(application_in_review), populate_existing=True
+    )
+    assert application.status == "IN_REVIEW"
+
+    grounds = (
+        (
+            await db.execute(
+                select(ApplicationRejectionGround).where(
+                    ApplicationRejectionGround.application_id == uuid.UUID(application_in_review)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert grounds == []
+
+    printout = (
         await db.execute(
             select(ApplicationPrintout).where(
                 ApplicationPrintout.application_id == uuid.UUID(application_in_review),
                 ApplicationPrintout.kind == "rejection_notice",
             )
         )
+    ).scalar_one_or_none()
+    assert printout is None
+
+
+async def test_a_bom_and_zero_width_space_are_stripped_from_a_rejection_ground(
+    db, executor_head_client, application_in_review, rejection_reason_item
+) -> None:
+    """F1.2: `strip_invisible` runs on every ground field BEFORE pydantic's
+    own `min_length=1` — a BOM or zero-width space pasted from Word must not
+    silently ride into the append-only `application_rejection_grounds` row."""
+    dirty_fact = "﻿Birinchi​ holat"
+    result = await _decide(
+        executor_head_client,
+        application_in_review,
+        "reject",
+        **_reject_body(rejection_reason_item, _ground(rejection_reason_item, fact=dirty_fact)),
+    )
+    assert result.status_code == 200, result.text
+    row = (
+        await db.execute(
+            select(ApplicationRejectionGround).where(
+                ApplicationRejectionGround.application_id == uuid.UUID(application_in_review)
+            )
+        )
     ).scalar_one()
-    await db.refresh(row)
-    assert row.file_id is None and row.sha256 is None
+    assert "﻿" not in row.fact
+    assert "​" not in row.fact
+    assert row.fact == "Birinchi holat"
 
 
 async def test_an_archived_stored_file_refuses_the_download(

@@ -47,7 +47,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import settings_store
+from app.core import pdf, settings_store
 from app.core.errors import err
 from app.core.events import Event, publish
 from app.modules.admin import repo as admin_repo
@@ -677,6 +677,16 @@ async def reject(
     required and bounded to 1..10 by `ApplicationRejectIn` itself, so an empty
     or oversized list never reaches this function at all.
 
+    **An unrenderable character is refused HERE, before `_sign_decision`
+    spends the head's ERI** (stage 16 fix wave F1): `pdf.assert_renderable`
+    runs over every ground's five text fields plus `reapply_text`/
+    `appeal_text`, keyed `grounds.{i}.{field}` (0-based). Snapshots are
+    immutable once recorded, so a fact pasted from Word carrying a character
+    the bundled face cannot draw would otherwise sign, store and freeze a
+    rejection notice that can never be rendered — permanently. This is the
+    request-side half of R6; `printouts.renderable_text` is the other half,
+    for data that was never typed into this request at all.
+
     **Ruling R8 retires ruling #182's server-side default.** The old
     `legal_basis` fallback off a rejected benefit claim is gone: the reject
     form now prefills the first ground's `fact` with that reason instead, and
@@ -701,6 +711,16 @@ async def reject(
         db, application_id, to_status=REJECTED_STATUS, actor=actor, action=APPLICATION_REJECT
     )
     items = [await _rejection_ground_item(db, g.reason_item_id) for g in grounds]
+    renderable_values: dict[str, Any] = {}
+    for index, ground in enumerate(grounds):
+        renderable_values[f"grounds.{index}.fact"] = ground.fact
+        renderable_values[f"grounds.{index}.legal_document"] = ground.legal_document
+        renderable_values[f"grounds.{index}.legal_clause"] = ground.legal_clause
+        renderable_values[f"grounds.{index}.evidence"] = ground.evidence
+        renderable_values[f"grounds.{index}.remedy"] = ground.remedy
+    renderable_values["reapply_text"] = reapply_text
+    renderable_values["appeal_text"] = appeal_text
+    pdf.assert_renderable(renderable_values)
     signature = await _sign_decision(db, application, pkcs7=pkcs7, actor=actor, ip=ip)
     first = grounds[0]
     legal_basis = f"{first.legal_document}, {first.legal_clause}"

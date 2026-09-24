@@ -35,6 +35,7 @@ from pydantic import (
     field_validator,
 )
 
+from app.core.pdf import strip_invisible
 from app.core.time import TASHKENT
 
 # Spelled out rather than `Literal[*APPLICATION_STATUSES]`: pyright rejects a
@@ -942,6 +943,15 @@ _Text300 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1,
 _Text100 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
 
+def _strip_invisible_field(value: Any) -> Any:
+    """A `mode="before"` validator body (stage 16 fix wave F1.2): runs BEFORE
+    `StringConstraints`' own `strip_whitespace`/`min_length=1`, so a field
+    consisting only of a BOM or a zero-width space (invisible to whoever
+    pasted it from Word) reads as blank — 422 — rather than a false non-empty
+    pass. Non-`str` input is left alone; pydantic's own type check reports it."""
+    return strip_invisible(value) if isinstance(value, str) else value
+
+
 class RejectionGroundIn(BaseModel):
     """One ground of a rejection (stage 16, ruling R3) — every field required:
     the blank refuses a bare generic reason, so an empty or whitespace-only
@@ -955,6 +965,11 @@ class RejectionGroundIn(BaseModel):
     legal_clause: _Text100
     evidence: _Text2000
     remedy: _Text2000
+
+    @field_validator("fact", "legal_document", "legal_clause", "evidence", "remedy", mode="before")
+    @classmethod
+    def _strip_invisible_characters(cls, value: Any) -> Any:
+        return _strip_invisible_field(value)
 
 
 class ApplicationRejectIn(BaseModel):
@@ -970,6 +985,11 @@ class ApplicationRejectIn(BaseModel):
     ]
     reapply_text: _Text2000
     appeal_text: _Text2000
+
+    @field_validator("reapply_text", "appeal_text", mode="before")
+    @classmethod
+    def _strip_invisible_characters(cls, value: Any) -> Any:
+        return _strip_invisible_field(value)
 
 
 class RejectionDefaultsOut(BaseModel):
