@@ -13,12 +13,19 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StringConstraints,
     ValidationInfo,
     field_serializer,
     field_validator,
 )
 
-from app.core.schemas import CodeStr
+from app.core.schemas import DAYS_MAX, LIST_MAX_ITEMS, CodeStr
+
+# A required legal-basis note, stripped (stage 17 R5) so a whitespace-only
+# one refuses the same way a blank one already does. Shared by every
+# `basis` field on this page (`RuleParameterIn`/`Patch`, `TariffIn`/`Patch`)
+# so the bound and the stripping live in exactly one place.
+BasisStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 
 def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
@@ -58,7 +65,18 @@ def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
     return value
 
 
-BenefitModifiers = Annotated[dict[str, str] | None, AfterValidator(_benefit_modifiers)]
+# `TariffIn.benefit_modifiers`/`.benefit_modifiers.*` (stage 17 C1): keys are
+# benefit codes (VMQ 278's own short list), values are the `"0".."1"` string
+# `_benefit_modifiers` above parses — 20 chars comfortably covers any decimal
+# representation `Decimal` produces, and `maxProperties` caps the map at more
+# entries than VMQ 278 could ever seed. `maxProperties` has to sit on the
+# `dict[...]` annotation ITSELF, not on the `... | None` union around it —
+# `Field(json_schema_extra=...)` on the union lands on the `anyOf` wrapper,
+# a level `test_request_bounds.py`'s walker never inspects (it visits each
+# `anyOf` member on its own).
+_ModifierValue = Annotated[str, StringConstraints(max_length=20)]
+_ModifiersMap = Annotated[dict[str, _ModifierValue], Field(json_schema_extra={"maxProperties": 50})]
+BenefitModifiers = Annotated[_ModifiersMap | None, AfterValidator(_benefit_modifiers)]
 
 # The DB CHECKs these mirror live in migrations 0011 (`livestock_group_valid`)
 # and 0013 (`quantity_unit_valid`). Unbounded, a typo flushed into an
@@ -95,6 +113,12 @@ class SeasonWindow(BaseModel):
     to: MonthDay
 
 
+# A season's own windows are a handful of MM-DD ranges within one calendar
+# year — generous enough that no real leshoz form ever approaches it, tight
+# enough that a body cannot pointlessly grow past it (stage 17 C1).
+MAX_SEASON_WINDOWS = 20
+
+
 class Season(BaseModel):
     """`season` used to be free-form JSONB written straight through from the
     request (I5, final review). A window missing `from`/`to` raised a
@@ -102,7 +126,14 @@ class Season(BaseModel):
     /calculations/preview`, not a domain error — and a non-string value was a
     `TypeError` the same way."""
 
-    windows: list[SeasonWindow] = Field(default_factory=list)
+    windows: list[SeasonWindow] = Field(default_factory=list, max_length=MAX_SEASON_WINDOWS)
+
+
+# A calendar-year bound for `Rotation.rest_years` (stage 17 C1) — generous on
+# both ends of a rotation planned decades out, tight enough to keep the field
+# an actual year rather than an arbitrary integer.
+MIN_REST_YEAR = 1900
+MAX_REST_YEAR = 2100
 
 
 class Rotation(BaseModel):
@@ -112,24 +143,26 @@ class Rotation(BaseModel):
     silently for a resting year: a fail-open on a BLOCKING check from a
     plausible data-entry mistake, with no error anywhere (I5)."""
 
-    rest_years: list[int] = Field(default_factory=list)
+    rest_years: list[Annotated[int, Field(ge=MIN_REST_YEAR, le=MAX_REST_YEAR)]] = Field(
+        default_factory=list, max_length=LIST_MAX_ITEMS
+    )
 
 
 class RuleParameterIn(BaseModel):
     code: Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+(:[a-z0-9_]+)?$")]
     value: Any
-    unit: str | None = None
+    unit: CodeStr | None = None
     effective_from: date
     effective_to: date | None = None
-    basis: Annotated[str, Field(min_length=1, max_length=500)]
+    basis: BasisStr
 
 
 class RuleParameterPatch(BaseModel):
     value: Any = None
-    unit: str | None = None
+    unit: CodeStr | None = None
     effective_from: date | None = None
     effective_to: date | None = None
-    basis: str | None = None
+    basis: BasisStr | None = None
 
 
 class RuleParameterOut(BaseModel):
@@ -151,12 +184,18 @@ class RuleParameterOut(BaseModel):
 class TariffIn(BaseModel):
     activity_type_id: uuid.UUID
     livestock_group: LivestockGroup | None = None
-    coefficient: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)]
+    # `Numeric(12, 6)` is `tariffs.coefficient`'s own column (stage 17 R4:
+    # `10**(p-s) - 10**-s` = `999999.999999`); `max_digits`/`decimal_places`
+    # already enforce it but emit no OpenAPI `maximum`, so `le=` is added
+    # alongside them, not in place of them.
+    coefficient: Annotated[
+        Decimal, Field(ge=0, le=Decimal("999999.999999"), max_digits=12, decimal_places=6)
+    ]
     quantity_unit: QuantityUnit
     benefit_modifiers: BenefitModifiers = None
     effective_from: date
     effective_to: date | None = None
-    basis: Annotated[str, Field(min_length=1, max_length=500)]
+    basis: BasisStr
 
 
 class TariffPatch(BaseModel):
@@ -164,12 +203,17 @@ class TariffPatch(BaseModel):
     `service._Versioned.key_filters` matches a tariff by) and stay out of this
     patch for the same reason `RuleParameterPatch` excludes `code`."""
 
-    coefficient: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)] | None = None
+    coefficient: (
+        Annotated[
+            Decimal, Field(ge=0, le=Decimal("999999.999999"), max_digits=12, decimal_places=6)
+        ]
+        | None
+    ) = None
     quantity_unit: QuantityUnit | None = None
     benefit_modifiers: BenefitModifiers = None
     effective_from: date | None = None
     effective_to: date | None = None
-    basis: str | None = None
+    basis: BasisStr | None = None
 
 
 class TariffOut(BaseModel):
@@ -194,12 +238,24 @@ class TariffOut(BaseModel):
 class NormIn(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
-    yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    # `Numeric(10, 4)`/`Numeric(14, 4)` are `norms.yield_c_per_ha`/`.capacity`'s
+    # own columns (stage 17 R4: `10**(p-s) - 10**-s`); `max_digits`/
+    # `decimal_places` already enforce the same ceiling but emit no OpenAPI
+    # `maximum`, so `le=` sits alongside them.
+    yield_c_per_ha: (
+        Annotated[Decimal, Field(ge=0, le=Decimal("999999.9999"), max_digits=10, decimal_places=4)]
+        | None
+    ) = None
     # Ruling #176 (stage 9): the general capacity limit, in the activity's own
     # `quantity_unit` — grazing keeps `max_sb` alone and refuses this field
     # (`service.create_norm`), so a second source of truth for the same fact
     # can never be written.
-    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
+    capacity: (
+        Annotated[
+            Decimal, Field(ge=0, le=Decimal("9999999999.9999"), max_digits=14, decimal_places=4)
+        ]
+        | None
+    ) = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -211,8 +267,16 @@ class NormPatch(BaseModel):
     """`contour_id`/`activity_type_id` are identity and stay out of this patch,
     the same way `TariffPatch` excludes its own key fields."""
 
-    yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
-    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
+    yield_c_per_ha: (
+        Annotated[Decimal, Field(ge=0, le=Decimal("999999.9999"), max_digits=10, decimal_places=4)]
+        | None
+    ) = None
+    capacity: (
+        Annotated[
+            Decimal, Field(ge=0, le=Decimal("9999999999.9999"), max_digits=14, decimal_places=4)
+        ]
+        | None
+    ) = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -268,7 +332,7 @@ class ActivitySeasonIn(BaseModel):
     organization_id: uuid.UUID
     activity_type_id: uuid.UUID
     season: Season = Field(default_factory=Season)
-    min_term_days: Annotated[int, Field(gt=0)] | None = None
+    min_term_days: Annotated[int, Field(gt=0, le=DAYS_MAX)] | None = None
 
 
 class ActivitySeasonPatch(BaseModel):
@@ -284,7 +348,7 @@ class ActivitySeasonPatch(BaseModel):
     gis_enabled`)."""
 
     season: Season | None = None
-    min_term_days: Annotated[int, Field(gt=0)] | None = None
+    min_term_days: Annotated[int, Field(gt=0, le=DAYS_MAX)] | None = None
 
     @field_validator("season", mode="after")
     @classmethod
@@ -371,6 +435,12 @@ class PublishOut(BaseModel):
 MAX_HEAD_COUNT = 1_000_000
 # Ten livestock types are seeded; a valid request names each at most once.
 MAX_LIVESTOCK_ITEMS = 20
+# `CalculationIn.quantity`/`PublicEstimateIn.quantity` (stage 17 R7): no DB
+# column of its own (it feeds `bhm * coefficient * quantity` and is recorded
+# inside `input_snapshot`, never a `Numeric` column), so it gets a named
+# domain constant instead of a column-derived one — 12 digits, 4 decimals,
+# matching the adminka wizard's own `max=99999999.9999`.
+MAX_QUANTITY = Decimal("99999999.9999")
 
 
 class LivestockItemIn(BaseModel):
@@ -432,9 +502,11 @@ class CalculationIn(BaseModel):
     activity_type_id: uuid.UUID
     period_from: date
     period_to: date
-    quantity: Annotated[Decimal, Field(ge=0)] | None = None
+    quantity: (
+        Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY, max_digits=12, decimal_places=4)] | None
+    ) = None
     items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
-    benefit_code: str | None = None
+    benefit_code: CodeStr | None = None
 
 
 class CalculationOut(BaseModel):
@@ -487,7 +559,9 @@ class PublicEstimateIn(BaseModel):
     activity_type_id: uuid.UUID
     period_from: date
     period_to: date
-    quantity: Annotated[Decimal, Field(ge=0)] | None = None
+    quantity: (
+        Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY, max_digits=12, decimal_places=4)] | None
+    ) = None
     items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
 
 

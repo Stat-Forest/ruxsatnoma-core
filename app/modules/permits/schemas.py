@@ -24,7 +24,7 @@ from pydantic import (
     model_validator,
 )
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import BlobStr, JsonObject, LocalizedName
 
 # Spelled out rather than `Literal[*PERMIT_STATUSES]`: pyright rejects a starred
 # variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal` is exactly
@@ -246,7 +246,7 @@ class PermitSignIn(BaseModel):
     """
 
     purpose: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")]
-    pkcs7: Annotated[str | None, Field(min_length=1)] = None
+    pkcs7: BlobStr | None = None
 
 
 class PermitSignatureOut(BaseModel):
@@ -276,7 +276,7 @@ class DecisionIn(BaseModel):
     reason_item_id: uuid.UUID
     legal_basis: Annotated[str | None, Field(max_length=2000)] = None
     doc_file_id: uuid.UUID | None = None
-    pkcs7: Annotated[str, Field(min_length=1)]
+    pkcs7: BlobStr
 
 
 class DuplicateIn(BaseModel):
@@ -334,7 +334,7 @@ class ForestTicketIn(BaseModel):
 
     valid_from: date
     valid_to: date
-    restrictions: dict[str, Any]
+    restrictions: JsonObject
 
     @model_validator(mode="after")
     def _check_period(self) -> Self:

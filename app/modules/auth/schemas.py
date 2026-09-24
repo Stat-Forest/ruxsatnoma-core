@@ -8,6 +8,8 @@ from typing import Annotated, Any, Literal
 from email_validator import validate_email
 from pydantic import BaseModel, EmailStr, Field, StringConstraints, model_validator
 
+from app.core.schemas import BlobStr, CodeStr, NameStr, PasswordStr
+
 
 class UserOut(BaseModel):
     id: uuid.UUID
@@ -35,18 +37,36 @@ class ZoneOut(BaseModel):
 
 
 class ConsentsIn(BaseModel):
-    privacy_policy: str
-    offer: str
+    # Version codes (`"1.0"`), never the document text itself — compared
+    # against `settings_store`'s own `privacy_policy_version`/`offer_version`
+    # (`service.py::_check_consents_current`).
+    privacy_policy: CodeStr
+    offer: CodeStr
 
 
 class CompleteRegistrationIn(BaseModel):
     consents: ConsentsIn
-    phone: str = Field(pattern=r"^\+998[0-9]{9}$")
-    otp_token: str
+    # `max_length` alongside the existing pattern (stage 17 C1): the literal
+    # `+` in `\+998...` makes `test_request_bounds.py`'s pattern-anchored
+    # check treat this as unbounded (it flags any `*`/`+` character in the
+    # raw pattern string, escaped or not), and a stray `maxLength` is the
+    # simplest fix that leaves the regex itself untouched.
+    phone: str = Field(pattern=r"^\+998[0-9]{9}$", max_length=13)
+    # An OTP handoff token (`service.new_token()`, `secrets.token_urlsafe(32)`)
+    # — never typed by hand, but the same "human-typed token" class `PasswordStr`
+    # already covers (never stripped: it is compared byte for byte).
+    otp_token: PasswordStr
     email: EmailStr | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
-    address: str | None = None
+    # Same bound as `ApplicantAddressIn.address` above, for the same reason:
+    # this route no longer collects it in practice (ruling #113 moved the
+    # requisite to `ApplicationWizardPage`'s own submit), but the field stays
+    # reachable and a whitespace-only address must not pass as a real one.
+    address: (
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+        | None
+    ) = None
 
 
 class ApplicantOut(BaseModel):
@@ -119,12 +139,15 @@ class EimzoChallengeOut(BaseModel):
 
 
 class EimzoLoginIn(BaseModel):
-    signed_challenge: str
+    # E-IMZO's own signed envelope, posted straight through to the adapter
+    # (`RealEimzo.verify_signed_challenge`) — the same PKCS#7-shaped blob
+    # `signatures.CertificateBindIn.pkcs7` carries, so the same bound.
+    signed_challenge: BlobStr
 
 
 class LoginIn(BaseModel):
-    login: str
-    password: str
+    login: CodeStr
+    password: PasswordStr
 
 
 class LoginOut(BaseModel):
@@ -142,13 +165,13 @@ class LoginOut(BaseModel):
 
 
 class MfaIn(BaseModel):
-    mfa_token: str
-    code: str
+    mfa_token: PasswordStr
+    code: PasswordStr
 
 
 class PasswordChangeIn(BaseModel):
-    old_password: str
-    new_password: str
+    old_password: PasswordStr
+    new_password: PasswordStr
 
 
 class PasswordForgotLookupIn(BaseModel):
@@ -175,7 +198,7 @@ class PasswordForgotResetIn(BaseModel):
     login: str = Field(min_length=1, max_length=150)
     channel: Literal["phone", "email"]
     code: str = Field(min_length=1, max_length=16)
-    new_password: str
+    new_password: PasswordStr
 
 
 def _validate_target_format(target: str, purpose: str) -> None:
@@ -195,7 +218,17 @@ def _validate_target_format(target: str, purpose: str) -> None:
 
 class OtpRequestIn(BaseModel):
     target_type: Literal["phone", "email"]
-    target: str
+    # A phone number OR an email address, human-typed — unlike `LoginIn.
+    # login` (a dedicated username, never an email: `repo.get_user_by_login`
+    # matches only `users.login`), this field genuinely carries an email
+    # half the time, and RFC 5321 allows one up to 254 characters. `CodeStr`
+    # (64) refused a real, syntactically valid long address here before fix
+    # round 1 (`test_a_long_but_valid_email_target_is_not_refused_on_
+    # length`) — `NameStr`'s 255-char bound is reused for its LENGTH only,
+    # not its "name" semantics. `_validate_target_format` below still does
+    # the real format check; this is only the upper bound
+    # `test_request_bounds.py` requires.
+    target: NameStr
     purpose: Literal["phone_verify", "email_verify"]
 
     @model_validator(mode="after")
@@ -208,8 +241,9 @@ class OtpRequestIn(BaseModel):
 
 
 class OtpVerifyIn(BaseModel):
-    target: str
-    code: str
+    # Same reasoning as `OtpRequestIn.target` above: this can be an email too.
+    target: NameStr
+    code: PasswordStr
     purpose: Literal["phone_verify", "email_verify"]
 
     @model_validator(mode="after")
@@ -225,10 +259,10 @@ class OtpVerifyOut(BaseModel):
 class AttachLegalIn(BaseModel):
     stir: str = Field(pattern=r"^[0-9]{9}$")
     basis: Literal["org_eri", "director_registry", "poa"]
-    signed_challenge: str | None = None
+    signed_challenge: BlobStr | None = None
     poa_file_id: uuid.UUID | None = None
     valid_until: date | None = None
-    name: str | None = None
+    name: NameStr | None = None
 
     @model_validator(mode="after")
     def _validate_basis_fields(self) -> AttachLegalIn:
@@ -247,7 +281,7 @@ class AttachLegalOut(BaseModel):
 class AddRepresentationIn(BaseModel):
     user_pinfl: str = Field(pattern=r"^[0-9]{14}$")
     basis: Literal["org_eri", "director_registry", "poa"]
-    signed_challenge: str | None = None
+    signed_challenge: BlobStr | None = None
     poa_file_id: uuid.UUID | None = None
     valid_until: date | None = None
 
@@ -261,14 +295,17 @@ class AddRepresentationIn(BaseModel):
 
 
 class ContactUpdateIn(BaseModel):
-    phone: str | None = Field(default=None, pattern=r"^\+998[0-9]{9}$")
+    # `max_length` alongside the pattern for the same reason
+    # `CompleteRegistrationIn.phone` carries one now (stage 17 C1): the
+    # literal `+` in the pattern reads as "unbounded" to the walker.
+    phone: str | None = Field(default=None, pattern=r"^\+998[0-9]{9}$", max_length=13)
     email: EmailStr | None = None
     # Optional since decision #150: a staff member changes their own phone number
     # with no SMS code, because no SMS is ever sent to them and a confirmation they
     # cannot receive is a number they cannot change. Whether the token is REQUIRED
     # is a question about the caller's role, so `service.update_contact` decides it
     # — this schema cannot see the user.
-    otp_token: str | None = None
+    otp_token: PasswordStr | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self) -> ContactUpdateIn:

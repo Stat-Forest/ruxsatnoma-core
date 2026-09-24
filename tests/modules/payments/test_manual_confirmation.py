@@ -549,8 +549,11 @@ async def test_reject_refuses_an_empty_reason(
     payments_view_client, head_client, pending_invoice: Invoice, bank_doc: MediaFile
 ):
     """A missing field is FastAPI's own validation; a present-but-blank one is
-    the service's check, since a Pydantic `str` requirement cannot see past
-    whitespace the way `str.strip()` can. Both are `ERR-VAL-001`."""
+    now ALSO refused at the schema level (stage 17 QA run 01 C2/R5:
+    `ManualConfirmationRejectIn.reason` is `TextStr`, which strips before
+    checking `min_length=1`) — both answer `ERR-VAL-001`, via FastAPI's own
+    validation shape rather than the service's `reason_required` domain
+    error."""
     filed = await _file_via_http(payments_view_client, pending_invoice, bank_doc)
 
     missing = await head_client.post(f"{MANUAL_CONFIRMATIONS}/{filed['id']}/reject", json={})
@@ -561,7 +564,7 @@ async def test_reject_refuses_an_empty_reason(
         f"{MANUAL_CONFIRMATIONS}/{filed['id']}/reject", json={"reason": "   "}
     )
     assert blank.status_code == 422, blank.text
-    assert blank.json()["error"]["details"]["reason"] == "reason_required"
+    assert blank.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_reject_records_the_reason_and_moves_no_money(

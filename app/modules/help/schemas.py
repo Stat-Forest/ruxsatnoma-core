@@ -5,7 +5,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import SORT_ORDER_MAX, LocalizedName
 
 
 class FaqOut(BaseModel):
@@ -21,14 +21,14 @@ class FaqIn(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     question: LocalizedName
     answer: LocalizedName
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
 
 
 class FaqPatch(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     question: LocalizedName | None = None
     answer: LocalizedName | None = None
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
     status: str | None = Field(default=None, pattern="^(draft|published|archived)$")
 
 

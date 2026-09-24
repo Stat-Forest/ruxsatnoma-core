@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from app.core.schemas import LIST_MAX_ITEMS, CodeStr, JsonObject
+
 # Spelled out rather than `Literal[*models.SEARCH_KINDS]` (pyright rejects a
 # starred variable inside `Literal`, `reportInvalidTypeForm` — same shape
 # `permits.schemas` documents for its own status literal).
@@ -20,6 +22,15 @@ ExportStatus = Literal["done", "failed"]
 
 _Name = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
 _Query = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
+
+# `SavedFilterIn.shared`/`.shared.*`/`.shared.*[]` (stage 17 C1): the stored
+# shape is `{"role_codes": [...], "user_ids": [...]}` (`search.repo`'s own
+# docstring) — role codes and stringified user UUIDs both fit `CodeStr`'s
+# bound. `maxProperties` is declared through `json_schema_extra` because a
+# plain `dict[str, list[CodeStr]]` carries no bound of its own for
+# `test_request_bounds.py` to see.
+_SharedGroup = Annotated[list[CodeStr], Field(max_length=LIST_MAX_ITEMS)]
+SharedMap = Annotated[dict[str, _SharedGroup], Field(json_schema_extra={"maxProperties": 10})]
 
 
 class SearchResultOut(BaseModel):
@@ -43,16 +54,16 @@ class SavedFilterIn(BaseModel):
 
     name: _Name
     kind: SearchKind
-    params: dict[str, Any] = Field(default_factory=dict)
-    shared: dict[str, list[str]] | None = None
+    params: JsonObject = Field(default_factory=dict)
+    shared: SharedMap | None = None
 
 
 class SavedFilterPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: _Name | None = None
-    params: dict[str, Any] | None = None
-    shared: dict[str, list[str]] | None = None
+    params: JsonObject | None = None
+    shared: SharedMap | None = None
 
 
 class SavedFilterOut(BaseModel):
@@ -78,7 +89,7 @@ class ExportCreate(BaseModel):
     kind: SearchKind
     format: ExportFormat
     q: _Query | None = None
-    status: str | None = None
+    status: CodeStr | None = None
     organization_id: uuid.UUID | None = None
     activity_type_id: uuid.UUID | None = None
     series: Annotated[str | None, StringConstraints(max_length=10)] = None
