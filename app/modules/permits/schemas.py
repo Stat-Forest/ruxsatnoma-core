@@ -245,7 +245,16 @@ class PermitSignIn(BaseModel):
     anyone, whatever the purpose or the application's `on_behalf`.
     """
 
-    purpose: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")]
+    # `strip_whitespace=True` (I4, final review): the pattern is anchored, so
+    # it already rejects bare whitespace, but it used to refuse real content
+    # with accidental surrounding whitespace too instead of accepting it
+    # stripped, the C2 rule every other required code-shaped field follows.
+    purpose: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True, min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$"
+        ),
+    ]
     pkcs7: BlobStr | None = None
 
 

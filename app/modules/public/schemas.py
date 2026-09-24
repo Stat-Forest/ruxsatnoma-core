@@ -10,7 +10,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import LocalizedName, LongTextStr, NameStr
 
 
 class AppealContact(BaseModel):
@@ -28,10 +28,14 @@ class AppealContact(BaseModel):
 
 
 class AppealIn(BaseModel):
-    applicant_name: str = Field(min_length=1, max_length=255)
+    # `NameStr`/`LongTextStr` (C2, final review) — required, stripped so a
+    # whitespace-only value is refused the same way a blank one already is.
+    # No adminka/landing form submits this route yet (I4's own check), so
+    # nothing pins these below the shared types' own defaults.
+    applicant_name: NameStr
     contact: AppealContact
-    subject: str = Field(min_length=1, max_length=255)
-    body: str = Field(min_length=1, max_length=5000)
+    subject: NameStr
+    body: LongTextStr
 
 
 class AppealSubmitOut(BaseModel):
@@ -65,7 +69,7 @@ class AppealAdminOut(BaseModel):
 
 
 class AppealAnswerIn(BaseModel):
-    answer_text: str = Field(min_length=1, max_length=5000)
+    answer_text: LongTextStr
 
 
 class AppealStatusIn(BaseModel):

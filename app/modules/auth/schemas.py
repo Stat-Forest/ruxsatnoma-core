@@ -46,12 +46,12 @@ class ConsentsIn(BaseModel):
 
 class CompleteRegistrationIn(BaseModel):
     consents: ConsentsIn
-    # `max_length` alongside the existing pattern (stage 17 C1): the literal
-    # `+` in `\+998...` makes `test_request_bounds.py`'s pattern-anchored
-    # check treat this as unbounded (it flags any `*`/`+` character in the
-    # raw pattern string, escaped or not), and a stray `maxLength` is the
-    # simplest fix that leaves the regex itself untouched.
-    phone: str = Field(pattern=r"^\+998[0-9]{9}$", max_length=13)
+    # The anchored pattern alone bounds this (M6, final review):
+    # `test_request_bounds.py`'s walker now ignores an ESCAPED `\+`/`\*` (a
+    # literal character, not an open quantifier), so the `max_length=13`
+    # this field used to carry alongside the pattern — a workaround for that
+    # walker limitation — is gone; the pattern was always the real bound.
+    phone: str = Field(pattern=r"^\+998[0-9]{9}$")
     # An OTP handoff token (`service.new_token()`, `secrets.token_urlsafe(32)`)
     # — never typed by hand, but the same "human-typed token" class `PasswordStr`
     # already covers (never stripped: it is compared byte for byte).
@@ -174,8 +174,16 @@ class PasswordChangeIn(BaseModel):
     new_password: PasswordStr
 
 
+# `login: CodeStr` on all three below (C2, final review) matches `LoginIn.login`
+# exactly — stripped, 64 — rather than the wider, unstripped 150 they used to
+# carry: three different bounds for the same field is what let a login with
+# trailing whitespace slip past the reset flow's own uniqueness lookup while
+# `LoginIn` already refused it. The adminka sets no client-side maxLength on
+# this input at all (`LoginPage.tsx`), so nothing pins it above 64.
+
+
 class PasswordForgotLookupIn(BaseModel):
-    login: str = Field(min_length=1, max_length=150)
+    login: CodeStr
 
 
 class PasswordForgotLookupOut(BaseModel):
@@ -190,14 +198,18 @@ class PasswordForgotLookupOut(BaseModel):
 
 
 class PasswordForgotSendIn(BaseModel):
-    login: str = Field(min_length=1, max_length=150)
+    login: CodeStr
     channel: Literal["phone", "email"]
 
 
 class PasswordForgotResetIn(BaseModel):
-    login: str = Field(min_length=1, max_length=150)
+    login: CodeStr
     channel: Literal["phone", "email"]
-    code: str = Field(min_length=1, max_length=16)
+    # `PasswordStr` (I4, final review): a human-typed OTP code, the same type
+    # `MfaIn.code`/`OtpVerifyIn.code` already use for the identical reason —
+    # this one was the odd one out, a bare `Field(min_length=1, max_length=16)`
+    # that the new stripped-required-text check would otherwise flag.
+    code: PasswordStr
     new_password: PasswordStr
 
 
@@ -295,10 +307,9 @@ class AddRepresentationIn(BaseModel):
 
 
 class ContactUpdateIn(BaseModel):
-    # `max_length` alongside the pattern for the same reason
-    # `CompleteRegistrationIn.phone` carries one now (stage 17 C1): the
-    # literal `+` in the pattern reads as "unbounded" to the walker.
-    phone: str | None = Field(default=None, pattern=r"^\+998[0-9]{9}$", max_length=13)
+    # The anchored pattern alone bounds this (M6, final review) — see
+    # `CompleteRegistrationIn.phone`'s own comment.
+    phone: str | None = Field(default=None, pattern=r"^\+998[0-9]{9}$")
     email: EmailStr | None = None
     # Optional since decision #150: a staff member changes their own phone number
     # with no SMS code, because no SMS is ever sent to them and a confirmation they
