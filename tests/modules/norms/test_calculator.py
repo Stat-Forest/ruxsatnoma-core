@@ -18,6 +18,7 @@ from app.modules.norms.calculator import (
     ParamSnapshot,
     TariffFact,
     calculate,
+    explain,
     from_input_snapshot,
     max_sb,
     remaining_sb,
@@ -843,3 +844,125 @@ def test_the_recomputation_survives_the_shape_the_database_returns() -> None:
     rebuilt = calculate(*from_input_snapshot(json.loads(json.dumps(original.input_snapshot))))
     assert rebuilt.amount == original.amount
     assert rebuilt.breakdown == original.breakdown
+
+
+def _grazing_with_a_benefit_on_the_sheep_only() -> ParamSnapshot:
+    return ParamSnapshot(
+        values=PARAMS,
+        tariffs=(
+            TariffFact(
+                id=None,
+                livestock_group="small_adult",
+                coefficient=Decimal("0.1"),
+                quantity_unit="head",
+                benefit_modifiers={"veteran": "0.5"},
+            ),
+            GRAZING_TARIFFS[1],
+        ),
+        norm=NormFact(
+            id=None,
+            yield_c_per_ha=Decimal("12"),
+            max_sb=100,
+            season={"windows": [{"from": "04-01", "to": "10-31"}]},
+            rotation={"rest_years": []},
+        ),
+        load_sb=Decimal("0"),
+        load_source="none",
+    )
+
+
+def test_explain_retells_each_herd_line_with_its_own_benefit() -> None:
+    """What the card shows a citizen, read back from the stored (JSON) shape:
+    50 sheep × 0.1 BHM × 0.5 (veteran) × 412 000 = 1 030 000, and
+    3 cows × 0.45 BHM × 412 000 = 556 200 — the cows untouched by a benefit
+    only the sheep's row grants. The `limit` line is not a price line."""
+    result = calculate(
+        CalcRequest(
+            activity_code="grazing",
+            on_date=date(2026, 8, 30),
+            period_from=date(2026, 5, 1),
+            period_to=date(2026, 9, 30),
+            area_ha=Decimal("10"),
+            items=(LivestockItem("sheep_goat_6m", 50), LivestockItem("cattle_adult", 3)),
+            quantity=None,
+            benefit_code="veteran",
+        ),
+        _grazing_with_a_benefit_on_the_sheep_only(),
+    )
+    stored = json.loads(json.dumps({"b": result.breakdown, "s": result.input_snapshot}))
+
+    explained = explain(stored["b"], stored["s"])
+
+    assert explained["bhm"] == Decimal("412000")
+    sheep, cows = explained["lines"]
+    assert sheep["livestock_code"] == "sheep_goat_6m"
+    assert (sheep["quantity"], sheep["quantity_unit"]) == (Decimal("50"), "head")
+    assert sheep["coefficient"] == Decimal("0.1")
+    assert (sheep["benefit_code"], sheep["benefit_modifier"]) == ("veteran", Decimal("0.5"))
+    assert sheep["amount"] == Decimal("1030000")
+    assert cows["livestock_code"] == "cattle_adult"
+    assert (cows["benefit_code"], cows["benefit_modifier"]) == (None, None)
+    assert cows["amount"] == Decimal("556200")
+    assert sheep["amount"] + cows["amount"] == result.amount
+
+
+def test_explain_marks_the_lawful_zero_as_exempt() -> None:
+    result = calculate(
+        CalcRequest(
+            activity_code="science",
+            on_date=date(2026, 8, 30),
+            period_from=date(2026, 6, 1),
+            period_to=date(2026, 9, 30),
+            area_ha=Decimal("10"),
+            items=(),
+            quantity=Decimal("1"),
+            benefit_code=None,
+        ),
+        ParamSnapshot(
+            values=PARAMS, tariffs=(), norm=None, load_sb=Decimal("0"), load_source="none"
+        ),
+    )
+
+    (line,) = explain(result.breakdown, result.input_snapshot)["lines"]
+
+    assert line["exempt"] is True
+    assert line["activity_code"] == "science"
+    assert (line["quantity"], line["coefficient"], line["amount"]) == (None, None, Decimal("0"))
+
+
+def test_explain_rounds_a_line_to_the_tiyin_while_the_total_stays_whole() -> None:
+    """1 ha × 0.123457 BHM × 412 000 = 50 864.284: the line reads 50 864.28,
+    the amount billed is 50 864 — rounded once, by `rounding_money`."""
+    result = calculate(
+        CalcRequest(
+            activity_code="haymaking",
+            on_date=date(2026, 8, 30),
+            period_from=date(2026, 6, 1),
+            period_to=date(2026, 9, 30),
+            area_ha=Decimal("10"),
+            items=(),
+            quantity=Decimal("1"),
+            benefit_code=None,
+        ),
+        ParamSnapshot(
+            values=PARAMS,
+            tariffs=(
+                TariffFact(
+                    id=None,
+                    livestock_group=None,
+                    coefficient=Decimal("0.123457"),
+                    quantity_unit="ha",
+                    benefit_modifiers=None,
+                ),
+            ),
+            norm=None,
+            load_sb=Decimal("0"),
+            load_source="none",
+        ),
+    )
+
+    (line,) = explain(result.breakdown, result.input_snapshot)["lines"]
+
+    assert line["activity_code"] == "haymaking"
+    assert line["amount"] == Decimal("50864.28")
+    assert result.amount == Decimal("50864")
