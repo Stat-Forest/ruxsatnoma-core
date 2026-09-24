@@ -1,6 +1,8 @@
 <!--
   The bundled blank for GRAZING — Odilxon's «Рухсатнома турлари асл дизайнда» (docs:
-  tz/forms/2026-09-13-ruxsatnoma-turlari.md), decision #213/#215.
+  tz/forms/2026-09-13-ruxsatnoma-turlari.md), decision #213/#215; revised on 2026-09-24 to the
+  official form Oybek sent that day (tz/forms/2026-09-24-ruxsatnoma-blankasi.docx): the
+  Regulation's annex line on top, and four signature lines instead of two.
 
   Rules for whoever edits this file or uploads a replacement:
   1. Every placeholder (brace syntax) must be a key `permits/service.py::_snapshot` freezes, with a
@@ -22,15 +24,17 @@
        past that case is refused at issuance (render._assert_one_page), never printed. */
     @page { size: A4; margin: 9mm 12mm 8mm 14mm; }
     body { font-size: 9.5pt; line-height: 1.2; color: #000; }
+    .annex { text-align: center; font-size: 8pt; margin: 0 6mm 0.5mm; }
     .emblem { text-align: center; margin-bottom: 1.5mm; }
-    .emblem img { width: 19mm; height: 19mm; }
+    /* Four signature lines (2026-09-24) cost ~12 mm: the emblem, the herd table and the gaps give it back. */
+    .emblem img { width: 15mm; height: 15mm; }
     .series { text-align: right; font-size: 9pt; }
     .authority { text-align: center; font-size: 9pt; margin: 0.5mm 0 0; }
     .authority .caption { font-size: 7.5pt; color: #333; }
-    .title { text-align: center; margin: 3mm 0 0.5mm; font-size: 10pt; }
+    .title { text-align: center; margin: 2mm 0 0.5mm; font-size: 10pt; }
     h1 { text-align: center; font-size: 15pt; letter-spacing: 2pt; margin: 0.5mm 0; }
     .ru { color: #222; }
-    .date { text-align: center; margin: 1mm 0 2.5mm; }
+    .date { text-align: center; margin: 1mm 0 1.5mm; }
     table.fields { width: 100%; border-collapse: collapse; }
     table.fields th, table.fields td { border: 0.5pt solid #000; padding: 1mm 1.8mm; vertical-align: top; text-align: left; }
     table.fields th { width: 40%; font-weight: normal; }
@@ -38,12 +42,12 @@
     table.fields th .caption { font-size: 7.5pt; color: #333; }
     table.fields td { font-weight: bold; font-size: 9.5pt; }
     table.herd { width: 100%; border-collapse: collapse; margin-top: 2mm; font-size: 9pt; }
-    table.herd th, table.herd td { border: 0.5pt solid #000; padding: 1mm 1.5mm; text-align: center; }
+    table.herd th, table.herd td { border: 0.5pt solid #000; padding: 0.5mm 1.5mm; text-align: center; }
     table.herd th { font-weight: normal; }
     table.herd td.species { text-align: left; }
     /* No rowspan here: WeasyPrint paginates a rowspan cell's rows apart even with room
        to spare, which put the holder's line alone on a second page. */
-    table.signatures { width: 100%; margin-top: 3mm; border-collapse: collapse; font-size: 9.5pt; page-break-inside: avoid; }
+    table.signatures { width: 100%; margin-top: 2mm; border-collapse: collapse; font-size: 9.5pt; page-break-inside: avoid; }
     table.signatures td { vertical-align: top; padding: 0; }
     table.lines { width: 100%; border-collapse: collapse; }
     table.lines td { vertical-align: top; padding: 0.8mm 2mm; }
@@ -55,6 +59,9 @@
   </style>
 </head>
 <body>
+  <!-- Verbatim from the official form, in its own Cyrillic (#214 point 2: a blank's wording is
+       printed as the form has it). The form ends the line at «низомга» with no annex number. -->
+  <div class="annex">Ўсимлик дунёси объектларидан фойдаланиш ва ўсимлик дунёси объектларидан фойдаланиш соҳасида рухсат бериш тартиб-таомилларидан ўтиш тартиби тўғрисидаги низомга</div>
   <div class="emblem"><img src="emblem.svg" alt=""></div>
   <div class="series">seriya {{ series }} №{{ number }}</div>
   <div class="authority">
@@ -103,13 +110,23 @@
     <tr><th>Toʻlov <span class="ru">Оплата</span></th><td>{{ payment_basis }}</td></tr>
   </table>
 
-  <!-- R4: two labelled lines, the holder's NAME on the second, no staff name, one QR. -->
+  <!-- The official form's four lines: the three leshoz signatories of #210 (permit_head,
+       permit_chief_forester, permit_accountant — in the form's own wording) and the holder.
+       R4 otherwise holds: no staff name (rendered before signing), no «М.П.», one QR. -->
   <table class="signatures">
     <tr>
       <td>
         <table class="lines">
           <tr>
             <td class="who">Xoʻjalik rahbari<br><span class="caption">Директор лесхоза</span></td>
+            <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
+          </tr>
+          <tr>
+            <td class="who">Bosh oʻrmonbegi<br><span class="caption">Главный лесничий</span></td>
+            <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
+          </tr>
+          <tr>
+            <td class="who">Bosh hisobchi<br><span class="caption">Главный бухгалтер</span></td>
             <td class="line">Elektron raqamli imzo<br><span class="caption">QR orqali tekshiriladi / проверяется по QR</span></td>
           </tr>
           <tr>
