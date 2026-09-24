@@ -374,7 +374,10 @@ async def _send_sms_otp(db: AsyncSession, payload: dict[str, Any]) -> None:
     from app.modules.integrations.adapters.otp_sender import get_otp_sender
 
     await get_otp_sender().send(
-        target_type=payload["target_type"], target=payload["target"], code=payload["code"]
+        target_type=payload["target_type"],
+        target=payload["target"],
+        code=payload["code"],
+        purpose=payload.get("purpose"),
     )
 
 

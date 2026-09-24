@@ -10,7 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import delete, update
+from sqlalchemy import delete, select, update
 
 from app.core import settings_store
 from app.core.models import SystemSetting
@@ -21,6 +21,7 @@ from app.modules.auth.models import OtpCode
 from app.modules.auth.service import _mask_target
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.otp_sender import MockOtpSender, get_otp_sender
+from app.modules.integrations.models import OutboxMessage
 from tests.conftest import make_client
 from tests.modules.auth.conftest import _delivered_code
 
@@ -280,3 +281,73 @@ async def test_real_otp_sender_routes_phone_to_sms_and_email_to_smtp(monkeypatch
     # row, so every report would dead-letter with the phone number in it (finding 1).
     assert sms_calls[0]["delivery_report"] is False
     assert "654321" in email_calls[0]["text"] and email_calls[0]["to"] == "u@example.com"
+
+
+async def test_each_otp_purpose_gets_its_own_moderated_text(monkeypatch):
+    """Eskiz (and the operators behind it) refuse a confirmation-code SMS that does
+    not name the resource AND what the code is for: our one shared text
+    «Ruxsatnoma: tasdiqlash kodi …» was rejected on 2026-09-24. Each purpose that
+    can reach a phone therefore sends its own text — verbatim what was submitted
+    for moderation, so any drift here is a message that silently never arrives."""
+    from app.modules.integrations.adapters.otp_sender import OTP_TEXTS, RealOtpSender
+
+    sms_texts: list[str] = []
+
+    class _Sms:
+        async def send(self, *, phone, text, reference, delivery_report=True):
+            sms_texts.append(text)
+            return "id"
+
+    monkeypatch.setattr(
+        "app.modules.integrations.adapters.otp_sender.get_sms_sender", lambda: _Sms()
+    )
+    sender = RealOtpSender()
+    for purpose in ("phone_verify", "password_reset"):
+        await sender.send(
+            target_type="phone", target="998901234567", code="482913", purpose=purpose
+        )
+    assert sms_texts == [
+        "ruxsatnoma-urmon.uz saytida telefon raqamingizni tasdiqlash uchun kod: 482913."
+        " Kodni hech kimga bermang.",
+        "ruxsatnoma-urmon.uz saytida parolni tiklash uchun kod: 482913. Kodni hech kimga bermang.",
+    ]
+    assert set(OTP_TEXTS) == {"phone_verify", "email_verify", "password_reset"}
+
+
+async def test_an_otp_queued_without_a_purpose_still_goes_out(monkeypatch):
+    """Rows enqueued before the purpose reached the payload must not be lost on
+    deploy: they fall back to the verify text of their channel."""
+    from app.modules.integrations.adapters.otp_sender import RealOtpSender
+
+    sms_texts: list[str] = []
+
+    class _Sms:
+        async def send(self, *, phone, text, reference, delivery_report=True):
+            sms_texts.append(text)
+            return "id"
+
+    monkeypatch.setattr(
+        "app.modules.integrations.adapters.otp_sender.get_sms_sender", lambda: _Sms()
+    )
+    await RealOtpSender().send(target_type="phone", target="998901234567", code="111222")
+    assert "telefon raqamingizni tasdiqlash" in sms_texts[0] and "111222" in sms_texts[0]
+
+
+async def test_request_otp_puts_the_purpose_on_the_outbox_payload(db):
+    """The sender cannot pick the text for a purpose it is never told."""
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r = await client.post(
+            f"{API}/auth/otp/request",
+            json={"target_type": "phone", "target": unique_phone(), "purpose": "phone_verify"},
+        )
+        assert r.status_code == 204
+    payload = (
+        await db.execute(
+            select(OutboxMessage.payload)
+            .where(OutboxMessage.destination == "sms_otp")
+            .order_by(OutboxMessage.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    assert payload["purpose"] == "phone_verify"
