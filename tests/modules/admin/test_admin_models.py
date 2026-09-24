@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import date
+from typing import get_args
 
 import pytest
 from sqlalchemy import select
@@ -9,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.models import SystemSetting
 from app.modules.admin.models import (
+    ORGANIZATION_KINDS,
     ActivityType,
     Classifier,
     ClassifierItem,
@@ -17,6 +19,7 @@ from app.modules.admin.models import (
     Organization,
     Region,
 )
+from app.modules.admin.schemas import OrganizationKind
 from app.modules.auth.models import Role, User
 
 
@@ -63,6 +66,19 @@ async def test_organization_kind_check(db):
     db.add(Organization(kind="ministry", code="bad-kind", name={"uz_cyrl": "Х"}))
     with pytest.raises(IntegrityError):
         await db.flush()
+
+
+def test_the_schema_literal_matches_the_organization_kinds_tuple():
+    """`admin.schemas.OrganizationKind` (stage 17 t6) is spelled out by hand —
+    `Literal[*ORGANIZATION_KINDS]` is rejected by pyright as `reportInvalidTypeForm`
+    (a `Literal`'s members must be statically visible) — so it is a THIRD
+    hand-typed copy of the same set the `kind_valid` CHECK above enforces and
+    `admin.service.ALLOWED_PARENT_KINDS`'s keys retype again. `.claude/lessons.md`
+    ("An enum-ish column has ONE source of truth: the tuple") names
+    `ORGANIZATION_KINDS` as the one column still missing this guard; this test
+    closes that gap, mirroring
+    `tests/modules/payments/test_recipients_api.py::test_the_schema_literal_matches_the_tables_own_check_constraint`."""
+    assert set(get_args(OrganizationKind)) == set(ORGANIZATION_KINDS)
 
 
 async def test_only_agency_may_be_root(db):
