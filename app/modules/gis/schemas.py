@@ -152,8 +152,8 @@ class VersionIn(BaseModel):
 
     geom: GeoJsonGeometry | None = None
     source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
-    declared_area_ha: Decimal | None = Field(default=None, le=DECLARED_AREA_HA_MAX)
-    accuracy_m: Decimal | None = Field(default=None, le=ACCURACY_M_MAX)
+    declared_area_ha: Decimal | None = Field(default=None, ge=0, le=DECLARED_AREA_HA_MAX)
+    accuracy_m: Decimal | None = Field(default=None, ge=0, le=ACCURACY_M_MAX)
     survey_date: date | None = None
     effective_from: date | None = None
 
@@ -207,8 +207,8 @@ class VersionPatch(BaseModel):
     """Draft-only metadata edits (service 409s otherwise). Geometry is never
     patched in place — a changed shape is a new version, by design."""
 
-    declared_area_ha: Decimal | None = Field(default=None, le=DECLARED_AREA_HA_MAX)
-    accuracy_m: Decimal | None = Field(default=None, le=ACCURACY_M_MAX)
+    declared_area_ha: Decimal | None = Field(default=None, ge=0, le=DECLARED_AREA_HA_MAX)
+    accuracy_m: Decimal | None = Field(default=None, ge=0, le=ACCURACY_M_MAX)
     survey_date: date | None = None
     effective_from: date | None = None
 
@@ -225,7 +225,7 @@ class SplitPieceIn(BaseModel):
 
     number: CodeStr
     geom: GeoJsonGeometry
-    declared_area_ha: Decimal | None = Field(default=None, le=DECLARED_AREA_HA_MAX)
+    declared_area_ha: Decimal | None = Field(default=None, ge=0, le=DECLARED_AREA_HA_MAX)
 
 
 class SplitIn(BaseModel):
@@ -238,7 +238,7 @@ class SplitIn(BaseModel):
     piece_a: SplitPieceIn
     piece_b: SplitPieceIn
     source: str = Field(pattern="^(cadastre|survey|aerial|gps|import)$")
-    accuracy_m: Decimal | None = Field(default=None, le=ACCURACY_M_MAX)
+    accuracy_m: Decimal | None = Field(default=None, ge=0, le=ACCURACY_M_MAX)
     survey_date: date | None = None
     effective_from: date | None = None
 

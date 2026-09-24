@@ -130,7 +130,7 @@ class ActCreateIn(BaseModel):
     application_id: uuid.UUID | None = None
     occurred_at: datetime
     gps: GpsPoint | None = None
-    gps_accuracy_m: Decimal | None = Field(default=None, le=GPS_ACCURACY_M_MAX)
+    gps_accuracy_m: Decimal | None = Field(default=None, ge=0, le=GPS_ACCURACY_M_MAX)
     checklist_id: uuid.UUID
     answers: JsonObject = Field(default_factory=dict)
     facts: JsonObject = Field(default_factory=dict)
@@ -150,7 +150,7 @@ class ActUpdateIn(BaseModel):
 
     occurred_at: datetime | None = None
     gps: GpsPoint | None = None
-    gps_accuracy_m: Decimal | None = Field(default=None, le=GPS_ACCURACY_M_MAX)
+    gps_accuracy_m: Decimal | None = Field(default=None, ge=0, le=GPS_ACCURACY_M_MAX)
     answers: JsonObject | None = None
     facts: JsonObject | None = None
     notes: ActNotesStr | None = None
@@ -325,7 +325,7 @@ class ExplanationIn(BaseModel):
 
 class DecisionIn(BaseModel):
     decision: Literal["warning", "suspend", "revoke", "transfer"]
-    damage_amount: Decimal | None = Field(default=None, le=DAMAGE_AMOUNT_MAX)
+    damage_amount: Decimal | None = Field(default=None, ge=0, le=DAMAGE_AMOUNT_MAX)
     damage_calc: JsonObject | None = None
     note: NoteStr | None = None
 

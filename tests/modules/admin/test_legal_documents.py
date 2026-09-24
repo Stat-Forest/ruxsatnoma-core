@@ -87,14 +87,17 @@ async def test_the_public_list_orders_by_sort_order_then_newest_adopted(db):
     """The Forest Code heads the page forever, and by date of adoption it is the
     oldest row in the register — which is the whole reason `sort_order` leads."""
     actor, _, _ = await signed_in_with(db, LEGAL_DOCUMENTS_MANAGE)
-    # Numbers unique to this test, and negative `sort_order`s so these three head
-    # the register whatever else the API suites have committed into the shared
-    # test database: `page_size` is capped at 100, so a row that sorts after
-    # somebody else's hundred would simply not be on the page being asserted.
+    # Numbers unique to this test, and low but non-negative `sort_order`s (I2,
+    # final review: the field gained `ge=0`, so the negative values this test
+    # used to head the register with are refused now) — relative order is all
+    # that is asserted (the `ORD-` prefix filter below excludes every other
+    # test's own rows), and this is the only file that ever writes to
+    # `legal_documents`, so ten-odd rows total never come close to the
+    # `page_size<=100` cap the comment used to guard against.
     for number, adopted, order in (
-        ("ORD-PF-108", date(2026, 1, 1), -10),
-        ("ORD-ZRU-475", date(2018, 4, 16), -20),
-        ("ORD-VMQ-342", date(2021, 5, 12), -10),
+        ("ORD-PF-108", date(2026, 1, 1), 10),
+        ("ORD-ZRU-475", date(2018, 4, 16), 0),
+        ("ORD-VMQ-342", date(2021, 5, 12), 10),
     ):
         doc = await make_draft(
             db, actor, doc_number=number, adopted_on=adopted, sort_order=order, source_url=LEX

@@ -136,8 +136,8 @@ class RoleCreateIn(BaseModel):
     code: CodeStr
     name: LocalizedName
     description: LocalizedName | None = None
-    max_approve_amount: Decimal | None = Field(default=None, le=MAX_APPROVE_AMOUNT)
-    max_approve_area: Decimal | None = Field(default=None, le=MAX_APPROVE_AREA)
+    max_approve_amount: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AMOUNT)
+    max_approve_area: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AREA)
     copy_from: CodeStr | None = None
 
 
@@ -147,8 +147,8 @@ class RolePatchIn(BaseModel):
 
     name: LocalizedName | None = None
     description: LocalizedName | None = None
-    max_approve_amount: Decimal | None = Field(default=None, le=MAX_APPROVE_AMOUNT)
-    max_approve_area: Decimal | None = Field(default=None, le=MAX_APPROVE_AREA)
+    max_approve_amount: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AMOUNT)
+    max_approve_area: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AREA)
 
 
 class PermissionCodesIn(BaseModel):

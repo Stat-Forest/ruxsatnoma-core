@@ -103,7 +103,7 @@ class ActivityTypePatch(BaseModel):
     name: LocalizedName | None = None
     description: LocalizedName | None = None
     processing_days: int | None = Field(default=None, gt=0, le=DAYS_MAX)
-    sort_order: int | None = Field(default=None, le=SORT_ORDER_MAX)
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
     status: Literal["active", "archived"] | None = None
 
     # `processing_days`/`sort_order`/`status` back NOT-NULL columns — unlike
@@ -194,14 +194,14 @@ class ClassifierItemIn(BaseModel):
     props: JsonObject = {}
     valid_from: date
     valid_to: date | None = None
-    sort_order: int = Field(default=0, le=SORT_ORDER_MAX)
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
 
 
 class ClassifierItemPatch(BaseModel):
     name: LocalizedName | None = None
     props: JsonObject | None = None
     valid_to: date | None = None
-    sort_order: int | None = Field(default=None, le=SORT_ORDER_MAX)
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
 
 
 class SettingOut(BaseModel):

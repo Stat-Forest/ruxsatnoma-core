@@ -70,7 +70,7 @@ class LegalDocumentCreateIn(BaseModel):
     adopted_on: date
     source_url: UrlStr | None = None
     file_id: uuid.UUID | None = None
-    sort_order: int = Field(default=0, le=SORT_ORDER_MAX)
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
 
 
 class LegalDocumentPatchIn(BaseModel):
@@ -83,7 +83,7 @@ class LegalDocumentPatchIn(BaseModel):
     adopted_on: date | None = None
     source_url: UrlStr | None = None
     file_id: uuid.UUID | None = None
-    sort_order: int | None = Field(default=None, le=SORT_ORDER_MAX)
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
 
 
 _AUDITED_FIELDS = (
