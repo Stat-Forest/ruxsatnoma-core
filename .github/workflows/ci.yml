@@ -59,10 +59,24 @@ jobs:
       - run: uv python install 3.14
       - run: uv sync --frozen
       # MinIO can't be a `services:` entry (needs a command); run it directly.
+      # On 2026-09-24 MinIO withdrew its public images: quay.io/minio/minio answers
+      # `unauthorized` and docker.io/minio/minio is gone, which failed every PR at this
+      # step. Chainguard's build is pinned by its index digest (its free tier tags only
+      # `latest`). It runs as uid 65532, hence `--user 0:0` for a throwaway /data.
+      # docker-compose.yml and docker-compose.deploy.yml still name the old image: their
+      # hosts run it from cache, and switching them means a non-root image over volumes
+      # a root one wrote — a change of its own, not this one.
       - run: |
-          docker run -d --name minio -p 9000:9000 \
+          docker run -d --name minio -p 9000:9000 --user 0:0 \
             -e MINIO_ROOT_USER=ruxsatnoma -e MINIO_ROOT_PASSWORD=ruxsatnoma-secret \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
+            server /data
+          for _ in $(seq 60); do
+            curl -sf http://localhost:9000/minio/health/live && exit 0
+            sleep 1
+          done
+          docker logs minio
+          exit 1
       # postgresql-client creates the test DB below. The three pango/harfbuzz packages are
       # WeasyPrint's own documented Debian/Ubuntu requirement (they carry gobject, pango,
       # pangoft2, harfbuzz and fontconfig, which it dlopens at import time): without them
