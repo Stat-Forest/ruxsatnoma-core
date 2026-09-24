@@ -95,3 +95,17 @@ async def test_a_line_is_rejected_for_the_contour_layer(db, contours_layer, lesh
             created_by=gis_user.id,
         )
     assert excinfo.value.code == "ERR-GIS-001"
+
+
+async def test_version_point_lies_on_the_published_contours_own_surface(db, published_contour):
+    """Stage 16: `applications.printouts.record_letter` prints this point as
+    the plot's coordinates. `ST_PointOnSurface`, not the centroid — guaranteed
+    to lie ON the geometry rather than merely near it, which matters for a
+    concave plot even though `published_contour`'s own box is convex."""
+    from app.modules.gis import service
+
+    point = await service.version_point(db, published_contour.id)
+    assert point is not None
+    lat, lon = point
+    assert 41.5 <= lat <= 41.51
+    assert 69.9 <= lon <= 69.91

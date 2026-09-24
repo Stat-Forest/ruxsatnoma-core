@@ -1862,6 +1862,16 @@ async def contour_number(db: AsyncSession, contour_id: uuid.UUID) -> str | None:
     return await repo.contour_number(db, contour_id)
 
 
+async def version_point(db: AsyncSession, version_id: uuid.UUID) -> tuple[float, float] | None:
+    """`(lat, lon)` of a point on this version's own surface — `None` for a
+    version with no geometry (#178) or no such version. Identity-only read,
+    like `contour_organization`/`contour_number` beside it: no permission, no
+    zone, no HTTP actor. First consumer: `applications.printouts.record_letter`
+    (stage 16), whose frozen snapshot names a point on the plot rather than a
+    live re-derivation from the contour's CURRENT geometry."""
+    return await repo.version_point(db, version_id)
+
+
 async def version_geometry(db: AsyncSession, version_id: uuid.UUID) -> dict[str, Any] | None:
     """One specific version's geometry, as a parsed GeoJSON geometry object.
 

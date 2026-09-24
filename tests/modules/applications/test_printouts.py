@@ -149,3 +149,94 @@ async def test_rejection_defaults_need_the_decide_permission(
         f"/api/v1/applications/{application_in_review}/rejection-defaults"
     )
     assert result.status_code == 403
+
+
+# --- Task B4 (rulings R6/R7/R11): the application letter's frozen snapshot ---
+
+
+async def _letter(db, application_id: str) -> ApplicationPrintout:
+    rows = (
+        (
+            await db.execute(
+                select(ApplicationPrintout)
+                .where(
+                    ApplicationPrintout.application_id == uuid.UUID(application_id),
+                    ApplicationPrintout.kind == "letter",
+                )
+                .order_by(ApplicationPrintout.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows, "a filed application has a letter"
+    return rows[-1]
+
+
+async def test_filing_freezes_a_letter(db, submitted_application: str) -> None:
+    row = await _letter(db, submitted_application)
+    snap = row.snapshot
+    assert snap["number"].startswith("RX-")
+    assert snap["plot"].startswith(("Kontur №", "Контур №", "Contour No."))
+    assert snap["coordinates"] != ""
+    assert snap["package_sha256"] and len(snap["package_sha256"]) == 64
+    assert all(isinstance(v, str) for v in snap.values()), "a letter snapshot holds strings only"
+
+
+async def test_the_letter_is_in_the_applicants_language(
+    db, applicant_user, applicant_client, filing_ready_for_submission
+) -> None:
+    from tests.modules.applications.test_submit import _submit
+
+    applicant_user.language = "kaa"
+    await db.commit()
+    result = await _submit(applicant_client, filing_ready_for_submission)
+    assert result.status_code == 201, result.text
+    row = await _letter(db, result.json()["id"])
+    assert row.language == "kaa"
+    assert row.snapshot["period"].endswith("ge shekem")
+
+
+async def test_a_resubmission_freezes_a_second_letter(
+    db, hodim_client, applicant_client, application_in_review, rj_01_return_reason
+) -> None:
+    """Ruling R7 — the same real path `test_return.py` walks: return, edit,
+    re-sign, resubmit. Never a hand-set status."""
+    from app.modules.applications import repo
+    from tests.modules.applications.test_submit import _resubmit
+
+    returned = await hodim_client.post(
+        f"/api/v1/applications/{application_in_review}/return",
+        json={
+            "reason_item_id": str(rj_01_return_reason.id),
+            "fields_to_fix": {"period_to": "srok"},
+            "legal_basis": "VMQ 290",
+        },
+    )
+    assert returned.status_code == 200, returned.text
+    patched = await applicant_client.patch(
+        f"/api/v1/applications/{application_in_review}", json={"period_to": "2027-08-31"}
+    )
+    assert patched.status_code == 200, patched.text
+    again = await _resubmit(applicant_client, application_in_review)
+    assert again.status_code == 200, again.text
+
+    rows = (
+        (
+            await db.execute(
+                select(ApplicationPrintout)
+                .where(
+                    ApplicationPrintout.application_id == uuid.UUID(application_in_review),
+                    ApplicationPrintout.kind == "letter",
+                )
+                .order_by(ApplicationPrintout.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    assert rows[0].submission_id != rows[1].submission_id
+    assert rows[1].snapshot["period"].count("31.08.2027") == 1, "the new letter carries the edit"
+    latest = await repo.latest_printouts(db, uuid.UUID(application_in_review))
+    assert [p.id for p in latest] == [rows[1].id]

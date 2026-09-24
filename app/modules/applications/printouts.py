@@ -25,13 +25,17 @@ from app.modules.admin.models import ClassifierItem
 from app.modules.applications import printout_labels as labels
 from app.modules.applications import repo
 from app.modules.applications.models import (
+    PRINTOUT_LETTER,
     PRINTOUT_REJECTION_NOTICE,
     Application,
+    ApplicationDocument,
+    ApplicationItem,
     ApplicationPrintout,
     ApplicationRejectionGround,
 )
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
+from app.modules.gis import service as gis_service
 from app.modules.signatures import service as signatures_service
 from app.modules.signatures.models import Signature
 
@@ -177,6 +181,183 @@ async def record_rejection_notice(
         application_id=application.id,
         kind=PRINTOUT_REJECTION_NOTICE,
         number=number,
+        language=language,
+        snapshot=snapshot,
+    )
+    await repo.add_printout(db, row)
+    return row
+
+
+# --- Task B4 (rulings R6/R7/R11): the application letter's frozen snapshot ---
+
+
+async def _addressee(db: AsyncSession, organization_id: uuid.UUID | None, language: str) -> str:
+    """«{leshoz} rahbari {name}ga». The name is printed only when exactly one
+    active user of the leshoz holds `applications.decide` — the head; with
+    none or several, the line names the office, never a guess."""
+    organization = (
+        await admin_repo.get_organization(db, organization_id) if organization_id else None
+    )
+    org = _name(organization.name if organization else None, language)
+    heads = (
+        await auth_service.user_ids_with_permission(
+            db, "applications.decide", organization_id=organization_id
+        )
+        if organization_id
+        else []
+    )
+    if len(heads) == 1:
+        head = await db.get(User, heads[0])
+        if head is not None:
+            return labels.LETTER_ADDRESSEE_FORMAT[language].format(org=org, name=head.full_name)
+    return labels.LETTER_ADDRESSEE_NO_NAME_FORMAT[language].format(org=org)
+
+
+async def _quantity_line(
+    db: AsyncSession,
+    application: Application,
+    activity: Any,
+    items: list[ApplicationItem],
+    language: str,
+) -> str:
+    if items:
+        names = {t.id: t.name for t in await admin_repo.list_livestock_types(db)}
+        return "; ".join(
+            f"{_name(names.get(i.livestock_type_id), language)}: {i.head_count}" for i in items
+        )
+    if application.quantity is None or activity is None:
+        return labels.NOT_STATED
+    unit = labels.UNIT_LABELS[language].get(activity.quantity_unit, activity.quantity_unit)
+    return f"{_decimal(application.quantity)} {unit}"
+
+
+def _purpose_line(application: Application, activity_name: str, language: str) -> str:
+    if application.deadwood_product:
+        product = labels.DEADWOOD_PRODUCT_LABELS[language].get(
+            application.deadwood_product, application.deadwood_product
+        )
+        return labels.PURPOSE_DEADWOOD_FORMAT[language].format(
+            product=product, deadline=_date(application.removal_deadline)
+        )
+    if application.recreation_purpose:
+        purpose = labels.RECREATION_PURPOSE_LABELS[language].get(
+            application.recreation_purpose, application.recreation_purpose
+        )
+        return labels.PURPOSE_RECREATION_FORMAT[language].format(
+            purpose=purpose, event_at=_datetime(application.event_at)
+        )
+    return activity_name
+
+
+async def record_letter(
+    db: AsyncSession,
+    application: Application,
+    *,
+    submission_id: uuid.UUID,
+    signature: Signature,
+    items: list[ApplicationItem],
+    documents: list[ApplicationDocument],
+    recipient_user_id: uuid.UUID,
+) -> ApplicationPrintout:
+    """Freeze the letter of one submission (rulings R6/R7) — called by
+    `service.file` and `service.submit` at their very end, in their transaction."""
+    language = await recipient_language(db, recipient_user_id)
+    applicant = await auth_service.get_applicant(db, application.applicant_id)
+    activity = (
+        await admin_repo.get_activity_type(db, application.activity_type_id)
+        if application.activity_type_id
+        else None
+    )
+    activity_name = _name(activity.name if activity else None, language)
+    organization_id = (
+        await gis_service.contour_organization(db, application.contour_id)
+        if application.contour_id
+        else None
+    )
+    organization = (
+        await admin_repo.get_organization(db, organization_id) if organization_id else None
+    )
+    region = (
+        await admin_repo.get_region(db, organization.region_id)
+        if organization is not None and organization.region_id
+        else None
+    )
+    district = (
+        await admin_repo.get_district(db, organization.district_id)
+        if organization is not None and organization.district_id
+        else None
+    )
+    contour = (
+        await gis_service.contour_number(db, application.contour_id)
+        if application.contour_id
+        else None
+    )
+    point = (
+        await gis_service.version_point(db, application.contour_version_id)
+        if application.contour_version_id
+        else None
+    )
+    doc_names: list[str] = []
+    for document in documents:
+        item = await admin_repo.get_classifier_item(db, document.doc_type_item_id)
+        doc_names.append(_name(item.name if item else None, language))
+    submitter = await db.get(User, application.submitted_by_user_id)
+    name = applicant.name if applicant is not None else labels.NOT_STATED
+    if applicant is not None and applicant.kind == "legal" and submitter is not None:
+        name = f"{applicant.name} ({submitter.full_name})"
+    contact = (
+        " • ".join(
+            x
+            for x in (
+                (applicant.phone if applicant else None)
+                or (submitter.phone if submitter else None),
+                (applicant.email if applicant else None)
+                or (submitter.email if submitter else None),
+            )
+            if x
+        )
+        or labels.NOT_STATED
+    )
+    snapshot = {
+        "number": application.number or labels.NOT_STATED,
+        "date": _date(
+            application.submitted_at.astimezone(TASHKENT).date()
+            if application.submitted_at
+            else None
+        ),
+        "addressee": await _addressee(db, organization_id, language),
+        "applicant_name": name,
+        "applicant_address": await _applicant_address(db, applicant)
+        if applicant
+        else labels.NOT_STATED,
+        "contact": contact,
+        "activity_name": activity_name,
+        "territory": " / ".join(
+            (
+                _name(region.name if region else None, language),
+                _name(district.name if district else None, language),
+                _name(organization.name if organization else None, language),
+            )
+        ),
+        "plot": labels.PLOT_FORMAT[language].format(
+            contour=contour or labels.NOT_STATED, area=_decimal(application.requested_area_ha)
+        ),
+        "coordinates": f"{point[0]:.6f}, {point[1]:.6f}" if point else labels.NOT_STATED,
+        "period": labels.PERIOD_FORMAT[language].format(
+            start=_date(application.period_from), end=_date(application.period_to)
+        ),
+        "quantity": await _quantity_line(db, application, activity, items, language),
+        "purpose": _purpose_line(application, activity_name, language),
+        "attachments": "; ".join(doc_names) or labels.NOT_STATED,
+        "signed_at": _datetime(signature.signed_at),
+        "signature": _signature_line(signature, language, await _certificate_serial(db, signature)),
+        "package_sha256": signature.doc_hash,
+        "created": _iso(signature.signed_at),
+    }
+    row = ApplicationPrintout(
+        application_id=application.id,
+        kind=PRINTOUT_LETTER,
+        submission_id=submission_id,
         language=language,
         snapshot=snapshot,
     )

@@ -38,7 +38,7 @@ from app.db import uuid7
 from app.modules.admin import open_work as admin_open_work
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import ClassifierItem, Organization
-from app.modules.applications import checks, repo, sla
+from app.modules.applications import checks, printouts, repo, sla
 from app.modules.applications.assignment import choose_executor
 from app.modules.applications.events import APPLICATION_CANCELLED, APPLICATION_SUBMITTED
 from app.modules.applications.models import (
@@ -1998,7 +1998,7 @@ async def file(
     # ours is pending, which is the whole point of the order above.
     document = _package_bytes(application, priced, contour_version_id=version.id)
     if payload.pkcs7 is not None:
-        await signatures_service.sign(
+        signature = await signatures_service.sign(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2010,7 +2010,7 @@ async def file(
             ip=ip,
         )
     else:
-        await signatures_service.sign_simple(
+        signature = await signatures_service.sign_simple(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2122,6 +2122,17 @@ async def file(
     await publish(db, Event(name=APPLICATION_SUBMITTED, payload={"application_id": application.id}))
     await _auto_assign_on_submission(db, application)
     await db.refresh(application)
+    # Stage 16 (R6/R7): the letter of THIS submission, frozen last — after the
+    # assignment, so nothing below it can still change what it records.
+    await printouts.record_letter(
+        db,
+        application,
+        submission_id=submission_id,
+        signature=signature,
+        items=items,
+        documents=filing.documents,
+        recipient_user_id=await _notification_recipient(db, application),
+    )
     return application
 
 
@@ -2296,7 +2307,7 @@ async def submit(
     # kept evidence-then-raise like every refusal that got this far.
     document = _package_bytes(application, priced, contour_version_id=version.id)
     if pkcs7 is not None:
-        await signatures_service.sign(
+        signature = await signatures_service.sign(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2308,7 +2319,7 @@ async def submit(
             ip=ip,
         )
     elif application.on_behalf == "self":
-        await signatures_service.sign_simple(
+        signature = await signatures_service.sign_simple(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
             object_id=submission_id,
@@ -2486,6 +2497,17 @@ async def submit(
     # Postgres stored"). Refresh unconditionally rather than branching on
     # whether it actually wrote anything.
     await db.refresh(application)
+    # Stage 16 (R6/R7): the letter of THIS submission, frozen last — after the
+    # assignment, so nothing below it can still change what it records.
+    await printouts.record_letter(
+        db,
+        application,
+        submission_id=submission_id,
+        signature=signature,
+        items=await repo.list_items(db, application.id),
+        documents=await repo.list_documents(db, application.id),
+        recipient_user_id=await _notification_recipient(db, application),
+    )
     return application
 
 
