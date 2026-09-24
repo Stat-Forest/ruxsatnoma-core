@@ -128,9 +128,12 @@ async def test_an_estimate_with_a_repeated_livestock_code_is_refused(
 async def test_an_estimate_with_more_items_than_the_cap_is_refused_before_any_work(
     client: httpx.AsyncClient, grazing_activity_id: uuid.UUID
 ) -> None:
-    """`MAX_LIVESTOCK_ITEMS` items is the whole seeded catalog (ten types) —
-    one over that is refused by the schema's own `max_length`, before the
-    request ever reaches a lookup or the calculator."""
+    """M8, final review: the docstring used to claim `MAX_LIVESTOCK_ITEMS` IS
+    the seeded catalog's own size — it is not. The cap is 20 (R3, headroom
+    over any real herd's group count) and the seeded catalog has ten
+    livestock types; one over the CAP (not the catalog) is refused by the
+    schema's own `max_length`, before the request ever reaches a lookup or
+    the calculator."""
     response = await client.post(
         ESTIMATE,
         json={

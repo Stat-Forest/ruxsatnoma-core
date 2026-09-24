@@ -377,6 +377,31 @@ async def test_a_reversed_period_is_a_422_on_create_and_on_patch(
     assert patched.json()["error"]["details"]["reason"] == "effective_to_before_from"
 
 
+async def test_an_explicit_null_effective_from_is_a_422_not_a_500(
+    tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
+) -> None:
+    """M3, final review: `effective_from` backs a NOT NULL column.
+    `update_versioned`'s guard reads `fields.get("effective_from",
+    row.effective_from)` — for a key PRESENT with value `None` that returns
+    `None`, not the row's own value, and `effective_to < effective_from`
+    then compares a date against `None`, an unhandled `TypeError` -> 500."""
+    created = await tariffs_maker_client.post(
+        "/api/v1/tariffs",
+        json={
+            "activity_type_id": str(haymaking_activity_id),
+            "coefficient": "1.0",
+            "quantity_unit": "ha",
+            "effective_from": "2036-01-01",
+            "basis": "t",
+        },
+    )
+    assert created.status_code == 201, created.text
+    patched = await tariffs_maker_client.patch(
+        f"/api/v1/tariffs/{created.json()['id']}", json={"effective_from": None}
+    )
+    assert patched.status_code == 422, patched.text
+
+
 async def test_the_create_response_shows_the_stored_precision_not_the_caller_s(
     tariffs_maker_client: AsyncClient, haymaking_activity_id: uuid.UUID
 ) -> None:

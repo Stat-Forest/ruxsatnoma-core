@@ -151,7 +151,20 @@ class Rotation(BaseModel):
 
 
 class RuleParameterIn(BaseModel):
-    code: Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+(:[a-z0-9_]+)?$")]
+    # `strip_whitespace=True` (I4, final review): the pattern is anchored, so
+    # bare whitespace never validated, but " grazing" — real content with
+    # accidental surrounding whitespace — used to be refused outright instead
+    # of accepted as "grazing", the same C2 stripping every other required
+    # code-shaped field in this codebase already applies.
+    code: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=100,
+            pattern=r"^[a-z0-9_]+(:[a-z0-9_]+)?$",
+        ),
+    ]
     # `JsonValue` (stage 17 task 8b), not narrowed to a number: every consumer
     # today (`calculator._param`/`_rule` via `Decimal(str(...))`) expects a
     # scalar, but narrowing the wire type is a behaviour change this stage did
@@ -169,6 +182,23 @@ class RuleParameterPatch(BaseModel):
     effective_from: date | None = None
     effective_to: date | None = None
     basis: BasisStr | None = None
+
+    # `effective_from` backs a NOT NULL column (M3, final review): an explicit
+    # JSON `null` used to reach `service.update_versioned`, whose guard reads
+    # `fields.get("effective_from", row.effective_from)` — for a KEY PRESENT
+    # with value `None` that returns `None`, not the row's own value, and
+    # `effective_to < None` (both real dates) raises `TypeError`, an unhandled
+    # 500. Refused here instead, the same idiom `ActivityTypePatch._reject_
+    # explicit_null`/`OrganizationPatch._reject_explicit_null_gis_enabled`
+    # already use: an *omitted* field still takes the `None` default and is
+    # skipped by `exclude_unset=True` untouched, so this only catches a
+    # payload that names the field with a JSON `null`.
+    @field_validator("effective_from", mode="after")
+    @classmethod
+    def _reject_explicit_null_effective_from(cls, value: date | None, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
 
 
 class RuleParameterOut(BaseModel):
@@ -220,6 +250,16 @@ class TariffPatch(BaseModel):
     effective_from: date | None = None
     effective_to: date | None = None
     basis: BasisStr | None = None
+
+    # Same guard as `RuleParameterPatch`'s own (M3, final review) — an
+    # explicit `null` here makes `service.update_versioned`'s
+    # `effective_to < effective_from` compare a date against `None`.
+    @field_validator("effective_from", mode="after")
+    @classmethod
+    def _reject_explicit_null_effective_from(cls, value: date | None, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
 
 
 class TariffOut(BaseModel):
@@ -508,9 +548,13 @@ class CalculationIn(BaseModel):
     activity_type_id: uuid.UUID
     period_from: date
     period_to: date
-    quantity: (
-        Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY, max_digits=12, decimal_places=4)] | None
-    ) = None
+    # `max_digits`/`decimal_places` dropped (M2, final review): this value is
+    # never stored (the calculator reads it and moves on — `application
+    # quantity`, the field that IS stored, is unchanged NUMERIC(12,4)), and
+    # the landing sends it through `parseFloat`, whose output can carry more
+    # than 4 decimal places for an input that never had them (binary
+    # floating point). `ge`/`le` still bound the value itself.
+    quantity: Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY)] | None = None
     items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
     benefit_code: CodeStr | None = None
 
@@ -565,9 +609,10 @@ class PublicEstimateIn(BaseModel):
     activity_type_id: uuid.UUID
     period_from: date
     period_to: date
-    quantity: (
-        Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY, max_digits=12, decimal_places=4)] | None
-    ) = None
+    # `max_digits`/`decimal_places` dropped (M2, final review) — see
+    # `CalculationIn.quantity`'s own comment: never stored, and the landing
+    # sends it through `parseFloat`.
+    quantity: Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY)] | None = None
     items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
 
 

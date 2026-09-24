@@ -173,6 +173,29 @@ async def test_a_reversed_period_is_a_422_on_create_and_on_patch(
     assert patched.json()["error"]["details"]["reason"] == "effective_to_before_from"
 
 
+async def test_an_explicit_null_effective_from_is_a_422_not_a_500(
+    tariffs_maker_client: AsyncClient, unique_suffix: str
+) -> None:
+    """M3, final review: same guard as `TariffPatch`'s own — `effective_from`
+    backs a NOT NULL column, and an explicit JSON `null` used to reach
+    `update_versioned`'s `effective_to < effective_from` as a date-vs-None
+    comparison, an unhandled `TypeError` -> 500."""
+    created = await tariffs_maker_client.post(
+        "/api/v1/rule-parameters",
+        json={
+            "code": f"test_param_{unique_suffix}_3",
+            "value": "0.9",
+            "effective_from": "2036-01-01",
+            "basis": "t",
+        },
+    )
+    assert created.status_code == 201, created.text
+    patched = await tariffs_maker_client.patch(
+        f"/api/v1/rule-parameters/{created.json()['id']}", json={"effective_from": None}
+    )
+    assert patched.status_code == 422, patched.text
+
+
 async def test_a_second_maker_cannot_publish_another_makers_draft(
     tariffs_maker_client: AsyncClient,
     second_tariffs_maker_client: AsyncClient,
