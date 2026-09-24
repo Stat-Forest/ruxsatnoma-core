@@ -7,7 +7,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
 
 from app.core.schemas import BlobStr, CodeStr, JsonObject, LocalizedName, NoteStr, TextStr
 
@@ -17,6 +17,21 @@ from app.core.schemas import BlobStr, CodeStr, JsonObject, LocalizedName, NoteSt
 GPS_ACCURACY_M_MAX = Decimal("99999999.99")  # inspection_acts.gps_accuracy_m NUMERIC(10, 2)
 DAMAGE_AMOUNT_MAX = Decimal("9999999999999999.99")  # violation_cases.damage_amount NUMERIC(18, 2)
 CHECKLIST_ITEMS_MAX = 200  # R3
+# `notes`/explanation mirror the adminka's own 4000-char textareas
+# (`ActFormPage.tsx:312`, `CaseDetailPage.tsx:158`), wider than the stage-17
+# default `TEXT_MAX_LENGTH`/2000 (Global Constraints: never bound below an
+# existing adminka maxLength). Fix round 1 (QA run 01 review).
+ACT_NOTES_MAX_LENGTH = 4000
+EXPLANATION_TEXT_MAX_LENGTH = 4000
+# Optional, blank-capable (like NoteStr, but wider).
+ActNotesStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=0, max_length=ACT_NOTES_MAX_LENGTH)
+]
+# Required, non-blank (like TextStr, but wider).
+ExplanationTextStr = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=EXPLANATION_TEXT_MAX_LENGTH),
+]
 
 
 def _trim_decimal(value: Decimal | None) -> str | None:
@@ -119,7 +134,7 @@ class ActCreateIn(BaseModel):
     checklist_id: uuid.UUID
     answers: JsonObject = Field(default_factory=dict)
     facts: JsonObject = Field(default_factory=dict)
-    notes: NoteStr | None = None
+    notes: ActNotesStr | None = None
     result: Literal["compliant", "warning", "violation"] | None = None
     created_offline_at: datetime | None = None
 
@@ -138,7 +153,7 @@ class ActUpdateIn(BaseModel):
     gps_accuracy_m: Decimal | None = Field(default=None, le=GPS_ACCURACY_M_MAX)
     answers: JsonObject | None = None
     facts: JsonObject | None = None
-    notes: NoteStr | None = None
+    notes: ActNotesStr | None = None
     result: Literal["compliant", "warning", "violation"] | None = None
 
 
@@ -304,7 +319,7 @@ class CaseCardOut(CaseOut):
 
 
 class ExplanationIn(BaseModel):
-    text: TextStr
+    text: ExplanationTextStr
     file_id: uuid.UUID | None = None
 
 
