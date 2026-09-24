@@ -218,10 +218,17 @@ def _validate_target_format(target: str, purpose: str) -> None:
 
 class OtpRequestIn(BaseModel):
     target_type: Literal["phone", "email"]
-    # A phone number or an email address, human-typed like `LoginIn.login` —
-    # `_validate_target_format` below still does the real format check; this
-    # is only the upper bound `test_request_bounds.py` requires.
-    target: CodeStr
+    # A phone number OR an email address, human-typed — unlike `LoginIn.
+    # login` (a dedicated username, never an email: `repo.get_user_by_login`
+    # matches only `users.login`), this field genuinely carries an email
+    # half the time, and RFC 5321 allows one up to 254 characters. `CodeStr`
+    # (64) refused a real, syntactically valid long address here before fix
+    # round 1 (`test_a_long_but_valid_email_target_is_not_refused_on_
+    # length`) — `NameStr`'s 255-char bound is reused for its LENGTH only,
+    # not its "name" semantics. `_validate_target_format` below still does
+    # the real format check; this is only the upper bound
+    # `test_request_bounds.py` requires.
+    target: NameStr
     purpose: Literal["phone_verify", "email_verify"]
 
     @model_validator(mode="after")
@@ -234,7 +241,8 @@ class OtpRequestIn(BaseModel):
 
 
 class OtpVerifyIn(BaseModel):
-    target: CodeStr
+    # Same reasoning as `OtpRequestIn.target` above: this can be an email too.
+    target: NameStr
     code: PasswordStr
     purpose: Literal["phone_verify", "email_verify"]
 
