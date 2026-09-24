@@ -8,11 +8,21 @@ schema had to remember one. Read off the live OpenAPI schema, like
 reason: `app.routes` no longer lists the routes since FastAPI 0.141.
 
 Bounded means: a string has maxLength, enum/const, a bounded format or an
-anchored pattern without * or +; an array has maxItems; an integer or a
-Decimal has maximum/exclusiveMaximum; an object has declared properties only,
-or declares its bound as an `x-max-*` extension, or is a dict whose values are
-checked recursively and whose keys are capped by maxProperties.
+anchored pattern without an unescaped * or +; an array has maxItems; an
+integer or a Decimal has BOTH a maximum/exclusiveMaximum AND a
+minimum/exclusiveMinimum; an object has declared properties only, or
+declares its bound as an `x-max-*` extension, or is a dict (`additionalProperties`
+is a schema) whose values are checked recursively and whose keys are capped
+by BOTH maxProperties AND a bounded `propertyNames` (a string with
+maxLength/enum/const, or an anchored fixed pattern) — `maxProperties` alone,
+the way `json_schema_extra` can declare it, documents a bound pydantic does
+not enforce (I1, final review) and does not count.
 Query parameters are out of scope (stage 17 ruling R8).
+
+Known blind spot: a request body read by hand, outside a pydantic model, is
+never walked — `notifications/webhooks_router.py`'s Eskiz webhook and
+`payments/payme_router.py`'s Payme RPC both parse their own JSON and are not
+covered here (M5, final review).
 
 No baseline any more (task 8b closed the last three offenders): the rule
 holds for every request body in the schema, with no exceptions carried
@@ -48,12 +58,26 @@ def _string_bounded(node: dict[str, Any]) -> bool:
         pattern is not None
         and pattern.startswith("^")
         and pattern.endswith("$")
-        and not re.search(r"[*+]|,\}", pattern)
+        # An ESCAPED `\+`/`\*` (a literal character, e.g. `^\+998\d{9}$`'s
+        # leading `+`) does not open the pattern — only an unescaped
+        # quantifier does (M6, final review).
+        and not re.search(r"(?<!\\)[*+]|,\}", pattern)
     )
 
 
 def _number_bounded(node: dict[str, Any]) -> bool:
-    return "maximum" in node or "exclusiveMaximum" in node
+    has_max = "maximum" in node or "exclusiveMaximum" in node
+    has_min = "minimum" in node or "exclusiveMinimum" in node
+    return has_max and has_min
+
+
+def _property_names_bounded(node: dict[str, Any]) -> bool:
+    """A typed dict's keys (`propertyNames`) must be bounded too — a
+    `maxProperties` alongside an open `additionalProperties: {"type":
+    "string"}` caps the COUNT of entries but not the size of each key, so
+    `{"x" * 200_000: "v"}` is still one property (I1, final review)."""
+    names = node.get("propertyNames")
+    return isinstance(names, dict) and _string_bounded(names)
 
 
 def _offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
@@ -72,9 +96,13 @@ def _offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
                 visit(components[name], name)
             return
         # `allOf` is treated exactly like `anyOf`/`oneOf` here — every member is
-        # walked and any one of them being bounded is enough. The live schema
-        # has no `allOf` today (Pydantic emits `anyOf`/`oneOf` for unions and
-        # inlines everything else), so this is an untested assumption, not an
+        # walked, and EVERY one of them must be bounded on its own terms (a
+        # shared `where` key, so one unbounded member adds the offense
+        # regardless of the others — M6, final review: this used to say "any
+        # one of them being bounded is enough", which described OR semantics
+        # the code has never implemented). The live schema has no `allOf`
+        # today (Pydantic emits `anyOf`/`oneOf` for unions and inlines
+        # everything else), so this is an untested assumption, not an
         # observed shape.
         members = node.get("anyOf") or node.get("oneOf") or node.get("allOf")
         if members:
@@ -106,7 +134,11 @@ def _offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
             if "properties" not in node or extra not in (None, False):
                 checked += 1
                 declared = any(key.startswith("x-max-") for key in node)
-                typed = isinstance(extra, dict) and "maxProperties" in node
+                typed = (
+                    isinstance(extra, dict)
+                    and "maxProperties" in node
+                    and _property_names_bounded(node)
+                )
                 if not (declared or typed):
                     offenders.add(where)
                 if isinstance(extra, dict):
