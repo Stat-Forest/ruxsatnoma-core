@@ -16,6 +16,8 @@ and the other two from 3.11a:
 
 - every integer QUERY parameter carries an upper bound, or it reaches asyncpg
   as `DataError: value out of int64 range` — a 500 anybody can type (t5).
+- every field of every request BODY carries an upper bound, asserted in
+  `tests/test_request_bounds.py` (stage 17, QA run 01).
 - `register_event_subscriptions()` is idempotent for every registry it fills,
   not only for the event bus the autouse fixture restores (pre-flight P4).
 """

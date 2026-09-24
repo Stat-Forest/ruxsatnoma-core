@@ -12,13 +12,15 @@ anchored pattern without * or +; an array has maxItems; an integer or a
 Decimal has maximum/exclusiveMaximum; an object has declared properties only,
 or declares its bound as an `x-max-*` extension, or is a dict whose values are
 checked recursively and whose keys are capped by maxProperties.
-Query parameters are out of scope (stage 17 ruling R8)."""
+Query parameters are out of scope (stage 17 ruling R8).
+
+No baseline any more (task 8b closed the last three offenders): the rule
+holds for every request body in the schema, with no exceptions carried
+forward."""
 
 import os
 import re
 from typing import Any
-
-from tests.request_bounds_baseline import BASELINE
 
 _BOUNDED_FORMATS = {"uuid", "date", "date-time", "time", "email", "binary"}
 
@@ -138,12 +140,7 @@ def _offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
 def test_every_request_body_field_carries_an_upper_bound() -> None:
     checked, offenders = _offenders(_openapi())
     assert checked >= 300, f"only {checked} request fields seen — the walk is wrong"
-    new = sorted(offenders - BASELINE)
-    assert not new, (
+    assert not offenders, (
         "unbounded request field(s) — use the bounded types in app/core/schemas.py "
-        "(CodeStr, NameStr, TextStr, …, Field(max_length=…/le=…)): " + ", ".join(new)
-    )
-    stale = sorted(BASELINE - offenders)
-    assert not stale, "bounded now — delete from tests/request_bounds_baseline.py: " + ", ".join(
-        stale
+        "(CodeStr, NameStr, TextStr, …, Field(max_length=…/le=…)): " + ", ".join(sorted(offenders))
     )

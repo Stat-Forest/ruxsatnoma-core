@@ -19,7 +19,7 @@ from pydantic import (
     field_validator,
 )
 
-from app.core.schemas import DAYS_MAX, LIST_MAX_ITEMS, CodeStr
+from app.core.schemas import DAYS_MAX, LIST_MAX_ITEMS, CodeStr, JsonValue
 
 # A required legal-basis note, stripped (stage 17 R5) so a whitespace-only
 # one refuses the same way a blank one already does. Shared by every
@@ -150,7 +150,11 @@ class Rotation(BaseModel):
 
 class RuleParameterIn(BaseModel):
     code: Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+(:[a-z0-9_]+)?$")]
-    value: Any
+    # `JsonValue` (stage 17 task 8b), not narrowed to a number: every consumer
+    # today (`calculator._param`/`_rule` via `Decimal(str(...))`) expects a
+    # scalar, but narrowing the wire type is a behaviour change this stage did
+    # not rule on — it only bounds what was previously unbounded `Any`.
+    value: JsonValue
     unit: CodeStr | None = None
     effective_from: date
     effective_to: date | None = None
@@ -158,7 +162,7 @@ class RuleParameterIn(BaseModel):
 
 
 class RuleParameterPatch(BaseModel):
-    value: Any = None
+    value: JsonValue | None = None
     unit: CodeStr | None = None
     effective_from: date | None = None
     effective_to: date | None = None
