@@ -74,6 +74,18 @@ class ChecklistIn(BaseModel):
     items: Annotated[list[ChecklistQuestion], Field(min_length=1, max_length=CHECKLIST_ITEMS_MAX)]
 
 
+class ChecklistQuestionOut(BaseModel):
+    """Same shape as `ChecklistQuestion`, but `code` is a plain, unbounded
+    `str` (I5, final review): a STORED row may predate `CodeStr`'s 64-char
+    bound, and a GET must still list it rather than 500 re-validating
+    output through the same tightened type the input schema uses."""
+
+    code: str
+    question: LocalizedName
+    type: Literal["bool", "number", "text"]
+    required: bool = False
+
+
 class ChecklistOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -82,7 +94,7 @@ class ChecklistOut(BaseModel):
     version: int
     name: LocalizedName
     activity_type_id: uuid.UUID | None
-    items: list[ChecklistQuestion]
+    items: list[ChecklistQuestionOut]
     status: str
 
 
