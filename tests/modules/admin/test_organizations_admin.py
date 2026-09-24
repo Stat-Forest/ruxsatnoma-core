@@ -240,6 +240,40 @@ async def test_duplicate_code_rejected(db, agency):
     assert r.json()["error"]["details"]["code"] == f"dup-{suffix}"
 
 
+async def test_trailing_space_in_code_is_the_same_code(db, agency):
+    """R5 (stage 17 QA run 01, C2): `OrganizationIn.code` is stripped before the
+    uniqueness check runs, so a trailing space can no longer be used to smuggle
+    past the SAME duplicate-code refusal `test_duplicate_code_rejected` asserts."""
+    suffix = uuid.uuid4().hex[:6]
+    code = f"QA17-{suffix}"
+    _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        first = await client.post(
+            f"{API}/admin/organizations",
+            json={
+                "kind": "leshoz",
+                "parent_id": str(agency.id),
+                "code": code,
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+            },
+        )
+        assert first.status_code == 201, first.text
+        second = await client.post(
+            f"{API}/admin/organizations",
+            json={
+                "kind": "leshoz",
+                "parent_id": str(agency.id),
+                "code": f"{code} ",
+                "name": {"uz_cyrl": "Х", "uz_latn": "X"},
+            },
+        )
+    assert second.status_code == 422
+    assert second.json()["error"]["details"]["code"] == code
+
+
 async def test_reparent_into_own_subtree_rejected(db, agency):
     suffix = uuid.uuid4().hex[:6]
     _, token, csrf = await signed_in_with(db, ORGANIZATIONS_MANAGE)

@@ -74,6 +74,21 @@ JsonObject = Annotated[
     Field(json_schema_extra={"x-max-json-bytes": JSON_MAX_BYTES}),
 ]
 
+
+def _cap_json_value(value: Any) -> Any:
+    size = len(json.dumps(value, default=str, separators=(",", ":")).encode())
+    if size > JSON_MAX_BYTES:
+        raise ValueError(f"value is {size} bytes, the limit is {JSON_MAX_BYTES}")
+    return value
+
+
+# Any JSON value (scalar, list or object) under the same byte cap as JsonObject.
+JsonValue = Annotated[
+    Any,
+    AfterValidator(_cap_json_value),
+    Field(json_schema_extra={"x-max-json-bytes": JSON_MAX_BYTES}),
+]
+
 LocalizedText = Annotated[str, StringConstraints(max_length=LONG_TEXT_MAX_LENGTH)]
 
 

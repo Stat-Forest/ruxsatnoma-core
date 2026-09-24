@@ -12,6 +12,7 @@ from app.core.schemas import (
     LONG_TEXT_MAX_LENGTH,
     CodeStr,
     JsonObject,
+    JsonValue,
     LocalizedName,
     NoteStr,
     PasswordStr,
@@ -28,6 +29,7 @@ class Body(BaseModel):
     url: UrlStr | None = None
     extra: JsonObject | None = None
     name: LocalizedName | None = None
+    setting: JsonValue = None
 
 
 def test_codes_are_stripped_so_a_trailing_space_is_the_same_code() -> None:
@@ -69,3 +71,11 @@ def test_a_json_object_over_the_byte_cap_is_refused() -> None:
 def test_localized_name_values_are_capped() -> None:
     with pytest.raises(ValidationError):
         Body.model_validate({"name": {"uz_latn": "x" * (LONG_TEXT_MAX_LENGTH + 1)}})
+
+
+def test_a_json_value_accepts_a_bare_scalar_and_caps_an_oversize_one() -> None:
+    """Unlike `JsonObject`, a setting's value is not always a `dict` — most of
+    `settings_store.SETTING_SPECS` are `int`/`str`/`bool` (stage 17 t6)."""
+    assert Body(setting=45).setting == 45
+    with pytest.raises(ValidationError):
+        Body(setting="x" * JSON_MAX_BYTES)
