@@ -19,6 +19,8 @@ import base64
 import uuid
 from datetime import date
 
+import pytest
+
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 
 
@@ -637,43 +639,92 @@ async def test_a_missing_address_is_named_in_missing_and_resolved_by_filling_it_
     assert result.status_code == 201, result.text
 
 
-async def test_a_benefit_claim_is_accepted_without_a_document(
+async def test_a_benefit_claim_is_refused_while_the_benefit_doc_type_is_unconfigured(
     applicant_client,
     filing_ready_for_submission,
     benefit_category_item_id,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision #220, FAIL-CLOSED: with no active `benefit_proof` item in the
+    `doc_types` classifier a benefit claim cannot be PROVEN at all, and an
+    unconfigurable rule refuses — a benefit REDUCES the fee.
+
+    The state is reached by moving the CODE, not the database (migration
+    `0024` seeds `benefit_proof`): `monkeypatch` points the guard at a code
+    nothing carries and writes nothing, so the shared test database is never
+    left with the seeded row archived."""
+    from app.modules.applications import service
+
+    absent_code = f"benefit_proof_absent_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(service, "BENEFIT_DOC_TYPE_CODE", absent_code)
+    claimed = {
+        **filing_ready_for_submission,
+        "benefit_category_item_id": str(benefit_category_item_id),
+        "benefit_certificate_no": "CERT-DOC-0",
+    }
+
+    refused = await _submit_with_button(applicant_client, claimed)
+
+    assert refused.status_code == 422, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "ERR-APP-003"
+    assert error["details"]["reason"] == "benefit_doc_type_not_configured"
+    assert error["details"]["doc_type_code"] == absent_code
+
+
+async def test_a_benefit_claim_needs_a_scan_of_the_benefit_type_and_no_other(
+    applicant_client,
+    filing_ready_for_submission,
+    benefit_category_item_id,
+    benefit_doc_type_item_id,
     doc_type_item_id,
 ) -> None:
-    """Ruling #189: the certificate's scan is optional. A claim with its
-    number and NO attachment at all — or with an attachment of some other
-    type, which used to be refused as "not the benefit type" — passes what
-    was step 3 and is answered by the gates behind it. The refusal below is
-    step 7's pricing (decision #50: no seeded tariff carries a modifier for
-    a category a test invented), and what matters is which gate answers: not
-    `ERR-APP-003` with a reason about documents.
-    """
+    """Decision #220 (supersedes #189): the number AND the scan are both
+    mandatory for every benefit. No attachment, or an attachment of another
+    type, is refused `benefit_claim_needs_a_document`, at the pre-check (the
+    wizard's step-4 "Next") and at filing alike; a scan of the benefit type
+    passes and the next gate answers — step 7's pricing, which knows no
+    modifier for a category a test invented (decision #50).
+
+    All three in one test on purpose: "a document is attached" passing while
+    "a document of the right type is attached" fails is the difference
+    between a fail-open guard and this one, and only the set can tell them
+    apart."""
     claimed = {
         **filing_ready_for_submission,
         "benefit_category_item_id": str(benefit_category_item_id),
         "benefit_certificate_no": "CERT-DOC-1",
     }
-    bare = await _submit_with_button(applicant_client, claimed)
-    assert bare.status_code == 422, bare.text
-    assert bare.json()["error"]["code"] == "ERR-VAL-001"
+    other = {
+        **claimed,
+        "documents": [
+            {"doc_type_item_id": str(doc_type_item_id), "file_id": await _upload(applicant_client)}
+        ],
+    }
+    for body in (claimed, other):
+        for refused in (
+            await applicant_client.post("/api/v1/applications/precheck", json=body),
+            await _submit_with_button(applicant_client, body),
+        ):
+            assert refused.status_code == 422, refused.text
+            error = refused.json()["error"]
+            assert error["code"] == "ERR-APP-003"
+            assert error["details"]["reason"] == "benefit_claim_needs_a_document"
 
-    with_other = await _submit_with_button(
+    proven = await _submit_with_button(
         applicant_client,
         {
             **claimed,
             "documents": [
                 {
-                    "doc_type_item_id": str(doc_type_item_id),
+                    "doc_type_item_id": str(benefit_doc_type_item_id),
                     "file_id": await _upload(applicant_client),
                 }
             ],
         },
     )
-    assert with_other.status_code == 422, with_other.text
-    assert with_other.json()["error"]["code"] == "ERR-VAL-001"
+    assert proven.status_code == 422, proven.text
+    assert proven.json()["error"]["code"] == "ERR-VAL-001"
 
 
 async def test_a_filing_on_an_unpublished_contour_is_refused(

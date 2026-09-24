@@ -10,14 +10,14 @@ keeps the next seeded template from putting them back.
 `uz_cyrl` and `ru` are outside the set by definition and are not checked: a
 Cyrillic SMS is UCS-2 whatever we do, which is why `0009` ruling 20 already
 counts them at 70. Only `uz_latn` — the one language that CAN be cheap — and
-the OTP text are held to it.
+the OTP texts are held to it.
 """
 
 import re
 
 import sqlalchemy as sa
 
-from app.modules.integrations.adapters.otp_sender import OTP_TEXT
+from app.modules.integrations.adapters.otp_sender import OTP_TEXTS
 
 # GSM 03.38 basic set. The extension table (`^{}\[~]|€`) is deliberately NOT
 # included: those characters cost two septets each and none of our texts needs
@@ -38,8 +38,10 @@ def _outside(text: str) -> set[str]:
     return {char for char in stripped if char not in GSM_BASIC}
 
 
-def test_otp_text_is_gsm_only() -> None:
-    assert _outside(OTP_TEXT) == set()
+def test_otp_texts_are_gsm_only() -> None:
+    assert {purpose: _outside(text) for purpose, text in OTP_TEXTS.items()} == {
+        purpose: set() for purpose in OTP_TEXTS
+    }
 
 
 async def test_every_active_latin_sms_body_is_gsm_only(db) -> None:

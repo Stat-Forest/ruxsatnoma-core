@@ -81,6 +81,13 @@ async def test_one_application_walks_the_whole_path(
     assert card["number"] == number
     assert card["calculation"]["amount"] is not None
     assert card["calculation"]["rule_version"] is not None
+    # The card explains its own price: one line per herd group, each the
+    # product of what it names, read off the stored row — never re-priced.
+    calc = card["calculation"]
+    (line,) = calc["lines"]
+    assert (line["quantity"], line["quantity_unit"]) == ("40", "head")
+    assert Decimal(line["amount"]) == Decimal(calc["bhm"]) * Decimal(line["coefficient"]) * 40
+    assert Decimal(line["amount"]) == Decimal(calc["amount"])
 
     timeline = (await applicant_client.get(f"/api/v1/applications/{app_id}/timeline")).json()
     assert [e["to_status"] for e in timeline["status_history"]] == [

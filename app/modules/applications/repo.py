@@ -22,13 +22,14 @@ an expression — this file imports no other module's service (review I2)."""
 
 import uuid
 from collections.abc import Collection, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Row, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.textsearch import text_filter
+from app.core.time import tashkent_day_start
 from app.modules.admin.models import ActivityType, Classifier, ClassifierItem, Organization
 from app.modules.applications.assignment import Candidate
 from app.modules.applications.models import (
@@ -287,6 +288,8 @@ async def list_applications(
     q: str | None,
     period_from: date | None,
     period_to: date | None,
+    created_from: date | None,
+    created_to: date | None,
     offset: int,
     limit: int,
 ) -> tuple[list[Application], int]:
@@ -321,6 +324,10 @@ async def list_applications(
     active in this window" is the question a reviewer's queue asks, and an
     exact-match filter on either end would answer a question nobody has.
 
+    `created_from`/`created_to` are Asia/Tashkent calendar days, both ends
+    inclusive — "filed between these dates" — turned into UTC instants by
+    `core.time.tashkent_day_start`, because `created_at` is `timestamptz`.
+
     Most recently UPDATED first — `updated_at DESC`, then `id DESC` as the
     tie-break (uuid7 is creation-ordered, so equal timestamps still read newest
     first). A queue read as "what changed since I looked" must float an old
@@ -345,6 +352,11 @@ async def list_applications(
         conditions.append(Application.period_to >= period_from)
     if period_to is not None:
         conditions.append(Application.period_from <= period_to)
+    if created_from is not None:
+        conditions.append(Application.created_at >= tashkent_day_start(created_from))
+    if created_to is not None:
+        next_day = created_to + timedelta(days=1)
+        conditions.append(Application.created_at < tashkent_day_start(next_day))
     if q:
         conditions.append(text_filter(q, Application.number, Applicant.name))
 

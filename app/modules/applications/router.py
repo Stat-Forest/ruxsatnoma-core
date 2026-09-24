@@ -206,6 +206,8 @@ async def list_applications(
     q: Annotated[str | None, Query(max_length=200)] = None,
     period_from: date | None = None,
     period_to: date | None = None,
+    created_from: date | None = None,
+    created_to: date | None = None,
 ) -> Page[ApplicationOut]:
     """The applications this caller may see: their own, or — holding one of the
     three staff read codes — their zone's.
@@ -216,7 +218,9 @@ async def list_applications(
     `status` is the `ApplicationStatus` literal, so a typo is a 422 rather than
     an empty page that reads as "no applications in that state".
     `period_from`/`period_to` select applications whose own period OVERLAPS the
-    window — the question a reviewer's queue asks.
+    window — the question a reviewer's queue asks. `created_from`/`created_to`
+    select by the Asia/Tashkent calendar day the application was filed, both
+    ends inclusive — the applicant's own "what did I file last week".
     """
     items, total = await service.list_applications(
         db,
@@ -230,6 +234,8 @@ async def list_applications(
         q=q,
         period_from=period_from,
         period_to=period_to,
+        created_from=created_from,
+        created_to=created_to,
     )
     return Page[ApplicationOut](
         items=[ApplicationOut.model_validate(item) for item in items],

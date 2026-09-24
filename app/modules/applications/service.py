@@ -78,6 +78,7 @@ from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
+from app.modules.beekeepers import service as beekeepers_service
 from app.modules.gis import service as gis_service
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters import cadastre as cadastre_adapter
@@ -160,16 +161,28 @@ BENEFIT_CLASSIFIER_CODE = "benefit_categories"
 # membership, not merely that the id names some classifier item — otherwise a
 # rejection reason could be attached as a document type.
 DOC_TYPE_CLASSIFIER_CODE = "doc_types"
-# The `doc_types` item a benefit certificate's scan is filed under when the
-# citizen attaches one. **Optional since ruling #189** (2026-09-10): the claim
-# is the certificate NUMBER (ruling #181), checked against a register or by the
-# leshoz (`_open_benefit_verification`); the file is supporting material the
-# verifier may want to see, never a gate. Migration `0024` seeds the code —
-# it is ours, not the Agency's — so the adminka can name it; nothing on the
-# submission path looks it up any more. `tests/modules/applications/
+# The ONE `doc_types` item a benefit claim is proven with. **Mandatory again
+# since decision #220** (2026-09-24, superseding #189): every benefit needs its
+# certificate number AND a scan of this type (`_check_benefit_claim`).
+# Migration `0024` seeds the code — it is ours, not the Agency's — and while no
+# ACTIVE item carries it (somebody archived it) every benefit claim is REFUSED
+# rather than accepted on an unchecked attachment. `tests/modules/applications/
 # test_documents.py` holds the literal in the migration and this constant
 # together.
 BENEFIT_DOC_TYPE_CODE = "benefit_proof"
+
+# Ruling #219: the one benefit category with a register the system can check
+# by itself — the Beekeeping Union's own (`beekeepers`), kept by its
+# registrar. Every other category is the leshoz's decision (`pending`).
+BEEKEEPING_BENEFIT_CODE = "beekeeping_union_member"
+# `beekeepers.service.MatchResult.status` -> the `ERR-APP-003` reason the
+# applicant is shown. `matched` is absent on purpose: it is the one answer
+# that is not a refusal.
+REGISTER_REFUSALS = {
+    "unknown": "benefit_certificate_unknown",
+    "not_yours": "benefit_certificate_not_yours",
+    "expired": "benefit_certificate_expired",
+}
 
 
 # tz/05's transition table (plan 03.9a task 8, the brief's own copy). All
@@ -1248,6 +1261,8 @@ async def list_applications(
     q: str | None = None,
     period_from: date | None = None,
     period_to: date | None = None,
+    created_from: date | None = None,
+    created_to: date | None = None,
 ) -> tuple[list[Application], int]:
     """`GET /applications` — one page of the applications `actor` may see, plus
     the total.
@@ -1313,6 +1328,8 @@ async def list_applications(
         q=q,
         period_from=period_from,
         period_to=period_to,
+        created_from=created_from,
+        created_to=created_to,
         offset=params.offset,
         limit=params.page_size,
     )
@@ -1468,6 +1485,7 @@ async def precheck(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
     3.9b's route, not this one.
     """
     application = await _own_draft_for_update(db, application_id, actor=actor)
+    await _check_benefit_claim(db, application)  # ruling #219, as `precheck_filing`
     priced: dict[str, Any] | None = None
     if not await checks.missing_for_pricing(db, application):
         priced = await norms_service.preview(
@@ -1725,47 +1743,131 @@ async def _assert_complete(
         raise err("ERR-APP-001", details={"missing": missing})
 
 
-async def _open_benefit_verification(db: AsyncSession, application: Application) -> None:
-    """Step 3b. Ruling #181: EVERY benefit category now needs a certificate
-    number — refused for every category with none, not only the ones a
-    per-item switch used to flag. **`requires_certificate` is no longer read
-    at all; the branch reading it is DELETED, not merely skipped** — the
-    number is universal, so there is nothing left for that property to gate.
+async def _benefit_doc_type(db: AsyncSession) -> Any:
+    """The ACTIVE `doc_types` item whose code is `BENEFIT_DOC_TYPE_CODE`, or
+    `None` when there is none. Read through `admin.repo` (reference data is
+    reached through its owner); `list_classifier_items` already applies
+    "valid today AND active", the only sense in which a doc type proves
+    anything on a submission."""
+    classifier = await admin_repo.get_classifier_by_code(db, DOC_TYPE_CLASSIFIER_CODE)
+    if classifier is None:
+        return None
+    items = await admin_repo.list_classifier_items(db, classifier.id)
+    return next((item for item in items if item.code == BENEFIT_DOC_TYPE_CODE), None)
 
-    **No automatic verdict, ruling #206 (2026-09-13; supersedes the
-    register-at-filing half of #182).** Every claim that carries a number
-    opens `pending` — the leshoz's own review queue — whatever the category.
-    The Beekeeping Union's register (`beekeepers`) is still maintained by
-    the registrar and is what the leshoz consults for a `beekeeping_union_
-    member` claim, but the system no longer refuses a FILING over it: an
-    unknown or someone else's number is a question for the reviewer, not a
-    wall in front of the applicant. The seam that used to hold that check
-    (`BENEFIT_AUTO_VERIFIERS`, wired from `app/event_subscriptions.py`) is
-    DELETED, not left empty — an empty seam reads like a check that could be
-    on, and this project's defects hide rather than leak.
 
-    Fail-closed on the unconfigurable case: a claim whose classifier item
-    cannot be read is refused, not waved through as `not_required`. The
-    certificate's scan (`BENEFIT_DOC_TYPE_CODE`) is NOT required here —
-    ruling #189: the number is the claim, the file is optional support.
+async def _check_benefit_claim(
+    db: AsyncSession,
+    application: Application,
+    *,
+    documents: list[ApplicationDocument] | None = None,
+) -> bool:
+    """The benefit claim's own gate, shared by every step that can reach a
+    signature — the pre-checks, the package and the filing — so the wizard's
+    "Next" and the filing can never disagree about a claim (lesson: one
+    precondition, one function). Reads the application, writes nothing.
+
+    `documents`: a transient filing's own attachments (stage 12 — they are
+    not in the session yet); `None` reads the stored rows of a RETURNED
+    application, the same idiom as `checks.missing_for_pricing`'s `items`.
+
+    Decision #220 (supersedes #189): EVERY benefit needs its certificate
+    number (#181) AND a scan of the `benefit_proof` type — refused 422
+    `ERR-APP-003` `benefit_certificate_required` /
+    `benefit_claim_needs_a_document`, in that order. A document of another
+    type does not prove a claim. **FAIL-CLOSED**: a benefit REDUCES the fee,
+    so a claim whose category cannot be read, or while `benefit_proof` is not
+    configured (`benefit_doc_type_not_configured`), is refused, never waved
+    through.
+
+    **Ruling #219 (2026-09-24; supersedes #206, restores the register half of
+    #182).** A `beekeeping_union_member` claim is checked against the
+    Beekeeping Union's register (`beekeepers.service.match_certificate`): an
+    unknown number, someone else's, or an expired certificate is refused
+    422 `ERR-APP-003` naming which (`REGISTER_REFUSALS`); a match answers
+    `True` — the register has confirmed the claim. Every other category
+    answers `False`: no register exists for it, so the leshoz decides.
+
+    Identity is read off the APPLICANT the filing is for (`get_applicant`),
+    never the signed-in user: an individual carries a PINFL and no STIR, a
+    legal entity the reverse (`identity_by_kind`), so a representative filing
+    for a member farm is matched by the farm's STIR, never by their own PINFL.
+    Matching the number to this identity is what makes the number evidence —
+    it is a validity check against the Union's record, not only an existence
+    check (lesson).
     """
     item_id = application.benefit_category_item_id
     if item_id is None:
-        application.benefit_verification_status = "not_required"
-        return
+        return False
     item = await admin_repo.get_classifier_item(db, item_id)
     if item is None:
         raise err("ERR-APP-003", details={"reason": "unknown_benefit_category"})
-    if not (application.benefit_certificate_no or "").strip():
+    certificate_no = (application.benefit_certificate_no or "").strip()
+    if not certificate_no:
         raise err("ERR-APP-003", details={"reason": "benefit_certificate_required"})
+    doc_type = await _benefit_doc_type(db)
+    if doc_type is None:
+        raise err(
+            "ERR-APP-003",
+            details={
+                "reason": "benefit_doc_type_not_configured",
+                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
+            },
+        )
+    if documents is None:
+        documents = await repo.list_documents(db, application.id)
+    if not any(document.doc_type_item_id == doc_type.id for document in documents):
+        raise err(
+            "ERR-APP-003",
+            details={
+                "reason": "benefit_claim_needs_a_document",
+                "doc_type_code": BENEFIT_DOC_TYPE_CODE,
+            },
+        )
+    if item.code != BEEKEEPING_BENEFIT_CODE:
+        return False
 
-    # A RESUBMISSION must not silently keep a verdict made about the
-    # previous attempt: the applicant may have changed the number since it
-    # was rejected.
-    application.benefit_verification_status = "pending"
+    applicant = await auth_service.get_applicant(db, application.applicant_id)
+    result = await beekeepers_service.match_certificate(
+        db,
+        certificate_no=certificate_no,
+        pinfl=applicant.pinfl if applicant is not None else None,
+        stir=applicant.stir if applicant is not None else None,
+    )
+    if result.status != "matched":
+        raise err("ERR-APP-003", details={"reason": REGISTER_REFUSALS[result.status]})
+    return True
+
+
+async def _open_benefit_verification(
+    db: AsyncSession,
+    application: Application,
+    *,
+    documents: list[ApplicationDocument] | None = None,
+) -> None:
+    """Step 3b: `_check_benefit_claim`, then the verdict it leaves on the row.
+
+    A claim the Union's register confirmed is `verified` on the spot, with
+    `benefit_verified_by` NULL — ruling #182's own meaning, "the register,
+    not a human" (the staff card says so). Any other claim opens `pending`,
+    the leshoz's own review queue.
+
+    A RESUBMISSION must not silently keep a verdict made about the previous
+    attempt — the applicant may have changed the number since it was
+    rejected — so every field of the verdict is written, both ways.
+    """
+    if application.benefit_category_item_id is None:
+        application.benefit_verification_status = "not_required"
+        return
+    confirmed_by_register = await _check_benefit_claim(db, application, documents=documents)
     application.benefit_verified_by = None
-    application.benefit_verified_at = None
     application.benefit_rejection_reason = None
+    if confirmed_by_register:
+        application.benefit_verification_status = "verified"
+        application.benefit_verified_at = datetime.now(UTC)
+    else:
+        application.benefit_verification_status = "pending"
+        application.benefit_verified_at = None
 
 
 async def _published_version_or_refuse(db: AsyncSession, application: Application) -> Any:
@@ -1919,6 +2021,10 @@ async def precheck_filing(
     Writes nothing but the audit entry (plan 12, R3)."""
     filing = await _build_filing(db, payload, actor=actor)
     application, items = filing.application, filing.items
+    # Ruling #219: the wizard runs this on leaving step 4, and the Union's
+    # register answers HERE — a refused claim is a broken input (an HTTP
+    # error the wizard shows at the certificate field), never a check row.
+    await _check_benefit_claim(db, application, documents=filing.documents)
     priced: dict[str, Any] | None = None
     if not await checks.missing_for_pricing(db, application, items=items):
         priced = await norms_service.preview(
@@ -1963,6 +2069,9 @@ async def package_filing(
     filing = await _build_filing(db, payload, actor=actor)
     application, items = filing.application, filing.items
     await _assert_complete(db, application, items=items)
+    # Ruling #219: before the bytes exist, so a claim the register refuses
+    # never reaches the E-IMZO dialog. `file()` checks again (step 3b).
+    await _check_benefit_claim(db, application, documents=filing.documents)
     version = await _published_version_or_refuse(db, application)
     application.id = application_id or uuid7()
     _, priced = await _price(db, application, actor=actor, items=items)
@@ -2015,7 +2124,7 @@ async def file(
         db, application, items=items, rules_accepted=payload.rules_accepted
     )
     application.rules_accepted_at = datetime.now(UTC)  # ruling #184, the server's clock
-    await _open_benefit_verification(db, application)  # step 3b
+    await _open_benefit_verification(db, application, documents=filing.documents)  # step 3b
     version = await _published_version_or_refuse(db, application)  # step 4 (ruling 22)
     application.contour_version_id = version.id
     application.requested_area_ha = version.area_ha

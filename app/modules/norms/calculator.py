@@ -626,3 +626,54 @@ def calculate(request: CalcRequest, snapshot: ParamSnapshot) -> CalcResult:
         rule_code_version=RULE_CODE_VERSION,
         input_snapshot=input_snapshot,
     )
+
+
+TIYIN = Decimal("0.01")
+
+
+def _explained_decimal(value: Any) -> Decimal | None:
+    return None if value is None else Decimal(str(value))
+
+
+def explain(breakdown: list[dict[str, Any]], input_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """A calculation re-told as the lines a person reads — «10 head × 0.45 БҲМ
+    × 440 000 = 1 980 000» — for a citizen who otherwise sees one total and
+    cannot tell how it came about.
+
+    Reads what `calculate` wrote and recomputes nothing. Each `tariff` line
+    becomes one line here, and the `benefit` line `calculate` appends right
+    after its tariff line is folded into that line (`benefit_code`,
+    `benefit_modifier`), because the tariff line's `amount` is already the
+    after-benefit product. The `limit` line is dropped: `used_sb`/`max_sb`
+    travel as fields of their own. `bhm` is read from the snapshot's `params`
+    — the value this row was priced with, not today's, which is the point of
+    storing the snapshot.
+
+    A line's `amount` is rounded to the tiyin for reading only. The total is
+    still `amount` as `calculate` rounded it ONCE by `rounding_money`, so the
+    lines can add up to a fraction of a sum more or less — nothing may
+    re-derive the total from them."""
+    params = input_snapshot.get("params") or {}
+    lines: list[dict[str, Any]] = []
+    for entry in breakdown:
+        kind = entry.get("kind")
+        if kind == "tariff":
+            exempt = entry.get("reason") == "no_tariff_by_law"
+            quantity = entry.get("count", entry.get("quantity"))
+            lines.append(
+                {
+                    "livestock_code": entry.get("livestock_code"),
+                    "activity_code": entry.get("activity_code"),
+                    "quantity": _explained_decimal(quantity),
+                    "quantity_unit": entry.get("quantity_unit"),
+                    "coefficient": _explained_decimal(entry.get("coefficient")),
+                    "benefit_code": None,
+                    "benefit_modifier": None,
+                    "amount": Decimal(str(entry["amount"])).quantize(TIYIN, ROUND_HALF_UP),
+                    "exempt": exempt,
+                }
+            )
+        elif kind == "benefit" and lines:
+            lines[-1]["benefit_code"] = entry.get("code")
+            lines[-1]["benefit_modifier"] = _explained_decimal(entry.get("modifier"))
+    return {"bhm": _explained_decimal(params.get("bhm")), "lines": lines}
