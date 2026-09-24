@@ -461,6 +461,29 @@ def test_the_schema_literals_match_the_tuples_the_checks_are_built_from() -> Non
     assert set(get_args(PrintoutKind)) == set(PRINTOUT_KINDS)
 
 
+def test_the_printout_language_check_is_built_from_core_locales() -> None:
+    """F7 (stage 16 fix wave): `ApplicationPrintout`'s `language` CHECK is
+    built directly from `app.core.schemas.LOCALES` (models.py imports it),
+    not a copied literal — migration 0064 keeps its own frozen literal on
+    purpose (a migration is history and does not import the app), so this is
+    the guard that the model-side CHECK and `LOCALES` cannot drift from each
+    other independently of it."""
+    from typing import cast
+
+    from sqlalchemy import CheckConstraint, Table
+
+    from app.core.schemas import LOCALES
+    from app.modules.applications.models import ApplicationPrintout
+
+    table = cast(Table, ApplicationPrintout.__table__)
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert checks["ck_application_printouts_language_valid"] == f"language IN {LOCALES}"
+
+
 def test_the_blank_fields_of_stage_15_are_columns_with_check_backed_codes() -> None:
     """Decision #215 R6: the four lines the deadwood and recreation blanks print
     live on `applications`, nullable (a draft is autosaved field by field), and

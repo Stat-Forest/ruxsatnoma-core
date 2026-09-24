@@ -30,6 +30,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.schemas import LOCALES
 from app.db import Base, uuid7
 
 # tz/05's full state machine, all 14 statuses from day one (ruling 2) even though
@@ -513,9 +514,13 @@ class ApplicationPrintout(Base):
     # reasoning as `Application`'s own deadwood/recreation checks above).
     __table_args__ = (
         CheckConstraint(f"kind IN {PRINTOUT_KINDS}", name="kind_valid"),
-        CheckConstraint(
-            "language IN ('uz_cyrl', 'uz_latn', 'ru', 'kaa', 'en')", name="language_valid"
-        ),
+        # F7 (stage 16 fix wave): built from `app.core.schemas.LOCALES`
+        # itself rather than a copied literal (lesson: an enum-ish column has
+        # ONE source of truth) — migration 0064 keeps its own frozen literal
+        # (`LOCALES_SQL`), since a migration is history and does not import
+        # the app; this is the model-side half, and the two cannot drift
+        # from each other independently of that migration ever again.
+        CheckConstraint(f"language IN {LOCALES}", name="language_valid"),
         CheckConstraint(
             "(kind = 'letter') = (submission_id IS NOT NULL)", name="letter_has_submission"
         ),
