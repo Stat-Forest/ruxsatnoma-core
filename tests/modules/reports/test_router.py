@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Organization
 from app.modules.reports import repo, service
+from app.modules.reports.models import ReportForm
 from tests.modules.reports.conftest import Signer, sign_report_request
 
 
@@ -57,6 +58,40 @@ async def test_create_form_requires_reports_forms_manage(hodim_client: httpx.Asy
     )
     assert result.status_code == 403
     assert result.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_a_legacy_column_code_over_the_current_bound_is_still_listed(
+    db: AsyncSession, hodim_client: httpx.AsyncClient
+) -> None:
+    """I5, final review. `ReportFormColumn.code` (the IN-side item type) is
+    `CodeStr`, capped at 64 — but `ReportFormOut.columns` used to reuse that
+    SAME type to validate what it reads back, so a row stored before the
+    stage-17 bound existed (or written directly, as this test does) would
+    500 the whole `GET /reports/forms` list the moment pydantic tried to
+    re-validate its 100-character column code against a 64-character cap.
+    `ReportFormOut` now uses `ReportFormColumnOut`, whose `code` is a plain
+    unbounded `str`, so a legacy row is still listed rather than breaking
+    the page for everyone."""
+    code = f"legacy-{uuid.uuid4().hex[:8]}"
+    form = ReportForm(
+        code=code,
+        version=1,
+        name={"uz_cyrl": "Legacy", "uz_latn": "Legacy"},
+        period_type="month",
+        columns=[
+            {"code": "x" * 100, "label": {"uz_latn": "Legacy"}, "source": "manual", "type": "text"}
+        ],
+        rules=[],
+        schedule={},
+        status="active",
+    )
+    db.add(form)
+    await db.commit()
+
+    listed = await hodim_client.get("/api/v1/reports/forms", params={"page_size": 100})
+    assert listed.status_code == 200
+    row = next(item for item in listed.json()["items"] if item["code"] == code)
+    assert row["columns"][0]["code"] == "x" * 100
 
 
 async def test_full_round_trip(
