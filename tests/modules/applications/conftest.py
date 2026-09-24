@@ -1341,9 +1341,10 @@ async def application_in_review_at_agency(
 
 
 async def _rejection_reasons_item(db: AsyncSession, code: str) -> ClassifierItem:
-    """One ACTIVE item of the `rejection_reasons` classifier by its RJ-* code
-    — the fixed catalogue `tz/10` § 8.2 seeds through migration 0005 (fifteen
-    values) and 0025 (RJ-15's `kind`, "reject" -> "both").
+    """One ACTIVE item of the `rejection_reasons` classifier by its code — the
+    fixed catalogue `tz/10` § 8.2 seeds through migration 0005 (RJ-01..RJ-15)
+    and 0025 (RJ-15's `kind`, "reject" -> "both"); migration 0064 (stage 16,
+    ruling R4) adds R01..R08 and archives RJ-03..RJ-12.
 
     Fetched, never created: a private copy inserted per test would leave rows
     in this shared, persistent database that `GET /refs/classifiers/
@@ -1364,9 +1365,10 @@ async def _rejection_reasons_item(db: AsyncSession, code: str) -> ClassifierItem
 
 @pytest.fixture
 async def rejection_reason_item(db: AsyncSession) -> ClassifierItem:
-    """RJ-03, «участок вне границ лесного фонда» — `kind="reject"`, task 7's
-    own rejection ground."""
-    return await _rejection_reasons_item(db, "RJ-03")
+    """R01, «маълумот тўлиқ эмас ёки ўзаро мос эмас» — `kind="reject"`, task
+    7's own rejection ground. RJ-03, the fixture's original code, was
+    archived by migration 0064 (ruling R4)."""
+    return await _rejection_reasons_item(db, "R01")
 
 
 @pytest.fixture
@@ -1378,11 +1380,12 @@ async def rj_01_return_reason(db: AsyncSession) -> ClassifierItem:
 
 @pytest.fixture
 async def rj_03_reject_reason(db: AsyncSession) -> ClassifierItem:
-    """The same RJ-03 row as `rejection_reason_item` above, under task 3's own
-    (3.9b) test name: a REFUSAL (`kind="reject"`), the negative control for
-    `test_a_return_requires_a_reason_of_the_right_type` — returning under it
-    would misdescribe the decision (ruling 3)."""
-    return await _rejection_reasons_item(db, "RJ-03")
+    """R01, a refusal code — the negative control for returning under it
+    (`test_a_return_requires_a_reason_of_the_right_type` — returning under a
+    REFUSAL code would misdescribe the decision, ruling 3). Named after RJ-03,
+    this fixture's original code before migration 0064 (stage 16, ruling R4)
+    archived it; kept under its old name so its callers need no edit."""
+    return await _rejection_reasons_item(db, "R01")
 
 
 @pytest.fixture

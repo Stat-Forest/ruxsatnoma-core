@@ -17,7 +17,16 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, UniqueConstraint, func, text
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Numeric,
+    SmallInteger,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -437,4 +446,91 @@ class ApplicationCheck(Base):
         CheckConstraint(f"check_type IN {CHECK_TYPES}", name="check_type_valid"),
         CheckConstraint(f"result IN {CHECK_RESULTS}", name="result_valid"),
         CheckConstraint(f"source IN {CHECK_SOURCES}", name="source_valid"),
+    )
+
+
+# Stage 16 (rulings R3/R4): a rejection's grounds, one row per ground, append-only
+# (migration 0064's trigger). `position` is 1-based and is the order the head
+# entered them and the notice prints them.
+REJECTABLE_REASON_KINDS = frozenset({"reject", "both"})
+
+
+class ApplicationRejectionGround(Base):
+    """One ground of a rejection decision (design R3/R4, migration 0064).
+    Append-only: migration 0064's trigger forbids UPDATE/DELETE/TRUNCATE, the
+    same idiom as `ApplicationStatusHistory` and `ApplicationCheck`'s history."""
+
+    __tablename__ = "application_rejection_grounds"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    position: Mapped[int] = mapped_column(SmallInteger)
+    reason_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("classifier_items.id"))
+    fact: Mapped[str]
+    legal_document: Mapped[str]
+    legal_clause: Mapped[str]
+    evidence: Mapped[str]
+    remedy: Mapped[str]
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("application_id", "position"),
+        CheckConstraint("position >= 1", name="position_positive"),
+    )
+
+
+# Stage 16 (ruling R6): the frozen snapshot of a printed document, and — once
+# somebody downloads it — the rendered file. Migration 0064's trigger lets
+# `file_id`/`sha256` go from NULL to a value exactly once and nothing else change.
+PRINTOUT_LETTER = "letter"
+PRINTOUT_REJECTION_NOTICE = "rejection_notice"
+PRINTOUT_KINDS = (PRINTOUT_LETTER, PRINTOUT_REJECTION_NOTICE)
+
+
+class ApplicationPrintout(Base):
+    """A rendered application document — the application letter or the
+    rejection notice (design R6/R7/R12, migration 0064). The `snapshot` is
+    frozen at recording time and never changes; `file_id`/`sha256` start NULL
+    and are filled exactly once, on the first download (lazy render)."""
+
+    __tablename__ = "application_printouts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
+    application_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applications.id"), index=True)
+    kind: Mapped[str]
+    submission_id: Mapped[uuid.UUID | None] = mapped_column(unique=True)
+    number: Mapped[str | None] = mapped_column(unique=True)
+    language: Mapped[str]
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
+    sha256: Mapped[str | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    # Migration 0064 creates all five checks and the partial unique index by
+    # hand (autogenerate cannot write a CHECK or a `WHERE`-qualified index);
+    # declared here as well so the autogenerate-diff guard stays empty (same
+    # reasoning as `Application`'s own deadwood/recreation checks above).
+    __table_args__ = (
+        CheckConstraint(f"kind IN {PRINTOUT_KINDS}", name="kind_valid"),
+        CheckConstraint(
+            "language IN ('uz_cyrl', 'uz_latn', 'ru', 'kaa', 'en')", name="language_valid"
+        ),
+        CheckConstraint(
+            "(kind = 'letter') = (submission_id IS NOT NULL)", name="letter_has_submission"
+        ),
+        CheckConstraint(
+            "(kind = 'rejection_notice') = (number IS NOT NULL)", name="notice_has_number"
+        ),
+        CheckConstraint("(file_id IS NULL) = (sha256 IS NULL)", name="file_and_hash_together"),
+        # `uq_application_printouts_one_notice` (ruling R6/R12): at most one
+        # rejection notice per application, ever — a printout row is never
+        # deleted, so a second rejection decision on the same application
+        # would otherwise mint a second notice number.
+        Index(
+            "uq_application_printouts_one_notice",
+            "application_id",
+            unique=True,
+            postgresql_where=text("kind = 'rejection_notice'"),
+        ),
     )

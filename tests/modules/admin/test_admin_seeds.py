@@ -95,10 +95,21 @@ async def test_rejection_reasons_seeded(db):
         .scalars()
         .all()
     )
-    assert [r.code for r in rows] == [f"RJ-{i:02d}" for i in range(1, 16)]
-    assert all(r.status == "active" and r.valid_from == date(2026, 1, 1) for r in rows)
+    by_code = {r.code: r for r in rows}
+    assert [c for c in by_code if c.startswith("RJ-")] == [f"RJ-{i:02d}" for i in range(1, 16)]
+    assert [c for c in by_code if c.startswith("R0")] == [f"R0{i}" for i in range(1, 9)]
+    archived = {f"RJ-{i:02d}" for i in range(3, 13)}
+    assert all(by_code[c].status == ("archived" if c in archived else "active") for c in by_code)
+    # RJ-* rows are migration 0005's own seed (2026-01-01); R01..R08 are
+    # migration 0064's, effective the day rulings R3/R4 were approved.
+    assert all(
+        by_code[c].valid_from == (date(2026, 9, 24) if c.startswith("R0") else date(2026, 1, 1))
+        for c in by_code
+    )
     # props carry the decision type and the legal basis (design/02 § classifier_items)
-    assert rows[0].props["kind"] == "return"
-    assert rows[2].props["kind"] == "reject"
-    assert rows[12].props["kind"] == "cancel"
-    assert rows[3].props["legal_basis"] == "ВМҚ 689"
+    assert by_code["RJ-01"].props["kind"] == "return"
+    assert by_code["RJ-15"].props["kind"] == "return"
+    assert by_code["RJ-13"].props["kind"] == "cancel"
+    assert all(by_code[f"R0{i}"].props["kind"] == "reject" for i in range(1, 9))
+    assert set(by_code["R05"].name) == {"uz_latn", "uz_cyrl", "ru", "kaa", "en"}
+    assert by_code["RJ-04"].props["legal_basis"] == "ВМҚ 689"

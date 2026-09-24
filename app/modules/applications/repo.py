@@ -38,6 +38,8 @@ from app.modules.applications.models import (
     ApplicationConclusion,
     ApplicationDocument,
     ApplicationItem,
+    ApplicationPrintout,
+    ApplicationRejectionGround,
     ApplicationStatusHistory,
     InfoRequest,
 )
@@ -838,3 +840,49 @@ async def applicants_by_ids(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.
         select(Application.id, Application.applicant_id).where(Application.id.in_(ids))
     )
     return {row.id: row.applicant_id for row in rows}
+
+
+# --- Stage 16 (rulings R3/R6/R7): rejection grounds and printouts -------------
+
+
+async def add_rejection_grounds(db: AsyncSession, rows: list[ApplicationRejectionGround]) -> None:
+    db.add_all(rows)
+    await db.flush()
+
+
+async def add_printout(db: AsyncSession, row: ApplicationPrintout) -> None:
+    db.add(row)
+    await db.flush()
+
+
+async def latest_printouts(
+    db: AsyncSession, application_id: uuid.UUID
+) -> list[ApplicationPrintout]:
+    """The newest printout of each kind — what the card lists and the download serves."""
+    rows = (
+        await db.execute(
+            select(ApplicationPrintout)
+            .where(ApplicationPrintout.application_id == application_id)
+            .order_by(ApplicationPrintout.kind, ApplicationPrintout.created_at.desc())
+            .distinct(ApplicationPrintout.kind)
+        )
+    ).scalars()
+    return list(rows)
+
+
+async def latest_printout_for_update(
+    db: AsyncSession, application_id: uuid.UUID, kind: str
+) -> ApplicationPrintout | None:
+    """The newest printout of `kind`, row-locked so two first downloads render
+    it once. `populate_existing`: a lock does not refresh an instance the
+    session already holds (lesson «A row in memory is not what Postgres stored»)."""
+    return await db.scalar(
+        select(ApplicationPrintout)
+        .where(
+            ApplicationPrintout.application_id == application_id, ApplicationPrintout.kind == kind
+        )
+        .order_by(ApplicationPrintout.created_at.desc())
+        .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
