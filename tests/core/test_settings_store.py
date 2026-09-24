@@ -68,6 +68,20 @@ def test_coerce_accepts_and_rejects():
         settings_store.coerce(spec, 0)  # positive-int policy values only
 
 
+def test_consent_version_settings_are_capped_at_a_consents_in_can_echo():
+    """M7, final review: `auth.ConsentsIn.privacy_policy`/`.offer` are
+    `CodeStr` (64 chars) — before this, either setting could be written up
+    to the general 64 KB value cap, and no citizen's consent could ever
+    match a version longer than 64 characters again."""
+    for key in ("privacy_policy_version", "offer_version"):
+        spec = settings_store.SETTING_SPECS[key]
+        assert spec.max_length == 64
+        assert settings_store.coerce(spec, "x" * 64) == "x" * 64
+        with pytest.raises(DomainError) as exc:
+            settings_store.coerce(spec, "x" * 65)
+        assert exc.value.details == {"setting": key, "reason": "too_long"}
+
+
 def test_every_spec_has_a_description():
     assert all(spec.description for spec in settings_store.SETTING_SPECS.values())
 
