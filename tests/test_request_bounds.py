@@ -35,6 +35,12 @@ def _string_bounded(node: dict[str, Any]) -> bool:
         return True
     if node.get("format") in _BOUNDED_FORMATS:
         return True
+    # A multipart file field renders as `{"type": "string", "contentMediaType":
+    # "application/octet-stream"}` on this FastAPI/Pydantic version, never
+    # `format: binary` — the upload itself is size-capped elsewhere
+    # (`app/core/files.py`'s `max_upload_mb`, `POST /gis/imports`'s own cap).
+    if "contentMediaType" in node:
+        return True
     pattern = node.get("pattern")
     return (
         pattern is not None
@@ -63,6 +69,11 @@ def _offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
                 visited.add(name)
                 visit(components[name], name)
             return
+        # `allOf` is treated exactly like `anyOf`/`oneOf` here — every member is
+        # walked and any one of them being bounded is enough. The live schema
+        # has no `allOf` today (Pydantic emits `anyOf`/`oneOf` for unions and
+        # inlines everything else), so this is an untested assumption, not an
+        # observed shape.
         members = node.get("anyOf") or node.get("oneOf") or node.get("allOf")
         if members:
             kinds = {member.get("type") for member in members}
@@ -75,6 +86,17 @@ def _offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
                 visit(member, where)
             return
         kind = node.get("type")
+        # An untyped `Any` (none of type/$ref/anyOf/oneOf/allOf/enum/const —
+        # `$ref` and `anyOf`/`oneOf`/`allOf` are already handled and returned
+        # above) is unbounded unless it declares its own cap as an `x-max-*`
+        # extension (`JsonObject` and `GeoJsonGeometry` both do).
+        if kind is None and not any(
+            key in node for key in ("properties", "additionalProperties", "enum", "const")
+        ):
+            checked += 1
+            if not any(key.startswith("x-max-") for key in node):
+                offenders.add(where)
+            return
         if kind == "object" or "properties" in node or "additionalProperties" in node:
             for prop, sub in node.get("properties", {}).items():
                 visit(sub, f"{where}.{prop}")
