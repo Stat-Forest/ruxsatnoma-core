@@ -641,11 +641,13 @@ async def return_application(
     422 `ERR-VAL-001`: `unknown_rejection_reason` for a `reason_item_id`
     outside the `rejection_reasons` classifier; `reason_not_returnable` for
     one that IS in it but types a refusal or a withdrawal rather than a return
-    (RJ-03 is a REFUSAL — returning under it would misdescribe the decision);
-    `fields_to_fix_required` for an empty object; `unknown_field` for a key
-    naming no real column of the application. 404 `ERR-SYS-003` for an id that
-    does not exist and for an application outside the caller's zone. 409
-    `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
+    (R01 is a REFUSAL — returning under it would misdescribe the decision;
+    RJ-03, this docstring's own example before migration 0064, is now
+    archived and answers `unknown_rejection_reason` instead of ever reaching
+    this check); `fields_to_fix_required` for an empty object; `unknown_field`
+    for a key naming no real column of the application. 404 `ERR-SYS-003` for
+    an id that does not exist and for an application outside the caller's
+    zone. 409 `ERR-APP-004` in any status but SUBMITTED or IN_REVIEW.
     """
     return ApplicationOut.model_validate(
         await service.return_to_applicant(

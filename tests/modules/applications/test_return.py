@@ -10,9 +10,12 @@ name -> what is wrong with it, `ApplicationStatusHistory.fields_to_fix` /
 async def test_a_return_requires_a_reason_of_the_right_type(
     hodim_client, application_in_review, rj_01_return_reason, rj_03_reject_reason
 ) -> None:
-    """Ruling 3: tz/10 types each RJ code. RJ-03 ('outside the forest fund') is
-    a REFUSAL — returning under it would misdescribe the decision, and the
-    applicant would be told to fix something unfixable."""
+    """Ruling 3: tz/10 types each RJ code. `rj_03_reject_reason` is named
+    after RJ-03, this fixture's original code before migration 0064 (stage
+    16, ruling R4) archived it — it now resolves to R01 ('information
+    incomplete or inconsistent'), a REFUSAL: returning under it would
+    misdescribe the decision, and the applicant would be told to fix
+    something unfixable."""
     wrong = await hodim_client.post(
         f"/api/v1/applications/{application_in_review}/return",
         json={

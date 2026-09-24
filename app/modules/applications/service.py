@@ -2993,11 +2993,14 @@ NOTIFY_APPLICATION_RETURNED = "application.returned"
 # The SAME `rejection_reasons` classifier `decision._reason_item` reads
 # (tz/10 §8.2) — repeated here rather than imported because `decision.py`
 # imports `service.py`, never the reverse. Ruling 3's KIND check below is this
-# function's own; `decision.reject` checks no kind at all.
+# function's own; `decision.reject` has its own KIND check too (stage 16,
+# `REJECTABLE_REASON_KINDS` — every ground's `reason_item_id` must be
+# `kind` `reject`/`both`, R01..R08 today).
 RETURN_REASON_CLASSIFIER_CODE = "rejection_reasons"
-# `classifier_items.props["kind"]` values a RETURN may cite (0005_admin_seeds;
-# 0025 recast RJ-15 from "reject" to "both"). RJ-03 ("plot outside the forest
-# fund") types "reject" and is refused with `reason_not_returnable` —
+# `classifier_items.props["kind"]` values a RETURN may cite (0005_admin_seeds).
+# Migration 0064 (stage 16, ruling R4) archived RJ-03..RJ-12 and made RJ-15
+# return-only ("both" -> "return"); R01 ("information incomplete or
+# inconsistent") types "reject" and is refused with `reason_not_returnable` —
 # returning under it would misdescribe the decision and hand the applicant
 # something they cannot fix.
 RETURNABLE_REASON_KINDS = frozenset({"return", "both"})
