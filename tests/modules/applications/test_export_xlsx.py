@@ -26,9 +26,9 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
-from app.modules.admin.models import District, Organization, Region
+from app.modules.admin.models import District, LivestockType, Organization, Region
 from app.modules.applications import service as applications_service
-from app.modules.applications.models import APPLICATION_STATUSES
+from app.modules.applications.models import APPLICATION_STATUSES, ApplicationItem
 from app.modules.auth.models import Applicant
 from app.modules.inspections import service as inspections_service
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
@@ -178,6 +178,42 @@ async def test_the_export_renders_names_labels_and_places_not_codes(
     assert row_ru["Статус заявки"] == "Новая заявка"
     assert row_ru["Ед. изм."] == "голова"
     assert row_ru["Область"] == xlsx.localized(region.name, "ru")
+
+
+async def test_the_export_spells_out_the_herd_by_kind(
+    db: AsyncSession, submitted_application: str, published_contour, hodim_client
+) -> None:
+    """«Miqdor» holds one number, so for grazing it is the whole herd and says
+    nothing of what the herd IS: «Chorva» names every kind with its count, in
+    the catalogue's order rather than the order the applicant typed them.
+    The fixture's filing declares 40 sheep; a cattle row added here sorts
+    before it (`livestock_types.sort_order` 10 against 90)."""
+    found = await db.execute(
+        select(LivestockType).where(LivestockType.code.in_(("cattle_adult", "sheep_goat_6m")))
+    )
+    kinds = {row.code: row for row in found.scalars()}
+    db.add(
+        ApplicationItem(
+            application_id=uuid.UUID(submitted_application),
+            livestock_type_id=kinds["cattle_adult"].id,
+            head_count=2,
+        )
+    )
+    await db.commit()
+
+    params = {"contour_id": str(published_contour.id)}
+    headers: tuple[tuple[xlsx.Lang, str, str], ...] = (
+        ("uz_latn", "Chorva", "Miqdor"),
+        ("ru", "Скот", "Количество"),
+    )
+    for lang, herd, quantity in headers:
+        resp = await hodim_client.get(EXPORT, params={**params, "lang": lang})
+        assert resp.status_code == 200, resp.text
+        row = _by_header(resp.content, submitted_application)
+        cattle = xlsx.localized(kinds["cattle_adult"].name, lang)
+        sheep = xlsx.localized(kinds["sheep_goat_6m"].name, lang)
+        assert row[herd] == f"{cattle}: 2, {sheep}: 40", lang
+        assert row[quantity] == 42, lang  # the herd's total stays a number
 
 
 async def test_the_export_carries_the_review_columns(

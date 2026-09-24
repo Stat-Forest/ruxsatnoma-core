@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.admin.models import Organization
+from app.modules.admin.models import LivestockType, Organization
 from app.modules.applications.models import ApplicationItem
 from app.modules.auth.models import Applicant
 from app.modules.inspections import service as inspections_service
@@ -384,16 +384,23 @@ async def calculated_amount_by_application(
     return {row[0]: row[1] for row in rows}
 
 
-async def head_count_by_application(db: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, int]:
-    """The herd an application declares — the sum of its `application_items`
-    — for the register's «quantity» column: grazing keeps its count in the
-    items by livestock kind and leaves `applications.quantity` NULL (that
-    column is every OTHER activity's declared amount)."""
+async def herd_by_application(
+    db: AsyncSession, ids: set[uuid.UUID]
+) -> dict[uuid.UUID, list[tuple[dict[str, Any], int]]]:
+    """The herd an application declares, kind by kind — `(livestock name,
+    heads)` in the catalogue's own order — for the register's «herd» column
+    and, summed, its «quantity»: grazing keeps its count in the items and
+    leaves `applications.quantity` NULL (that column is every OTHER
+    activity's declared amount)."""
     if not ids:
         return {}
     rows = await db.execute(
-        select(ApplicationItem.application_id, func.sum(ApplicationItem.head_count))
+        select(ApplicationItem.application_id, LivestockType.name, ApplicationItem.head_count)
+        .join(LivestockType, LivestockType.id == ApplicationItem.livestock_type_id)
         .where(ApplicationItem.application_id.in_(ids))
-        .group_by(ApplicationItem.application_id)
+        .order_by(ApplicationItem.application_id, LivestockType.sort_order, LivestockType.code)
     )
-    return {row[0]: int(row[1]) for row in rows}
+    out: dict[uuid.UUID, list[tuple[dict[str, Any], int]]] = {}
+    for application_id, name, heads in rows:
+        out.setdefault(application_id, []).append((dict(name), heads))
+    return out
