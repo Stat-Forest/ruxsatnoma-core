@@ -182,11 +182,39 @@ async def test_archiving_removes_it_from_both_catalogs(
         assert "recreation" not in staff_codes, (
             "ruling #139a: archived must leave the wizard's catalog too"
         )
+        admin_rows = (await staff_client.get("/api/v1/refs/activity-types/all")).json()
+        status_by_code = {item["code"]: item["status"] for item in admin_rows}
+        assert status_by_code["recreation"] == "archived", (
+            "the admin catalog must keep an archived service visible, "
+            "or nobody can switch it back on"
+        )
     finally:
         restored = await staff_client.patch(
             f"/api/v1/refs/activity-types/{row.id}", json={"status": "active"}
         )
         assert restored.status_code == 200, restored.text
+
+
+async def test_the_admin_catalog_lists_all_six_in_order_whatever_their_status(
+    staff_client: httpx.AsyncClient,
+) -> None:
+    rows = (await staff_client.get("/api/v1/refs/activity-types/all")).json()
+    assert {item["code"] for item in rows} == DESCRIBED_CODES | UNDESCRIBED_CODES
+    active_rows = (await staff_client.get("/api/v1/refs/activity-types")).json()
+    active = [item["code"] for item in active_rows]
+    assert [item["code"] for item in rows if item["status"] == "active"] == active, (
+        "the admin catalog must keep the same order as the active one"
+    )
+
+
+async def test_the_admin_catalog_needs_the_manage_grant(db: AsyncSession) -> None:
+    """Archived rows are hidden from citizens on purpose (#139a) — the full
+    list is for whoever can switch them back on, nobody else."""
+    _, token, csrf = await signed_in_with(db)  # no grants
+    await db.commit()
+    async with make_client(create_app(), lifespan=True) as plain:
+        auth_client(plain, token, csrf)
+        assert (await plain.get("/api/v1/refs/activity-types/all")).status_code == 403
 
 
 async def test_the_catalog_offers_no_way_to_create_or_delete(
