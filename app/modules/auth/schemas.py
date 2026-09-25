@@ -141,7 +141,7 @@ class EimzoChallengeOut(BaseModel):
 class EimzoLoginIn(BaseModel):
     # E-IMZO's own signed envelope, posted straight through to the adapter
     # (`RealEimzo.verify_signed_challenge`) — the same PKCS#7-shaped blob
-    # `signatures.CertificateBindIn.pkcs7` carries, so the same bound.
+    # `signatures.sign()` verifies, so the same bound.
     signed_challenge: BlobStr
 
 

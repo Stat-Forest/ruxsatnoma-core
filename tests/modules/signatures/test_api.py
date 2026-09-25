@@ -1,9 +1,10 @@
-"""Task 7's own HTTP surface: certificates a caller may list/bind/unbind, one
-object's signature list, and oversight re-verification.
+"""Task 7's own HTTP surface: one object's signature list and oversight
+re-verification (the certificates list/bind/unbind routes were removed on
+2026-09-25).
 
 Not the shared `conftest.py` (pre-flight ruling P4: later tasks add their own
 fixtures rather than growing that file) -- `client_a`/`client_b`/
-`client_oversight`/`a_signature`/`bound_cert_of_a` are this file's own, the
+`client_oversight`/`a_signature` are this file's own, the
 same local-fixture pattern every earlier task in this module already used
 (`test_sign.py`'s `a_user`, `test_ri05.py`'s `a_user`, ...).
 
@@ -136,8 +137,7 @@ async def client_oversight(db: AsyncSession) -> AsyncIterator[httpx.AsyncClient]
 @pytest.fixture
 async def a_signature(db: AsyncSession, user_a: User) -> Signature:
     """One valid signature, signed by `user_a` with a freshly bound
-    certificate -- the shared basis `bound_cert_of_a` derives from, so the
-    two can never disagree about which certificate produced it."""
+    certificate."""
     row = await service.sign(
         db,
         object_type="permit",
@@ -149,93 +149,6 @@ async def a_signature(db: AsyncSession, user_a: User) -> Signature:
     )
     await db.commit()
     return row
-
-
-@pytest.fixture
-async def bound_cert_of_a(a_signature: Signature) -> uuid.UUID:
-    assert a_signature.certificate_id is not None  # kind == "eri" here (a_signature's own sign())
-    return a_signature.certificate_id
-
-
-# ---------------------------------------------------------------------------
-# GET/POST/DELETE /certificates
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_a_user_sees_only_their_own_certificates(client_a, client_b, bound_cert_of_a):
-    mine = await client_a.get(f"{API}/certificates")
-    assert [c["id"] for c in mine.json()["items"]] == [str(bound_cert_of_a)]
-    theirs = await client_b.get(f"{API}/certificates")
-    assert theirs.json()["items"] == []
-
-
-@pytest.mark.asyncio
-async def test_deleting_a_certificate_unbinds_it_and_keeps_the_signature_readable(
-    client_a, bound_cert_of_a, a_signature
-):
-    resp = await client_a.delete(f"{API}/certificates/{bound_cert_of_a}")
-    assert resp.status_code == 204
-    listed = await client_a.get(
-        f"{API}/signatures?object_type=permit&object_id={a_signature.object_id}"
-    )
-    assert listed.json()["items"][0]["verification_status"] == "valid"
-
-
-@pytest.mark.asyncio
-async def test_deleting_a_certificate_removes_it_from_the_owners_own_list(
-    client_a, bound_cert_of_a
-):
-    """The list route's own `unbound_at IS NULL` filter (brief) -- checked
-    directly, since the two given tests above never re-list `/certificates`
-    after deleting."""
-    await client_a.delete(f"{API}/certificates/{bound_cert_of_a}")
-    resp = await client_a.get(f"{API}/certificates")
-    assert resp.json()["items"] == []
-
-
-@pytest.mark.asyncio
-async def test_unbinding_someone_elses_certificate_is_refused(client_b, bound_cert_of_a):
-    resp = await client_b.delete(f"{API}/certificates/{bound_cert_of_a}")
-    assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "ERR-SIGN-001"
-    assert resp.json()["error"]["details"]["reason"] == "certificate_owned_by_another_user"
-
-
-@pytest.mark.asyncio
-async def test_unbinding_an_unknown_certificate_is_404(client_a):
-    resp = await client_a.delete(f"{API}/certificates/{uuid.uuid4()}")
-    assert resp.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_register_certificate_binds_it_ahead_of_time(client_a, user_a: User):
-    """`POST /certificates` is never reached by any of the four given tests
-    -- untested otherwise (lesson: a public-surface task's own end-to-end
-    test can ship the surface untested)."""
-    pkcs7 = _pkcs7(b"a-signed-challenge", user_a.pinfl)
-    resp = await client_a.post(f"{API}/certificates", json={"pkcs7": pkcs7})
-    assert resp.status_code == 201, resp.text
-    body = resp.json()
-    assert body["pinfl_or_stir"] == user_a.pinfl
-    assert body["status"] == "active"
-
-    listed = await client_a.get(f"{API}/certificates")
-    assert body["id"] in [c["id"] for c in listed.json()["items"]]
-
-
-@pytest.mark.asyncio
-async def test_register_certificate_refuses_an_unproven_pinfl(client_a):
-    """Ruling 4's "ownership proven by PINFL/STIR", refused: a certificate
-    naming someone else's PINFL cannot be registered to `user_a`, matching
-    `bind_certificate`'s own rule but enforced directly (`bind_certificate`
-    itself leaves it silently unbound, since it has no signature to hang the
-    refusal on -- Task 7's own route does have one)."""
-    pkcs7 = _pkcs7(b"a-signed-challenge", _pinfl())  # someone else's pinfl
-    resp = await client_a.post(f"{API}/certificates", json={"pkcs7": pkcs7})
-    assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "ERR-SIGN-001"
-    assert resp.json()["error"]["details"]["reason"] == "certificate_pinfl_mismatch"
 
 
 # ---------------------------------------------------------------------------

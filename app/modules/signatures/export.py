@@ -1,13 +1,11 @@
-"""`GET /certificates/export.xlsx` and `GET /signatures/export.xlsx` (stage
-13, ruling #204): the caller's own bound certificates and one object's
-signature list on paper. Each `rows()` calls the list's own service
-function — `service.list_my_certificates` / `service.list_signatures_page`
-(ruling R2) — with the cap as the page size, then resolves every user id
-the sheet shows in ONE batch query (`auth.service.user_names`). Neither
-route gets an Excel button from this track (out of its screen list) —
-`CertificatesSection.tsx` and `PermitSignaturesPanel.tsx` do read these
-routes, but each shows a small, single-owner/single-object list rather
-than a register."""
+"""`GET /signatures/export.xlsx` (stage 13, ruling #204): one object's
+signature list on paper. `signature_rows()` calls the list's own service
+function — `service.list_signatures_page` (ruling R2) — with the cap as the
+page size, then resolves every user id the sheet shows in ONE batch query
+(`auth.service.user_names`). The route gets no Excel button (out of its
+track's screen list) — `PermitSignaturesPanel.tsx` reads the list, but shows
+a small single-object list rather than a register. The certificates export
+beside it was removed on 2026-09-25 together with the cabinet tab."""
 
 import uuid
 from collections.abc import Sequence
@@ -19,9 +17,8 @@ from app.core.schemas import PageParams
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import User
 from app.modules.signatures import service
-from app.modules.signatures.models import Certificate, Signature
+from app.modules.signatures.models import Signature
 
-CERTIFICATES_TITLE = {"uz_latn": "Sertifikatlar", "ru": "Сертификаты"}
 SIGNATURES_TITLE = {"uz_latn": "Imzolar", "ru": "Подписи"}
 KIND_LABELS: dict[str, dict[str, str]] = {
     "eri": {"uz_latn": "ERI", "ru": "ЭЦП"},
@@ -35,57 +32,6 @@ VERIFICATION_STATUS_LABELS: dict[str, dict[str, str]] = {
 
 def _label(table: dict[str, dict[str, str]], code: str, lang: xlsx.Lang) -> str:
     return table.get(code, {}).get(lang, code)
-
-
-# --- certificates ------------------------------------------------------------
-
-
-class CertificateRow:
-    def __init__(self, cert: Certificate, *, user: str) -> None:
-        self.cert = cert
-        self.id = cert.id
-        self.user = user
-
-
-def certificate_columns(lang: xlsx.Lang) -> list[xlsx.Column[CertificateRow]]:
-    c = lambda f: lambda r: getattr(r.cert, f)  # noqa: E731 - column accessors read alike
-    return [
-        xlsx.Column("subject", {"uz_latn": "Egasi", "ru": "Субъект"}, c("subject"), 40),
-        xlsx.Column(
-            "serial_number",
-            {"uz_latn": "Seriya raqami", "ru": "Серийный номер"},
-            c("serial_number"),
-            24,
-        ),
-        xlsx.Column(
-            "valid_from", {"uz_latn": "Amal boshi", "ru": "Действует с"}, c("valid_from"), 18
-        ),
-        xlsx.Column("valid_to", {"uz_latn": "Amal oxiri", "ru": "Действует по"}, c("valid_to"), 18),
-        xlsx.Column("status", {"uz_latn": "Holati", "ru": "Статус"}, c("status"), 14),
-        xlsx.Column(
-            "user", {"uz_latn": "Foydalanuvchi", "ru": "Пользователь"}, lambda r: r.user, 26
-        ),
-        xlsx.id_column(),
-    ]
-
-
-async def certificate_rows(
-    db: AsyncSession, *, actor: User, lang: xlsx.Lang
-) -> tuple[list[CertificateRow], int, int]:
-    cap = await settings_store.get_int(db, xlsx.CAP_SETTING)
-    certs, total = await service.list_my_certificates(
-        db, user=actor, params=PageParams.model_construct(page=1, page_size=cap)
-    )
-    users = await auth_service.user_names(db, {c.user_id for c in certs if c.user_id})
-    return (
-        [CertificateRow(c, user=users.get(c.user_id, "") if c.user_id else "") for c in certs],
-        total,
-        cap,
-    )
-
-
-def render_certificates(items: Sequence[CertificateRow], *, lang: xlsx.Lang) -> bytes:
-    return xlsx.render(items, certificate_columns(lang), lang=lang, title=CERTIFICATES_TITLE[lang])
 
 
 # --- signatures ----------------------------------------------------------

@@ -9,33 +9,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from app.core.schemas import BlobStr
-
-
-class CertificateBindIn(BaseModel):
-    """`POST /certificates`: a self-contained signed challenge. E-IMZO's
-    ATTACHED form carries what was signed inside the envelope itself, so
-    there is no separate document to hand alongside it -- unlike `sign()`,
-    which signs bytes the caller supplies (ruling 6), this route has no
-    document of its own (ruling 4's explicit-bind path)."""
-
-    pkcs7: BlobStr
-
-
-class CertificateOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    serial_number: str
-    issuer: str
-    subject: str
-    pinfl_or_stir: str
-    valid_from: datetime
-    valid_to: datetime
-    status: str
-    bound_at: datetime
-    revoked_at: datetime | None
-
 
 class SignatureOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)

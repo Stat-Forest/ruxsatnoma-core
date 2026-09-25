@@ -23,7 +23,7 @@ from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User
 from app.modules.integrations.adapters.eimzo import EimzoError, EimzoVerification
 from app.modules.signatures import service
-from app.modules.signatures.models import Certificate, Signature
+from app.modules.signatures.models import Signature
 from tests.modules.auth.test_sessions import make_user
 
 DOC = b"the-permit-bytes"
@@ -93,39 +93,6 @@ async def test_sign_surfaces_a_provider_outage_as_the_integration_error(
     audit_count = (
         await db.execute(
             select(func.count()).select_from(AuditLog).where(AuditLog.object_id == obj_id)
-        )
-    ).scalar_one()
-    assert audit_count == 0
-
-
-@pytest.mark.asyncio
-async def test_register_certificate_surfaces_a_provider_outage_as_the_integration_error(
-    db: AsyncSession, a_user: User, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(service, "get_eimzo_adapter", lambda: _OutageAdapter())
-
-    with pytest.raises(DomainError) as exc:
-        await service.register_certificate(
-            db, pkcs7="unused-the-fake-adapter-never-decodes-it", user=a_user
-        )
-
-    assert exc.value.code == "ERR-INT-001"
-    assert exc.value.http_status == 503
-
-    # No `certificates` row bound to this user -- an outage proves nothing
-    # about the presentation.
-    cert_count = (
-        await db.execute(
-            select(func.count()).select_from(Certificate).where(Certificate.user_id == a_user.id)
-        )
-    ).scalar_one()
-    assert cert_count == 0
-
-    audit_count = (
-        await db.execute(
-            select(func.count())
-            .select_from(AuditLog)
-            .where(AuditLog.action == service.CERTIFICATE_BIND, AuditLog.user_id == a_user.id)
         )
     ).scalar_one()
     assert audit_count == 0

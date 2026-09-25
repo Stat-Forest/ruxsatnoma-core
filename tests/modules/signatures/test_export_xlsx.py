@@ -1,15 +1,9 @@
-"""Stage 13: `GET /certificates/export.xlsx` and `GET /signatures/export.xlsx`
-— the caller's own bound certificates and one object's signature list on
-paper. Neither is wired to an Excel button by this track (out of its screen
-list): `src/pages/admin/profile/certificates/CertificatesSection.tsx` and
-`src/pages/permits/PermitSignaturesPanel.tsx` DO read these routes today,
-but each shows a small, single-owner/single-object list ("a handful of
-keys at most", that file's own comment) rather than a register — track
-report flags the correction. Fixtures reused from `test_api.py` (pre-flight
+"""Stage 13: `GET /signatures/export.xlsx` — one object's signature list on
+paper. Not wired to an Excel button by this track (out of its screen list):
+`src/pages/permits/PermitSignaturesPanel.tsx` reads the list, but shows a
+small single-object list rather than a register. Fixtures reused from `test_api.py` (pre-flight
 ruling P4: this file adds its own where `test_api.py`'s do not fit, rather
 than growing the shared `conftest.py`)."""
-
-import uuid
 
 from app.modules.auth.models import User
 from app.modules.signatures import service
@@ -21,9 +15,6 @@ from tests.modules.signatures.test_api import (
 )
 from tests.modules.signatures.test_api import (
     a_signature as a_signature,
-)
-from tests.modules.signatures.test_api import (
-    bound_cert_of_a as bound_cert_of_a,
 )
 from tests.modules.signatures.test_api import (
     client_a as client_a,
@@ -41,43 +32,7 @@ from tests.modules.signatures.test_api import (
     user_b as user_b,
 )
 
-CERTIFICATES = "/api/v1/certificates/export.xlsx"
 SIGNATURES = "/api/v1/signatures/export.xlsx"
-
-
-# --- /certificates/export.xlsx ---------------------------------------------
-
-
-async def test_the_certificates_export_mirrors_the_list(
-    client_a, client_b, bound_cert_of_a, user_a: User
-):
-    """The caller's own certificates and nobody else's, the owner resolved
-    to a name, and the cap. No permission gate on `/certificates` at all —
-    every authenticated caller gets their OWN (possibly empty) list, and
-    `client_b`'s empty file is the list's own shape for "no rows"."""
-    mine = await client_a.get("/api/v1/certificates")
-    assert [c["id"] for c in mine.json()["items"]] == [str(bound_cert_of_a)]
-
-    resp = await client_a.get(CERTIFICATES, params={"lang": "ru"})
-    assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("application/vnd.openxmlformats")
-    headers, rows = xlsx_rows(resp.content)
-    assert headers[0] == "Субъект" and headers[-1] == "ID"
-    assert {str(row[-1]) for row in rows} == {str(bound_cert_of_a)}
-    (row,) = rows
-    assert row[5] == user_a.full_name  # the resolved user name, not a bare id
-
-    theirs = await client_b.get(CERTIFICATES)
-    assert theirs.status_code == 200
-    assert xlsx_rows(theirs.content)[1] == []
-
-    pkcs7 = _pkcs7(b"another-challenge-" + uuid.uuid4().bytes, user_a.pinfl)
-    bound = await client_a.post("/api/v1/certificates", json={"pkcs7": pkcs7})
-    assert bound.status_code == 201, bound.text
-    with export_cap(1):  # two of A's certificates, one fits
-        resp = await client_a.get(CERTIFICATES)
-        assert resp.headers["x-export-total"] == "2"
-        assert_export_cut(resp, cap=1)
 
 
 # --- /signatures/export.xlsx -----------------------------------------------
