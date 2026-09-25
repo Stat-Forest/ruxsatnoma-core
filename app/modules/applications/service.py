@@ -1134,6 +1134,7 @@ async def get_card(db: AsyncSession, application_id: uuid.UUID, *, actor: User) 
             else sla.is_overdue(application.status, deadline, datetime.now(UTC))
         ),
         "printouts": await repo.latest_printouts(db, application.id),
+        "applicant": await auth_service.get_applicant(db, application.applicant_id),
     }
 
 

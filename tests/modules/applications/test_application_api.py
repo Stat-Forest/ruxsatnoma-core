@@ -220,6 +220,37 @@ async def test_a_legal_entitys_own_account_files_for_itself(
     assert "representation_id" not in body
 
 
+async def test_the_card_says_an_organisation_filed_it(
+    db, representative_client, legal_applicant, legal_filing_ready_for_submission
+) -> None:
+    """Decision #226: with `on_behalf` gone, the card's `applicant` block is the
+    reviewer's only way to see that an organisation filed — its kind, name and
+    STIR."""
+    created = await _submit(representative_client, legal_filing_ready_for_submission)
+    assert created.status_code == 201, created.text
+    card = await representative_client.get(f"/api/v1/applications/{created.json()['id']}")
+    assert card.status_code == 200, card.text
+    assert card.json()["applicant"] == {
+        "kind": "legal",
+        "name": legal_applicant.name,
+        "stir": legal_applicant.stir,
+    }
+
+
+async def test_the_card_shows_the_reviewer_an_individual_without_repeating_the_pinfl(
+    hodim_client, application_in_review
+) -> None:
+    """The staff reviewer's view of an individual's filing: kind and name, no
+    STIR, and the PINFL is not copied into this block."""
+    card = await hodim_client.get(f"/api/v1/applications/{application_in_review}")
+    assert card.status_code == 200, card.text
+    applicant = card.json()["applicant"]
+    assert applicant["kind"] == "individual"
+    assert applicant["name"]
+    assert applicant["stir"] is None
+    assert "pinfl" not in applicant
+
+
 async def test_an_unknown_reference_id_is_a_422_and_not_a_500(
     applicant_client, sheep_type_id
 ) -> None:
