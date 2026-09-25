@@ -145,7 +145,6 @@ async def test_a_second_applicant_is_refused_at_approval_before_any_invoice(
     against a free contour, occupied while it sat in review.
     """
     filing = {
-        "on_behalf": "self",
         "contour_id": str(published_contour.id),
         "activity_type_id": str(apiary_activity_id),
         "period_from": "2027-06-01",
@@ -205,7 +204,6 @@ async def test_a_second_applicant_is_refused_at_approval_while_the_first_permit_
     refused only at issuance — exactly the manual refund ruling #176 exists
     to prevent. Same refusal, same reason, one status earlier."""
     filing = {
-        "on_behalf": "self",
         "contour_id": str(published_contour.id),
         "activity_type_id": str(apiary_activity_id),
         "period_from": "2027-06-01",

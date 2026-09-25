@@ -2,7 +2,7 @@
 
 import uuid
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import ColumnElement, delete, func, or_, select, update
@@ -12,7 +12,6 @@ from app.db import Base
 from app.modules.auth.models import (
     Applicant,
     OtpCode,
-    Representation,
     Role,
     RolePermission,
     Session,
@@ -424,64 +423,8 @@ async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant |
     ).scalar_one_or_none()
 
 
-async def effective_representations(
-    db: AsyncSession, user_id: uuid.UUID, today: date
-) -> list[tuple[Representation, Applicant]]:
-    rows = await db.execute(
-        select(Representation, Applicant)
-        .join(Applicant, Representation.applicant_id == Applicant.id)
-        .where(
-            Representation.user_id == user_id,
-            Representation.status == "active",
-            (Representation.valid_until.is_(None)) | (Representation.valid_until >= today),
-        )
-        .order_by(Representation.created_at)
-    )
-    return [(rep, app) for rep, app in rows.all()]
-
-
 async def get_applicant_by_stir(db: AsyncSession, stir: str) -> Applicant | None:
     return (await db.execute(select(Applicant).where(Applicant.stir == stir))).scalar_one_or_none()
-
-
-async def get_effective_representation(
-    db: AsyncSession, *, applicant_id: uuid.UUID, user_id: uuid.UUID, today: date
-) -> Representation | None:
-    return (
-        await db.execute(
-            select(Representation).where(
-                Representation.applicant_id == applicant_id,
-                Representation.user_id == user_id,
-                Representation.status == "active",
-                (Representation.valid_until.is_(None)) | (Representation.valid_until >= today),
-            )
-        )
-    ).scalar_one_or_none()
-
-
-async def any_effective_representative(
-    db: AsyncSession, applicant_id: uuid.UUID, today: date
-) -> uuid.UUID | None:
-    """One user currently holding an EFFECTIVE representation of `applicant_id`
-    (`status='active'`, not past `valid_until`), or `None` — the reverse
-    direction of `effective_representations` above (that one walks FROM a
-    user; this walks FROM an applicant). A legal entity has SEVERAL
-    representatives (decision #9); this picks the earliest-created one,
-    deterministic rather than "the primary one" — no rule in this codebase
-    names a primary representative. First caller: `inspections.service.
-    _violator_recipient` (ruling R2, `07.6-handover-and-the-violator.md`),
-    which has no submitter of its own to fall back to the way
-    `applications`/`permits` do — a violation case is opened BY THE SYSTEM."""
-    return await db.scalar(
-        select(Representation.user_id)
-        .where(
-            Representation.applicant_id == applicant_id,
-            Representation.status == "active",
-            (Representation.valid_until.is_(None)) | (Representation.valid_until >= today),
-        )
-        .order_by(Representation.created_at)
-        .limit(1)
-    )
 
 
 # --- Stage 13 (ruling #204): batch name readers for the register exports ------

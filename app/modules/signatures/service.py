@@ -3,10 +3,11 @@
 exists to support it.
 
 Level 2 (`models.py`'s own docstring): this module reaches `auth` through the
-`User` object a caller hands in and, since fix round 2, through
-`auth.service.has_effective_representation` (proving an organisation
-certificate belongs to its presenter) — never queries `users`/
-`representations` itself, only ever through `auth`'s own service. Reaches
+`User` object a caller hands in and, since fix round 2 (superseded by stage 18,
+decision #226), through `auth.service.get_own_applicant` (proving an
+organisation certificate belongs to its presenter's OWN legal applicant) —
+never queries `users`/`applicants` itself, only ever through `auth`'s own
+service. Reaches
 E-IMZO only through the `integrations.adapters.eimzo` seam
 (`get_eimzo_adapter`; real verification arrives at stage 5.2). Task 7 adds
 one further, narrow exception: `auth.repo.role_code`/`permission_codes`,
@@ -385,12 +386,12 @@ async def _ownership_reason(
     organisation STIR (`applicants.stir`'s own `^[0-9]{9}$` CHECK) — the two
     formats never collide, so the length alone disambiguates them.
 
-    - Organisation (9 digits): proven the way `auth` already proves legal
-      representation — the caller must hold an EFFECTIVE representation for
-      that STIR right now (fix round 2). `"certificate_pinfl_mismatch"` when
-      they don't — a stranger's certificate and one for a STIR whose
-      representation has since expired or been revoked read the same way to
-      a caller: "not provably yours right now".
+    - Organisation (9 digits): proven the way `auth` already proves it
+      (decision #226, R4) — the caller's OWN applicant must be `kind='legal'`
+      and its `stir` must equal this certificate's. `"certificate_pinfl_
+      mismatch"` when it doesn't — a stranger's certificate and one for a
+      STIR the caller never logged into read the same way to a caller: "not
+      provably yours right now".
     - Personal (14 digits): it must equal the caller's own `user.pinfl`.
       `user.pinfl` can itself be `None` — a staff user created before their
       PINFL was recorded (real: `users.pinfl` is nullable) — and that is OUR
@@ -399,9 +400,8 @@ async def _ownership_reason(
       mismatch used for an actual stranger's certificate.
     """
     if len(info.pinfl_or_stir) == 9:
-        if await auth_service.has_effective_representation(
-            db, user_id=user.id, stir=info.pinfl_or_stir
-        ):
+        own = await auth_service.get_own_applicant(db, user.id)
+        if own is not None and own.kind == "legal" and own.stir == info.pinfl_or_stir:
             return None
         return "certificate_pinfl_mismatch"
     if user.pinfl is None:

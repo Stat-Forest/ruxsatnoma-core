@@ -1,4 +1,4 @@
-"""applicants/representations/user_consents DDL: CHECKs, uniques, deferred poa FK."""
+"""applicants/user_consents DDL: CHECKs, uniques."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.modules.auth.models import Applicant, OtpCode, Representation, Role, User, UserConsent
+from app.modules.auth.models import Applicant, OtpCode, Role, User, UserConsent
 
 
 async def make_user(db, *, role_code="applicant", pinfl=None) -> User:
@@ -56,45 +56,6 @@ async def test_owner_user_unique(db):
     db.add(individual(user))
     await db.flush()
     db.add(individual(user, pinfl="11111111111114"))
-    with pytest.raises(IntegrityError):
-        await db.flush()
-
-
-async def test_poa_requires_file_and_term(db):
-    user = await make_user(db, pinfl="11111111111115")
-    legal = Applicant(kind="legal", stir="987654321", name="OOO Y")
-    db.add(legal)
-    await db.flush()
-    db.add(
-        Representation(
-            applicant_id=legal.id,
-            user_id=user.id,
-            basis="poa",
-            valid_from=datetime.now(UTC).date(),
-        )
-    )
-    with pytest.raises(IntegrityError):
-        await db.flush()
-
-
-async def test_one_active_representation_per_pair(db):
-    user = await make_user(db, pinfl="11111111111116")
-    legal = Applicant(kind="legal", stir="987654322", name="OOO Z")
-    db.add(legal)
-    await db.flush()
-    today = datetime.now(UTC).date()
-    db.add(
-        Representation(applicant_id=legal.id, user_id=user.id, basis="org_eri", valid_from=today)
-    )
-    await db.flush()
-    db.add(
-        Representation(
-            applicant_id=legal.id,
-            user_id=user.id,
-            basis="director_registry",
-            valid_from=today,
-        )
-    )
     with pytest.raises(IntegrityError):
         await db.flush()
 

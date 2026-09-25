@@ -204,64 +204,20 @@ async def test_a_stranger_still_cannot_patch_a_returned_application(
     assert refused.json()["error"]["code"] == "ERR-SYS-003"
 
 
-async def test_a_representative_files_for_the_legal_entity_they_represent(
+async def test_a_legal_entitys_own_account_files_for_itself(
     db, representative_client, legal_applicant, legal_filing_ready_for_submission
 ) -> None:
-    """`on_behalf="legal"` (decision #9: a legal entity has no account of its
-    own). The assertion that matters is `representation_id`: it records WHICH
-    power of attorney the filing was made under, and it is the legal basis of
-    the application — an application filed for a company by nobody in
-    particular is not a document anyone can stand behind."""
-    from sqlalchemy import select
-
-    from app.modules.auth.models import Representation
-
+    """Decision #226 (R5): there is no more "on whose authority" question — a
+    legal applicant's own account files for its own `applicant_id`, exactly
+    like an individual's, resolved server-side from the caller alone. The
+    "representation" mechanism `applications.representation_id` used to
+    record is gone with the column."""
     created = await _submit(representative_client, legal_filing_ready_for_submission)
     assert created.status_code == 201, created.text
     body = created.json()
     assert body["applicant_id"] == str(legal_applicant.id)
-    assert body["on_behalf"] == "legal"
-    representation_id = await db.scalar(
-        select(Representation.id).where(Representation.applicant_id == legal_applicant.id)
-    )
-    assert body["representation_id"] == str(representation_id), (
-        "the stored representation is the one the caller actually holds, not just any non-null id"
-    )
-
-
-async def test_filing_for_a_legal_entity_you_do_not_represent_is_refused(
-    applicant_client, legal_applicant
-) -> None:
-    """403 `ERR-ACL-001`, not 404: the caller NAMED the applicant, so there is
-    no existence to hide — and unlike an application, an `applicants` row for a
-    company is public information (its STIR is on every invoice it issues).
-    Without this guard anyone could file in any company's name."""
-    refused = await _submit_with_button(
-        applicant_client, {"on_behalf": "legal", "applicant_id": str(legal_applicant.id)}
-    )
-    assert refused.status_code == 403
-    assert refused.json()["error"]["code"] == "ERR-ACL-001"
-    assert refused.json()["error"]["details"]["reason"] == "no_effective_representation"
-
-
-async def test_on_behalf_legal_needs_an_applicant_id(applicant_client) -> None:
-    """`applicant_id` is optional in the schema because `on_behalf="self"` must
-    not need it — so the pairing rule is the service's, and it says so."""
-    refused = await _submit_with_button(applicant_client, {"on_behalf": "legal"})
-    assert refused.status_code == 422
-    assert refused.json()["error"]["details"]["reason"] == "applicant_id_required"
-
-
-async def test_naming_someone_elses_applicant_on_behalf_of_self_is_refused(
-    applicant_client, legal_applicant
-) -> None:
-    """Refused rather than IGNORED: silently overriding the field is how a
-    client ends up believing it filed for the person it named."""
-    refused = await _submit_with_button(
-        applicant_client, {"on_behalf": "self", "applicant_id": str(legal_applicant.id)}
-    )
-    assert refused.status_code == 422
-    assert refused.json()["error"]["details"]["reason"] == "applicant_is_not_the_caller"
+    assert "on_behalf" not in body
+    assert "representation_id" not in body
 
 
 async def test_an_unknown_reference_id_is_a_422_and_not_a_500(
@@ -289,9 +245,7 @@ async def test_an_unknown_reference_id_is_a_422_and_not_a_500(
         ),
         ({"items": [{"livestock_type_id": stranger, "head_count": 10}]}, "unknown_livestock_type"),
     ):
-        refused = await applicant_client.post(
-            "/api/v1/applications/precheck", json={"on_behalf": "self", **body}
-        )
+        refused = await applicant_client.post("/api/v1/applications/precheck", json=body)
         assert refused.status_code == 422, (body, refused.text)
         assert refused.json()["error"]["code"] == "ERR-VAL-001"
         assert refused.json()["error"]["details"]["reason"] == reason
@@ -311,7 +265,7 @@ async def test_a_benefit_item_from_another_classifier_is_refused(db, applicant_c
     )
     refused = await applicant_client.post(
         "/api/v1/applications/precheck",
-        json={"on_behalf": "self", "benefit_category_item_id": str(rejection_item_id)},
+        json={"benefit_category_item_id": str(rejection_item_id)},
     )
     assert refused.status_code == 422
     assert refused.json()["error"]["details"]["reason"] == "unknown_benefit_category"

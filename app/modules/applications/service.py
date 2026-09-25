@@ -77,7 +77,7 @@ from app.modules.audit import service as audit
 from app.modules.auth import repo as auth_repo
 from app.modules.auth import service as auth_service
 from app.modules.auth.deps import SUPERUSER_ROLE
-from app.modules.auth.models import User
+from app.modules.auth.models import Applicant, User
 from app.modules.beekeepers import service as beekeepers_service
 from app.modules.gis import service as gis_service
 from app.modules.integrations import service as integrations_service
@@ -668,11 +668,9 @@ async def effective_organization(db: AsyncSession, application_id: uuid.UUID) ->
 
 
 async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
-    """Every `applicants` row this user may act for today — their own
-    individual row plus every legal entity they hold an EFFECTIVE
-    representation of. `auth.service` owns that definition and judges
-    "effective" against `business_today()`, so a lapsed power of attorney stops
-    working the day it lapses.
+    """Every `applicants` row this user may act for — exactly their own row,
+    individual or legal (decision #226, R4). `auth.service` owns that
+    definition.
 
     One definition, three uses: the card asks about one application, the list
     needs the SET to build a query out of, and `patch_draft` asks the same
@@ -684,9 +682,8 @@ async def _own_applicant_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
 
 async def owned_application_ids(db: AsyncSession, actor: User) -> list[uuid.UUID]:
     """Every application `actor` may act for as its OWNER — filed by their own
-    individual `applicants` row or by a legal entity they hold an effective
-    representation of (`_own_applicant_ids`, judged on `business_today()`), in
-    every status.
+    `applicants` row, individual or legal (`_own_applicant_ids`, decision
+    #226), in every status.
 
     The seam `payments` needs for a citizen's "all of mine" reads (stage 11,
     ruling R2): `invoices` and `refunds` carry `application_id` and no
@@ -899,39 +896,16 @@ async def _assert_in_actor_zone(
     raise err("ERR-SYS-003", details={"application": str(application.id)})
 
 
-async def _resolve_applicant(
-    db: AsyncSession, payload: ApplicationFilingIn, *, actor: User
-) -> tuple[uuid.UUID, uuid.UUID | None]:
-    """Whose application this is, and on whose authority — `(applicant_id,
-    representation_id)`.
-
-    `on_behalf="self"`: the caller's own `applicants` row and no other. A
-    supplied `applicant_id` naming somebody else is refused rather than
-    ignored, because "ignored" is how a client ends up believing it filed for
-    the person it named.
-
-    `on_behalf="legal"`: a legal entity has no account of its own (decision
-    #9), so the caller must hold an EFFECTIVE representation of it — and the
-    representation's own id is stored, because `applications.representation_id`
-    is the record of which power of attorney was acted under. A representation
-    that has lapsed or been revoked is not effective, judged against
-    `business_today()` inside `auth.service`.
-    """
-    if payload.on_behalf == "self":
-        own = await auth_service.get_own_applicant(db, actor.id)
-        if own is None:
-            raise err("ERR-VAL-001", details={"reason": "no_own_applicant"})
-        if payload.applicant_id is not None and payload.applicant_id != own.id:
-            raise err("ERR-VAL-001", details={"reason": "applicant_is_not_the_caller"})
-        return own.id, None
-    if payload.applicant_id is None:
-        raise err("ERR-VAL-001", details={"reason": "applicant_id_required"})
-    representation = await auth_service.effective_representation_of(
-        db, user_id=actor.id, applicant_id=payload.applicant_id
-    )
-    if representation is None:
-        raise err("ERR-ACL-001", details={"reason": "no_effective_representation"})
-    return payload.applicant_id, representation.id
+async def _resolve_applicant(db: AsyncSession, *, actor: User) -> Applicant:
+    """Whose application this is (decision #226, R5): the CALLER's own
+    `applicants` row, individual or legal — there is nobody else to file for
+    since the "representation" mechanism was removed. Returns the row itself,
+    not just its id, so a caller can also read `.kind` (the simple-signature
+    gate, `signatures.service`'s own equivalent) without a second query."""
+    own = await auth_service.get_own_applicant(db, actor.id)
+    if own is None:
+        raise err("ERR-VAL-001", details={"reason": "no_own_applicant"})
+    return own
 
 
 async def _assert_references(db: AsyncSession, fields: dict[str, Any]) -> None:
@@ -1942,11 +1916,15 @@ APPLICATION_FILE = "application.file"
 @dataclass(frozen=True)
 class Filing:
     """A filing as `_build_filing` resolves it: the transient application and
-    the rows that will hang off it, none of them in the session."""
+    the rows that will hang off it, none of them in the session. `applicant`
+    is the caller's own row `_resolve_applicant` already fetched — `file()`
+    reads its `.kind` for the simple-signature gate rather than querying it
+    a second time."""
 
     application: Application
     items: list[ApplicationItem]
     documents: list[ApplicationDocument]
+    applicant: Applicant
 
 
 async def _build_filing(
@@ -1968,8 +1946,8 @@ async def _build_filing(
     """
     if kind not in APPLICATION_KINDS:
         raise err("ERR-VAL-001", details={"reason": "unknown_kind"})
-    applicant_id, representation_id = await _resolve_applicant(db, payload, actor=actor)
-    fields = payload.model_dump(exclude={"documents", "on_behalf", "applicant_id"})
+    applicant = await _resolve_applicant(db, actor=actor)
+    fields = payload.model_dump(exclude={"documents"})
     await _assert_references(db, fields)
     documents: list[ApplicationDocument] = []
     for doc in payload.documents:
@@ -1984,10 +1962,9 @@ async def _build_filing(
             )
         )
     application = Application(
-        applicant_id=applicant_id,
+        applicant_id=applicant.id,
         submitted_by_user_id=actor.id,
-        on_behalf=payload.on_behalf,
-        representation_id=representation_id,
+        on_behalf="self",  # decision #226, R5 — the only value any new filing writes
         status=SUBMITTED_STATUS,
         channel=CHANNEL_PORTAL,
         kind=kind,
@@ -2008,7 +1985,7 @@ async def _build_filing(
         ApplicationItem(livestock_type_id=item.livestock_type_id, head_count=item.head_count)
         for item in payload.items
     ]
-    return Filing(application=application, items=items, documents=documents)
+    return Filing(application=application, items=items, documents=documents, applicant=applicant)
 
 
 async def precheck_filing(
@@ -2113,11 +2090,12 @@ async def file(
         db, payload, actor=actor, kind=kind, parent_application_id=parent_application_id
     )
     application, items = filing.application, filing.items
-    # Step 1b (ruling #183), AFTER step 1 on purpose: who is filing and on
-    # whose authority is answered first — a caller with no representation at
-    # all hears `no_effective_representation`, not "sign with ERI". Nothing
-    # is pending yet either way; `_build_filing` only reads.
-    if payload.pkcs7 is None and payload.on_behalf != "self":
+    # Step 1b (ruling #183, keyed on `applicant.kind` since decision #226 R5
+    # retired `on_behalf` as a client choice): a legal applicant with no
+    # envelope can never succeed, known from `filing.applicant` alone —
+    # refusing here spends nothing on steps 2-7. Nothing is pending yet
+    # either way; `_build_filing` only reads.
+    if payload.pkcs7 is None and filing.applicant.kind == "legal":
         raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
     application.id = payload.application_id or uuid7()
     await _assert_complete(  # step 2
@@ -2415,13 +2393,17 @@ async def submit(
     # `from_status="RETURNED"`.
     application = await _own_draft_for_update(db, application_id, actor=actor)
     from_status = application.status
-    # Ruling #183, decided FIRST (stage 10 review, finding 9): a legal entity
-    # with no envelope can never succeed, and that is known from the body and
-    # `on_behalf` alone — refusing here spends nothing on steps 2-7 and leaves
-    # no half-attempt to commit. Nothing has been written yet, so a plain
-    # raise is the whole refusal; the audit row a refused ATTEMPT earns
-    # belongs to attempts that got as far as the package.
-    if pkcs7 is None and application.on_behalf != "self":
+    applicant = await auth_service.get_applicant(db, application.applicant_id)
+    assert applicant is not None  # FK
+    is_legal = applicant.kind == "legal"
+    # Ruling #183, decided FIRST (stage 10 review, finding 9), keyed on
+    # `applicant.kind` since decision #226 R5 retired `on_behalf` as a client
+    # choice: a legal entity with no envelope can never succeed, and that is
+    # known from the applicant alone — refusing here spends nothing on steps
+    # 2-7 and leaves no half-attempt to commit. Nothing has been written yet,
+    # so a plain raise is the whole refusal; the audit row a refused ATTEMPT
+    # earns belongs to attempts that got as far as the package.
+    if pkcs7 is None and is_legal:
         raise err("ERR-SIGN-001", details={"reason": "simple_signature_not_allowed"})
     await _assert_complete(db, application, rules_accepted=rules_accepted)  # step 2
     # Ruling #184: stamped from the SERVER clock, not the client's claim —
@@ -2476,7 +2458,7 @@ async def submit(
             content_changed_reason=STALE_PACKAGE_REASON,
             ip=ip,
         )
-    elif application.on_behalf == "self":
+    elif not is_legal:
         signature = await signatures_service.sign_simple(
             db,
             object_type=SUBMISSION_OBJECT_TYPE,
@@ -3670,8 +3652,7 @@ async def clone_template(
     the kind of quiet error this system exists to prevent — the applicant
     attaches a fresh one.
 
-    What copies is the request itself: who is filing and on whose authority
-    (`applicant_id`, `on_behalf`), the plot and activity (`contour_id`,
+    What copies is the request itself: the plot and activity (`contour_id`,
     `activity_type_id`), the declared period, quantity and herd
     (`period_from`, `period_to`, `quantity`, `items`), the claimed
     `benefit_category_item_id` with its certificate number, and (decision
@@ -3690,8 +3671,6 @@ async def clone_template(
         raise err("ERR-SYS-003", details={"application": str(application_id)})
     items = await repo.list_items(db, source.id)
     return ApplicationCloneOut(
-        on_behalf=source.on_behalf,  # type: ignore[arg-type]  # CHECK-backed literal
-        applicant_id=source.applicant_id,
         activity_type_id=source.activity_type_id,
         contour_id=source.contour_id,
         period_from=source.period_from,

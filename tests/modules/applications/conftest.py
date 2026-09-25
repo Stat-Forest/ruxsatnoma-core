@@ -33,13 +33,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.models import MediaFile
-from app.core.time import business_today
 from app.db import make_session_factory, uuid7
 from app.main import create_app
 from app.modules.admin.models import Classifier, ClassifierItem, Organization
 from app.modules.applications import service as applications_service
 from app.modules.applications.permissions import APPLICATIONS_REVIEW, APPLICATIONS_VIEW_ANY
-from app.modules.auth.models import Applicant, Representation, Role, RolePermission, User
+from app.modules.auth.models import Applicant, Role, RolePermission, User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.norms import calculator
 from app.modules.norms import params as norm_params
@@ -222,7 +221,6 @@ def recreation_filing_ready_for_submission(
     "ready to submit" and every caller of this fixture would 400 at
     `POST /applications/package` instead of reaching what it means to test."""
     return {
-        "on_behalf": "self",
         "contour_id": str(published_contour.id),
         "activity_type_id": str(recreation_activity_id),
         "period_from": "2027-09-01",
@@ -437,11 +435,17 @@ def unique_stir() -> str:
 
 @pytest.fixture
 async def legal_applicant(db: AsyncSession) -> Applicant:
-    """A legal entity — `kind='legal'`, a STIR and NO `owner_user_id`: decision
-    #9 gives a legal applicant no account of its own, so every application for
-    it is filed by a representative."""
+    """A legal entity's OWN account (decision #226): `kind='legal'`, a STIR,
+    and an `owner_user_id` — the same 1:1 cabinet an individual has, built
+    the way `auth.service.login_or_create_legal` builds it on an
+    organisation's first E-IMZO login (`users.pinfl` stays `NULL`, R1)."""
+    user = await make_user(db, role_code="applicant", pinfl=None)
     row = Applicant(
-        kind="legal", stir=unique_stir(), name="ООО Тест", address=TEST_APPLICANT_ADDRESS
+        kind="legal",
+        stir=unique_stir(),
+        name="ООО Тест",
+        address=TEST_APPLICANT_ADDRESS,
+        owner_user_id=user.id,
     )
     db.add(row)
     await db.flush()
@@ -450,33 +454,14 @@ async def legal_applicant(db: AsyncSession) -> Applicant:
 
 @pytest.fixture
 async def representative_client(db: AsyncSession, legal_applicant: Applicant):
-    """A user who is themselves a registered individual applicant — required by
-    `get_current_user`'s `ERR-AUTH-008` gate on any `applicant`-role account
-    with no `Applicant` row of its own — AND holds an ACTIVE `Representation`
-    over `legal_applicant`.
-
-    The `Representation` row is built directly, the same way
-    `tests/modules/payments/test_intents.py::representative_client` builds its
-    own: the production path (`auth.service.attach_legal` /
-    `add_representation`) needs a verified organisation ERI challenge and an
-    existing director-or-org_eri representation to bootstrap from, none of
-    which this module's rules depend on. `basis='org_eri'` needs no
-    `poa_file_id`/`valid_until` — the DB CHECK requires those for
-    `basis='poa'` only.
-    """
-    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
-    )
-    db.add(
-        Representation(
-            applicant_id=legal_applicant.id,
-            user_id=user.id,
-            basis="org_eri",
-            valid_from=business_today(),
-        )
-    )
-    await db.flush()
+    """`legal_applicant`'s own account, signed in. Kept under this name so
+    every test filing/acting "for `legal_applicant`" needs no rename —
+    decision #226 retired the separate representative identity this fixture
+    used to build via `Representation`; an organisation now logs into its
+    own cabinet exactly the way `applicant_client` signs in as an
+    individual's."""
+    user = await db.get(User, legal_applicant.owner_user_id)
+    assert user is not None, "the `legal_applicant` fixture always owns a real user"
     async for client in _client_for_applicant(db, user):
         yield client
 
@@ -488,25 +473,22 @@ def _ready_filing(
     *,
     period_from: str,
     period_to: str,
-    on_behalf: str = "self",
-    applicant_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """One complete grazing FILING — the body `POST /applications` takes since
     stage 12 (plan 12, R1); a draft is no longer a thing a fixture can build.
     Shared by the filing fixtures below so that "complete" means the same thing
     in all of them: a second hand-written body is how two fixtures that are
-    supposed to differ only in their period end up differing in more."""
-    body: dict[str, Any] = {
-        "on_behalf": on_behalf,
+    supposed to differ only in their period end up differing in more.
+
+    No `on_behalf`/`applicant_id` since decision #226 (R5): the service always
+    resolves the CALLER's own applicant now, individual or legal."""
+    return {
         "contour_id": str(contour_id),
         "activity_type_id": str(activity_type_id),
         "period_from": period_from,
         "period_to": period_to,
         "items": [{"livestock_type_id": str(livestock_type_id), "head_count": 40}],
     }
-    if applicant_id is not None:
-        body["applicant_id"] = str(applicant_id)
-    return body
 
 
 @pytest.fixture
@@ -555,8 +537,6 @@ def legal_filing_ready_for_submission(
         sheep_type_id,
         period_from="2027-05-01",
         period_to="2027-09-30",
-        on_behalf="legal",
-        applicant_id=legal_applicant.id,
     )
 
 

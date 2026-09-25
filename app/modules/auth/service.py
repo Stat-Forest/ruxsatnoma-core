@@ -6,7 +6,7 @@ import secrets
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -18,7 +18,6 @@ from app.config import get_settings
 from app.core import settings_store
 from app.core.crypto import decrypt_str
 from app.core.errors import err
-from app.core.models import MediaFile
 from app.core.schemas import LOCALES
 from app.core.security import (
     hash_otp,
@@ -29,14 +28,12 @@ from app.core.security import (
     verify_password,
     verify_totp,
 )
-from app.core.time import business_today
 from app.modules.audit import service as audit
 from app.modules.auth import repo
 from app.modules.auth.models import (
     APPLICANT_ROLE_CODE,
     Applicant,
     OtpCode,
-    Representation,
     Role,
     Session,
     User,
@@ -46,7 +43,6 @@ from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import (
     EimzoCall,
     EimzoError,
-    EimzoIdentity,
     get_eimzo_adapter,
 )
 from app.modules.integrations.adapters.oneid import (
@@ -65,6 +61,10 @@ _DUMMY_HASH = hash_password("dummy-timing-equalizer")
 # `login_via_eimzo` (finding 6, final review), not left to the database to
 # reject as an uncaught `IntegrityError`/500.
 _PINFL_RE = re.compile(r"^[0-9]{14}$")
+# Mirrors `applicants.stir`'s own `CheckConstraint` (`ck_applicants_stir_
+# format`, 9 digits) -- an organisation certificate's `identity.tin` is
+# checked against it before `login_or_create_legal` ever inserts it.
+_STIR_RE = re.compile(r"^[0-9]{9}$")
 
 
 async def issue_session(
@@ -357,6 +357,34 @@ async def login_via_eimzo(
         )
         await db.commit()
         raise err("ERR-AUTH-004")
+    # R2 (decision #226): `identity.tin` present, whatever 9 digits, means an
+    # ORGANISATION certificate -- login by STIR into that organisation's own
+    # cabinet (`login_or_create_legal`), regardless of whatever PINFL the same
+    # certificate also carries. No `tin` -- the personal branch below, exactly
+    # as before this stage. Neither present is refused by the personal branch's
+    # own `_PINFL_RE` check (identical to the pre-stage-18 behaviour).
+    if identity.tin is not None:
+        if not _STIR_RE.fullmatch(identity.tin):
+            await audit.log(
+                db,
+                action="user.login",
+                result="denied",
+                basis="eimzo_legal: malformed tin",
+                ip=ip,
+                user_agent=user_agent,
+            )
+            await db.commit()
+            raise err("ERR-AUTH-004")
+        signer_pinfl = identity.pinfl if _PINFL_RE.fullmatch(identity.pinfl) else None
+        return await login_or_create_legal(
+            db,
+            stir=identity.tin,
+            org_name=identity.legal_name or f"STIR {identity.tin}",
+            signer_pinfl=signer_pinfl,
+            signer_name=identity.full_name,
+            ip=ip,
+            user_agent=user_agent,
+        )
     if not _PINFL_RE.fullmatch(identity.pinfl):
         # Finding 6 (final review): `eimzo_wire.read_subject`'s STIR/""
         # fallback is right for an OWNERSHIP check (`signatures.
@@ -387,6 +415,108 @@ async def login_via_eimzo(
         ip=ip,
         user_agent=user_agent,
     )
+
+
+async def login_or_create_legal(
+    db: AsyncSession,
+    *,
+    stir: str,
+    org_name: str,
+    signer_pinfl: str | None,
+    signer_name: str | None,
+    ip: str | None,
+    user_agent: str | None,
+) -> tuple[User, Session, str, str]:
+    """R1/R2/R3 (decision #226): a certificate whose TIN is present logs into
+    the ONE cabinet for that STIR, whoever presents it. `applicants.stir` is
+    the lookup key, linked to its own account through `owner_user_id` -- the
+    same 1:1 link an individual has -- rather than a per-employee account
+    (R1: there is no `users.stir` column at all). First login for a STIR with
+    no `applicants` row creates both rows together; a legal applicant created
+    earlier by the retired `attach_legal` (`owner_user_id IS NULL`) is linked
+    here, on its organisation's first login under this stage -- no data
+    migration (R1). The signer's own pinfl/name never become a second
+    account: they are recorded in `audit.extra` only (R3)."""
+    applicant = await repo.get_applicant_by_stir(db, stir)
+    now = datetime.now(UTC)
+    login_extra = {
+        "method": "eimzo_legal",
+        "signer_pinfl": signer_pinfl,
+        "signer_name": signer_name,
+    }
+    if applicant is not None and applicant.owner_user_id is not None:
+        user = await repo.get_user(db, applicant.owner_user_id)
+        assert user is not None  # FK
+        if user.status != "active":
+            await audit.log(
+                db,
+                action="user.login",
+                user_id=user.id,
+                result="denied",
+                basis="eimzo_legal: user not active",
+                extra=login_extra,
+                ip=ip,
+                user_agent=user_agent,
+            )
+            await db.commit()
+            raise err("ERR-AUTH-001")
+    else:
+        role = await repo.get_role_by_code(db, "applicant")
+        assert role is not None  # seeded by migration 0003
+        user = User(full_name=org_name, role_id=role.id, pinfl=None)
+        await repo.add(db, user)
+        await audit.log(
+            db,
+            action="user.create",
+            user_id=user.id,
+            object_type="user",
+            object_id=user.id,
+            basis="self-registration",
+            extra={"method": "eimzo_legal"},
+            ip=ip,
+            user_agent=user_agent,
+        )
+        if applicant is None:
+            applicant = Applicant(
+                kind="legal",
+                stir=stir,
+                name=org_name,
+                owner_user_id=user.id,
+                verified_at=now,
+                verify_source="eimzo_legal",
+            )
+            await repo.add(db, applicant)
+            await audit.log(
+                db,
+                action="applicant.create_legal",
+                user_id=user.id,
+                object_type="applicant",
+                object_id=applicant.id,
+                extra={"stir": stir},
+                ip=ip,
+            )
+        else:
+            applicant.owner_user_id = user.id
+            await audit.log(
+                db,
+                action="applicant.link_owner",
+                user_id=user.id,
+                object_type="applicant",
+                object_id=applicant.id,
+                extra={"stir": stir},
+                ip=ip,
+            )
+    user.last_login_at = now
+    row, token, csrf = await issue_session(db, user, ip=ip, user_agent=user_agent)
+    await audit.log(
+        db,
+        action="user.login",
+        user_id=user.id,
+        extra=login_extra,
+        ip=ip,
+        user_agent=user_agent,
+    )
+    return user, row, token, csrf
 
 
 async def logout_session(db: AsyncSession, session_row: Session) -> None:
@@ -929,340 +1059,6 @@ async def complete_registration(
     return applicant
 
 
-async def _verify_org_challenge(
-    db: AsyncSession, *, signed_challenge: str, stir: str, signer_pinfl: str, ip: str | None
-) -> EimzoIdentity:
-    """org_eri basis: a fresh org-cert signature naming this stir and this signer.
-
-    Gap closed here, found in Task 4's own review: this function used to look
-    up `identity.challenge` in `otp_codes` UNCONDITIONALLY, the same mistake
-    `login_via_eimzo` had before ruling R1. In `real` mode e-imzo-server has
-    ALREADY matched its own challenge, inside `/backend/auth`, before ever
-    answering `status: 1` -- and `identity.challenge` is deliberately `""` in
-    that mode (`RealEimzo.verify_signed_challenge`'s own docstring), so an
-    unconditional lookup here always misses and refuses every legal-entity
-    attach the moment `EIMZO_MODE=real` is set, forever. Do NOT "fix" this
-    back into an unconditional lookup -- that is exactly the regression this
-    comment exists to prevent."""
-    adapter = get_eimzo_adapter()
-    try:
-        identity = await adapter.verify_signed_challenge(signed_challenge, ip=ip)
-    except EimzoError as exc:
-        # Fix round 1, finding 3: an integration error (`ERR-INT-001`/
-        # `ERR-INT-002`, a provider outage or a bad response) is not a
-        # verdict about the CERTIFICATE at all -- collapsing it into
-        # `ERR-ACL-001` used to tell a citizen their org certificate was
-        # invalid when the real story was that E-IMZO could not be reached.
-        # Only the genuine login-contract refusal (`ERR-AUTH-004`, the
-        # unchanged status the mock and `RealEimzo.verify_signed_challenge`
-        # both raise for a non-1 status) becomes the ACL error here; every
-        # other code keeps its own.
-        #
-        # Task 5: the refused round trip is logged before it is rolled back
-        # -- nothing else of ours is pending here (`attach_legal`/
-        # `add_representation` only read before calling this), so the commit
-        # only persists this one log row.
-        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
-        await db.commit()
-        if exc.err_code != "ERR-AUTH-004":
-            # Minor 9 (final review): carry the provider's own status/reason
-            # for the two codes that have one (`ERR-INT-001`/`ERR-INT-002`)
-            # instead of a bare 502/503 -- reuses `integrations.service.
-            # eimzo_error_details` rather than a second copy.
-            raise err(exc.err_code, details=integrations_service.eimzo_error_details(exc)) from exc
-        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "bad signature"}) from exc
-    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
-    # Gap fix (this function's own docstring): in `real` mode the provider
-    # already owns and matched the challenge, and `identity.challenge` is
-    # always `""` -- looking it up here would always miss.
-    if get_settings().eimzo_mode == "mock":
-        row = await repo.get_valid_otp(
-            db, hash_token(identity.challenge), purpose="eimzo_challenge"
-        )
-        if row is None:
-            raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "challenge invalid"})
-        row.used_at = datetime.now(UTC)
-    if identity.tin != stir or identity.pinfl != signer_pinfl:
-        raise err("ERR-ACL-001", details={"basis": "org_eri", "reason": "certificate mismatch"})
-    return identity
-
-
-def _director_listed(user: User, stir: str) -> tuple[bool, str | None]:
-    """director_registry basis: OneID's legal_info is the directors' registry (ruling 12)."""
-    profile = user.oneid_profile or {}
-    for entry in profile.get("legal_info", []):
-        if entry.get("le_tin") == stir:
-            return True, entry.get("le_name")
-    return False, None
-
-
-async def _check_poa_file(db: AsyncSession, *, file_id: uuid.UUID, actor: User) -> None:
-    """ruling 6 (3.3b): poa file must exist, be active, own, and be a PDF."""
-    file = await db.get(MediaFile, file_id)
-    if file is None or file.status != "active":
-        raise err("ERR-VAL-001", details={"reason": "poa_file_not_found"})
-    if file.uploaded_by != actor.id:
-        raise err("ERR-VAL-001", details={"reason": "poa_file_not_owned"})
-    if file.content_type != "application/pdf":
-        raise err("ERR-VAL-001", details={"reason": "poa_file_not_pdf"})
-
-
-async def attach_legal(
-    db: AsyncSession,
-    user: User,
-    *,
-    stir: str,
-    basis: str,
-    signed_challenge: str | None,
-    poa_file_id: uuid.UUID | None,
-    valid_until: date | None,
-    name: str | None,
-    ip: str | None,
-) -> tuple[Applicant, Representation]:
-    if await repo.role_code(db, user) != APPLICANT_ROLE_CODE:
-        raise err("ERR-ACL-001", details={"reason": "not an applicant account"})
-    assert user.pinfl is not None
-    legal_name = name
-    requisites: dict[str, Any] | None = None
-    if basis == "org_eri":
-        assert signed_challenge is not None  # schema guarantees
-        identity = await _verify_org_challenge(
-            db, signed_challenge=signed_challenge, stir=stir, signer_pinfl=user.pinfl, ip=ip
-        )
-        legal_name = identity.legal_name or legal_name or f"STIR {stir}"
-        requisites = {"cert_serial": identity.cert_serial}
-    elif basis == "director_registry":
-        listed, le_name = _director_listed(user, stir)
-        if not listed:
-            raise err(
-                "ERR-ACL-001",
-                details={"basis": "director_registry", "reason": "stir not in oneid profile"},
-            )
-        legal_name = le_name or legal_name or f"STIR {stir}"
-    else:  # poa — schema guarantees file/term/name
-        assert legal_name is not None
-        assert poa_file_id is not None
-        await _check_poa_file(db, file_id=poa_file_id, actor=user)
-    applicant = await repo.get_applicant_by_stir(db, stir)
-    created = False
-    if applicant is None:
-        applicant = Applicant(
-            kind="legal",
-            stir=stir,
-            name=legal_name,
-            requisites=requisites,
-            verified_at=datetime.now(UTC) if basis != "poa" else None,
-            verify_source=basis if basis != "poa" else None,
-        )
-        await repo.add(db, applicant)
-        created = True
-    existing = await repo.get_effective_representation(
-        db, applicant_id=applicant.id, user_id=user.id, today=business_today()
-    )
-    if existing is not None:
-        raise err("ERR-AUTH-011")
-    # A poa attach can pre-create an applicant row for any stir under an arbitrary
-    # name (basis=poa never verifies the stir against anything) — the first
-    # cryptographically/registry-verified attach for that stir heals the row instead
-    # of silently inheriting the squatted name. Only on the success path (a raise
-    # above would roll the heal back too, which is fine — nothing urgent to fix on a
-    # duplicate/denied attach).
-    healed = (
-        not created and basis in ("org_eri", "director_registry") and applicant.verified_at is None
-    )
-    if healed:
-        applicant.name = legal_name
-        applicant.verified_at = datetime.now(UTC)
-        applicant.verify_source = basis
-        if basis == "org_eri":
-            applicant.requisites = requisites
-    representation = Representation(
-        applicant_id=applicant.id,
-        user_id=user.id,
-        basis=basis,
-        poa_file_id=poa_file_id,
-        valid_from=business_today(),
-        valid_until=valid_until,
-    )
-    await repo.add(db, representation)
-    if created:
-        await audit.log(
-            db,
-            action="applicant.create_legal",
-            user_id=user.id,
-            object_type="applicant",
-            object_id=applicant.id,
-            extra={"stir": stir},
-            ip=ip,
-        )
-    if healed:
-        await audit.log(
-            db,
-            action="applicant.verify",
-            user_id=user.id,
-            object_type="applicant",
-            object_id=applicant.id,
-            extra={"stir": stir, "source": basis},
-            ip=ip,
-        )
-    await audit.log(
-        db,
-        action="representation.create",
-        user_id=user.id,
-        object_type="representation",
-        object_id=representation.id,
-        basis=basis,
-        ip=ip,
-    )
-    return applicant, representation
-
-
-async def add_representation(
-    db: AsyncSession,
-    user: User,
-    *,
-    applicant_id: uuid.UUID,
-    user_pinfl: str,
-    basis: str,
-    signed_challenge: str | None,
-    poa_file_id: uuid.UUID | None,
-    valid_until: date | None,
-    ip: str | None,
-) -> tuple[Representation, Applicant]:
-    applicant = await db.get(Applicant, applicant_id)
-    if applicant is None or applicant.kind != "legal":
-        raise err("ERR-SYS-003")
-    today = business_today()
-    own = await repo.get_effective_representation(
-        db, applicant_id=applicant_id, user_id=user.id, today=today
-    )
-    if own is None or own.basis not in ("org_eri", "director_registry"):
-        raise err("ERR-ACL-001", details={"reason": "org_eri or director basis required"})
-    candidate = await repo.get_user_by_pinfl(db, user_pinfl)
-    if candidate is None or await repo.get_own_applicant(db, candidate.id) is None:
-        raise err("ERR-SYS-003", details={"reason": "candidate must sign in and register first"})
-    if await repo.role_code(db, candidate) != APPLICANT_ROLE_CODE:
-        raise err("ERR-ACL-001", details={"reason": "candidate is not an applicant account"})
-    assert applicant.stir is not None and user.pinfl is not None
-    if basis == "org_eri":
-        assert signed_challenge is not None
-        await _verify_org_challenge(
-            db,
-            signed_challenge=signed_challenge,
-            stir=applicant.stir,
-            signer_pinfl=user.pinfl,
-            ip=ip,
-        )
-    elif basis == "director_registry":
-        listed, _ = _director_listed(candidate, applicant.stir)
-        if not listed:
-            raise err(
-                "ERR-ACL-001",
-                details={"basis": "director_registry", "reason": "candidate not listed"},
-            )
-    elif basis == "poa":
-        assert poa_file_id is not None  # schema guarantees
-        await _check_poa_file(db, file_id=poa_file_id, actor=user)
-    existing = await repo.get_effective_representation(
-        db, applicant_id=applicant_id, user_id=candidate.id, today=today
-    )
-    if existing is not None:
-        raise err("ERR-AUTH-011")
-    representation = Representation(
-        applicant_id=applicant_id,
-        user_id=candidate.id,
-        basis=basis,
-        poa_file_id=poa_file_id,
-        valid_from=today,
-        valid_until=valid_until,
-    )
-    await repo.add(db, representation)
-    await audit.log(
-        db,
-        action="representation.create",
-        user_id=user.id,
-        object_type="representation",
-        object_id=representation.id,
-        basis=basis,
-        extra={"for_user": str(candidate.id)},
-        ip=ip,
-    )
-    return representation, applicant
-
-
-async def has_effective_representation(db: AsyncSession, *, user_id: uuid.UUID, stir: str) -> bool:
-    """Pass-through to `repo.get_effective_representation`, resolved from a STIR rather
-    than an `applicant_id` — the public entry point another module (`signatures`, proving
-    an organisation certificate belongs to its presenter) needs instead of reaching into
-    `auth.repo` directly, which the module-boundary rule (backend/CLAUDE.md: cross-module
-    calls only via the other module's service) forbids. "Effective" means exactly what
-    `attach_legal`/`add_representation` above already mean by it: `status='active'` and
-    not past `valid_until`, judged against `business_today()`, never `date.today()`
-    (lesson). No `applicants` row for `stir` at all is simply "no representation"."""
-    applicant = await repo.get_applicant_by_stir(db, stir)
-    if applicant is None:
-        return False
-    representation = await repo.get_effective_representation(
-        db, applicant_id=applicant.id, user_id=user_id, today=business_today()
-    )
-    return representation is not None
-
-
-async def has_effective_representation_of(
-    db: AsyncSession, *, user_id: uuid.UUID, applicant_id: uuid.UUID
-) -> bool:
-    """Pass-through to `repo.get_effective_representation`, resolved directly
-    from an `applicant_id` — for a caller that already holds it
-    (`payments.service`, deciding whether a representative may see or pay a
-    LEGAL applicant's invoice) and has no STIR to look up the way
-    `has_effective_representation` above does. Same "effective" meaning:
-    `status='active'` and not past `valid_until`, judged against
-    `business_today()`, never `date.today()` (lesson). First consumer:
-    3.10a task 5's ownership ruling — a legal entity's non-owner
-    representative must be able to act on an invoice they filed themselves,
-    not just its `owner_user_id` (which is `None` for `kind='legal'`
-    anyway)."""
-    representation = await repo.get_effective_representation(
-        db, applicant_id=applicant_id, user_id=user_id, today=business_today()
-    )
-    return representation is not None
-
-
-async def effective_representation_of(
-    db: AsyncSession, *, user_id: uuid.UUID, applicant_id: uuid.UUID
-) -> Representation | None:
-    """The ROW behind `has_effective_representation_of` above, for a caller that
-    has to STORE which power of attorney it acted under rather than merely check
-    that one exists — `applications.service._build_filing` fills
-    `applications.representation_id`, the column that says on whose authority a
-    representative filed for a legal entity.
-
-    Same "effective" meaning as every sibling here: `status='active'` and not
-    past `valid_until`, judged against `business_today()`, never `date.today()`
-    (lesson). Same repo call as the boolean sibling, so the two can never
-    disagree about which representation is the effective one."""
-    return await repo.get_effective_representation(
-        db, applicant_id=applicant_id, user_id=user_id, today=business_today()
-    )
-
-
-async def effective_representative(db: AsyncSession, applicant_id: uuid.UUID) -> uuid.UUID | None:
-    """One user currently holding an EFFECTIVE representation of a LEGAL
-    applicant, or `None` if nobody does. "Effective" means the same thing as
-    everywhere else in this file: `status='active'` and not past
-    `valid_until`, judged against `business_today()`, never `date.today()`
-    (lesson). A legal entity has SEVERAL representatives (decision #9); this
-    is not "the primary one" (no rule names one), only "a currently valid
-    one", deterministic via `repo.any_effective_representative`'s own
-    ordering.
-
-    First caller: `inspections.service._violator_recipient` (ruling R2) — a
-    violation case is opened BY THE SYSTEM when an inspector signs an act,
-    so unlike `applications`/`permits` there is no `submitted_by_user_id` to
-    fall back to when the applicant itself has no account."""
-    return await repo.any_effective_representative(db, applicant_id, business_today())
-
-
 async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant | None:
     """The `Applicant` this user itself owns (`Applicant.owner_user_id`), or
     `None`. Thin pass-through to `repo.get_own_applicant` — kept here, not
@@ -1277,30 +1073,24 @@ async def get_own_applicant(db: AsyncSession, user_id: uuid.UUID) -> Applicant |
 
 
 async def own_applicant_ids(db: AsyncSession, user_id: uuid.UUID) -> list[uuid.UUID]:
-    """Every `applicants` row this user may act for TODAY: their own individual
-    row (`applicants.owner_user_id`) plus every legal entity they hold an
-    EFFECTIVE representation of — exactly the set `GET /auth/me` already reports
-    back to the user as "who I can act for".
+    """Every `applicants` row this user may act for: exactly their own row
+    (`applicants.owner_user_id`), whatever its `kind` — individual or legal
+    (R4, decision #226; representations are gone, and an organisation's
+    cabinet is now just as much a 1:1 account as an individual's). Nothing
+    else answers this question and every caller keeps calling it — `permits`,
+    `payments`, `applications`, `inspections`, `beekeepers`, `norms`.
 
-    The set-shaped companion of `has_effective_representation` above, and the
-    reason it exists: a caller asking about ONE applicant can ask that one; a
-    caller building a QUERY over somebody's own rows (`GET /api/v1/permits`,
-    3.11a) cannot, and would otherwise have to import `auth.repo` across the
-    module boundary. "Effective" means the same thing here as everywhere else in
-    this file — `status='active'` and not past `valid_until`, judged against
-    `business_today()`, never `date.today()` (lesson).
+    The set-shaped companion of `get_own_applicant` above, and the reason it
+    exists: a caller building a QUERY over somebody's own rows (`GET
+    /api/v1/permits`, 3.11a) needs a set, not one row, and would otherwise
+    have to import `auth.repo` across the module boundary.
 
     No permission and no zone rule, like `get_applicant`/`role_code` above: the
     caller is another SERVICE inside this process, and the gates live on the
     routes that reach it.
     """
     own = await repo.get_own_applicant(db, user_id)
-    ids = [] if own is None else [own.id]
-    ids.extend(
-        applicant.id
-        for _, applicant in await repo.effective_representations(db, user_id, business_today())
-    )
-    return ids
+    return [] if own is None else [own.id]
 
 
 async def update_applicant_address(
@@ -1320,13 +1110,9 @@ async def update_applicant_address(
     reasoning `applications.service._readable_application` already states in
     full).
 
-    "No claim" means exactly what `own_applicant_ids` means everywhere else
-    in this module: the caller's own individual row, or a legal entity they
-    hold an EFFECTIVE representation of — `status='active'` and not past
-    `valid_until`, judged against `business_today()` inside that function,
-    never `date.today()` (lesson). One definition, reused rather than
-    re-derived: a representative who may act for a legal applicant here is
-    exactly the same set that may file for it.
+    "No claim" means exactly what `own_applicant_ids` means everywhere else in
+    this module: the caller's own row, individual or legal (R4, decision
+    #226). One definition, reused rather than re-derived.
     """
     if applicant_id not in await own_applicant_ids(db, actor.id):
         raise err("ERR-SYS-003", details={"applicant": str(applicant_id)})

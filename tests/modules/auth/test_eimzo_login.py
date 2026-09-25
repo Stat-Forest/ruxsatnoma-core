@@ -109,7 +109,89 @@ async def test_garbage_signature_rejected(db):
     assert r.status_code == 401
 
 
-async def test_legal_cert_still_logs_in_the_person(db):
+def unique_stir() -> str:
+    return f"9{uuid.uuid4().int % 10**8:08d}"
+
+
+async def test_legal_cert_logs_into_the_organisations_own_cabinet(db):
+    """R2/R1 (decision #226): `identity.tin` present logs in the ORGANISATION
+    by STIR — its own account, not the signer's personal one — whatever
+    PINFL the certificate also carries."""
+    app = create_app()
+    stir = unique_stir()
+    async with make_client(app, lifespan=True) as client:
+        challenge = await get_challenge(client)
+        identity = EimzoIdentity(
+            challenge=challenge,
+            pinfl=unique_pinfl(),
+            full_name="DIRECTOR",
+            tin=stir,
+            legal_name="OOO DIR",
+        )
+        r = await client.post(
+            f"{API}/auth/eimzo/login",
+            json={"signed_challenge": encode_mock_signed_challenge(identity)},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["role"]["code"] == "applicant"
+    assert body["user"]["pinfl"] is None
+    assert body["applicant"]["kind"] == "legal"
+    assert body["applicant"]["stir"] == stir
+    assert body["applicant"]["name"] == "OOO DIR"
+
+
+async def test_a_second_employee_of_the_same_organisation_lands_in_the_same_cabinet(db):
+    """One cabinet per STIR (decision #226): a DIFFERENT signer's PINFL, the
+    SAME org STIR, must resolve to the identical `applicants`/`users` row."""
+    app = create_app()
+    stir = unique_stir()
+    async with make_client(app, lifespan=True) as client:
+        first_challenge = await get_challenge(client)
+        first = EimzoIdentity(
+            challenge=first_challenge,
+            pinfl=unique_pinfl(),
+            full_name="FIRST DIRECTOR",
+            tin=stir,
+            legal_name="OOO SHARED",
+        )
+        r1 = await client.post(
+            f"{API}/auth/eimzo/login",
+            json={"signed_challenge": encode_mock_signed_challenge(first)},
+        )
+        assert r1.status_code == 200, r1.text
+        first_applicant_id = r1.json()["applicant"]["id"]
+        first_user_id = r1.json()["user"]["id"]
+
+        second_challenge = await get_challenge(client)
+        second = EimzoIdentity(
+            challenge=second_challenge,
+            pinfl=unique_pinfl(),
+            full_name="SECOND EMPLOYEE",
+            tin=stir,
+            legal_name="OOO SHARED",
+        )
+        r2 = await client.post(
+            f"{API}/auth/eimzo/login",
+            json={"signed_challenge": encode_mock_signed_challenge(second)},
+        )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["applicant"]["id"] == first_applicant_id
+    assert r2.json()["user"]["id"] == first_user_id
+
+
+async def test_a_pre_existing_unowned_legal_applicant_is_linked_on_first_login(db):
+    """R1: an `applicants` row created earlier by the retired `attach_legal`
+    (`owner_user_id IS NULL`) gets its account on the organisation's first
+    login under this stage — no data migration."""
+    from app.modules.auth.models import Applicant
+
+    stir = unique_stir()
+    existing = Applicant(kind="legal", stir=stir, name="OOO PRE-EXISTING")
+    db.add(existing)
+    await db.flush()
+    await db.commit()
+
     app = create_app()
     async with make_client(app, lifespan=True) as client:
         challenge = await get_challenge(client)
@@ -117,15 +199,15 @@ async def test_legal_cert_still_logs_in_the_person(db):
             challenge=challenge,
             pinfl=unique_pinfl(),
             full_name="DIRECTOR",
-            tin="555666777",
-            legal_name="OOO DIR",
+            tin=stir,
+            legal_name="OOO PRE-EXISTING",
         )
         r = await client.post(
             f"{API}/auth/eimzo/login",
             json={"signed_challenge": encode_mock_signed_challenge(identity)},
         )
-    assert r.status_code == 200
-    assert r.json()["role"]["code"] == "applicant"
+    assert r.status_code == 200, r.text
+    assert r.json()["applicant"]["id"] == str(existing.id)
 
 
 class _StubAdapter:
@@ -270,17 +352,13 @@ async def test_a_provider_outage_during_login_is_also_logged(db, monkeypatch) ->
     assert row.http_status is None
 
 
-async def test_a_legal_entity_only_certificate_refuses_login_cleanly(db, monkeypatch) -> None:
-    """Finding 6 (final review): `eimzo_wire.read_subject` falls back to the
-    org STIR (9 digits) and then to `""` when a certificate carries no
-    PERSONAL PINFL at all -- the right answer for an ownership check
-    (`signatures._ownership_reason`, which only needs SOME identifier), but
-    wrong for login, which hands the value straight to
-    `login_or_create_by_pinfl` -> a `User` insert against
-    `CheckConstraint("pinfl ~ '^[0-9]{14}$'")`. Before the fix, a
-    legal-entity-only certificate the provider accepts with `status: 1`
-    reached that insert with a 9-digit STIR and blew up as an
-    `IntegrityError` (a bare 500), not a clean refusal."""
+async def test_a_legal_entity_certificate_logs_in_by_tin_over_real_mode(db, monkeypatch) -> None:
+    """R2 (decision #226): a certificate carrying an org TIN but no personal
+    PINFL still logs in -- as the ORGANISATION, by STIR, over the real-mode
+    wire (`eimzo_wire.read_subject`'s own OID map, `subjectName`'s
+    `1.2.860.3.16.1.1`). Before stage 18 this same shape used to be refused
+    at the personal-login PINFL check (finding 6, final review) because the
+    legal branch did not exist yet; now it is the legal branch's own case."""
     sample = {
         "subjectCertificateInfo": {
             "serialNumber": "org-cert-2",
@@ -289,10 +367,6 @@ async def test_a_legal_entity_only_certificate_refuses_login_cleanly(db, monkeyp
                 "1.2.860.3.16.1.1": "301234567",  # org STIR only -- no personal PINFL
                 "CN": "BURCHMULLA LESHOZ",
             },
-            # Deliberately far in the future: this test targets the PINFL-format
-            # refusal, not the (unrelated) `cert_expires_at` check a couple of
-            # lines above it in `login_via_eimzo` -- a near-dated cert would let
-            # THAT check fire first and pass this test for the wrong reason.
             "validFrom": "2026-05-25 15:47:22",
             "validTo": "2099-06-24 15:47:22",
         },
@@ -308,13 +382,42 @@ async def test_a_legal_entity_only_certificate_refuses_login_cleanly(db, monkeyp
         "get_eimzo_adapter",
         lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
     )
-    # `login_via_eimzo` reads `get_settings().eimzo_mode` directly (ruling R1)
-    # to decide whether to consult the LOCAL `otp_codes` challenge -- forced
-    # to "real" here too, or the default test env's mock mode would take that
-    # branch instead and refuse on `identity.challenge == ""` missing an
-    # `otp_codes` row, never reaching the PINFL check this test targets
-    # (mirrors `test_org_eri_real_mode.py`'s identical need for
-    # `_verify_org_challenge`).
+    monkeypatch.setattr(service, "get_settings", lambda: REAL_SETTINGS)
+    user, _row, _token, _csrf = await service.login_via_eimzo(
+        db, signed_challenge="x", ip=None, user_agent=None
+    )
+    assert user.pinfl is None
+    applicant = await service.get_own_applicant(db, user.id)
+    assert applicant is not None
+    assert applicant.kind == "legal"
+    assert applicant.stir == "301234567"
+
+
+async def test_a_certificate_with_neither_pinfl_nor_tin_refuses_login_cleanly(
+    db, monkeypatch
+) -> None:
+    """R2's own last sentence: a certificate with neither is refused as
+    before this stage (`ERR-AUTH-004`), not an uncaught `IntegrityError`/500."""
+    sample = {
+        "subjectCertificateInfo": {
+            "serialNumber": "org-cert-3",
+            "X500Name": "CN=NOBODY",
+            "subjectName": {"CN": "NOBODY"},
+            "validFrom": "2026-05-25 15:47:22",
+            "validTo": "2099-06-24 15:47:22",
+        },
+        "status": 1,
+        "message": "",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=sample)
+
+    monkeypatch.setattr(
+        service,
+        "get_eimzo_adapter",
+        lambda: RealEimzo(REAL_SETTINGS, transport=httpx.MockTransport(handler)),
+    )
     monkeypatch.setattr(service, "get_settings", lambda: REAL_SETTINGS)
     with pytest.raises(DomainError) as exc:
         await service.login_via_eimzo(db, signed_challenge="x", ip=None, user_agent=None)

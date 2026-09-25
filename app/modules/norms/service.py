@@ -1748,11 +1748,12 @@ async def list_calculations(
     calculation the actor CREATED came back in the list, full `CalculationOut`
     and all (`input_snapshot`, `amount`, `breakdown`), even where the FIRST
     branch's own question (ownership, zone, or ruling #107's forwarding
-    carve-out) would answer no. `own_applicant_ids` is effective-dated, with a
-    daily job flipping a representation to `expired`, so a representative who
-    priced an application during a valid representation keeps the bound row
-    forever unless this scope excludes it — the card and `GET
-    /calculations/{id}` answer 404 for them while the unfiltered list did not.
+    carve-out) would answer no. (Historical note: before decision #226
+    retired the "representation" mechanism, `own_applicant_ids` was also
+    effective-dated, and a representative whose representation had since
+    expired would otherwise keep a bound row forever unless this scope
+    excluded it — the card and `GET /calculations/{id}` answered 404 for them
+    while the unfiltered list did not.)
     **A forwarding head is the OTHER illustration, and cuts the other way
     since F7's fix**: `_forwarded_here_by` now grants them the single read and
     the FILTERED list back (`?application_id=`), but never the unfiltered

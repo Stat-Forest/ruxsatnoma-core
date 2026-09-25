@@ -972,9 +972,9 @@ async def _case_applicant_id(db: AsyncSession, act: InspectionAct) -> uuid.UUID 
 
 
 async def _violator_recipient(db: AsyncSession, case: ViolationCase) -> uuid.UUID | None:
-    """Who hears about THIS case (ruling R2): the individual applicant's own
-    account, or — for a legal entity, which has none (decision #9) — the
-    representative whose representation is currently valid.
+    """Who hears about THIS case (ruling R2): the applicant's own account —
+    individual or legal, since decision #226 an organisation has one too,
+    through `applicants.owner_user_id`, the same as an individual.
 
     Unlike `applications`/`permits`, a `ViolationCase` has no submitter to
     fall back to: it is opened BY THE SYSTEM when an inspector signs a
@@ -982,7 +982,8 @@ async def _violator_recipient(db: AsyncSession, case: ViolationCase) -> uuid.UUI
     `_notification_recipient` always returns a `uuid.UUID`, this one may
     return `None` — the fail-open half of R2: an unreachable applicant (or a
     case with no identified applicant at all, e.g. an "activity without a
-    permit" act) must not be able to block its own case by being
+    permit" act, or a legal applicant nobody from that organisation has ever
+    logged into yet) must not be able to block its own case by being
     unreachable. `_notify_violator` below is what turns `None` into a logged
     warning instead of a raised error."""
     if case.applicant_id is None:
@@ -990,9 +991,7 @@ async def _violator_recipient(db: AsyncSession, case: ViolationCase) -> uuid.UUI
     applicant = await auth_service.get_applicant(db, case.applicant_id)
     if applicant is None:
         return None
-    if applicant.owner_user_id is not None:
-        return applicant.owner_user_id
-    return await auth_service.effective_representative(db, applicant.id)
+    return applicant.owner_user_id
 
 
 async def _notify_violator(

@@ -1045,17 +1045,14 @@ async def _may_act_on_invoices_of(
 ) -> bool:
     """`payments.view` (or sys_admin) sees or pays any invoice; a
     `payments.confirm` holder SEES one (`read_only=True`, finding F13) and
-    still may not raise a payment link with it; otherwise the
-    actor must OWN the same applicant identity the invoice's application
-    belongs to, OR hold an EFFECTIVE REPRESENTATION of it (task 5's
-    ownership ruling) — matched on `applicant_id`, never
-    `submitted_by_user_id`: a legal entity has several representatives, and
-    the one who happens to have submitted THIS particular application is
-    not the only one entitled to see or pay its invoice. Shared by the two
-    read routes (`get_invoice_for_actor`/`list_invoices_for_actor`) and the
-    pay-intent route (`create_pay_intent`) — one rule, three callers, so the
-    representation gap Task 2 deliberately carried to this task is closed
-    for reads too, not just for paying."""
+    still may not raise a payment link with it; otherwise the actor must OWN
+    the same applicant identity the invoice's application belongs to (decision
+    #226, R4 — the "representation" mechanism this used to also check is
+    gone: an organisation logs into its own cabinet the same way an
+    individual does, so ownership alone is the whole rule now) — matched on
+    `applicant_id`, never `submitted_by_user_id`. Shared by the two read
+    routes (`get_invoice_for_actor`/`list_invoices_for_actor`) and the
+    pay-intent route (`create_pay_intent`) — one rule, three callers."""
     staff = holds_payments_read if read_only else holds_payments_view
     if await staff(db, actor):
         # A permission says WHETHER, a zone says WHERE — and zone scoping is
@@ -1065,11 +1062,7 @@ async def _may_act_on_invoices_of(
     # is not territorial, and a zone rule reaching it would hide a person's own
     # bill from them.
     own_applicant = await auth_service.get_own_applicant(db, actor.id)
-    if own_applicant is not None and own_applicant.id == applicant_id:
-        return True
-    return await auth_service.has_effective_representation_of(
-        db, user_id=actor.id, applicant_id=applicant_id
-    )
+    return own_applicant is not None and own_applicant.id == applicant_id
 
 
 async def get_invoice_for_actor(db: AsyncSession, invoice_id: uuid.UUID, *, actor: User) -> Invoice:
@@ -1100,7 +1093,7 @@ async def list_invoices_for_actor(
     offset: int,
 ) -> tuple[list[Invoice], int]:
     """`GET /invoices` — with `?application_id=`, the original rule: same
-    ownership-or-representation-or-staff-in-zone check as
+    ownership-or-staff-in-zone check as
     `get_invoice_for_actor`, applied to the application rather than one
     invoice, and the same 404-not-403 reasoning (a stranger asking about an
     application that is not theirs cannot tell it apart from one that does
@@ -1213,7 +1206,7 @@ async def create_pay_intent(
 
     404, never 403, both when the invoice does not exist and when the actor
     may not act on it (same reasoning as `get_invoice_for_actor`) — reuses
-    `_may_act_on_invoices_of`, so the SAME ownership-or-representation rule
+    `_may_act_on_invoices_of`, so the SAME ownership rule
     that gates READING an invoice also gates PAYING it.
 
     A non-`pending` invoice (already `paid`, `cancelled`, or `expired`)

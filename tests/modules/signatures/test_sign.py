@@ -15,9 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.core.errors import DomainError
-from app.core.time import business_today
 from app.modules.audit.models import AuditLog
-from app.modules.auth.models import Applicant, Representation, User
+from app.modules.auth.models import Applicant, User
 from app.modules.integrations.adapters.eimzo import RealEimzo, encode_mock_signature
 from app.modules.integrations.models import IntegrationLog
 from app.modules.signatures import repo, service
@@ -335,23 +334,15 @@ async def test_signing_with_a_previously_unbound_own_certificate_rebinds_it(db, 
 
 
 @pytest.mark.asyncio
-async def test_a_caller_with_an_effective_representation_signs_with_the_org_certificate(db, a_user):
-    """Fix round 2: the unblocked organisation-certificate half of ownership
-    proof. `_pkcs7`'s `pinfl` argument doubles as `pinfl_or_stir` — a 9-digit
-    value makes `_owns_certificate` read it as an organisation STIR and ask
-    `auth.service.has_effective_representation` instead of matching PINFL."""
+async def test_a_caller_who_owns_the_legal_applicant_signs_with_the_org_certificate(db, a_user):
+    """Fix round 2, updated by decision #226: the unblocked organisation-
+    certificate half of ownership proof. `_pkcs7`'s `pinfl` argument doubles
+    as `pinfl_or_stir` — a 9-digit value makes `_ownership_reason` read it as
+    an organisation STIR and check the caller's OWN applicant is `kind=
+    'legal'` with a matching `stir`, instead of matching a personal PINFL."""
     stir = _stir()
-    applicant = Applicant(kind="legal", stir=stir, name="OOO Represented")
+    applicant = Applicant(kind="legal", stir=stir, name="OOO Owned", owner_user_id=a_user.id)
     db.add(applicant)
-    await db.flush()
-    db.add(
-        Representation(
-            applicant_id=applicant.id,
-            user_id=a_user.id,
-            basis="org_eri",
-            valid_from=business_today(),
-        )
-    )
     await db.flush()
 
     row = await service.sign(
@@ -370,11 +361,11 @@ async def test_a_caller_with_an_effective_representation_signs_with_the_org_cert
 
 
 @pytest.mark.asyncio
-async def test_a_caller_with_no_representation_for_the_org_stir_is_refused(db, a_user):
-    """The negative half: a STIR nobody has ever represented `a_user` for is
+async def test_a_caller_who_does_not_own_the_org_stir_is_refused(db, a_user):
+    """The negative half: a STIR `a_user` owns no legal applicant for is
     refused exactly like a stranger's personal PINFL — same evidence-then-
     raise path, same reason, and the certificate stays unbound."""
-    stir = _stir()  # no Applicant/Representation row at all for this STIR
+    stir = _stir()  # no Applicant row at all for this STIR
     with pytest.raises(DomainError) as exc:
         await service.sign(
             db,
@@ -393,42 +384,6 @@ async def test_a_caller_with_no_representation_for_the_org_stir_is_refused(db, a
     assert rows[0].certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, rows[0].certificate_id)
     assert cert.user_id is None
-
-
-@pytest.mark.asyncio
-async def test_a_caller_whose_representation_has_expired_is_refused(db, a_user):
-    """`business_today()` is what makes this testable (per its own module
-    docstring): `valid_until` in the past relative to it, `status` still
-    'active' (the 3.4 daily expiry job has not run yet) — the read-time
-    effectiveness check itself must catch this, not rely on the job."""
-    stir = _stir()
-    applicant = Applicant(kind="legal", stir=stir, name="OOO Expired")
-    db.add(applicant)
-    await db.flush()
-    db.add(
-        Representation(
-            applicant_id=applicant.id,
-            user_id=a_user.id,
-            basis="org_eri",
-            valid_from=business_today() - timedelta(days=30),
-            valid_until=business_today() - timedelta(days=1),
-        )
-    )
-    await db.flush()
-
-    with pytest.raises(DomainError) as exc:
-        await service.sign(
-            db,
-            object_type="permit",
-            object_id=OBJ,
-            purpose="permit_head",
-            document=DOC,
-            pkcs7=_pkcs7(stir),
-            user=a_user,
-        )
-    assert exc.value.code == "ERR-SIGN-001"
-    assert exc.value.details is not None
-    assert exc.value.details["reason"] == "certificate_pinfl_mismatch"
 
 
 # --- Fix round 3 ---------------------------------------------------------
@@ -508,26 +463,18 @@ async def test_a_racing_duplicate_signature_is_also_audited(db, a_user, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_caller_whose_representation_expires_after_binding_is_refused_next_time(db, a_user):
-    """Fix round 3, fix 2: ownership is re-proven on EVERY `sign()` call, not
-    only trusted once from the stored `certificates.user_id` — the
-    `user_id == user.id` fast path used to skip `_owns_certificate` entirely,
-    so a representation that expired or was revoked AFTER the certificate
-    was bound kept authorising signatures forever. Signs once while the
-    representation is active, expires it, then signs again with the SAME
-    already-bound certificate and asserts the second attempt is refused."""
+async def test_a_caller_who_stops_owning_the_applicant_is_refused_next_time(db, a_user):
+    """Fix round 3, fix 2 (updated by decision #226): ownership is re-proven
+    on EVERY `sign()` call, not only trusted once from the stored
+    `certificates.user_id` — the `user_id == user.id` fast path used to skip
+    `_ownership_reason` entirely. There is no more time-boxed representation
+    to expire, but the applicant's `owner_user_id` can still change hands (an
+    admin correction); signs once while owning it, then again with the SAME
+    already-bound certificate after ownership moved elsewhere, and asserts
+    the second attempt is refused."""
     stir = _stir()
-    applicant = Applicant(kind="legal", stir=stir, name="OOO Time-Boxed")
+    applicant = Applicant(kind="legal", stir=stir, name="OOO Reassigned", owner_user_id=a_user.id)
     db.add(applicant)
-    await db.flush()
-    representation = Representation(
-        applicant_id=applicant.id,
-        user_id=a_user.id,
-        basis="org_eri",
-        valid_from=business_today() - timedelta(days=10),
-        valid_until=business_today() + timedelta(days=10),
-    )
-    db.add(representation)
     await db.flush()
 
     first = await service.sign(
@@ -542,9 +489,10 @@ async def test_a_caller_whose_representation_expires_after_binding_is_refused_ne
     assert first.verification_status == "valid"
     assert first.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, first.certificate_id)
-    assert cert.user_id == a_user.id  # bound on the first, still-effective sign
+    assert cert.user_id == a_user.id  # bound on the first, still-owning sign
 
-    representation.valid_until = business_today() - timedelta(days=1)
+    someone_else = await make_user(db, pinfl=None)
+    applicant.owner_user_id = someone_else.id
     await db.flush()
 
     with pytest.raises(DomainError) as exc:

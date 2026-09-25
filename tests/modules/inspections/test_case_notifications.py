@@ -18,10 +18,9 @@ from sqlalchemy import select
 from structlog.testing import capture_logs
 
 from app.core.models import MediaFile
-from app.core.time import business_today
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application
-from app.modules.auth.models import Applicant, Representation, User
+from app.modules.auth.models import Applicant, User
 from app.modules.gis.models import GisLayer
 from app.modules.inspections import events, repo, service
 from app.modules.inspections.models import ViolationCase
@@ -29,7 +28,6 @@ from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.notifications.models import Notification
 from tests.modules.auth.test_sessions import make_user
 from tests.modules.gis.conftest import make_contour, make_version, random_box_wkt
-from tests.modules.inspections.conftest import unique_pinfl
 from tests.modules.inspections.test_violation_cases import opened_case as opened_case
 
 API = "/api/v1/inspections"
@@ -187,16 +185,10 @@ async def test_resolving_the_appeal_notifies_nobody_new(
 
 @pytest.fixture
 async def representative_user(db) -> User:
-    """A registered individual applicant (required by `get_current_user`'s
-    `ERR-AUTH-008` gate) who ALSO holds an effective `Representation` over
-    `legal_application`'s own applicant — mirrors `tests/modules/applications/
-    conftest.py::representative_client`'s own idiom."""
-    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
-    )
-    await db.flush()
-    return user
+    """The legal applicant's OWN account (decision #226) — kept under this
+    fixture's original name for the test below, which now asks whether the
+    entity's own account hears about a case, not a separate representative's."""
+    return await make_user(db, role_code="applicant", pinfl=None)
 
 
 @pytest.fixture
@@ -208,17 +200,13 @@ async def legal_application(
     grazing_activity_id: uuid.UUID,
     representative_user: User,
 ) -> Application:
-    legal = Applicant(kind="legal", stir=unique_stir(), name="OOO Repeat Violator")
-    db.add(legal)
-    await db.flush()
-    db.add(
-        Representation(
-            applicant_id=legal.id,
-            user_id=representative_user.id,
-            basis="org_eri",
-            valid_from=business_today(),
-        )
+    legal = Applicant(
+        kind="legal",
+        stir=unique_stir(),
+        name="OOO Repeat Violator",
+        owner_user_id=representative_user.id,
     )
+    db.add(legal)
     await db.flush()
 
     contour = await make_contour(db, contours_layer, leshoz)
@@ -228,7 +216,7 @@ async def legal_application(
     application = Application(
         applicant_id=legal.id,
         submitted_by_user_id=representative_user.id,
-        on_behalf="legal",
+        on_behalf="self",
         activity_type_id=grazing_activity_id,
         contour_id=contour.id,
         contour_version_id=version.id,
@@ -244,7 +232,7 @@ async def legal_application(
     return application
 
 
-async def test_a_legal_entity_is_reached_through_its_valid_representative(
+async def test_a_legal_entity_is_reached_through_its_own_account(
     db,
     inspector,
     inspector_client,

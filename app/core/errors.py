@@ -11,6 +11,9 @@ ERRORS: dict[str, tuple[int, str]] = {
     "ERR-AUTH-008": (403, "Регистрация не завершена"),
     "ERR-AUTH-009": (429, "Слишком много запросов кода подтверждения"),
     "ERR-AUTH-010": (400, "Неверный или истёкший код подтверждения"),
+    # RETIRED (stage 18, decision #226): raised by `attach_legal`/
+    # `add_representation`, both removed with the "representation" mechanism.
+    # Codes are add-only and never reused — kept here, raised by nothing.
     "ERR-AUTH-011": (409, "Представительство уже действует"),
     "ERR-AUTH-012": (409, "Регистрация уже завершена"),
     "ERR-ACL-001": (403, "Нет прав на ресурс"),

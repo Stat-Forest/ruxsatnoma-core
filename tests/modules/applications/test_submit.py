@@ -45,11 +45,15 @@ async def _submit(client, filing: dict, pinfl=None, *, key=None, rules_accepted:
     Two deviations from any naive snippet, both forced by
     `signatures.service.sign` and by the shared, persistent test database:
 
-    * **the signer's OWN pinfl, read from `GET /auth/me`, never a literal.**
-      `sign()` re-proves ownership on every call (`_ownership_reason`) and a
-      certificate whose PINFL is not the caller's is refused
-      `certificate_pinfl_mismatch` — the fixtures randomise every PINFL,
-      because `users.pinfl` is unique in a database every past run wrote to;
+    * **the signer's OWN pinfl (or, for a legal cabinet, its STIR), read from
+      `GET /auth/me`, never a literal.** `sign()` re-proves ownership on every
+      call (`_ownership_reason`), which disambiguates by the VALUE's own
+      length (decision #226, R4: 9 digits is an organisation STIR, 14 a
+      personal PINFL) — `applicant.pinfl` is `None` for a `kind='legal'`
+      applicant (R1), so this falls back to `applicant.stir`, or the
+      certificate is refused `certificate_pinfl_mismatch`. The fixtures
+      randomise every PINFL/STIR, because both are unique in a database every
+      past run wrote to;
     * **a fresh certificate identity per call.** `certificates` is unique on
       `(serial_number, issuer)` and each row is BOUND to one user, so a literal
       `"SER-1"/"ISS-1"` binds to whoever ran first and is refused for every
@@ -62,7 +66,8 @@ async def _submit(client, filing: dict, pinfl=None, *, key=None, rules_accepted:
     OTHER caller in this suite to discover the new required field.
     """
     if pinfl is None:
-        pinfl = (await client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+        applicant = (await client.get("/api/v1/auth/me")).json()["applicant"]
+        pinfl = applicant["pinfl"] or applicant["stir"]
     packaged = await client.post("/api/v1/applications/package", json=filing)
     assert packaged.status_code == 200, packaged.text
     doc = base64.b64decode(packaged.json()["package"])
@@ -95,7 +100,8 @@ async def _resubmit(client, app_id, pinfl=None, *, key=None, rules_accepted: boo
     """The per-id path a RETURNED application keeps (plan 12, R5): `GET
     /package`, sign those exact bytes, `POST /submit`."""
     if pinfl is None:
-        pinfl = (await client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+        applicant = (await client.get("/api/v1/auth/me")).json()["applicant"]
+        pinfl = applicant["pinfl"] or applicant["stir"]
     doc = (await client.get(f"/api/v1/applications/{app_id}/package")).content
     return await client.post(
         f"/api/v1/applications/{app_id}/submit",
@@ -491,7 +497,7 @@ async def test_a_same_key_retry_after_a_refused_filing_replays_it_not_in_flight(
     first attempt's failure.
     """
     key = str(uuid.uuid4())
-    incomplete = {"on_behalf": "self", "rules_accepted": True}
+    incomplete = {"rules_accepted": True}
 
     first = await applicant_client.post(
         "/api/v1/applications", json=incomplete, headers={"Idempotency-Key": key}
@@ -528,7 +534,7 @@ async def test_a_same_key_retry_after_a_malformed_body_replays_the_422(
     exact shape this test exists to exercise.
     """
     key = str(uuid.uuid4())
-    malformed = {"on_behalf": "self", "pkcs7": 123}
+    malformed = {"pkcs7": 123}
 
     first = await applicant_client.post(
         "/api/v1/applications", json=malformed, headers={"Idempotency-Key": key}
@@ -561,7 +567,7 @@ async def test_a_same_key_retry_after_a_server_error_is_not_locked_out(
     from app.modules.applications import service
 
     key = str(uuid.uuid4())
-    incomplete = {"on_behalf": "self", "rules_accepted": True}
+    incomplete = {"rules_accepted": True}
 
     async def _boom(*_args, **_kwargs):
         raise RuntimeError("simulated bug")
@@ -587,7 +593,7 @@ async def test_an_incomplete_filing_is_refused_400_naming_the_missing_fields(
     """ERR-APP-001 is 400, not 422 — the catalogue, `tz/10` and the original
     spec all say so. The refusal NAMES the fields, because "не заполнено
     обязательное поле" without saying which one is not an answer."""
-    refused = await _submit_with_button(applicant_client, {"on_behalf": "self"})
+    refused = await _submit_with_button(applicant_client, {})
     assert refused.status_code == 400, refused.text
     error = refused.json()["error"]
     assert error["code"] == "ERR-APP-001"
@@ -745,7 +751,6 @@ async def test_a_filing_on_an_unpublished_contour_is_refused(
     refused = await _submit_with_button(
         applicant_client,
         {
-            "on_behalf": "self",
             "contour_id": str(contour.id),
             "activity_type_id": str(grazing_activity_id),
             "period_from": "2027-05-01",

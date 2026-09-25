@@ -38,12 +38,11 @@ from app.config import get_settings
 from app.core import files, storage
 from app.core.models import MediaFile, SystemSetting
 from app.core.settings_store import invalidate
-from app.core.time import business_today
 from app.main import create_app
 from app.modules.admin import repo as admin_repo
 from app.modules.admin.models import Organization
 from app.modules.applications.models import Application, ApplicationStatusHistory
-from app.modules.auth.models import Applicant, Representation, User
+from app.modules.auth.models import Applicant, User
 from app.modules.gis.models import Contour, GisLayer
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.norms.calculator import RULE_CODE_VERSION
@@ -327,45 +326,27 @@ async def make_legal_paid_application(
     approval_doc: MediaFile,
     activity_type_id: uuid.UUID,
 ) -> tuple[Application, User]:
-    """Ruling #183's OTHER branch: a PAID application `on_behalf='legal'`,
-    filed through a REPRESENTATIVE — decision #9 gives a legal entity no
-    account of its own. Returns the application and the representative user,
-    who is who `_is_holder` recognises for the recipient line (`auth.service.
-    own_applicant_ids`, satisfied by an EFFECTIVE `Representation` exactly the
-    way `tests/modules/applications/conftest.py::representative_client`
-    builds one — replicated here rather than imported across modules, the
-    same choice this file already makes for `make_contour`/`make_version`).
+    """Ruling #183's OTHER branch: a PAID application for a LEGAL applicant.
+    Since decision #226 that applicant is its OWN account (`owner_user_id`),
+    the same 1:1 cabinet an individual has — no more separate representative
+    identity. Returns the application and the owning user, who is who
+    `_is_holder` recognises for the recipient line (`auth.service.
+    own_applicant_ids`).
 
     Mirrors `make_paid_application` otherwise: its own contour, its own
     calculation, the same grazing herd — the only thing this fixture exists to
-    vary is WHO may act for the applicant and HOW `on_behalf` reads.
+    vary is the applicant's KIND.
     """
+    holder = await make_user(db, role_code="applicant", pinfl=None)
+    holder.full_name = HOLDER_NAME
     legal_applicant = Applicant(
         kind="legal",
         stir=unique_stir(),
         name="ООО Тест",
         address="Тошкент вилояти, Бўстонлиқ тумани, Бурчмулла қишлоғи, 2-уй",
+        owner_user_id=holder.id,
     )
     db.add(legal_applicant)
-    await db.flush()
-
-    representative = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    representative.full_name = HOLDER_NAME
-    db.add(
-        Applicant(
-            kind="individual",
-            pinfl=representative.pinfl,
-            name=representative.full_name,
-            owner_user_id=representative.id,
-        )
-    )
-    representation = Representation(
-        applicant_id=legal_applicant.id,
-        user_id=representative.id,
-        basis="org_eri",
-        valid_from=business_today(),
-    )
-    db.add(representation)
     await db.flush()
 
     contour = await make_contour(db, layer, org)
@@ -375,9 +356,8 @@ async def make_legal_paid_application(
 
     row = Application(
         applicant_id=legal_applicant.id,
-        submitted_by_user_id=representative.id,
-        on_behalf="legal",
-        representation_id=representation.id,
+        submitted_by_user_id=holder.id,
+        on_behalf="self",
         activity_type_id=activity_type_id,
         contour_id=contour.id,
         contour_version_id=version.id,
@@ -406,7 +386,7 @@ async def make_legal_paid_application(
         )
     )
     await db.flush()
-    return row, representative
+    return row, holder
 
 
 @pytest.fixture
@@ -767,6 +747,14 @@ async def _signer_for(
 
     `user=` reuses an account that already exists (the holder, who must be the
     applicant of the permit's own application, not a fresh stranger).
+
+    `Signer.pinfl` is really "whatever `pinfl_or_stir` this signer's
+    certificate carries" (`encode_mock_signature`'s own parameter name, kept
+    here for it): an organisation's own account has `users.pinfl = NULL`
+    since decision #226 (R1), so for such a user this falls back to the
+    caller's own `kind='legal'` applicant's `stir` — the value
+    `_ownership_reason` actually checks (R4) — rather than asserting a PINFL
+    that no longer exists on that row.
     """
     if user is None:
         user = await make_user(
@@ -774,13 +762,21 @@ async def _signer_for(
         )
     _, token, csrf = await make_session(db, user)
     await db.commit()
-    assert user.pinfl is not None
+    identity = user.pinfl
+    if identity is None:
+        applicant = (
+            await db.execute(select(Applicant).where(Applicant.owner_user_id == user.id))
+        ).scalar_one_or_none()
+        assert applicant is not None and applicant.stir is not None, (
+            "a user with no pinfl must be an organisation's own account"
+        )
+        identity = applicant.stir
     async with make_client(create_app(), lifespan=True) as client:
         auth_client(client, token, csrf)
         _commit_pending_before_requests(client, db)
-        # The serial is derived from the pinfl, so one signer always presents the
-        # same certificate and two never collide on `uq_certificate_identity`.
-        yield Signer(client=client, user=user, pinfl=user.pinfl, serial=f"SER-{user.pinfl}", db=db)
+        # The serial is derived from the identity, so one signer always presents
+        # the same certificate and two never collide on `uq_certificate_identity`.
+        yield Signer(client=client, user=user, pinfl=identity, serial=f"SER-{identity}", db=db)
 
 
 def _db_of(signer: Signer) -> AsyncSession:
@@ -945,10 +941,10 @@ async def legal_paid_application(
     approval_doc: MediaFile,
     grazing_activity_id: uuid.UUID,
 ) -> Application:
-    """Ruling #183's OTHER branch: `on_behalf='legal'`, so the button is never
+    """Ruling #183's OTHER branch: a LEGAL applicant, so the button is never
     available on this permit's recipient line — see `legal_representative_client`
     for who may still sign it, with an envelope."""
-    application, _representative = await make_legal_paid_application(
+    application, _owner = await make_legal_paid_application(
         db,
         layer=contours_layer,
         org=leshoz,
@@ -960,15 +956,13 @@ async def legal_paid_application(
 
 @pytest.fixture
 async def legal_representative(db: AsyncSession, legal_paid_application: Application) -> User:
-    """Read back from the `Representation` `make_legal_paid_application` built —
-    the legal-entity mirror of `applicant_user` above."""
-    rows = await db.execute(
-        select(Representation).where(
-            Representation.applicant_id == legal_paid_application.applicant_id
-        )
-    )
-    representation = rows.scalar_one()
-    user = await db.get(User, representation.user_id)
+    """Read back from `legal_paid_application`'s own applicant
+    (`owner_user_id`, decision #226) — the legal-entity mirror of
+    `applicant_user` above. Kept under this fixture's original name: the
+    organisation's own account, not a separate representative identity."""
+    applicant = await db.get(Applicant, legal_paid_application.applicant_id)
+    assert applicant is not None and applicant.owner_user_id is not None
+    user = await db.get(User, applicant.owner_user_id)
     assert user is not None
     return user
 
@@ -977,10 +971,10 @@ async def legal_representative(db: AsyncSession, legal_paid_application: Applica
 async def legal_representative_client(
     db: AsyncSession, legal_representative: User
 ) -> AsyncIterator[Signer]:
-    """The representative — the only one who may sign `legal_paid_application`'s
-    recipient line (`_is_holder` via `auth.service.own_applicant_ids`), and
-    always with an ERI envelope: ruling #183 never lifts that for `on_behalf=
-    'legal'`."""
+    """The legal applicant's own account — the only one who may sign
+    `legal_paid_application`'s recipient line (`_is_holder` via
+    `auth.service.own_applicant_ids`), and always with an ERI envelope:
+    ruling #183 never lifts that for a legal applicant."""
     async for signer in _signer_for(db, role_code="applicant", user=legal_representative):
         yield signer
 

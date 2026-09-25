@@ -1,11 +1,12 @@
 """End-to-end: C11, the permit's 3+1 — played out entirely through the
 service, because `permits` does not exist yet (3.11 will drive this same
-sequence through HTTP). Four different users of one organisation each sign
-the identical bytes with their own certificate, one per required purpose
-(`test_requirements.py::test_the_default_permit_requirement_is_the_three_
-plus_one`); the object becomes complete only once every purpose holds a
-valid signature, and neither a repeat of an already-satisfied purpose nor a
-revoked certificate may ever count toward it (ruling 8, RI-05)."""
+sequence through HTTP). One organisation's own account (decision #226) signs
+the identical bytes with a DIFFERENT employee's certificate each time, one
+per required purpose (`test_requirements.py::test_the_default_permit_
+requirement_is_the_three_plus_one`); the object becomes complete only once
+every purpose holds a valid signature, and neither a repeat of an
+already-satisfied purpose nor a revoked certificate may ever count toward it
+(ruling 8, RI-05)."""
 
 import secrets
 import uuid
@@ -14,8 +15,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import DomainError
-from app.core.time import business_today
-from app.modules.auth.models import Applicant, Representation, User
+from app.modules.auth.models import Applicant, User
 from app.modules.integrations.adapters.eimzo import encode_mock_signature
 from app.modules.signatures import service
 from tests.modules.auth.test_sessions import make_user
@@ -33,16 +33,10 @@ THE_THREE_PURPOSES = [
 ]
 
 
-def _pinfl() -> str:
-    """A fresh, valid-shape (`^[0-9]{14}$`) pinfl per call — `users.pinfl` is
-    UNIQUE and this file's fixtures may run many times against the shared,
-    persistent test database (mirrors `test_sign.py`'s own helper)."""
-    return f"{secrets.randbelow(10**14):014d}"
-
-
 def _stir() -> str:
     """A fresh, valid-shape (`^[0-9]{9}$`) stir per call — `applicants.stir`
-    is UNIQUE, same reasoning as `_pinfl()`."""
+    is UNIQUE and this file's fixtures may run many times against the
+    shared, persistent test database."""
     return f"{secrets.randbelow(10**9):09d}"
 
 
@@ -57,29 +51,27 @@ def _pkcs7(stir: str, *, serial: str) -> str:
 @pytest.fixture
 async def one_organisation(db: AsyncSession) -> Applicant:
     """One legal-entity `Applicant` — the "of one organisation" in C11's own
-    scenario description — that this test's four signers will each hold
-    their own effective representation for."""
-    applicant = Applicant(kind="legal", stir=_stir(), name="Test Leshoz Org")
+    scenario description — OWNED by one account (decision #226: an
+    organisation logs into its own cabinet, `owner_user_id`, the same 1:1
+    link an individual has). Several employees still each hold their OWN
+    certificate — a distinct `(serial, issuer)` pair naming the SAME org
+    STIR — but every one of them signs AS this one account now, never as a
+    separate representative of their own."""
+    owner = await make_user(db, pinfl=None)
+    applicant = Applicant(
+        kind="legal", stir=_stir(), name="Test Leshoz Org", owner_user_id=owner.id
+    )
     db.add(applicant)
     await db.flush()
     return applicant
 
 
-async def _staff_member(db: AsyncSession, *, applicant: Applicant) -> User:
-    """A fresh user holding their own effective representation for
-    `applicant` — one organisation, several people each authorised to
-    represent it, the same shape `test_sign.py`'s own org-certificate tests
-    use for a single signer."""
-    user = await make_user(db, pinfl=_pinfl())
-    db.add(
-        Representation(
-            applicant_id=applicant.id,
-            user_id=user.id,
-            basis="org_eri",
-            valid_from=business_today(),
-        )
-    )
-    await db.flush()
+async def _org_owner(db: AsyncSession, *, applicant: Applicant) -> User:
+    """The organisation's own account — `applicant.owner_user_id` — read back
+    fresh each call, the same signer every employee's distinct certificate
+    signs as."""
+    user = await db.get(User, applicant.owner_user_id)
+    assert user is not None
     return user
 
 
@@ -98,7 +90,7 @@ async def test_c11_the_permits_three_lines(db: AsyncSession, one_organisation: A
     # Nothing is bound in advance (brief): each signer's certificate is
     # created here, on first use, by `sign()` itself via `bind_certificate`.
     for index, purpose in enumerate(THE_THREE_PURPOSES):
-        signer = await _staff_member(db, applicant=one_organisation)
+        signer = await _org_owner(db, applicant=one_organisation)
         row = await service.sign(
             db,
             object_type="permit",
@@ -121,7 +113,7 @@ async def test_c11_the_permits_three_lines(db: AsyncSession, one_organisation: A
     # A fifth attempt at an already-satisfied purpose is a conflict, not a
     # silent extra signature — `uq_signatures_valid_purpose` (ERR-SIGN-002),
     # not a fifth required slot.
-    fifth_signer = await _staff_member(db, applicant=one_organisation)
+    fifth_signer = await _org_owner(db, applicant=one_organisation)
     with pytest.raises(DomainError) as exc:
         await service.sign(
             db,
@@ -140,7 +132,7 @@ async def test_c11_the_permits_three_lines(db: AsyncSession, one_organisation: A
     # checks certificate standing before `sign()` ever reaches the
     # already-signed check) — and completeness is unaffected either way, an
     # invalid attempt can never occupy a purpose's slot (ruling 8).
-    revoked_signer = await _staff_member(db, applicant=one_organisation)
+    revoked_signer = await _org_owner(db, applicant=one_organisation)
     with pytest.raises(DomainError) as exc:
         await service.sign(
             db,

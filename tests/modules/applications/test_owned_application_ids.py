@@ -1,17 +1,14 @@
 """`applications.service.owned_application_ids` — the seam `payments` reads a
 citizen's "all of mine" invoices and refunds through (stage 11, ruling R2).
-Ownership only: the individual's own row plus every effectively represented
-legal entity, every status (a just-filed SUBMITTED one included — stage 12 has no
-DRAFT), and never a staff zone."""
-
-from datetime import timedelta
+Ownership only: exactly the caller's own row, individual or legal (decision
+#226, R4), every status (a just-filed SUBMITTED one included — stage 12 has
+no DRAFT), and never a staff zone."""
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.time import business_today
 from app.modules.applications import service
 from app.modules.applications.models import Application
-from app.modules.auth.models import Applicant, Representation, User
+from app.modules.auth.models import Applicant, User
 from tests.modules.applications.conftest import unique_pinfl
 from tests.modules.auth.test_sessions import make_user
 
@@ -51,52 +48,17 @@ async def test_the_owner_gets_every_status_of_their_own_and_nothing_of_a_strange
     assert strangers.id not in ids
 
 
-async def test_a_representative_gets_the_legal_entitys_applications(
+async def test_a_legal_entitys_own_account_gets_its_own_applications(
     db: AsyncSession, legal_applicant: Applicant
 ) -> None:
-    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
-    )
-    db.add(
-        Representation(
-            applicant_id=legal_applicant.id,
-            user_id=user.id,
-            basis="org_eri",
-            valid_from=business_today(),
-        )
-    )
-    await db.flush()
+    """Decision #226 (R4): a legal applicant's own account (`owner_user_id`)
+    sees its applications the same way an individual does — no more separate
+    representative identity to grant or lapse."""
+    owner = await db.get(User, legal_applicant.owner_user_id)
+    assert owner is not None
     theirs = await _application(db, legal_applicant, status="INVOICED")
 
-    assert theirs.id in await service.owned_application_ids(db, user)
-
-
-async def test_an_expired_representation_grants_nothing(
-    db: AsyncSession, legal_applicant: Applicant
-) -> None:
-    """The mirror of the test above: a `valid_until` in the past makes the
-    representation no longer effective on `business_today()`
-    (`auth_service.own_applicant_ids`'s own effectiveness check, `status=
-    'active'` and not past `valid_until`), so the legal entity's
-    application must not appear in a lapsed representative's own list."""
-    user = await make_user(db, role_code="applicant", pinfl=unique_pinfl())
-    db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
-    )
-    db.add(
-        Representation(
-            applicant_id=legal_applicant.id,
-            user_id=user.id,
-            basis="org_eri",
-            valid_from=business_today() - timedelta(days=30),
-            valid_until=business_today() - timedelta(days=1),
-        )
-    )
-    await db.flush()
-    theirs = await _application(db, legal_applicant, status="INVOICED")
-
-    assert theirs.id not in await service.owned_application_ids(db, user)
+    assert theirs.id in await service.owned_application_ids(db, owner)
 
 
 async def test_a_staff_user_with_no_applicant_row_gets_an_empty_list(db: AsyncSession) -> None:

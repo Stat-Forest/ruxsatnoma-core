@@ -41,14 +41,6 @@ def build_scheduler(factory: async_sessionmaker[AsyncSession]) -> AsyncIOSchedul
     # next_run_time=now → also run once at startup (covers missed windows).
     now = datetime.now(sched.timezone)
     sched.add_job(
-        _wrap(factory, jobs.expire_representations),
-        CronTrigger(hour=0, minute=5, timezone=TIMEZONE),
-        next_run_time=now,
-        id="expire_representations",
-        misfire_grace_time=3600,
-        coalesce=True,
-    )
-    sched.add_job(
         _wrap(factory, jobs.purge_stale_rows),
         CronTrigger(hour=0, minute=15, timezone=TIMEZONE),
         next_run_time=now,

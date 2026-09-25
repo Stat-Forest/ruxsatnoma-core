@@ -2,7 +2,11 @@
 applicants/prosecutors have no password (login/password_hash null, decision #32).
 
 Territory FKs closed in stage 3.3a (migration 0004). user_delegations deferred
-entirely (ruling 10); applicants, representations, user_consents are stage 3.2b.
+entirely (ruling 10); applicants, user_consents are stage 3.2b. `representations`
+(and the "attach a legal entity to a personal profile" mechanism it supported)
+was removed in stage 18 (decision #226): an organisation now logs in with its
+own E-IMZO key straight into `applicants.owner_user_id` of its own `kind='legal'`
+row, the same 1:1 link an individual has.
 """
 
 import uuid
@@ -17,7 +21,6 @@ from sqlalchemy import (
     Numeric,
     UniqueConstraint,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -169,8 +172,10 @@ class Applicant(Base):
 
     individual ⇔ pinfl, legal ⇔ stir (identity_by_kind); the full unique on each
     column subsumes design/02's partial unique — the CHECK already restricts the
-    column to one kind. owner_user_id: individual's 1:1 account; legal has none
-    (representatives act, decision #9)."""
+    column to one kind. owner_user_id: since stage 18 (decision #226) a legal
+    applicant has one too — the org's own account, found by `stir`, that every
+    employee holding a key of that organisation logs into (superseding decision
+    #9's representatives)."""
 
     __tablename__ = "applicants"
 
@@ -199,43 +204,6 @@ class Applicant(Base):
         ),
         CheckConstraint("pinfl IS NULL OR pinfl ~ '^[0-9]{14}$'", name="pinfl_format"),
         CheckConstraint("stir IS NULL OR stir ~ '^[0-9]{9}$'", name="stir_format"),
-    )
-
-
-class Representation(Base):
-    """Who may act for a legal applicant and on what basis (decision #9).
-
-    poa_file_id FK to media_files closed in 3.3b (the deferred-FK pattern from
-    3.2b is resolved). Effectiveness is checked on read: status='active' AND not
-    past valid_until (ruling 14); the expiry job is 3.4+."""
-
-    __tablename__ = "representations"
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid7)
-    applicant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applicants.id"))
-    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
-    basis: Mapped[str]
-    poa_file_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("media_files.id"))
-    valid_from: Mapped[date]
-    valid_until: Mapped[date | None]
-    status: Mapped[str] = mapped_column(default="active")
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-
-    __table_args__ = (
-        CheckConstraint("basis IN ('director_registry', 'poa', 'org_eri')", name="basis_valid"),
-        CheckConstraint("status IN ('active', 'expired', 'revoked')", name="status_valid"),
-        CheckConstraint(
-            "basis <> 'poa' OR (poa_file_id IS NOT NULL AND valid_until IS NOT NULL)",
-            name="poa_requires_file_and_term",
-        ),
-        Index(
-            "uq_representations_active",
-            "applicant_id",
-            "user_id",
-            unique=True,
-            postgresql_where=text("status = 'active'"),
-        ),
-        Index("ix_representations_user", "user_id"),
     )
 
 

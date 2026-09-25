@@ -941,7 +941,6 @@ async def test_the_free_path_from_filing_to_an_active_permit(
                 submitted = await citizen.client.post(
                     f"{API}/applications",
                     json={
-                        "on_behalf": "self",
                         "contour_id": str(contour.id),
                         "activity_type_id": str(recreation_activity_id),
                         "period_from": "2027-09-01",

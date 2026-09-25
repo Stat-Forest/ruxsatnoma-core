@@ -1,7 +1,7 @@
 """`GET /invoices` without `?application_id=` for a caller who is NOT staff
-(stage 11, ruling R1): their OWN invoices — their individual row's and every
-effectively represented legal entity's — in every status. For staff the same
-route is still the register (`test_invoice_zone.py`).
+(stage 11, ruling R1): their OWN invoices — their own row's, individual or
+legal (decision #226, R4) — in every status. For staff the same route is
+still the register (`test_invoice_zone.py`).
 
 The legal-entity fixtures are `test_intents.py`'s own (the same import idiom
 `conftest.py` uses for `test_organizations_admin.auth_client`)."""
@@ -39,7 +39,7 @@ async def test_the_owner_lists_every_invoice_of_their_own_in_every_status(
     assert {"page", "page_size"} <= body.keys()
 
 
-async def test_a_representative_lists_the_legal_entitys_invoice(
+async def test_a_legal_entitys_own_account_lists_its_invoice(
     representative_client: httpx.AsyncClient, legal_invoice: Invoice
 ) -> None:
     response = await representative_client.get(INVOICES)
