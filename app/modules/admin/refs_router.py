@@ -1,9 +1,9 @@
 """GET /refs/*: form dictionaries for every authenticated user (ruling 10).
 
 No permission code and no zone filtering — these are catalogs, not business objects.
-The one exception is `PATCH /activity-types/{id}` (ruling #139): the hard catalog's
-one edit is gated behind `admin.classifiers.manage`, because unlike every read here
-it changes what the catalog says.
+The exceptions are `PATCH /activity-types/{id}` (ruling #139), the hard catalog's
+one edit, and `GET /activity-types/all`, the admin read that also shows archived
+rows: both are gated behind `admin.classifiers.manage`.
 """
 
 import uuid
@@ -96,6 +96,18 @@ async def export_organizations_xlsx(
 @router.get("/activity-types", response_model=list[ActivityTypeOut])
 async def activity_types(db: Annotated[AsyncSession, Depends(get_db)]):
     return await repo.list_activity_types(db)
+
+
+@router.get(
+    "/activity-types/all",
+    response_model=list[ActivityTypeOut],
+    dependencies=[Depends(require_permission(CLASSIFIERS_MANAGE))],
+)
+async def all_activity_types(db: Annotated[AsyncSession, Depends(get_db)]):
+    """The admin catalog: all six, archived ones included, so the on/off switch
+    can be flipped back. Gated like the PATCH it serves — citizens never see an
+    archived service (ruling #139a)."""
+    return await repo.list_all_activity_types(db)
 
 
 @router.patch("/activity-types/{activity_type_id}", response_model=ActivityTypeOut)
