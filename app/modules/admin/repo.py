@@ -138,6 +138,15 @@ async def list_activity_types(db: AsyncSession) -> list[ActivityType]:
     return list((await db.execute(stmt)).scalars())
 
 
+async def list_all_activity_types(db: AsyncSession) -> list[ActivityType]:
+    """Every row, archived included — the admin catalog's read only. An archived
+    service must stay on that screen, or the switch that archived it has no way
+    back; every other caller keeps `list_activity_types` and its active filter
+    (ruling #139a)."""
+    stmt = select(ActivityType).order_by(ActivityType.sort_order, ActivityType.code)
+    return list((await db.execute(stmt)).scalars())
+
+
 async def get_activity_type(db: AsyncSession, activity_type_id: uuid.UUID) -> ActivityType | None:
     """One activity type by id, whatever its status — the sibling of
     `get_organization`/`get_classifier_item` above, for a module that already
