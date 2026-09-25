@@ -34,7 +34,6 @@ from app.modules.auth.deps import SUPERUSER_ROLE
 from app.modules.auth.models import User
 from app.modules.integrations import service as integrations_service
 from app.modules.integrations.adapters.eimzo import (
-    EIMZO_STATUS_REASONS,
     EimzoCall,
     EimzoCertificateInfo,
     EimzoError,
@@ -61,8 +60,6 @@ SIGNATURE_CREATE = "signature.create"
 # (below) keeps using SIGNATURE_CREATE regardless of which caller reached it
 # — that behaviour is Task 4's, already relied on by `sign()`'s tests, and
 # this task does not change it.
-CERTIFICATE_BIND = "certificate.bind"
-CERTIFICATE_UNBIND = "certificate.unbind"
 SIGNATURE_REVERIFY = "signature.reverify"
 
 # Ruling #183: `sign_simple`'s own action — distinct from SIGNATURE_CREATE so
@@ -261,10 +258,9 @@ async def bind_certificate(
     already applies to legal representations. Fix round 1 (ruling 1) closed
     the personal-PINFL half; fix round 2 closes the organisation-TIN half —
     both live in `_ownership_reason`, in the automatic path every `sign()`
-    call takes. Task 7's explicit `POST /certificates` route enforces the
-    same rule on its own, rarer path; leaving the proof there alone would
-    mean an unknown `(serial_number, issuer)` pair is bound to whoever
-    presents it first through THIS path, unchecked.
+    call takes — the only path there is: binding a key ahead of any signing
+    (`POST /certificates`) was removed on 2026-09-25, so a certificate is
+    bound on its first successful use and nowhere else.
 
     Four outcomes:
     - unknown, and `_ownership_reason` proves `info` is the caller's own ->
@@ -292,7 +288,8 @@ async def bind_certificate(
 
     `unbound_at` (Task 7's column) plays a part in exactly one branch here:
     the signer IS this certificate's already-proven owner, re-signing with a
-    key they had previously unbound from their own cabinet list. Unbinding is
+    key that was unbound earlier (rows unbound through the cabinet route that
+    existed until 2026-09-25 keep their `unbound_at`). Unbinding is
     a convenience ("stop listing this key"), never a revocation — revocation
     is `status`, reconciled separately in `_reconcile_status`, and the
     verdict already refuses on it — so signing again simply re-lists the key
@@ -1068,126 +1065,6 @@ async def _holds_view_any(db: AsyncSession, user: User) -> bool:
     if await auth_repo.role_code(db, user) == SUPERUSER_ROLE:
         return True
     return VIEW_ANY in await auth_repo.permission_codes(db, user)
-
-
-async def list_my_certificates(
-    db: AsyncSession, *, user: User, params: PageParams
-) -> tuple[list[Certificate], int]:
-    """`GET /certificates`: the caller's own bound certificates only."""
-    return await repo.list_certificates(
-        db, user_id=user.id, offset=params.offset, limit=params.page_size
-    )
-
-
-async def register_certificate(
-    db: AsyncSession, *, pkcs7: str, user: User, ip: str | None = None
-) -> Certificate:
-    """`POST /certificates` (ruling 4's second sentence): register a
-    certificate ahead of any actual signing, from a self-contained signed
-    challenge (`verify_attached` — there is no external document to hand
-    alongside it, unlike `sign()`'s detached form).
-
-    Reuses `bind_certificate`'s own ownership rule (`_ownership_reason`, fix
-    rounds 1-2) via `bind_certificate` itself, but where THAT function leaves
-    an unproven certificate quietly unbound for a later `sign()` call to
-    explain (it has no document/purpose/object to hang the evidence on right
-    there), this route has no such later call coming — an unproven
-    presentation is refused directly, here, audited the same early-commit way
-    as every other ERR-SIGN-001 refusal in this module (`bind_certificate`'s
-    own docstring names this route explicitly as the reason its permissive
-    branch cannot be the only check)."""
-    adapter = get_eimzo_adapter()
-    try:
-        result = await adapter.verify_attached(pkcs7, ip=ip)
-    except EimzoError as exc:
-        # Fix round 1, finding 1 -- same reasoning as `sign()`'s own
-        # try/except a few hundred lines up: a provider outage is not a
-        # verdict about this presentation and not the caller's fault, so it
-        # earns no `audit_log` entry and no `certificates` row, only the
-        # mapped integration error. Task 5: the integration log is written
-        # regardless -- an administrator must be able to tell "our
-        # configuration is wrong" from "the provider is down".
-        await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
-        await db.commit()
-        raise err(exc.err_code) from exc
-    await _log_eimzo_calls(db, getattr(adapter, "calls", ()))
-    info = result.subject_certificate
-    if info is None or result.status_code != 1:
-        reason = EIMZO_STATUS_REASONS.get(result.status_code, "signature_invalid")
-        await audit.log(
-            db,
-            action=CERTIFICATE_BIND,
-            user_id=user.id,
-            object_type="certificate",
-            result="denied",
-            basis=reason,
-            extra=_ri05_extra(reason),
-        )
-        await db.commit()
-        raise err("ERR-SIGN-001", details={"reason": reason})
-
-    cert = await bind_certificate(db, info=info, user=user)  # may itself raise ERR-SIGN-001
-    if cert.user_id != user.id:
-        # bind_certificate's own "unproven, leave unbound" branch: re-derive
-        # WHY, the same function `bind_certificate` itself would have asked,
-        # so this refusal names the same reason `sign()` would have named had
-        # there been a signature to attach it to.
-        reason = await _ownership_reason(db, info=info, user=user)
-        await audit.log(
-            db,
-            action=CERTIFICATE_BIND,
-            user_id=user.id,
-            object_type="certificate",
-            object_id=cert.id,
-            result="denied",
-            basis=reason,
-            extra=_ri05_extra(reason),
-        )
-        await db.commit()
-        raise err("ERR-SIGN-001", details={"reason": reason})
-
-    await audit.log(
-        db,
-        action=CERTIFICATE_BIND,
-        user_id=user.id,
-        object_type="certificate",
-        object_id=cert.id,
-        result="success",
-    )
-    return cert
-
-
-async def unbind_certificate(db: AsyncSession, *, certificate_id: uuid.UUID, user: User) -> None:
-    """`DELETE /certificates/{id}`: the OWNER only. Sets `unbound_at`, never a
-    delete and never a `status` change (pre-flight ruling P3: `status` is the
-    certificate's own PKI state, per `design/02`, not our binding concept) —
-    a certificate a signature references must survive forever (models.py).
-    `get_certificate` raises `ERR-SYS-003` when the id does not exist at all;
-    ownership is checked here, the same reason string `bind_certificate` uses
-    for the identical fact reached from a different route."""
-    cert = await get_certificate(db, certificate_id)
-    if cert.user_id != user.id:
-        await audit.log(
-            db,
-            action=CERTIFICATE_UNBIND,
-            user_id=user.id,
-            object_type="certificate",
-            object_id=cert.id,
-            result="denied",
-            basis="certificate_owned_by_another_user",
-        )
-        await db.commit()
-        raise err("ERR-SIGN-001", details={"reason": "certificate_owned_by_another_user"})
-    cert.unbound_at = datetime.now(UTC)
-    await db.flush()
-    await audit.log(
-        db,
-        action=CERTIFICATE_UNBIND,
-        user_id=user.id,
-        object_type="certificate",
-        object_id=cert.id,
-        result="success",
-    )
 
 
 async def list_signatures_page(

@@ -14,7 +14,7 @@ module's own router, never mounted under another module's prefix."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
@@ -25,76 +25,9 @@ from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.signatures import export, service
 from app.modules.signatures.permissions import REVERIFY
-from app.modules.signatures.schemas import CertificateBindIn, CertificateOut, SignatureOut
+from app.modules.signatures.schemas import SignatureOut
 
 router = APIRouter(tags=["signatures"])
-
-
-@router.get("/certificates", response_model=Page[CertificateOut])
-async def list_certificates(
-    db: Annotated[AsyncSession, Depends(get_db)],
-    user: Annotated[User, Depends(get_current_user)],
-    params: Annotated[PageParams, Depends()],
-) -> Page[CertificateOut]:
-    """The caller's own BOUND certificates only (`unbound_at IS NULL`) —
-    unbinding (`DELETE` below) never deletes a row, it only takes it off this
-    list. Paged from its first commit, the same `Page[T]`/`PageParams`
-    envelope every other list route in this app uses (lesson: page a list
-    from the first commit, not after the fact)."""
-    items, total = await service.list_my_certificates(db, user=user, params=params)
-    return Page[CertificateOut](
-        items=[CertificateOut.model_validate(item) for item in items],
-        total=total,
-        page=params.page,
-        page_size=params.page_size,
-    )
-
-
-@router.get("/certificates/export.xlsx")
-async def export_certificates_xlsx(
-    db: Annotated[AsyncSession, Depends(get_db)],
-    user: Annotated[User, Depends(get_current_user)],
-    lang: xlsx.Lang = "uz_latn",
-) -> Response:
-    """`GET /certificates` as a spreadsheet (stage 13, ruling #204): the
-    caller's own bound certificates, exactly as the list route scopes them
-    (ruling R2) — no filters of its own, none on the list either."""
-    items, total, cap = await export.certificate_rows(db, actor=user, lang=lang)
-    filename = f"sertifikatlar-{business_today().isoformat()}.xlsx"
-    return xlsx.xlsx_response(
-        export.render_certificates(items, lang=lang), filename=filename, total=total, cap=cap
-    )
-
-
-@router.post("/certificates", status_code=201)
-async def create_certificate(
-    payload: CertificateBindIn,
-    request: Request,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    user: Annotated[User, Depends(get_current_user)],
-) -> CertificateOut:
-    """Bind a certificate ahead of any actual signing, from a signed
-    challenge — ownership proven by PINFL/STIR the same way `sign()` proves
-    it on every call (ruling 4)."""
-    cert = await service.register_certificate(
-        db,
-        pkcs7=payload.pkcs7,
-        user=user,
-        ip=request.client.host if request.client else None,
-    )
-    return CertificateOut.model_validate(cert)
-
-
-@router.delete("/certificates/{certificate_id}", status_code=204)
-async def delete_certificate(
-    certificate_id: uuid.UUID,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    user: Annotated[User, Depends(get_current_user)],
-) -> None:
-    """Unbind, never delete (pre-flight ruling P3): sets `unbound_at`, leaves
-    `status` — the certificate's own PKI state — untouched. The owner only; a
-    certificate a signature references must survive forever."""
-    await service.unbind_certificate(db, certificate_id=certificate_id, user=user)
 
 
 @router.get("/signatures", response_model=Page[SignatureOut])

@@ -187,24 +187,3 @@ async def list_for_object_page(
         .limit(limit)
     )
     return list(rows.scalars()), total
-
-
-async def list_certificates(
-    db: AsyncSession, *, user_id: uuid.UUID, offset: int, limit: int
-) -> tuple[list[Certificate], int]:
-    """A user's own BOUND certificates (`unbound_at IS NULL`) — Task 7's own
-    `GET /certificates`. Unbinding (below) never deletes a row, so a
-    certificate a signature still references keeps existing, just off this
-    list."""
-    conditions = (Certificate.user_id == user_id, Certificate.unbound_at.is_(None))
-    total = (
-        await db.execute(select(func.count()).select_from(Certificate).where(*conditions))
-    ).scalar_one()
-    rows = await db.execute(
-        select(Certificate)
-        .where(*conditions)
-        .order_by(Certificate.bound_at, Certificate.id)
-        .offset(offset)
-        .limit(limit)
-    )
-    return list(rows.scalars()), total
