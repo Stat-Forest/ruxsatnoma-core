@@ -423,6 +423,18 @@ class ApplicationPrintoutOut(BaseModel):
     created_at: datetime
 
 
+class ApplicationApplicantOut(BaseModel):
+    """Who filed, as the reviewing staff sees it on the card (decision #226):
+    an individual or an organisation's own cabinet. `stir` is set for an
+    organisation only; an individual's PINFL is deliberately not repeated here."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    kind: Literal["individual", "legal"]
+    name: str
+    stir: str | None
+
+
 class BenefitClaimMonitorOut(BaseModel):
     """One row of `GET /applications/beekeeping` (ruling #217): what the
     Beekeeping Union's registrar may see of an application claiming its
@@ -533,6 +545,10 @@ class ApplicationCardOut(ApplicationOut):
     # Stage 16, ruling R2: the newest printout of each kind — what the card's
     # download buttons read to decide whether to show at all.
     printouts: list[ApplicationPrintoutOut]
+    # Decision #226: with `on_behalf` gone, this is the card's only way to tell
+    # a reviewer whether an individual or an organisation filed. `None` only if
+    # the applicant row is missing, which the FK makes impossible in practice.
+    applicant: ApplicationApplicantOut | None
 
     @classmethod
     def build(cls, card: dict[str, Any]) -> ApplicationCardOut:
@@ -557,6 +573,7 @@ class ApplicationCardOut(ApplicationOut):
                 ),
                 "sla_overdue": card["sla_overdue"],
                 "printouts": card["printouts"],
+                "applicant": card["applicant"],
             }
         )
 
