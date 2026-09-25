@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from app.modules.integrations.adapters.eimzo import EIMZO_STATUS_REASONS
 from app.modules.integrations.adapters.eimzo_wire import (
+    OID_LEGAL_TIN,
     parse_provider_datetime,
     read_subject,
     verification_from_pkcs7_info,
@@ -96,6 +97,24 @@ def test_verification_never_carries_the_signers_pinfl_or_the_ocsp_response() -> 
     assert signer_evidence["certificateSerialNumber"] == "218712ed3"
     assert signer_evidence["certificateValidFrom"] == "2026-05-25 15:47:22"
     assert signer_evidence["certificateValidTo"] == "2026-06-24 15:47:22"
+
+
+def test_verification_reads_a_real_shaped_org_certificates_tin_alongside_the_pinfl() -> None:
+    """C1 (final review): a REAL organisation pkcs7-verify signer certificate
+    carries BOTH OIDs at once, in the SAME `subjectInfo` map
+    `test_subject_prefers_the_personal_pinfl_over_the_org_tin` already
+    proves `read_subject` parses correctly — this pins that
+    `verification_from_pkcs7_info`'s own certificate builder
+    (`_certificate_from_pkcs7_entry`) actually carries the TIN through onto
+    `EimzoCertificateInfo.tin` rather than discarding it the way the
+    pre-fix version did (as `_legal_tin`)."""
+    sample = copy.deepcopy(VENDOR_ATTACHED_SAMPLE)
+    cert = sample["pkcs7Info"]["signers"][0]["certificate"][0]
+    cert["subjectInfo"][OID_LEGAL_TIN] = "301234567"
+    result = verification_from_pkcs7_info(sample)
+    assert result.subject_certificate is not None
+    assert result.subject_certificate.pinfl_or_stir == "31234567890123"
+    assert result.subject_certificate.tin == "301234567"
 
 
 def test_verification_reads_the_signer_certificate_and_signing_time() -> None:

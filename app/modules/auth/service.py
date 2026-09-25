@@ -11,7 +11,7 @@ from typing import Any
 
 import structlog
 from cryptography.fernet import InvalidToken
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -376,6 +376,29 @@ async def login_via_eimzo(
             await db.commit()
             raise err("ERR-AUTH-004")
         signer_pinfl = identity.pinfl if _PINFL_RE.fullmatch(identity.pinfl) else None
+        # Amendment to R2 (decision #226, 2026-09-26, C2): an organisation key
+        # also names the employee's own PINFL, and when that PINFL already
+        # belongs to a STAFF account (any role but `applicant`) it logs that
+        # person in personally, exactly as their own key would -- a leshoz
+        # inspector signing in with the leshoz's key must reach their working
+        # account, never a fresh "leshoz X" applicant cabinet. Only when the
+        # PINFL matches no staff user does the TIN open the organisation's
+        # own cabinet; an applicant-role match (e.g. the same person also
+        # holds a personal cabinet) is not staff and falls through the same
+        # way an unknown PINFL does.
+        if signer_pinfl is not None:
+            existing = await repo.get_user_by_pinfl(db, signer_pinfl)
+            if existing is not None and await repo.role_code(db, existing) != APPLICANT_ROLE_CODE:
+                return await login_or_create_by_pinfl(
+                    db,
+                    pinfl=signer_pinfl,
+                    full_name=identity.full_name,
+                    method="eimzo",
+                    snapshot=None,
+                    phone=None,
+                    ip=ip,
+                    user_agent=user_agent,
+                )
         return await login_or_create_legal(
             db,
             stir=identity.tin,
@@ -436,7 +459,20 @@ async def login_or_create_legal(
     earlier by the retired `attach_legal` (`owner_user_id IS NULL`) is linked
     here, on its organisation's first login under this stage -- no data
     migration (R1). The signer's own pinfl/name never become a second
-    account: they are recorded in `audit.extra` only (R3)."""
+    account: they are recorded in `audit.extra` only (R3).
+
+    I2 (final review): the lookup-then-branch below is not atomic, and two
+    employees of the same organisation can present their keys at the same
+    moment -- a fresh STIR (both branches would INSERT a colliding
+    `applicants.stir`, the second as a bare 500) or a pre-existing UNOWNED
+    applicant (both would `UPDATE ... SET owner_user_id`, the second
+    silently overwriting the first, whose own session then owns no
+    applicant at all). An advisory transaction lock keyed on the STIR
+    serializes every login for that ONE organisation without locking a row
+    that, on the fresh-STIR path, does not exist yet to lock; it is held
+    until this transaction commits (`get_db`), so the second caller's own
+    lookup, once it runs, already sees the first caller's committed row."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:stir))"), {"stir": stir})
     applicant = await repo.get_applicant_by_stir(db, stir)
     now = datetime.now(UTC)
     login_extra = {
@@ -497,6 +533,18 @@ async def login_or_create_legal(
             )
         else:
             applicant.owner_user_id = user.id
+            # M1 (final review): a row from the retired `attach_legal` (a
+            # `basis=poa` attach could name any STIR under any name with no
+            # verification of its own) kept whatever name it was created
+            # under and stayed unverified forever -- the organisation's OWN
+            # certificate is stronger proof than that ever was, so an
+            # adoption of a row NOBODY had verified heals both fields; a row
+            # some earlier login already verified (a second employee's
+            # first login, or a re-adoption) is left alone.
+            if applicant.verified_at is None:
+                applicant.name = org_name
+                applicant.verified_at = now
+                applicant.verify_source = "eimzo_legal"
             await audit.log(
                 db,
                 action="applicant.link_owner",
@@ -1007,11 +1055,27 @@ async def complete_registration(
     address: str | None,
     ip: str | None,
 ) -> Applicant:
+    """C2's individual flow (phone by OTP + consents), reused verbatim for a
+    legal cabinet's own account (R6, decision #226 amendment 2026-09-26,
+    I1): `login_or_create_legal` already creates that account's `Applicant`
+    row at login (it needs the row to exist for the STIR lookup itself), so
+    "already registered" for THIS branch cannot be "an applicant already
+    exists" the way it is for an individual -- it is "this account has
+    already recorded a verified phone". A legal owner therefore fills in
+    the SAME row `login_or_create_legal` created rather than getting a
+    second one, and skips the `user.pinfl is not None` assert an
+    organisation's own account never satisfies (R1: `users.pinfl` stays
+    NULL for it)."""
     if await repo.role_code(db, user) != APPLICANT_ROLE_CODE:
         raise err("ERR-ACL-001", details={"reason": "not an applicant account"})
-    if await repo.get_own_applicant(db, user.id) is not None:
+    own = await repo.get_own_applicant(db, user.id)
+    is_legal_first_registration = own is not None and own.kind == "legal"
+    if own is not None and not is_legal_first_registration:
         raise err("ERR-AUTH-012")
-    assert user.pinfl is not None  # oneid/eimzo entry always sets it
+    if is_legal_first_registration and user.phone_verified_at is not None:
+        raise err("ERR-AUTH-012")
+    if not is_legal_first_registration:
+        assert user.pinfl is not None  # oneid/eimzo entry always sets it
     current_privacy = await settings_store.get_str(db, "privacy_policy_version")
     current_offer = await settings_store.get_str(db, "offer_version")
     stale = {}
@@ -1023,20 +1087,33 @@ async def complete_registration(
         raise err("ERR-VAL-001", details={"consents_current": stale})
     await consume_otp_token(db, token=otp_token, purpose="phone_verify", target=phone)
     now = datetime.now(UTC)
-    applicant = Applicant(
-        kind="individual",
-        pinfl=user.pinfl,
-        name=user.full_name,
-        phone=phone,
-        email=email,
-        region_id=region_id,
-        district_id=district_id,
-        address=address,
-        owner_user_id=user.id,
-        verified_at=now if user.oneid_profile is not None else None,
-        verify_source="oneid" if user.oneid_profile is not None else None,
-    )
-    await repo.add(db, applicant)
+    if is_legal_first_registration:
+        assert own is not None  # narrowed above
+        applicant = own
+        applicant.phone = phone
+        if email is not None:
+            applicant.email = email
+        if region_id is not None:
+            applicant.region_id = region_id
+        if district_id is not None:
+            applicant.district_id = district_id
+        if address is not None:
+            applicant.address = address
+    else:
+        applicant = Applicant(
+            kind="individual",
+            pinfl=user.pinfl,
+            name=user.full_name,
+            phone=phone,
+            email=email,
+            region_id=region_id,
+            district_id=district_id,
+            address=address,
+            owner_user_id=user.id,
+            verified_at=now if user.oneid_profile is not None else None,
+            verify_source="oneid" if user.oneid_profile is not None else None,
+        )
+        await repo.add(db, applicant)
     for doc_type, doc_version in (
         ("privacy_policy", privacy_policy_version),
         ("offer", offer_version),

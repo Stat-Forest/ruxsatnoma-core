@@ -27,8 +27,8 @@ DOC = b"the-permit-bytes"
 OBJ = uuid.uuid4()
 
 
-def _pkcs7(pinfl: str, serial: str = "SER-1") -> str:
-    return encode_mock_signature(document=DOC, serial=serial, issuer="ISS-1", pinfl=pinfl)
+def _pkcs7(pinfl: str, serial: str = "SER-1", *, tin: str | None = None) -> str:
+    return encode_mock_signature(document=DOC, serial=serial, issuer="ISS-1", pinfl=pinfl, tin=tin)
 
 
 def _pinfl() -> str:
@@ -358,6 +358,35 @@ async def test_a_caller_who_owns_the_legal_applicant_signs_with_the_org_certific
     assert row.certificate_id is not None  # kind == "eri" here
     cert = await service.get_certificate(db, row.certificate_id)
     assert cert.user_id == a_user.id  # bound on first use, same as personal PINFL
+
+
+@pytest.mark.asyncio
+async def test_a_real_shaped_org_certificate_with_both_pinfl_and_tin_still_proves_ownership(
+    db, a_user
+):
+    """C1 (final review): a REAL organisation certificate carries the
+    employee's own PINFL AND the org TIN at once — `pinfl_or_stir` alone is
+    then the 14-digit PERSONAL identifier, never the TIN, so a fix keying
+    purely on `pinfl_or_stir`'s length would take the PERSONAL branch here
+    and refuse `signer_pinfl_unknown` (`a_user.pinfl` is unrelated to this
+    STIR). Every OTHER test in this file built a TIN-only mock envelope,
+    which is exactly why this hid: `_ownership_reason` must read `info.tin`
+    FIRST, before `pinfl_or_stir`'s shape is ever consulted."""
+    stir = _stir()
+    applicant = Applicant(kind="legal", stir=stir, name="OOO Real Shape", owner_user_id=a_user.id)
+    db.add(applicant)
+    await db.flush()
+
+    row = await service.sign(
+        db,
+        object_type="permit",
+        object_id=uuid.uuid4(),
+        purpose="permit_head",
+        document=DOC,
+        pkcs7=_pkcs7(_pinfl(), tin=stir),
+        user=a_user,
+    )
+    assert row.verification_status == "valid"
 
 
 @pytest.mark.asyncio

@@ -75,7 +75,16 @@ async def _me_out(db: AsyncSession, user: User, role: Role, csrf_token: str) -> 
     if role.code == "applicant":
         own = await repo.get_own_applicant(db, user.id)
         applicant_out = ApplicantOut.model_validate(own, from_attributes=True) if own else None
-        registration_complete = own is not None
+        # R6 amendment (decision #226, I1): `login_or_create_legal` creates the
+        # `Applicant` row itself, at login, so its mere presence proves nothing
+        # about registration the way it does for an individual (whose row is
+        # created ONLY by `complete_registration`) — a legal cabinet still
+        # owes the same phone-by-OTP-plus-consents flow, and
+        # `user.phone_verified_at` is what that flow sets, in the same
+        # transaction as the consent rows.
+        registration_complete = own is not None and (
+            own.kind != "legal" or user.phone_verified_at is not None
+        )
     return MeOut(
         user=UserOut.model_validate(user, from_attributes=True),
         role=RoleOut.model_validate(role, from_attributes=True),
