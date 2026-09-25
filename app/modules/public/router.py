@@ -14,11 +14,12 @@ of that list."""
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.core.ratelimit import rate_limit
+from app.core.schemas import CODE_MAX_LENGTH, NAME_MAX_LENGTH
 from app.modules.public import service
 from app.modules.public.schemas import (
     AppealContact,
@@ -60,10 +61,10 @@ async def submit_appeal(payload: AppealIn, db: Annotated[AsyncSession, Depends(g
 
 @router.get("/appeals/check", response_model=AppealStatusOut, dependencies=[_APPEAL_STATUS_LIMIT])
 async def check_appeal_status(
-    number: str,
+    number: Annotated[str, Query(max_length=CODE_MAX_LENGTH)],
     db: Annotated[AsyncSession, Depends(get_db)],
-    phone: str | None = None,
-    email: str | None = None,
+    phone: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    email: Annotated[str | None, Query(max_length=NAME_MAX_LENGTH)] = None,
 ) -> Any:
     """`phone`/`email` — the shared secret R3 requires (`plans/
     04.6-4.8-public-help.md`). Neither is validated as a real phone/email
@@ -80,7 +81,9 @@ async def check_appeal_status(
     dependencies=[_APPEAL_STATUS_LIMIT],
 )
 async def check_application_status(
-    number: str, phone: str, db: Annotated[AsyncSession, Depends(get_db)]
+    number: Annotated[str, Query(max_length=CODE_MAX_LENGTH)],
+    phone: Annotated[str, Query(max_length=CODE_MAX_LENGTH)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Any:
     """Task 4: status without logging in. `phone` is compared against the
     applicant's own contact on file (`service.check_application_status`'s own
@@ -102,7 +105,8 @@ async def open_data_layers(db: Annotated[AsyncSession, Depends(get_db)]) -> Any:
 
 @router.get("/open-data/layers/{code}/features", dependencies=[_OPEN_DATA_LIMIT])
 async def open_data_layer_features(
-    code: str, db: Annotated[AsyncSession, Depends(get_db)]
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict[str, Any]:
     return await service.open_data_layer_features(db, code)
 

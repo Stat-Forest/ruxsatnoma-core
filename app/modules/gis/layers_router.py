@@ -9,10 +9,11 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.core.schemas import BBOX_MAX_LENGTH, CODE_MAX_LENGTH
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
 from app.modules.gis import service
@@ -41,7 +42,7 @@ async def list_layers(
 
 @router.patch("/layers/{code}", response_model=LayerOut)
 async def patch_layer(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     payload: LayerPatch,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
@@ -59,10 +60,10 @@ async def patch_layer(
 
 @router.get("/layers/{code}/features")
 async def list_features(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
-    bbox: str | None = None,
+    bbox: Annotated[str | None, Query(max_length=BBOX_MAX_LENGTH)] = None,
     valid_on: date | None = None,
     status: Annotated[str | None, Query(pattern="^(draft|published|archived)$")] = None,
     import_id: uuid.UUID | None = None,
@@ -83,7 +84,7 @@ async def list_features(
 
 @router.post("/layers/{code}/features", status_code=201)
 async def create_feature(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     payload: FeatureIn,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
@@ -104,7 +105,7 @@ async def create_feature(
 
 @router.patch("/layers/{code}/features/{feature_id}")
 async def patch_feature(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     feature_id: uuid.UUID,
     payload: FeaturePatch,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -118,7 +119,7 @@ async def patch_feature(
 
 @router.post("/layers/{code}/features/{feature_id}/publish")
 async def publish_feature(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     feature_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],
@@ -129,7 +130,7 @@ async def publish_feature(
 
 @router.post("/layers/{code}/features/{feature_id}/archive")
 async def archive_feature(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     feature_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(LAYERS_MANAGE))],

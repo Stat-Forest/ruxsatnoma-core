@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import SEARCH_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -140,7 +140,7 @@ async def list_permits(
     organization_id: uuid.UUID | None = None,
     series: Annotated[str | None, Query(max_length=service.SERIES_MAX_LENGTH)] = None,
     number: Annotated[int | None, Query(ge=1, le=service.MAX_PERMIT_NUMBER)] = None,
-    q: Annotated[str | None, Query(max_length=200)] = None,
+    q: Annotated[str | None, Query(max_length=SEARCH_MAX_LENGTH)] = None,
 ) -> Page[PermitOut]:
     """The permits this caller may see: their own, or — holding
     `permits.view_any` — their zone's.

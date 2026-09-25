@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, SEARCH_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
@@ -33,8 +33,8 @@ async def list_beekeepers(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
     _: Annotated[User, Depends(require_permission(BEEKEEPERS_MANAGE))],
-    q: str | None = Query(default=None, max_length=200),
-    status: str | None = None,
+    q: str | None = Query(default=None, max_length=SEARCH_MAX_LENGTH),
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[BeekeeperOut]:
     return await service.list_beekeepers(db, params=params, q=q, status=status)
 
@@ -44,8 +44,8 @@ async def export_beekeepers_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[User, Depends(require_permission(BEEKEEPERS_MANAGE))],
     lang: xlsx.Lang = "uz_latn",
-    q: str | None = Query(default=None, max_length=200),
-    status: str | None = None,
+    q: str | None = Query(default=None, max_length=SEARCH_MAX_LENGTH),
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /beekeepers` as a spreadsheet (stage 13, ruling #204): the same
     filters, the same scope (ruling R2 — no zone here, ruling #182's single

@@ -9,12 +9,12 @@ from "may this role act at all")."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -112,7 +112,7 @@ async def list_tasks(
     db: AsyncDb,
     user: CurrentUser,
     params: Annotated[PageParams, Depends()],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[TaskOut]:
     items, total = await service.list_tasks(db, status=status, params=params, actor=user)
     return Page[TaskOut](
@@ -128,7 +128,7 @@ async def export_tasks_xlsx(
     db: AsyncDb,
     user: CurrentUser,
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /tasks` as a spreadsheet (stage 13, ruling #204): the same scope,
     the same filter, every matching row up to the configured cap. Declared
@@ -206,7 +206,7 @@ async def list_acts(
     db: AsyncDb,
     user: CurrentUser,
     params: Annotated[PageParams, Depends()],
-    result: str | None = None,
+    result: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[ActOut]:
     items, total = await service.list_acts(db, result=result, params=params, actor=user)
     return Page[ActOut](
@@ -222,7 +222,7 @@ async def export_acts_xlsx(
     db: AsyncDb,
     user: CurrentUser,
     lang: xlsx.Lang = "uz_latn",
-    result: str | None = None,
+    result: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /acts` as a spreadsheet — same scope, same filter, declared
     before `/acts/{act_id}` for the same reason `export_tasks_xlsx` is."""
@@ -305,7 +305,7 @@ async def list_cases(
     db: AsyncDb,
     user: CurrentUser,
     params: Annotated[PageParams, Depends()],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     applicant_id: uuid.UUID | None = None,
 ) -> Page[CaseOut]:
     """`applicant_id` (ruling R8, finding F3): every case against ONE
@@ -328,7 +328,7 @@ async def export_cases_xlsx(
     db: AsyncDb,
     user: CurrentUser,
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     applicant_id: uuid.UUID | None = None,
 ) -> Response:
     """`GET /cases` as a spreadsheet — same scope, same filters (`status`,

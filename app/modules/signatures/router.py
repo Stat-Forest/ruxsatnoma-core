@@ -14,12 +14,12 @@ module's own router, never mounted under another module's prefix."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -35,9 +35,9 @@ async def list_signatures(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
     params: Annotated[PageParams, Depends()],
-    object_type: str,
+    object_type: Annotated[str, Query(max_length=CODE_MAX_LENGTH)],
     object_id: uuid.UUID,
-    kind: str | None = None,
+    kind: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[SignatureOut]:
     """The object's owner (anyone holding at least one signature row of
     their own against it) or `signatures.view_any` (oversight) — a check
@@ -64,10 +64,10 @@ async def list_signatures(
 async def export_signatures_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
-    object_type: str,
+    object_type: Annotated[str, Query(max_length=CODE_MAX_LENGTH)],
     object_id: uuid.UUID,
     lang: xlsx.Lang = "uz_latn",
-    kind: str | None = None,
+    kind: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /signatures` as a spreadsheet (stage 13, ruling #204): the same
     filters, the same ownership/oversight check (ruling R2 —

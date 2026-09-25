@@ -5,11 +5,12 @@
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
+from app.core.schemas import CODE_MAX_LENGTH
 from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
@@ -22,7 +23,10 @@ _MANAGE = Depends(require_permission(FAQ_MANAGE))
 
 
 @router.get("", response_model=list[FaqOut], dependencies=[_MANAGE])
-async def list_faq(db: Annotated[AsyncSession, Depends(get_db)], status: str | None = None) -> Any:
+async def list_faq(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+) -> Any:
     return await service.list_faq_admin(db, status=status)
 
 
@@ -30,7 +34,7 @@ async def list_faq(db: Annotated[AsyncSession, Depends(get_db)], status: str | N
 async def export_faq_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/help/faq` as a spreadsheet (stage 13, ruling #204): the
     same permission, the same filter, the whole (unpaged) list truncated to

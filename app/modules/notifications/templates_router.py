@@ -5,13 +5,13 @@ level-2 module may depend on `auth` (level 1) for its gates."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
 from app.core.errors import err
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
@@ -35,9 +35,9 @@ async def list_templates(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
     actor: Annotated[User, Depends(require_permission(TEMPLATES_MANAGE))],
-    event_code: str | None = None,
-    channel: str | None = None,
-    status: str | None = None,
+    event_code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    channel: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[TemplateOut]:
     rows, total = await repo.list_templates(
         db,
@@ -57,9 +57,9 @@ async def export_templates_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(TEMPLATES_MANAGE))],
     lang: xlsx.Lang = "uz_latn",
-    event_code: str | None = None,
-    channel: str | None = None,
-    status: str | None = None,
+    event_code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    channel: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/notification-templates` as a spreadsheet (stage 13,
     ruling #204): the same filters, the same permission gate, every

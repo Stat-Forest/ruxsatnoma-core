@@ -10,12 +10,12 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Path, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.admin import export, repo, service
 from app.modules.admin.permissions import CLASSIFIERS_MANAGE
@@ -51,9 +51,9 @@ async def organizations(
     db: Annotated[AsyncSession, Depends(get_db)],
     page: Annotated[PageParams, Depends()],
     parent_id: uuid.UUID | None = None,
-    kind: str | None = None,
+    kind: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     region_id: uuid.UUID | None = None,
-    status: str = "active",
+    status: Annotated[str, Query(max_length=CODE_MAX_LENGTH)] = "active",
 ) -> Page[OrganizationOut]:
     rows, total = await repo.list_organizations(
         db,
@@ -77,9 +77,9 @@ async def export_organizations_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     lang: xlsx.Lang = "uz_latn",
     parent_id: uuid.UUID | None = None,
-    kind: str | None = None,
+    kind: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     region_id: uuid.UUID | None = None,
-    status: str = "active",
+    status: Annotated[str, Query(max_length=CODE_MAX_LENGTH)] = "active",
 ) -> Response:
     """`GET /refs/organizations` as a spreadsheet (stage 13, ruling #204):
     the same filters, no permission code and no zone filtering (ruling 10),
@@ -133,7 +133,7 @@ async def livestock_types(db: Annotated[AsyncSession, Depends(get_db)]):
 
 @router.get("/classifiers/{code}/items", response_model=list[ClassifierItemOut])
 async def classifier_items(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     db: Annotated[AsyncSession, Depends(get_db)],
     on_date: Annotated[date | None, Query()] = None,
 ):

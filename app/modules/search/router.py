@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, SEARCH_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
@@ -35,8 +35,8 @@ async def search(
     actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
     params: Annotated[PageParams, Depends()],
     kind: SearchKind,
-    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
-    filter_status: Annotated[str | None, Query(alias="status")] = None,
+    q: Annotated[str | None, Query(min_length=1, max_length=SEARCH_MAX_LENGTH)] = None,
+    filter_status: Annotated[str | None, Query(alias="status", max_length=CODE_MAX_LENGTH)] = None,
     organization_id: uuid.UUID | None = None,
     activity_type_id: uuid.UUID | None = None,
     series: Annotated[str | None, Query(max_length=10)] = None,
@@ -60,8 +60,8 @@ async def export_search_xlsx(
     actor: Annotated[User, Depends(require_permission(SEARCH_USE))],
     kind: SearchKind,
     lang: xlsx.Lang = "uz_latn",
-    q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
-    filter_status: Annotated[str | None, Query(alias="status")] = None,
+    q: Annotated[str | None, Query(min_length=1, max_length=SEARCH_MAX_LENGTH)] = None,
+    filter_status: Annotated[str | None, Query(alias="status", max_length=CODE_MAX_LENGTH)] = None,
     organization_id: uuid.UUID | None = None,
     activity_type_id: uuid.UUID | None = None,
     series: Annotated[str | None, Query(max_length=10)] = None,

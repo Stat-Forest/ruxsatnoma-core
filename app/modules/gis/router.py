@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import BBOX_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
 from app.modules.auth.models import User
@@ -59,7 +59,7 @@ async def list_contours(
     user: Annotated[User, Depends(get_current_user)],
     params: Annotated[PageParams, Depends()],
     organization_id: uuid.UUID | None = None,
-    bbox: str | None = None,
+    bbox: Annotated[str | None, Query(max_length=BBOX_MAX_LENGTH)] = None,
     region_id: uuid.UUID | None = None,
 ) -> Page[ContourListItem]:
     """Reading published contours needs no permission at all (ruling 5): an
@@ -92,7 +92,7 @@ async def export_contours_xlsx(
     user: Annotated[User, Depends(get_current_user)],
     lang: xlsx.Lang = "uz_latn",
     organization_id: uuid.UUID | None = None,
-    bbox: str | None = None,
+    bbox: Annotated[str | None, Query(max_length=BBOX_MAX_LENGTH)] = None,
     region_id: uuid.UUID | None = None,
 ) -> Response:
     """`GET /gis/contours` as a spreadsheet (stage 13, ruling #204): the
@@ -115,7 +115,7 @@ async def list_contour_features(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
     organization_id: uuid.UUID | None = None,
-    bbox: str | None = None,
+    bbox: Annotated[str | None, Query(max_length=BBOX_MAX_LENGTH)] = None,
     region_id: uuid.UUID | None = None,
     tolerance: Annotated[float | None, Query(gt=0, le=0.05)] = None,
 ) -> FeatureCollectionOut:
