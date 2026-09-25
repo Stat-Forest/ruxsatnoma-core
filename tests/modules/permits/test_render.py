@@ -7,6 +7,9 @@ import pytest
 from app.core.errors import DomainError
 from app.modules.permits import render
 
+# The renderer under test: never the stand-in the root conftest puts everywhere else.
+pytestmark = pytest.mark.real_pdf
+
 SNAPSHOT = {
     "series": "А",
     "number": "000001",

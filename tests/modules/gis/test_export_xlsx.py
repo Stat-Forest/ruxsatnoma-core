@@ -96,7 +96,7 @@ async def test_the_contours_export_mirrors_the_list(
         assert_export_cut(resp, cap=1)
 
 
-async def test_contours_export_is_empty_for_a_caller_with_no_matching_zone(
+async def test_contours_export_leaves_out_a_contour_outside_the_callers_zone(
     region_scoped_client: AsyncClient,
     db: AsyncSession,
     contours_layer: GisLayer,
@@ -104,14 +104,16 @@ async def test_contours_export_is_empty_for_a_caller_with_no_matching_zone(
     approval_doc: MediaFile,
 ) -> None:
     """`region_scoped_client` is zoned to a region `leshoz` does not belong
-    to (`leshoz` sets no region at all) — the same empty-not-403 shape
+    to (`leshoz` sets no region at all) — the same filtered-not-403 shape
     `test_the_list_is_filtered_for_a_region_scoped_actor` proves for the
-    list."""
-    await _published_contour(db, contours_layer, leshoz, approval_doc)
+    list. Asserted by id, never as an empty sheet: the run shares one database
+    and that very test publishes a contour in the caller's region on purpose,
+    so `== []` failed whenever the two landed on the same worker."""
+    contour = await _published_contour(db, contours_layer, leshoz, approval_doc)
 
     resp = await region_scoped_client.get(CONTOURS)
     assert resp.status_code == 200, resp.text
-    assert xlsx_rows(resp.content)[1] == []
+    assert str(contour.id) not in {str(row[-1]) for row in xlsx_rows(resp.content)[1]}
 
 
 # --- imports -----------------------------------------------------------------

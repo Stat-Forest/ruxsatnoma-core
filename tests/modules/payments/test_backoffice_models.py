@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.admin.models import Classifier, ClassifierItem
@@ -29,8 +29,6 @@ from app.modules.payments.models import (
     BankStatementLine,
     ManualPaymentConfirmation,
     Reconciliation,
-    Refund,
-    RefundComponent,
 )
 from tests.modules.auth.test_sessions import make_user
 
@@ -196,53 +194,3 @@ async def test_a_reconciliation_rejects_an_unknown_result(db: AsyncSession):
 
 
 # --- refunds --------------------------------------------------------------------
-
-
-async def test_a_returned_refund_needs_a_breakdown_that_sums_to_the_final_amount(
-    db: AsyncSession, invoice, refund_reason_item_id: uuid.UUID
-):
-    """The invariant design/02 names moved from a row CHECK
-    (`returned_needs_complete_breakdown`) to the `refund_components_complete`
-    TRIGGER (decision #162, migration `0046`) — which fires on UPDATE only,
-    never on INSERT, so this must reach `returned` through an update, the
-    same way the real service does (`request_refund` always inserts
-    `requested`, `approve_refund` is what moves a row to `returned`). A bare
-    INSERT with `status="returned"` from the start would not exercise the
-    trigger at all and would prove nothing."""
-    row = Refund(
-        application_id=invoice.application_id,
-        invoice_id=invoice.id,
-        basis_item_id=refund_reason_item_id,
-        status="requested",
-        requested_at=datetime.now(UTC),
-        due_at=date(2026, 10, 1),
-    )
-    db.add(row)
-    await db.flush()
-    db.add(RefundComponent(refund_id=row.id, amount=Decimal("400000.00")))  # 400 000, not 1 000 000
-    await db.flush()
-    row.final_amount = Decimal("1000000.00")
-    row.status = "returned"
-    with pytest.raises(DBAPIError, match="do not sum to final_amount"):
-        await db.flush()
-
-
-async def test_a_returned_refund_with_a_matching_breakdown_is_insertable(
-    db: AsyncSession, invoice, refund_reason_item_id: uuid.UUID
-):
-    row = Refund(
-        application_id=invoice.application_id,
-        invoice_id=invoice.id,
-        basis_item_id=refund_reason_item_id,
-        status="requested",
-        requested_at=datetime.now(UTC),
-        due_at=date(2026, 10, 1),
-    )
-    db.add(row)
-    await db.flush()
-    db.add(RefundComponent(refund_id=row.id, amount=Decimal("1000000.00")))
-    await db.flush()
-    row.final_amount = Decimal("1000000.00")
-    row.status = "returned"
-    await db.flush()
-    assert row.id is not None

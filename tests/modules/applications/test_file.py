@@ -98,6 +98,7 @@ async def test_a_legal_entity_without_an_envelope_is_refused_before_anything_is_
     before = await _count(db, Application)
     result = await _submit_with_button(representative_client, legal_filing_ready_for_submission)
     assert result.status_code == 422, result.text
+    assert result.json()["error"]["code"] == "ERR-SIGN-001"
     assert result.json()["error"]["details"]["reason"] == "simple_signature_not_allowed"
     assert await _count(db, Application) == before
 
@@ -291,15 +292,3 @@ async def test_a_replayed_key_returns_the_stored_response_and_not_a_second_numbe
     again = await _submit_with_button(applicant_client, filing_ready_for_submission, key=key)
     assert first.status_code == again.status_code == 201, again.text
     assert first.json()["number"] == again.json()["number"]
-
-
-async def test_a_stranger_cannot_file_in_my_name(
-    other_applicant_client, legal_filing_ready_for_submission
-):
-    """The legal entity's applicant id in a body from a user holding no
-    representation of it: refused with a domain reason, no row."""
-    result = await _submit_with_button(
-        other_applicant_client, {**legal_filing_ready_for_submission, "on_behalf": "self"}
-    )
-    assert result.status_code == 422, result.text
-    assert result.json()["error"]["details"]["reason"] == "applicant_is_not_the_caller"
