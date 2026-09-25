@@ -621,6 +621,11 @@ async def change_password(
         verify_password, old, user.password_hash
     ):
         raise err("ERR-AUTH-001")
+    # `old` was just verified against the hash, so a plain comparison is exact.
+    # Accepting it would clear must_change_password with nothing changed — an
+    # admin-issued one-time password would survive as the permanent one.
+    if new == old:
+        raise err("ERR-VAL-001", details={"password_policy": ["not_current"]})
     validate_password_policy(new)
     user.password_hash = await asyncio.to_thread(hash_password, new)
     user.must_change_password = False

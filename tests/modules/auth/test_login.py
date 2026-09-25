@@ -327,3 +327,32 @@ async def test_weak_new_password_rejected(db):
             headers={"X-CSRF-Token": csrf},
         )
     assert r.status_code == 422
+
+
+async def test_new_password_equal_to_current_is_rejected(db, engine):
+    """A "change" to the same password clears must_change_password without
+    changing anything — so a one-time password issued by an admin would
+    survive as the permanent one."""
+    user, secret = await make_staff(db, must_change_password=True)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r1 = await client.post(
+            f"{API}/auth/login", json={"login": user.login, "password": PASSWORD}
+        )
+        code = pyotp.TOTP(secret).now()
+        await client.post(
+            f"{API}/auth/mfa/verify", json={"mfa_token": r1.json()["mfa_token"], "code": code}
+        )
+        csrf = client.cookies.get("csrf_token")
+        assert csrf is not None
+        r = await client.post(
+            f"{API}/auth/password/change",
+            json={"old_password": PASSWORD, "new_password": PASSWORD},
+            headers={"X-CSRF-Token": csrf},
+        )
+    assert r.status_code == 422
+    assert r.json()["error"]["details"] == {"password_policy": ["not_current"]}
+    async with make_session_factory(engine)() as fresh:
+        refreshed = (await fresh.execute(select(User).where(User.id == user.id))).scalar_one()
+        assert refreshed.must_change_password is True
