@@ -48,6 +48,13 @@ class SettingSpec:
     # could write a version string no `POST /auth/register` could ever
     # match again.
     max_length: int | None = None
+    # The same two keys are also compared for EQUALITY against that echo
+    # (`auth.service.complete_registration`) rather than merely bounded by
+    # it, and `CodeStr` strips the citizen's side (`strip_whitespace=True`).
+    # `coerce()` must strip this side too, or an admin who saves "1.1 " (a
+    # trailing space) stores a value no trimmed echo can ever equal again —
+    # every registration would then answer `consents_current` forever.
+    strip: bool = False
 
 
 # Stage 16 (ruling R3): the default «Qayta murojaat» / «Shikoyat qilish» texts a
@@ -126,9 +133,15 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "1.0",
             "Current privacy policy version",
             max_length=CODE_MAX_LENGTH,
+            strip=True,
         ),
         SettingSpec(
-            "offer_version", str, "1.0", "Current public offer version", max_length=CODE_MAX_LENGTH
+            "offer_version",
+            str,
+            "1.0",
+            "Current public offer version",
+            max_length=CODE_MAX_LENGTH,
+            strip=True,
         ),
         SettingSpec("max_upload_mb", int, 20, "Maximum accepted upload size, MB"),
         SettingSpec(
@@ -543,6 +556,8 @@ def coerce(spec: SettingSpec, raw: Any) -> Any:
     # its OWN shape validation here, not inherit this one's "any object goes".
     if not isinstance(raw, str):
         raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
+    if spec.strip:
+        raw = raw.strip()
     if not spec.allow_blank and not raw.strip():
         raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
     if spec.max_length is not None and len(raw) > spec.max_length:

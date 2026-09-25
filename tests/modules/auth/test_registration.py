@@ -4,6 +4,7 @@ import uuid
 
 from sqlalchemy import select
 
+from app.core import settings_store
 from app.main import create_app
 from app.modules.auth.models import User, UserConsent
 from app.modules.integrations.adapters.oneid import OneIdProfile, encode_mock_code
@@ -120,6 +121,53 @@ async def test_stale_consent_version_422(db):
         )
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "ERR-VAL-001"
+
+
+async def test_registration_succeeds_when_saved_consent_version_has_stray_whitespace(db):
+    """The adminka settings editor sends text as typed
+    (`adminka/src/pages/admin/settings/SettingsPage.tsx`), with no client-side
+    trim. `ConsentsIn.privacy_policy`/`.offer` are `CodeStr`
+    (`strip_whitespace=True`), so an admin who saves "1.1 " (a trailing
+    space) must not lock out every citizen whose echoed, already-trimmed
+    version can never equal the untrimmed stored one — `settings_store.
+    coerce()` must strip a consent-version setting the same way."""
+    from sqlalchemy import delete
+
+    from app.core.models import SystemSetting
+    from tests.modules.admin.test_organizations_admin import auth_client
+    from tests.modules.auth.test_sessions import make_session, make_user
+
+    admin = await make_user(db, role_code="sys_admin")
+    _, admin_token, admin_csrf = await make_session(db, admin)
+    await db.commit()
+
+    pinfl, phone = unique_pinfl(), unique_phone()
+    app = create_app()
+    try:
+        # The real PUT route, as sys_admin — not a direct settings_store call.
+        async with make_client(app, lifespan=True) as client:
+            auth_client(client, admin_token, admin_csrf)
+            saved = await client.put(
+                f"{API}/admin/settings/privacy_policy_version", json={"value": "1.1 "}
+            )
+            assert saved.status_code == 200
+            assert saved.json()["value"] == "1.1"  # stored stripped, not "1.1 "
+
+        async with make_client(app, lifespan=True) as client:
+            await oneid_login(client, pinfl)
+            token = await verified_phone_token(client, phone, db=db)
+            r = await client.post(
+                f"{API}/auth/complete-registration",
+                json=registration_body(
+                    phone, token, consents={"privacy_policy": "1.1", "offer": "1.0"}
+                ),
+                headers=csrf_headers(client),
+            )
+        assert r.status_code == 200
+    finally:
+        await db.execute(delete(SystemSetting).where(SystemSetting.key == "privacy_policy_version"))
+        await db.commit()
+        settings_store.invalidate()
 
 
 async def test_otp_token_target_must_match_phone(db):
