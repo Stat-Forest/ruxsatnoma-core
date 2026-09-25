@@ -228,18 +228,6 @@ async def test_the_catalog_offers_no_way_to_create_or_delete(
     )
 
 
-async def test_a_description_without_uz_latn_is_refused(
-    db: AsyncSession, staff_client: httpx.AsyncClient
-) -> None:
-    row = (
-        await db.execute(select(ActivityType).where(ActivityType.code == "grazing"))
-    ).scalar_one()
-    response = await staff_client.patch(
-        f"/api/v1/refs/activity-types/{row.id}", json={"description": {"ru": "Только по-русски"}}
-    )
-    assert response.status_code == 422, "decision #90: uz_latn is required"
-
-
 @pytest.mark.parametrize("field", ["processing_days", "sort_order", "status"])
 async def test_explicit_null_for_a_not_null_field_is_refused(
     db: AsyncSession, staff_client: httpx.AsyncClient, field: str

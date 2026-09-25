@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import os
 from collections.abc import AsyncIterator, Iterator
@@ -11,13 +12,24 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 import app.models_registry  # noqa: F401  # populate Base.metadata for migration tests
 from app.config import get_settings
+from app.core import storage
 from app.db import make_engine, make_session_factory
 
 os.environ.setdefault("WORKERS_MODE", "off")  # lifespans in tests must not spawn workers
+# `make check` picks tests with pytest-testmon (decision #229), which records what
+# each test executes through coverage.py's per-test contexts. On Python 3.14
+# coverage defaults to its `sys.monitoring` core, which records a line the FIRST
+# time any test runs it and never again — so testmon saw `permits.service.set_status`
+# in 2 tests out of the 25 that break without it (measured 2026-09-25) and would
+# have skipped the other 23. The C tracer records every test. testmon builds its
+# Coverage with `config_file=False`, so only the environment reaches it; this line
+# runs before testmon's `pytest_configure`, and `_testmon_records_every_test` below
+# refuses a run in which it did not take effect.
+os.environ["COVERAGE_CORE"] = "ctrace"
 
 
 def _use_a_database_of_this_workers_own() -> None:
@@ -133,6 +145,28 @@ async def _migrated_test_db(request: pytest.FixtureRequest) -> None:
     await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _testmon_records_every_test() -> None:
+    """Stop a testmon run whose coverage is not the C tracer (see COVERAGE_CORE
+    above): its map would silently under-record, and every later `make check`
+    would skip tests it should run. A fixture, not a test — testmon deselects a
+    test whose code did not change, and this has to hold on every run."""
+    try:
+        from testmon.testmon_core import TestmonCollector
+    except ImportError:
+        return
+    if not TestmonCollector.coverage_stack:
+        return  # testmon is not collecting in this run
+    tracer = TestmonCollector.coverage_stack[-1]._collector.tracer_name()
+    if tracer != "CTracer":
+        pytest.exit(
+            f"testmon is recording through {tracer}, not CTracer: its map would skip "
+            "tests. COVERAGE_CORE must be 'ctrace' (tests/conftest.py); delete "
+            ".testmondata and run `make check` again.",
+            returncode=3,
+        )
+
+
 @pytest.fixture(scope="session")
 async def engine():
     eng = make_engine(get_settings().database_url_test)
@@ -146,6 +180,94 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
     async with factory() as session:
         yield session
         await session.rollback()
+
+
+class _SharedEngine(AsyncEngine):
+    """An engine whose `dispose()` does nothing, so an app's lifespan cannot close it.
+
+    `create_app()`'s lifespan makes its own engine and disposes it on the way out,
+    so every test that drives the API through `make_client(create_app(),
+    lifespan=True)` — over half the suite — opened a fresh pool before its first
+    request: TCP, SCRAM auth and SQLAlchemy's dialect initialisation, ~45 ms on an
+    idle machine and ~0.5 s beside another session's suite (measured 2026-09-25).
+    `_one_engine_per_database` hands every such app this engine instead, one per
+    database URL, and disposes it for real once, at the end of the session.
+    """
+
+    __slots__ = ()
+
+    async def dispose(self, close: bool = True) -> None:
+        return None
+
+
+class _BucketEnsuredOnce:
+    """`app.main`'s view of `app.core.storage`: `ensure_bucket` runs once per
+    endpoint and bucket, not once per lifespan. Only the lifespan reads storage
+    through `app.main`, so `tests/core/test_storage.py` and every other caller
+    still reach the real function."""
+
+    def __init__(self) -> None:
+        self._done: set[tuple[str, str]] = set()
+
+    async def ensure_bucket(self) -> None:
+        s = get_settings()
+        key = (s.s3_endpoint, s.s3_bucket)
+        if key not in self._done:
+            await storage.ensure_bucket()
+            self._done.add(key)
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def _one_engine_per_database() -> AsyncIterator[None]:
+    """Every app a test builds shares one engine per database URL (see
+    `_SharedEngine`). Keyed by URL because the lifespan reads `DATABASE_URL`
+    after a test's own monkeypatch, so a test that points it elsewhere still
+    gets an engine for THAT database."""
+    import app.main
+
+    engines: dict[str, _SharedEngine] = {}
+
+    def shared_engine(url: str) -> AsyncEngine:
+        if url not in engines:
+            engines[url] = _SharedEngine(make_engine(url).sync_engine)
+        return engines[url]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(app.main, "make_engine", shared_engine)
+        mp.setattr(app.main, "storage", _BucketEnsuredOnce())
+        yield
+    for eng in engines.values():
+        await AsyncEngine.dispose(eng)
+
+
+@pytest.fixture(autouse=True)
+def _permit_pdf_without_weasyprint(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """Issuing a permit renders its PDF through WeasyPrint, and ~270 tests issue one
+    only to have a permit to read, sign, suspend or revoke — the render was most of
+    their setup. Everywhere but a `real_pdf` test, `render_permit` keeps its cheap
+    refusals (`_assert_renderable`: a character the fonts cannot draw; `fill`: an
+    unfilled placeholder) and skips the typesetting: the bytes are a stand-in that
+    starts like a PDF and is unique to the filled layout, so two permits never
+    share a hash and one permit always hashes the same.
+
+    What only the real render proves — the one-page and bundled-faces guards, the
+    text a reader extracts, the byte-identical re-render — lives in `real_pdf`
+    tests: `tests/modules/permits/test_render.py` and `test_issue.py`."""
+    if request.node.get_closest_marker("real_pdf"):
+        return
+    from app.modules.permits import render
+
+    def stand_in(snapshot, layout_html: str, qr_url: str) -> bytes:
+        values = {**snapshot, render.QR_FIELD: qr_url}
+        render._assert_renderable(values)
+        html = render.fill(layout_html, values)
+        return (
+            b"%PDF-1.7\n% stand-in "
+            + hashlib.sha256(html.encode()).hexdigest().encode()
+            + b"\n%%EOF\n"
+        )
+
+    monkeypatch.setattr(render, "render_permit", stand_in)
 
 
 @pytest.fixture(autouse=True)

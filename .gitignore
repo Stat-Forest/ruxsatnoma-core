@@ -19,3 +19,7 @@ pg-data/
 !.claude/lessons.md
 !.claude/commands/
 !.claude/skills/
+
+# pytest-testmon's per-worktree map of which test runs which code (make check)
+.testmondata
+.testmondata-*

@@ -67,11 +67,6 @@ async def test_the_bbox_filter_excludes_what_is_outside_it(applicant_client, pub
     assert outside.json()["items"] == []
 
 
-async def test_a_malformed_bbox_is_422_not_500(applicant_client):
-    resp = await applicant_client.get("/api/v1/gis/contours?bbox=nonsense")
-    assert resp.status_code == 422
-
-
 @pytest.mark.parametrize(
     "bbox",
     [

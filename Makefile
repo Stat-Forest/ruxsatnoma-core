@@ -1,6 +1,8 @@
-# Single entry point for the local gate. `make check` mirrors CI
-# (.github/workflows/ci.yml) exactly, so the two can never drift apart.
-.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test test-all lint fmt type security check heads lessons-check
+# Single entry point for the local gate. `make check-all` mirrors CI
+# (.github/workflows/ci.yml) exactly. `make check` is only the tests of what
+# changed (decision #228): the lint steps run once, in the pre-commit hook at
+# `git commit`, and CI runs everything on push.
+.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test test-all test-changed lint fmt type security check check-all heads lessons-check
 
 help:               ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -65,10 +67,9 @@ type:               ## Type-check (CI's `lint` job)
 
 # `make test` alone is the full suite; `make test M=payments` (or M="permits gis")
 # is that module's package only -- the shape to use WHILE WORKING, because the
-# full suite costs 4-7 min of one shared PostgreSQL and two sessions running it
+# full suite costs ~6 min of one shared PostgreSQL and two sessions running it
 # at once halve each other (CLAUDE.md "One machine, one make test at a time").
-# The full suite still runs on every push in CI and in `make check`, which
-# depends on `test-all` and never narrows.
+# The full suite still runs on every push in CI and in `make check-all`.
 ifdef M
 TEST_PATHS = $(addprefix tests/modules/,$(M))
 else
@@ -76,21 +77,40 @@ TEST_PATHS =
 endif
 
 test:               ## Test suite; one module with M=<name> -- make test M=payments
-	uv run pytest -q -n 4 --fresh-db $(TEST_PATHS)
+	uv run pytest -q -n 1 --fresh-db $(TEST_PATHS)
 
 test-all:           ## Full test suite (needs `make up`; CI's `test` job)
-	# -n 4: the suite is I/O-bound on PostgreSQL and MinIO, so four workers cut
-	# it from ~14 min to ~3 (measured 2026-09-06). Each worker migrates a test
-	# DB of its own -- tests/conftest.py derives its name from DATABASE_URL_TEST.
-	# --fresh-db re-creates those DBs first: fixtures place random polygons and
-	# never clean up, so leftovers from the last run turn into ERR-GIS-002 in
-	# fixtures that have nothing to do with geometry. Debugging one file is
-	# faster without either flag: uv run pytest tests/modules/<x>/test_y.py
-	uv run pytest -q -n 4 --fresh-db
+	# -n 1 locally (2026-09-25, amends decision #92): four workers per run made a
+	# solo suite ~4x faster, but this machine runs several sessions at once and
+	# each one's `make check` put four more workers on the one PostgreSQL inside
+	# a 4-CPU Docker VM -- five sessions were twenty workers and everything
+	# crawled. One worker keeps a run on a database of its own (`_gw0`, derived
+	# from DATABASE_URL_TEST by tests/conftest.py). CI keeps -n 4: its runner is
+	# not this machine. --fresh-db re-creates that DB first: fixtures place
+	# random polygons and never clean up, so leftovers from the last run turn
+	# into ERR-GIS-002 in fixtures that have nothing to do with geometry.
+	# Debugging one file is faster without either flag:
+	# uv run pytest tests/modules/<x>/test_y.py
+	uv run pytest -q -n 1 --fresh-db
 
 security:           ## Security scan (bandit), same args as CI and pre-commit
 	# Run via uvx: bandit is a linter, not an app dependency, so it stays out of
 	# pyproject.toml. Version pinned so local and CI report the same findings.
 	uvx bandit@1.9.4 -ll --skip B101 -r app
 
-check: heads lessons-check lint type security test-all  ## The full local gate — exactly what CI runs
+test-changed:       ## Tests of what this branch changed since origin/dev -- make check's test step
+	# Two filters (decisions #228, #229). scripts/changed_tests.py bounds the run:
+	# a module's package for a change in it, every importer of a changed test
+	# helper, the whole suite for anything shared or unknown, nothing for docs.
+	# pytest-testmon then runs, inside that bound, only the tests whose executed
+	# code changed since its last green run (.testmondata, per worktree; a test
+	# it has never seen always runs, so a new worktree's first check is the
+	# bound in full). CI runs everything on every push.
+	@paths="$$(uv run python scripts/changed_tests.py)"; \
+	if [ -z "$$paths" ]; then echo "test-changed: nothing but docs changed since origin/dev -- no tests"; exit 0; fi; \
+	if [ "$$paths" = "ALL" ]; then echo "test-changed: shared code changed -- testmon over the whole suite"; paths=""; \
+	else echo "test-changed: testmon within $$paths"; fi; \
+	uv run pytest -q -n 1 --fresh-db --testmon $$paths
+
+check: test-changed  ## Before a commit: the tests of what changed (lint runs in the commit hook)
+check-all: heads lessons-check lint type security test-all  ## Exactly what CI runs, the whole suite included

@@ -800,11 +800,10 @@ Tooling and environment.
   - **A claim-the-oldest worker takes a stranger's row:** `process_pending` claims the oldest
     `pending` import in the DB, not yours → a package-scoped autouse drain running the JOB,
     bounded by `DRAIN_LIMIT`, never a DELETE.
-  - **A global number is never your number:** page 1 is full of previous runs, and a
-    whole-table sweep returns a whole-table count — `sweep_overlapping_permits` scans every
-    permit pair in the DB, so `assert written == 1` measured other suites' committed permits
-    and went red on the CI run after a green one (`7 == 1`; PR #75) → assert on rows
-    carrying your fixture's own ids (`details["contour_id"]`, a fresh `organization_id`).
+  - **A global count or an empty list is never yours:** `sweep_overlapping_permits` counts
+    every permit pair in the DB (`7 == 1`, PR #75); a Fergana-zoned export asserted `== []`
+    while a sibling publishes in Fergana on purpose (red only on `-n 1`, 2026-09-25) →
+    assert on your fixture's own ids (`details["contour_id"]`, your row's absence by id).
   - **A refused action leaves its row:** `test_a_maker_cannot_archive_a_published_tariff`
     succeeds BY being refused, so its `science` tariff stays published forever → a
     yield-fixture teardown with a scoped DELETE; and a row the test REFERENCES cannot be
