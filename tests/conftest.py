@@ -20,6 +20,16 @@ from app.core import storage
 from app.db import make_engine, make_session_factory
 
 os.environ.setdefault("WORKERS_MODE", "off")  # lifespans in tests must not spawn workers
+# `make check` picks tests with pytest-testmon (decision #229), which records what
+# each test executes through coverage.py's per-test contexts. On Python 3.14
+# coverage defaults to its `sys.monitoring` core, which records a line the FIRST
+# time any test runs it and never again — so testmon saw `permits.service.set_status`
+# in 2 tests out of the 25 that break without it (measured 2026-09-25) and would
+# have skipped the other 23. The C tracer records every test. testmon builds its
+# Coverage with `config_file=False`, so only the environment reaches it; this line
+# runs before testmon's `pytest_configure`, and `_testmon_records_every_test` below
+# refuses a run in which it did not take effect.
+os.environ["COVERAGE_CORE"] = "ctrace"
 
 
 def _use_a_database_of_this_workers_own() -> None:
@@ -133,6 +143,28 @@ async def _migrated_test_db(request: pytest.FixtureRequest) -> None:
     cfg = Config("alembic.ini")
     cfg.attributes["sqlalchemy_url"] = url
     await asyncio.to_thread(command.upgrade, cfg, "head")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _testmon_records_every_test() -> None:
+    """Stop a testmon run whose coverage is not the C tracer (see COVERAGE_CORE
+    above): its map would silently under-record, and every later `make check`
+    would skip tests it should run. A fixture, not a test — testmon deselects a
+    test whose code did not change, and this has to hold on every run."""
+    try:
+        from testmon.testmon_core import TestmonCollector
+    except ImportError:
+        return
+    if not TestmonCollector.coverage_stack:
+        return  # testmon is not collecting in this run
+    tracer = TestmonCollector.coverage_stack[-1]._collector.tracer_name()
+    if tracer != "CTracer":
+        pytest.exit(
+            f"testmon is recording through {tracer}, not CTracer: its map would skip "
+            "tests. COVERAGE_CORE must be 'ctrace' (tests/conftest.py); delete "
+            ".testmondata and run `make check` again.",
+            returncode=3,
+        )
 
 
 @pytest.fixture(scope="session")

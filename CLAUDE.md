@@ -6,7 +6,7 @@ FastAPI modular monolith for the forest-permit system. Architecture, DB schema a
 
 ## Run / test
 
-`make help` lists every target; **`make check` is the local gate: the tests of what this branch changed since `origin/dev`**, picked by `scripts/changed_tests.py` (decision #228) — run it before every commit. The lint steps (single Alembic head, lessons budget, ruff check + format, pyright, bandit) are NOT in it: the pre-commit hook runs them once, at `git commit` — do not run them by hand as well. `make check-all` is every lint step plus the WHOLE suite, exactly what CI runs; CI runs it on every push and nothing merges before it is green. The raw commands behind it:
+`make help` lists every target; **`make check` is the local gate: the tests of what this branch changed since `origin/dev`**, bounded by `scripts/changed_tests.py` (decision #228) and narrowed inside that bound by pytest-testmon to the tests whose executed code changed since its last green run (decision #229; `.testmondata` per worktree, the first check in a new worktree runs the bound in full) — run it before every commit. testmon must record through coverage's C tracer: on Python 3.14 the default `sys.monitoring` core records a line for the first test only and the map silently skips the rest — `tests/conftest.py` sets `COVERAGE_CORE=ctrace` and stops any testmon run that did not get it. The lint steps (single Alembic head, lessons budget, ruff check + format, pyright, bandit) are NOT in it: the pre-commit hook runs them once, at `git commit` — do not run them by hand as well. `make check-all` is every lint step plus the WHOLE suite, exactly what CI runs; CI runs it on every push and nothing merges before it is green. The raw commands behind it:
 
 ```bash
 uv sync

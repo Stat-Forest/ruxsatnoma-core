@@ -99,13 +99,18 @@ security:           ## Security scan (bandit), same args as CI and pre-commit
 	uvx bandit@1.9.4 -ll --skip B101 -r app
 
 test-changed:       ## Tests of what this branch changed since origin/dev -- make check's test step
-	# scripts/changed_tests.py picks them (decision #228): a module's tests for a
-	# change in that module, every importer for a changed test helper, the whole
-	# suite for anything shared or unknown, nothing for docs. CI runs everything.
+	# Two filters (decisions #228, #229). scripts/changed_tests.py bounds the run:
+	# a module's package for a change in it, every importer of a changed test
+	# helper, the whole suite for anything shared or unknown, nothing for docs.
+	# pytest-testmon then runs, inside that bound, only the tests whose executed
+	# code changed since its last green run (.testmondata, per worktree; a test
+	# it has never seen always runs, so a new worktree's first check is the
+	# bound in full). CI runs everything on every push.
 	@paths="$$(uv run python scripts/changed_tests.py)"; \
-	if [ -z "$$paths" ]; then echo "test-changed: nothing but docs changed since origin/dev -- no tests"; \
-	elif [ "$$paths" = "ALL" ]; then echo "test-changed: shared code changed -- the whole suite"; $(MAKE) test-all; \
-	else echo "test-changed: $$paths"; uv run pytest -q -n 1 --fresh-db $$paths; fi
+	if [ -z "$$paths" ]; then echo "test-changed: nothing but docs changed since origin/dev -- no tests"; exit 0; fi; \
+	if [ "$$paths" = "ALL" ]; then echo "test-changed: shared code changed -- testmon over the whole suite"; paths=""; \
+	else echo "test-changed: testmon within $$paths"; fi; \
+	uv run pytest -q -n 1 --fresh-db --testmon $$paths
 
 check: test-changed  ## Before a commit: the tests of what changed (lint runs in the commit hook)
 check-all: heads lessons-check lint type security test-all  ## Exactly what CI runs, the whole suite included
