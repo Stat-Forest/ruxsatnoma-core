@@ -6,7 +6,7 @@ FastAPI modular monolith for the forest-permit system. Architecture, DB schema a
 
 ## Run / test
 
-`make help` lists every target; **`make check` is the local gate and mirrors CI exactly** (single Alembic head + lessons budget + ruff check + format check + pyright + bandit + pytest) — run it before every commit, together with `uv run pre-commit run --all-files`. The raw commands behind it:
+`make help` lists every target; **`make check` is the local gate: the tests of what this branch changed since `origin/dev`**, picked by `scripts/changed_tests.py` (decision #228) — run it before every commit. The lint steps (single Alembic head, lessons budget, ruff check + format, pyright, bandit) are NOT in it: the pre-commit hook runs them once, at `git commit` — do not run them by hand as well. `make check-all` is every lint step plus the WHOLE suite, exactly what CI runs; CI runs it on every push and nothing merges before it is green. The raw commands behind it:
 
 ```bash
 uv sync
@@ -15,7 +15,7 @@ uv run alembic upgrade head
 uv run uvicorn app.main:create_app --factory --reload
 uv run pytest -v              # integration tests need docker up (serial; one DB)
 make test M=payments          # one module's package while working (~30 s; M="permits gis" for two)
-make test-all                 # the full suite: -n 1 --fresh-db (CI: -n 4); also what `make check` runs
+make test-all                 # the full suite: -n 1 --fresh-db (CI: -n 4); what `make check-all` runs
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                # type check (standard mode, decision #39)
 uv run python -m app.seed organizations app/seed/data/organizations.example.json   # reference data
@@ -58,7 +58,7 @@ PostgreSQL in Docker, and the suite is bound by its round-trips, not by
 CPU: two suites at once do not share the machine, they halve each other
 (measured 2026-09-15 — a 70 s module run took 160 s beside another session's
 suite, load average 15). While working, run the module's own tests —
-`make test M=payments` (353 tests, ~30 s); run `make check` once, before the
+`make test M=payments` (353 tests, ~45 s); run `make check` once, before the
 commit, and not while another session's pytest is visible in `ps`. The full
 suite runs on every push in CI anyway, and nothing merges before it is green.
 

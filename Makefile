@@ -1,6 +1,8 @@
-# Single entry point for the local gate. `make check` mirrors CI
-# (.github/workflows/ci.yml) exactly, so the two can never drift apart.
-.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test test-all lint fmt type security check heads lessons-check
+# Single entry point for the local gate. `make check-all` mirrors CI
+# (.github/workflows/ci.yml) exactly. `make check` is only the tests of what
+# changed (decision #228): the lint steps run once, in the pre-commit hook at
+# `git commit`, and CI runs everything on push.
+.PHONY: help install hooks up down logs migrate revision bootstrap seed demo-seed api workers test test-all test-changed lint fmt type security check check-all heads lessons-check
 
 help:               ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -65,10 +67,9 @@ type:               ## Type-check (CI's `lint` job)
 
 # `make test` alone is the full suite; `make test M=payments` (or M="permits gis")
 # is that module's package only -- the shape to use WHILE WORKING, because the
-# full suite costs 4-7 min of one shared PostgreSQL and two sessions running it
+# full suite costs ~6 min of one shared PostgreSQL and two sessions running it
 # at once halve each other (CLAUDE.md "One machine, one make test at a time").
-# The full suite still runs on every push in CI and in `make check`, which
-# depends on `test-all` and never narrows.
+# The full suite still runs on every push in CI and in `make check-all`.
 ifdef M
 TEST_PATHS = $(addprefix tests/modules/,$(M))
 else
@@ -97,4 +98,14 @@ security:           ## Security scan (bandit), same args as CI and pre-commit
 	# pyproject.toml. Version pinned so local and CI report the same findings.
 	uvx bandit@1.9.4 -ll --skip B101 -r app
 
-check: heads lessons-check lint type security test-all  ## The full local gate — exactly what CI runs
+test-changed:       ## Tests of what this branch changed since origin/dev -- make check's test step
+	# scripts/changed_tests.py picks them (decision #228): a module's tests for a
+	# change in that module, every importer for a changed test helper, the whole
+	# suite for anything shared or unknown, nothing for docs. CI runs everything.
+	@paths="$$(uv run python scripts/changed_tests.py)"; \
+	if [ -z "$$paths" ]; then echo "test-changed: nothing but docs changed since origin/dev -- no tests"; \
+	elif [ "$$paths" = "ALL" ]; then echo "test-changed: shared code changed -- the whole suite"; $(MAKE) test-all; \
+	else echo "test-changed: $$paths"; uv run pytest -q -n 1 --fresh-db $$paths; fi
+
+check: test-changed  ## Before a commit: the tests of what changed (lint runs in the commit hook)
+check-all: heads lessons-check lint type security test-all  ## Exactly what CI runs, the whole suite included
