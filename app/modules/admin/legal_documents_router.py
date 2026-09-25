@@ -12,12 +12,12 @@ the same public register a citizen does."""
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.admin import export
 from app.modules.admin import legal_documents_service as service
@@ -38,7 +38,7 @@ async def list_legal_documents(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
     actor: Annotated[User, Depends(require_permission(LEGAL_DOCUMENTS_MANAGE))],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[LegalDocumentAdminOut]:
     return await service.list_admin(db, params=params, status=status)
 
@@ -48,7 +48,7 @@ async def export_legal_documents_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(LEGAL_DOCUMENTS_MANAGE))],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/legal-documents` as a spreadsheet (stage 13, ruling
     #204): the same filter, the same permission gate, every matching row up

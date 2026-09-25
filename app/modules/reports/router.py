@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import files, xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.applications.schemas import NUMBER_MAX_LENGTH, ApplicationStatus
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
@@ -117,7 +117,7 @@ async def list_forms(
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[User, Depends(require_permission(REPORTS_VIEW))],
     params: Annotated[PageParams, Depends()],
-    status: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[ReportFormOut]:
     items, total = await service.list_forms(db, status=status, params=params)
     return Page[ReportFormOut](
@@ -133,7 +133,7 @@ async def export_report_forms_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     _user: Annotated[User, Depends(require_permission(REPORTS_VIEW))],
     lang: xlsx.Lang = "uz_latn",
-    status: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /reports/forms` as a spreadsheet (stage 13, ruling #204).
     Declared before `/forms/{form_id}` on purpose — a UUID path parser
@@ -198,7 +198,7 @@ async def list_reports(
     user: Annotated[User, Depends(require_permission(REPORTS_VIEW))],
     params: Annotated[PageParams, Depends()],
     organization_id: Annotated[uuid.UUID | None, Query()] = None,
-    status: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     form_id: Annotated[uuid.UUID | None, Query()] = None,
 ) -> Page[ReportOut]:
     if status is not None and status not in REPORT_STATUSES:
@@ -225,7 +225,7 @@ async def export_reports_xlsx(
     user: Annotated[User, Depends(require_permission(REPORTS_VIEW))],
     lang: xlsx.Lang = "uz_latn",
     organization_id: Annotated[uuid.UUID | None, Query()] = None,
-    status: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     form_id: Annotated[uuid.UUID | None, Query()] = None,
 ) -> Response:
     """`GET /reports` as a spreadsheet (stage 13, ruling #204): the same

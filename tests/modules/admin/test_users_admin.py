@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 
 from app.core.crypto import decrypt_str, encrypt_str
+from app.core.schemas import SEARCH_MAX_LENGTH
 from app.core.security import hash_password, validate_password_policy, verify_password
 from app.main import create_app
 from app.modules.admin.models import Organization
@@ -650,3 +651,22 @@ async def test_audit_written_for_create_and_patch(db):
     assert patch_entry.old_value["full_name"] == "Audit Target"
     assert patch_entry.new_value["full_name"] == "Audit Target Renamed"
     assert not forbidden_keys & set(patch_entry.new_value or {})
+
+
+async def test_users_search_longer_than_the_cap_is_refused(db):
+    """Stage 19: `?q=` is bounded at `SEARCH_MAX_LENGTH` — one past it is a 422
+    naming the limit, exactly at it is not refused for length."""
+    _, token, csrf = await signed_in_with(db, USERS_MANAGE)
+    await db.commit()
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        auth_client(client, token, csrf)
+        too_long = await client.get(
+            f"{API}/admin/users", params={"q": "x" * (SEARCH_MAX_LENGTH + 1)}
+        )
+        at_cap = await client.get(f"{API}/admin/users", params={"q": "x" * SEARCH_MAX_LENGTH})
+    assert too_long.status_code == 422, too_long.text
+    error = too_long.json()["error"]["details"]["errors"][0]
+    assert error["type"] == "string_too_long"
+    assert error["ctx"]["max_length"] == SEARCH_MAX_LENGTH
+    assert at_cap.status_code == 200, at_cap.text

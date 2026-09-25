@@ -1,6 +1,7 @@
 """The catalogue is fixed (ruling 19): read is open to any authenticated user,
 presentation is editable under gis.layers.manage, and there is no create/delete."""
 
+from app.core.schemas import CODE_MAX_LENGTH
 from app.modules.gis.models import LAYER_CODES
 
 
@@ -67,3 +68,18 @@ async def test_layer_names_in_latin_use_no_cyrillic(applicant_client):
         if any("Ѐ" <= ch <= "ӿ" for ch in item["name"].get("uz_latn", ""))
     }
     assert cyrillic == {}
+
+
+async def test_layer_code_longer_than_the_cap_is_refused(applicant_client):
+    """Stage 19: the path `{code}` is bounded at `CODE_MAX_LENGTH`. One past it
+    is a 422 naming the limit; exactly at the cap is not refused for LENGTH —
+    the route may still answer its own 404 for an unknown layer (ruling: not a
+    specific status, just != 422 / no `string_too_long`)."""
+    too_long = await applicant_client.get(f"/api/v1/gis/layers/{'a' * 65}/features")
+    assert too_long.status_code == 422, too_long.text
+    error = too_long.json()["error"]["details"]["errors"][0]
+    assert error["type"] == "string_too_long"
+    assert error["ctx"]["max_length"] == CODE_MAX_LENGTH
+
+    at_cap = await applicant_client.get(f"/api/v1/gis/layers/{'a' * CODE_MAX_LENGTH}/features")
+    assert at_cap.status_code != 422, at_cap.text

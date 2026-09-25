@@ -4,13 +4,14 @@ import secrets
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.deps import get_db
 from app.core.ratelimit import rate_limit
+from app.core.schemas import OAUTH_PARAM_MAX_LENGTH
 from app.core.security import new_token
 from app.core.time import business_today
 from app.modules.auth import repo, service
@@ -209,8 +210,8 @@ async def oneid_authorize(response: Response) -> OneIdAuthorizeOut:
 
 @router.get("/oneid/callback")
 async def oneid_callback(
-    code: str,
-    state: str,
+    code: Annotated[str, Query(max_length=OAUTH_PARAM_MAX_LENGTH)],
+    state: Annotated[str, Query(max_length=OAUTH_PARAM_MAX_LENGTH)],
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> RedirectResponse:

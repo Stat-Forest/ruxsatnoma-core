@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import PAGING_MAX, Page
+from app.core.schemas import CODE_MAX_LENGTH, PAGING_MAX, Page
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -36,7 +36,7 @@ async def list_norms(
     _: Annotated[User, Depends(get_current_user)],
     contour_id: uuid.UUID | None = None,
     activity_type_id: uuid.UUID | None = None,
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
@@ -63,7 +63,7 @@ async def export_norms_xlsx(
     lang: xlsx.Lang = "uz_latn",
     contour_id: uuid.UUID | None = None,
     activity_type_id: uuid.UUID | None = None,
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /norms` as a spreadsheet (stage 13, ruling #204): the same
     filters, every matching row up to the configured cap. Declared before

@@ -8,12 +8,12 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -42,7 +42,7 @@ async def list_risk_indicators(
     code: RiskIndicatorCode | None = None,
     level: RiskIndicatorLevel | None = None,
     status: RiskIndicatorStatus | None = None,
-    object_type: str | None = None,
+    object_type: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     object_id: uuid.UUID | None = None,
     period_from: date | None = None,
     period_to: date | None = None,
@@ -86,7 +86,7 @@ async def export_risk_indicators_xlsx(
     code: RiskIndicatorCode | None = None,
     level: RiskIndicatorLevel | None = None,
     status: RiskIndicatorStatus | None = None,
-    object_type: str | None = None,
+    object_type: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     object_id: uuid.UUID | None = None,
     period_from: date | None = None,
     period_to: date | None = None,
@@ -121,8 +121,8 @@ async def list_events(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
     params: Annotated[PageParams, Depends()],
-    event_type: str | None = None,
-    object_type: str | None = None,
+    event_type: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    object_type: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     period_from: date | None = None,
     period_to: date | None = None,
 ) -> Page[OversightEventOut]:
@@ -154,8 +154,8 @@ async def export_events_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
     lang: xlsx.Lang = "uz_latn",
-    event_type: str | None = None,
-    object_type: str | None = None,
+    event_type: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    object_type: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     period_from: date | None = None,
     period_to: date | None = None,
 ) -> Response:

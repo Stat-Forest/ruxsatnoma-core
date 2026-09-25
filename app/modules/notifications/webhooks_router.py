@@ -4,13 +4,14 @@ shared secret in the path is the whole authentication (plan 03.5 ruling 18)."""
 import secrets
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Path, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.ratelimit import rate_limit
+from app.core.schemas import NAME_MAX_LENGTH
 from app.modules.notifications import service
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -47,7 +48,7 @@ async def _body(request: Request) -> dict[str, Any]:
     dependencies=[Depends(rate_limit("webhook", "ratelimit_webhook_per_minute"))],
 )
 async def eskiz_delivery_report(
-    secret: str,
+    secret: Annotated[str, Path(max_length=NAME_MAX_LENGTH)],
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict[str, str]:

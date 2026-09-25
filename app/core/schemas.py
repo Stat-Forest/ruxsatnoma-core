@@ -30,6 +30,9 @@ LONG_TEXT_MAX_LENGTH = 10_000
 PASSWORD_MAX_LENGTH = 128
 BLOB_MAX_LENGTH = 1_048_576  # base64 PKCS#7 with its certificate chain
 URL_MAX_LENGTH = 2048
+SEARCH_MAX_LENGTH = 200  # free-text `?q=` on every list (stage 19, R2)
+BBOX_MAX_LENGTH = 200  # "minx,miny,maxx,maxy" — ~80 characters in practice
+OAUTH_PARAM_MAX_LENGTH = 2048  # OneID's `code`/`state`: the provider's format, not ours
 LIST_MAX_ITEMS = 100
 JSON_MAX_BYTES = 65_536
 SORT_ORDER_MAX = 10_000
