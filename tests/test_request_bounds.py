@@ -17,7 +17,8 @@ by BOTH maxProperties AND a bounded `propertyNames` (a string with
 maxLength/enum/const, or an anchored fixed pattern) — `maxProperties` alone,
 the way `json_schema_extra` can declare it, documents a bound pydantic does
 not enforce (I1, final review) and does not count.
-Query parameters are out of scope (stage 17 ruling R8).
+Every operation PARAMETER (query, path, header, cookie) is walked too, by the
+same rules (stage 19, closing stage 17's own R8).
 
 Known blind spot: a request body read by hand, outside a pydantic model, is
 never walked — `notifications/webhooks_router.py`'s Eskiz webhook and
@@ -175,4 +176,47 @@ def test_every_request_body_field_carries_an_upper_bound() -> None:
     assert not offenders, (
         "unbounded request field(s) — use the bounded types in app/core/schemas.py "
         "(CodeStr, NameStr, TextStr, …, Field(max_length=…/le=…)): " + ", ".join(sorted(offenders))
+    )
+
+
+def _parameter_offenders(schema: dict[str, Any]) -> tuple[int, set[str]]:
+    """Every operation parameter (query, path, header, cookie), judged by the
+    same rules as a body field (stage 19, closing stage 17's R8). `null` in
+    an optional parameter's `anyOf` is skipped; a boolean needs no bound."""
+    checked = 0
+    offenders: set[str] = set()
+    for path, operations in schema["paths"].items():
+        for method, operation in operations.items():
+            for parameter in operation.get("parameters", []):
+                param_schema = parameter.get("schema", {})
+                members = param_schema.get("anyOf") or [param_schema]
+                where = f"{method.upper()} {path} {parameter['in']}:{parameter['name']}"
+                for member in members:
+                    kind = member.get("type")
+                    if kind in (None, "null", "boolean"):
+                        continue
+                    checked += 1
+                    if kind == "string":
+                        bounded = _string_bounded(member)
+                    elif kind in ("integer", "number"):
+                        bounded = _number_bounded(member)
+                    elif kind == "array":
+                        items = member.get("items", {})
+                        bounded = "maxItems" in member and (
+                            items.get("type") != "string" or _string_bounded(items)
+                        )
+                    else:
+                        bounded = False
+                    if not bounded:
+                        offenders.add(where)
+    return checked, offenders
+
+
+def test_every_request_parameter_carries_an_upper_bound() -> None:
+    checked, offenders = _parameter_offenders(_openapi())
+    assert checked >= 500, f"only {checked} request parameters seen — the walk is wrong"
+    assert not offenders, (
+        "unbounded request parameter(s) — add Query(max_length=…)/Path(max_length=…) "
+        "from app/core/schemas.py (CODE_MAX_LENGTH, SEARCH_MAX_LENGTH, …): "
+        + ", ".join(sorted(offenders))
     )

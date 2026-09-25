@@ -6,13 +6,13 @@ own `router`/`admin_router` split."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
 from app.core.ratelimit import rate_limit
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import get_current_user, require_permission
 from app.modules.auth.models import User
@@ -35,7 +35,8 @@ _FAQ_READ_LIMIT = Depends(rate_limit("public_help_faq", "ratelimit_public_help_f
 
 @router.get("/faq", response_model=list[FaqOut], dependencies=[_FAQ_READ_LIMIT])
 async def public_faq(
-    db: Annotated[AsyncSession, Depends(get_db)], category: str | None = None
+    db: Annotated[AsyncSession, Depends(get_db)],
+    category: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Any:
     return await service.list_public_faq(db, category=category)
 
@@ -56,7 +57,7 @@ async def list_tickets(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
     params: Annotated[PageParams, Depends()],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Any:
     items, total = await service.list_tickets(db, actor=user, status=status, params=params)
     return Page[TicketOut](
@@ -72,7 +73,7 @@ async def export_tickets_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /tickets` as a spreadsheet (stage 13, ruling #204): the same
     scope, the same filter, every matching row up to the configured cap.

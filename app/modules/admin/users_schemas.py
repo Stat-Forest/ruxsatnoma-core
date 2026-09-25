@@ -8,9 +8,17 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
+from fastapi import Query
 from pydantic import BaseModel, EmailStr, Field
 
-from app.core.schemas import CodeStr, LocalizedName, NameStr, TextStr
+from app.core.schemas import (
+    CODE_MAX_LENGTH,
+    SEARCH_MAX_LENGTH,
+    CodeStr,
+    LocalizedName,
+    NameStr,
+    TextStr,
+)
 
 # `Numeric(18, 2)`/`Numeric(12, 4)` (`auth/models.py::Role`) — `le = 10**(p-s) -
 # 10**-s` (stage 17 R4).
@@ -26,11 +34,11 @@ Pinfl = Annotated[str, Field(pattern=r"^[0-9]{14}$")]
 class UserFilters(BaseModel):
     """`GET /admin/users` query filters; every field is optional (no filter)."""
 
-    role_code: str | None = None
-    status: str | None = None
+    role_code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None
     organization_id: uuid.UUID | None = None
     region_id: uuid.UUID | None = None
-    q: str | None = None  # ILIKE against login/full_name/pinfl
+    q: Annotated[str | None, Query(max_length=SEARCH_MAX_LENGTH)] = None  # ILIKE login/name/pinfl
 
 
 class UserAdminOut(BaseModel):

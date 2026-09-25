@@ -4,10 +4,11 @@ audited; nothing here deletes rows."""
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.core.schemas import CODE_MAX_LENGTH
 from app.modules.admin import service
 from app.modules.admin.permissions import CLASSIFIERS_MANAGE, ORGANIZATIONS_MANAGE, SETTINGS_MANAGE
 from app.modules.admin.schemas import (
@@ -82,7 +83,7 @@ async def create_classifier(
 
 @router.post("/classifiers/{code}/items", response_model=ClassifierItemOut, status_code=201)
 async def add_classifier_item(
-    code: str,
+    code: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     body: ClassifierItemIn,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(CLASSIFIERS_MANAGE))],
@@ -135,7 +136,7 @@ async def list_settings(
 
 @router.put("/settings/{key}", response_model=SettingOut)
 async def update_setting(
-    key: str,
+    key: Annotated[str, Path(max_length=CODE_MAX_LENGTH)],
     body: SettingIn,
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(SETTINGS_MANAGE))],

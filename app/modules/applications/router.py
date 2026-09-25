@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import files
 from app.core.deps import get_db
 from app.core.idempotency import IdempotencyContext
-from app.core.schemas import Page, PageParams
+from app.core.schemas import SEARCH_MAX_LENGTH, Page, PageParams
 from app.modules.applications import decision as service_decision
 from app.modules.applications import service
 from app.modules.applications.models import PRINTOUT_LETTER, PRINTOUT_REJECTION_NOTICE
@@ -203,7 +203,7 @@ async def list_applications(
     contour_id: uuid.UUID | None = None,
     applicant_id: uuid.UUID | None = None,
     number: Annotated[str | None, Query(max_length=NUMBER_MAX_LENGTH)] = None,
-    q: Annotated[str | None, Query(max_length=200)] = None,
+    q: Annotated[str | None, Query(max_length=SEARCH_MAX_LENGTH)] = None,
     period_from: date | None = None,
     period_to: date | None = None,
     created_from: date | None = None,

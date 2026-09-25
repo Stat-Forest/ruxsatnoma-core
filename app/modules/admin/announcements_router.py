@@ -5,12 +5,12 @@ authenticated user; `admin_router` is the CRUD surface gated behind
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.admin import announcements_service as service
 from app.modules.admin import export
@@ -51,7 +51,7 @@ async def admin_list_announcements(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
     actor: Annotated[User, Depends(require_permission(ANNOUNCEMENTS_MANAGE))],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[AnnouncementAdminOut]:
     return await service.list_admin(db, params=params, status=status)
 
@@ -61,7 +61,7 @@ async def export_announcements_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_permission(ANNOUNCEMENTS_MANAGE))],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/announcements` as a spreadsheet (stage 13, ruling #204):
     the same filter, the same permission gate, every matching row up to the

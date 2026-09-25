@@ -3,12 +3,12 @@
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import require_permission
 from app.modules.auth.models import User
@@ -24,7 +24,7 @@ _MANAGE = Depends(require_permission(APPEALS_MANAGE))
 async def list_appeals(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Any:
     items, total = await service.list_appeals(db, status=status, params=params)
     return Page[AppealAdminOut](
@@ -39,7 +39,7 @@ async def list_appeals(
 async def export_appeals_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/public/appeals` as a spreadsheet (stage 13, ruling #204):
     the same filter, the same permission gate, every matching row up to the

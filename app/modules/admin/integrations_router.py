@@ -7,13 +7,13 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import xlsx
 from app.core.deps import get_db
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.admin import export
 from app.modules.admin.permissions import INTEGRATIONS_MANAGE, INTEGRATIONS_VIEW
@@ -56,8 +56,8 @@ async def list_outbox(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
     actor: Annotated[User, Depends(require_any_permission(INTEGRATIONS_VIEW, INTEGRATIONS_MANAGE))],
-    status: str | None = None,
-    destination: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    destination: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[OutboxMessageOut]:
     rows, total = await repo.list_outbox(
         db, status=status, destination=destination, page=params.page, page_size=params.page_size
@@ -75,8 +75,8 @@ async def export_outbox_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_any_permission(INTEGRATIONS_VIEW, INTEGRATIONS_MANAGE))],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
-    destination: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    destination: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/integrations/outbox` as a spreadsheet (stage 13, ruling
     #204): the same filters, the same view-or-manage gate, every matching
@@ -109,7 +109,7 @@ async def list_dead_letters(
     db: Annotated[AsyncSession, Depends(get_db)],
     params: Annotated[PageParams, Depends()],
     actor: Annotated[User, Depends(require_any_permission(INTEGRATIONS_VIEW, INTEGRATIONS_MANAGE))],
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Page[DeadLetterOut]:
     rows, total = await repo.list_dead_letters(
         db, status=status, page=params.page, page_size=params.page_size
@@ -127,7 +127,7 @@ async def export_dead_letters_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     actor: Annotated[User, Depends(require_any_permission(INTEGRATIONS_VIEW, INTEGRATIONS_MANAGE))],
     lang: xlsx.Lang = "uz_latn",
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /admin/integrations/dead-letters` as a spreadsheet (stage 13,
     ruling #204): the same filter, the same view-or-manage gate, every

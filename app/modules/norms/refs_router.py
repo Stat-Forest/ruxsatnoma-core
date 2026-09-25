@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import xlsx
 from app.core.deps import get_db
 from app.core.errors import err
-from app.core.schemas import PAGING_MAX, Page
+from app.core.schemas import CODE_MAX_LENGTH, PAGING_MAX, Page
 from app.core.time import business_today
 from app.modules.admin import repo as admin_repo
 from app.modules.auth.deps import get_current_user, require_any_permission, require_permission
@@ -65,8 +65,8 @@ def _paged(offset: int, limit: int) -> tuple[int, int]:
 async def list_parameters(
     db: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
-    code: str | None = None,
-    status: str | None = None,
+    code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
@@ -87,8 +87,8 @@ async def export_parameters_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
     lang: xlsx.Lang = "uz_latn",
-    code: str | None = None,
-    status: str | None = None,
+    code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /rule-parameters` as a spreadsheet (stage 13, ruling #204): the
     same filters, every matching row up to the configured cap. Declared
@@ -167,10 +167,10 @@ async def _resolve_activity_type_id(
 async def list_tariffs(
     db: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
-    activity_code: str | None = None,
+    activity_code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     activity_type_id: uuid.UUID | None = None,
     on_date: date | None = None,
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=PAGING_MAX)] = 0,
 ) -> Any:
@@ -199,10 +199,10 @@ async def export_tariffs_xlsx(
     db: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
     lang: xlsx.Lang = "uz_latn",
-    activity_code: str | None = None,
+    activity_code: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
     activity_type_id: uuid.UUID | None = None,
     on_date: date | None = None,
-    status: str | None = None,
+    status: Annotated[str | None, Query(max_length=CODE_MAX_LENGTH)] = None,
 ) -> Response:
     """`GET /tariffs` as a spreadsheet (stage 13, ruling #204): the same
     filters (`activity_code` resolved the same way `list_tariffs` resolves
