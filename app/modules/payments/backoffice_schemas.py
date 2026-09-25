@@ -32,6 +32,15 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
+from app.core.schemas import LIST_MAX_ITEMS, TextStr
+
+# `Numeric(18, 2)` is every money column's own precision in this module
+# (`manual_payment_confirmations.amount`, `refund_components.amount`,
+# `refunds.final_amount` alike) — the same derivation `schemas.MAX_MONEY`
+# uses, and the same value; imported rather than redefined (final review) so
+# the two can never drift apart.
+from app.modules.payments.schemas import MAX_MONEY
+
 
 class StatementAccepted(BaseModel):
     """`POST /payments/bank-statements` answers 202 with the id and the status
@@ -193,11 +202,12 @@ class ReconciliationResolveIn(BaseModel):
 
     `comment` is required by the SCHEMA (its absence is `ERR-VAL-001` from
     FastAPI's own validation, before the service ever runs); a comment that
-    is present but blank (`""`, `"   "`) is a service-level check instead
-    (`backoffice_service.resolve_reconciliation`), because a Pydantic length
-    check cannot see past whitespace the way `str.strip()` can."""
+    is present but blank (`""`, `"   "`) is now also refused at the SCHEMA
+    level (stage 17 R5, `TextStr` strips before checking `min_length=1`) —
+    `backoffice_service.resolve_reconciliation`'s own blank check stays as a
+    defensive second layer."""
 
-    comment: str
+    comment: TextStr
     resolution_doc_id: uuid.UUID | None = None
 
 
@@ -229,12 +239,13 @@ class ManualConfirmationIn(BaseModel):
 
     **No business ceiling, deliberately.** An overpayment is a documented
     refund ground in `tz/08`, so capping the upper end would refuse a real
-    case. `max_digits`/`decimal_places` mirror `numeric(18, 2)` exactly and
-    exist only so an overflow is a 422 at the edge rather than a
-    `DataError` 500 from the database."""
+    case. `max_digits`/`decimal_places`/`le=MAX_MONEY` mirror `numeric(18, 2)`
+    exactly (stage 17 R4: `10**(p-s) - 10**-s`) and exist only so an overflow
+    is a 422 at the edge rather than a `DataError` 500 from the database —
+    `le` is the column's own ceiling, not a new business one."""
 
     invoice_id: uuid.UUID
-    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    amount: Decimal = Field(gt=0, le=MAX_MONEY, max_digits=18, decimal_places=2)
     paid_at: datetime
     bank_doc_file_id: uuid.UUID
 
@@ -242,11 +253,11 @@ class ManualConfirmationIn(BaseModel):
 class ManualConfirmationRejectIn(BaseModel):
     """`POST /payments/manual-confirmations/{id}/reject` — a rejection must
     say why (ruling 7). A missing field is FastAPI's own `ERR-VAL-001`; a
-    present-but-blank one is the service's own check, since a Pydantic `str`
-    requirement cannot see past whitespace the way `str.strip()` can (same
-    split as `ReconciliationResolveIn.comment`)."""
+    present-but-blank one is refused at the schema level too now (stage 17
+    R5, `TextStr` strips before checking `min_length=1`), same as
+    `ReconciliationResolveIn.comment`."""
 
-    reason: str
+    reason: TextStr
 
 
 class ManualConfirmationOut(BaseModel):
@@ -305,7 +316,7 @@ class RefundRequestIn(BaseModel):
 
     application_id: uuid.UUID
     basis_item_id: uuid.UUID
-    comment: str | None = None
+    comment: TextStr | None = None
 
 
 class RefundComponentIn(BaseModel):
@@ -337,7 +348,7 @@ class RefundComponentIn(BaseModel):
     before writing anything, and answers `ERR-VAL-001` naming the reason."""
 
     recipient_id: uuid.UUID | None
-    amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    amount: Decimal = Field(ge=0, le=MAX_MONEY, max_digits=18, decimal_places=2)
 
 
 class RefundSubmitDecisionIn(BaseModel):
@@ -350,9 +361,9 @@ class RefundSubmitDecisionIn(BaseModel):
     catching the arithmetic here is what keeps a wrong number from ever
     reaching the rahbar's screen at all."""
 
-    final_amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
-    components: list[RefundComponentIn] = Field(default_factory=list)
-    comment: str | None = None
+    final_amount: Decimal = Field(gt=0, le=MAX_MONEY, max_digits=18, decimal_places=2)
+    components: list[RefundComponentIn] = Field(default_factory=list, max_length=LIST_MAX_ITEMS)
+    comment: TextStr | None = None
 
 
 class RefundApproveIn(BaseModel):
@@ -365,7 +376,7 @@ class RefundApproveIn(BaseModel):
     status returned/rejected")."""
 
     resolution: str = Field(pattern="^(returned|rejected)$")
-    comment: str | None = None
+    comment: TextStr | None = None
 
 
 class RefundComponentOut(BaseModel):

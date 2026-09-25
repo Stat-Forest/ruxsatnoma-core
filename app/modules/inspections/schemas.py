@@ -7,9 +7,31 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import BlobStr, CodeStr, JsonObject, LocalizedName, NoteStr, TextStr
+
+# --- Request bounds (stage 17, QA run 01, task 8) -----------------------------
+# `inspection_acts`/`violation_cases`' numeric columns are fixed-scale
+# NUMERIC — `le=` mirrors that scale exactly (R4).
+GPS_ACCURACY_M_MAX = Decimal("99999999.99")  # inspection_acts.gps_accuracy_m NUMERIC(10, 2)
+DAMAGE_AMOUNT_MAX = Decimal("9999999999999999.99")  # violation_cases.damage_amount NUMERIC(18, 2)
+CHECKLIST_ITEMS_MAX = 200  # R3
+# `notes`/explanation mirror the adminka's own 4000-char textareas
+# (`ActFormPage.tsx:312`, `CaseDetailPage.tsx:158`), wider than the stage-17
+# default `TEXT_MAX_LENGTH`/2000 (Global Constraints: never bound below an
+# existing adminka maxLength). Fix round 1 (QA run 01 review).
+ACT_NOTES_MAX_LENGTH = 4000
+EXPLANATION_TEXT_MAX_LENGTH = 4000
+# Optional, blank-capable (like NoteStr, but wider).
+ActNotesStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=0, max_length=ACT_NOTES_MAX_LENGTH)
+]
+# Required, non-blank (like TextStr, but wider).
+ExplanationTextStr = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=EXPLANATION_TEXT_MAX_LENGTH),
+]
 
 
 def _trim_decimal(value: Decimal | None) -> str | None:
@@ -35,7 +57,7 @@ class GpsPoint(BaseModel):
 
 
 class ChecklistQuestion(BaseModel):
-    code: str
+    code: CodeStr
     question: LocalizedName
     type: Literal["bool", "number", "text"]
     required: bool = False
@@ -46,10 +68,22 @@ class ChecklistIn(BaseModel):
     supersedes it (archive + insert, service-side) — never an in-place edit of
     a past act's own checklist."""
 
-    code: str
+    code: CodeStr
     name: LocalizedName
     activity_type_id: uuid.UUID | None = None
-    items: Annotated[list[ChecklistQuestion], Field(min_length=1)]
+    items: Annotated[list[ChecklistQuestion], Field(min_length=1, max_length=CHECKLIST_ITEMS_MAX)]
+
+
+class ChecklistQuestionOut(BaseModel):
+    """Same shape as `ChecklistQuestion`, but `code` is a plain, unbounded
+    `str` (I5, final review): a STORED row may predate `CodeStr`'s 64-char
+    bound, and a GET must still list it rather than 500 re-validating
+    output through the same tightened type the input schema uses."""
+
+    code: str
+    question: LocalizedName
+    type: Literal["bool", "number", "text"]
+    required: bool = False
 
 
 class ChecklistOut(BaseModel):
@@ -60,7 +94,7 @@ class ChecklistOut(BaseModel):
     version: int
     name: LocalizedName
     activity_type_id: uuid.UUID | None
-    items: list[ChecklistQuestion]
+    items: list[ChecklistQuestionOut]
     status: str
 
 
@@ -108,11 +142,11 @@ class ActCreateIn(BaseModel):
     application_id: uuid.UUID | None = None
     occurred_at: datetime
     gps: GpsPoint | None = None
-    gps_accuracy_m: Decimal | None = None
+    gps_accuracy_m: Decimal | None = Field(default=None, ge=0, le=GPS_ACCURACY_M_MAX)
     checklist_id: uuid.UUID
-    answers: dict[str, Any] = Field(default_factory=dict)
-    facts: dict[str, Any] = Field(default_factory=dict)
-    notes: str | None = None
+    answers: JsonObject = Field(default_factory=dict)
+    facts: JsonObject = Field(default_factory=dict)
+    notes: ActNotesStr | None = None
     result: Literal["compliant", "warning", "violation"] | None = None
     created_offline_at: datetime | None = None
 
@@ -128,10 +162,10 @@ class ActUpdateIn(BaseModel):
 
     occurred_at: datetime | None = None
     gps: GpsPoint | None = None
-    gps_accuracy_m: Decimal | None = None
-    answers: dict[str, Any] | None = None
-    facts: dict[str, Any] | None = None
-    notes: str | None = None
+    gps_accuracy_m: Decimal | None = Field(default=None, ge=0, le=GPS_ACCURACY_M_MAX)
+    answers: JsonObject | None = None
+    facts: JsonObject | None = None
+    notes: ActNotesStr | None = None
     result: Literal["compliant", "warning", "violation"] | None = None
 
 
@@ -145,7 +179,7 @@ class ActFileIn(BaseModel):
     kind: Literal["photo", "video"]
     taken_at: datetime | None = None
     gps: GpsPoint | None = None
-    device: dict[str, Any] | None = None
+    device: JsonObject | None = None
 
 
 class ActSignIn(BaseModel):
@@ -156,7 +190,7 @@ class ActSignIn(BaseModel):
     act names which of VT-01…06 applies, so the inspector classifies it here,
     at the moment of finalizing."""
 
-    pkcs7: str = Field(min_length=1)
+    pkcs7: BlobStr
     violation_type_item_id: uuid.UUID | None = None
 
 
@@ -297,20 +331,20 @@ class CaseCardOut(CaseOut):
 
 
 class ExplanationIn(BaseModel):
-    text: str = Field(min_length=1)
+    text: ExplanationTextStr
     file_id: uuid.UUID | None = None
 
 
 class DecisionIn(BaseModel):
     decision: Literal["warning", "suspend", "revoke", "transfer"]
-    damage_amount: Decimal | None = None
-    damage_calc: dict[str, Any] | None = None
-    note: str | None = None
+    damage_amount: Decimal | None = Field(default=None, ge=0, le=DAMAGE_AMOUNT_MAX)
+    damage_calc: JsonObject | None = None
+    note: NoteStr | None = None
 
 
 class AppealIn(BaseModel):
-    text: str = Field(min_length=1)
+    text: TextStr
 
 
 class AppealResolveIn(BaseModel):
-    result: str = Field(min_length=1)
+    result: TextStr

@@ -17,13 +17,13 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import storage
 from app.core.errors import err
 from app.core.models import MediaFile
-from app.core.schemas import LocalizedName, Page, PageParams
+from app.core.schemas import SORT_ORDER_MAX, CodeStr, LocalizedName, Page, PageParams, UrlStr
 from app.modules.admin import repo
 
 # `FileRef` is the same three fields an announcement's attachment exposes, and
@@ -66,11 +66,11 @@ class LegalDocumentAdminOut(BaseModel):
 class LegalDocumentCreateIn(BaseModel):
     title: LocalizedName
     summary: LocalizedName | None = None
-    doc_number: str
+    doc_number: CodeStr
     adopted_on: date
-    source_url: str | None = None
+    source_url: UrlStr | None = None
     file_id: uuid.UUID | None = None
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
 
 
 class LegalDocumentPatchIn(BaseModel):
@@ -79,11 +79,11 @@ class LegalDocumentPatchIn(BaseModel):
 
     title: LocalizedName | None = None
     summary: LocalizedName | None = None
-    doc_number: str | None = None
+    doc_number: CodeStr | None = None
     adopted_on: date | None = None
-    source_url: str | None = None
+    source_url: UrlStr | None = None
     file_id: uuid.UUID | None = None
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
 
 
 _AUDITED_FIELDS = (

@@ -76,6 +76,24 @@ async def test_a_profile_shared_by_role_is_visible_to_that_role(db: AsyncSession
         assert profile_id in ids
 
 
+async def test_shared_rejects_an_unknown_key(db: AsyncSession):
+    """I1, final review: `SharedMap`'s key type is now `Literal["role_codes",
+    "user_ids"]` — the only two keys `search.service._visible_to` ever
+    reads — so a third key is refused at the schema boundary rather than
+    silently stored and never consulted."""
+    async for client in _client_for(db, SEARCH_USE):
+        resp = await client.post(
+            "/api/v1/search/profiles",
+            json={
+                "name": "Bad shared shape",
+                "kind": "applications",
+                "params": {},
+                "shared": {"role_codes": [], "user_ids": [], "extra": []},
+            },
+        )
+        assert resp.status_code == 422
+
+
 async def test_owner_can_delete_own_profile(db: AsyncSession):
     async for client in _client_for(db, SEARCH_USE):
         created = await client.post(

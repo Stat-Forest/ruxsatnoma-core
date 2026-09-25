@@ -234,7 +234,13 @@ async def list_users(
 ) -> Page[UserAdminOut]:
     """Ruling 7: a viewer without `auth.users.manage` (and not sys_admin) sees only
     their own zone (`zone_of(actor)` over `region_id`/`district_id`/`organization_id`);
-    a manage-holder sees everything, filters notwithstanding."""
+    a manage-holder sees everything, filters notwithstanding.
+
+    Stage 17 R1: an actor whose own zone is empty (`central_admin`, `leadership`,
+    `prosecutor` — the republic-wide roles) sees every user in full, PINFL/phone/
+    email included, by design — `zone_filter` over an empty zone matches every
+    row rather than none, the same convention `search`/`payments`/`oversight`/
+    `archive` already rely on."""
     zone_condition = None
     if not await _may_manage(db, actor):
         zone_condition = zone_filter(

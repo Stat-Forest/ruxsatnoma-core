@@ -109,10 +109,15 @@ async def test_an_applicant_may_not_read_the_register(applicant_client):
 async def test_resolve_requires_a_nonempty_comment(payments_view_client, db):
     """`tz/08`: close with a comment or a correcting document — never with
     neither. A missing field is FastAPI's own validation (`ERR-VAL-001` with
-    no `reason`, per `app.main.validation_error_handler`); a comment that is
-    present but blank is the service's own check (`details.reason ==
-    "comment_required"`), since a Pydantic `str` requirement cannot see past
-    whitespace the way `str.strip()` can."""
+    no `reason`, per `app.main.validation_error_handler`).
+
+    A comment that is present but blank is now ALSO refused at the schema
+    level (stage 17 QA run 01 C2/R5: `ReconciliationResolveIn.comment` is
+    `TextStr`, which strips before checking `min_length=1`) — this used to
+    be the service's own check (`details.reason == "comment_required"`), but
+    a Pydantic length check can now see past whitespace too, so the blank
+    case answers the same `ERR-VAL-001` FastAPI validation shape the missing
+    case does, not the service's domain error."""
     missing = await _make_reconciliation(db)
     blank = await _make_reconciliation(db)
 
@@ -128,7 +133,6 @@ async def test_resolve_requires_a_nonempty_comment(payments_view_client, db):
     )
     assert blank_comment.status_code == 422, blank_comment.text
     assert blank_comment.json()["error"]["code"] == "ERR-VAL-001"
-    assert blank_comment.json()["error"]["details"]["reason"] == "comment_required"
 
 
 async def test_resolve_on_an_already_resolved_row_answers_err_pay_005(payments_view_client, db):

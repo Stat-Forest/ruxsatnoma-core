@@ -3,6 +3,10 @@ superseding by archive-then-insert rather than an in-place edit."""
 
 import uuid
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.inspections.models import Checklist
+
 
 def _payload(code: str) -> dict:
     return {
@@ -58,3 +62,39 @@ async def test_executor_head_cannot_manage_checklists(executor_head_client) -> N
     )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "ERR-ACL-001"
+
+
+async def test_a_legacy_item_code_over_the_current_bound_is_still_listed(
+    db: AsyncSession, central_admin_client
+) -> None:
+    """I5, final review. `ChecklistQuestion.code` (the IN-side item type) is
+    `CodeStr`, capped at 64 — but `ChecklistOut.items` used to reuse that
+    SAME type to validate what it reads back, so a row stored before the
+    stage-17 bound existed (or written directly, as this test does) would
+    500 the whole `GET /inspections/checklists` list the moment pydantic
+    tried to re-validate its 100-character code against a 64-character cap.
+    `ChecklistOut` now uses `ChecklistQuestionOut`, whose `code` is a plain
+    unbounded `str`, so a legacy row is still listed rather than breaking
+    the page for everyone."""
+    code = _unique_code("legacy")
+    checklist = Checklist(
+        code=code,
+        version=1,
+        name={"uz_latn": "Legacy"},
+        items=[
+            {
+                "code": "x" * 100,
+                "question": {"uz_latn": "Legacy question?"},
+                "type": "bool",
+                "required": True,
+            }
+        ],
+        status="active",
+    )
+    db.add(checklist)
+    await db.commit()
+
+    listed = await central_admin_client.get("/api/v1/inspections/checklists")
+    assert listed.status_code == 200
+    row = next(item for item in listed.json() if item["code"] == code)
+    assert row["items"][0]["code"] == "x" * 100

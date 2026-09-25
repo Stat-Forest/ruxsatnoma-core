@@ -10,8 +10,9 @@ latest_calculation(), LOAD_PROVIDERS — see the dedicated section near the end
 of this module for what a caller at those levels may and may not do with
 them."""
 
+import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -40,6 +41,7 @@ from app.modules.norms.schemas import (
     ActivitySeasonIn,
     ActivitySeasonPatch,
     CalculationIn,
+    LivestockItemIn,
     NormIn,
     NormPatch,
     PublicEstimateIn,
@@ -158,6 +160,12 @@ async def create_versioned(db: AsyncSession, kind: _Versioned, payload: Any, *, 
         if not any(activity.id == activity_type_id for activity in known):
             raise err("ERR-VAL-001", details={"reason": "unknown_activity_type"})
     await _assert_benefit_codes(db, payload)
+    if payload.effective_to is not None and payload.effective_to < payload.effective_from:
+        # Caught here, not by the `period_valid` CHECK (mirrors
+        # create_norm's own reasoning, QA run 01 a3-central-02): an
+        # IntegrityError has no handler in main.py and answers
+        # ERR-SYS-001/500 instead of a domain 422.
+        raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
     row = kind.model(**payload.model_dump(), status="draft", created_by=actor.id)
     db.add(row)
     await db.flush()
@@ -192,8 +200,13 @@ async def update_versioned(
     # A PATCH can set `benefit_modifiers` too, so the same guard applies here —
     # validating only on create would leave the hole open one HTTP verb over.
     await _assert_benefit_codes(db, patch)
+    fields = patch.model_dump(exclude_unset=True)
+    effective_from = fields.get("effective_from", row.effective_from)
+    effective_to = fields.get("effective_to", row.effective_to)
+    if effective_to is not None and effective_to < effective_from:
+        raise err("ERR-VAL-001", details={"reason": "effective_to_before_from"})
     before = _snapshot(row)
-    for field, value in patch.model_dump(exclude_unset=True).items():
+    for field, value in fields.items():
         setattr(row, field, value)
     await db.flush()
     # `updated_at` is `onupdate=func.now()`: an UPDATE leaves it expired (unlike
@@ -1015,6 +1028,14 @@ def resolve_effective_windows(
 # it (or refuses to).
 
 
+def _refuse_repeated_livestock(items: Sequence[LivestockItemIn]) -> None:
+    codes = [item.livestock_code for item in items]
+    if len(set(codes)) != len(codes):
+        # Same reason code as applications._assert_references, so one adminka
+        # message covers both (QA run 01, a1-02 / a6-code-01).
+        raise err("ERR-VAL-001", details={"reason": "duplicate_livestock_type"})
+
+
 async def _resolve_activity_code(db: AsyncSession, activity_type_id: uuid.UUID) -> str:
     """Same existence guard `create_norm`/`create_versioned` already apply to
     this FK, plus the CODE `CalcRequest.activity_code` needs — resolved
@@ -1044,6 +1065,7 @@ async def _build_request_and_snapshot(
     caller-declared figure, same principle as `contour_versions.area_ha`
     itself) — `Decimal('0')` when the contour has none, since it plays no
     part in `Amount` either way (calculator.py's own docstring)."""
+    _refuse_repeated_livestock(payload.items)
     activity_code = await _resolve_activity_code(db, payload.activity_type_id)
     if await gis_service.contour_organization(db, payload.contour_id) is None:
         raise err("ERR-SYS-003")
@@ -1090,7 +1112,8 @@ async def _compute(
     per-endpoint guard is not a root fix' lesson warns about — this module IS
     that one shared entry point, so the guard stays where it already lives."""
     request, snapshot = await _build_request_and_snapshot(db, payload)
-    result = calculator.calculate(request, snapshot)
+    # pure CPU; never on the event loop (QA run 01 a6-code-01; precedent: permits render)
+    result = await asyncio.to_thread(calculator.calculate, request, snapshot)
     check_results = await checks.run_checks(
         db,
         request=request,
@@ -1166,6 +1189,7 @@ async def estimate_public(db: AsyncSession, *, payload: PublicEstimateIn) -> dic
     `checks.run_checks` enforces) because that guard is never reached any other
     way here — `run_checks` itself is not called (see the block comment
     above)."""
+    _refuse_repeated_livestock(payload.items)
     activity_code = await _resolve_activity_code(db, payload.activity_type_id)
     if payload.period_to < payload.period_from:
         raise err("ERR-VAL-001", details={"reason": "period_reversed"})
@@ -1190,7 +1214,8 @@ async def estimate_public(db: AsyncSession, *, payload: PublicEstimateIn) -> dic
     snapshot = await norm_params.load_snapshot(
         db, request=request, contour_id=None, activity_type_id=payload.activity_type_id
     )
-    result = calculator.calculate(request, snapshot)
+    # pure CPU; never on the event loop (QA run 01 a6-code-01; precedent: permits render)
+    result = await asyncio.to_thread(calculator.calculate, request, snapshot)
     return {
         "activity_type_id": payload.activity_type_id,
         "period_from": payload.period_from,

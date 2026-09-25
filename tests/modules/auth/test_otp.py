@@ -333,6 +333,24 @@ async def test_an_otp_queued_without_a_purpose_still_goes_out(monkeypatch):
     assert "telefon raqamingizni tasdiqlash" in sms_texts[0] and "111222" in sms_texts[0]
 
 
+async def test_a_long_but_valid_email_target_is_not_refused_on_length(db):
+    """`OtpRequestIn.target` must fit an e-mail (RFC 5321: up to 254 chars),
+    not just a phone number — fix round 1 caught it bound at `CodeStr`'s 64,
+    which would have refused a real, syntactically valid long address before
+    `_validate_target_format` ever got to check its shape. 100 chars here:
+    well past 64, well under the 254-char RFC ceiling."""
+    email = f"{'a' * 60}@{'b' * 36}.uz"
+    assert len(email) == 100
+    app = create_app()
+    async with make_client(app, lifespan=True) as client:
+        r = await client.post(
+            f"{API}/auth/otp/request",
+            json={"target_type": "email", "target": email, "purpose": "email_verify"},
+        )
+        assert r.status_code != 422, r.text
+        assert r.status_code == 204, r.text
+
+
 async def test_request_otp_puts_the_purpose_on_the_outbox_payload(db):
     """The sender cannot pick the text for a purpose it is never told."""
     app = create_app()

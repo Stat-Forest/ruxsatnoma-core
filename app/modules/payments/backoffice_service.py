@@ -126,13 +126,21 @@ async def resolve_reconciliation(
     """`POST /payments/reconciliations/{id}/resolve` — `tz/08`: close a
     discrepancy with a comment or with a correcting document.
 
-    A blank comment (`""`, whitespace-only) is `ERR-VAL-001`: the schema's
-    own `str` requirement only rules out a MISSING field, not one filled with
-    spaces. An already-`resolved` row is `ERR-PAY-005` (409) rather than a
+    A blank comment (`""`, whitespace-only) is `ERR-VAL-001`. Since stage 17
+    R5, `ReconciliationResolveIn.comment` is `TextStr`
+    (`app/core/schemas.py`), which already strips and refuses a
+    whitespace-only value at the SCHEMA level, before this function ever
+    runs — so the check right below is a deliberate defensive second layer,
+    not the only thing standing between a blank comment and a stored row: it
+    is what still catches a caller that reaches this function directly,
+    bypassing the Pydantic model (an in-process call, a future internal
+    caller). An already-`resolved` row is `ERR-PAY-005` (409) rather than a
     silent second resolution overwriting the first accountant's comment —
     NOT `ERR-PAY-004`, whose registered message names an invoice, never a
     reconciliation.
     """
+    # Defensive second layer (see docstring above) — `TextStr` already
+    # refuses this at the schema level for every HTTP caller.
     stripped = comment.strip()
     if not stripped:
         raise err("ERR-VAL-001", details={"reason": "comment_required"})
@@ -411,7 +419,16 @@ async def check_manual_confirmation(
     or not at all. Nothing here uses decision #40's early-commit pattern —
     that is for DENIALS, and the only denials here (`ERR-ACL-001`,
     `ERR-PAY-004`) happen before any write and have nothing to preserve.
+
+    A blank `reason` on a reject is `ERR-VAL-001`. Since stage 17 R5,
+    `ManualConfirmationRejectIn.reason` is `TextStr`, which already strips
+    and refuses a whitespace-only value at the SCHEMA level, before this
+    function ever runs — the check right below is a deliberate defensive
+    second layer for a caller that reaches this function directly, not the
+    only thing enforcing it.
     """
+    # Defensive second layer (see docstring above) — `TextStr` already
+    # refuses this at the schema level for every HTTP caller.
     stripped = (reason or "").strip()
     if not approve and not stripped:
         raise err("ERR-VAL-001", details={"reason": "reason_required"})

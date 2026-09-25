@@ -5,7 +5,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import SORT_ORDER_MAX, LocalizedName, LongTextStr, NameStr
 
 
 class FaqOut(BaseModel):
@@ -21,14 +21,14 @@ class FaqIn(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     question: LocalizedName
     answer: LocalizedName
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
 
 
 class FaqPatch(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     question: LocalizedName | None = None
     answer: LocalizedName | None = None
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
     status: str | None = Field(default=None, pattern="^(draft|published|archived)$")
 
 
@@ -57,13 +57,17 @@ class TicketWithMessagesOut(TicketOut):
 
 
 class TicketIn(BaseModel):
-    subject: str = Field(min_length=1, max_length=255)
-    body: str = Field(min_length=1, max_length=5000)
+    # `NameStr`'s 255 matches the adminka's own `TicketFormModal.tsx` maxLength
+    # exactly; `LongTextStr`'s 10 000 widens the adminka's 5 000 (C2, final
+    # review — never bound below an existing adminka maxLength).
+    subject: NameStr
+    body: LongTextStr
     file_id: uuid.UUID | None = None
 
 
 class TicketMessageIn(BaseModel):
-    body: str = Field(min_length=1, max_length=5000)
+    # `LongTextStr` widens the adminka's own 5 000 (`TicketDetailPanel.tsx`).
+    body: LongTextStr
     file_id: uuid.UUID | None = None
 
 

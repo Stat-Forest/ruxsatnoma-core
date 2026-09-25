@@ -11,6 +11,11 @@ don't retype the rules" (the plan's own words) means: use `[0-9]`, never
 `\\d` (`\\d` is Unicode-aware in Python but the DB CHECK is ASCII-only —
 lessons.md), the exact pattern every other PINFL/STIR field in this schema
 already enforces.
+
+`CodeStr`/`NameStr` (`app.core.schemas`), unlike `Pinfl`/`Stir` above, ARE
+shared: they are bounds, not domain-specific format rules, and `app.core`
+sits below every module (stage 17 t6 folded the module-local `NonBlankStr`
+into them — same strip-and-require-non-blank shape, now with an upper bound).
 """
 
 import uuid
@@ -19,14 +24,10 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from app.core.schemas import CodeStr, NameStr
+
 Pinfl = Annotated[str, Field(pattern=r"^[0-9]{14}$")]
 Stir = Annotated[str, Field(pattern=r"^[0-9]{9}$")]
-
-# Whitespace-only free text has a nonzero length and would otherwise pass a
-# bare `Field(min_length=1)` as if it named something real (`auth/schemas.py::
-# ApplicantAddressIn`, `permits/schemas.py::DuplicateIn.reason` — the same
-# idiom, reused here for the same reason).
-NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 REMOVED_REASON_MAX_LENGTH = 1000
 
@@ -54,13 +55,13 @@ class BeekeeperOut(BaseModel):
 class BeekeeperCreateIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    certificate_no: NonBlankStr
+    certificate_no: CodeStr
     pinfl: Pinfl
-    passport_series: NonBlankStr
-    passport_number: NonBlankStr
+    passport_series: CodeStr
+    passport_number: CodeStr
     stir: Stir | None = None
-    full_name: NonBlankStr
-    farm_name: str | None = None
+    full_name: NameStr
+    farm_name: NameStr | None = None
     # Ruling #217: the certificate's term, optional — a registrar copying a
     # certificate without one leaves it blank rather than inventing a date.
     valid_to: date | None = None
@@ -74,13 +75,13 @@ class BeekeeperPatchIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    certificate_no: NonBlankStr | None = None
+    certificate_no: CodeStr | None = None
     pinfl: Pinfl | None = None
-    passport_series: NonBlankStr | None = None
-    passport_number: NonBlankStr | None = None
+    passport_series: CodeStr | None = None
+    passport_number: CodeStr | None = None
     stir: Stir | None = None
-    full_name: NonBlankStr | None = None
-    farm_name: str | None = None
+    full_name: NameStr | None = None
+    farm_name: NameStr | None = None
     valid_to: date | None = None
 
 

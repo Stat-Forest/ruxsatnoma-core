@@ -36,8 +36,10 @@ from pydantic import (
 )
 
 from app.core.pdf import strip_invisible
+from app.core.schemas import BlobStr, JsonObject, NoteStr, TextStr
 from app.core.time import TASHKENT
 from app.modules.norms import service as norms_service
+from app.modules.norms.schemas import MAX_HEAD_COUNT, MAX_LIVESTOCK_ITEMS
 
 # Spelled out rather than `Literal[*APPLICATION_STATUSES]`: pyright rejects a
 # starred variable inside `Literal` (`reportInvalidTypeForm`), and a `Literal`
@@ -125,18 +127,27 @@ ExternalCheckType = Literal["vet", "cadastre"]
 CheckResult = Literal["pass", "fail", "warning"]
 
 # `application_items.head_count` is a plain integer column, so the only ceiling
-# it has is the one written here. Bounded for the same reason every integer
-# query parameter is (`core.schemas.PAGING_MAX`): an unbounded integer reaches
-# asyncpg as `DataError: value out of int64 range` — a 500 for a body anybody
-# can post. A million head on one contour is already absurd by three orders of
-# magnitude; the real limit is the norm's, checked by `norms.checks`.
-MAX_HEAD_COUNT = 1_000_000
+# it has is `MAX_HEAD_COUNT`, imported above from `norms.schemas` — the same
+# constant `LivestockItemIn.count` (norms' own per-group head count) is bound
+# by, moved down a level rather than copied (stage 17 task 3): an unbounded
+# integer reaches asyncpg as `DataError: value out of int64 range` — a 500 for
+# a body anybody can post. A million head on one contour is already absurd by
+# three orders of magnitude; the real limit is the norm's, checked by
+# `norms.checks`.
 # `applications.quantity` is `NUMERIC(12, 4)` — 8 integer digits. `max_digits`
 # and `decimal_places` below are that column, restated where a 422 is still
 # possible; without them an over-precise value reaches Postgres as a
 # `NumericValueOutOfRange` 500.
 QUANTITY_MAX_DIGITS = 12
 QUANTITY_DECIMAL_PLACES = 4
+# `Field(le=…)` mirrors the same column (R4): the value `NUMERIC(12, 4)` can
+# hold, `10**(12-4) - 10**-4`. `max_digits`/`decimal_places` alone reject an
+# over-precise or over-wide value with the WRONG shape of error for the
+# convention test (no `maximum`/`exclusiveMaximum` in the generated schema);
+# without either bound an out-of-range value reaches asyncpg as
+# `NumericValueOutOfRange`, a 500. Mirrored by the adminka's own
+# `max={99999999.9999}` on the quantity input (stage 17 R7).
+QUANTITY_MAX_VALUE = Decimal("99999999.9999")
 # `applications.benefit_certificate_no` is unbounded TEXT (ruling #179 — no
 # `tz/` document prescribes a format, the Agency's certificate registries vary
 # by category), so this is the only ceiling it has, the same reasoning
@@ -228,6 +239,7 @@ class ApplicationPatch(BlankLinesMixin):
             Decimal,
             Field(
                 ge=0,
+                le=QUANTITY_MAX_VALUE,
                 allow_inf_nan=False,
                 max_digits=QUANTITY_MAX_DIGITS,
                 decimal_places=QUANTITY_DECIMAL_PLACES,
@@ -235,7 +247,7 @@ class ApplicationPatch(BlankLinesMixin):
         ]
         | None
     ) = None
-    items: list[ApplicationItemIn] | None = None
+    items: Annotated[list[ApplicationItemIn], Field(max_length=MAX_LIVESTOCK_ITEMS)] | None = None
     benefit_category_item_id: uuid.UUID | None = None
     # Ruling #179: the certificate a certificate-requiring benefit category
     # needs. Free to leave blank while the claim is still being typed —
@@ -567,7 +579,7 @@ class ApplicationDocumentIn(BaseModel):
 
     doc_type_item_id: uuid.UUID
     file_id: uuid.UUID
-    note: str | None = None
+    note: NoteStr | None = None
 
 
 class PrecheckCalculationOut(BaseModel):
@@ -678,7 +690,7 @@ class ApplicationSubmitIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    pkcs7: str | None = None
+    pkcs7: BlobStr | None = None
     rules_accepted: bool = False
 
 
@@ -693,6 +705,12 @@ class ApplicationSubmitIn(BaseModel):
 # with the fields still to fill (`checks.missing_for_pricing`), exactly as it
 # answered a half-empty draft, and the filing itself refuses one with 400
 # `ERR-APP-001`.
+
+# `documents` (stage 17, R3, brief step 3): a body anybody can post, so it
+# needs a ceiling the same way `items` does — 50 is comfortably above any
+# real filing's attachment count (a permit's own maximum is a handful of
+# certificates and photos).
+APPLICATION_DOCUMENTS_MAX = 50
 
 
 class ApplicationFilingIn(BlankLinesMixin):
@@ -728,6 +746,7 @@ class ApplicationFilingIn(BlankLinesMixin):
             Decimal,
             Field(
                 ge=0,
+                le=QUANTITY_MAX_VALUE,
                 allow_inf_nan=False,
                 max_digits=QUANTITY_MAX_DIGITS,
                 decimal_places=QUANTITY_DECIMAL_PLACES,
@@ -735,12 +754,14 @@ class ApplicationFilingIn(BlankLinesMixin):
         ]
         | None
     ) = None
-    items: list[ApplicationItemIn] = []
+    items: Annotated[list[ApplicationItemIn], Field(max_length=MAX_LIVESTOCK_ITEMS)] = []
     benefit_category_item_id: uuid.UUID | None = None
     benefit_certificate_no: (
         Annotated[str, Field(max_length=BENEFIT_CERTIFICATE_NO_MAX_LENGTH)] | None
     ) = None
-    documents: list[ApplicationDocumentIn] = []
+    documents: Annotated[
+        list[ApplicationDocumentIn], Field(max_length=APPLICATION_DOCUMENTS_MAX)
+    ] = []
 
 
 class ApplicationFileIn(ApplicationFilingIn):
@@ -751,7 +772,7 @@ class ApplicationFileIn(ApplicationFilingIn):
     all: the service refuses one without the other."""
 
     rules_accepted: bool = False
-    pkcs7: str | None = None
+    pkcs7: BlobStr | None = None
     application_id: uuid.UUID | None = None
 
 
@@ -976,7 +997,7 @@ class ApplicationApproveIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    pkcs7: str
+    pkcs7: BlobStr
 
 
 # Stage 16 (ruling R3): a rejection now carries 1..10 detailed grounds instead
@@ -1024,7 +1045,7 @@ class ApplicationRejectIn(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    pkcs7: str
+    pkcs7: BlobStr
     grounds: Annotated[
         list[RejectionGroundIn], Field(min_length=1, max_length=REJECTION_GROUNDS_MAX)
     ]
@@ -1056,24 +1077,29 @@ class ApplicationReturnIn(BaseModel):
     (`applications.review`, the hodim's own permission, holds no ERI purpose
     at all); only approve/reject spend one.
 
-    `legal_basis` is required with the same `min_length=1` as
-    `ApplicationRejectIn`'s own, closing the identical gap a plain `str` would
-    leave open. `fields_to_fix` is a JSON **OBJECT** — field name -> what is
+    `legal_basis` is required, stripped and non-blank (stage 17 C2 —
+    `StringConstraints`, so `"   "` fails `min_length=1` before it ever
+    reaches the service), the same gap `ApplicationRejectIn`'s own grounds
+    close. `fields_to_fix` is a JSON **OBJECT** — field name -> what is
     wrong with it, e.g. `{"period_to": "срок выходит за пределы сезона
     выпаса"}` — never a bare list of names, which would tell the applicant
     WHAT to fix but not why; `ApplicationStatusHistory.fields_to_fix` and
     `TimelineHistoryRow.fields_to_fix` are both `dict[str, Any] | None` for
-    exactly this shape. Pydantic checks the TYPE only — that it is non-empty
-    and that its keys name real columns of the application is the service's
-    own check (`service.return_to_applicant`), which needs the row to answer
+    exactly this shape. Bounded by `JsonObject` (stage 17 C1, `JSON_MAX_BYTES`)
+    — pydantic otherwise checks the TYPE only, and that it is non-empty and
+    that its keys name real columns of the application is the service's own
+    check (`service.return_to_applicant`), which needs the row to answer
     "real column of THIS application".
     """
 
     model_config = ConfigDict(extra="forbid")
 
     reason_item_id: uuid.UUID
-    fields_to_fix: dict[str, Any]
-    legal_basis: Annotated[str, Field(min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH)]
+    fields_to_fix: JsonObject
+    legal_basis: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=LEGAL_BASIS_MAX_LENGTH),
+    ]
 
 
 class ApplicationRequestInfoIn(BaseModel):
@@ -1082,14 +1108,21 @@ class ApplicationRequestInfoIn(BaseModel):
     that pauses the SLA clock (`sla.py`, ruling 8) until `respond-info` closes
     it.
 
-    `message` is required and non-empty (`min_length=1`, the same gap
-    `ApplicationRejectIn`'s own `legal_basis` closes) — a paused clock with
-    nothing asked for leaves the applicant with no way to answer.
+    `message` is required, stripped and non-blank (`TextStr`, stage 17 C1/C2)
+    — a paused clock with nothing asked for leaves the applicant with no way
+    to answer.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    message: Annotated[str, Field(min_length=1)]
+    message: TextStr
+
+
+# `respond-info` `file_ids` (stage 17, R3, brief step 2): a body anybody can
+# post, the same reason `APPLICATION_DOCUMENTS_MAX` bounds `documents` above —
+# a smaller number, since a reply to one information request realistically
+# attaches a handful of files, not a whole new filing's worth.
+RESPOND_INFO_MAX_FILES = 20
 
 
 class ApplicationRespondInfoIn(BaseModel):
@@ -1101,13 +1134,23 @@ class ApplicationRespondInfoIn(BaseModel):
     through `POST /files` first, the same two-step `ApplicationDocumentIn`
     uses — and every one must be the caller's OWN active upload
     (`service._own_document_file`). An empty list is a text-only reply and is
-    legal: not every request for information needs a document back.
+    legal: not every request for information needs a document back. Capped at
+    `RESPOND_INFO_MAX_FILES` and de-duplicated by `service.respond_info`
+    (stage 17, QA run 01 P1): a repeated id used to become one
+    `application_documents` row per repetition.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    text: Annotated[str, Field(min_length=1)]
-    file_ids: list[uuid.UUID]
+    text: TextStr
+    file_ids: Annotated[list[uuid.UUID], Field(max_length=RESPOND_INFO_MAX_FILES)]
+
+
+# The adminka's own conclusion textarea (`ConclusionsPanel.tsx`) is
+# `maxLength={4000}` — wider than `TEXT_MAX_LENGTH` (2000), so this field
+# gets its own constant rather than `TextStr` (Global Constraints: never set
+# a backend bound below an existing adminka `maxLength`).
+CONCLUSION_TEXT_MAX_LENGTH = 4000
 
 
 class ApplicationConclusionIn(BaseModel):
@@ -1122,12 +1165,19 @@ class ApplicationConclusionIn(BaseModel):
     permissions.py` registers no code yet that means "authorised to write an
     application conclusion" (see that function's docstring — a gap for
     `decisions.md`/`design/03`, not something this schema can paper over).
+
+    `text` is required, stripped and non-blank (stage 17 C2).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     kind: ConclusionKind
-    text: Annotated[str, Field(min_length=1)]
+    text: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True, min_length=1, max_length=CONCLUSION_TEXT_MAX_LENGTH
+        ),
+    ]
     recommendation: ConclusionRecommendation | None = None
 
 
@@ -1250,8 +1300,16 @@ class BenefitClaimRejectIn(BaseModel):
     benefit-certificate check is an administrative verification against a
     paper registry, not a decision `tz/04` asks the state to sign — the same
     reasoning `ApplicationReturnIn` states for itself.
+
+    Stripped as well as non-blank (stage 17 C2): `"   "` used to pass
+    `min_length=1` and land in `benefit_rejection_reason` verbatim.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=1, max_length=BENEFIT_REJECTION_REASON_MAX_LENGTH)]
+    reason: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True, min_length=1, max_length=BENEFIT_REJECTION_REASON_MAX_LENGTH
+        ),
+    ]

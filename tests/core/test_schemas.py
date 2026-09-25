@@ -41,6 +41,20 @@ def test_localized_name_rejects_unknown_locale():
         Holder(name={"uz_latn": "Nomi", "fr": "Nom"})  # pyright: ignore[reportArgumentType]
 
 
+def test_localized_name_schema_declares_an_enforced_bound():
+    """I1, final review: `maxProperties` now comes from `Field(max_length=...)`
+    on the root dict, which pydantic both emits into the schema AND enforces
+    at runtime — unlike the `json_schema_extra` it replaces, which only ever
+    emitted it. `propertyNames` is declared alongside it (also via
+    `json_schema_extra`, deliberately not a `Literal` key type — see
+    `_LocalizedNameRoot`'s own comment in `app/core/schemas.py`), which is
+    what `tests/test_request_bounds.py`'s walker requires of a bounded typed
+    dict."""
+    schema = LocalizedName.model_json_schema()
+    assert schema["maxProperties"] == 5
+    assert schema["propertyNames"] == {"enum": ["uz_cyrl", "uz_latn", "ru", "kaa", "en"]}
+
+
 def test_page_envelope_shape():
     page = Page[int](items=[1, 2], total=7, page=2, page_size=2)
     assert page.model_dump() == {"items": [1, 2], "total": 7, "page": 2, "page_size": 2}

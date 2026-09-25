@@ -16,6 +16,8 @@ and the other two from 3.11a:
 
 - every integer QUERY parameter carries an upper bound, or it reaches asyncpg
   as `DataError: value out of int64 range` — a 500 anybody can type (t5).
+- every field of every request BODY carries an upper bound, asserted in
+  `tests/test_request_bounds.py` (stage 17, QA run 01).
 - `register_event_subscriptions()` is idempotent for every registry it fills,
   not only for the event bus the autouse fixture restores (pre-flight P4).
 """
@@ -93,6 +95,51 @@ def _locking_gets_without_populate_existing(tree: ast.AST) -> list[int]:
         if "with_for_update" in kwargs and "populate_existing" not in kwargs:
             hits.append(node.lineno)
     return hits
+
+
+def _json_schema_extra_maxproperties(tree: ast.AST) -> list[int]:
+    """Line numbers of a `json_schema_extra={...}` call keyword whose dict
+    literal declares a `"maxProperties"` key.
+
+    An AST walk over the keyword's DICT LITERAL, not a text grep: the walk
+    only fires on a `json_schema_extra=` keyword argument, so a comment or a
+    docstring that happens to mention "maxProperties" (this very file, for
+    one) is never mistaken for the real thing.
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg != "json_schema_extra" or not isinstance(kw.value, ast.Dict):
+                continue
+            for key in kw.value.keys:
+                if isinstance(key, ast.Constant) and key.value == "maxProperties":
+                    hits.append(node.lineno)
+    return hits
+
+
+def test_no_json_schema_extra_declares_maxproperties() -> None:
+    """I1, final review. `maxProperties` inside `json_schema_extra` DOCUMENTS a
+    bound in the OpenAPI schema, but pydantic never enforces it at runtime —
+    the review stored 5 000 keys and a 200 000-character key in
+    `saved_filters.shared` straight past it. The enforced mechanism is
+    `Field(max_length=N)` on the dict annotation itself (pydantic emits
+    `maxProperties` from that AND enforces it) together with a bounded key
+    type (`propertyNames`) — `SharedMap`/`BenefitModifiers`/`LocalizedName`
+    all moved to it in the same fix wave. Keep this the only route: a future
+    `json_schema_extra={"maxProperties": ...}` reintroduces the same
+    declared-not-enforced hole `tests/test_request_bounds.py`'s walker
+    cannot see on its own (it reads the schema, which cannot tell the two
+    mechanisms apart)."""
+    offenders = []
+    for path in _sources():
+        for line in _json_schema_extra_maxproperties(ast.parse(path.read_text())):
+            offenders.append(f"{path}:{line}")
+    assert not offenders, (
+        "json_schema_extra declares maxProperties but pydantic does not enforce it — use "
+        "Field(max_length=N) on the dict with a bounded key type instead: " + ", ".join(offenders)
+    )
 
 
 def test_every_locking_get_also_repopulates_the_row() -> None:

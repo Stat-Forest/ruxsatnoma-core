@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import err
 from app.core.models import SystemSetting
+from app.core.schemas import CODE_MAX_LENGTH
 
 CACHE_TTL_SECONDS = 60
 
@@ -38,6 +39,15 @@ class SettingSpec:
     # so it must round-trip through the admin API rather than being the one
     # value that API can never write back (finding 4, stage 8 fix wave).
     allow_blank: bool = False
+    # A `str` spec's own upper bound (M7, final review). `None` (most keys)
+    # means the general `JsonValue`/`SettingIn.value` byte cap is the only
+    # limit — 64 KB, plenty for a URL or an address. A handful of keys are
+    # echoed back by a request body of their own with a TIGHTER bound
+    # (`ConsentsIn.privacy_policy`/`.offer`, `CodeStr`, 64 chars) and must
+    # never accept more than that themselves, or `POST /admin/settings`
+    # could write a version string no `POST /auth/register` could ever
+    # match again.
+    max_length: int | None = None
 
 
 # Stage 16 (ruling R3): the default «Qayta murojaat» / «Shikoyat qilish» texts a
@@ -105,8 +115,21 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec("otp_ttl_minutes", int, 5, "Lifetime of a phone/email OTP code"),
         SettingSpec("otp_max_attempts", int, 5, "Wrong OTP entries before the code burns"),
         SettingSpec("otp_hourly_limit", int, 5, "OTP requests per target per hour"),
-        SettingSpec("privacy_policy_version", str, "1.0", "Current privacy policy version"),
-        SettingSpec("offer_version", str, "1.0", "Current public offer version"),
+        # `max_length=CODE_MAX_LENGTH` (M7, final review): `auth.ConsentsIn.
+        # privacy_policy`/`.offer` (`CodeStr`, 64 chars) echo these two keys
+        # back at registration time — before this, an admin could set either
+        # to anything up to the general 64 KB setting-value cap, and no
+        # citizen's `ConsentsIn` could ever match a version that long.
+        SettingSpec(
+            "privacy_policy_version",
+            str,
+            "1.0",
+            "Current privacy policy version",
+            max_length=CODE_MAX_LENGTH,
+        ),
+        SettingSpec(
+            "offer_version", str, "1.0", "Current public offer version", max_length=CODE_MAX_LENGTH
+        ),
         SettingSpec("max_upload_mb", int, 20, "Maximum accepted upload size, MB"),
         SettingSpec(
             "outbox_max_attempts", int, 8, "Delivery attempts before an outbox row goes dead"
@@ -522,6 +545,8 @@ def coerce(spec: SettingSpec, raw: Any) -> Any:
         raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
     if not spec.allow_blank and not raw.strip():
         raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "expected text"})
+    if spec.max_length is not None and len(raw) > spec.max_length:
+        raise err("ERR-VAL-001", details={"setting": spec.key, "reason": "too_long"})
     return raw
 
 

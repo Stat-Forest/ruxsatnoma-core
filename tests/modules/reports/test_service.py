@@ -199,6 +199,49 @@ async def test_generate_report_reads_matching_permits(
     assert rows[0]["refunded_amount"] == "0.00"
 
 
+async def test_generate_report_refuses_loudly_past_the_row_cap(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    grazing_form: ReportForm,
+    leshoz: Organization,
+    contours_layer: GisLayer,
+    approval_doc,
+    grazing_activity_id: uuid.UUID,
+):
+    """M4, final review: a register past `REPORT_ROWS_MAX` is refused with
+    `ERR-VAL-001`/`report_too_large` rather than silently truncated — the
+    cap is monkeypatched to 1 so the test does not need 20 000 real rows to
+    prove the refusal fires and `report.data` stays untouched."""
+    monkeypatch.setattr(service, "REPORT_ROWS_MAX", 1)
+    period_from, period_to = date(2027, 5, 1), date(2027, 5, 31)
+    for _ in range(2):
+        await make_report_permit(
+            db,
+            layer=contours_layer,
+            org=leshoz,
+            approval_doc=approval_doc,
+            activity_type_id=grazing_activity_id,
+            period_from=period_from,
+            period_to=period_to,
+            paid_amount=Decimal("100000.00"),
+        )
+    hodim = await _own_hodim(db, leshoz)
+    report = await service.create_report(
+        db,
+        form_id=grazing_form.id,
+        organization_id=leshoz.id,
+        period_start=date(2027, 4, 1),
+        period_end=date(2027, 6, 30),
+        actor=hodim,
+    )
+    with pytest.raises(DomainError) as exc:
+        await service.generate_report(db, report.id, hodim)
+    assert exc.value.code == "ERR-VAL-001"
+    assert exc.value.details == {"reason": "report_too_large", "rows": 2, "max": 1}
+    await db.refresh(report)
+    assert report.data == {}
+
+
 async def test_generate_report_lists_every_act_result_in_chronological_order(
     db: AsyncSession,
     grazing_form: ReportForm,

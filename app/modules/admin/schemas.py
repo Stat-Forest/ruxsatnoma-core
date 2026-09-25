@@ -6,13 +6,28 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import (
+    DAYS_MAX,
+    SORT_ORDER_MAX,
+    CodeStr,
+    JsonObject,
+    JsonValue,
+    LocalizedName,
+)
 
 # Matches the `stir_format` DB CHECK (ruling 12): catching the shape here means a bad
 # value 422s at the schema boundary instead of surfacing as an IntegrityError (500).
 # [0-9], not \d: \d is Unicode-aware in Pydantic's pattern matching, so it would
 # accept e.g. nine Arabic-Indic digits that the ASCII-only Postgres CHECK rejects.
 Stir = Annotated[str, Field(pattern=r"^[0-9]{9}$")]
+
+# The closed set `service.ALLOWED_PARENT_KINDS` and the adminka's own
+# `ORGANIZATION_KINDS` Select already enforce (stage 17 t6): a `kind` outside it
+# was already refused (`service._validate_parent`'s `unknown kind`), but only
+# after reaching the service — an enum here is what the OpenAPI schema itself
+# needs to count as bounded, and it turns that stray value into a 422 one layer
+# earlier, at the door.
+OrganizationKind = Literal["agency", "territorial", "leshoz", "bolim", "aylanma", "bolak"]
 
 
 class RegionOut(BaseModel):
@@ -87,8 +102,8 @@ class ActivityTypePatch(BaseModel):
 
     name: LocalizedName | None = None
     description: LocalizedName | None = None
-    processing_days: int | None = Field(default=None, gt=0)
-    sort_order: int | None = None
+    processing_days: int | None = Field(default=None, gt=0, le=DAYS_MAX)
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
     status: Literal["active", "archived"] | None = None
 
     # `processing_days`/`sort_order`/`status` back NOT-NULL columns — unlike
@@ -131,13 +146,13 @@ class OrganizationIn(BaseModel):
     never need to set it explicitly."""
 
     parent_id: uuid.UUID | None = None
-    kind: str
-    code: str
+    kind: OrganizationKind
+    code: CodeStr
     name: LocalizedName
     stir: Stir | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
-    requisites: dict[str, Any] = {}
+    requisites: JsonObject = {}
     gis_enabled: bool = True
 
 
@@ -151,7 +166,7 @@ class OrganizationPatch(BaseModel):
     stir: Stir | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
-    requisites: dict[str, Any] | None = None
+    requisites: JsonObject | None = None
     gis_enabled: bool | None = None
 
     # `gis_enabled` backs a NOT NULL column — an explicit JSON `null` has no
@@ -169,24 +184,24 @@ class OrganizationPatch(BaseModel):
 
 
 class ClassifierIn(BaseModel):
-    code: str
+    code: CodeStr
     name: LocalizedName
 
 
 class ClassifierItemIn(BaseModel):
-    code: str
+    code: CodeStr
     name: LocalizedName
-    props: dict[str, Any] = {}
+    props: JsonObject = {}
     valid_from: date
     valid_to: date | None = None
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=SORT_ORDER_MAX)
 
 
 class ClassifierItemPatch(BaseModel):
     name: LocalizedName | None = None
-    props: dict[str, Any] | None = None
+    props: JsonObject | None = None
     valid_to: date | None = None
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=SORT_ORDER_MAX)
 
 
 class SettingOut(BaseModel):
@@ -198,4 +213,6 @@ class SettingOut(BaseModel):
 
 
 class SettingIn(BaseModel):
-    value: Any
+    # Not `JsonObject`: most of `settings_store.SETTING_SPECS` are scalars
+    # (`int`/`str`/`bool`), not objects (stage 17 t6).
+    value: JsonValue

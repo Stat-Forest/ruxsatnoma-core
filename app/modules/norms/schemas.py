@@ -13,10 +13,19 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StringConstraints,
     ValidationInfo,
     field_serializer,
     field_validator,
 )
+
+from app.core.schemas import DAYS_MAX, LIST_MAX_ITEMS, CodeStr, JsonValue
+
+# A required legal-basis note, stripped (stage 17 R5) so a whitespace-only
+# one refuses the same way a blank one already does. Shared by every
+# `basis` field on this page (`RuleParameterIn`/`Patch`, `TariffIn`/`Patch`)
+# so the bound and the stripping live in exactly one place.
+BasisStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 
 def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
@@ -56,7 +65,20 @@ def _benefit_modifiers(value: dict[str, str] | None) -> dict[str, str] | None:
     return value
 
 
-BenefitModifiers = Annotated[dict[str, str] | None, AfterValidator(_benefit_modifiers)]
+# `TariffIn.benefit_modifiers`/`.benefit_modifiers.*` (stage 17 C1, key type
+# fixed I1 final review): keys are benefit codes (VMQ 278's own short list,
+# `CodeStr`'s bound comfortably covers any of them), values are the
+# `"0".."1"` string `_benefit_modifiers` above parses — 20 chars comfortably
+# covers any decimal representation `Decimal` produces.
+# `Field(max_length=50)` has to sit on the `dict[...]` annotation ITSELF, not
+# on the `... | None` union around it — on the union it would land on the
+# `anyOf` wrapper, a level `test_request_bounds.py`'s walker never inspects
+# (it visits each `anyOf` member on its own) — and, on the dict itself, it is
+# both emitted into the schema AND enforced at runtime, unlike the
+# `json_schema_extra` this replaces, which only ever documented it.
+_ModifierValue = Annotated[str, StringConstraints(max_length=20)]
+_ModifiersMap = Annotated[dict[CodeStr, _ModifierValue], Field(max_length=50)]
+BenefitModifiers = Annotated[_ModifiersMap | None, AfterValidator(_benefit_modifiers)]
 
 # The DB CHECKs these mirror live in migrations 0011 (`livestock_group_valid`)
 # and 0013 (`quantity_unit_valid`). Unbounded, a typo flushed into an
@@ -93,6 +115,12 @@ class SeasonWindow(BaseModel):
     to: MonthDay
 
 
+# A season's own windows are a handful of MM-DD ranges within one calendar
+# year — generous enough that no real leshoz form ever approaches it, tight
+# enough that a body cannot pointlessly grow past it (stage 17 C1).
+MAX_SEASON_WINDOWS = 20
+
+
 class Season(BaseModel):
     """`season` used to be free-form JSONB written straight through from the
     request (I5, final review). A window missing `from`/`to` raised a
@@ -100,7 +128,14 @@ class Season(BaseModel):
     /calculations/preview`, not a domain error — and a non-string value was a
     `TypeError` the same way."""
 
-    windows: list[SeasonWindow] = Field(default_factory=list)
+    windows: list[SeasonWindow] = Field(default_factory=list, max_length=MAX_SEASON_WINDOWS)
+
+
+# A calendar-year bound for `Rotation.rest_years` (stage 17 C1) — generous on
+# both ends of a rotation planned decades out, tight enough to keep the field
+# an actual year rather than an arbitrary integer.
+MIN_REST_YEAR = 1900
+MAX_REST_YEAR = 2100
 
 
 class Rotation(BaseModel):
@@ -110,24 +145,60 @@ class Rotation(BaseModel):
     silently for a resting year: a fail-open on a BLOCKING check from a
     plausible data-entry mistake, with no error anywhere (I5)."""
 
-    rest_years: list[int] = Field(default_factory=list)
+    rest_years: list[Annotated[int, Field(ge=MIN_REST_YEAR, le=MAX_REST_YEAR)]] = Field(
+        default_factory=list, max_length=LIST_MAX_ITEMS
+    )
 
 
 class RuleParameterIn(BaseModel):
-    code: Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+(:[a-z0-9_]+)?$")]
-    value: Any
-    unit: str | None = None
+    # `strip_whitespace=True` (I4, final review): the pattern is anchored, so
+    # bare whitespace never validated, but " grazing" — real content with
+    # accidental surrounding whitespace — used to be refused outright instead
+    # of accepted as "grazing", the same C2 stripping every other required
+    # code-shaped field in this codebase already applies.
+    code: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=100,
+            pattern=r"^[a-z0-9_]+(:[a-z0-9_]+)?$",
+        ),
+    ]
+    # `JsonValue` (stage 17 task 8b), not narrowed to a number: every consumer
+    # today (`calculator._param`/`_rule` via `Decimal(str(...))`) expects a
+    # scalar, but narrowing the wire type is a behaviour change this stage did
+    # not rule on — it only bounds what was previously unbounded `Any`.
+    value: JsonValue
+    unit: CodeStr | None = None
     effective_from: date
     effective_to: date | None = None
-    basis: Annotated[str, Field(min_length=1, max_length=500)]
+    basis: BasisStr
 
 
 class RuleParameterPatch(BaseModel):
-    value: Any = None
-    unit: str | None = None
+    value: JsonValue | None = None
+    unit: CodeStr | None = None
     effective_from: date | None = None
     effective_to: date | None = None
-    basis: str | None = None
+    basis: BasisStr | None = None
+
+    # `effective_from` backs a NOT NULL column (M3, final review): an explicit
+    # JSON `null` used to reach `service.update_versioned`, whose guard reads
+    # `fields.get("effective_from", row.effective_from)` — for a KEY PRESENT
+    # with value `None` that returns `None`, not the row's own value, and
+    # `effective_to < None` (both real dates) raises `TypeError`, an unhandled
+    # 500. Refused here instead, the same idiom `ActivityTypePatch._reject_
+    # explicit_null`/`OrganizationPatch._reject_explicit_null_gis_enabled`
+    # already use: an *omitted* field still takes the `None` default and is
+    # skipped by `exclude_unset=True` untouched, so this only catches a
+    # payload that names the field with a JSON `null`.
+    @field_validator("effective_from", mode="after")
+    @classmethod
+    def _reject_explicit_null_effective_from(cls, value: date | None, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
 
 
 class RuleParameterOut(BaseModel):
@@ -149,12 +220,18 @@ class RuleParameterOut(BaseModel):
 class TariffIn(BaseModel):
     activity_type_id: uuid.UUID
     livestock_group: LivestockGroup | None = None
-    coefficient: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)]
+    # `Numeric(12, 6)` is `tariffs.coefficient`'s own column (stage 17 R4:
+    # `10**(p-s) - 10**-s` = `999999.999999`); `max_digits`/`decimal_places`
+    # already enforce it but emit no OpenAPI `maximum`, so `le=` is added
+    # alongside them, not in place of them.
+    coefficient: Annotated[
+        Decimal, Field(ge=0, le=Decimal("999999.999999"), max_digits=12, decimal_places=6)
+    ]
     quantity_unit: QuantityUnit
     benefit_modifiers: BenefitModifiers = None
     effective_from: date
     effective_to: date | None = None
-    basis: Annotated[str, Field(min_length=1, max_length=500)]
+    basis: BasisStr
 
 
 class TariffPatch(BaseModel):
@@ -162,12 +239,27 @@ class TariffPatch(BaseModel):
     `service._Versioned.key_filters` matches a tariff by) and stay out of this
     patch for the same reason `RuleParameterPatch` excludes `code`."""
 
-    coefficient: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)] | None = None
+    coefficient: (
+        Annotated[
+            Decimal, Field(ge=0, le=Decimal("999999.999999"), max_digits=12, decimal_places=6)
+        ]
+        | None
+    ) = None
     quantity_unit: QuantityUnit | None = None
     benefit_modifiers: BenefitModifiers = None
     effective_from: date | None = None
     effective_to: date | None = None
-    basis: str | None = None
+    basis: BasisStr | None = None
+
+    # Same guard as `RuleParameterPatch`'s own (M3, final review) — an
+    # explicit `null` here makes `service.update_versioned`'s
+    # `effective_to < effective_from` compare a date against `None`.
+    @field_validator("effective_from", mode="after")
+    @classmethod
+    def _reject_explicit_null_effective_from(cls, value: date | None, info: ValidationInfo) -> Any:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be explicitly cleared")
+        return value
 
 
 class TariffOut(BaseModel):
@@ -192,12 +284,24 @@ class TariffOut(BaseModel):
 class NormIn(BaseModel):
     contour_id: uuid.UUID
     activity_type_id: uuid.UUID
-    yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
+    # `Numeric(10, 4)`/`Numeric(14, 4)` are `norms.yield_c_per_ha`/`.capacity`'s
+    # own columns (stage 17 R4: `10**(p-s) - 10**-s`); `max_digits`/
+    # `decimal_places` already enforce the same ceiling but emit no OpenAPI
+    # `maximum`, so `le=` sits alongside them.
+    yield_c_per_ha: (
+        Annotated[Decimal, Field(ge=0, le=Decimal("999999.9999"), max_digits=10, decimal_places=4)]
+        | None
+    ) = None
     # Ruling #176 (stage 9): the general capacity limit, in the activity's own
     # `quantity_unit` — grazing keeps `max_sb` alone and refuses this field
     # (`service.create_norm`), so a second source of truth for the same fact
     # can never be written.
-    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
+    capacity: (
+        Annotated[
+            Decimal, Field(ge=0, le=Decimal("9999999999.9999"), max_digits=14, decimal_places=4)
+        ]
+        | None
+    ) = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -209,8 +313,16 @@ class NormPatch(BaseModel):
     """`contour_id`/`activity_type_id` are identity and stay out of this patch,
     the same way `TariffPatch` excludes its own key fields."""
 
-    yield_c_per_ha: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=4)] | None = None
-    capacity: Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=4)] | None = None
+    yield_c_per_ha: (
+        Annotated[Decimal, Field(ge=0, le=Decimal("999999.9999"), max_digits=10, decimal_places=4)]
+        | None
+    ) = None
+    capacity: (
+        Annotated[
+            Decimal, Field(ge=0, le=Decimal("9999999999.9999"), max_digits=14, decimal_places=4)
+        ]
+        | None
+    ) = None
     season: Season | None = None
     rotation: Rotation | None = None
     geobotanic_doc_id: uuid.UUID | None = None
@@ -266,7 +378,7 @@ class ActivitySeasonIn(BaseModel):
     organization_id: uuid.UUID
     activity_type_id: uuid.UUID
     season: Season = Field(default_factory=Season)
-    min_term_days: Annotated[int, Field(gt=0)] | None = None
+    min_term_days: Annotated[int, Field(gt=0, le=DAYS_MAX)] | None = None
 
 
 class ActivitySeasonPatch(BaseModel):
@@ -282,7 +394,7 @@ class ActivitySeasonPatch(BaseModel):
     gis_enabled`)."""
 
     season: Season | None = None
-    min_term_days: Annotated[int, Field(gt=0)] | None = None
+    min_term_days: Annotated[int, Field(gt=0, le=DAYS_MAX)] | None = None
 
     @field_validator("season", mode="after")
     @classmethod
@@ -360,6 +472,23 @@ class PublishOut(BaseModel):
     warnings: list[PublishWarning] = []
 
 
+# `calculations.items`/`quantity` reach `asyncpg` untyped from PostGIS's view —
+# a body integer needs its own ceiling (stage 17 ruling R4) or it reaches
+# asyncpg as a `DataError: value out of int64 range`, a 500 for a body anybody
+# can post. Moved here from `applications/schemas.py` (stage 17 task 3): a
+# livestock head count is this module's own concept, and `applications`
+# imports it rather than keeping a second copy that could drift.
+MAX_HEAD_COUNT = 1_000_000
+# Ten livestock types are seeded; a valid request names each at most once.
+MAX_LIVESTOCK_ITEMS = 20
+# `CalculationIn.quantity`/`PublicEstimateIn.quantity` (stage 17 R7): no DB
+# column of its own (it feeds `bhm * coefficient * quantity` and is recorded
+# inside `input_snapshot`, never a `Numeric` column), so it gets a named
+# domain constant instead of a column-derived one — 12 digits, 4 decimals,
+# matching the adminka wizard's own `max=99999999.9999`.
+MAX_QUANTITY = Decimal("99999999.9999")
+
+
 class LivestockItemIn(BaseModel):
     """One grazing line: how many head of one livestock type. Validity of the
     code itself (a real `livestock_types` entry with a known VMQ 278 group and
@@ -367,8 +496,8 @@ class LivestockItemIn(BaseModel):
     unknown code surfaces as `ERR-NORM-004` naming the missing parameter,
     exactly like every other missing rule number (ruling 6)."""
 
-    livestock_code: str
-    count: Annotated[int, Field(gt=0)]
+    livestock_code: CodeStr
+    count: Annotated[int, Field(gt=0, le=MAX_HEAD_COUNT)]
 
 
 class CalculationIn(BaseModel):
@@ -419,9 +548,15 @@ class CalculationIn(BaseModel):
     activity_type_id: uuid.UUID
     period_from: date
     period_to: date
-    quantity: Annotated[Decimal, Field(ge=0)] | None = None
-    items: list[LivestockItemIn] = Field(default_factory=list)
-    benefit_code: str | None = None
+    # `max_digits`/`decimal_places` dropped (M2, final review): this value is
+    # never stored (the calculator reads it and moves on — `application
+    # quantity`, the field that IS stored, is unchanged NUMERIC(12,4)), and
+    # the landing sends it through `parseFloat`, whose output can carry more
+    # than 4 decimal places for an input that never had them (binary
+    # floating point). `ge`/`le` still bound the value itself.
+    quantity: Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY)] | None = None
+    items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
+    benefit_code: CodeStr | None = None
 
 
 class CalculationOut(BaseModel):
@@ -474,8 +609,11 @@ class PublicEstimateIn(BaseModel):
     activity_type_id: uuid.UUID
     period_from: date
     period_to: date
-    quantity: Annotated[Decimal, Field(ge=0)] | None = None
-    items: list[LivestockItemIn] = Field(default_factory=list)
+    # `max_digits`/`decimal_places` dropped (M2, final review) — see
+    # `CalculationIn.quantity`'s own comment: never stored, and the landing
+    # sends it through `parseFloat`.
+    quantity: Annotated[Decimal, Field(ge=0, le=MAX_QUANTITY)] | None = None
+    items: list[LivestockItemIn] = Field(default_factory=list, max_length=MAX_LIVESTOCK_ITEMS)
 
 
 # The five admissibility checks `checks.run_checks` runs (`checks.BLOCKING`) all

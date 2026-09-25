@@ -1,8 +1,10 @@
 """Contour identity + draft versions through the API, with the zone rule of ruling 18."""
 
+import math
 import uuid
 
 from app.modules.gis import repo
+from app.modules.gis.schemas import GEOMETRY_MAX_COORDINATES
 from tests.modules.gis.conftest import make_contour
 
 
@@ -41,6 +43,95 @@ async def test_gis_specialist_creates_a_contour_and_a_draft_version(
     assert body["version_no"] == 1
     assert float(body["area_ha"]) > 85  # computed, not the declared 2.6 (ruling 2)
     assert body["declared_area_ha"] == "2.6"  # kept for reference only
+
+
+async def test_a_geometry_over_the_coordinate_cap_is_422(gis_client, leshoz, contours_layer):
+    """Stage 17 QA run 01 (task 8): geometry has no maxLength/maxItems of its
+    own to bound it, so `GeoJsonGeometry`'s coordinate count is the one thing
+    standing between this route and a body of unbounded size. A ring of
+    `GEOMETRY_MAX_COORDINATES // 2 + 1` points, closed by repeating its first
+    point, is `GEOMETRY_MAX_COORDINATES // 2 + 2` points — two coordinate
+    PAIRS (four numbers) past the cap, not one (each point is 2 numbers) — a
+    valid convex polygon (not a degenerate one PostGIS would reject on its
+    own merits), refused before it ever reaches PostGIS."""
+    created = await gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(contours_layer.id),
+            "organization_id": str(leshoz.id),
+            "number": "huge-geom-1",
+            "kind": "contour",
+        },
+    )
+    assert created.status_code == 201
+    contour_id = created.json()["id"]
+
+    point_count = GEOMETRY_MAX_COORDINATES // 2 + 1
+
+    def _vertex(i: int) -> list[float]:
+        angle = 2 * math.pi * i / point_count
+        return [69.9 + 0.01 * math.cos(angle), 41.5 + 0.01 * math.sin(angle)]
+
+    ring = [_vertex(i) for i in range(point_count)]
+    ring.append(ring[0])
+    resp = await gis_client.post(
+        f"/api/v1/gis/contours/{contour_id}/versions",
+        json={"geom": {"type": "Polygon", "coordinates": [ring]}, "source": "survey"},
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "ERR-VAL-001"
+    assert "coordinates" in body["error"]["details"]["errors"][0]["msg"]
+
+
+async def test_a_geometry_collection_nested_inside_another_is_still_capped(
+    gis_client, leshoz, contours_layer
+):
+    """I3, final review. `_cap_geometry` used to read only the TOP level's
+    `geometries` list and, for each part, only that part's OWN `coordinates`
+    key — a GeometryCollection nested one level down has no `coordinates` key
+    of its own (only `geometries`), so `_count_numbers(None)` silently
+    counted it as zero numbers no matter how large the polygon inside it
+    was. The fix is an iterative walk over every number anywhere in the
+    whole dict, which this over-cap polygon two levels down must still
+    trip."""
+    created = await gis_client.post(
+        "/api/v1/gis/contours",
+        json={
+            "layer_id": str(contours_layer.id),
+            "organization_id": str(leshoz.id),
+            "number": "huge-geom-nested-1",
+            "kind": "contour",
+        },
+    )
+    assert created.status_code == 201
+    contour_id = created.json()["id"]
+
+    point_count = GEOMETRY_MAX_COORDINATES // 2 + 1
+
+    def _vertex(i: int) -> list[float]:
+        angle = 2 * math.pi * i / point_count
+        return [69.9 + 0.01 * math.cos(angle), 41.5 + 0.01 * math.sin(angle)]
+
+    ring = [_vertex(i) for i in range(point_count)]
+    ring.append(ring[0])
+    nested = {
+        "type": "GeometryCollection",
+        "geometries": [
+            {
+                "type": "GeometryCollection",
+                "geometries": [{"type": "Polygon", "coordinates": [ring]}],
+            }
+        ],
+    }
+    resp = await gis_client.post(
+        f"/api/v1/gis/contours/{contour_id}/versions",
+        json={"geom": nested, "source": "survey"},
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "ERR-VAL-001"
+    assert "coordinates" in body["error"]["details"]["errors"][0]["msg"]
 
 
 async def test_a_duplicate_number_in_one_organization_is_409(gis_client, leshoz, contours_layer):

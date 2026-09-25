@@ -32,6 +32,7 @@ from app.modules.reports import render, repo
 from app.modules.reports.models import Report, ReportForm
 from app.modules.reports.permissions import REPORTS_ACCEPT
 from app.modules.reports.rules import check_rows
+from app.modules.reports.schemas import REPORT_ROWS_MAX
 from app.modules.reports.signers import REPORT_APPROVE_PURPOSE, required_role
 from app.modules.signatures import service as signatures_service
 
@@ -384,6 +385,16 @@ async def generate_report(db: AsyncSession, report_id: uuid.UUID, actor: User) -
         period_start=report.period_start,
         period_end=report.period_end,
     )
+    # M4, final review: refuse loudly rather than silently truncate — a
+    # register that quietly drops rows past REPORT_ROWS_MAX is the same
+    # "hides data rather than leaking it" defect shape the stage keeps
+    # finding (docs/status.md), and here it would understate a leshoz's own
+    # activity in a document it signs.
+    if len(rows) > REPORT_ROWS_MAX:
+        raise err(
+            "ERR-VAL-001",
+            details={"reason": "report_too_large", "rows": len(rows), "max": REPORT_ROWS_MAX},
+        )
     report.data = {"rows": rows, "generated_at": datetime.now(UTC).isoformat()}
     report.filled_by = actor.id
     await audit.log(

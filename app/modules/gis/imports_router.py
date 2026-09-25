@@ -34,7 +34,7 @@ from app.core import files, settings_store, xlsx
 from app.core.deps import get_db
 from app.core.errors import err
 from app.core.idempotency import IdempotencyContext
-from app.core.schemas import Page, PageParams
+from app.core.schemas import CODE_MAX_LENGTH, TEXT_MAX_LENGTH, Page, PageParams
 from app.core.time import business_today
 from app.modules.auth.deps import idempotency_context, require_any_permission, require_permission
 from app.modules.auth.models import User
@@ -81,14 +81,17 @@ def _parse_attributes(raw: str) -> dict[str, Any]:
 async def create_import(
     request: Request,
     file: UploadFile,
-    layer_code: Annotated[str, Form()],
+    layer_code: Annotated[str, Form(min_length=1, max_length=CODE_MAX_LENGTH)],
     organization_id: Annotated[uuid.UUID, Form()],
     approval_doc_id: Annotated[uuid.UUID, Form()],
-    fmt: Annotated[str, Form(alias="format")],
+    # A max_length bound only, not an enum pattern: an out-of-range value must
+    # still reach `import_service.create_import`'s own `ERR-GIS-004`
+    # (`unsupported_format`), not FastAPI's generic 422 (stage 17, task 8).
+    fmt: Annotated[str, Form(alias="format", max_length=CODE_MAX_LENGTH)],
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_permission(CONTOURS_MANAGE))],
     ctx: Annotated[IdempotencyContext, Depends(idempotency_context)],
-    attributes: Annotated[str, Form()] = "{}",
+    attributes: Annotated[str, Form(max_length=TEXT_MAX_LENGTH)] = "{}",
 ) -> ImportAccepted:
     """202, not 201: the file is stored and the work is QUEUED (ruling 6). The
     parse happens in `jobs.process_gis_imports`, which is why a 151-feature

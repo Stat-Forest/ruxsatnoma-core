@@ -137,6 +137,65 @@ async def test_reading_a_parameter_needs_no_special_permission(
     assert listed.json()["total"] >= 2
 
 
+async def test_a_reversed_period_is_a_422_on_create_and_on_patch(
+    tariffs_maker_client: AsyncClient, unique_suffix: str
+) -> None:
+    """QA run 01, a3-central-02 (P1): `effective_to` before `effective_from`
+    reached `flush()` unguarded in `create_versioned`/`update_versioned` and
+    surfaced as an uncaught `IntegrityError` -> `ERR-SYS-001`/500."""
+    response = await tariffs_maker_client.post(
+        "/api/v1/rule-parameters",
+        json={
+            "code": f"test_param_{unique_suffix}",
+            "value": "0.9",
+            "effective_from": "2026-10-10",
+            "effective_to": "2026-10-01",
+            "basis": "t",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["reason"] == "effective_to_before_from"
+
+    created = await tariffs_maker_client.post(
+        "/api/v1/rule-parameters",
+        json={
+            "code": f"test_param_{unique_suffix}_2",
+            "value": "0.9",
+            "effective_from": "2036-01-01",
+            "basis": "t",
+        },
+    )
+    assert created.status_code == 201, created.text
+    patched = await tariffs_maker_client.patch(
+        f"/api/v1/rule-parameters/{created.json()['id']}", json={"effective_to": "2000-01-01"}
+    )
+    assert patched.status_code == 422, patched.text
+    assert patched.json()["error"]["details"]["reason"] == "effective_to_before_from"
+
+
+async def test_an_explicit_null_effective_from_is_a_422_not_a_500(
+    tariffs_maker_client: AsyncClient, unique_suffix: str
+) -> None:
+    """M3, final review: same guard as `TariffPatch`'s own — `effective_from`
+    backs a NOT NULL column, and an explicit JSON `null` used to reach
+    `update_versioned`'s `effective_to < effective_from` as a date-vs-None
+    comparison, an unhandled `TypeError` -> 500."""
+    created = await tariffs_maker_client.post(
+        "/api/v1/rule-parameters",
+        json={
+            "code": f"test_param_{unique_suffix}_3",
+            "value": "0.9",
+            "effective_from": "2036-01-01",
+            "basis": "t",
+        },
+    )
+    assert created.status_code == 201, created.text
+    patched = await tariffs_maker_client.patch(
+        f"/api/v1/rule-parameters/{created.json()['id']}", json={"effective_from": None}
+    )
+    assert patched.status_code == 422, patched.text
+
+
 async def test_a_second_maker_cannot_publish_another_makers_draft(
     tariffs_maker_client: AsyncClient,
     second_tariffs_maker_client: AsyncClient,

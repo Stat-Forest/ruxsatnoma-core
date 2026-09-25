@@ -8,9 +8,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
-from app.core.schemas import LocalizedName
+from app.core.schemas import CodeStr, LocalizedName, NameStr, TextStr
+
+# `Numeric(18, 2)`/`Numeric(12, 4)` (`auth/models.py::Role`) — `le = 10**(p-s) -
+# 10**-s` (stage 17 R4).
+MAX_APPROVE_AMOUNT = Decimal("9999999999999999.99")
+MAX_APPROVE_AREA = Decimal("99999999.9999")
 
 # Matches the DB's `pinfl_format` CHECK (ASCII-only digits, migration 0007):
 # catching the shape here means a bad value 422s at the schema boundary instead of
@@ -52,16 +57,16 @@ class UserCreateIn(BaseModel):
     """Staff roles only (`role_code != "applicant"`, ruling 8/9) — applicants are
     born via OneID/E-IMZO, never created by hand here, so `login` is mandatory."""
 
-    login: str
-    full_name: str
-    role_code: str
+    login: CodeStr
+    full_name: NameStr
+    role_code: CodeStr
     pinfl: Pinfl | None = None
-    position: str | None = None
+    position: NameStr | None = None
     organization_id: uuid.UUID | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
-    phone: str | None = None
-    email: str | None = None
+    phone: CodeStr | None = None
+    email: EmailStr | None = None
     valid_until: date | None = None
 
 
@@ -71,21 +76,21 @@ class UserPatchIn(BaseModel):
     Assigning a non-applicant `role_code` requires a `login` (stored or in the same
     patch) — ruling 9."""
 
-    full_name: str | None = None
-    position: str | None = None
+    full_name: NameStr | None = None
+    position: NameStr | None = None
     pinfl: Pinfl | None = None
-    phone: str | None = None
-    email: str | None = None
+    phone: CodeStr | None = None
+    email: EmailStr | None = None
     organization_id: uuid.UUID | None = None
     region_id: uuid.UUID | None = None
     district_id: uuid.UUID | None = None
-    role_code: str | None = None
-    login: str | None = None
+    role_code: CodeStr | None = None
+    login: CodeStr | None = None
     valid_until: date | None = None
 
 
 class UserBlockIn(BaseModel):
-    reason: str
+    reason: TextStr
 
 
 class UserCreatedOut(BaseModel):
@@ -128,12 +133,12 @@ class RoleCreateIn(BaseModel):
     and, for any limit NOT explicitly given here, its `max_approve_amount`/
     `max_approve_area` too — an explicit value in this payload always wins."""
 
-    code: str
+    code: CodeStr
     name: LocalizedName
     description: LocalizedName | None = None
-    max_approve_amount: Decimal | None = None
-    max_approve_area: Decimal | None = None
-    copy_from: str | None = None
+    max_approve_amount: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AMOUNT)
+    max_approve_area: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AREA)
+    copy_from: CodeStr | None = None
 
 
 class RolePatchIn(BaseModel):
@@ -142,16 +147,17 @@ class RolePatchIn(BaseModel):
 
     name: LocalizedName | None = None
     description: LocalizedName | None = None
-    max_approve_amount: Decimal | None = None
-    max_approve_area: Decimal | None = None
+    max_approve_amount: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AMOUNT)
+    max_approve_area: Decimal | None = Field(default=None, ge=0, le=MAX_APPROVE_AREA)
 
 
 class PermissionCodesIn(BaseModel):
     """Replace-set request body, shared by `PUT /admin/roles/{id}/permissions` and
     `PUT /admin/users/{id}/permissions` (personal grants) — same `{codes: [...]}`
-    shape for both."""
+    shape for both. 200 (stage 17 R3) is well past the 58 codes the registry
+    holds today (`.claude/lessons.md`'s own count for a superuser's `/auth/me`)."""
 
-    codes: list[str]
+    codes: Annotated[list[CodeStr], Field(max_length=200)]
 
 
 class PermissionCodesOut(BaseModel):
