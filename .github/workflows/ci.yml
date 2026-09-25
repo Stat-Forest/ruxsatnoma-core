@@ -92,7 +92,8 @@ jobs:
             -c "CREATE DATABASE ruxsatnoma_test OWNER ruxsatnoma"
           PGPASSWORD=ruxsatnoma psql -h localhost -U ruxsatnoma -d ruxsatnoma_test \
             -c "CREATE EXTENSION IF NOT EXISTS postgis"
-      # -n 4 mirrors `make test`. Each worker migrates a database of its own,
+      # -n 4 here, -n 1 in `make test` since 2026-09-25: the local machine runs
+      # several sessions at once, this runner runs one job. Each worker migrates a database of its own,
       # named after DATABASE_URL_TEST (tests/conftest.py) and created on the
       # spot -- the CREATE DATABASE above covers only a serial run. No
       # --fresh-db here: the `services:` postgres is new for every job.

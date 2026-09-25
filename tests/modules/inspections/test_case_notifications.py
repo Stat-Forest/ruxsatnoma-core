@@ -88,12 +88,13 @@ async def test_requesting_an_explanation_notifies_with_its_deadline(
     assert case.explanation_due_at.strftime("%d.%m.%Y") in rows[-1].rendered_text
 
 
-@pytest.mark.parametrize("decision", ["warning", "suspend", "revoke", "transfer"])
-async def test_every_decision_reaches_the_violator(
-    db, executor_head_client, opened_case: dict, applicant_user, decision: str
+async def test_a_decision_reaches_the_violator(
+    db, executor_head_client, opened_case: dict, applicant_user
 ) -> None:
+    """One decision, not all four: `service.decide_case` stores the value and
+    notifies the same way whatever it is — no branch reads it."""
     resp = await executor_head_client.post(
-        f"{API}/cases/{opened_case['case_id']}/decide", json={"decision": decision}
+        f"{API}/cases/{opened_case['case_id']}/decide", json={"decision": "suspend"}
     )
     assert resp.status_code == 200, resp.text
 

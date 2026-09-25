@@ -76,17 +76,21 @@ TEST_PATHS =
 endif
 
 test:               ## Test suite; one module with M=<name> -- make test M=payments
-	uv run pytest -q -n 4 --fresh-db $(TEST_PATHS)
+	uv run pytest -q -n 1 --fresh-db $(TEST_PATHS)
 
 test-all:           ## Full test suite (needs `make up`; CI's `test` job)
-	# -n 4: the suite is I/O-bound on PostgreSQL and MinIO, so four workers cut
-	# it from ~14 min to ~3 (measured 2026-09-06). Each worker migrates a test
-	# DB of its own -- tests/conftest.py derives its name from DATABASE_URL_TEST.
-	# --fresh-db re-creates those DBs first: fixtures place random polygons and
-	# never clean up, so leftovers from the last run turn into ERR-GIS-002 in
-	# fixtures that have nothing to do with geometry. Debugging one file is
-	# faster without either flag: uv run pytest tests/modules/<x>/test_y.py
-	uv run pytest -q -n 4 --fresh-db
+	# -n 1 locally (2026-09-25, amends decision #92): four workers per run made a
+	# solo suite ~4x faster, but this machine runs several sessions at once and
+	# each one's `make check` put four more workers on the one PostgreSQL inside
+	# a 4-CPU Docker VM -- five sessions were twenty workers and everything
+	# crawled. One worker keeps a run on a database of its own (`_gw0`, derived
+	# from DATABASE_URL_TEST by tests/conftest.py). CI keeps -n 4: its runner is
+	# not this machine. --fresh-db re-creates that DB first: fixtures place
+	# random polygons and never clean up, so leftovers from the last run turn
+	# into ERR-GIS-002 in fixtures that have nothing to do with geometry.
+	# Debugging one file is faster without either flag:
+	# uv run pytest tests/modules/<x>/test_y.py
+	uv run pytest -q -n 1 --fresh-db
 
 security:           ## Security scan (bandit), same args as CI and pre-commit
 	# Run via uvx: bandit is a linter, not an app dependency, so it stays out of

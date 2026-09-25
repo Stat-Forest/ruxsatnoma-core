@@ -10,7 +10,6 @@ than the list would be a scoping leak with a friendlier face.
 
 import uuid
 
-import pytest
 from sqlalchemy import func
 
 from app.main import create_app
@@ -137,17 +136,14 @@ async def test_an_anonymous_caller_gets_nothing():
     assert resp.json()["error"]["code"] == "ERR-AUTH-002"
 
 
-@pytest.mark.parametrize(
-    "bbox",
-    ["1,2,3", "a,b,c,d", "nan,nan,nan,nan", "10,10,5,5", "-200,0,200,0"],
-    ids=["too-few", "not-numeric", "not-finite", "min-past-max", "out-of-range"],
-)
-async def test_a_malformed_viewport_is_refused_not_crashed(applicant_client, bbox):
+async def test_a_malformed_viewport_is_refused_not_crashed(applicant_client):
     """`_parse_bbox`'s guarantee, reasserted on this route: bad input is a 422,
     never a 500. `nan` is the one that matters — every comparison against it is
     False, so it passes a naive range check and reaches PostGIS, which raises,
-    and `app/main.py` has no `DBAPIError` handler."""
-    resp = await applicant_client.get(f"/api/v1/gis/contours/features?bbox={bbox}")
+    and `app/main.py` has no `DBAPIError` handler. One case proves this route is
+    wired to the shared parser; the parser's other refusals are exhausted in
+    `test_read_api.py::test_every_bad_bbox_is_422_on_both_read_endpoints`."""
+    resp = await applicant_client.get("/api/v1/gis/contours/features?bbox=nan,nan,nan,nan")
 
     assert resp.status_code == 422, resp.text
 

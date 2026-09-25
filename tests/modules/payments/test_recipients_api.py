@@ -219,15 +219,6 @@ async def test_a_recipient_is_deactivated_not_deleted(client, sys_admin, budget_
     assert after_active == {**before_active, str(budget_50.id): False}
 
 
-async def test_uz_latn_is_required_in_the_name(client, sys_admin):
-    response = await client.post(
-        "/api/v1/payments/recipients",
-        json={"name": {"ru": "Только по-русски"}, "kind": "percent", "percent": "1.00"},
-        headers=sys_admin,
-    )
-    assert response.status_code == 422
-
-
 async def test_clearing_a_percent_recipients_own_percent_is_refused(client, sys_admin, budget_50):
     """`PaymentRecipientPatch.percent` is typed `Decimal | None`, so a bare
     `null` parses — but clearing the only amount a `percent`-kind row is

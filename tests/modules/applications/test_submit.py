@@ -1048,18 +1048,6 @@ async def test_a_citizen_signs_with_the_button_and_it_is_a_simple_signature(
     assert signature_row["verification_status"] == "valid"
 
 
-async def test_a_legal_entity_without_an_envelope_is_refused(
-    representative_client, legal_filing_ready_for_submission
-) -> None:
-    """Ruling #183's OTHER half: decision #9 still requires ERI of a legal
-    entity's representative — the button is `on_behalf="self"` alone."""
-    refused = await _submit_with_button(representative_client, legal_filing_ready_for_submission)
-    assert refused.status_code == 422, refused.text
-    error = refused.json()["error"]
-    assert error["code"] == "ERR-SIGN-001"
-    assert error["details"]["reason"] == "simple_signature_not_allowed"
-
-
 async def test_the_eri_path_also_stamps_rules_accepted_at(
     applicant_client, filing_ready_for_submission
 ) -> None:

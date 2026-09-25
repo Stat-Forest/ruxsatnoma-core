@@ -38,6 +38,10 @@ from app.modules.permits import events, render, repo, service
 from app.modules.permits.models import Permit, PermitStatusHistory, PermitTemplate
 from tests.modules.permits.conftest import PAID_AT, STORED_LAYOUT, make_paid_application
 
+# Issuance itself: the one file that keeps the whole chain real, WeasyPrint included
+# (the root conftest's stand-in serves every other test that merely needs a permit).
+pytestmark = pytest.mark.real_pdf
+
 API = "/api/v1"
 
 
