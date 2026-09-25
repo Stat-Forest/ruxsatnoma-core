@@ -32,11 +32,10 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import Event, publish
-from app.core.time import business_today
 from app.main import create_app
 from app.modules.applications.events import APPLICATION_APPROVED
 from app.modules.applications.models import Application
-from app.modules.auth.models import Applicant, Representation
+from app.modules.auth.models import Applicant, User
 from app.modules.payments import service as payments_service
 from app.modules.payments.models import Invoice
 from tests.conftest import make_client
@@ -204,16 +203,12 @@ async def test_a_same_key_retry_after_a_refused_pay_intent_replays_it_not_in_fli
     assert retried.json()["error"]["code"] == "ERR-PAY-004"
 
 
-# --- ownership ruling: an effective representative may act too --------------
-# Task 2 shipped the invoice routes admitting only the applicant's own
-# `owner_user_id`, leaving a legal entity's non-owner representative unable
-# to see or pay an invoice they filed themselves — deliberately carried to
-# this task because the pay-intent route reuses the same check
-# (`service._may_act_on_invoices_of`). These fixtures build a LEGAL
-# applicant (the only kind a `Representation` means anything for —
-# `Applicant.owner_user_id` is `None` by construction for `kind='legal'`,
-# decision #9) rather than reusing `pending_invoice`'s own individual
-# `applicant`.
+# --- ownership: a legal entity's own account may act too --------------------
+# Decision #226 retired the "representation" mechanism: an organisation logs
+# into its own cabinet (`Applicant.owner_user_id`, the same 1:1 link an
+# individual has) rather than acting through a separate representative
+# account. This fixture set builds that LEGAL applicant, owned, rather than
+# reusing `pending_invoice`'s own individual `applicant`.
 
 
 def _stir() -> str:
@@ -224,7 +219,8 @@ def _stir() -> str:
 
 @pytest.fixture
 async def legal_applicant(db: AsyncSession) -> Applicant:
-    row = Applicant(kind="legal", stir=_stir(), name="OOO Represented")
+    user = await make_user(db, role_code="applicant", pinfl=None)
+    row = Applicant(kind="legal", stir=_stir(), name="OOO Owned", owner_user_id=user.id)
     db.add(row)
     await db.flush()
     return row
@@ -234,13 +230,12 @@ async def legal_applicant(db: AsyncSession) -> Applicant:
 async def legal_invoice(db: AsyncSession, legal_applicant: Applicant) -> Invoice:
     """A pending invoice for `legal_applicant`, built directly — Task 1's
     own model-level idiom (mirrors `conftest.py::invoice`) — since this
-    fixture exists only to give the representative test an invoice whose
+    fixture exists only to give the ownership test an invoice whose
     OWNING APPLICANT is `kind='legal'`."""
-    submitter = await make_user(db, role_code="applicant", pinfl=_pinfl())
     application = Application(
         applicant_id=legal_applicant.id,
-        submitted_by_user_id=submitter.id,
-        on_behalf="legal",
+        submitted_by_user_id=legal_applicant.owner_user_id,
+        on_behalf="self",
         channel="portal",
         status="APPROVED",
     )
@@ -266,26 +261,11 @@ async def legal_invoice(db: AsyncSession, legal_applicant: Applicant) -> Invoice
 
 @pytest.fixture
 async def representative_client(db: AsyncSession, legal_applicant: Applicant):
-    """A user who is themselves a registered individual applicant (required
-    by `get_current_user`'s own `ERR-AUTH-008` gate on any `applicant`-role
-    account with no `Applicant` row of its own — decision #9's
-    representatives are real accounts, not bare grants) AND holds an
-    ACTIVE `Representation` over `legal_applicant`, `basis='org_eri'`
-    (needs no `poa_file_id`/`valid_until` — the DB CHECK only requires those
-    for `basis='poa'`)."""
-    user = await make_user(db, role_code="applicant", pinfl=_pinfl())
-    db.add(
-        Applicant(kind="individual", pinfl=user.pinfl, name=user.full_name, owner_user_id=user.id)
-    )
-    db.add(
-        Representation(
-            applicant_id=legal_applicant.id,
-            user_id=user.id,
-            basis="org_eri",
-            valid_from=business_today(),
-        )
-    )
-    await db.flush()
+    """`legal_applicant`'s own account, signed in — kept under this name for
+    the test below (decision #226 retired the separate representative
+    identity this fixture used to build via `Representation`)."""
+    user = await db.get(User, legal_applicant.owner_user_id)
+    assert user is not None
     _, token, csrf = await make_session(db, user)
     await db.commit()
     async with make_client(create_app(), lifespan=True) as client:
@@ -294,7 +274,7 @@ async def representative_client(db: AsyncSession, legal_applicant: Applicant):
         yield client
 
 
-async def test_a_representative_can_start_a_payment_for_the_applicant_they_represent(
+async def test_a_legal_entitys_own_account_can_start_a_payment_for_itself(
     representative_client, legal_invoice
 ):
     result = await representative_client.post(

@@ -462,8 +462,6 @@ class ApplicationOut(BaseModel):
     status: ApplicationStatus
     applicant_id: uuid.UUID
     submitted_by_user_id: uuid.UUID
-    on_behalf: OnBehalf
-    representation_id: uuid.UUID | None
     activity_type_id: uuid.UUID | None
     contour_id: uuid.UUID | None
     contour_version_id: uuid.UUID | None
@@ -718,10 +716,12 @@ class ApplicationFilingIn(BlankLinesMixin):
     claim and the documents. The body of `POST /applications/precheck` and
     `POST /applications/package`, and the base of `ApplicationFileIn`.
 
-    `applicant_id` is meaningful only with `on_behalf="legal"`: for `"self"`
-    the applicant is the caller's own `applicants` row and naming somebody
-    else's is refused by the service with a domain reason
-    (`applicant_is_not_the_caller`), never silently ignored.
+    **No `on_behalf`/`applicant_id` since stage 18 (decision #226, R5).** The
+    "representation" mechanism is gone: an application is always filed for
+    the CALLER's own applicant, resolved server-side
+    (`service._resolve_applicant`, `auth.service.get_own_applicant`) — an
+    individual's own row or, since an organisation now logs into its own
+    cabinet, a legal one just the same. There is nobody else to name.
 
     `documents` carry file ids already uploaded through `POST /files` (plan
     12, R9); each must be the caller's own active upload.
@@ -735,8 +735,6 @@ class ApplicationFilingIn(BlankLinesMixin):
 
     model_config = ConfigDict(extra="forbid")
 
-    on_behalf: OnBehalf
-    applicant_id: uuid.UUID | None = None
     activity_type_id: uuid.UUID | None = None
     contour_id: uuid.UUID | None = None
     period_from: date | None = None

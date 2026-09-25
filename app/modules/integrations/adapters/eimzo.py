@@ -122,6 +122,13 @@ class EimzoCertificateInfo:
     pinfl_or_stir: str
     valid_from: datetime
     valid_to: datetime
+    # C1 (final review, stage 18): a real organisation certificate carries
+    # BOTH the employee's PINFL and the org TIN (`read_subject`'s two OIDs),
+    # and `pinfl_or_stir` -- the PERSONAL identifier, when present -- cannot
+    # also carry the TIN. `signatures.service._ownership_reason` needs the
+    # TIN on its own to prove a legal cabinet's ownership of such a
+    # certificate; `None` for a personal-only certificate.
+    tin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +200,7 @@ def encode_mock_signature(
     issuer: str,
     pinfl: str,
     *,
+    tin: str | None = None,
     subject: str | None = None,
     valid_from: datetime | None = None,
     valid_to: datetime | None = None,
@@ -204,13 +212,21 @@ def encode_mock_signature(
     signing time, the document itself (so `verify_attached` can recover it) and
     its sha256 (so `verify_detached` can check it without decoding the rest).
     Unset validity/signing times default to a window that brackets "now", so a
-    caller that only names the four required fields still gets a valid signature."""
+    caller that only names the four required fields still gets a valid signature.
+
+    `tin` is optional and REAL-SHAPED (C1, final review): a genuine
+    organisation certificate carries the signer's own PINFL in `pinfl`
+    (never empty for a person holding the key) AND the org's TIN separately
+    -- a test wanting to reproduce that must pass both, not just `pinfl=
+    stir` as every caller did before this fix, which never exercised the
+    branch of `_ownership_reason` a legal cabinet's OWN key actually hits."""
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "serial_number": serial,
         "issuer": issuer,
         "subject": subject or f"PINFL={pinfl}",
         "pinfl_or_stir": pinfl,
+        "tin": tin,
         "valid_from": (valid_from or now - timedelta(days=30)).isoformat(),
         "valid_to": (valid_to or now + timedelta(days=365)).isoformat(),
         "signed_at": (signed_at or now).isoformat(),
@@ -243,6 +259,9 @@ def _verify_envelope(pkcs7: str, document: bytes | None) -> EimzoVerification:
             issuer=data["issuer"],
             subject=data["subject"],
             pinfl_or_stir=data["pinfl_or_stir"],
+            # `.get`, not `[...]`: an envelope encoded before this fix (or by
+            # a caller that never passes `tin=`) has no such key at all.
+            tin=data.get("tin"),
             valid_from=datetime.fromisoformat(data["valid_from"]),
             valid_to=datetime.fromisoformat(data["valid_to"]),
         )
@@ -529,8 +548,10 @@ class RealEimzo:
         into `users.full_name`; joining an organization's name onto it on
         every legal-entity-certificate login would corrupt a real citizen's
         name field. `tin`/`legal_name` (the org's own STIR and display name)
-        are filled in from the same `subjectName` map for `_verify_org_challenge`'s
-        two callers, which `login_via_eimzo` itself never reads.
+        are filled in from the same `subjectName` map for `login_via_eimzo`
+        itself to read (R2, decision #226): an organisation certificate's
+        `tin` is what routes that call to `login_or_create_legal` instead of
+        the personal branch.
 
         Local import of `eimzo_wire` (module docstring): that module imports
         FROM this one at its own top level, so importing it back at THIS

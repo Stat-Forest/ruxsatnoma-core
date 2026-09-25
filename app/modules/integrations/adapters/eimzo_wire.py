@@ -39,15 +39,16 @@ def parse_provider_datetime(value: str) -> datetime:
 def read_subject(subject_name: dict[str, str]) -> tuple[str, str, str | None]:
     """The certificate subject as an OID-keyed map (`design/04` §2.2 step 5).
 
-    Returns `(human-readable subject, the identifier ownership is proven
-    against, the organization STIR if this is a legal-entity certificate)`.
-    The PERSONAL PINFL wins whenever both are present: `signatures.service.
-    _ownership_reason` compares the identifier against the signed-in user's
-    own `users.pinfl`, and a legal-entity certificate still names the human
-    who holds it. With no personal PINFL at all (a legal-entity-only
-    certificate), the org STIR is what `pinfl_or_stir` falls back to — some
-    identifier has to be there for that same ownership check to compare
-    against."""
+    Returns `(human-readable subject, the identifier `pinfl_or_stir` carries,
+    the organization TIN if this is an organisation certificate)`. The third
+    value is returned SEPARATELY from the second because a real organisation
+    certificate carries BOTH a personal PINFL and the org TIN at once (C1,
+    final review) — `pinfl_or_stir` alone cannot hold both, so it keeps the
+    PERSONAL PINFL when present (falling back to the TIN only for a
+    legal-entity-only certificate with no PINFL at all), and
+    `signatures.service._ownership_reason` reads the TIN return value
+    directly to prove a legal cabinet's ownership of a certificate whose
+    `pinfl_or_stir` is a PINFL, not that cabinet's STIR."""
     pinfl = subject_name.get(OID_PINFL, "").strip()
     legal_tin = subject_name.get(OID_LEGAL_TIN, "").strip() or None
     common_name = subject_name.get("CN", "").strip()
@@ -71,12 +72,13 @@ def _certificate_from_pkcs7_entry(cert_data: dict[str, Any]) -> EimzoCertificate
     `ValueError` escaping `sign()`'s `except EimzoError` as an unhandled
     500 with no signature row, no audit entry and no integration-log row."""
     try:
-        subject, identifier, _legal_tin = read_subject(cert_data.get("subjectInfo") or {})
+        subject, identifier, legal_tin = read_subject(cert_data.get("subjectInfo") or {})
         return EimzoCertificateInfo(
             serial_number=cert_data["serialNumber"],
             issuer=cert_data.get("issuerName", ""),
             subject=subject,
             pinfl_or_stir=identifier,
+            tin=legal_tin,
             valid_from=parse_provider_datetime(cert_data["validFrom"]),
             valid_to=parse_provider_datetime(cert_data["validTo"]),
         )

@@ -139,10 +139,13 @@ class Application(Base):
     number: Mapped[str | None] = mapped_column(unique=True)
     applicant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("applicants.id"), index=True)
     submitted_by_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    # Stage 18 (decision #226) removed the "representation" mechanism:
+    # `on_behalf` is no longer client-settable and `service.file` always
+    # writes `"self"` — every application is filed for the caller's own
+    # applicant, individual or legal. The column and its CHECK stay (never
+    # dropped, `ON_BEHALF_VALUES` unchanged) so a historical `"legal"` row
+    # filed before this stage still reads back honestly.
     on_behalf: Mapped[str]
-    representation_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("representations.id"), index=True
-    )
     activity_type_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("activity_types.id"), index=True
     )

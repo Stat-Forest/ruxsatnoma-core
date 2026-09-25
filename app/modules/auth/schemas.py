@@ -2,7 +2,7 @@
 
 import re
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from email_validator import validate_email
@@ -97,15 +97,6 @@ class ApplicantAddressIn(BaseModel):
     address: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 
-class RepresentationOut(BaseModel):
-    id: uuid.UUID
-    applicant: ApplicantOut
-    basis: str
-    valid_from: date
-    valid_until: date | None
-    status: str
-
-
 class MeOut(BaseModel):
     user: UserOut
     role: RoleOut
@@ -126,7 +117,6 @@ class MeOut(BaseModel):
     # Applicant-role only (ruling 16); every other role keeps the defaults below so
     # existing staff suites stay green without touching their assertions.
     applicant: ApplicantOut | None = None
-    representations: list[RepresentationOut] = []
     registration_complete: bool = True
 
 
@@ -266,44 +256,6 @@ class OtpVerifyIn(BaseModel):
 
 class OtpVerifyOut(BaseModel):
     otp_token: str
-
-
-class AttachLegalIn(BaseModel):
-    stir: str = Field(pattern=r"^[0-9]{9}$")
-    basis: Literal["org_eri", "director_registry", "poa"]
-    signed_challenge: BlobStr | None = None
-    poa_file_id: uuid.UUID | None = None
-    valid_until: date | None = None
-    name: NameStr | None = None
-
-    @model_validator(mode="after")
-    def _validate_basis_fields(self) -> AttachLegalIn:
-        if self.basis == "org_eri" and not self.signed_challenge:
-            raise ValueError("org_eri requires signed_challenge")
-        if self.basis == "poa" and not (self.poa_file_id and self.valid_until and self.name):
-            raise ValueError("poa requires poa_file_id, valid_until and name")
-        return self
-
-
-class AttachLegalOut(BaseModel):
-    applicant: ApplicantOut
-    representation: RepresentationOut
-
-
-class AddRepresentationIn(BaseModel):
-    user_pinfl: str = Field(pattern=r"^[0-9]{14}$")
-    basis: Literal["org_eri", "director_registry", "poa"]
-    signed_challenge: BlobStr | None = None
-    poa_file_id: uuid.UUID | None = None
-    valid_until: date | None = None
-
-    @model_validator(mode="after")
-    def _validate_basis_fields(self) -> AddRepresentationIn:
-        if self.basis == "org_eri" and not self.signed_challenge:
-            raise ValueError("org_eri requires signed_challenge")
-        if self.basis == "poa" and not (self.poa_file_id and self.valid_until):
-            raise ValueError("poa requires poa_file_id and valid_until")
-        return self
 
 
 class ContactUpdateIn(BaseModel):

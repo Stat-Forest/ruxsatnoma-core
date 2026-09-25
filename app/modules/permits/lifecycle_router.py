@@ -275,9 +275,10 @@ async def extend_permit(
     permit is not `active` or its period has already ended (applied for
     afresh instead, never extended). 409 `ERR-APP-002`
     `extension_already_open` with the existing application's id when one is
-    already open against this permit. 422 `ERR-VAL-001`
-    `applicant_is_not_the_holder` when the body names another applicant;
-    everything `POST /applications` refuses, refused here the same way.
+    already open against this permit. There is no more `applicant_id` in the
+    body to name another applicant with (decision #226, R5) — the applicant
+    is always the holder, resolved server-side; everything else `POST
+    /applications` refuses, refused here the same way.
     """
     application = await service.extend(
         db, permit_id, payload, actor=actor, ip=request.client.host if request.client else None

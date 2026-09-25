@@ -21,11 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core import settings_store
 from app.core.models import IdempotencyKey
-from app.core.time import business_today
 from app.modules.applications import jobs as applications_jobs
 from app.modules.audit import service as audit
 from app.modules.auth import service as auth_service
-from app.modules.auth.models import OtpCode, Representation, Session
+from app.modules.auth.models import OtpCode, Session
 from app.modules.gis import import_service as gis_import_service
 from app.modules.integrations.models import OutboxMessage
 from app.modules.notifications import service as notifications_service
@@ -88,39 +87,6 @@ async def purge_stale_rows(factory: async_sessionmaker[AsyncSession]) -> dict[st
         await db.commit()
     logger.info("job.purge_stale_rows", **counts)
     return counts
-
-
-async def expire_representations(factory: async_sessionmaker[AsyncSession]) -> int:
-    """Flip past-valid_until active representations to 'expired' (3.2b ruling 14
-    carry-over): reads already exclude them; this makes the stored status true."""
-    async with factory() as db:
-        rows = (
-            (
-                await db.execute(
-                    select(Representation).where(
-                        Representation.status == "active",
-                        Representation.valid_until.is_not(None),
-                        Representation.valid_until < business_today(),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        correlation = f"job:{uuid.uuid4()}"
-        for rep in rows:
-            rep.status = "expired"
-            await audit.log(
-                db,
-                action="representation.expire",
-                user_id=None,
-                object_type="representation",
-                object_id=rep.id,
-                correlation_id=correlation,
-            )
-        await db.commit()
-    logger.info("job.expire_representations", expired=len(rows))
-    return len(rows)
 
 
 # The audience of system alerts. Kept as a code constant, not a setting: an

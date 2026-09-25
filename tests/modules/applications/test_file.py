@@ -89,7 +89,6 @@ async def test_a_legal_entity_files_with_the_package_it_signed(
     result = await _submit(representative_client, legal_filing_ready_for_submission)
     assert result.status_code == 201, result.text
     assert result.json()["status"] == "SUBMITTED"
-    assert result.json()["on_behalf"] == "legal"
 
 
 async def test_a_legal_entity_without_an_envelope_is_refused_before_anything_is_written(
@@ -135,7 +134,8 @@ async def test_a_signature_over_another_package_cannot_file_under_a_taken_id(
     first = await _submit(representative_client, legal_filing_ready_for_submission)
     assert first.status_code == 201, first.text
     taken = first.json()["id"]
-    pinfl = (await representative_client.get("/api/v1/auth/me")).json()["applicant"]["pinfl"]
+    me_applicant = (await representative_client.get("/api/v1/auth/me")).json()["applicant"]
+    pinfl = me_applicant["pinfl"] or me_applicant["stir"]
     next_season = {
         **legal_filing_ready_for_submission,
         "period_from": "2028-05-01",
@@ -192,7 +192,7 @@ async def test_an_id_already_filed_is_refused_by_the_primary_key(
         document=package,
         serial=f"SER-{uuid.uuid4().hex[:12]}",
         issuer="ISS-TEST",
-        pinfl=me["applicant"]["pinfl"],
+        pinfl=me["applicant"]["pinfl"] or me["applicant"]["stir"],
     )
     with pytest.raises(DomainError) as refused:
         await service.file(
@@ -292,3 +292,18 @@ async def test_a_replayed_key_returns_the_stored_response_and_not_a_second_numbe
     again = await _submit_with_button(applicant_client, filing_ready_for_submission, key=key)
     assert first.status_code == again.status_code == 201, again.text
     assert first.json()["number"] == again.json()["number"]
+
+
+async def test_a_stranger_filing_the_same_body_files_for_their_own_account(
+    other_applicant_client, legal_filing_ready_for_submission
+):
+    """Decision #226 (R5) closed the surface this used to guard against: there
+    is no more `applicant_id`/`on_behalf` field a body could name someone
+    else's applicant through — `_resolve_applicant` always resolves the
+    CALLER's own row, so posting `legal_filing_ready_for_submission`'s other
+    fields (contour, activity, period) as a different, unrelated applicant
+    simply files it for THAT caller's own account, never the legal entity's."""
+    result = await _submit_with_button(other_applicant_client, legal_filing_ready_for_submission)
+    assert result.status_code == 201, result.text
+    me = await other_applicant_client.get("/api/v1/auth/me")
+    assert result.json()["applicant_id"] == me.json()["applicant"]["id"]

@@ -772,8 +772,7 @@ async def revoke_session(db: AsyncSession, *, session_id: uuid.UUID, actor: User
         object_type="session",
         object_id=session.id,
         basis="admin",
-        # Same key convention as `add_representation`'s extra={"for_user": ...}
-        # (auth/service.py) for an actor-acts-on-someone-else audit row: a bare
+        # The convention for an actor-acts-on-someone-else audit row: a bare
         # "user_id" here would read as a duplicate of the top-level actor column.
         extra={"for_user": str(session.user_id)},
     )

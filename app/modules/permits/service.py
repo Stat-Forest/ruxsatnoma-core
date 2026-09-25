@@ -1311,12 +1311,12 @@ def _permit_number(series: str, number: int) -> str:
 async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:
     """Whether `user` is the permit's own holder — the 4th signature line.
 
-    Two ways, the same two `auth` already recognises everywhere else: the
-    individual applicant's own account (`applicants.owner_user_id`), or an
-    EFFECTIVE representation of a legal-entity applicant, judged against
-    `business_today()` inside `auth.service` so a lapsed power of attorney stops
-    working the day it lapses (decision #9: a legal entity has no account of its
-    own and always acts through a representative).
+    Since decision #226 (R4) this is simply "is `permit.applicant_id` this
+    user's own applicant" — `auth.service.own_applicant_ids` returns exactly
+    one row, individual or legal, through `applicants.owner_user_id`. The
+    "representation" mechanism this used to also check is gone: an
+    organisation now logs into its own cabinet the same way an individual
+    does, rather than acting through a representative's personal account.
 
     This is the half `signatures.sign()` structurally cannot check: it re-proves
     that the CERTIFICATE is the caller's own by PINFL/STIR, which says nothing
@@ -1330,17 +1330,6 @@ async def _is_holder(db: AsyncSession, permit: Permit, user: User) -> bool:
     three can share — a separate per-permit predicate beside a separate list scope
     is two rules that agree until one of them is edited, and the visible symptom
     would be a permit readable by id and missing from the list that must carry it.
-
-    **What this delegation rests on.** It replaced an explicit
-    `owner_user_id, else has_effective_representation(applicant.stir)` pair, and
-    the two resolve the same set only because every `representations.applicant_id`
-    points at a `kind='legal'` applicant, which `identity_by_kind` guarantees has
-    a non-null `stir`. `representations` carries no DB CHECK on the target's KIND
-    — the guarantee is the two writers in `auth.service`, `add_representation`
-    (which refuses `kind != "legal"` outright) and `attach_legal`, staying the
-    only ones. A third writer that could name an individual applicant would widen
-    who may sign the recipient line, and this is the sentence that must be read
-    before adding it.
     """
     return permit.applicant_id in await auth_service.own_applicant_ids(db, user.id)
 
@@ -1599,8 +1588,8 @@ async def add_signature(
     2. `purpose` is in the configured requirement set;
     3. **authorization (ruling 4), BEFORE `sign()`/`sign_simple()`;**
     4. `sign()` over the STORED bytes when `pkcs7` is present, `sign_simple()`
-       when it is not AND this is the holder signing an `on_behalf='self'`
-       application (ruling #183) — everyone else with no envelope is refused;
+       when it is not AND this is the holder signing for an INDIVIDUAL applicant
+       (ruling #183) — everyone else with no envelope is refused;
     5. nothing missing -> active, in one step with the application's own move;
     6. audit, always.
 
@@ -1614,10 +1603,12 @@ async def add_signature(
     **Ruling #183, and why it belongs HERE rather than inside `signatures`.**
     `signatures.service.sign_simple` deliberately does not decide whether a
     simple signature is allowed for an object — that is a caller's rule, and
-    this module's own rule is the application's `on_behalf`: `self` may use
-    the button on the RECIPIENT line only, `legal` always needs an envelope
-    (decision #9, narrowed by #183), and every STAFF purpose keeps needing one
-    too, whatever `on_behalf` says. Step 3 has already proven WHO may sign
+    this module's own rule is the application's applicant `kind`: an
+    INDIVIDUAL applicant may use the button on the RECIPIENT line only, a
+    LEGAL one always needs an envelope (decision #9, narrowed by #183, and
+    superseded by decision #226's own login), and every STAFF purpose keeps
+    needing one too, whatever the applicant's kind. Step 3 has already proven
+    WHO may sign
     `purpose` by the time step 4 runs — for the recipient line specifically,
     that `user` really is the application's holder — so step 4 only has to
     ask WHICH mechanism, never re-derive identity.
@@ -1689,7 +1680,7 @@ async def add_signature(
     document = await pdf_bytes(db, permit.id)
     if pkcs7 is not None:
         # An envelope was posted: nothing changes for anyone, whatever the
-        # purpose or the application's `on_behalf` (ruling #183's own text).
+        # purpose or the applicant's kind (ruling #183's own text).
         await signatures_service.sign(
             db,
             object_type=OBJECT_TYPE,
@@ -1707,13 +1698,14 @@ async def add_signature(
         # proven `user` is entitled to sign `purpose` on THIS permit — for the
         # recipient line, that they really are the application's holder — so
         # the only question left is which mechanism: the button, for the
-        # holder of an `on_behalf='self'` application, or a flat refusal for
-        # everyone else (a legal entity's representative, or any staff
-        # purpose) without one.
+        # holder of an INDIVIDUAL applicant's application, or a flat refusal
+        # for everyone else (a legal entity, or any staff purpose) without one.
         application = await applications_service.get(db, permit.application_id)
         if application is None:
             raise err("ERR-SYS-003", details={"application": str(permit.application_id)})
-        if purpose == signers.RECIPIENT_PURPOSE and application.on_behalf == "self":
+        applicant = await auth_service.get_applicant(db, application.applicant_id)
+        is_individual = applicant is not None and applicant.kind != "legal"
+        if purpose == signers.RECIPIENT_PURPOSE and is_individual:
             await signatures_service.sign_simple(
                 db,
                 object_type=OBJECT_TYPE,
@@ -2902,10 +2894,11 @@ async def extend(
     """`POST /permits/{id}/extend` — FILE a `kind='extension'` application
     against a permit still in force, in one request (stage 12, plan 12 R6:
     there is no draft to open any more; the body is the whole filing and the
-    row is born SUBMITTED through `applications.service.file`). `on_behalf`
-    and `applicant_id` are derived from the holder, never trusted from the
-    body — a body naming another applicant is refused
-    `applicant_is_not_the_holder`.
+    row is born SUBMITTED through `applications.service.file`). Since decision
+    #226 (R5) `applications.service._resolve_applicant` always resolves the
+    CALLER's own applicant — nothing here needs to derive or check it, because
+    `_is_holder` below already proved `actor`'s own applicant IS
+    `permit.applicant_id`.
 
     No `-> Application` on this signature, deliberately: the return type IS
     `applications.models.Application` (inferred from `file`'s own
@@ -2965,23 +2958,9 @@ async def extend(
     parent = await applications_service.get(db, permit.application_id)
     assert parent is not None  # permits.application_id FKs applications
 
-    # `on_behalf` is the ACTOR's own relationship to this applicant, never
-    # copied from the parent's stored value: `_resolve_applicant` has exactly
-    # the same two branches `_is_holder` just admitted the caller through
-    # (the individual's own account, or an effective representation of a
-    # legal-entity applicant), so this asks the identical question. Copying
-    # the parent's `on_behalf` would refuse a representative lawfully
-    # extending a permit the citizen filed in person — and the reverse.
-    if payload.applicant_id is not None and payload.applicant_id != permit.applicant_id:
-        raise err("ERR-VAL-001", details={"reason": "applicant_is_not_the_holder"})
-    own = await auth_service.get_own_applicant(db, actor.id)
-    on_behalf = "self" if own is not None and own.id == permit.applicant_id else "legal"
-    filing = payload.model_copy(
-        update={"on_behalf": on_behalf, "applicant_id": permit.applicant_id}
-    )
     application = await applications_service.file(
         db,
-        filing,
+        payload,
         actor=actor,
         ip=ip,
         kind=applications_service.KIND_EXTENSION,

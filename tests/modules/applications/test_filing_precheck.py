@@ -15,7 +15,6 @@ API = "/api/v1"
 
 def _grazing_filing(contour_id, activity_type_id, livestock_type_id, **overrides):
     body = {
-        "on_behalf": "self",
         "contour_id": str(contour_id),
         "activity_type_id": str(activity_type_id),
         "period_from": "2027-05-01",
@@ -64,20 +63,6 @@ async def test_an_incomplete_filing_names_the_missing_fields_as_skipped_rows(
     assert result.json()["calculation"] is None
     skipped = [row for row in result.json()["checks"] if row["result"] == "skipped"]
     assert any("period_to" in json.dumps(row["details"]) for row in skipped)
-
-
-async def test_a_filing_for_somebody_elses_applicant_is_refused(
-    applicant_client, legal_applicant, published_contour, grazing_activity_id, sheep_type_id
-):
-    body = _grazing_filing(
-        published_contour.id,
-        grazing_activity_id,
-        sheep_type_id,
-        applicant_id=str(legal_applicant.id),
-    )
-    result = await applicant_client.post("/api/v1/applications/precheck", json=body)
-    assert result.status_code == 422, result.text
-    assert result.json()["error"]["details"]["reason"] == "applicant_is_not_the_caller"
 
 
 async def test_the_package_mints_an_id_and_names_it_in_the_bytes(
@@ -132,11 +117,16 @@ async def test_a_document_that_is_not_the_callers_upload_is_refused_at_precheck(
 
 
 async def test_the_static_routes_are_not_shadowed_by_the_uuid_routes(applicant_client):
-    """`/applications/precheck` must not be parsed as `/applications/{id}`."""
+    """`/applications/precheck` must not be parsed as `/applications/{id}`.
+
+    Since decision #226 removed `on_behalf` (the last REQUIRED field on
+    `ApplicationFilingIn`), an empty body no longer 422s at the schema —
+    `precheck` REPORTS an incomplete filing as data (`checks[]`), it does not
+    refuse it. Reaching that 200 with a `checks` key is what proves the route
+    resolved to the precheck handler rather than being misparsed."""
     result = await applicant_client.post("/api/v1/applications/precheck", json={})
-    assert result.status_code == 422, result.text
-    assert result.json()["error"]["code"] == "ERR-VAL-001"
-    assert "on_behalf" in result.text
+    assert result.status_code == 200, result.text
+    assert "checks" in result.json()
 
 
 async def test_a_transient_deadwood_filing_is_told_its_blank_lines_too(
@@ -147,7 +137,6 @@ async def test_a_transient_deadwood_filing_is_told_its_blank_lines_too(
     result = await applicant_client.post(
         f"{API}/applications/precheck",
         json={
-            "on_behalf": "self",
             "activity_type_id": str(deadwood_activity_id),
             "contour_id": str(published_contour.id),
             "period_from": "2027-05-01",

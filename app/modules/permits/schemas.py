@@ -239,10 +239,10 @@ class PermitSignIn(BaseModel):
     `pkcs7` is OPTIONAL (ruling #183): a citizen acting for themselves signs
     with a button, and posts a body carrying no envelope at all. Absent, it is
     NOT automatically a simple signature — `permits.service.add_signature`
-    decides who may take that path (the holder purpose, `on_behalf='self'`)
-    and refuses everyone else with `ERR-SIGN-001` `simple_signature_not_
-    allowed`. WITH `pkcs7` present, nothing about this route changes for
-    anyone, whatever the purpose or the application's `on_behalf`.
+    decides who may take that path (the holder purpose, an INDIVIDUAL
+    applicant) and refuses everyone else with `ERR-SIGN-001` `simple_
+    signature_not_allowed`. WITH `pkcs7` present, nothing about this route
+    changes for anyone, whatever the purpose or the applicant's kind.
     """
 
     # `strip_whitespace=True` (I4, final review): the pattern is anchored, so

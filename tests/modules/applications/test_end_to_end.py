@@ -51,7 +51,6 @@ async def test_one_application_walks_the_whole_path(
     from tests.modules.applications.test_submit import _submit
 
     filing = {
-        "on_behalf": "self",
         "activity_type_id": str(grazing_activity_id),
         "contour_id": str(published_contour.id),
         "period_from": "2027-05-01",

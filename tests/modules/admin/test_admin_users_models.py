@@ -1,7 +1,6 @@
-"""0007 DDL: media_files, announcements, roles.status, ASCII pinfl, poa FK, seeds."""
+"""0007 DDL: media_files, announcements, roles.status, ASCII pinfl, seeds."""
 
 import uuid
-from datetime import date
 
 import pytest
 from sqlalchemy import select
@@ -99,30 +98,6 @@ async def test_users_pinfl_check_is_ascii_only(db):
 
     user = await make_user(db)
     user.pinfl = "١٢٣٤٥٦٧٨٩٠١٢٣٤"  # 14 Arabic-Indic digits
-    with pytest.raises(IntegrityError):
-        await db.flush()
-    await db.rollback()
-
-
-async def test_poa_file_fk_enforced(db):
-    """representations.poa_file_id now points at media_files."""
-    from app.modules.auth.models import Applicant, Representation
-    from tests.modules.auth.test_sessions import make_user
-
-    user = await make_user(db, role_code="applicant")
-    applicant = Applicant(kind="legal", stir=str(uuid.uuid4().int)[:9], name="ООО Тест")
-    db.add(applicant)
-    await db.flush()
-    db.add(
-        Representation(
-            applicant_id=applicant.id,
-            user_id=user.id,
-            basis="poa",
-            poa_file_id=uuid.uuid4(),  # no such file
-            valid_from=date(2026, 1, 1),
-            valid_until=date(2026, 12, 31),
-        )
-    )
     with pytest.raises(IntegrityError):
         await db.flush()
     await db.rollback()

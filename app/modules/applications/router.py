@@ -442,7 +442,7 @@ async def submit_application(
     or `ERR-NORM-001/002/003/006` when a BLOCKING check fails — the difference
     from the pre-check, which reports the identical result as data; 422
     `ERR-SIGN-001` for an invalid signature, or (ruling #183) `pkcs7` absent on
-    a `on_behalf="legal"` filing (`simple_signature_not_allowed`); 409
+    a legal applicant's filing (`simple_signature_not_allowed`); 409
     `ERR-APP-002` with the existing number when another active application
     already covers this plot and period.
     """

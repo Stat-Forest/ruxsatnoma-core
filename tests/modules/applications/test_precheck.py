@@ -96,9 +96,7 @@ async def test_a_half_empty_filing_is_answered_with_skipped_rows_not_an_error(
     """The wizard pre-checks whatever it holds, so the route is reached on an
     incomplete filing. `skipped` with a named reason is the established idiom
     of both check modules; a 500 or an empty list is not."""
-    result = await applicant_client.post(
-        "/api/v1/applications/precheck", json={"on_behalf": "self"}
-    )
+    result = await applicant_client.post("/api/v1/applications/precheck", json={})
     assert result.status_code == 200, result.text
     body = result.json()
     assert body["calculation"] is None
@@ -110,7 +108,7 @@ async def test_a_half_empty_filing_is_answered_with_skipped_rows_not_an_error(
 
     result = await applicant_client.post(
         "/api/v1/applications/precheck",
-        json={"on_behalf": "self", "contour_id": str(published_contour.id)},
+        json={"contour_id": str(published_contour.id)},
     )
     assert result.status_code == 200, result.text
     by_type = {c["check_type"]: c for c in result.json()["checks"]}
@@ -214,7 +212,6 @@ async def test_a_real_overlap_is_reported_with_its_raw_decimal_and_uuid_details(
     pre-check answers 200 and hands the applicant the overlapping contour.
     """
     filing = {
-        "on_behalf": "self",
         "contour_id": str(overlapping_published_contour.id),
         "activity_type_id": str(grazing_activity_id),
         "period_from": "2027-05-01",
@@ -266,7 +263,6 @@ async def test_a_tariff_exempt_activity_still_has_to_declare_its_quantity(
     route exists to prevent.
     """
     filing = {
-        "on_behalf": "self",
         "contour_id": str(published_contour.id),
         "activity_type_id": str(science_activity_id),
         "period_from": "2027-05-01",

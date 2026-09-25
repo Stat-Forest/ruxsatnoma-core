@@ -1,7 +1,7 @@
-"""Purge/expiry jobs: retention deletes and the representation-expiry flip+audit."""
+"""Purge/expiry jobs: retention deletes and the periodic sweeps."""
 
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import text
@@ -9,16 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 from app.db import make_session_factory
-from app.modules.auth.models import Applicant
 from app.workers.jobs import (
     expire_invoices,
-    expire_representations,
     oversight_sweep,
     purge_stale_rows,
     refund_sla_sweep,
     sla_sweep,
 )
-from tests.modules.auth.test_sessions import make_user
 
 
 async def test_purge_deletes_only_stale_rows(engine, db):
@@ -72,50 +69,6 @@ async def test_purge_deletes_only_stale_rows(engine, db):
         await db.execute(text("SELECT count(*) FROM audit_log WHERE action = 'purge.run'"))
     ).scalar_one()
     assert audited >= 1
-
-
-def _unique_stir() -> str:
-    # Same shape as tests/modules/auth/test_legal_applicants.py's unique_stir():
-    # a fresh 9-digit stir per call so reruns against the shared dev Postgres
-    # never collide on applicants.uq_applicants_stir.
-    return f"9{uuid.uuid4().int % 10**8:08d}"
-
-
-async def test_expire_representations_flips_and_audits(engine, db):
-    # No make_applicant fixture exists at this level (checked tests/modules/auth/);
-    # inline the applicant the way tests/modules/auth/test_applicant_models.py does,
-    # and the representation row via raw SQL like the purge test above.
-    user = await make_user(db)
-    applicant = Applicant(kind="legal", stir=_unique_stir(), name="OOO Test")
-    db.add(applicant)
-    await db.flush()
-    await db.execute(
-        text(
-            "INSERT INTO representations (id, applicant_id, user_id, basis, valid_from,"
-            " valid_until, status) VALUES"
-            " (gen_random_uuid(), :a, :u, 'director_registry', :vf, :vu, 'active')"
-        ),
-        {"a": applicant.id, "u": user.id, "vf": date(2026, 1, 1), "vu": date(2026, 1, 2)},
-    )
-    await db.commit()
-
-    n = await expire_representations(make_session_factory(engine))
-    assert n >= 1
-    status = (
-        await db.execute(
-            text("SELECT status FROM representations WHERE user_id = :u"), {"u": user.id}
-        )
-    ).scalar_one()
-    assert status == "expired"
-    audited = (
-        await db.execute(
-            text("SELECT count(*) FROM audit_log WHERE action = 'representation.expire'")
-        )
-    ).scalar_one()
-    assert audited >= 1
-
-
-# --- 3.11a task 7: the permit sweeps drain in batches -------------------------
 
 
 class _StubSession:

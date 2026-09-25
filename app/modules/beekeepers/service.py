@@ -293,10 +293,9 @@ async def match_certificate(
 ) -> MatchResult:
     """`active` rows only, trimmed/case-folded — `repo.get_active_by_
     certificate_no` does both. Identity = PINFL when given, else STIR
-    (ruling #182 option а): the caller decides which one to pass by
-    `on_behalf` (`self` -> the applicant's own PINFL, `legal` -> the
-    applicant's STIR) and this function trusts that choice without knowing
-    what it means."""
+    (ruling #182 option а): the caller decides which one to pass by the
+    applicant's own `kind` (`individual` -> its PINFL, `legal` -> its STIR)
+    and this function trusts that choice without knowing what it means."""
     row = await repo.get_active_by_certificate_no(db, certificate_no)
     if row is None:
         return MatchResult(status="unknown", beekeeper_id=None)

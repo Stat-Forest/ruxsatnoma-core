@@ -3,10 +3,11 @@
 exists to support it.
 
 Level 2 (`models.py`'s own docstring): this module reaches `auth` through the
-`User` object a caller hands in and, since fix round 2, through
-`auth.service.has_effective_representation` (proving an organisation
-certificate belongs to its presenter) — never queries `users`/
-`representations` itself, only ever through `auth`'s own service. Reaches
+`User` object a caller hands in and, since fix round 2 (superseded by stage 18,
+decision #226), through `auth.service.get_own_applicant` (proving an
+organisation certificate belongs to its presenter's OWN legal applicant) —
+never queries `users`/`applicants` itself, only ever through `auth`'s own
+service. Reaches
 E-IMZO only through the `integrations.adapters.eimzo` seam
 (`get_eimzo_adapter`; real verification arrives at stage 5.2). Task 7 adds
 one further, narrow exception: `auth.repo.role_code`/`permission_codes`,
@@ -379,29 +380,45 @@ async def _ownership_reason(
     the certificate was first bound, and `cert.user_id` alone cannot see
     that happen.
 
-    `EimzoCertificateInfo` carries no explicit personal/org kind flag, so the
-    shape of `pinfl_or_stir` itself is the only signal available: 14 digits is
-    a personal PINFL (`users.pinfl`'s own `^[0-9]{14}$` CHECK), 9 digits is an
-    organisation STIR (`applicants.stir`'s own `^[0-9]{9}$` CHECK) — the two
-    formats never collide, so the length alone disambiguates them.
+    **C1 (final review): a REAL organisation certificate carries BOTH the
+    employee's PINFL and the org TIN at once** (`info.tin`, `eimzo_wire.
+    read_subject`'s third return value) — `info.pinfl_or_stir` is then the
+    14-digit PERSONAL identifier, never the TIN, so the pre-fix version of
+    this function (keying purely on `pinfl_or_stir`'s own length) took the
+    PERSONAL branch for exactly the certificate a legal cabinet signs with,
+    and refused every one of its signatures `signer_pinfl_unknown` (that
+    cabinet's `user.pinfl` is always `None`, R1). `info.tin`, when present,
+    is therefore checked FIRST and separately, before `pinfl_or_stir`'s
+    shape is ever consulted: an ORGANISATION identifier is `info.tin` if the
+    certificate carries one, else `pinfl_or_stir` itself when it is
+    9-digit-shaped (a TIN-only certificate, or the mock's older shape with
+    no `tin` field at all — `applicants.stir`'s own `^[0-9]{9}$` CHECK, which
+    a 14-digit PINFL can never satisfy, so the two never collide).
 
-    - Organisation (9 digits): proven the way `auth` already proves legal
-      representation — the caller must hold an EFFECTIVE representation for
-      that STIR right now (fix round 2). `"certificate_pinfl_mismatch"` when
-      they don't — a stranger's certificate and one for a STIR whose
-      representation has since expired or been revoked read the same way to
-      a caller: "not provably yours right now".
-    - Personal (14 digits): it must equal the caller's own `user.pinfl`.
-      `user.pinfl` can itself be `None` — a staff user created before their
-      PINFL was recorded (real: `users.pinfl` is nullable) — and that is OUR
-      data gap, not a wrong certificate, so it gets its own honest reason,
+    - Organisation identifier present: proven the way `auth` already proves
+      it (decision #226, R4) — the caller's OWN applicant must be
+      `kind='legal'` and its `stir` must equal that identifier.
+      `"certificate_pinfl_mismatch"` when it doesn't — a stranger's
+      certificate and one for a STIR the caller never logged into read the
+      same way to a caller: "not provably yours right now". This branch
+      NEVER falls through to the personal check below, even though the same
+      certificate may also carry a PINFL: an organisation certificate
+      proves the ORGANISATION's identity, not the signer's personal one, and
+      `sign()`'s caller is always that organisation's own cabinet account
+      when this path is reached at all (login already routed a STAFF
+      PINFL's key to that person's personal account — C2).
+    - No organisation identifier (a plain personal certificate): must equal
+      the caller's own `user.pinfl`. `user.pinfl` can itself be `None` — a
+      staff user created before their PINFL was recorded (real:
+      `users.pinfl` is nullable) — and that is OUR data gap, not a wrong
+      certificate, so it gets its own honest reason,
       `"signer_pinfl_unknown"` (fix round 3, fix 3), never the generic
       mismatch used for an actual stranger's certificate.
     """
-    if len(info.pinfl_or_stir) == 9:
-        if await auth_service.has_effective_representation(
-            db, user_id=user.id, stir=info.pinfl_or_stir
-        ):
+    org_identifier = info.tin or (info.pinfl_or_stir if len(info.pinfl_or_stir) == 9 else None)
+    if org_identifier is not None:
+        own = await auth_service.get_own_applicant(db, user.id)
+        if own is not None and own.kind == "legal" and own.stir == org_identifier:
             return None
         return "certificate_pinfl_mismatch"
     if user.pinfl is None:
@@ -909,10 +926,13 @@ async def sign_simple(
 
     **This does NOT decide whether a simple signature is ALLOWED for
     `(object_type, object_id, purpose)` — that is entirely the caller's
-    rule.** For a permit's holder line the rule is the application's
-    `on_behalf` (`permits.service.add_signature`, ruling #183's other half);
-    a future object type may gate it differently. Call this only once the
-    caller has already decided a simple signature is legitimate here.
+    rule.** For a permit's holder line the rule is the applicant's OWN
+    `kind` (`permits.service.add_signature`, ruling #183's other half,
+    narrowed by decision #226's R5: `on_behalf` no longer exists as a
+    per-application field — a `kind='legal'` applicant's holder line always
+    needs an ERI envelope, an individual's never does); a future object
+    type may gate it differently. Call this only once the caller has
+    already decided a simple signature is legitimate here.
 
     Same TRANSACTION CONTRACT as `sign()` — read that docstring first: every
     refusal below commits the caller's whole session before raising

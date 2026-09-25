@@ -32,10 +32,10 @@ async def test_a_clone_copies_the_request_and_nothing_that_was_earned(
     assert result.status_code == 200, result.text
     clone = result.json()
     # The request itself, by VALUE — a wrong-but-FK-valid substitution
-    # (someone else's applicant, a different benefit category) would slip
-    # through a non-null check but not this one.
-    assert clone["on_behalf"] == source["on_behalf"]
-    assert clone["applicant_id"] == source["applicant_id"]
+    # (a different benefit category) would slip through a non-null check but
+    # not this one. Since decision #226 there is no `on_behalf`/`applicant_id`
+    # to compare: the clone carries no applicant identity at all, resolved
+    # afresh from the caller at refiling time (`_resolve_applicant`).
     assert clone["contour_id"] == source["contour_id"]
     assert clone["activity_type_id"] == source["activity_type_id"]
     assert clone["period_from"] == source["period_from"]
@@ -85,19 +85,20 @@ async def test_the_clone_route_is_a_read(applicant_client, submitted_application
     assert result.status_code == 405, result.text
 
 
-async def test_a_clone_names_the_legal_entity_the_source_was_filed_for(
+async def test_a_legal_entitys_own_clone_carries_the_request_not_the_identity(
     representative_client, legal_applicant, legal_filing_ready_for_submission
 ) -> None:
-    """The template names the same applicant and authority shape the source
-    was filed under; the representation itself is resolved afresh at the
-    refiling (`_resolve_applicant`), never copied — a lapsed power of
-    attorney must not ride along."""
+    """Decision #226: the clone carries the REQUEST (plot, activity, period)
+    and nothing about WHO is filing — that is resolved afresh from the
+    caller at refiling time (`_resolve_applicant`), individual or legal
+    alike, never copied from the source."""
     source = await _submit(representative_client, legal_filing_ready_for_submission)
     assert source.status_code == 201, source.text
     clone = await representative_client.get(f"/api/v1/applications/{source.json()['id']}/clone")
     assert clone.status_code == 200, clone.text
-    assert clone.json()["applicant_id"] == str(legal_applicant.id)
-    assert clone.json()["on_behalf"] == "legal"
+    assert "applicant_id" not in clone.json()
+    assert "on_behalf" not in clone.json()
+    assert clone.json()["contour_id"] == source.json()["contour_id"]
 
 
 async def test_a_clone_can_be_filed_once_the_original_is_out_of_the_way(

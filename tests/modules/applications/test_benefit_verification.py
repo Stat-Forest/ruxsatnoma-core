@@ -455,7 +455,6 @@ def apiary_filing(
     `applicant` is a dependency so the caller's own `applicants` row, with its
     address, exists."""
     return {
-        "on_behalf": "self",
         "contour_id": str(published_contour.id),
         "activity_type_id": str(apiary_activity_id),
         "period_from": "2027-05-01",
@@ -609,9 +608,9 @@ async def test_a_legal_entitys_claim_is_matched_by_its_stir_not_the_representati
     hodim_user: User,
     benefit_doc_type_item_id: uuid.UUID,
 ) -> None:
-    """A farm files through its representative: the register row names the
-    ENTITY's STIR, and a stranger's PINFL beside it — the claim is the
-    entity's, so it matches."""
+    """A farm files through its own account (decision #226): the register row
+    names the ENTITY's STIR, and a stranger's PINFL beside it — the claim is
+    the entity's, so it matches."""
     assert legal_applicant.stir is not None
     certificate_no = await _register_beekeeper(
         db, hodim_user, pinfl=unique_pinfl(), stir=legal_applicant.stir
@@ -619,7 +618,7 @@ async def test_a_legal_entitys_claim_is_matched_by_its_stir_not_the_representati
     filing = await _beekeeping_claim(
         db,
         representative_client,
-        {**apiary_filing, "on_behalf": "legal", "applicant_id": str(legal_applicant.id)},
+        apiary_filing,
         certificate_no,
         benefit_doc_type_item_id,
     )

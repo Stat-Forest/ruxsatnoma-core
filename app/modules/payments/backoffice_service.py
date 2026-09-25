@@ -702,22 +702,19 @@ REFUND_RESOLUTIONS = (_STATUS_RETURNED, _STATUS_REJECTED)
 
 async def _may_request_refund_for(db: AsyncSession, applicant_id: uuid.UUID, *, actor: Any) -> bool:
     """`payments.manage` (the accountant) files for anyone; otherwise the
-    actor must own the SAME applicant identity the application belongs to,
-    or hold an effective representation of it — the exact ownership rule
-    `payments.service._may_act_on_invoices_of` gives `GET /invoices/{id}`,
-    reimplemented here rather than imported (that function is `service.py`'s
-    own file-private helper, not part of this module's cross-file surface;
-    see the lesson on module-private names)."""
+    actor must own the SAME applicant identity the application belongs to —
+    the exact ownership rule `payments.service._may_act_on_invoices_of` gives
+    `GET /invoices/{id}` (decision #226, R4: no more "or hold an effective
+    representation of it" half), reimplemented here rather than imported
+    (that function is `service.py`'s own file-private helper, not part of
+    this module's cross-file surface; see the lesson on module-private
+    names)."""
     if await auth_repo.role_code(db, actor) == SUPERUSER_ROLE:
         return True
     if PAYMENTS_MANAGE in await auth_repo.permission_codes(db, actor):
         return True
     own_applicant = await auth_service.get_own_applicant(db, actor.id)
-    if own_applicant is not None and own_applicant.id == applicant_id:
-        return True
-    return await auth_service.has_effective_representation_of(
-        db, user_id=actor.id, applicant_id=applicant_id
-    )
+    return own_applicant is not None and own_applicant.id == applicant_id
 
 
 async def _assert_refund_basis_active(db: AsyncSession, basis_item_id: uuid.UUID) -> None:

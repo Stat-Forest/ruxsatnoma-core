@@ -32,10 +32,10 @@ from app.modules.permits import jobs
 def _extension(active_permit, activity_type_id: uuid.UUID, **overrides) -> dict:
     """A priceable filing for next season on the permit's own contour: the
     seeded haymaking tariff needs no norm and no coefficient, so the permits
-    suite (which publishes neither) can file it. `on_behalf`/`applicant_id`
-    are derived by the service; the body carries the request alone."""
+    suite (which publishes neither) can file it. The applicant is resolved by
+    the service from the caller alone (decision #226, R5); the body carries
+    the request alone."""
     body = {
-        "on_behalf": "self",
         "contour_id": str(active_permit.contour_id),
         "activity_type_id": str(activity_type_id),
         "period_from": "2028-05-01",
@@ -78,18 +78,6 @@ async def test_a_stranger_cannot_extend_my_permit(
     )
     assert refused.status_code == 404  # the same answer the card gives, not an oracle
     assert refused.json()["error"]["code"] == "ERR-SYS-003"
-
-
-async def test_a_body_naming_another_applicant_is_refused(
-    active_permit, holder_client, haymaking_activity_id
-) -> None:
-    refused = await _extend(
-        holder_client,
-        active_permit.id,
-        _extension(active_permit, haymaking_activity_id, applicant_id=str(uuid.uuid4())),
-    )
-    assert refused.status_code == 422, refused.text
-    assert refused.json()["error"]["details"]["reason"] == "applicant_is_not_the_holder"
 
 
 async def test_an_expired_permit_is_applied_for_afresh(
@@ -138,7 +126,7 @@ async def test_file_refuses_an_unknown_kind(db, holder_client) -> None:
     with pytest.raises(DomainError) as exc_info:
         await applications_service.file(
             db,
-            ApplicationFileIn(on_behalf="self", rules_accepted=True),
+            ApplicationFileIn(rules_accepted=True),
             actor=holder_client.user,
             kind="bogus",
         )
